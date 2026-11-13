@@ -386,14 +386,14 @@ impl ReadBatch<'_, '_> {
             .ok_or_else(|| Error::new("table payload authentication failed"))
     }
 
-    /// Replay needs the authenticated header and cutoff, never an application's plaintext.
+    /// Replay authenticates the borrowed envelope and returns its cutoff, never application plaintext.
     /// Only a non-cutoff fact can be reused, after the same historical grant and current key
     /// read as a full opening. The enclosing batch still revalidates reused keys and custody.
     fn replay_metadata(
         &self,
         wire: &signatures::Identified,
-        envelope: Envelope<'_>,
-    ) -> Result<(Header, Option<store::cutoff::Cut>)> {
+        envelope: &Envelope<'_>,
+    ) -> Result<Option<store::cutoff::Cut>> {
         if envelope.header.id != wire.id() {
             return Err(Error::new(
                 "replay envelope differs from identified ciphertext",
@@ -403,7 +403,7 @@ impl ReadBatch<'_, '_> {
             .session
             .with_payload_key(
                 self.scope,
-                &envelope,
+                envelope,
                 false,
                 self.keys.as_ref(),
                 |key, identity| {
@@ -427,7 +427,7 @@ impl ReadBatch<'_, '_> {
                 },
             )?
             .ok_or_else(|| Error::new("table payload authentication failed"))?;
-        Ok((envelope.header, cut))
+        Ok(cut)
     }
 }
 

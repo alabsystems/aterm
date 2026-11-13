@@ -250,6 +250,9 @@ struct Stamps {
     /// A caller other than aterm's own was admitted to type here, set before its bytes are
     /// written ([`TypedStamp::admit`]) and never cleared.
     driver_admitted: bool,
+    /// Another Mac's fleet drive was admitted to type here ([`Who::is_fleet_drive`]), set as
+    /// [`Stamps::driver_admitted`] is and never cleared.
+    fleet_admitted: bool,
 }
 
 impl Who {
@@ -257,6 +260,13 @@ impl Who {
     /// message bus's deliveries ([`Who::Bridge`]), neither of which asks a program to end.
     const fn is_aterms_own(&self) -> bool {
         matches!(self, Self::Aterm | Self::Bridge)
+    }
+
+    /// Whether this caller is another Mac's drive over the fleet: the one caller named by a
+    /// drive's credit ([`fleet_credit`]), which no tab and no other caller is named by
+    /// ([`is_credit_word`]).
+    fn is_fleet_drive(&self) -> bool {
+        matches!(self, Self::Word(word) if word.ends_with(FLEET_CREDIT))
     }
 }
 
@@ -268,6 +278,7 @@ impl TypedStamp {
             slot.driven_at_unix_ms = Some(at_unix_ms);
             slot.driver_admitted = true;
         }
+        slot.fleet_admitted |= by.who.is_fleet_drive();
         let (by, moved) = match slot.last.take() {
             Some(last) if last.by.covers(&by.who) => {
                 (last.by, last.at_unix_ms / 60_000 != at_unix_ms / 60_000)
@@ -283,11 +294,20 @@ impl TypedStamp {
     /// ask before the driver counts.
     pub(crate) fn admit(&self, by: &Caller) {
         if !by.who.is_aterms_own() {
-            self.0
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .driver_admitted = true;
+            let mut slot = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            slot.driver_admitted = true;
+            slot.fleet_admitted |= by.who.is_fleet_drive();
         }
+    }
+
+    /// Whether another Mac's fleet drive has ever been admitted to type into the session:
+    /// what it typed can still be running, so `reveal` says `fleet=yes` of the session from
+    /// then on, and a sign-in started in it opens nothing on this Mac's desk.
+    pub(crate) fn fleet_admitted(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .fleet_admitted
     }
 
     /// Whether a caller other than aterm's own has ever been admitted to type into the session

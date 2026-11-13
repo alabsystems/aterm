@@ -78,6 +78,11 @@ impl<C: Ctl> Session<'_, C> {
         if now.saturating_duration_since(first) < minimum {
             return Ok(());
         }
+        // An unconfirmed agent is never restarted ([`super::observe::RESTART_WITHHELD`]): the
+        // leader's ceiling ends here, refused, and is said once.
+        if self.observing() {
+            return self.withhold_memory_restart(leader, &over, seq, review);
+        }
         let pid = format!("pid={leader}");
         let quiet = format!("quiet={}", self.stall_grace_s);
         let mut args = vec!["restart"];
@@ -86,6 +91,9 @@ impl<C: Ctl> Session<'_, C> {
         let r = self.call(&args)?;
         if self.unserved(&r) {
             return Err(Fail::Lost(format!("restart failed: {}", r.stderr.trim())));
+        }
+        if super::observe::refused(&r) {
+            return self.withhold_memory_restart(leader, &over, seq, review);
         }
         let reply = reply_line(&r);
         if crate::supervise::report::without_verb(&r) {
@@ -107,6 +115,28 @@ impl<C: Ctl> Session<'_, C> {
                 },
                 over.footprint_mib,
                 over.ceiling_mib,
+            ))
+            .map_err(Fail::Hard)
+    }
+
+    /// The memory ceiling's restart withheld from an unconfirmed agent: ended for `leader` and
+    /// refused, as a server's lasting refusal is, so it is said once,
+    /// `RESTART-REFUSED … reply=(<why>)`.
+    fn withhold_memory_restart(
+        &mut self,
+        leader: u32,
+        over: &super::super::memory::MemoryOver,
+        seq: u64,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        self.beside_memory_ended = Some(leader);
+        self.memory_refused = true;
+        review
+            .say(&format!(
+                "RESTART-REFUSED seq={seq} memory footprint_mb={} ceiling_mb={} reply=({})",
+                over.footprint_mib,
+                over.ceiling_mib,
+                super::observe::RESTART_WITHHELD,
             ))
             .map_err(Fail::Hard)
     }

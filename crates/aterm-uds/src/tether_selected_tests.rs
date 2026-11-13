@@ -14,7 +14,7 @@ fn selected_native_copy_executes_and_same_byte_source_replacement_refuses() {
     deadline::ad_hoc_copy(Path::new("/bin/cat"), &source);
     let until = Instant::now() + Duration::from_secs(60);
     let image = SelectedExecutable::retain(&source, until).unwrap();
-    let (read, mut write) = std::io::pipe().unwrap();
+    let (read, mut write) = crate::pipe().unwrap();
     write.write_all(b"ran\n").unwrap();
     drop(write);
     let input: OwnedFd = read.into();

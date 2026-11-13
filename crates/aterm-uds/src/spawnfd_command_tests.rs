@@ -192,7 +192,7 @@ fn every_stdio_mode_round_trips() {
     assert_eq!(out.stderr, b"err\n");
 
     let scratch = Scratch::new("stdio");
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = crate::pipe().expect("pipe");
     writer.write_all(b"fed\n").expect("write the pipe");
     drop(writer);
     let status = command("/bin/sh")
@@ -1222,7 +1222,7 @@ fn a_dropped_handle_of_an_exited_child_leaves_no_zombie() {
         "the dropped handle collected its exited child"
     );
 
-    let (read, write) = std::io::pipe().expect("pipe");
+    let (read, write) = crate::pipe().expect("pipe");
     let running = command("/bin/sh")
         .args(["-c", "read _ || :"])
         .stdin(Stdio::from(read))

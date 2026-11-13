@@ -51,6 +51,12 @@ pub const VERBS: &[Verb] = &[
         synopsis: artifact::package::SYNOPSIS,
         does: "pack, gate and sign a prebuilt package tree (codex, built in codex-alab)",
     },
+    #[cfg(unix)]
+    Verb {
+        name: "publish-package",
+        synopsis: crate::package_campaign::SYNOPSIS,
+        does: "qualify, retain, stage, read back and publish a regular package and its exact index; retry one durable campaign",
+    },
     Verb {
         name: "pack-bottle",
         synopsis: artifact::bottle::SYNOPSIS,
@@ -104,8 +110,8 @@ pub const VERBS: &[Verb] = &[
     },
     Verb {
         name: "lane",
-        synopsis: "lane stage linux --reuse-package PKG… | lane run <alab|linux> [--dry-run] [--staged-only [--queued]] [--json] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux> [--staged-only] [--allow-dirty] [--no-arm] [--keyless] [--host gh|agh-staging|agh] | lane disarm <alab|linux>",
-        does: "stage retained GNU bottles unsigned, or run/install/disarm a lane (a run without --dry-run needs its installed unit's --sha256)",
+        synopsis: "lane stage linux --reuse-package PKG… | lane run <alab|linux|tip> [--dry-run] [--staged-only [--queued]] [--json] [--sha256 HEX] [--log FILE] [--triple T]… | lane install <alab|linux|tip> [--staged-only] [--allow-dirty] [--no-arm] [--keyless] [--host gh|agh-staging|agh] | lane disarm <alab|linux|tip>",
+        does: "stage retained GNU bottles unsigned, or run/install/disarm a lane (a run without --dry-run needs its installed unit's --sha256); `run tip` freezes, qualifies, packs and queues each plain program's dev main, and `run tip --staged-only` publishes the queue in one index",
     },
     Verb {
         name: "hosts",
@@ -304,8 +310,8 @@ fn run_with_context(
             // command's context alone and arm a `gh` unit.
             "lane" if rest.first().is_some_and(|w| w == "install") => {
                 return Err(Error::usage(
-                    "lane install takes its own --host: atpkg-publish lane install <alab|linux> \
-                     --host gh|agh-staging|agh",
+                    "lane install takes its own --host: atpkg-publish lane install \
+                     <alab|linux|tip> --host gh|agh-staging|agh",
                 ));
             }
             _ => {}
@@ -329,7 +335,7 @@ fn run_with_context(
         "lane" if rest.first().is_some_and(|w| w == "install") => {
             let kind = rest
                 .get(1)
-                .ok_or_else(|| Error::usage("lane install needs alab or linux"))?;
+                .ok_or_else(|| Error::usage("lane install needs alab, linux or tip"))?;
             let kind = crate::lane::LaneKind::parse(kind)?;
             let flags = crate::lane::install::InstallFlags::parse(&rest[2..])?;
             if kind == crate::lane::LaneKind::Linux {
@@ -356,7 +362,7 @@ fn live_identity_lookup(verb: &str, rest: &[String]) -> bool {
         return false;
     }
     match verb {
-        "upload" | "mirror" => true,
+        "upload" | "mirror" | "publish-package" => true,
         "publish-group" => rest
             .iter()
             .any(|arg| matches!(arg.as_str(), "--stage-upload" | "--publish-staged")),
@@ -380,6 +386,8 @@ pub fn dispatch(ctx: &Ctx, verb: &str, rest: &[String]) -> Result<()> {
         "pack" => artifact::pack::run(ctx, rest),
         "pack-bundle" => artifact::bundle::run(ctx, rest),
         "pack-package" => artifact::package::run(ctx, rest),
+        #[cfg(unix)]
+        "publish-package" => crate::package_campaign::run(ctx, rest),
         "pack-bottle" => artifact::bottle::run(ctx, rest),
         "pack-upstream" => artifact::bottle::upstream::run(ctx, rest),
         "build-local" => artifact::build_local::run(ctx, rest),

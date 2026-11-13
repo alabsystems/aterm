@@ -232,7 +232,7 @@ fn the_budget_is_a_sliding_window_over_the_stamps_it_persisted() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// ONE NOTIFIER PER STORE ([`Store::hold`]): while one notifier holds a state dir, a second
+/// ONE NOTIFIER PER STORE ([`Store::open`]): while one notifier holds a state dir, a second
 /// one's start on it is refused, naming the holder's pid, and writes nothing; once the first
 /// lets go, a start takes it.
 #[test]
@@ -262,64 +262,25 @@ fn a_second_notifier_on_the_same_store_is_refused_at_its_start() {
     assert_eq!(back.stamps, [1_000]);
 }
 
-/// How a test takes a running notifier's store from under it.
-#[derive(Clone, Copy, Debug)]
-enum Under {
-    /// `notify/` removed whole, as by hand.
-    Removed,
-    /// `notify/lock` removed, its journal left in place.
-    LockRemoved,
-}
-
-/// What [`under_a_running_notifier`] saw.
-struct Lost {
-    /// The first notifier's write after its store was taken from under it, before a second one.
-    alone: io::Result<()>,
-    /// What [`StoreLock::moved`] answered once a second notifier took the new store.
-    moved: io::Result<Option<Moved>>,
-    /// The first one's write after the second wrote the new store.
-    beside: io::Result<()>,
-    /// Whether that write changed the new store's journal.
-    wrote: bool,
-    /// The first one's reader connecting again then, taking up its log's store ([`reader_store`]).
-    read: io::Result<()>,
-    /// Whether that reader wrote the new store's `log` file.
-    logged: bool,
-    /// The stamps a start after both let go reads.
-    stamps: Vec<u64>,
-}
-
-/// A notifier writes its store, the store is taken from under it (`under`), it writes, a second
-/// notifier takes the new store and writes it, and the first writes again and its reader
-/// connects again; `by_file` is the mutant that holds the store by its lock's file only
-/// ([`Hold::check`]).
-fn under_a_running_notifier(tag: &str, under: Under, by_file: bool) -> Lost {
-    let dir = scratch(tag);
-    let mut c = cfg(&dir);
-    c.limit = 8;
+/// Renaming the held directory ends every writer, including readers reconnecting later.
+#[test]
+fn a_notifier_whose_store_is_renamed_stops_and_keeps_its_loss() {
+    let dir = scratch("directory-moved");
+    let c = cfg(&dir);
     let mut first = Notifier::new(c.clone()).expect("open");
-    first
-        .hold
-        .by_file
-        .store(by_file, std::sync::atomic::Ordering::Relaxed);
     first.charge(1_000).expect("charge");
-    match under {
-        Under::Removed => std::fs::remove_dir_all(&first.store.root).expect("remove notify/"),
-        Under::LockRemoved => {
-            std::fs::remove_file(first.store.root.join(LOCK)).expect("remove notify/lock");
-        }
-    }
-    let alone = first.charge(2_000);
-    let mut second =
-        Notifier::new(c.clone()).expect("the path taken from under the first is a new store");
-    second
-        .charge(5_000)
-        .expect("the second writes the new store");
-    let journal_path = second.store.root.join(journal::FILE);
-    let journal = std::fs::read(&journal_path).expect("the new store's journal");
-    let moved = first.hold.lock.moved();
-    let beside = first.charge(3_000);
-    let wrote = std::fs::read(&journal_path).expect("the new store's journal") != journal;
+    let root = first.store.root.clone();
+    let aside = root.with_extension("aside");
+    std::fs::rename(&root, &aside).expect("rename held root");
+    let lost = first
+        .charge(2_000)
+        .expect_err("renamed root refuses writes");
+    assert_eq!(lost.kind(), io::ErrorKind::NotFound);
+    let mut second = Notifier::new(c.clone()).expect("new physical directory");
+    second.charge(5_000).expect("new owner writes");
+    let journal = std::fs::read(root.join(journal::FILE)).unwrap();
+    let again = first.charge(3_000).expect_err("loss is sticky");
+    assert_eq!(again.to_string(), lost.to_string());
     let log = ReadLog {
         id: Some(astream_broker::LogIdentity {
             id: [7; 16],
@@ -328,226 +289,91 @@ fn under_a_running_notifier(tag: &str, under: Under, by_file: bool) -> Lost {
         lineage: None,
         ordered: false,
     };
-    let read = reader_store(&first.hold, &log).map(drop);
-    let logged = second.store.root.join("log").exists();
+    assert_eq!(
+        reader_store(&first.hold, &log)
+            .expect_err("reader also refuses")
+            .to_string(),
+        lost.to_string()
+    );
+    assert_eq!(std::fs::read(root.join(journal::FILE)).unwrap(), journal);
+    assert!(!root.join("log").exists());
     drop(second);
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::rename(&aside, &root).unwrap();
+    assert_eq!(
+        first
+            .charge(4_000)
+            .expect_err("restoring the path cannot clear loss")
+            .to_string(),
+        lost.to_string()
+    );
     drop(first);
-    let stamps = Notifier::new(c).expect("once both let go").stamps;
-    Lost {
-        alone,
-        moved,
-        beside,
-        wrote,
-        read,
-        logged,
-        stamps,
-    }
+    let back = Notifier::new(c).expect("original owner retired");
+    assert_eq!(back.stamps, [1_000]);
 }
 
-/// THE STORE BY ITS PATH ([`Hold::check`]): a notifier whose `notify/` (or whose `notify/lock`)
-/// is removed under it stops at its next write, naming the store, and never writes again, its
-/// readers' connects included ([`reader_store`], whose [`Store::for_log`] writes the `log`
-/// file), so a second notifier takes the new store and nothing of the first's reaches it.
-/// NEGATIVE CONTROL: the store held by its lock's file only (`by_file`) takes every write: its
-/// reader writes the second's `log` file, and beside the lock removed its writes go into the
-/// journal the second one now writes (whose steps then interleave out of order). With
-/// `notify/` removed the notifier's own writes go to descriptors no path names, so there the
-/// `alone`, `beside` and `read` refusals and the `log` file are what tell the check from none.
-#[test]
-fn a_notifier_whose_store_is_removed_under_it_stops_at_its_next_write() {
-    for under in [Under::Removed, Under::LockRemoved] {
-        let lost = under_a_running_notifier("lock-path", under, false);
-        let alone = lost
-            .alone
-            .expect_err("the next write after the removal stops");
-        assert_eq!(alone.kind(), io::ErrorKind::NotFound, "{under:?}: {alone}");
-        assert!(
-            alone
-                .to_string()
-                .contains("was removed or replaced under this notifier"),
-            "{under:?}: the refusal names the store: {alone}"
-        );
-        assert!(
-            matches!(lost.moved, Ok(Some(Moved::Replaced(_)))),
-            "{under:?}: the new store's lock is not the one it holds: {:?}",
-            lost.moved
-        );
-        let beside = lost.beside.expect_err("it never writes again");
-        assert_eq!(beside.to_string(), alone.to_string(), "{under:?}");
-        assert!(!lost.wrote, "{under:?}: the first wrote the second's store");
-        let read = lost.read.expect_err("its reader writes nothing either");
-        assert_eq!(read.to_string(), alone.to_string(), "{under:?}");
-        assert!(
-            !lost.logged,
-            "{under:?}: its reader wrote the second's `log`"
-        );
-        assert!(
-            !lost.stamps.contains(&2_000) && !lost.stamps.contains(&3_000),
-            "{under:?}: the new store holds the first's writes: {:?}",
-            lost.stamps
-        );
-        assert!(lost.stamps.contains(&5_000), "{under:?}: {:?}", lost.stamps);
-
-        let mutant = under_a_running_notifier("lock-file", under, true);
-        assert!(
-            mutant.alone.is_ok() && mutant.beside.is_ok() && mutant.read.is_ok(),
-            "CONTROL {under:?}: held by its file only, every write is taken"
-        );
-        assert!(
-            mutant.logged,
-            "CONTROL {under:?}: the first's reader writes the second's store"
-        );
-        if matches!(under, Under::LockRemoved) {
-            assert!(
-                mutant.wrote && mutant.stamps.contains(&2_000),
-                "CONTROL: two notifiers write one journal: {:?}",
-                mutant.stamps
-            );
-        }
-    }
-}
-
-/// A [`Hold::check`] whose `lstat` does not answer (here `ELOOP`, a path that loops) records
-/// nothing: the errno is passed up as a write the state dir refused, retried later, and the
-/// next check that reads the path names the lock again. NEGATIVE CONTROL: the path moved is
-/// recorded, and every check after answers it.
+/// An unreadable path is Unknown, not evidence that directory ownership was lost.
 #[test]
 fn a_store_check_that_cannot_read_its_path_records_no_loss() {
-    let dir = scratch("lock-errno");
-    let store = Store::open(&dir).expect("open");
-    let lock = store.hold().expect("hold");
-    let probe = store.root.join("loop");
-    std::os::unix::fs::symlink("loop", &probe).expect("a link to itself");
-    let hold = Hold::new(
-        store.root.clone(),
-        StoreLock {
-            file: lock.file.try_clone().expect("dup"),
-            path: probe.join(LOCK),
-            id: lock.id,
-        },
-    );
-    let errno = hold.check().expect_err("the path does not read");
-    assert!(errno.raw_os_error().is_some(), "an lstat errno: {errno}");
-    assert!(
-        hold.lost().is_none(),
-        "a read that did not answer is no loss"
-    );
-    let hold = Hold::new(store.root.clone(), lock);
-    hold.check().expect("the path names the lock it took");
-    std::fs::remove_file(store.root.join(LOCK)).expect("remove notify/lock");
-    let gone = hold.check().expect_err("CONTROL: the lock removed");
-    assert_eq!(gone.kind(), io::ErrorKind::NotFound, "{gone}");
-    std::fs::write(store.root.join(LOCK), b"").expect("a new lock file");
-    let again = hold.check().expect_err("CONTROL: recorded");
-    assert_eq!(again.to_string(), gone.to_string());
-}
-
-/// [`Store::hold`] holds a lock its path names; a path replaced after the take is told by
-/// [`StoreLock::moved`]. NEGATIVE CONTROL: the same file back at its path is held again.
-#[test]
-fn a_held_lock_is_the_file_its_path_names() {
-    let dir = scratch("lock-held-at");
-    let store = Store::open(&dir).expect("open");
-    let lock = store.hold().expect("hold");
+    let dir = scratch("directory-errno");
+    let mut store = Store::open(&dir).expect("open");
+    let original = store.root.clone();
+    let probe = original.join("loop");
+    std::os::unix::fs::symlink("loop", &probe).unwrap();
+    Arc::get_mut(&mut store.access.0)
+        .expect("sole owner")
+        .lock
+        .path = probe.join("missing");
+    let errno = store.access.0.check().expect_err("unreadable path");
+    assert!(errno.raw_os_error().is_some());
+    assert!(store.access.0.lost().is_none());
+    Arc::get_mut(&mut store.access.0).unwrap().lock.path = original.clone();
+    store.access.0.check().expect("same original directory");
+    let aside = original.with_extension("aside");
+    std::fs::rename(&original, &aside).unwrap();
+    let gone = store.access.0.check().expect_err("positive absence");
+    std::fs::rename(&aside, &original).unwrap();
     assert_eq!(
-        lock.moved().expect("lstat"),
-        None,
-        "the path names the lock"
-    );
-    let aside = store.root.join("lock.aside");
-    std::fs::rename(store.root.join(LOCK), &aside).expect("move the lock aside");
-    assert_eq!(lock.moved().expect("lstat"), Some(Moved::Removed));
-    std::fs::write(store.root.join(LOCK), b"").expect("a new lock file");
-    assert!(
-        matches!(lock.moved(), Ok(Some(Moved::Replaced(_)))),
-        "another file at the path"
-    );
-    std::fs::rename(&aside, store.root.join(LOCK)).expect("move it back");
-    assert_eq!(
-        lock.moved().expect("lstat"),
-        None,
-        "CONTROL: the same file back"
+        store.access.0.check().expect_err("sticky loss").to_string(),
+        gone.to_string()
     );
 }
 
-/// [`Store::hold`] takes [`LOCK`] again where its path was replaced between the open and the
-/// `flock(2)` ([`BEFORE_TAKE`]), and holds the file its path names; replaced under each of
-/// [`HOLD_TRIES`] takes, it refuses by name. NEGATIVE CONTROL: with no replacement the first
-/// take is held, and the take count shows the retries ran.
+/// The PID file is diagnostic DATA; unlinking it cannot release the directory owner.
 #[test]
-fn a_lock_replaced_under_its_take_is_taken_again() {
-    let run = |replace: usize| {
-        let dir = scratch("lock-take");
-        let store = Store::open(&dir).expect("open");
-        let takes = std::rc::Rc::new(std::cell::Cell::new(0_usize));
-        let seen = std::rc::Rc::clone(&takes);
-        BEFORE_TAKE.with(|seam| {
-            *seam.borrow_mut() = Some(Box::new(move |path: &Path| {
-                seen.set(seen.get() + 1);
-                if seen.get() <= replace {
-                    let fresh = path.with_extension("fresh");
-                    std::fs::write(&fresh, b"").expect("a new lock file");
-                    std::fs::rename(&fresh, path).expect("replace the lock");
-                }
-            }));
-        });
-        let held = store.hold();
-        BEFORE_TAKE.with(|seam| *seam.borrow_mut() = None);
-        (held, takes.get(), dir)
-    };
-    let (held, takes, _dir) = run(0);
-    assert_eq!(held.expect("CONTROL: held").moved().expect("lstat"), None);
-    assert_eq!(takes, 1, "CONTROL: one take");
-    for replace in 1..HOLD_TRIES {
-        let (held, takes, _dir) = run(replace);
-        let lock = held.expect("taken again");
-        assert_eq!(
-            lock.moved().expect("lstat"),
-            None,
-            "{replace}: held by its path"
-        );
-        assert_eq!(takes, replace + 1, "{replace}");
-    }
-    let (held, takes, _dir) = run(HOLD_TRIES);
-    let Err(refused) = held else {
-        panic!("replaced under every take, it was held");
-    };
-    assert_eq!(refused.kind(), io::ErrorKind::Other, "{refused}");
-    assert!(
-        refused
-            .to_string()
-            .contains("between the open and the take"),
-        "{refused}"
-    );
-    assert_eq!(takes, HOLD_TRIES);
+fn removing_the_pid_file_does_not_release_the_directory_owner() {
+    let dir = scratch("directory-pid");
+    let mut first = Notifier::new(cfg(&dir)).unwrap();
+    std::fs::remove_file(first.store.root.join(LOCK)).unwrap();
+    let refused = Notifier::new(cfg(&dir))
+        .err()
+        .expect("directory still owned");
+    assert_eq!(refused.kind(), io::ErrorKind::WouldBlock);
+    first
+        .charge(1_000)
+        .expect("PID file absence is not ownership loss");
+    drop(first);
+    assert_eq!(Notifier::new(cfg(&dir)).unwrap().stamps, [1_000]);
 }
 
-/// A file system that takes no lock ([`Store::judge_take`]) is refused, never taken as a take:
-/// the journal's one writer rests on the lock. NEGATIVE CONTROL: a take is taken, and another
-/// errno is passed up as it is.
 #[test]
 fn a_store_whose_file_system_takes_no_lock_is_refused() {
-    let store = Store {
-        root: PathBuf::from("/nowhere/notify"),
-    };
-    let unsupported = store
-        .judge_take(Err(std::fs::TryLockError::Error(io::Error::from(
-            io::ErrorKind::Unsupported,
-        ))))
-        .expect_err("no lock is no store");
+    let dir = scratch("directory-unsupported");
+    let store = Store::open(&dir).unwrap();
+    let judge = |taken| Store::judge_take_at(&store.root, &store.directory, taken);
+    let unsupported = judge(Err(std::fs::TryLockError::Error(io::Error::from(
+        io::ErrorKind::Unsupported,
+    ))))
+    .expect_err("no lock is no store");
     assert_eq!(unsupported.kind(), io::ErrorKind::Unsupported);
-    assert!(
-        unsupported
-            .to_string()
-            .contains("--state on a volume that locks"),
-        "{unsupported}"
-    );
-    store.judge_take(Ok(())).expect("CONTROL: a take");
-    let other = store
-        .judge_take(Err(std::fs::TryLockError::Error(
-            io::Error::from_raw_os_error(libc::EIO),
-        )))
-        .expect_err("CONTROL: another errno");
+    assert!(unsupported
+        .to_string()
+        .contains("--state on a volume that locks"));
+    judge(Ok(())).expect("actual take result");
+    let other = judge(Err(std::fs::TryLockError::Error(
+        io::Error::from_raw_os_error(libc::EIO),
+    )))
+    .expect_err("other errno preserved");
     assert_eq!(other.raw_os_error(), Some(libc::EIO));
 }
 
@@ -904,10 +730,11 @@ fn a_notifier_files_its_cursor_and_journal_under_the_log_it_read() {
         broker_a.log_identity().to_string(),
         "the root is the first log's"
     );
-    assert!(Store {
-        root: root.join("logs").join(broker_b.log_identity().to_string()),
-    }
-    .cursor("attention")
+    assert!(Store::<ReadOnly>::existing(
+        root.join("logs").join(broker_b.log_identity().to_string())
+    )
+    .unwrap()
+    .read_cursor("attention")
     .is_some());
     server_a.shutdown();
     server_b.shutdown();
@@ -1196,12 +1023,7 @@ fn a_readers_start_at_the_head_is_written_before_it_reads() {
     let dir = scratch("start");
     let (mut n, _) = appending(&dir, 100, "");
     n.take(Notice::Log(0, strict_log())).expect("log");
-    let on_media = |n: &Notifier| {
-        Store {
-            root: n.log_store.root.clone(),
-        }
-        .read_cursor(&key)
-    };
+    let on_media = |n: &Notifier| n.log_store.read_only().read_cursor(&key);
     let start = |n: &mut Notifier, head| {
         let (done, wrote) = mpsc::sync_channel(1);
         n.take(Notice::Start(0, head, done)).expect("take");
@@ -1713,11 +1535,10 @@ fn a_standing_value_never_reaches_the_media_ahead_of_its_selectors_cursor() {
         [1],
         "a crash that loses the owed cursor re-reads from 3, and pages nothing again"
     );
-    Store {
-        root: Path::new(&dir).join("notify"),
-    }
-    .put_cursor_at(&key, 2)
-    .expect("CONTROL: the cursor as it stood before the clear");
+    Store::open(&dir)
+        .expect("retired notifier store")
+        .put_cursor_at(&key, 2)
+        .expect("CONTROL: the cursor as it stood before the clear");
     assert_eq!(
         replay(2),
         [1, 2],
@@ -2512,7 +2333,6 @@ fn the_exec_stamps_tell_each_fresh_page_once_in_the_order_it_ran() {
     let (mut n, fired) = appending(&dir, 100, "");
     let path = n.store.root.join(EXEC_STAMPS);
     n.exec_stamps = Some(ExecStamps {
-        path: path.clone(),
         origin: Instant::now(),
         untold: None,
     });
@@ -5360,9 +5180,7 @@ fn argv_requires_a_watch_and_a_command() {
 #[test]
 fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
     let dir = crate::test_scratch_dir("carry-ref");
-    let from = Store {
-        root: dir.path().join("from"),
-    };
+    let from = Store::at(dir.path().join("from")).unwrap();
     std::fs::create_dir_all(from.root.join("cur")).unwrap();
     from.set_cursor("attention", 2).unwrap();
     from.set_cursor("ask-to.h-alice", 9).unwrap();
@@ -5374,13 +5192,17 @@ fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
     .unwrap();
     from.set_standing(&[("/f/f/pub/n-a/s-a/presence".into(), "help".into())])
         .unwrap();
-    let logs = dir.path().join("logs");
+    let logs_store = Store::at(dir.path().join("target"))
+        .unwrap()
+        .child("logs", true)
+        .unwrap();
+    let logs = logs_store.root.clone();
     let ordinary = logs.join("ordinary");
-    from.carry(&from, &ordinary, 6).unwrap();
-    let carried = Store { root: ordinary };
-    assert_eq!(carried.cursor("attention"), Some(2));
-    assert_eq!(carried.cursor("ask-to.h-alice"), Some(6));
-    assert_eq!(carried.cursor("ask-to.h-bob"), Some(4));
+    logs_store.carry(&from.read_only(), "ordinary", 6).unwrap();
+    let carried = Store::<ReadOnly>::existing(ordinary).unwrap();
+    assert_eq!(carried.read_cursor("attention"), Some(2));
+    assert_eq!(carried.read_cursor("ask-to.h-alice"), Some(6));
+    assert_eq!(carried.read_cursor("ask-to.h-bob"), Some(4));
     std::fs::create_dir_all(carried.root.join("cur")).unwrap();
     std::fs::write(carried.root.join("cur/attention.migrated"), "3\n").unwrap();
     std::os::unix::fs::symlink(
@@ -5388,15 +5210,21 @@ fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
         carried.root.join("cur/halt"),
     )
     .unwrap();
-    assert_eq!(carried.cursor("halt"), None, "a link is no cursor");
+    assert_eq!(carried.read_cursor("halt"), None, "a link is no cursor");
     std::fs::remove_dir_all(carried.root.join("cur")).unwrap();
-    assert_eq!(carried.journal(), ["1 fired rc=0"]);
-    assert_eq!(carried.standing(), from.standing());
-    let empty = Store {
-        root: dir.path().join("empty"),
-    };
+    assert_eq!(
+        carried
+            .read_verdicts()
+            .unwrap()
+            .lines
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["1 fired rc=0"]
+    );
+    assert_eq!(carried.read_verdicts().unwrap().standing, from.standing());
+    let empty = Store::at(dir.path().join("empty")).unwrap();
     std::fs::create_dir_all(&empty.root).unwrap();
-    empty.carry(&empty, &logs.join("empty"), 6).unwrap();
+    logs_store.carry(&empty.read_only(), "empty", 6).unwrap();
 
     let mut refused = Vec::new();
     for (n, bytes) in [b"not an offset".as_slice(), b"", b"\xff"]
@@ -5405,7 +5233,11 @@ fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
     {
         std::fs::write(from.root.join("cur/attention"), bytes).unwrap();
         let to = logs.join(format!("bad-cursor-{n}"));
-        let result = from.carry(&from, &to, 6);
+        let result = logs_store.carry(
+            &from.read_only(),
+            to.file_name().unwrap().to_str().unwrap(),
+            6,
+        );
         refused.push(
             result.is_err()
                 && !to.exists()
@@ -5417,7 +5249,11 @@ fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
     let to = logs.join("unreadable-journal");
-    let result = from.carry(&from, &to, 6);
+    let result = logs_store.carry(
+        &from.read_only(),
+        to.file_name().unwrap().to_str().unwrap(),
+        6,
+    );
     refused.push(result.is_err() && !to.exists() && path.is_dir());
     std::fs::remove_dir(&path).unwrap();
     from.set_journal(&[], Flush::Ordered).unwrap();
@@ -5433,7 +5269,11 @@ fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
     let path = from.root.join(JOURNAL_FILE);
     std::fs::write(&path, &damaged).unwrap();
     let to = logs.join("faulted-journal");
-    let result = from.carry(&from, &to, 6);
+    let result = logs_store.carry(
+        &from.read_only(),
+        to.file_name().unwrap().to_str().unwrap(),
+        6,
+    );
     refused.push(
         result.is_err()
             && !to.exists()
@@ -5455,9 +5295,7 @@ fn a_carry_refuses_incomplete_cursor_and_verdict_reads() {
 #[test]
 fn a_carry_reads_an_old_stores_unreadable_line_files_as_empty_and_leaves_them() {
     let dir = crate::test_scratch_dir("carry-lenient");
-    let from = Store {
-        root: dir.path().join("from"),
-    };
+    let from = Store::at(dir.path().join("from")).unwrap();
     std::fs::create_dir_all(from.root.join("cur")).unwrap();
     std::fs::write(from.root.join("cur/attention"), "9\n").unwrap();
     std::fs::write(
@@ -5477,13 +5315,33 @@ fn a_carry_reads_an_old_stores_unreadable_line_files_as_empty_and_leaves_them() 
         names
     };
     let before = names(&from.root);
-    let to = dir.path().join("logs").join("next");
-    from.carry(&from, &to, 6)
+    let logs_store = Store::at(dir.path().join("target"))
+        .unwrap()
+        .child("logs", true)
+        .unwrap();
+    let to = logs_store.root.join("next");
+    logs_store
+        .carry(
+            &from.read_only(),
+            to.file_name().unwrap().to_str().unwrap(),
+            6,
+        )
         .expect("an unreadable line file is read as empty");
-    let carried = Store { root: to };
-    assert_eq!(carried.cursor("attention"), Some(6));
-    assert_eq!(carried.journal(), ["1 fired on=attention rc=0 dup=0"]);
-    assert_eq!(carried.standing(), Vec::<(String, String)>::new());
+    let carried = Store::<ReadOnly>::existing(to).unwrap();
+    assert_eq!(carried.read_cursor("attention"), Some(6));
+    assert_eq!(
+        carried
+            .read_verdicts()
+            .unwrap()
+            .lines
+            .into_iter()
+            .collect::<Vec<_>>(),
+        ["1 fired on=attention rc=0 dup=0"]
+    );
+    assert_eq!(
+        carried.read_verdicts().unwrap().standing,
+        Vec::<(String, String)>::new()
+    );
     assert_eq!(names(&from.root), before, "the source is left as it was");
     assert_eq!(
         std::fs::read(from.root.join("rate")).unwrap(),
@@ -5498,18 +5356,34 @@ fn a_carry_reads_an_old_stores_unreadable_line_files_as_empty_and_leaves_them() 
 #[test]
 fn an_unreadable_standing_file_keeps_the_journals_standing_values() {
     let dir = crate::test_scratch_dir("carry-standing");
-    let from = Store {
-        root: dir.path().join("from"),
-    };
+    let from = Store::at(dir.path().join("from")).unwrap();
     std::fs::create_dir_all(from.root.join("cur")).unwrap();
     from.set_cursor("attention", 9).unwrap();
     let rows = vec![("/f/f1/pub/n-a/s-one/presence".to_owned(), "key".to_owned())];
     from.set_standing(&rows).unwrap();
     std::fs::create_dir(from.root.join(journal::STANDING)).unwrap();
     assert_eq!(from.standing(), rows);
-    let to = dir.path().join("logs").join("next");
-    from.carry(&from, &to, 6).expect("carry");
-    assert_eq!(Store { root: to }.standing(), rows, "the carry keeps them");
+    let logs_store = Store::at(dir.path().join("target"))
+        .unwrap()
+        .child("logs", true)
+        .unwrap();
+    let to = logs_store.root.join("next");
+    logs_store
+        .carry(
+            &from.read_only(),
+            to.file_name().unwrap().to_str().unwrap(),
+            6,
+        )
+        .expect("carry");
+    assert_eq!(
+        Store::<ReadOnly>::existing(to)
+            .unwrap()
+            .read_verdicts()
+            .unwrap()
+            .standing,
+        rows,
+        "the carry keeps them"
+    );
     assert!(from.root.join(journal::STANDING).is_dir(), "left as it was");
     assert_eq!(
         from.verdicts().unwrap().standing,
@@ -5539,27 +5413,34 @@ fn an_unreadable_standing_file_keeps_the_journals_standing_values() {
 #[test]
 fn a_carry_retires_only_its_exclusively_owned_stage() {
     let dir = crate::test_scratch_dir("carry-own");
-    let from = Store {
-        root: dir.path().join("from"),
-    };
+    let from = Store::at(dir.path().join("from")).unwrap();
     std::fs::create_dir_all(from.root.join("cur")).unwrap();
     from.set_cursor("attention", 2).unwrap();
-    let logs = dir.path().join("logs");
-    std::fs::create_dir(&logs).unwrap();
+    let logs_store = Store::at(dir.path().join("target"))
+        .unwrap()
+        .child("logs", true)
+        .unwrap();
+    let logs = logs_store.root.clone();
+
     let foreign = logs.join(format!(".carry-{}-0", std::process::id()));
     std::fs::create_dir(&foreign).unwrap();
     std::fs::write(foreign.join("owner"), b"standing owner").unwrap();
     let target = logs.join("landed");
-    from.carry(&from, &target, 6).unwrap();
-    assert_eq!(Store { root: target }.cursor("attention"), Some(2));
+    logs_store.carry(&from.read_only(), "landed", 6).unwrap();
+    assert_eq!(
+        Store::<ReadOnly>::existing(target)
+            .unwrap()
+            .read_cursor("attention"),
+        Some(2)
+    );
     let winner = logs.join("winner");
     std::fs::create_dir_all(winner.join("cur")).unwrap();
     std::fs::write(winner.join("cur/attention"), b"4").unwrap();
-    from.carry(&from, &winner, 6).unwrap();
+    logs_store.carry(&from.read_only(), "winner", 6).unwrap();
     assert_eq!(std::fs::read(winner.join("cur/attention")).unwrap(), b"4");
     let blocked = logs.join("blocked");
     std::fs::write(&blocked, b"do not replace").unwrap();
-    assert!(from.carry(&from, &blocked, 6).is_err());
+    assert!(logs_store.carry(&from.read_only(), "blocked", 6).is_err());
     assert_eq!(std::fs::read(&blocked).unwrap(), b"do not replace");
     assert_eq!(
         std::fs::read(foreign.join("owner")).unwrap(),
@@ -5761,7 +5642,7 @@ fn a_drop_flood_writes_bytes_in_proportion_to_its_drops() {
                     "{DROPS} drops (full={full}) wrote {wrote} bytes, past {bound}"
                 );
                 let tally = n.store.root.join(FLUSH_TALLY);
-                n.flush_tally = Some((tally.clone(), (u64::MAX, u64::MAX, u64::MAX)));
+                n.flush_tally = Some((u64::MAX, u64::MAX, u64::MAX));
                 n.tell();
                 let text = std::fs::read_to_string(&tally).expect("the tally");
                 assert!(

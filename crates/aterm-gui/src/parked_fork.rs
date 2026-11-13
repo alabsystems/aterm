@@ -21,12 +21,14 @@ pub(crate) struct ParkedChild {
 impl ParkedChild {
     /// Fork the child and return once it exists.
     ///
-    /// The fork holds the spawn lock (`aterm_uds::spawn_lock::spawning`) across itself alone, as
+    /// The fork holds the spawn lock (`aterm_uds::spawn_lock::handing`) across itself alone, as
     /// every spawn does, so the child copies no neighbour's descriptor between its creation and
-    /// its close-on-fork mark (`aterm_uds::kept_out`); the parked child holds nothing of it.
+    /// its close-on-fork mark (`aterm_uds::kept_out`); the parked child holds nothing of it. The
+    /// two pipe ends the child keeps (`forked`'s write end and `go`'s read end) lose their own
+    /// mark for this fork alone.
     pub(crate) fn fork() -> Self {
-        let (mut forked_r, forked_w) = std::io::pipe().expect("pipe");
-        let (go_r, go_w) = std::io::pipe().expect("pipe");
+        let (mut forked_r, forked_w) = aterm_uds::pipe().expect("pipe");
+        let (go_r, go_w) = aterm_uds::pipe().expect("pipe");
         let (forked_fd, go_fd, go_w_fd) =
             (forked_w.as_raw_fd(), go_r.as_raw_fd(), go_w.as_raw_fd());
         let spawner = std::thread::spawn(move || {
@@ -37,7 +39,7 @@ impl ParkedChild {
                 std::ptr::null(),
             ];
             let envp = [std::ptr::null()];
-            let spawning = aterm_uds::spawn_lock::spawning();
+            let spawning = aterm_uds::spawn_lock::handing(&[forked_fd, go_fd]);
             // SAFETY: the child branch runs only `parked`, which calls async-signal-safe
             // functions on descriptors and arrays made before the fork and never returns.
             let pid = unsafe { libc::fork() };

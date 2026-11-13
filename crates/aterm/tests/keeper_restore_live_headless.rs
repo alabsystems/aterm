@@ -10,11 +10,14 @@ use std::time::Duration;
 use aterm_update::recovery_ledger::{KeeperAtLaunch, Row, ledger_path, read_rows};
 
 use crate::keeper_world::{
-    GAP, HANG, Proc, Start, World, admitted, await_keeper, await_start, boot, keeper, keeper_cli,
-    keeper_code, keeper_reached, keeper_status, ledger_dir, world, world_saying,
+    GAP, HANG, Proc, Start, World, admitted, await_keeper, await_start, boot, keeper, keeper_code,
+    keeper_reached, keeper_status, ledger_dir, world, world_saying,
 };
 use crate::launch_isolation;
 use crate::live_ctl::{Ctl, fields};
+
+#[path = "keeper_restored_worker_live.rs"]
+mod restored_worker;
 
 /// The window's journal off: the negative control's seam (`keeper_link::journal_refusal`).
 const NO_JOURNAL_SEAM: &str = "ATERM_DEBUG_NO_CRASH_JOURNAL";
@@ -286,17 +289,9 @@ fn crash_and_recover(root: &Path, a: Proc, seams: &[(&str, &str)]) -> (Proc, Ctl
 /// test label.
 const JOB_LABEL_SEAM: &str = "ATERM_DEBUG_KEEPER_JOB_LABEL";
 
-/// Ends the job a launch submitted under a test label, whatever the test did.
-struct Job<'a> {
-    root: &'a Path,
-    label: String,
-}
-
-impl Drop for Job<'_> {
-    fn drop(&mut self) {
-        keeper_cli(self.root, &["stop", "--label", &self.label]);
-    }
-}
+#[path = "keeper_job_cleanup_tests.rs"]
+mod job_cleanup;
+use job_cleanup::Job;
 
 fn job_label(tag: &str) -> String {
     format!(
@@ -331,10 +326,7 @@ fn a_config_that_says_nothing_starts_the_keeper_and_survives_a_crash() {
     let world = world_saying("d", "");
     let root = world.0.clone();
     let label = job_label("default");
-    let _job = Job {
-        root: &root,
-        label: label.clone(),
-    };
+    let _job = Job::new(&label);
     let (a, sock) = boot(&root, "a", &[(JOB_LABEL_SEAM, &label)]);
     let mut last = String::new();
     let answered = aterm_spec::wait::within(crate::keeper_world::FIRST_EXEC_HANG, GAP, || {

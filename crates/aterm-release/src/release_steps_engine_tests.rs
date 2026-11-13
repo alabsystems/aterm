@@ -616,19 +616,10 @@ fn step_one_and_a_dry_run_judge_the_origins_ledger_and_a_synced_run_its_own() {
     assert_eq!(w.real(true).engine, w.copy());
 }
 
-/// THE FIRST REAL RUN OF A CLONE REACHES ITS INPUT JUDGMENT WITH AN ENGINE, AND A DRY RUN STILL
-/// MAKES NONE: step 1's input judgment seals the HEAD of the engine it hands its verifier
-/// children ([`crate::input_record::context`]), a step before the sync, so step 1's fetch of
-/// both origins ([`Backend::fetch`], here handed aterm's as a fleet refresh hands it) makes the
-/// release's copy from the engine's origin where the clone has none, as the named checkout's
-/// committer, and step 2 syncs it. With the sync its only maker, a clone that had never released
-/// ended its first real run at that seal (git: "cannot change to
-/// '<clone>/.git/aterm-release/.ubd/engine'") and needed a copy made by hand.
-/// NEGATIVE CONTROLS: before that fetch the same seal cannot be made; a dry run's fetch leaves
-/// no copy and seals the checkout it was named; and a copy that cannot be put in place ends
-/// step 1 COULD NOT RUN in the copy's own words.
+/// Dry and real preflight judge the same retained policy without an operational copy.
+/// A later Sync selects a new policy and therefore invalidates that input context.
 #[test]
-fn step_one_of_a_first_real_run_makes_the_engine_its_input_judgment_seals() {
+fn step_one_pins_one_engine_input_without_making_an_operational_copy() {
     let w = World::new();
     let tip = git_in(&w.repo, &["rev-parse", "HEAD"]);
     let step_one_fetch = |real: &mut Real| {
@@ -638,50 +629,61 @@ fn step_one_of_a_first_real_run_makes_the_engine_its_input_judgment_seals() {
         });
         Backend::fetch(real)
     };
-    // What the input judgment asks of the engine it was handed, as it asks it.
     let sealed = |real: &Real| {
-        crate::input_record::context(
-            &w.repo,
-            &real.engine,
-            "seal",
-            &aterm_uds::spawnfd::command("/usr/bin/true"),
-        )
+        let engine = real.input_engine()?;
+        let mut command = aterm_uds::spawnfd::command("/usr/bin/true");
+        publication_environment(&real.engine, &mut command);
+        engine.apply(&mut command);
+        crate::input_record::context(&w.repo, &engine, "seal", &command)
     };
 
     let mut dry = w.real(true);
     step_one_fetch(&mut dry).unwrap();
-    assert!(!w.copy().exists(), "a dry run makes no engine");
-    assert_eq!(dry.engine, w.shared);
-    sealed(&dry).unwrap();
+    assert!(!w.copy().exists());
+    let dry_policy = dry.origin_main.as_ref().unwrap().commit().to_owned();
+    assert_eq!(git_in(&w.shared, &["rev-parse", "HEAD"]), dry_policy);
+    let dry_context = sealed(&dry).unwrap();
 
+    // A named checkout's HEAD is not policy authority. Only its origin stayed unchanged.
+    git_in(
+        &w.shared,
+        &["commit", "--allow-empty", "-qm", "local source head"],
+    );
+    assert_ne!(git_in(&w.shared, &["rev-parse", "HEAD"]), dry_policy);
     let mut real = w.real(false);
-    assert_eq!(real.engine, w.copy(), "a real run's engine is its own");
-    assert!(
-        sealed(&real).is_err(),
-        "no engine yet: what ended a first run"
-    );
+    assert!(sealed(&real).is_err(), "no snapshot before the origin read");
     step_one_fetch(&mut real).unwrap();
-    assert_eq!(git_in(&w.copy(), &["rev-parse", "HEAD"]), w.origin_main());
-    assert_eq!(
-        git_in(&w.copy(), &["config", "user.email"]),
-        SHARED_EMAIL,
-        "made as the named checkout's committer"
+    assert!(
+        !w.copy().exists(),
+        "preflight no longer needs a copy made ahead of Sync"
     );
+    assert_eq!(real.origin_main.as_ref().unwrap().commit(), dry_policy);
     assert!(real.engine_unready().is_none());
     let first = sealed(&real).unwrap();
+    assert_eq!(
+        first, dry_context,
+        "same policy across the dry-to-real transition"
+    );
 
-    // Step 2 still brings the copy to its origin's main, which the next judgment then seals.
+    // Advancing the origin cannot silently replace the policy already selected for preflight.
     w.peer_lands_code("pub-next");
+    assert_eq!(sealed(&real).unwrap(), first);
     real.engine_sync().unwrap();
     assert_eq!(git_in(&w.copy(), &["rev-parse", "HEAD"]), w.origin_main());
-    assert_ne!(sealed(&real).unwrap(), first);
+    assert_eq!(git_in(&w.copy(), &["config", "user.email"]), SHARED_EMAIL);
+    assert_ne!(
+        sealed(&real).unwrap(),
+        first,
+        "Sync's new policy must be rejudged"
+    );
 
-    // A clone whose copy cannot be put in place: something that is no checkout is in its way.
+    // A blocked operational copy does not prevent read-only preflight; Sync still refuses.
     let blocked = World::new();
     std::fs::create_dir_all(blocked.copy().join("stray")).unwrap();
     let mut real = blocked.real(false);
-    let refused = step_one_fetch(&mut real).unwrap_err();
-    assert!(refused.could_not_run, "{refused:?}");
+    step_one_fetch(&mut real).unwrap();
+    assert!(real.input_engine().is_ok());
+    let refused = real.engine_sync().unwrap_err();
     assert!(
         refused
             .why

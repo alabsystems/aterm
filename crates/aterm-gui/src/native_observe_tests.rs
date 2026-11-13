@@ -1530,7 +1530,7 @@ fn a_member_that_forks_and_goes_while_its_group_is_read_leaves_the_group_live() 
             }
         }
     }
-    let (reader, mut writer) = std::io::pipe().expect("a pipe");
+    let (reader, mut writer) = aterm_uds::pipe().expect("a pipe");
     // The leader exits at once, leaving its member blocked on a line from the pipe (fd 3: an
     // asynchronous list's stdin is /dev/null); given one, the member starts a sleep in the group
     // and exits.

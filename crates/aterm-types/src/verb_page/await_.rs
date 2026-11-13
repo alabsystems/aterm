@@ -2,8 +2,8 @@
 // Copyright 2026 Andrew Yates
 
 //! `help await`: block until a condition holds. `aterm-gui`'s `control_session::cmd_await`
-//! parses the screen, agent, task and log kinds; inbox, sys, consent, momentum, wake and edit
-//! have their own readers. `aterm help sys wait` is the one reference for `await sys`.
+//! parses the screen, agent, task and log kinds; inbox, sys, consent, momentum, wake, edit and
+//! elsewhere have their own readers. `aterm help sys wait` is the one reference for `await sys`.
 
 use super::{Page, Section, para, row};
 
@@ -60,6 +60,10 @@ pub(crate) const PAGE: Page = Page {
         row(
             "await edit ticket=<t>|uri=<file-uri>",
             "an Editor tab's edit ends (owner)",
+        ),
+        row(
+            "await elsewhere",
+            "until the caller hangs up: `aterm ctl` holds it while another aterm serves its wait",
         ),
     ],
     options: &[

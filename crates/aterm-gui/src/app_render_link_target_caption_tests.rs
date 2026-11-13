@@ -880,12 +880,14 @@ fn a_link_scrolled_under_a_still_pointer_is_disclosed_by_the_frame() {
 #[cfg(unix)]
 #[test]
 fn a_stationary_pointer_event_under_mouse_tracking_takes_no_lock_and_reports_nothing() {
+    use std::os::fd::IntoRawFd;
     use std::sync::Arc;
 
     use aterm_session::sink::SinkWriter;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(
@@ -955,12 +957,14 @@ fn a_stationary_pointer_event_under_mouse_tracking_takes_no_lock_and_reports_not
 #[cfg(unix)]
 #[test]
 fn a_keyboard_focus_move_under_a_still_pointer_re_derives_the_cell_before_the_wheel_report() {
+    use std::os::fd::IntoRawFd;
     use std::sync::Arc;
 
     use aterm_session::sink::SinkWriter;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(

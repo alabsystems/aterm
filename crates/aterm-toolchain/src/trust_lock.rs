@@ -61,6 +61,21 @@ const MARK_FRESH: std::time::Duration = std::time::Duration::from_secs(3600);
 /// The store program a lock names builds of.
 pub const PROGRAM: &str = "trust";
 
+/// What puts Trust on a machine no published build serves, wherever the store's own readers say
+/// it (the shim hop, a pending stub, `which`, a rerouted tool): a local build of its own linked
+/// into the store, whose shims then run it, and which takes a lock's place as a dev link does in
+/// discovery.
+pub const LOCAL_SYSROOT_REMEDY: &str = "a locally built Trust sysroot links in with `aterm pkg \
+     link trust <sysroot> bin/trustc bin/targo …` (docs/LINUX-LOCAL-TOOLCHAIN.md)";
+
+/// [`LOCAL_SYSROOT_REMEDY`] where the reader takes `$TRUST_STAGE2_BIN`'s toolchain ahead of the
+/// store's (toolchain discovery, and an explicit lane's `targo`): there naming the local build's
+/// bin in that variable puts it in place too. A reader that never reads the variable says
+/// [`LOCAL_SYSROOT_REMEDY`].
+pub const LOCAL_SYSROOT_OR_STAGE2_REMEDY: &str = "a locally built Trust sysroot links in with \
+     `aterm pkg link trust <sysroot> bin/trustc bin/targo …`, or TRUST_STAGE2_BIN names its bin \
+     (docs/LINUX-LOCAL-TOOLCHAIN.md)";
+
 /// What a `trust.lock` says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TrustLock {
@@ -83,6 +98,11 @@ pub struct Found {
     pub path: PathBuf,
     /// What it says, or why it could not be read: a reader refuses rather than fall back.
     pub lock: Result<TrustLock, String>,
+    /// Why no published install of the lock's build can satisfy it on this machine's target, when
+    /// the store's signed manifests say so (atpkg's `trust_lock::found_for`): that build has no
+    /// pack for the target, or one with another tree. `None` from [`find`], which reads only the
+    /// file.
+    pub unpublished: Option<String>,
 }
 
 impl Found {
@@ -104,7 +124,11 @@ pub fn find(start: &Path) -> Option<Found> {
         let path = here.join(LOCK_FILE);
         if std::fs::symlink_metadata(&path).is_ok() {
             let lock = read(&path);
-            return Some(Found { path, lock });
+            return Some(Found {
+                path,
+                lock,
+                unpublished: None,
+            });
         }
         dir = here.parent();
     }
@@ -558,28 +582,41 @@ pub fn locked_build(prefix: &Path, lock: &TrustLock) -> LockedBuild {
 
 impl LockedBuild {
     /// Why a tree cannot compile with the lock's build here, with what to run; `None` when it can.
+    /// The act is the build's install, unless the store's signed manifests say no install serves
+    /// this target ([`Found::unpublished`]): then `local`, the local build the caller's own
+    /// resolution takes in the lock's place ([`LOCAL_SYSROOT_REMEDY`], or
+    /// [`LOCAL_SYSROOT_OR_STAGE2_REMEDY`] where it reads `TRUST_STAGE2_BIN` first).
     #[must_use]
-    pub fn refusal(&self, found: &Found, lock: &TrustLock) -> Option<String> {
+    pub fn refusal(&self, found: &Found, lock: &TrustLock, local: &str) -> Option<String> {
         let named = format!(
             "{} names Trust build {} (tree root {})",
             found.path.display(),
             lock.build,
             short(&lock.tree_root)
         );
-        let fix = format!("run `aterm pkg install trust --build {}`", lock.build);
+        let fix = |purpose: &str| match &found.unpublished {
+            None => format!(
+                "run `aterm pkg install trust --build {}`{purpose}",
+                lock.build
+            ),
+            Some(why) => format!("no published install of it serves this machine ({why}); {local}"),
+        };
         match self {
             Self::Present { .. } => None,
             Self::Absent => Some(format!(
-                "{named}, which this Mac's store does not hold: {fix}"
+                "{named}, which this machine's store does not hold: {}",
+                fix("")
             )),
             Self::Unrecorded => Some(format!(
-                "{named}; this Mac's store holds that build with no record of the tree its \
-                 install verified: {fix} to verify and record it"
+                "{named}; this machine's store holds that build with no record of the tree its \
+                 install verified: {}",
+                fix(" to verify and record it")
             )),
             Self::Mismatch { recorded } => Some(format!(
-                "{named}; this Mac's store holds that build number with tree root {}, another \
-                 build: {fix} to replace it",
-                short(recorded)
+                "{named}; this machine's store holds that build number with tree root {}, \
+                 another build: {}",
+                short(recorded),
+                fix(" to replace it")
             )),
         }
     }

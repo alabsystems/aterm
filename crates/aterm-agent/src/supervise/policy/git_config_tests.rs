@@ -18,20 +18,9 @@ impl Scratch {
 }
 
 fn git(dir: &Path, args: &[&str]) {
-    let mut cmd = Command::new(crate::test_program::git());
-    // The kept copy of Apple Git finds no `libexec/git-core` beside itself, so
-    // its scripted commands (`git submodule`) and init templates need the path
-    // named (`crate::test_program::git_exec_path`, as in repo_work's helper).
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Some(exec_path) = crate::test_program::git_exec_path() {
-        cmd.env("GIT_EXEC_PATH", exec_path);
-    }
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    if let Some(template_dir) = crate::test_program::git_template_dir() {
-        cmd.env("GIT_TEMPLATE_DIR", template_dir);
-    }
     let out = aterm_uds::deadline::output_until(
-        cmd.args(args)
+        crate::test_program::kept_git_command()
+            .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null"),
@@ -461,7 +450,7 @@ fn large_index(tag: &str, tail: usize) -> Scratch {
 #[test]
 fn a_large_index_is_read_whole() {
     let r = large_index("large-index", 60);
-    let mut cmd = Command::new(crate::test_program::git());
+    let mut cmd = crate::test_program::kept_git_command();
     cmd.args(["ls-files", "-z", "--stage", "-v"])
         .current_dir(r.0.path());
     let listed = aterm_uds::deadline::output_until_complete_stdout_with_limit(
@@ -935,7 +924,7 @@ fn what_only_git_config_reads_does_not_hide_the_effective_config() {
     let empty = r.0.path().join("empty.cfg");
     std::fs::write(&empty, "").unwrap();
     let hidden = aterm_uds::deadline::output_until(
-        Command::new(crate::test_program::git())
+        crate::test_program::kept_git_command()
             .args(["config", "--list"])
             .current_dir(r.0.path())
             .env("GIT_CONFIG", &empty),

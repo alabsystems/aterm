@@ -400,6 +400,7 @@ fn a_resume_line_keeps_root_and_child_flags_in_their_launch_scopes() {
 #[test]
 fn the_exit_is_decided_from_the_copy_alone() {
     let copy = |seen: Seen| Copy {
+        lifetime: None,
         pid: 4242,
         start: "s".to_string(),
         home: PathBuf::from("/h"),
@@ -449,6 +450,7 @@ fn the_exit_is_decided_from_the_copy_alone() {
 #[test]
 fn a_record_never_written_is_never_read_as_removed() {
     let copy = |pid: u32, start: &str, seen: Seen| Copy {
+        lifetime: None,
         pid,
         start: start.to_string(),
         home: PathBuf::from("/h"),
@@ -781,6 +783,23 @@ fn the_record_is_read_only_while_its_process_runs() {
     let resume = copy.resume.as_ref().expect("its own line validates");
     assert_eq!(resume.argv[0], sleep_s);
     assert_eq!(resume.codex_home.as_deref(), Some(home_s.as_ref()));
+    let lifetime = copy
+        .lifetime
+        .as_ref()
+        .expect("captured during this live read");
+    assert_eq!(lifetime.pid(), pid);
+    assert_eq!(
+        lifetime.observe(),
+        super::super::relaunch::ProcessLiveness::Alive
+    );
+    let last_live_copy = copy.clone();
+    let mut no_witness = copy.clone();
+    no_witness.lifetime = None;
+    assert_eq!(
+        super::super::relaunch::snapshot_of_copy("tab", &no_witness, resume, 0, None).lifetime,
+        None,
+        "the pure builder must not sample the still-live pid"
+    );
     assert_eq!(verdict(&copy, false), Verdict::Crash);
     std::fs::write(&path, vec![b' '; RECORD_MAX_BYTES as usize + 1]).expect("oversized record");
     let unreadable = read_copy(pid, &start, None).expect("live identity still vouched for");
@@ -804,6 +823,23 @@ fn the_record_is_read_only_while_its_process_runs() {
     let _ = child.kill();
     let _ = child.wait();
     assert_eq!(read_copy(pid, &start, None), None, "gone: nothing is read");
+    let lifetime = last_live_copy.lifetime.clone().unwrap();
+    assert_eq!(
+        lifetime.observe(),
+        super::super::relaunch::ProcessLiveness::Ended
+    );
+    let dead = super::super::relaunch::snapshot_of_copy(
+        "tab",
+        &last_live_copy,
+        last_live_copy.resume.as_ref().unwrap(),
+        0,
+        None,
+    );
+    assert_eq!(
+        dead.lifetime,
+        Some(lifetime),
+        "retain the original birth after exit"
+    );
 }
 
 #[test]

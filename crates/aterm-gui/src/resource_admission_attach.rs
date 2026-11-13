@@ -7,6 +7,7 @@ use aterm_uds::CtlStream;
 use std::{io, time::Instant};
 
 pub(crate) fn attach_accounted_expected(
+    native_job: bool,
     stream: &CtlStream,
     owner_authenticated: bool,
     deadline: Instant,
@@ -14,15 +15,29 @@ pub(crate) fn attach_accounted_expected(
     matches_backend: impl FnOnce(&std::os::fd::OwnedFd) -> io::Result<bool>,
     submit: impl FnOnce(AuthorizedSubmission, std::os::fd::OwnedFd) -> io::Result<()>,
 ) -> io::Result<()> {
-    let (authorized, expected) = transport::store_expectation::receive_submission(
-        stream,
-        owner_authenticated,
-        deadline,
-        authorize,
-        matches_backend,
-    )?;
+    let (authorized, expected) = if native_job {
+        transport::native_store::receive_submission(
+            stream,
+            owner_authenticated,
+            deadline,
+            authorize,
+            matches_backend,
+        )
+    } else {
+        transport::store_expectation::receive_submission(
+            stream,
+            owner_authenticated,
+            deadline,
+            authorize,
+            matches_backend,
+        )
+    }?;
     submit(authorized, expected)?;
-    transport::store_expectation::acknowledge(stream, deadline)
+    if native_job {
+        transport::native_store::acknowledge(stream, deadline)
+    } else {
+        transport::store_expectation::acknowledge(stream, deadline)
+    }
 }
 
 /// Dispatch after consuming exactly `resource-admission-v3 attach`. The

@@ -980,7 +980,10 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
         Some(glass),
     ) = (
         metric_u64(reply, "n_key_write"),
-        whole("key_write_p99_ms"),
+        reply_field(reply, "key_write_p99_ms")
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0),
         whole("max_term_wait_press_ms"),
         metric_u64(reply, "n_acquire"),
         whole("acquire_p99_ms"),
@@ -1008,13 +1011,17 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
         )));
     };
     let f = |name: &str| reply_field(reply, name);
-    let max_ms = |name: &str| {
-        reply_field(reply, name).parse::<f64>().map_err(|_| {
-            Miss::Fail(format!(
-                "gui smoke: a sampled slice published no {name}, so nothing can confirm or \
-                 refute its p99 [{reply}]"
-            ))
-        })
+    let max_ms = |source: &str, name: &str| {
+        reply_field(source, name)
+            .parse::<f64>()
+            .ok()
+            .filter(|value| value.is_finite() && *value >= 0.0)
+            .ok_or_else(|| {
+                Miss::Fail(format!(
+                    "gui smoke: a sampled slice published no {name}, so nothing can confirm or \
+                     refute its p99 [{source}]"
+                ))
+            })
     };
     let bar = |ms: u64| f64::from(u32::try_from(ms).unwrap_or(u32::MAX));
     let (Some(queue_unavailable), Some(write_unavailable)) = (
@@ -1070,15 +1077,16 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
         return Err(Miss::Fail(why.clone()));
     }
     let acquire_max = if n_acquire > 0 {
-        Some(max_ms("max_acquire_wait_ms")?)
+        Some(max_ms(reply, "max_acquire_wait_ms")?)
     } else {
         None
     };
     let glass_max = if n_present_glass > 0 {
-        Some(max_ms("max_present_glass_ms")?)
+        Some(max_ms(reply, "max_present_glass_ms")?)
     } else {
         None
     };
+    let key_write_max = max_ms(summary, "max_key_write_ms")?;
     if retries != 0 || drops != 0 {
         return Err(Miss::Fail(format!(
             "gui smoke: present retries/drops during frontmost typing — \
@@ -1100,7 +1108,9 @@ pub fn hardware_key_verdict(posted: u64, summary: &str, reply: &str) -> Result<S
              (>= {INPUT_PRESENT_CEILING_MS}) [{summary}]"
         )));
     }
-    if key_write > KEY_WRITE_P99_CEILING_MS {
+    // Histogram quantiles are bucket upper edges. A measured maximum below the ceiling
+    // disproves a breach even when that bucket straddles it.
+    if key_write_max > bar(KEY_WRITE_P99_CEILING_MS) && key_write > bar(KEY_WRITE_P99_CEILING_MS) {
         return Err(Miss::Breach(format!(
             "gui smoke: hardware key→write — p99 {key_write}ms (> {KEY_WRITE_P99_CEILING_MS}), \
              aterm's own dispatch with OS queue residence; press lock wait max {}ms, \

@@ -901,7 +901,10 @@ fn a_keyed_run_that_stops_before_the_index_leaves_the_ceremony() {
 
 #[test]
 fn a_keyed_box_with_no_channel_token_signs_nothing() {
-    let w = World::new("linux-no-token");
+    // The `gh` arm's token check, said outright; under agh the public writer is asked
+    // (`host_choice::linux_preflights_ask_the_host_under_agh`, check 7).
+    let mut w = World::new("linux-no-token");
+    w.fx.use_gh();
     std::fs::remove_file(&w.fx.ctx.tokens.channel).expect("rm token");
     let (r, _) = w.run(false);
     let e = r.expect_err("no token refuses");
@@ -919,9 +922,10 @@ fn a_keyed_box_with_no_channel_token_signs_nothing() {
 
 #[test]
 fn owed_uploads_with_no_channel_token_say_why_in_ready_md() {
-    // The default `Gh` host (§1 rule 16's third exception): READY.md's keyed, nothing-ready
-    // arm names the refusal that stopped the follow-up index.
-    let w = World::new("linux-no-token-owed");
+    // The `gh` host, said outright (§1 rule 16's third exception): READY.md's keyed,
+    // nothing-ready arm names the refusal that stopped the follow-up index.
+    let mut w = World::new("linux-no-token-owed");
+    w.fx.use_gh();
     w.fx.indexer.fail.store(true, Ordering::SeqCst);
     let _ = w.run(false);
     w.fx.indexer.fail.store(false, Ordering::SeqCst);
@@ -1299,7 +1303,10 @@ fn a_public_copy_that_is_not_the_signed_bytes_nor_their_prefix_publishes_no_inde
 
 #[test]
 fn a_real_run_needs_the_staging_token_and_a_dry_run_does_not() {
-    let w = World::new("linux-no-staging-token");
+    // The `gh` arm's token check, said outright; under agh the staging writer is asked
+    // (`host_choice::linux_preflights_ask_the_host_under_agh`, check 6).
+    let mut w = World::new("linux-no-staging-token");
+    w.fx.use_gh();
     std::fs::remove_file(&w.fx.ctx.tokens.staging).expect("rm token");
     let (r, _) = w.run(false);
     let e = r.expect_err("no staging identity");
@@ -1581,9 +1588,6 @@ mod host_choice {
     fn world(label: &str, choice: HostChoice) -> World {
         let mut w = World::new(label);
         w.fx.ctx = w.fx.ctx.clone().with_host_choice(choice);
-        for token in [&w.fx.ctx.tokens.staging, &w.fx.ctx.tokens.channel] {
-            std::fs::remove_file(token).expect("rm token");
-        }
         w
     }
 
@@ -1721,9 +1725,11 @@ mod host_choice {
         // READY.md, and the world's owners, read at run time so no owner is written here.
         let ceremony = |choice: HostChoice| {
             let label = format!("linux-ready-{}", choice.as_str());
-            // The default reads its token files, as M1 did; the agh choices read none.
+            // The `gh` arm reads its token files, as M1 did; the agh choices read none.
             let w = if choice == HostChoice::Gh {
-                World::new(&label)
+                let mut w = World::new(&label);
+                w.fx.use_gh();
+                w
             } else {
                 world(&label, choice)
             };

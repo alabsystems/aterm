@@ -146,7 +146,7 @@ fn the_whole_path_is_three_keys_and_the_hosts_no_is_todays_wait_row() {
     assert_eq!(reset_world(&mut off).chosen, [RESET_WAIT]);
     let off_presses: Vec<String> = off.presses().iter().map(|r| ungen(r)).collect();
     let arrow = format!(
-        "key if-gen=* if={} down",
+        "key if-human=0 if-gen=* if={} down",
         guard_of("   What do you want to do?")
     );
     assert_eq!(
@@ -155,7 +155,7 @@ fn the_whole_path_is_three_keys_and_the_hosts_no_is_todays_wait_row() {
             arrow.clone(),
             arrow,
             format!(
-                "key if-gen=* if={} enter",
+                "key if-human=0 if-gen=* if={} enter",
                 guard_of(&format!("   ❯ 3. {RESET_WAIT}"))
             ),
         ],
@@ -1276,7 +1276,7 @@ fn a_key_off_successor_escapes_a_reworded_consent_and_never_takes_its_yes() {
         assert_eq!(
             presses,
             [format!(
-                "key if-gen=* if={} enter",
+                "key if-human=0 if-gen=* if={} enter",
                 guard_of("   ❯ Continue with a refill")
             )],
             "{tag}: {:#?}",

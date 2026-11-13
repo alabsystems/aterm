@@ -48,15 +48,17 @@ aterm secrets: one credentials file for every machine (aterm help secrets).
                                          leaves the file; prints kept, or why not, per
                                          name, never a value
   aterm secrets need ls [--all] [--json] this machine's needs (a credential it lacks, asked
-                                         of the lab's Macs or a person), --all every request
-                                         in the lab's table; need <want> raises one by hand,
-                                         need retire <want|id> [--declined] [--note <text>]
-                                         withdraws or declines one, need pass runs this
-                                         machine's pass now (aterm secrets need --help)
+                                         of the lab's Macs), --all every request in the
+                                         lab's table; need <want> raises one by hand,
+                                         need retire <want|id> [--note <text>] withdraws
+                                         one, need pass runs this machine's pass now
+                                         (aterm secrets need --help)
   aterm secrets git-credential [--dev-user <login>] [--token-file <path> [--token-key <name>]] [<op>]
-                                         git's credential helper over ~/.secrets (or, for
-                                         the dev token, the file --token-file names and, in
-                                         it, the <name>= line --token-key names)
+                                         git's credential helper over the registry's gh:dev
+                                         and gh:release entries (or, for the dev token, the
+                                         file --token-file names and, in it, the <name>= line
+                                         --token-key names); one this Mac lacks is filed as a
+                                         need and git's request fails
   aterm secrets git-setup [--apply]    plan a local migration of known vault/native Git helpers
                                          to this protected development executable; --apply keeps
                                          exact private rollback files and refuses custom helpers
@@ -270,7 +272,7 @@ enum Command {
     Keep(Vec<String>),
     GitCredential {
         dev_user: Option<String>,
-        /// The dev token's file in place of `~/.secrets/gh_access_token` (absolute).
+        /// The dev token's file in place of the secrets registry's gh:dev entry (absolute).
         token_file: Option<std::path::PathBuf>,
         /// The `<name>=` line of `token_file` that holds the token.
         token_key: Option<String>,
@@ -1525,6 +1527,7 @@ mod unix {
         self, Approval, JoinEvent, JoinOptions, JoinOutcome, JoinPassword, Membership, Paths,
         Published, SyncOutcome,
     };
+    use crate::need::{GhProfile, Want};
     use crate::service::{self, Job};
     use crate::text::Audience;
     use crate::transport::{Source, describe};
@@ -2324,7 +2327,30 @@ mod unix {
                 Err(error) => format!("unknown ({error})"),
             };
         }
-        service_words(&user_state)
+        match job {
+            Job::Server => server_words(paths, &user_state),
+            Job::Subscriber => service_words(&user_state),
+        }
+    }
+
+    /// The server job's words: its state and, once installed, what the store its unit names
+    /// holds ([`super::served_by`], [`crate::server::held_vaults`]), read from the store, not asked
+    /// of the server, so a server that runs and serves nothing says so.
+    pub(super) fn server_words(paths: &Paths, state: &crate::Result<service::State>) -> String {
+        let words = service_words(state);
+        if !matches!(state, Ok(service::State::Installed { .. })) {
+            return words;
+        }
+        let Some((store, _)) = service::unit_argv(&paths.home, Job::Server)
+            .and_then(|argv| super::served_by(paths, argv.get(1..)?))
+        else {
+            return words;
+        };
+        match crate::server::held_vaults(&store) {
+            Ok(held) if held.is_empty() => format!("{words}, holds no vault"),
+            Ok(held) => format!("{words}, holds {}", held.join(", ")),
+            Err(error) => format!("{words}, its store unreadable ({error})"),
+        }
     }
 
     fn service_words(state: &crate::Result<service::State>) -> String {
@@ -3246,18 +3272,15 @@ mod unix {
     /// Why `secrets get` refuses a Claude Code token entry (DESIGN-claude-setup-token §4.2).
     pub(super) const CLAUDE_TOKEN_GET: &str = "a Claude Code token, which aterm hands only to Claude Code and never prints; aterm secrets ls --describe shows its state";
 
-    const DEV_TOKEN_FILE: &str = ".secrets/gh_access_token";
-    const RELEASE_TOKEN_FILE: &str = ".secrets/gh_access_token_alabsystems";
     const CREDENTIAL_QUIT: &[u8] = b"quit=1\n";
     const CREDENTIAL_INPUT_MAX: usize = 64 * 1024;
     const CREDENTIAL_TOKEN_MAX: usize = 4 * 1024;
-    const VAULT_RECORD_MAX: usize = 4 * 1024;
     const INIT_TOML_MAX: usize = 64 * 1024;
 
     /// Where `aterm secrets git-credential` reads the dev token.
     #[derive(Debug, Clone, Copy)]
     pub(super) enum DevToken<'a> {
-        /// The vault's `~/.secrets/gh_access_token`.
+        /// The secrets registry's `gh:dev` entry ([`registry_token`]).
         Vault,
         /// `--token-file`, the whole file or (`--token-key`) its `<key>=` line.
         File {
@@ -3266,10 +3289,42 @@ mod unix {
         },
     }
 
+    /// What [`git_credential_reply`] answers: the stdout bytes git reads, and the GitHub profile
+    /// the secrets registry could not give, which [`git_credential`] files in the need ledger.
+    pub(super) struct CredentialAnswer {
+        pub(super) reply: SecretBytes,
+        pub(super) missing: Option<GhProfile>,
+    }
+
+    impl CredentialAnswer {
+        fn reply(bytes: &[u8]) -> Self {
+            Self {
+                reply: SecretBytes::new(bytes.to_vec()),
+                missing: None,
+            }
+        }
+
+        fn token(username: &str, token: &SecretBytes) -> Self {
+            Self {
+                reply: format_credential_reply(username, token),
+                missing: None,
+            }
+        }
+
+        /// git stops on `quit=1`; the registry holds no usable `profile` token.
+        fn missing(profile: GhProfile) -> Self {
+            Self {
+                reply: SecretBytes::new(CREDENTIAL_QUIT.to_vec()),
+                missing: Some(profile),
+            }
+        }
+    }
+
     /// `aterm secrets git-credential [--dev-user <login>] [--token-file <path> [--token-key
-    /// <name>]] [<op>]`: git's credential helper over `~/.secrets`, the dev token read from
-    /// `dev`. Answers on `get` only; `store`, `erase` and unknown operations write nothing and
-    /// exit 0.
+    /// <name>]] [<op>]`: git's credential helper over the secrets registry's GitHub tokens, the
+    /// dev token read from `dev`. Answers on `get` only; `store`, `erase` and unknown operations
+    /// write nothing and exit 0. A token this Mac's registry does not give is filed in the need
+    /// ledger (`aterm secrets need gh:<profile>`) and git's request fails.
     fn git_credential(
         dev_user: Option<&str>,
         dev: &DevToken<'_>,
@@ -3277,50 +3332,73 @@ mod unix {
     ) -> crate::Result<ExitCode> {
         let stdin = std::io::stdin();
         let is_terminal = stdin.is_terminal();
-        let home = aterm_types::dirs::home_dir();
-        let xdg_config = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
-        let reply = git_credential_reply(
-            home.as_deref(),
-            xdg_config.as_deref(),
+        let paths = Paths::locate().ok();
+        let answer = git_credential_reply(
+            paths.as_ref(),
             dev_user,
             dev,
             operation,
             is_terminal,
             &mut stdin.lock(),
         );
-        if !reply.as_slice().is_empty() {
+        if !answer.reply.as_slice().is_empty() {
             let mut out = std::io::stdout().lock();
-            out.write_all(reply.as_slice())?;
+            out.write_all(answer.reply.as_slice())?;
             out.flush()?;
+        }
+        if let (Some(profile), Some(paths)) = (answer.missing, &paths) {
+            file_missing(paths, profile, &mut std::io::stderr().lock());
         }
         Ok(ExitCode::SUCCESS)
     }
 
-    /// Pure-input seam for [`git_credential`]: returns the exact stdout reply bytes, wiped on
-    /// drop (`SecretBytes`).
+    /// File the GitHub token git asked for and this Mac's registry lacks in the need ledger,
+    /// under the purpose of the agh identity it is (`agh.dev` or `agh.release`), so a repeat
+    /// request reuses that row, and say on `err` which want was filed and its request id.
+    pub(super) fn file_missing(paths: &Paths, profile: GhProfile, err: &mut dyn Write) {
+        let purpose = match profile {
+            GhProfile::Dev => crate::need::Purpose::AghDev,
+            GhProfile::Release => crate::need::Purpose::AghRelease,
+        };
+        let want = Want::Gh(profile);
+        let key = want.key();
+        let line = match crate::need::raise(paths, want, purpose) {
+            Ok(need) => format!(
+                "aterm secrets git-credential: this Mac holds no {key}; asked the lab's Macs (request {})",
+                aterm_codec::hex::encode_lower(&need.id)
+            ),
+            Err(why) => format!(
+                "aterm secrets git-credential: this Mac holds no {key}; the request was not filed: {why}"
+            ),
+        };
+        let _ = writeln!(err, "{line}");
+    }
+
+    /// Pure-input seam for [`git_credential`]: the exact stdout reply bytes, wiped on drop
+    /// (`SecretBytes`), and the profile to file a need for. Reads the registry under `paths`;
+    /// never writes.
     pub(super) fn git_credential_reply(
-        home: Option<&Path>,
-        xdg_config_home: Option<&Path>,
+        paths: Option<&Paths>,
         dev_user: Option<&str>,
         dev: &DevToken<'_>,
         operation: Option<&str>,
         is_terminal: bool,
         input: &mut dyn Read,
-    ) -> SecretBytes {
+    ) -> CredentialAnswer {
         if operation != Some("get") {
-            return SecretBytes::new(Vec::new());
+            return CredentialAnswer::reply(b"");
         }
         if is_terminal {
-            return SecretBytes::new(CREDENTIAL_QUIT.to_vec());
+            return CredentialAnswer::reply(CREDENTIAL_QUIT);
         }
         let Some(raw) = read_credential_attributes(input) else {
-            return SecretBytes::new(Vec::new());
+            return CredentialAnswer::reply(b"");
         };
         let Ok(text) = std::str::from_utf8(raw.as_slice()) else {
-            return SecretBytes::new(Vec::new());
+            return CredentialAnswer::reply(b"");
         };
         if text.contains('\0') {
-            return SecretBytes::new(Vec::new());
+            return CredentialAnswer::reply(b"");
         }
         let (mut protocol, mut host, mut username) = (None, None, None);
         for line in text.split('\n') {
@@ -3329,7 +3407,7 @@ mod unix {
                 break;
             }
             let Some((key, value)) = line.split_once('=') else {
-                return SecretBytes::new(Vec::new());
+                return CredentialAnswer::reply(b"");
             };
             match key {
                 "protocol" => protocol = Some(value),
@@ -3341,50 +3419,41 @@ mod unix {
         if !protocol.is_some_and(|p| p.eq_ignore_ascii_case("https"))
             || !host.is_some_and(is_github_credential_host)
         {
-            return SecretBytes::new(Vec::new());
+            return CredentialAnswer::reply(b"");
         }
-        let Some(home) = home else {
-            return SecretBytes::new(CREDENTIAL_QUIT.to_vec());
+        let Some(paths) = paths else {
+            return CredentialAnswer::reply(CREDENTIAL_QUIT);
         };
         let public = aterm_types::channel::PUBLIC_OWNER;
         if username.is_some_and(|u| u.eq_ignore_ascii_case(public)) {
-            return match read_credential_token(&home.join(RELEASE_TOKEN_FILE)) {
-                Some(token) => format_credential_reply(public, &token),
-                None => SecretBytes::new(CREDENTIAL_QUIT.to_vec()),
+            return match registry_token(paths, GhProfile::Release) {
+                Some(token) => CredentialAnswer::token(public, &token),
+                None => CredentialAnswer::missing(GhProfile::Release),
             };
         }
-        if username.is_none_or(|u| u.is_empty() || u.eq_ignore_ascii_case("x-access-token")) {
-            let Some(token) = read_dev_token(home, dev) else {
-                return SecretBytes::new(CREDENTIAL_QUIT.to_vec());
-            };
-            let out_user = match username.filter(|u| !u.is_empty()) {
+        let unnamed =
+            username.is_none_or(|u| u.is_empty() || u.eq_ignore_ascii_case("x-access-token"));
+        let requested = username.filter(|u| !u.is_empty());
+        let out_user = if unnamed {
+            match requested {
                 Some(explicit) => explicit.to_owned(),
-                None => known_dev_login(home, xdg_config_home, dev_user, Some(token.as_slice()))
+                None => known_dev_login(&paths.home, dev_user)
                     .unwrap_or_else(|| "x-access-token".to_owned()),
-            };
-            return format_credential_reply(&out_user, &token);
-        }
-        let requested = username.unwrap_or_default();
-        if !is_github_login(requested) {
-            return SecretBytes::new(Vec::new());
-        }
-        let token = read_dev_token(home, dev);
-        let known = known_dev_login(
-            home,
-            xdg_config_home,
-            dev_user,
-            token.as_ref().map(SecretBytes::as_slice),
-        );
-        if known
-            .as_deref()
-            .is_some_and(|login| login.eq_ignore_ascii_case(requested))
-        {
-            match token {
-                Some(token) => format_credential_reply(requested, &token),
-                None => SecretBytes::new(CREDENTIAL_QUIT.to_vec()),
             }
         } else {
-            SecretBytes::new(Vec::new())
+            let requested = requested.unwrap_or_default();
+            if !is_github_login(requested)
+                || !known_dev_login(&paths.home, dev_user)
+                    .is_some_and(|login| login.eq_ignore_ascii_case(requested))
+            {
+                return CredentialAnswer::reply(b"");
+            }
+            requested.to_owned()
+        };
+        match read_dev_token(paths, dev) {
+            Some(token) => CredentialAnswer::token(&out_user, &token),
+            None if matches!(dev, DevToken::Vault) => CredentialAnswer::missing(GhProfile::Dev),
+            None => CredentialAnswer::reply(CREDENTIAL_QUIT),
         }
     }
 
@@ -3455,12 +3524,26 @@ mod unix {
         graphic_token(raw.as_slice())
     }
 
-    /// The dev token `dev` names: the vault's file under `home`, or the `--token-file`, whole
-    /// or its `--token-key` line ([`crate::token_line::assigned`]); `None` where it is missing,
-    /// loose, symlinked, not one graphic token, or (a key) assigned other than once.
-    fn read_dev_token(home: &Path, dev: &DevToken<'_>) -> Option<SecretBytes> {
+    /// The `profile` token through the one resolution path: the secrets registry this Mac
+    /// applied names the entry ([`Want::entries`], [`crate::registry::read`]) and its file
+    /// lands where the registry's pointer says ([`crate::materialize::target_path`]). `None`
+    /// where the registry is unread, does not name it, or its file is missing, loose,
+    /// symlinked or not one graphic token.
+    fn registry_token(paths: &Paths, profile: GhProfile) -> Option<SecretBytes> {
+        let names = Want::Gh(profile).entries();
+        let registry = crate::registry::read(paths).ok()?;
+        let entry = registry.iter().find(|entry| names.contains(&entry.name))?;
+        let file = crate::materialize::target_path(&paths.home, &entry.name).ok()?;
+        read_credential_token(&file)
+    }
+
+    /// The dev token `dev` names: the registry's `gh:dev` entry ([`registry_token`]), or the
+    /// `--token-file`, whole or its `--token-key` line ([`crate::token_line::assigned`]); `None`
+    /// where it is missing, loose, symlinked, not one graphic token, or (a key) assigned other
+    /// than once.
+    fn read_dev_token(paths: &Paths, dev: &DevToken<'_>) -> Option<SecretBytes> {
         match dev {
-            DevToken::Vault => read_credential_token(&home.join(DEV_TOKEN_FILE)),
+            DevToken::Vault => registry_token(paths, GhProfile::Dev),
             DevToken::File { file, key: None } => read_credential_token(file),
             DevToken::File {
                 file,
@@ -3496,69 +3579,12 @@ mod unix {
         SecretBytes::new(out)
     }
 
-    fn known_dev_login(
-        home: &Path,
-        xdg_config_home: Option<&Path>,
-        explicit: Option<&str>,
-        loaded_token: Option<&[u8]>,
-    ) -> Option<String> {
-        if let Some(explicit) = explicit {
-            return Some(explicit.to_owned());
+    /// The dev login: `--dev-user`, else init.toml's `[github] account`.
+    fn known_dev_login(home: &Path, explicit: Option<&str>) -> Option<String> {
+        match explicit {
+            Some(explicit) => Some(explicit.to_owned()),
+            None => init_toml_github_account(home),
         }
-        if let Some(login) = agh_recorded_dev_login(home, xdg_config_home, loaded_token) {
-            return Some(login);
-        }
-        init_toml_github_account(home)
-    }
-
-    fn agh_recorded_dev_login(
-        home: &Path,
-        xdg_config_home: Option<&Path>,
-        loaded_token: Option<&[u8]>,
-    ) -> Option<String> {
-        let config_dir = match xdg_config_home.filter(|p| p.is_absolute()) {
-            Some(xdg) => xdg.join("aterm"),
-            None => home.join(".config").join("aterm"),
-        };
-        let bytes = fsx::read_owned(&config_dir.join("agh").join("vault.toml"), VAULT_RECORD_MAX)
-            .ok()
-            .flatten()?;
-        let text = std::str::from_utf8(&bytes).ok()?;
-        let Ok(aterm_toml::Value::Table(table)) = aterm_toml::from_str::<aterm_toml::Value>(text)
-        else {
-            return None;
-        };
-        let dev = table.get("dev").and_then(aterm_toml::Value::as_table)?;
-        let login = dev.get("login").and_then(aterm_toml::Value::as_str)?;
-        let fp = dev.get("fingerprint").and_then(aterm_toml::Value::as_str)?;
-        if !is_github_login(login)
-            || fp.len() != 12
-            || !fp
-                .bytes()
-                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
-        {
-            return None;
-        }
-        if let Some(token) = loaded_token
-            && fp.as_bytes() != agh_fingerprint(token)
-        {
-            return None;
-        }
-        Some(login.to_owned())
-    }
-
-    pub(super) fn agh_fingerprint(token: &[u8]) -> [u8; 12] {
-        let mut hasher = aterm_digest::Sha256::new();
-        hasher.update(b"agh/fp/v1\0");
-        hasher.update(token);
-        let digest = hasher.finalize();
-        const DIGITS: &[u8; 16] = b"0123456789abcdef";
-        let mut hex = [0u8; 12];
-        for (i, &byte) in digest[..6].iter().enumerate() {
-            hex[i * 2] = DIGITS[usize::from(byte >> 4)];
-            hex[i * 2 + 1] = DIGITS[usize::from(byte & 0x0f)];
-        }
-        hex
     }
 
     fn init_toml_github_account(home: &Path) -> Option<String> {

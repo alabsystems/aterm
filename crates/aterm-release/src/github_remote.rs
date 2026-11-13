@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use agh::git::{FetchBatch, GitRun};
@@ -48,6 +48,12 @@ pub(crate) struct Remote {
     slug: Slug,
     repo: PathBuf,
     named: Named,
+    catalog: Mutex<Option<TagCatalog>>,
+}
+
+struct TagCatalog {
+    inventory: BTreeMap<String, String>,
+    rendered: String,
 }
 
 /// Read recorded vault adoption and explicit agh configuration. No credential
@@ -184,6 +190,7 @@ impl Remote {
             slug,
             repo: repo.to_path_buf(),
             named,
+            catalog: Mutex::new(None),
         };
         // A listing does not otherwise inspect its caller's checkout. Admit its
         // actual source/config first, just as exact fetch does before importing.
@@ -247,12 +254,65 @@ impl Remote {
     }
 
     /// Tag inventory is useful even for a repository with no main branch.
+    /// Reuse only its immutable, successfully imported and peeled answer while its full raw
+    /// object closure is still here. Source admission and the full advertisement remain fresh
+    /// on every call, including one that reuses it.
     pub(crate) fn tag_catalog(&self) -> Result<String, String> {
+        self.run(GitRun::check_local(&self.slug, &self.repo))?;
         let tags = self.tag_inventory()?;
-        self.import_snapshot(tags.values().cloned())?;
-        let tags = self.peel_tags(tags)?;
+        let cached = self
+            .catalog
+            .lock()
+            .map_err(|_| "tag catalog cache lock is poisoned")?
+            .as_ref()
+            .filter(|cached| cached.inventory == tags)
+            .map(|cached| cached.rendered.clone());
+        let rendered = if let Some(cached) = cached
+            && self.catalog_present(&tags)
+        {
+            cached
+        } else {
+            self.import_snapshot(tags.values().cloned())?;
+            render_tags(self.peel_tags(tags.clone())?)
+        };
         self.ensure_origin()?;
-        Ok(render_tags(tags))
+        self.run(GitRun::check_local(&self.slug, &self.repo))?;
+        *self
+            .catalog
+            .lock()
+            .map_err(|_| "tag catalog cache lock is poisoned")? = Some(TagCatalog {
+            inventory: tags,
+            rendered: rendered.clone(),
+        });
+        Ok(rendered)
+    }
+
+    /// A cached catalog promised imported history, not just the tag and commit headers. Ignore
+    /// local history cutoffs and accelerators so a missing parent, tree or blob requests the
+    /// ordinary import again. A failed or nonempty observation proves no complete closure.
+    fn catalog_present(&self, tags: &BTreeMap<String, String>) -> bool {
+        let objects: BTreeSet<_> = tags.values().map(String::as_str).collect();
+        if objects.is_empty() {
+            return true;
+        }
+        let mut args = vec![
+            "-c",
+            "core.commitGraph=false",
+            "rev-list",
+            "--objects",
+            "--quiet",
+            "--missing=print",
+        ];
+        args.extend(objects);
+        args.push("--");
+        self.local_with_environment(
+            &args,
+            &[
+                ("GIT_GRAFT_FILE", "/dev/null"),
+                ("GIT_SHALLOW_FILE", "/dev/null"),
+            ],
+        )
+        .is_ok_and(|out| out.status.success() && out.stdout.is_empty())
     }
 
     /// Select before importing: a harness window needs one release's immutable
@@ -581,8 +641,17 @@ impl Remote {
     /// Git here reads or updates local metadata only. The explicit checkout,
     /// scrubbed Git context and disabled hooks cannot select a remote transport.
     fn local(&self, args: &[&str]) -> Result<std::process::Output, String> {
+        self.local_with_environment(args, &[])
+    }
+
+    fn local_with_environment(
+        &self,
+        args: &[&str],
+        environment: &[(&str, &str)],
+    ) -> Result<std::process::Output, String> {
         let mut command =
             crate::ledger::object_git(&self.repo).map_err(|error| error.to_string())?;
+        command.envs(environment.iter().copied());
         command.args(["-c", "core.hooksPath=/dev/null"]).args(args);
         let waiting_on = format!("local git {}", args.join(" "));
         aterm_uds::deadline::output_while_process_progressing_complete_stdout(

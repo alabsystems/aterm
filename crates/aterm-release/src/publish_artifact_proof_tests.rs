@@ -95,7 +95,6 @@ fn fixture(label: &str) -> (aterm_tempfile::TempDir, CutCtx) {
         kind: CutKind::DryRun,
         lease: None,
         fence: None,
-        notes_section: VERSION.to_string(),
         journal: None,
         adopted: false,
         linux: None,

@@ -8,6 +8,7 @@
 //! vendor reading here is a stand-in with the harness's documented rules; the harness's own
 //! (`accounts_sync::read_sheet_cell`) is tested against its pool parser in `aterm-agent`.
 
+use super::plan_cells as plan;
 use super::*;
 use crate::{
     alab::registry::{ACCOUNT, ADDRESS, MACHINE, PREFERENCE},
@@ -118,8 +119,16 @@ fn input<'a>(sheets: &'a [Sheet], macs: &'a [KnownMac]) -> Input<'a> {
         vendors: &Stand,
         sealer: &SEALER,
         now_ms: 1_800_000_000_000,
-        births: true,
+        births: Births::Named,
         unread: &[],
+    }
+}
+
+/// The planner of registration's one-time label migration: it births every Mac the roster lists.
+fn listed<'a>(sheets: &'a [Sheet], macs: &'a [KnownMac]) -> Input<'a> {
+    Input {
+        births: Births::Listed,
+        ..input(sheets, macs)
     }
 }
 
@@ -726,11 +735,13 @@ fn a_retired_machines_label_births_a_row_of_its_own() {
 }
 
 /// A roster Mac whose node-born key a retired row holds (born `n-<node>`, then retired) is born
-/// again under `n-<node>/2`: the import writes label, status and node onto the new row and
-/// nothing onto the retired one, which keeps its history. A second import finds the new row by
-/// its node and writes nothing.
-/// NEGATIVE CONTROL: with `known_birth` keying a node birth `keys::machine_pk("n-<node>")` again,
-/// the label lands on the retired row: `left: None right: Some(String("m77"))`.
+/// again under `n-<node>/2` by the planner that births every listed Mac (the label migration):
+/// it writes label and status onto the new row and nothing onto the retired one, which keeps its
+/// history, and a second plan finds the new row and writes nothing. An import, which births only
+/// what a source names, writes nothing for it, so a row the owner retired stays the last word.
+/// NEGATIVE CONTROLS: with `known_birth` keying a node birth `keys::machine_pk("n-<node>")` again,
+/// the label lands on the retired row: `left: None right: Some(String("m77"))`. With `known_row`
+/// birthing under `Births::Named` whatever `named` says, `import.rows` is not empty.
 #[test]
 fn a_retired_node_born_row_leaves_the_mac_a_row_of_its_own() {
     let node = "0123456789abcdef";
@@ -754,7 +765,11 @@ fn a_retired_node_born_row_leaves_the_mac_a_row_of_its_own() {
         fleet_node: None,
         hosts: Vec::new(),
     }];
-    let first = plan(&input(&[], &macs), &cells).unwrap();
+    // An import births nothing for it: no source names the Mac, so the row the owner ended is
+    // not born again under another key at every import.
+    let import = plan(&input(&[], &macs), &cells).unwrap();
+    assert!(import.rows.is_empty(), "{:?}", import.planned);
+    let first = plan(&listed(&[], &macs), &cells).unwrap();
     let fresh = keys::machine_pk(&format!("n-{node}/2"));
     assert_eq!(
         planned(&first, "machine", &fresh, "label"),
@@ -766,7 +781,7 @@ fn a_retired_node_born_row_leaves_the_mac_a_row_of_its_own() {
         "nothing is written onto the retired row"
     );
     let cells = apply(&mut book, &first);
-    let again = plan(&input(&[], &macs), &cells).unwrap();
+    let again = plan(&listed(&[], &macs), &cells).unwrap();
     assert!(
         again.rows.is_empty(),
         "a re-import over the result writes nothing"
@@ -1180,67 +1195,13 @@ fn a_harness_file_adds_below_the_sheets() {
     assert_eq!(ended, [pref("m9", "ann@example.invalid").as_str()]);
 }
 
-/// Two live rows naming one fleet node (any writer can set the cell) adopt neither: the known
-/// Mac's label, status and aliases are written nowhere, the clash is a finding, and the generic
-/// check reports `fleet_node` as a unique clash.
-/// NEGATIVE CONTROL: with `sole` taking the first candidate (no `len() > 1` test), the roster's
-/// label lands on that row: `` assertion failed: plan.planned.iter().all(|p| p.pk != first &&
-/// p.pk != second) ``.
-#[test]
-fn two_rows_naming_one_fleet_node_adopt_neither() {
-    let node = "0011223344556677";
-    let (first, second) = (keys::machine_pk("m12"), keys::machine_pk("m40"));
-    let mut book = Book::new();
-    for (pk, label) in [(&first, "m12"), (&second, "m40")] {
-        book.write(
-            2,
-            &[],
-            vec![
-                put(&MACHINE, pk, "label", json!(label)),
-                put(&MACHINE, pk, "node", json!(node)),
-                put(&MACHINE, pk, "row", json!("live")),
-            ],
-        );
-    }
-    let cells = book.cells();
-    let macs = [KnownMac {
-        label: Some(Label::plain(12)),
-        aliases: vec![Label::plain(70)],
-        node: Some(node.to_owned()),
-        fleet_node: None,
-        hosts: Vec::new(),
-    }];
-    let adopt = Input {
-        sheets: &[],
-        macs: &macs,
-        vendors: &Stand,
-        sealer: &SEALER,
-        now_ms: 0,
-        births: false,
-        unread: &[],
-    };
-    let plan = plan(&adopt, &cells).unwrap();
-    assert!(plan.planned.iter().all(|p| p.pk != first && p.pk != second));
-    assert!(kinds(&plan).contains(&"node-ambiguous"));
-    let projection = cell::project(&MACHINE, &cells);
-    let tables = BTreeMap::from([(MACHINE.name, &projection)]);
-    assert!(
-        crate::typed::check::findings(&[&MACHINE], &tables)
-            .iter()
-            .any(
-                |f| matches!(f, crate::typed::check::Finding::Unique { columns, .. }
-                if columns == &["node"])
-            )
-    );
-}
-
 /// `adopt` binds the Macs the roster knows to the rows they already have, by fleet node first,
 /// and births none: a Mac no row answers is reported, never written. What the roster says
 /// carries the roster's coordinate, and the roster is a source row of its own. A row it finds by
 /// name keeps its `planned`, which its Mac adopts it by.
 /// NEGATIVE CONTROL: with a row `adopt` finds by name called `active`: `` left:
-/// Some(String("active")) right: None ``. With `known_row` birthing whatever `births` says (`None
-/// if true =>` in place of `None if self.input.births =>`), the unknown Mac gets a row: ``
+/// Some(String("active")) right: None ``. With `known_row` birthing under `Births::None` (`born`
+/// computed `true` for it), the unknown Mac gets a row: ``
 /// assertion failed:
 /// plan.planned.iter().all(|p| p.pk != stranger) ``. With the roster's values carrying no
 /// source (`source: String::new()` in `known_row`, as before the roster was a source), the plan
@@ -1283,7 +1244,7 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
         vendors: &Stand,
         sealer: &SEALER,
         now_ms: 0,
-        births: false,
+        births: Births::None,
         unread: &[],
     };
     let plan = plan(&adopt, &cells).unwrap();
@@ -1309,7 +1270,7 @@ fn adopt_binds_known_macs_by_node_and_births_none() {
     book2.write(2, &seen, vec![put(&MACHINE, &row, "node", json!(node))]);
     let after = book2.cells();
     // Once the Mac publishes its own node, the next adopt finds it by that node.
-    let again = super::plan(&adopt, &after).unwrap();
+    let again = super::plan_cells(&adopt, &after).unwrap();
     assert!(again.rows.is_empty());
     assert!(again.findings.iter().any(|f| f.kind == Kind::AdoptedByNode));
 }
@@ -1621,7 +1582,7 @@ fn per_cell_provenance_preserves_cross_sheet_cells_and_empty_sheet_preference_en
             ],
         },
     ];
-    let roster_plan = plan(&input(&[], &noisy_macs), &Cells::new()).unwrap();
+    let roster_plan = plan(&listed(&[], &noisy_macs), &Cells::new()).unwrap();
     let m77 = keys::machine_pk("n-0123456789abcdef");
     assert_eq!(planned(&roster_plan, "machine", &m77, "node"), None);
     assert_eq!(

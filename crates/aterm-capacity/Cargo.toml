@@ -81,3 +81,9 @@ aterm-spec = { workspace = true }
 
 [lints]
 workspace = true
+
+# Native debug-only custody fixture; never an application or packaged executable.
+[[test]]
+name = "exec_status_bank"
+path = "tests/exec_status_bank.rs"
+harness = false

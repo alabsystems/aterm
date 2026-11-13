@@ -55,7 +55,7 @@ pub(super) fn spawn<'s>(
     use std::os::unix::fs::OpenOptionsExt as _;
     admit_request(cmd)?;
     let (program, args) = live.argv(cmd)?;
-    let (read, write) = io::pipe().map_err(|e| RunFailed::Spawn(e.to_string()))?;
+    let (read, write) = aterm_uds::pipe().map_err(|e| RunFailed::Spawn(e.to_string()))?;
     let open_log = || {
         let f = std::fs::OpenOptions::new()
             .append(true)

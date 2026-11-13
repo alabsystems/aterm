@@ -35,7 +35,12 @@ pub(crate) struct View {
     pub(crate) gone: BTreeSet<u64>,
     /// The log's identity, as `link log` names it.
     pub(crate) log: String,
+    /// The moves of the log's identity so far (another log's too): the model's `g`.
     pub(crate) generation: u64,
+    /// The logs set aside so far (`--retire-log`, ATERM-KI-1111-4): a slot whose record lay on
+    /// a log set aside since it opened is no longer followed, since what the model loses is a
+    /// power loss's, never a durable record, and the world's own laws judge the rest.
+    pub(crate) retired_logs: u64,
     /// Where the inbox group resumes.
     pub(crate) group_start: u64,
     pub(crate) alive: bool,
@@ -53,6 +58,8 @@ struct Slot {
     first: String,
     later: Option<String>,
     gen0: u64,
+    /// The logs set aside when it opened ([`View::retired_logs`]).
+    retired0: u64,
     lost: bool,
     /// The model states this slot can be in.
     states: Vec<State>,
@@ -90,6 +97,8 @@ pub(crate) struct Tap {
     pub(crate) checked: u64,
     /// Slots opened.
     pub(crate) opened: u64,
+    /// Steps of [`Tap::checked`] of a slot opened after a log was set aside ([`Slot::retired0`]).
+    pub(crate) checked_past_a_retire: u64,
     /// Which model actions the world's steps were explained by, at least once.
     pub(crate) fired: BTreeSet<&'static str>,
 }
@@ -114,12 +123,16 @@ impl Tap {
             violations: Vec::new(),
             checked: 0,
             opened: 0,
+            checked_past_a_retire: 0,
             fired: BTreeSet::new(),
         }
     }
 
     fn project(&self, slot: &mut Slot, view: &View, markers: &BTreeSet<String>) -> Option<Key> {
         let session = view.sessions.get(&slot.sid)?;
+        if view.retired_logs != slot.retired0 {
+            return None;
+        }
         let at = usize::try_from(slot.off).ok()?;
         let elsewhere = |text: &String| {
             view.records
@@ -244,6 +257,7 @@ impl Tap {
                     first: text.clone(),
                     later: None,
                     gen0: view.generation,
+                    retired0: view.retired_logs,
                     lost: false,
                     states: initial(&self.model),
                     last: None,
@@ -262,6 +276,9 @@ impl Tap {
                     Some(want) if slot.last == Some(want) => {}
                     Some(want) => {
                         self.checked += 1;
+                        if slot.retired0 > 0 {
+                            self.checked_past_a_retire += 1;
+                        }
                         match self.reach(&slot.states, want) {
                             Some((states, path)) => {
                                 self.fired.extend(path);

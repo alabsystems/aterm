@@ -6,7 +6,9 @@
 //! runs the swarm lease's step (`sync.steward.lease`). Only the ALab vault ([`alab_vault`]) and
 //! only an admin: a personal vault is never stewarded, and a member's pass reads that it is no
 //! steward and writes nothing. The vault server step (`sync.steward.server.standby`) is any
-//! active ALab member's whose vault is at a URL. ALab Commons is founded by `sync.shared-data`
+//! active ALab member's whose vault is at a URL, on macOS ([`MEMBER_SERVER_FOUND`]); elsewhere
+//! it removes the member server an earlier release installed ([`stale_member_server`]), whether
+//! or not this machine takes part in the swarm. ALab Commons is founded by `sync.shared-data`
 //! ([`commons_foundable`]), on an open vault's only admin. A fleet's first secret is no
 //! steward's: a person's `aterm fleet init` and `aterm fleet publish` mint and publish it
 //! (`sync.steward.fleet` retired, `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1, F17).
@@ -50,9 +52,6 @@ pub enum Stewardship {
     /// It is not: why (no vault, a vault not ALab's, this Mac's vault sync turned off by the
     /// person, no admin key here, no copy applied yet).
     No(String),
-    /// A vault pass is applying on this Mac now, so its copy is not read: why. The next pass
-    /// reads it once that one ends.
-    Busy(String),
     /// It holds the ALab vault's admin key.
     Steward {
         /// The vault publishes the default fleet's code ([`fleet::FLEET_CODE_ENTRY`]).
@@ -63,13 +62,45 @@ pub enum Stewardship {
 /// Read, writing nothing and fetching nothing, whether this Mac is the ALab steward and what the
 /// vault it applied last carries: the admin text of the local signed copy, decrypted with this
 /// Mac's identity file where its admin locker is addressed to it. A Mac whose person turned its
-/// vault sync off (`aterm secrets agent off`) is no steward while that record stands.
+/// vault sync off (`aterm secrets agent off`) is no steward while that record stands. A vault
+/// pass holding the state lock is waited for ([`StateLock::observe_judging`]).
 ///
 /// # Errors
-/// A vault pass is applying on this Mac now, or the local state, the signed copy or the admin
-/// locker cannot be read.
+/// That pass held the lock through the whole wait for it ([`crate::ErrorKind::VaultBusy`]), or the
+/// local state, the signed copy or the admin locker cannot be read.
 pub fn stewardship(paths: &Paths) -> crate::Result<Stewardship> {
-    let no = |why: &str| Ok(Stewardship::No(why.to_owned()));
+    Ok(match steward_copy(paths)? {
+        Err(why) => Stewardship::No(why),
+        Ok(copy) => Stewardship::Steward {
+            fleet_code: copy
+                .text
+                .doc
+                .entry(&Audience::Everyone, fleet::FLEET_CODE_ENTRY)
+                .is_some(),
+        },
+    })
+}
+
+/// This Mac's applied ALab copy as its steward reads it ([`steward_copy`]).
+struct StewardCopy {
+    /// The configured vault.
+    config: Config,
+    /// The copy's admin text.
+    text: admin_keys::AdminText,
+    /// The observation the copy was read under (`None` where no lock file is there), which a
+    /// reader keeps while it reads more of that copy.
+    observation: Option<StateLock>,
+}
+
+/// The read behind [`stewardship`] and each steward step: `Err(why)` where this Mac is no
+/// steward ([`Stewardship::No`]'s reasons), else its copy, read under one observation of its
+/// state. A vault pass holding the state lock is waited for ([`StateLock::observe_judging`]).
+///
+/// # Errors
+/// That pass held the lock through the whole wait for it ([`crate::ErrorKind::VaultBusy`]), or the
+/// local state, the signed copy or the admin locker cannot be read.
+fn steward_copy(paths: &Paths) -> crate::Result<Result<StewardCopy, String>> {
+    let no = |why: &str| Ok(Err(why.to_owned()));
     let Some(config) = config(paths)? else {
         return no("no vault is configured");
     };
@@ -84,24 +115,33 @@ pub fn stewardship(paths: &Paths) -> crate::Result<Stewardship> {
     if read_identity(paths)?.is_none() || fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
         return no(&no_copy_applied());
     }
-    let lock = StateLock::observe(paths)?;
-    if lock.is_none() && fsx::kind(&paths.lock_file())? != fsx::Kind::Missing {
-        return Ok(Stewardship::Busy(
-            "a vault pass is applying on this machine now: the steward reads the vault once it \
-             ends"
-                .to_owned(),
-        ));
-    }
+    let observation = steward_observation(paths)?;
     let state = load_state(paths)?;
     let Some(text) = admin_text_here(paths, &config, &state)? else {
         return no(&no_admin_key());
     };
-    Ok(Stewardship::Steward {
-        fleet_code: text
-            .doc
-            .entry(&Audience::Everyone, fleet::FLEET_CODE_ENTRY)
-            .is_some(),
-    })
+    Ok(Ok(StewardCopy {
+        config,
+        text,
+        observation,
+    }))
+}
+
+/// The steward's observation of this Mac's applied copy, held while it reads that copy: a vault
+/// pass holding the state lock is waited for ([`StateLock::observe_judging`]). `None` where no
+/// lock file is there.
+///
+/// # Errors
+/// That pass still held the lock at the end of the wait ([`writer_outlasted_wait`]), or the lock
+/// cannot be read.
+fn steward_observation(paths: &Paths) -> crate::Result<Option<StateLock>> {
+    match StateLock::observe_judging(paths)? {
+        StateObservation::Held(lock) => Ok(Some(lock)),
+        StateObservation::Absent => Ok(None),
+        StateObservation::Busy => Err(writer_outlasted_wait(
+            "the steward reads the vault once it ends",
+        )),
+    }
 }
 
 /// What the ALab steward's revoke-repair step (`sync.steward.revoke`) finds or did
@@ -129,32 +169,17 @@ pub enum StewardRevoke {
 /// removes, and an admin's steward carries it into `[machines]`).
 ///
 /// # Errors
-/// A vault pass is applying on this Mac now, or local state, the signed copy, the admin locker,
+/// A vault pass on this Mac held its state lock through the whole wait for it
+/// ([`writer_outlasted_wait`]), or local state, the signed copy, the admin locker,
 /// `aterm-swarm-roster`, or `ai-pool.toml` cannot be read.
 pub fn steward_revoke_check(paths: &Paths) -> crate::Result<StewardRevoke> {
-    let idle = |why: &str| Ok(StewardRevoke::Idle(why.to_owned()));
-    let Some(config) = config(paths)? else {
-        return idle("no vault is configured");
-    };
-    if !alab_vault(&config) {
-        return idle("the configured vault is not ALab's, and no other vault is stewarded");
-    }
-    if crate::service::subscriber_turned_off(&paths.home) {
-        return idle(&sync_turned_off());
-    }
-    if read_identity(paths)?.is_none() || fsx::kind(&paths.cache_file())? == fsx::Kind::Missing {
-        return idle(&no_copy_applied());
-    }
-    let lock = StateLock::observe(paths)?;
-    if lock.is_none() && fsx::kind(&paths.lock_file())? != fsx::Kind::Missing {
-        return Err(Error::new(
-            "a vault pass is applying on this machine now: the steward reads the vault once it \
-             ends",
-        ));
-    }
-    let state = load_state(paths)?;
-    let Some(text) = admin_text_here(paths, &config, &state)? else {
-        return idle(&no_admin_key());
+    let StewardCopy {
+        config,
+        text,
+        observation: _observation,
+    } = match steward_copy(paths)? {
+        Ok(copy) => copy,
+        Err(why) => return Ok(StewardRevoke::Idle(why)),
     };
     let mut candidate = text.doc.clone();
     let local_log = super::log_entries::trusted_local_log(paths, &config)?;
@@ -227,11 +252,11 @@ fn remove_log_revoked_machines(
 /// publish (`sync.steward.revoke` apply, `DESIGN-alab-swarm` §7.6).
 ///
 /// # Errors
-/// Vault read, roster/pool parse, or publication fails.
+/// A vault pass on this Mac held its state lock through the whole wait for it
+/// ([`crate::ErrorKind::VaultBusy`]), or the vault read, roster/pool parse, or publication fails.
 pub fn steward_finish_revokes(paths: &Paths) -> crate::Result<StewardRevoke> {
     match stewardship(paths)? {
         Stewardship::No(why) => return Ok(StewardRevoke::Idle(why)),
-        Stewardship::Busy(why) => return Err(Error::new(why)),
         Stewardship::Steward { .. } => {}
     }
     let mirrored = super::log_entries::admin_mirror_log(paths, &[])
@@ -758,27 +783,36 @@ pub(crate) enum AlabRoleObservation {
 
 /// Observe role eligibility without fetching, repairing, or provisioning identity. Negative
 /// signed evidence is read before apply-health gates so a failed apply cannot hide removal.
+/// A vault pass holding the state lock is not waited for: the running server's poll keeps a
+/// role it holds through one ([`AlabRoleObservation::Unavailable`]).
 pub(crate) fn observe_alab_role(paths: &Paths) -> AlabRoleObservation {
     observe_alab_role_with(paths, || {})
 }
 
 fn observe_alab_role_with(paths: &Paths, before_recheck: impl FnOnce()) -> AlabRoleObservation {
-    observe_alab_member_with(paths, true, before_recheck)
+    match observe_alab_member_with(paths, true, OnWriter::Answer, before_recheck) {
+        Ok(observed) => observed,
+        // A read that does not wait never meets the end of a wait.
+        Err(_) => AlabRoleObservation::Unavailable(None),
+    }
 }
 
 // Both process roles and automatic installation require the same current membership
 // evidence. Only an explicitly running server may synthesize a discovery-only name.
+// `on_writer` says how it meets a vault pass holding the state lock; only a wait errs, where
+// the pass outlasts it.
 fn observe_alab_member_with(
     paths: &Paths,
     allow_bootstrap_label: bool,
+    on_writer: OnWriter,
     before_recheck: impl FnOnce(),
-) -> AlabRoleObservation {
-    let observed = observe_alab_role_inner(paths, allow_bootstrap_label);
+) -> crate::Result<AlabRoleObservation> {
+    let observed = observe_alab_role_inner(paths, allow_bootstrap_label, on_writer)?;
     let context = match &observed {
         AlabRoleObservation::Allowed { context, .. }
         | AlabRoleObservation::Unavailable(Some(context))
         | AlabRoleObservation::Unjudged(context) => context,
-        _ => return observed,
+        _ => return Ok(observed),
     };
     before_recheck();
     let current = super::config(paths).ok().flatten().and_then(|config| {
@@ -791,37 +825,41 @@ fn observe_alab_member_with(
             })
     });
     if current.as_ref() == Some(context) {
-        observed
+        Ok(observed)
     } else {
-        AlabRoleObservation::Unavailable(None)
+        Ok(AlabRoleObservation::Unavailable(None))
     }
 }
 
-fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRoleObservation {
+fn observe_alab_role_inner(
+    paths: &Paths,
+    allow_bootstrap_label: bool,
+    on_writer: OnWriter,
+) -> crate::Result<AlabRoleObservation> {
     use AlabRoleObservation::{Allowed, Denied, Missing, NotApplicable, Unavailable, Unjudged};
     let config = match super::config(paths) {
         Ok(Some(config)) => config,
-        Ok(None) => return Missing,
-        Err(_) => return Unavailable(None),
+        Ok(None) => return Ok(Missing),
+        Err(_) => return Ok(Unavailable(None)),
     };
     if !config
         .signer
         .is_some_and(|signer| Retired::compiled().lineage(&signer, &config.followed))
     {
-        return NotApplicable;
+        return Ok(NotApplicable);
     }
     if !alab_vault(&config) || !pin_admitted(&config, None) {
-        return Denied;
+        return Ok(Denied);
     }
     let state = load_state(paths);
     if state
         .as_ref()
         .is_ok_and(|state| state.membership == Stored::Revoked)
     {
-        return Denied;
+        return Ok(Denied);
     }
     let Ok(Some(identity)) = read_identity(paths) else {
-        return Unavailable(None);
+        return Ok(Unavailable(None));
     };
     let context = AlabRoleContext {
         configuration: super::network_observation::configuration_binding(&config),
@@ -864,14 +902,26 @@ fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRo
             Err(_) => Denied,
         }
     };
-    // Keep one shared observation through label resolution. Contention with an apply
-    // is unavailable evidence, not an authenticated reason to withdraw a retained role.
-    let role_lock = match StateLock::observe_classified(paths) {
+    // Keep one shared observation through label resolution. To the server's poll, contention
+    // with an apply is unavailable evidence, not an authenticated reason to withdraw a retained
+    // role; a gate waits the apply out, and one that outlasts the wait judges nothing.
+    let role_lock = match on_writer {
+        OnWriter::Answer => StateLock::observe_classified(paths),
+        OnWriter::Wait => StateLock::observe_judging(paths),
+    };
+    let role_lock = match role_lock {
         Ok(StateObservation::Held(lock)) => lock,
+        Ok(StateObservation::Busy) if matches!(on_writer, OnWriter::Wait) => {
+            return Err(writer_outlasted_wait(
+                "this Mac's ALab membership is judged once it ends",
+            ));
+        }
         Ok(StateObservation::Absent | StateObservation::Busy) | Err(_) => {
             // Negative evidence remains useful during contention. Its absence or an
             // unreadable snapshot grants no new authority and preserves only a held role.
-            return denial_or_unavailable(local_recipient_judgement(&Reads::new(paths)));
+            return Ok(denial_or_unavailable(local_recipient_judgement(
+                &Reads::new(paths),
+            )));
         }
     };
     let state = load_state(paths);
@@ -879,17 +929,17 @@ fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRo
         .as_ref()
         .is_ok_and(|state| state.membership == Stored::Revoked)
     {
-        return Denied;
+        return Ok(Denied);
     }
     // Use the same handoff-aware, causally ordered denial view as admission. This is
     // independent of successful materialization and therefore precedes its health gates.
     match local_recipient_judgement_held(paths, &role_lock) {
-        Ok(Judgement::Denied) => return Denied,
+        Ok(Judgement::Denied) => return Ok(Denied),
         Ok(Judgement::Clear) => {}
-        partial => return denial_or_unavailable(partial),
+        partial => return Ok(denial_or_unavailable(partial)),
     }
     let Ok(state) = state else {
-        return unavailable();
+        return Ok(unavailable());
     };
     let log_intact = state.seq == 0 && super::log_only_intact(paths, &config, &state);
     if state.membership != Stored::In
@@ -899,18 +949,18 @@ fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRo
         || ((!source_bound(&config, &state) || held_copy(paths, &config, &state).is_none())
             && !log_intact)
     {
-        return unavailable();
+        return Ok(unavailable());
     }
     let Ok(custody) = log_entries::authenticated_custody(paths, &config, &state) else {
-        return unavailable();
+        return Ok(unavailable());
     };
     if !log_entries::applied_log_available(&state, custody.as_ref().map(|(_, digest)| *digest)) {
         // Missing applied records cannot establish a new role from an older envelope.
         // ServeRole may retain its existing role only under this unchanged context.
-        return unavailable();
+        return Ok(unavailable());
     }
     let Ok(mut own_label) = resolve_member_own_label(paths, &config) else {
-        return unavailable();
+        return Ok(unavailable());
     };
     if allow_bootstrap_label && own_label.is_none() && config.host == crate::alab_advertised() {
         // Legacy first holders can have the reserved alias as their configured host and no
@@ -921,7 +971,7 @@ fn observe_alab_role_inner(paths: &Paths, allow_bootstrap_label: bool) -> AlabRo
             super::join_code(&identity.recipient())
         ));
     }
-    Allowed { context, own_label }
+    Ok(Allowed { context, own_label })
 }
 
 /// Outcome of the ALab steward lease step (`sync.steward.lease`, `DESIGN-alab-swarm` §3.4, §8.3).
@@ -988,7 +1038,8 @@ fn expire_denied_lease_holder(
 /// over `aterm-swarm-lease` (`sync.steward.lease` probe).
 ///
 /// # Errors
-/// A vault pass is applying on this Mac now, or local state, the signed copy, the admin locker,
+/// A vault pass on this Mac held its state lock through the whole wait for it
+/// ([`crate::ErrorKind::VaultBusy`]), or local state, the signed copy, the admin locker,
 /// `aterm-swarm-policy`, or `aterm-swarm-lease` cannot be read.
 pub fn steward_lease_check(
     paths: &Paths,
@@ -996,15 +1047,10 @@ pub fn steward_lease_check(
     now_secs: u64,
 ) -> crate::Result<StewardLease> {
     let idle = |why: &str| Ok(StewardLease::Idle(why.to_owned()));
-    if let Stewardship::No(why) = stewardship(paths)? {
-        return Ok(StewardLease::Idle(why));
-    }
-    let Some(config) = super::config(paths)? else {
-        return idle("no vault is configured");
-    };
-    let state = load_state(paths)?;
-    let Some(text) = admin_text_here(paths, &config, &state)? else {
-        return idle(&no_admin_key());
+    // The copy's observation ends here, before the lease's reads of other records.
+    let text = match steward_copy(paths)? {
+        Ok(copy) => copy.text,
+        Err(why) => return Ok(StewardLease::Idle(why)),
     };
     let Some(policy) = crate::swarm_roster::SwarmPolicy::from_document(&text.doc)? else {
         return idle("no aterm-swarm-policy is published in the vault yet");
@@ -1062,7 +1108,8 @@ pub fn steward_lease_check(
 /// winner's lease stands cleanly (`SingleCurrentLeaseEpoch`).
 ///
 /// # Errors
-/// Vault read, policy/lease parse, or publication fails.
+/// A vault pass on this Mac held its state lock through the whole wait for it
+/// ([`crate::ErrorKind::VaultBusy`]), or the vault read, policy/lease parse, or publication fails.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -1170,11 +1217,103 @@ pub fn steward_ensure_lease(
 /// Minimum release carrying F6 and F7 (`DESIGN-fluid-swarm` §4.1 F6, §4.3 step 1).
 pub(crate) const FLUID_SERVER_MIN_RELEASE: locker_skew::Version = (0, 146, 0);
 
+/// Whether a member vault server is found and fed on this OS. Members find one another's servers,
+/// and each server finds the ones it pulls from, over Bonjour, which aterm advertises and browses
+/// on macOS only ([`aterm_uds::lan`]); `DESIGN-fluid-swarm` covers no Linux member. Elsewhere
+/// nothing finds or feeds a member server (a Linux member's held no vault in its life), so the
+/// step installs none and removes the one an earlier release installed
+/// ([`member_server_installed`]).
+pub(crate) const MEMBER_SERVER_FOUND: bool = cfg!(target_os = "macos");
+
+/// Why the step serves nothing off macOS ([`MEMBER_SERVER_FOUND`]).
+fn unfound_member_server() -> String {
+    "a member vault server is found, and finds the servers it pulls from, over Bonjour, which \
+     aterm advertises and browses on macOS only, so one here is neither found nor fed"
+        .to_owned()
+}
+
+/// The arguments, after its program, of the member server this step installs for `label`.
+fn member_server_args(label: String) -> Vec<String> {
+    vec![
+        "secrets".to_owned(),
+        "serve".to_owned(),
+        "--advertise".to_owned(),
+        label,
+        "--pin".to_owned(),
+        format!("{}={}", crate::ALAB_VAULT, crate::ALAB_SIGNER),
+        // Every Mac member serves, laptops too: none is kept from idle sleep for it.
+        "--no-keep-awake".to_owned(),
+    ]
+}
+
+/// Whether a server job's arguments `args` (after its program) are a member server this step
+/// installed, in this release's shape ([`member_server_args`]) or an earlier one's, which pinned
+/// the ALab key of its day and passed no `--no-keep-awake`. Any other shape is a person's
+/// (`aterm secrets server on`), which the step leaves as it is.
+pub(crate) fn member_server_installed(args: &[String]) -> bool {
+    let words: Vec<&str> = args.iter().map(String::as_str).collect();
+    let pinned = format!("{}=", crate::ALAB_VAULT);
+    match words.as_slice() {
+        [
+            "secrets",
+            "serve",
+            "--advertise",
+            label,
+            "--pin",
+            pin,
+            rest @ ..,
+        ] => {
+            crate::text::valid_machine_name(label)
+                && pin.starts_with(&pinned)
+                && matches!(rest, [] | ["--no-keep-awake"])
+        }
+        _ => false,
+    }
+}
+
+/// The member vault server an earlier aterm installed where nothing finds or feeds it: off macOS
+/// ([`MEMBER_SERVER_FOUND`]), a server job in the step's shape ([`member_server_installed`]) that
+/// no pin record names. What the read finds, or `None` (always on macOS). It is aterm's own stale
+/// install, not swarm participation, so `sync.steward.server.standby` reads it, from the job's
+/// unit and pin record alone, and removes it ([`retire_stale_member_server`]) whatever `[swarm]`
+/// says.
+///
+/// # Errors
+/// The job's pin record cannot be read.
+pub fn stale_member_server(paths: &Paths) -> crate::Result<Option<String>> {
+    if MEMBER_SERVER_FOUND
+        || !crate::service::server_retire_due(&paths.home, &member_server_installed)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "{} runs the member vault server an earlier aterm installed: {}",
+        crate::service::Job::Server.label(),
+        unfound_member_server()
+    )))
+}
+
+/// Stop and remove the job [`stale_member_server`] finds, judged again under the job's decision
+/// lock: what was removed, or `None` where none is left to remove (always on macOS).
+///
+/// # Errors
+/// The job's decision lock or pin record cannot be read, or the job did not stop or go.
+pub fn retire_stale_member_server(paths: &Paths) -> crate::Result<Option<String>> {
+    if MEMBER_SERVER_FOUND {
+        return Ok(None);
+    }
+    Ok(
+        crate::service::retire_server(&paths.home, &member_server_installed)?
+            .map(|removed| format!("{removed}: {}", unfound_member_server())),
+    )
+}
+
 /// Outcome of the member vault server step (`sync.steward.server.standby`, `DESIGN-fluid-swarm`
 /// §4.1 F6 & §4.3 step 1).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StewardStandbyServer {
-    /// Not applicable on this Mac (not an active URL-backed ALab member, or turned off by choice).
+    /// Not applicable on this machine (not an active URL-backed ALab member, turned off by
+    /// choice, or not macOS).
     Idle(String),
     /// A vault server job (`aterm-vault-server` LaunchDaemon or `aterm-secrets-server` LaunchAgent)
     /// is already running on a current build on this member.
@@ -1220,8 +1359,9 @@ pub(super) fn check_standby_eligibility(
         ));
     }
     // Bind the source/opt-out policy above to the observation below. A concurrent
-    // reconfiguration must not use the old URL policy with a new member's authority.
-    match observe_alab_member_with(paths, false, || {}) {
+    // reconfiguration must not use the old URL policy with a new member's authority. A vault
+    // pass holding the state lock is waited out: its hold is not unavailable evidence.
+    match observe_alab_member_with(paths, false, OnWriter::Wait, || {})? {
         AlabRoleObservation::Allowed { context, own_label }
             if context.configuration
                 == super::network_observation::configuration_binding(&config) =>
@@ -1373,15 +1513,21 @@ pub(crate) fn steward_standby_server_check_with(
 }
 
 /// Probe whether this ALab member has its vault server running on a current build
-/// (`sync.steward.server.standby` probe, `DESIGN-fluid-swarm` §4.1 F6 & §4.3 step 1).
+/// (`sync.steward.server.standby` probe, `DESIGN-fluid-swarm` §4.1 F6 & §4.3 step 1). Off macOS
+/// it idles ([`MEMBER_SERVER_FOUND`]); the member server an earlier release installed there is
+/// [`stale_member_server`]'s.
 ///
 /// # Errors
-/// Vault configuration or service state cannot be read. Unavailable membership evidence
-/// returns [`StewardStandbyServer::Idle`] until a later observation can verify it.
+/// Vault configuration or service state cannot be read, or a vault pass held the state lock
+/// past the wait ([`writer_outlasted_wait`]). Unavailable membership evidence returns
+/// [`StewardStandbyServer::Idle`] until a later observation can verify it.
 pub fn steward_standby_server_check(
     paths: &Paths,
     observed_network_id: Option<&str>,
 ) -> crate::Result<StewardStandbyServer> {
+    if !MEMBER_SERVER_FOUND {
+        return Ok(StewardStandbyServer::Idle(unfound_member_server()));
+    }
     let own = locker_skew::own()?;
     let program = crate::service::program_for_service().ok();
     steward_standby_server_check_with(
@@ -1466,16 +1612,7 @@ pub(crate) fn steward_ensure_standby_server_with(
         )));
     }
     crate::service::require_program_release(new_program, own.version, release_of)?;
-    let args = vec![
-        "secrets".to_owned(),
-        "serve".to_owned(),
-        "--advertise".to_owned(),
-        own_label,
-        "--pin".to_owned(),
-        format!("{}={}", crate::ALAB_VAULT, crate::ALAB_SIGNER),
-        // Every member serves, laptops too: none is kept from idle sleep for it.
-        "--no-keep-awake".to_owned(),
-    ];
+    let args = member_server_args(own_label);
     Ok(install_it(new_program, &args)?.map_or_else(
         || StewardStandbyServer::Idle("server policy changed; kept as it is".to_owned()),
         StewardStandbyServer::Done,
@@ -1484,14 +1621,20 @@ pub(crate) fn steward_ensure_standby_server_with(
 
 /// Ensure the member vault server job runs on this ALab member and moves any held `< 0.146.0`
 /// server snapshot onto the new build once it starts and serves the same store
-/// (`sync.steward.server.standby` apply, `DESIGN-fluid-swarm` §4.1 F6 & §4.3 step 1).
+/// (`sync.steward.server.standby` apply, `DESIGN-fluid-swarm` §4.1 F6 & §4.3 step 1). Off macOS
+/// it installs none ([`MEMBER_SERVER_FOUND`]); [`retire_stale_member_server`] removes the one an
+/// earlier release installed there.
 ///
 /// # Errors
-/// Service program lookup or launchd/systemd installation fails.
+/// Service program lookup or launchd/systemd installation fails, or a vault pass held the
+/// state lock past the wait ([`writer_outlasted_wait`]).
 pub fn steward_ensure_standby_server(
     paths: &Paths,
     observed_network_id: Option<&str>,
 ) -> crate::Result<StewardStandbyServer> {
+    if !MEMBER_SERVER_FOUND {
+        return Ok(StewardStandbyServer::Idle(unfound_member_server()));
+    }
     if let Err(why) = check_standby_eligibility(paths, observed_network_id)? {
         return Ok(StewardStandbyServer::Idle(why));
     }

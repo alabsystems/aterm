@@ -1793,10 +1793,12 @@ pub(crate) enum ConfigPatchOutcome {
     },
 }
 
+/// A view's ask to open `uri` in the person's browser. Whether a person stands behind the press
+/// that made it is the host's to say, by the marks of the gesture it is dispatching
+/// (`App::gesture_unvouched`): a view cannot tell a click from a control client's `act`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExternalOpenRequest {
     pub(crate) uri: String,
-    pub(crate) user_initiated: bool,
 }
 
 /// What Settings' theme picker asks the host to do with the themes folder.
@@ -4875,7 +4877,6 @@ impl NativeAppModel for MarkdownApp {
                     LinkPolicy::ExplicitExternal if link.destination.len() <= 2_048 => {
                         cx.open_external(ExternalOpenRequest {
                             uri: link.destination.clone(),
-                            user_initiated: true,
                         });
                         view.notice = Some("Opening link…".to_string());
                         view.common.presentation_revision =
@@ -4950,10 +4951,7 @@ impl NativeAppModel for MarkdownApp {
                         view.notice = Some("Local image source selected".to_string());
                     }
                     crate::native_markdown::MarkdownImageAction::OpenRemote { uri } => {
-                        cx.open_external(ExternalOpenRequest {
-                            uri,
-                            user_initiated: true,
-                        });
+                        cx.open_external(ExternalOpenRequest { uri });
                         view.notice = Some("Opening remote image…".to_string());
                     }
                     crate::native_markdown::MarkdownImageAction::Denied { message } => {

@@ -23,11 +23,15 @@ use aterm_json::{Value, json};
 
 pub mod cell;
 pub mod check;
+pub mod claim;
+pub(crate) mod claim_activity;
 pub mod grid;
 pub mod guard;
 pub mod keys;
 pub mod owned;
 pub mod secret;
+pub mod view;
+pub use view::View;
 
 /// A table rule's refusal of an owner write: the collection, row, column and
 /// rule, never a value. It is portable metadata independent of a live table.
@@ -218,7 +222,7 @@ impl Ty {
     }
 
     /// The word a stored schema row spells this type with.
-    fn word(&self) -> Value {
+    pub(crate) fn word(&self) -> Value {
         match self {
             Self::Bool => json!("bool"),
             Self::Int { min, max } => json!({"int": [min, max]}),
@@ -250,6 +254,15 @@ impl Ty {
     }
 }
 
+/// How competing rows expose one scalar identity without changing their signed values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClaimRule {
+    /// One row keeps the stored label; other rows receive distinct clash labels.
+    Label,
+    /// Only the winning row exposes the identifier. A losing principal is never fabricated.
+    One,
+}
+
 /// One column of a collection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Column {
@@ -265,6 +278,7 @@ pub struct Column {
     /// The row's key derives from this column, so it is written at birth and never edited: a
     /// row saying another pair under its key would be two mappings at once.
     pub fixed: bool,
+    pub claim: Option<ClaimRule>,
 }
 
 impl Column {
@@ -279,7 +293,13 @@ impl Column {
             retired: None,
             writer: Writer::Owner,
             fixed: false,
+            claim: None,
         }
+    }
+    /// Settle competing row claims using causal tenure, then concurrent record identity.
+    pub const fn claim(mut self, rule: ClaimRule) -> Self {
+        self.claim = Some(rule);
+        self
     }
     /// The row's key derives from it: written at birth, never edited.
     pub const fn fixed(mut self) -> Self {
@@ -490,6 +510,16 @@ impl Collection {
             if secret_named(column.name) && !matches!(column.ty, Ty::Secret) {
                 return Err("a secret-named column must be Secret");
             }
+            if let Some(claim) = column.claim {
+                if !matches!(self.kind, Kind::Cells) {
+                    return Err("identity claims belong to cells collections");
+                }
+                match (claim, column.ty) {
+                    (ClaimRule::Label, Ty::Label)
+                    | (ClaimRule::One, Ty::Label | Ty::Text(_) | Ty::Hex(_)) => {}
+                    _ => return Err("the claim rule does not fit the column type"),
+                }
+            }
             if column.since == 0 || column.since > self.version {
                 return Err("a column's since lies outside the collection's versions");
             }
@@ -563,9 +593,19 @@ impl Collection {
                     Writer::Mine => "self",
                     Writer::Seed => "seed",
                 };
-                json!({"name": c.name, "type": c.ty.word(), "null": c.null,
+                let mut encoded = json!({"name": c.name, "type": c.ty.word(), "null": c.null,
                     "on_conflict": conflict, "since": c.since, "retired": c.retired,
-                    "pii": c.ty.pii(), "writer": writer})
+                    "pii": c.ty.pii(), "writer": writer});
+                if let Some(claim) = c.claim {
+                    encoded.as_object_mut().unwrap().insert(
+                        "claim".into(),
+                        json!(match claim {
+                            ClaimRule::Label => "label",
+                            ClaimRule::One => "one",
+                        }),
+                    );
+                }
+                encoded
             })
             .collect();
         json!({"r": self.version, "x": {"format": FORMAT, "version": self.version, "kind": kind,

@@ -109,7 +109,7 @@ fn activity_during_account_retirement_reaches_the_fresh_handoff_preflight() {
     app.finish_account_handoff(handoff);
     assert_eq!(
         app.native_updater_service.snapshot().error.as_deref(),
-        Some("a Command Line Tools install's tab is still running")
+        Some("a Mac Setup tab is still running")
     );
     assert!(
         app.auto_apply_intent.is_some(),

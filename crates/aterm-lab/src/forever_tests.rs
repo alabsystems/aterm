@@ -760,15 +760,6 @@ fn the_coverage_modes_pick_their_chains() {
             .unwrap();
         assert_eq!(a.mode, m);
     }
-    for w in [
-        "wall-day",
-        "wall-climb",
-        "wall-shift",
-        "wall-day-stop",
-        "wall-bucket",
-    ] {
-        assert_eq!(Mode::of(w), None, "{w}: a retired Gemini CLI mode");
-    }
 }
 
 #[test]
@@ -8893,22 +8884,29 @@ fn a_starting_tab_s_placeholder_is_an_empty_composer_as_every_gate_reads_it() {
     };
     let (pending, clear) = (input("pending", "3"), input("clear", "0"));
     let hint_cell = |_: usize, _: usize| Some("OK / 676c74 111318 none".to_string());
+    let row = hint.lines().position(|l| l.starts_with("❯ /export "));
+    assert!(row.is_some(), "the measured hint row");
+    let home = || row.map(|r| (r, 2));
     assert_eq!(
-        start_look("muse", &hint, &clear, hint_cell),
+        start_look("muse", &hint, &clear, hint_cell, home),
         Stand::Composer(String::new())
     );
     assert_eq!(
-        start_look("muse", &hint, &pending, hint_cell),
+        start_look("muse", &hint, &pending, hint_cell, home),
         Stand::Starting
     );
     assert_eq!(
-        start_look("muse", &hint, &clear, |_, _| Some(
-            "OK / ccd3db 111318 none".into()
-        )),
+        start_look(
+            "muse",
+            &hint,
+            &clear,
+            |_, _| Some("OK / ccd3db 111318 none".into()),
+            home
+        ),
         Stand::Composer("/export saves the conversation to a text file".into())
     );
     assert_eq!(
-        start_look("muse", &hint, &clear, |_, _| None),
+        start_look("muse", &hint, &clear, |_, _| None, home),
         Stand::Unknown
     );
 }
@@ -9293,10 +9291,7 @@ fn tab_of(chain: Chain, seen: Seen) -> Tab {
 fn cruise_on_main() -> Seen {
     Seen {
         journal: vec![
-            j(
-                3_800,
-                "EVENT idle seq=899 ⏺ Merged the parser and pushed it to origin/main. All done.",
-            ),
+            j(3_800, "EVENT idle seq=899 ATERM-TASK-DONE"),
             j(
                 3_800,
                 "WAITING seq=899 until=x 1 short turn(s) in a row: 2 min back-off",
@@ -9626,10 +9621,7 @@ fn the_hold_chains_end_a_minute_past_their_second_acts_point() {
 fn wrote_c_on_main() -> Seen {
     Seen {
         journal: vec![
-            j(
-                3_800,
-                "EVENT idle seq=896 ⏺ Wrote the parser and pushed it to origin/main. All done.",
-            ),
+            j(3_800, "EVENT idle seq=896 ATERM-TASK-DONE"),
             j(
                 3_800,
                 "WAITING seq=896 until=x 1 short turn(s) in a row: 2 min back-off",

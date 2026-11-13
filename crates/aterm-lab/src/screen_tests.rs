@@ -93,21 +93,22 @@ fn a_turn_stands_in_the_agents_own_composer() {
     let rule = "─".repeat(60);
     let claude = format!("⏺ Hi\n\n{rule}\n❯\u{a0}hi \n{rule}\n  ⏵⏵ auto mode on");
     assert_eq!(composer_row("claude", &claude).as_deref(), Some("hi"));
-    let codex = "› hi\n\n• Hi! (reply 1)\n\n› carry on \n\n  ? for shortcuts";
-    assert_eq!(composer_row("codex", codex).as_deref(), Some("carry on"));
+    for prompt in ['›', '»'] {
+        let codex = format!("› hi\n\n• Hi! (reply 1)\n\n{prompt} carry on \n\n  ? for shortcuts");
+        assert_eq!(composer_row("codex", &codex).as_deref(), Some("carry on"));
+    }
     assert_eq!(composer_row("codex", "no composer"), None);
     assert_eq!(composer_row("claude", "no frame"), None);
 }
 
 /// Codex's question dialog is no composer: the user's message over it is
-/// the screen's last row in column 0 that opens `›` (the dialog's cursor
+/// the screen's last row in column 0 that opens a prompt glyph (the dialog's cursor
 /// is at column 2), and read as a prompt still standing it would make
-/// `turn` press Enter on the dialog and answer it (the rows measured on
-/// 0.163.0).
+/// `turn` press Enter on the dialog and answer it.
 #[test]
 fn codexs_question_dialog_is_no_composer() {
     let dialog = [
-        "› QUESTION: plan the database migration",
+        "» QUESTION: plan the database migration",
         "",
         "  Question 1/1 (1 unanswered)",
         "  Which rollout should the migration use?",
@@ -120,12 +121,13 @@ fn codexs_question_dialog_is_no_composer() {
     ]
     .join("\n");
     assert_eq!(composer_row("codex", &dialog), None);
+    assert_eq!(composer_row("codex", &dialog.replace('»', "›")), None);
     let idle = [
         "› QUESTION: plan the database migration",
         "",
         "• Hi! I am the local lab stub, not a model. (reply 3)",
         "",
-        "› Ask Codex to do anything",
+        "» Ask Codex to do anything",
         "",
         "  gpt-6.1-sol medium · /private/tmp/at.lab0/proj",
     ]

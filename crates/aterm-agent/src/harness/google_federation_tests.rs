@@ -896,7 +896,7 @@ fn native_claude_probe(
     use std::io::Read;
     use std::os::fd::AsFd;
     aterm_secrets::fsx::ensure_private_dir(home).unwrap();
-    let (mut reader, writer) = std::io::pipe().unwrap();
+    let (mut reader, writer) = aterm_uds::pipe().unwrap();
     let mut command = aterm_uds::spawnfd::Command::new(login_drive::SANDBOX_EXEC);
     command
         .args(["-p", login_drive::NO_DESK])

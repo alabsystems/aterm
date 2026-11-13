@@ -451,6 +451,7 @@ fn standin_heads_the_chain() {
     };
     let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN * 2;
     if std::env::var_os(HEAD_WORKS).is_some() {
+        let _ = std::fs::write(works.with_file_name("head-spinning"), "");
         let parent = std::os::unix::process::parent_id();
         let mut n = 0u64;
         while works.exists()
@@ -492,6 +493,14 @@ fn a_holder_waiting_in_a_chain_is_as_stuck_as_its_head() {
     let works = dir.path().join("head-works");
     std::fs::write(&works, "").expect("the head's work");
     let head = head(&works, false);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the head's child to spin",
+        || {
+            dir.path().join("head-spinning").exists().then_some(())?;
+            crate::stall::tree_work(head.0.id(), &[]).filter(|w| w.cpu_ns > 0)
+        },
+    );
     let held = take(
         &path,
         &Holder {

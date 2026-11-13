@@ -351,6 +351,7 @@ impl Grid {
                 self.storage.mark_content_full();
             } else {
                 self.storage.content_gen += 1;
+                self.storage.history_content_gen += 1;
             }
         }
     }

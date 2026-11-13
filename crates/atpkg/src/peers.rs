@@ -1049,8 +1049,8 @@ impl Sharing {
         }
     }
 
-    /// The doctor's line: whether this Mac serves its toolset archives, where and to whom, what
-    /// it keeps, and whom its downloads race.
+    /// The doctor's line: whether this machine serves its toolset archives, where and to whom,
+    /// what it keeps, and whom its downloads race.
     #[must_use]
     pub fn line(&self) -> String {
         let plural =
@@ -1065,16 +1065,16 @@ impl Sharing {
             Serves::Off => concat!(
                 "off (Settings ▸ Packages ▸ \"",
                 serve_switch!(),
-                "\" or `aterm pkg serve-units --off`): this Mac keeps and serves no toolset \
-                 archive; that switch or `aterm pkg serve-units --on` turns it back on"
+                "\" or `aterm pkg serve-units --off`): this machine keeps and serves no \
+                 toolset archive; that switch or `aterm pkg serve-units --on` turns it back on"
             )
             .to_owned(),
             Serves::Serving(at) if self.members > 0 => {
-                format!("serving {kept} on {at} to this Mac's {members}")
+                format!("serving {kept} on {at} to this machine's {members}")
             }
             Serves::Serving(at) => format!("serving {kept} on {at}"),
             Serves::Idle => {
-                format!("on: keeps {kept} for this Mac's {members}, served while aterm runs")
+                format!("on: keeps {kept} for this machine's {members}, served while aterm runs")
             }
             Serves::NoMember if self.kept.0 > 0 => format!(
                 "on, with no fleet member to share with (`aterm fleet join` shares toolset \
@@ -1298,7 +1298,7 @@ impl OffWatch {
     fn open(layout: &Layout) -> Option<Self> {
         use std::os::fd::AsRawFd as _;
 
-        let (reader, writer) = aterm_uds::kept_out(std::io::pipe).ok()?;
+        let (reader, writer) = aterm_uds::pipe().ok()?;
         for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
             // SAFETY: `fd` is a freshly opened pipe descriptor owned here.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };

@@ -36,11 +36,12 @@ use super::checkpoint_state::{
     OutputBlockRepr, PaletteOverrideRepr, ShellRepr, ShellSpanRepr, TitleRepr,
 };
 use crate::config::{BiDiConfig, TerminalConfig};
-use crate::grid::{CellFlags, MAX_GRID_COLS, MAX_GRID_ROWS, PackedColor};
+use crate::grid::row::LineSize;
+use crate::grid::{CellFlags, MAX_GRID_COLS, MAX_GRID_ROWS, PackedColor, VisibleCells};
 use crate::scrollback::{deserialize_lines_strict, max_linked_record_bytes};
 
 /// The version [`TerminalCheckpoint::canonical`] writes after its magic.
-pub const CHECKPOINT_CANON_VERSION: u32 = 3;
+pub const CHECKPOINT_CANON_VERSION: u32 = 4;
 
 /// The version [`TerminalConfig::canonical`] writes after its magic.
 pub const CONFIG_CANON_VERSION: u32 = 1;
@@ -1457,6 +1458,47 @@ fn dec_holder(d: &mut R<'_>) -> Result<HolderRepr, CanonFault> {
     })
 }
 
+fn enc_visible_cells(w: &mut W, cells: &VisibleCells) {
+    let VisibleCells {
+        line_sizes,
+        protected,
+    } = cells;
+    w.len(line_sizes.len());
+    for &(row, size) in line_sizes {
+        w.u16(row);
+        match size {
+            LineSize::SingleWidth => w.u8(0),
+            LineSize::DoubleHeightTop => w.u8(3),
+            LineSize::DoubleHeightBottom => w.u8(4),
+            LineSize::DoubleWidth => w.u8(6),
+            other => w.unnamed(other),
+        }
+    }
+    w.len(protected.len());
+    for &(row, start, end) in protected {
+        w.u16(row);
+        w.u16(start);
+        w.u16(end);
+    }
+}
+
+fn dec_visible_cells(d: &mut R<'_>, f: &'static str) -> Result<VisibleCells, CanonFault> {
+    Ok(VisibleCells {
+        line_sizes: d.vec(f, 3, |d| {
+            let row = d.u16(f)?;
+            let size = match d.u8(f)? {
+                0 => LineSize::SingleWidth,
+                3 => LineSize::DoubleHeightTop,
+                4 => LineSize::DoubleHeightBottom,
+                6 => LineSize::DoubleWidth,
+                _ => return Err(fault(f, "a line size this build does not name")),
+            };
+            Ok((row, size))
+        })?,
+        protected: d.vec(f, 6, |d| Ok((d.u16(f)?, d.u16(f)?, d.u16(f)?)))?,
+    })
+}
+
 /// The strict decode of a grid body of `cols` columns, under the bounds the crash-restore records use: its record count.
 fn grid_records(blob: &[u8], cols: u16) -> Option<usize> {
     let cells = usize::from(cols);
@@ -1486,6 +1528,8 @@ impl TerminalCheckpoint {
             cursor,
             alt_grid,
             alt_cursor,
+            visible_cells,
+            alt_visible_cells,
             saved_cursor_main,
             saved_cursor_alt,
             modes,
@@ -1518,6 +1562,8 @@ impl TerminalCheckpoint {
         enc_grid_cursor(&mut w, cursor);
         w.opt(alt_grid.as_deref(), W::bytes);
         w.opt(alt_cursor.as_ref(), enc_grid_cursor);
+        enc_visible_cells(&mut w, visible_cells);
+        enc_visible_cells(&mut w, alt_visible_cells);
         enc_saved_cursor(&mut w, saved_cursor_main.as_ref());
         enc_saved_cursor(&mut w, saved_cursor_alt.as_ref());
         enc_modes(&mut w, modes);
@@ -1599,6 +1645,8 @@ impl TerminalCheckpoint {
                 ));
             }
         }
+        let visible_cells = dec_visible_cells(&mut d, "visible_cells")?;
+        let alt_visible_cells = dec_visible_cells(&mut d, "alt_visible_cells")?;
         let saved_cursor_main = dec_saved_cursor(&mut d)?;
         let saved_cursor_alt = dec_saved_cursor(&mut d)?;
         let modes = dec_modes(&mut d)?;
@@ -1637,6 +1685,8 @@ impl TerminalCheckpoint {
             cursor,
             alt_grid,
             alt_cursor,
+            visible_cells,
+            alt_visible_cells,
             saved_cursor_main,
             saved_cursor_alt,
             modes,

@@ -7,12 +7,15 @@
 //! snap stops ([`MenuRow::Stops`]) whose pick leaves the card open.
 
 use aterm_core::terminal::RenderCell;
-use aterm_effects::glass_inks::{GlassInks, field};
+use aterm_effects::glass_inks::{GlassInks, HoverPart, field};
 use aterm_effects::harness_card::CardPalette;
 use aterm_render::Theme;
 
 use crate::claude_lights::Fact;
 use crate::fact_menu::FactAct;
+use crate::footer_card_plate::{
+    CardPlate, CardWash, PillShape, PlateKey, PlateLine, PlatePill, PlateRule,
+};
 use crate::menu_viewport::MenuViewport;
 use crate::tab_menu::{MenuRect, display_cells, ellipsize};
 use crate::{App, WindowId};
@@ -538,7 +541,7 @@ fn side_pad(w: usize, rows: &[MenuRow]) -> usize {
     }
 }
 
-/// The fewest rows a card of `rows` opens in, its border included: its head, the rows before
+/// The fewest rows a card of `rows` opens in, its blank first and last row included: its head, the rows before
 /// its first rule or group heading, so a card of sections needs room for what it says first and
 /// scrolls the rest.
 fn least_rows(rows: &[MenuRow]) -> usize {
@@ -627,7 +630,8 @@ pub(crate) fn place(
     (h >= 3).then_some(MenuRect { row, col, w, h })
 }
 
-/// Index into `rows` at `frame_row`, or `None` on a border or past truncation.
+/// Index into `rows` at `frame_row`, or `None` on the card's blank first or last row or past
+/// truncation.
 #[must_use]
 pub(crate) fn row_at(
     rect: MenuRect,
@@ -774,22 +778,6 @@ pub(crate) const fn key_of(key: &aterm_types::keyboard::Key) -> MenuKey {
     }
 }
 
-/// The glass a card wears ([`paint`]): the inks and the card's painted height.
-struct CardGlass {
-    inks: GlassInks,
-    /// The rows the card paints, its border's included.
-    rows: usize,
-    /// Its rules are drawn inside the border, so the arc runs whole round the card.
-    arc: bool,
-}
-
-impl CardGlass {
-    /// The border's ink at `row`, `col` of a card `w` cells wide.
-    fn border(&self, row: usize, col: usize, w: usize) -> [u8; 3] {
-        unpack(self.inks.border(row, col, self.rows, w))
-    }
-}
-
 const fn pack(c: [u8; 3]) -> u32 {
     u32::from_be_bytes([0, c[0], c[1], c[2]])
 }
@@ -798,41 +786,145 @@ const fn unpack(c: u32) -> [u8; 3] {
     [(c >> 16) as u8, (c >> 8) as u8, c as u8]
 }
 
-/// The card's colours and the glass's inks on them ([`paint`]): a fact card the glass opens
-/// stands on the pane's own ground, the ground the inks are solved on; with no palette, on the
-/// band's grey.
-fn card_inks(
-    theme: Theme,
-    palette: Option<CardPalette>,
-) -> (crate::tab_menu::MenuColors, GlassInks) {
-    let c = match palette {
-        Some(_) => crate::tab_menu::glass_menu_colors(theme),
-        None => crate::tab_menu::menu_colors(theme),
-    };
-    let inks = GlassInks::of(
-        palette,
-        pack(c.card_bg),
-        theme.fg & 0x00FF_FFFF,
-        pack(c.rule),
-    );
-    (c, inks)
+/// How far a card's rule sits from its ground toward its words: a hairline, a decoration with
+/// no floor.
+const RULE_TOWARD_INK: f32 = 0.34;
+
+/// The opacity of the wash under the row, or the slider's stop, the pointer or the keys rest
+/// on: the pane's ink at this alpha over the card's ground, one tone on every card.
+pub(crate) const WASH_ALPHA: u8 = 56;
+
+/// How long the wash a row wore takes to go once the pointer or the keys left it
+/// ([`WashRelease`]): the style guide's fast change (`aterm_scene::motion::FAST`).
+pub(crate) const WASH_FADE: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// The steps a released wash fades in.
+pub(crate) const WASH_STEPS: u32 = 4;
+
+/// The one look every card wears (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4,
+/// §4.1): the glass's tokens ([`GlassInks`]) solved on the pane's own ground, whatever the
+/// palette, and the few inks a card adds to them. A card's head and its group headings are
+/// [`Self::head`], its choices and figures [`Self::item`], its notes, its facts' names and a
+/// choice that cannot be made [`Self::quiet`]; with no palette every glass token is neutral.
+/// Under an OS-forced palette ([`crate::chrome_band::forced_chrome`]) the ground, the ink and
+/// the highlight are the system's own colours and the glass wears no palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CardInks {
+    /// The glass's tokens on [`Self::ground`].
+    pub(crate) glass: GlassInks,
+    /// The card's ground: the pane's own.
+    pub(crate) ground: [u8; 3],
+    /// A rule's ink ([`RULE_TOWARD_INK`]), the grey the glass's rule and track are made from.
+    pub(crate) rule: [u8; 3],
+    /// The wash under the row the pointer or the keys rest on: its colour and its opacity
+    /// ([`WASH_ALPHA`] of the pane's ink; under a forced palette the system's highlight, whole).
+    pub(crate) wash: ([u8; 3], u8),
+    /// The row's words on the wash: the footer's hover ink ([`GlassInks::hovered`]), 4.5:1 or
+    /// more on what the wash makes of the card's ground ([`Self::sel_bg`]).
+    pub(crate) sel_fg: [u8; 3],
+    /// The traffic card's inbound band: the chrome's accent, 3:1 or more on the ground.
+    pub(crate) accent: [u8; 3],
+    /// Whether the OS forces the palette: the frame then wears no arc and casts no shadow.
+    pub(crate) forced: bool,
+}
+
+impl CardInks {
+    /// The look of a card on a pane of `theme` whose glass wears `palette`.
+    #[must_use]
+    pub(crate) fn of(theme: Theme, palette: Option<CardPalette>) -> Self {
+        use crate::chrome_band::{ensure_contrast, mix3};
+        let forced = crate::chrome_band::forced_chrome();
+        let (ground, ink) = match forced {
+            Some(hc) => (hc.window, hc.window_text),
+            None => (unpack(theme.bg), unpack(theme.fg)),
+        };
+        let rule = mix3(ground, ensure_contrast(ink, ground, 4.5), RULE_TOWARD_INK);
+        let palette = palette.filter(|_| forced.is_none());
+        let glass = GlassInks::of(palette, pack(ground), pack(ink), pack(rule));
+        let accent = crate::chrome_band::band_colors(theme).accent;
+        let mut inks = Self {
+            glass,
+            ground,
+            rule,
+            wash: forced.map_or((ink, WASH_ALPHA), |hc| (hc.highlight, 255)),
+            sel_fg: ink,
+            accent: ensure_contrast(accent, ground, 3.0),
+            forced: forced.is_some(),
+        };
+        inks.sel_fg = match forced {
+            Some(hc) => hc.highlight_text,
+            None => {
+                let lit = glass.hovered(glass.value(), HoverPart::Text).fg;
+                ensure_contrast(unpack(lit), inks.sel_bg(), 4.5)
+            }
+        };
+        inks
+    }
+
+    /// What the wash makes of the card's ground: [`Self::wash`]'s ink at its opacity over
+    /// [`Self::ground`], the tone the row's words are floored on.
+    #[must_use]
+    pub(crate) fn sel_bg(&self) -> [u8; 3] {
+        let (ink, alpha) = self.wash;
+        crate::chrome_band::mix3(self.ground, ink, f32::from(alpha) / 255.0)
+    }
+
+    /// A card's head, a group's heading and a scroll cue: the glass's lit ink.
+    #[must_use]
+    pub(crate) const fn head(&self) -> [u8; 3] {
+        unpack(self.glass.lit())
+    }
+
+    /// A choice, a figure and a value: the glass's value ink.
+    #[must_use]
+    pub(crate) const fn item(&self) -> [u8; 3] {
+        unpack(self.glass.value())
+    }
+
+    /// A note, a fact's name and a choice that cannot be made: the glass's quiet ink.
+    #[must_use]
+    pub(crate) const fn quiet(&self) -> [u8; 3] {
+        unpack(self.glass.quiet())
+    }
+
+    /// A projected stop's words, always bold: the glass's warn ink.
+    #[must_use]
+    pub(crate) const fn warn(&self) -> [u8; 3] {
+        unpack(self.glass.warn())
+    }
+
+    /// The ink of the card's frame ([`crate::footer_card_plate`]): the static arc of the glass
+    /// the card wears; with no palette and in Serious Mode (`serious`) the glass's track, one
+    /// ink all round, and under a forced palette the system's own ink.
+    #[must_use]
+    pub(crate) const fn line(&self, serious: bool) -> PlateLine {
+        if self.forced {
+            PlateLine::Flat(self.glass.key().ink)
+        } else if serious || self.glass.palette().is_none() {
+            PlateLine::Flat(self.glass.track())
+        } else {
+            PlateLine::Arc(self.glass)
+        }
+    }
 }
 
 /// The card columns a row's text (and a drawn row's cells) take in a card `w` cells wide:
-/// inside the border and the side pad.
+/// inside the card's blank first and last column and the side pad.
 fn text_span(w: usize, rows: &[MenuRow]) -> (usize, usize) {
     let pad = side_pad(w, rows);
     (1 + pad, w.saturating_sub(1 + pad))
 }
 
-/// Render the menu card into `rect.h` rows of `rect.w` cells, wearing `palette`'s glass
-/// (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4, §4.1): a fact card the glass opens
-/// wears its pane's Autopilot palette on the pane's own ground ([`crate::tab_menu::glass_menu_colors`],
-/// the ground the glass's inks are solved on), its border the static arc
-/// ([`GlassInks::border`]), its rules inside the border, its drawn rows the glass's tokens with
-/// each column's hue and a warn cell on a wash of the warn ink ([`WARN_WASH`]); with no palette
-/// (a pane with no harness theme) the card stands on the band's grey, every token is neutral
-/// and the border is the card's rule ink.
+/// Render the menu card into `rect.h` rows of `rect.w` cells in the one look every card wears
+/// ([`CardInks`], `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4, §4.1): on the pane's
+/// own ground, its drawn rows the glass's tokens with each column's hue and a warn cell on a
+/// wash of the warn ink ([`WARN_WASH`]). The card's frame is not cells: its first and last row
+/// and its first and last column are blank, but for a scroll cue, and so is a rule's row and a
+/// group heading's cells after its title; the line round the card and the hairlines are drawn
+/// in pixels under these cells ([`crate::footer_card_plate`], [`plate_rules`]). The row the
+/// pointer or the keys rest on (`highlight`) keeps the card's ground and its weight and takes
+/// the footer's hover ink ([`CardInks::sel_fg`]); its wash is pixels too ([`wash_pill`]), as a
+/// slider's track and a warn note's wash are ([`plate_pills`]).
 #[must_use]
 pub(crate) fn paint(
     rect: MenuRect,
@@ -842,140 +934,90 @@ pub(crate) fn paint(
     theme: Theme,
     palette: Option<CardPalette>,
 ) -> Vec<Vec<RenderCell>> {
-    let (c, inks) = card_inks(theme, palette);
+    let c = CardInks::of(theme, palette);
     let w = rect.w;
     let (text_start, text_end) = text_span(w, rows);
     let cell = crate::chrome_band::cell;
     let visible = viewport.range(rows.len(), rect.h.saturating_sub(2));
-    let glass = CardGlass {
-        inks,
-        rows: (visible.len() + 2).min(rect.h),
-        arc: palette.is_some(),
-    };
-    let edge = |r: usize, left: char, fill: char, right: char| {
-        (0..w)
-            .map(|col| {
-                let ch = match col {
-                    0 => left,
-                    col if col + 1 == w => right,
-                    _ => fill,
-                };
-                cell(ch, glass.border(r, col, w), c.card_bg, false, false)
-            })
-            .collect::<Vec<_>>()
-    };
-    let sides = |r: usize, row: &mut [RenderCell]| {
-        row[0] = cell('\u{2502}', glass.border(r, 0, w), c.card_bg, false, false);
-        if w >= 2 {
-            row[w - 1] = cell(
-                '\u{2502}',
-                glass.border(r, w - 1, w),
-                c.card_bg,
-                false,
-                false,
-            );
-        }
-    };
-    let mut out = Vec::with_capacity(rect.h);
-    out.push(edge(0, '\u{250C}', '\u{2500}', '\u{2510}'));
-    if visible.start > 0 && w > 2 {
-        out[0][w - 2] = cell('↑', c.band.value, c.card_bg, true, false);
+    let blank = || vec![cell(' ', c.rule, c.ground, false, false); w];
+    // The card's blank first row, its visible rows each on the row the frame's pixels are laid
+    // on ([`laid_rows`]), and its blank last row.
+    let mut out = vec![blank(); (visible.len() + 2).min(rect.h)];
+    if visible.start > 0 && w > 2 && !out.is_empty() {
+        out[0][w - 2] = cell('↑', c.head(), c.ground, true, false);
     }
-    for (i, row) in rows
-        .iter()
-        .enumerate()
-        .take(visible.end)
-        .skip(visible.start)
-    {
-        let r = out.len();
+    for (r, i, row) in laid_rows(rect, rows, viewport) {
         if matches!(row, MenuRow::Rule) {
-            if glass.arc {
-                // Inside the border, so the arc runs whole round the card.
-                let mut cells = vec![cell(' ', c.rule, c.card_bg, false, false); w];
-                sides(r, &mut cells);
-                for slot in cells.iter_mut().take(text_end).skip(text_start) {
-                    *slot = cell('\u{2500}', c.rule, c.card_bg, false, false);
-                }
-                out.push(cells);
-            } else {
-                out.push(edge(r, '\u{251C}', '\u{2500}', '\u{2524}'));
-            }
+            // Blank: its hairline is the frame's ([`plate_rules`]).
             continue;
         }
         if let MenuRow::Plot { cells: plot, .. } = row {
-            let mut cells = paint_plot(w, (text_start, text_end), plot, &c, &glass.inks);
-            sides(r, &mut cells);
-            out.push(cells);
+            out[r] = paint_plot(w, (text_start, text_end), plot, &c);
             continue;
         }
         if let MenuRow::Section(title) = row {
-            // Inside the border on every card, as a glass card's rule is: the heading's words
-            // begin where every row's do.
-            let mut cells = vec![cell(' ', c.rule, c.card_bg, false, false); w];
-            sides(r, &mut cells);
+            // The heading's words begin where every row's do; the hairline after them is the
+            // frame's ([`plate_rules`]).
+            let mut cells = blank();
             let title = ellipsize(title, text_end.saturating_sub(text_start));
-            let rule_from = text_start + display_cells(&title) + 1;
-            let (fg, bg) = (c.band.value, c.card_bg);
+            let (fg, bg) = (c.head(), c.ground);
             crate::tab_menu::put_text(&mut cells, text_start, text_end, &title, fg, bg, true);
-            for slot in cells.iter_mut().take(text_end).skip(rule_from) {
-                *slot = cell('\u{2500}', c.rule, c.card_bg, false, false);
-            }
-            out.push(cells);
+            out[r] = cells;
             continue;
         }
         if let MenuRow::Fact {
             label, value, tone, ..
         } = row
         {
-            let bg = c.card_bg;
-            let mut cells = vec![cell(' ', c.band.label, bg, false, false); w];
-            sides(r, &mut cells);
+            let bg = c.ground;
+            let mut cells = vec![cell(' ', c.quiet(), bg, false, false); w];
             crate::tab_menu::put_text(
                 &mut cells,
                 text_start,
                 text_end,
                 &ellipsize(label, text_end.saturating_sub(text_start)),
-                c.band.label,
+                c.quiet(),
                 bg,
                 false,
             );
             let (fg, bold) = match tone {
-                NoteTone::Label => (c.band.label, false),
-                NoteTone::Value => (c.band.value, false),
-                NoteTone::Warn => (unpack(glass.inks.warn()), true),
+                NoteTone::Label => (c.quiet(), false),
+                NoteTone::Value => (c.item(), false),
+                NoteTone::Warn => (c.warn(), true),
             };
             let from = (text_start + fact_value_at(label)).min(text_end);
             let value = ellipsize(value, text_end - from);
             crate::tab_menu::put_text(&mut cells, from, text_end, &value, fg, bg, bold);
-            out.push(cells);
+            out[r] = cells;
             continue;
         }
         let selected = highlight == Some(i) && row.selectable();
         if let MenuRow::Stops { stops, at, .. } = row {
-            let mut cells = vec![cell(' ', c.band.value, c.card_bg, false, false); w];
-            sides(r, &mut cells);
+            let mut cells = vec![cell(' ', c.item(), c.ground, false, false); w];
             let rested = row.rested_stop().filter(|_| selected);
             paint_stops(&mut cells, (text_start, text_end), (stops, *at, rested), &c);
-            out.push(cells);
+            out[r] = cells;
             continue;
         }
-        let bg = if selected { c.sel_bg } else { c.card_bg };
+        let bg = c.ground;
         let (fg, bold) = match row {
-            MenuRow::Header(_) | MenuRow::Name(_) => (c.band.value, true),
+            MenuRow::Header(_) | MenuRow::Name(_) => (c.head(), true),
             MenuRow::Note {
                 tone: NoteTone::Value,
                 ..
-            } => (c.band.value, false),
+            } => (c.item(), false),
             MenuRow::Note {
                 tone: NoteTone::Warn,
                 ..
-            } => (unpack(glass.inks.warn()), true),
-            MenuRow::Note { .. } | MenuRow::Item { enabled: false, .. } => (c.disabled, false),
-            MenuRow::Item { .. } if selected => (c.sel_fg, true),
-            _ => (c.band.value, false),
+            } => (warn_wash(&c).map_or(c.warn(), |(_, ink)| ink), true),
+            MenuRow::Note { .. } | MenuRow::Item { enabled: false, .. } => (c.quiet(), false),
+            MenuRow::Item { .. } if selected => (c.sel_fg, false),
+            _ => (c.item(), false),
         };
-        let mut cells = vec![cell(' ', fg, bg, false, false); w];
-        sides(out.len(), &mut cells);
+        let mut cells = blank();
+        for slot in cells.iter_mut().take(w.saturating_sub(1)).skip(1) {
+            *slot = cell(' ', fg, bg, false, false);
+        }
         let checked = matches!(row, MenuRow::Item { checked: true, .. });
         // An item's trailing words end where a check would begin, on a checked row or not, so
         // a card's trails share one right edge; the label has the room before them.
@@ -1016,52 +1058,93 @@ pub(crate) fn paint(
         if checked && text_end >= 1 {
             cells[text_end - 1] = cell('\u{25cf}', fg, bg, bold, false);
         }
-        out.push(cells);
-    }
-    if out.len() < rect.h {
-        out.push(edge(out.len(), '\u{2514}', '\u{2500}', '\u{2518}'));
+        out[r] = cells;
     }
     if visible.end < rows.len()
         && w > 2
         && let Some(bottom) = out.last_mut()
     {
-        bottom[w - 2] = cell('↓', c.band.value, c.card_bg, true, false);
+        bottom[w - 2] = cell('↓', c.head(), c.ground, true, false);
     }
-    out.truncate(rect.h);
     out
 }
 
-/// A slider's cells inside the border (its sides are the caller's), each stop on its span
-/// ([`stop_spans`]): its mark, the thumb's where the thumb stands, and its label; the track
-/// between two stops in the card's rule ink; the stop the keys or the pointer rest on (`rested`,
-/// on the card's selected row) on the selection's ground; a stop that cannot be picked in the
-/// disabled ink.
+/// The hairlines of the card's visible rows into `out`, as the frame draws them
+/// ([`crate::footer_card_plate::plate_content`]): a [`MenuRow::Rule`]'s over the text's span,
+/// a [`MenuRow::Section`]'s from one blank after its title to the text's end, each on the row
+/// [`paint`] lays it on, counted from the card's first.
+pub(crate) fn plate_rules(
+    rect: MenuRect,
+    rows: &[MenuRow],
+    viewport: MenuViewport,
+    out: &mut Vec<PlateRule>,
+) {
+    let (text_start, text_end) = text_span(rect.w, rows);
+    for (r, _, row) in laid_rows(rect, rows, viewport) {
+        let from = match row {
+            MenuRow::Rule => text_start,
+            MenuRow::Section(title) => {
+                let title = ellipsize(title, text_end.saturating_sub(text_start));
+                text_start + display_cells(&title) + 1
+            }
+            _ => continue,
+        };
+        if from < text_end {
+            out.push(PlateRule {
+                row: short(r),
+                from: short(from),
+                to: short(text_end),
+            });
+        }
+    }
+}
+
+/// The key of the frame of a card at `rect` in `inks` ([`PlateKey`]), its cells `cell` device
+/// pixels at `scale` pixels a point: the line the glass's arc, or flat in Serious Mode
+/// (`serious`), with no palette and under a forced palette ([`CardInks::line`]); a shadow
+/// unless the palette is forced.
+#[must_use]
+pub(crate) fn plate_key(
+    rect: MenuRect,
+    inks: &CardInks,
+    cell: (usize, usize),
+    scale: f64,
+    serious: bool,
+) -> PlateKey {
+    PlateKey::new(
+        (rect.w, rect.h),
+        cell,
+        scale,
+        pack(inks.ground),
+        inks.line(serious),
+        !inks.forced,
+    )
+}
+
+/// A slider's cells, each stop on its span ([`stop_spans`]): its mark, the thumb's where the
+/// thumb stands, and its label; the cells between two stops blank, their track the frame's
+/// ([`plate_pills`]); the stop the keys or the pointer rest on (`rested`, on the card's
+/// selected row) in the hover ink, its wash the card's ([`wash_pill`]); a stop that cannot be
+/// picked in the disabled ink.
 fn paint_stops(
     cells: &mut [RenderCell],
     (text_start, text_end): (usize, usize),
     (stops, at, rested): (&[Stop], Option<usize>, Option<usize>),
-    c: &crate::tab_menu::MenuColors,
+    c: &CardInks,
 ) {
     let cell = crate::chrome_band::cell;
     let spans = stop_spans(stops, text_end.saturating_sub(text_start));
     for (i, (stop, span)) in stops.iter().zip(&spans).enumerate() {
-        if let Some(next) = spans.get(i + 1) {
-            // A space either side of the track where the gap has room for it.
-            let pad = usize::from(next.start - span.end >= 3);
-            for col in span.end + pad..next.start - pad {
-                cells[text_start + col] = cell('\u{2500}', c.rule, c.card_bg, false, false);
-            }
-        }
         let thumb = at == Some(i);
-        let (fg, bg) = match (stop.enabled, rested == Some(i)) {
-            (false, _) => (c.disabled, c.card_bg),
-            (true, true) => (c.sel_fg, c.sel_bg),
-            (true, false) => (c.band.value, c.card_bg),
+        let fg = match (stop.enabled, rested == Some(i)) {
+            (false, _) => c.quiet(),
+            (true, true) => c.sel_fg,
+            (true, false) => c.item(),
         };
         let mark = if thumb { STOP_THUMB } else { STOP_MARK };
         let text = format!("{mark} {}", stop.label);
         for col in span.clone() {
-            cells[text_start + col] = cell(' ', fg, bg, false, false);
+            cells[text_start + col] = cell(' ', fg, c.ground, false, false);
         }
         crate::tab_menu::put_text(
             cells,
@@ -1069,9 +1152,322 @@ fn paint_stops(
             text_start + span.end,
             &ellipsize(&text, span.len()),
             fg,
-            bg,
+            c.ground,
             thumb,
         );
+    }
+}
+
+/// The card's visible rows, each with the row it is laid on, counted from the card's first,
+/// and its index: the one mapping the card's cells ([`paint`]) and its pixels ([`plate_rules`],
+/// [`plate_pills`], [`plate_own`], [`wash_pill`]) share.
+fn laid_rows(
+    rect: MenuRect,
+    rows: &[MenuRow],
+    viewport: MenuViewport,
+) -> impl Iterator<Item = (usize, usize, &MenuRow)> {
+    let visible = viewport.range(rows.len(), rect.h.saturating_sub(2));
+    rows.iter()
+        .enumerate()
+        .take(visible.end)
+        .skip(visible.start)
+        .map(move |(i, row)| (1 + i - visible.start, i, row))
+        .take_while(move |&(r, ..)| r + 1 < rect.h)
+}
+
+/// A pill's row and half cells from a card row and its cells.
+fn short(v: usize) -> u16 {
+    u16::try_from(v).unwrap_or(u16::MAX)
+}
+
+/// The pills under the card's visible rows that no pointer moves, into `out`, as the frame
+/// draws them ([`crate::footer_card_plate::plate_content`]): a slider's track, a capsule in
+/// each gap between two stops (a blank either side where the gap has room), the glass's lit
+/// ink up to the thumb and its track ink after it; and under a warn note's words, half a cell
+/// past them each side, a wash of the warn ink ([`WARN_WASH`]) where it has a hue of its own.
+pub(crate) fn plate_pills(
+    rect: MenuRect,
+    rows: &[MenuRow],
+    viewport: MenuViewport,
+    c: &CardInks,
+    out: &mut Vec<PlatePill>,
+) {
+    let (text_start, text_end) = text_span(rect.w, rows);
+    let room = text_end.saturating_sub(text_start);
+    for (r, _, row) in laid_rows(rect, rows, viewport) {
+        match row {
+            MenuRow::Stops { stops, at, .. } => {
+                let spans = stop_spans(stops, room);
+                for (j, pair) in spans.windows(2).enumerate() {
+                    let gap = pair[1].start.saturating_sub(pair[0].end);
+                    let pad = usize::from(gap >= 3);
+                    let (from, to) = (pair[0].end + pad, pair[1].start.saturating_sub(pad));
+                    if to <= from {
+                        continue;
+                    }
+                    let ink = if at.is_some_and(|at| j < at) {
+                        c.glass.lit()
+                    } else {
+                        c.glass.track()
+                    };
+                    out.push(PlatePill {
+                        row: short(r),
+                        from: short(2 * (text_start + from)),
+                        to: short(2 * (text_start + to)),
+                        shape: PillShape::Track,
+                        rgb: unpack(ink),
+                        alpha: 255,
+                    });
+                }
+            }
+            MenuRow::Note {
+                text,
+                tone: NoteTone::Warn,
+                ..
+            } if warn_wash(c).is_some() => {
+                let cells = display_cells(&ellipsize(text, room));
+                if cells > 0 {
+                    out.push(PlatePill {
+                        row: short(r),
+                        from: short((2 * text_start).saturating_sub(1)),
+                        to: short(2 * (text_start + cells) + 1),
+                        shape: PillShape::Wash,
+                        rgb: c.warn(),
+                        alpha: (WARN_WASH * 255.0).round() as u8,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The cells of the card's visible rows that stand on a ground of their own, into `out`, a
+/// row's in column order: a drawn row's busy and warn cells ([`plot_ground`]). The frame
+/// draws the card's ground round them
+/// ([`crate::footer_card_plate::plate_content`]).
+pub(crate) fn plate_own(
+    rect: MenuRect,
+    rows: &[MenuRow],
+    viewport: MenuViewport,
+    c: &CardInks,
+    out: &mut Vec<PlateRule>,
+) {
+    let (text_start, text_end) = text_span(rect.w, rows);
+    for (r, _, row) in laid_rows(rect, rows, viewport) {
+        let MenuRow::Plot { cells: plot, .. } = row else {
+            continue;
+        };
+        let mut open: Option<usize> = None;
+        for (col, p) in (text_start..text_end).zip(plot.iter()) {
+            match (plot_ground(p, c) != c.ground, open) {
+                (true, None) => open = Some(col),
+                (false, Some(from)) => {
+                    out.push(PlateRule {
+                        row: short(r),
+                        from: short(from),
+                        to: short(col),
+                    });
+                    open = None;
+                }
+                _ => {}
+            }
+        }
+        if let Some(from) = open {
+            out.push(PlateRule {
+                row: short(r),
+                from: short(from),
+                to: short(text_end.min(text_start + plot.len())),
+            });
+        }
+    }
+}
+
+/// What the wash lies under: a card's row, and on a slider the stop rested on.
+pub(crate) type Washed = (usize, Option<usize>);
+
+/// The pixel layers of a card at `rect` (frame cells) of `key`, as the window pushes them over
+/// the card's cells (§1.4, §1.5): the frame's ([`CardPlate`]: its line, shadow and ground, its
+/// rules' hairlines, [`plate_pills`]) and, over it, the wash's ([`CardWash`]: the pill of each
+/// of `washes`, a row or a stop and its opacity, the fainter first). Each is exact, under the
+/// glyphs, and stands on the card's own `chrome` (its occluder, which cuts every other layer
+/// and not these); the frame's is clipped to the card and its shadow's margin, the wash's to
+/// the card. `None` where a layer draws nothing.
+pub(crate) fn card_layers(
+    (rect, rows, viewport): (MenuRect, &[MenuRow], MenuViewport),
+    (inks, key): (&CardInks, PlateKey),
+    chrome: Option<aterm_core::render::PxRect>,
+    (plate_id, wash_id): (u64, u64),
+    (plate, wash): (&mut CardPlate, &mut CardWash),
+    washes: impl IntoIterator<Item = (Washed, u8)>,
+) -> [Option<aterm_core::render::FxLayer>; 2] {
+    use crate::footer_card_plate::plate_layer;
+    let px = |cells: usize, side: u16| {
+        i32::try_from(cells.saturating_mul(usize::from(side))).unwrap_or(i32::MAX)
+    };
+    let origin = (px(rect.col, key.cell.0), px(rect.row, key.cell.1));
+    let frame = plate
+        .content(key, pack(inks.rule), |lay| {
+            plate_rules(rect, rows, viewport, &mut lay.rules);
+            plate_pills(rect, rows, viewport, inks, &mut lay.pills);
+            plate_own(rect, rows, viewport, inks, &mut lay.own);
+        })
+        .map(|content| {
+            let clip = key.extent().translate(origin.0, origin.1);
+            plate_layer(plate_id, content, origin, clip, chrome)
+        });
+    let wash = wash
+        .content(&key, |out| {
+            out.extend(washes.into_iter().filter_map(|(washed, alpha)| {
+                wash_pill(rect, rows, viewport, washed, inks, alpha)
+            }));
+        })
+        .map(|content| {
+            let (w, h) = key.size();
+            let clip =
+                aterm_core::render::PxRect::new(origin.0, origin.1, origin.0 + w, origin.1 + h);
+            plate_layer(wash_id, content, origin, clip, chrome)
+        });
+    [frame, wash]
+}
+
+/// The wash under `washed` on a card at `rect`, at `alpha` of the card's wash ink
+/// ([`CardInks::wash`]): one pill, the same on every card. Under a choice it runs the row's
+/// width less half a cell each side, so the row's hit, the whole row, is half a cell wider
+/// than its wash; under a slider's stop it runs half a cell past the stop's span each side.
+/// `None` for a row out of view, one that is no choice, a slider with no stop rested on and a
+/// stop that cannot be picked.
+#[must_use]
+pub(crate) fn wash_pill(
+    rect: MenuRect,
+    rows: &[MenuRow],
+    viewport: MenuViewport,
+    (i, stop): Washed,
+    c: &CardInks,
+    alpha: u8,
+) -> Option<PlatePill> {
+    let (r, _, row) = laid_rows(rect, rows, viewport).find(|&(_, at, _)| at == i)?;
+    let (from, to) = match row {
+        MenuRow::Item { enabled: true, .. } => (1, (2 * rect.w).saturating_sub(1)),
+        MenuRow::Stops { stops, .. } => {
+            let stop = stop.filter(|j| stops.get(*j).is_some_and(|stop| stop.enabled))?;
+            let (text_start, text_end) = text_span(rect.w, rows);
+            let span = stop_spans(stops, text_end.saturating_sub(text_start))
+                .into_iter()
+                .nth(stop)?;
+            (
+                (2 * (text_start + span.start)).saturating_sub(1),
+                2 * (text_start + span.end) + 1,
+            )
+        }
+        _ => return None,
+    };
+    Some(PlatePill {
+        row: short(r),
+        from: short(from),
+        to: short(to),
+        shape: PillShape::Wash,
+        rgb: c.wash.0,
+        alpha,
+    })
+}
+
+/// The wash a row wore, fading once the pointer or the keys left it: what it lay under, the
+/// card's generation then (rows that moved since end it), when it was let go and the step of
+/// [`WASH_STEPS`] the last frame asked for drew.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WashRelease {
+    pub(crate) washed: Washed,
+    generation: u64,
+    from: std::time::Instant,
+    step: u32,
+}
+
+impl WashRelease {
+    /// The step the fade stands at `now`; `None` once [`WASH_FADE`] has run.
+    fn step_at(&self, now: std::time::Instant) -> Option<u32> {
+        let into = now.saturating_duration_since(self.from);
+        (into < WASH_FADE).then(|| {
+            (into.as_nanos() * u128::from(WASH_STEPS) / WASH_FADE.as_nanos().max(1)) as u32
+        })
+    }
+
+    /// The instant its step next changes.
+    fn next_at(&self) -> std::time::Instant {
+        self.from + WASH_FADE * (self.step + 1) / WASH_STEPS
+    }
+
+    /// The opacity its step draws of a wash of `full`: under the whole at once, less each
+    /// step, never none.
+    #[must_use]
+    pub(crate) const fn alpha(&self, full: u8) -> u8 {
+        (full as u32 * WASH_STEPS.saturating_sub(self.step) / (WASH_STEPS + 1)) as u8
+    }
+}
+
+/// The wash of an open card (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.5): what the
+/// last frame laid it under, the one it let go and is fading ([`WashRelease`]), and its layer's
+/// content as that frame drew it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WashState {
+    art: CardWash,
+    shown: Option<Washed>,
+    pub(crate) release: Option<WashRelease>,
+    /// How many frames the fade has asked for ([`Self::due`]), which the repaint key reads: the
+    /// frame that let a row go took its key before its compose made the release, so a fade that
+    /// ends with no step frame between would otherwise ask for a frame whose key matches it.
+    asked: u32,
+}
+
+impl WashState {
+    /// Take `washed` as what this frame lays the wash under, at `now` on a card of
+    /// `generation`: where it moved off a row, that row's wash is let go to fade if `fades`
+    /// (else it goes in this frame); a fade whose rows moved since ends.
+    fn settle(
+        &mut self,
+        washed: Option<Washed>,
+        generation: u64,
+        now: std::time::Instant,
+        fades: bool,
+    ) {
+        if self.shown != washed {
+            self.release = self.shown.filter(|_| fades).map(|washed| WashRelease {
+                washed,
+                generation,
+                from: now,
+                step: 0,
+            });
+            self.shown = washed;
+        }
+        self.release = self
+            .release
+            .filter(|release| release.generation == generation && Some(release.washed) != washed);
+    }
+
+    /// Whether a frame is owed at `now`: the fade reached a step no frame was asked for
+    /// (marking it asked) or ended (letting it go).
+    fn due(&mut self, now: std::time::Instant) -> bool {
+        let Some(release) = self.release.as_mut() else {
+            return false;
+        };
+        match release.step_at(now) {
+            Some(step) if step == release.step => false,
+            Some(step) => {
+                release.step = step;
+                self.asked = self.asked.wrapping_add(1);
+                true
+            }
+            None => {
+                self.release = None;
+                self.asked = self.asked.wrapping_add(1);
+                true
+            }
+        }
+    }
+
+    /// The loop's next wake for the fade: the instant its step changes.
+    fn wake(&self) -> Option<std::time::Instant> {
+        self.release.as_ref().map(WashRelease::next_at)
     }
 }
 
@@ -1083,9 +1479,10 @@ pub(crate) const WARN_WASH: f32 = 0.16;
 
 /// A warn cell's ground and ink on a drawn row: a wash of the warn ink ([`WARN_WASH`]) where it
 /// has a hue of its own, the warn ink floored to 4.5:1 on it; `None` where it has none.
-fn warn_wash(c: &crate::tab_menu::MenuColors, glass: &GlassInks) -> Option<([u8; 3], [u8; 3])> {
+fn warn_wash(c: &CardInks) -> Option<([u8; 3], [u8; 3])> {
+    let glass = &c.glass;
     (glass.warn() != glass.lit()).then(|| {
-        let wash = crate::chrome_band::mix3(c.card_bg, unpack(glass.warn()), WARN_WASH);
+        let wash = crate::chrome_band::mix3(c.ground, c.warn(), WARN_WASH);
         let ink = aterm_effects::color_math::floor_contrast_keeping_hue(
             glass.warn(),
             pack(wash),
@@ -1095,25 +1492,24 @@ fn warn_wash(c: &crate::tab_menu::MenuColors, glass: &GlassInks) -> Option<([u8;
     })
 }
 
-/// A drawn row's cells inside the border (its sides are the caller's): each cell in its ink,
+/// A drawn row's cells: each cell in its ink,
 /// a hued one at its column's palette position over the card's own `w` cells, and a warn cell
 /// on its wash ([`warn_wash`]).
 fn paint_plot(
     w: usize,
     (text_start, text_end): (usize, usize),
     plot: &[PlotCell],
-    c: &crate::tab_menu::MenuColors,
-    glass: &GlassInks,
+    c: &CardInks,
 ) -> Vec<RenderCell> {
     let cell = crate::chrome_band::cell;
-    let busy_bg = crate::chrome_band::mix3(c.card_bg, c.band.accent, 0.10);
-    let warn_on = warn_wash(c, glass);
-    let mut cells = vec![cell(' ', c.band.value, c.card_bg, false, false); w];
+    let glass = &c.glass;
+    let warn_on = warn_wash(c);
+    let mut cells = vec![cell(' ', c.item(), c.ground, false, false); w];
     for (col, p) in (text_start..text_end).zip(plot.iter()) {
         let at = field(col, w);
         let (fg, bold) = match p.ink {
-            PlotInk::In => (c.band.accent, false),
-            PlotInk::Out => (c.band.value, false),
+            PlotInk::In => (c.accent, false),
+            PlotInk::Out => (c.item(), false),
             PlotInk::Axis => (unpack(glass.quiet()), false),
             PlotInk::Read => (unpack(glass.mark(at)), false),
             PlotInk::Mark => (unpack(glass.lit()), false),
@@ -1121,14 +1517,21 @@ fn paint_plot(
             PlotInk::Warn => (warn_on.map_or(unpack(glass.warn()), |(_, ink)| ink), true),
             PlotInk::Value => (unpack(glass.value()), false),
         };
-        let bg = match (p.busy, warn_on) {
-            (true, _) => busy_bg,
-            (false, Some((wash, _))) if p.ink == PlotInk::Warn => wash,
-            (false, _) => c.card_bg,
-        };
-        cells[col] = cell(p.ch, fg, bg, bold, false);
+        cells[col] = cell(p.ch, fg, plot_ground(p, c), bold, false);
     }
     cells
+}
+
+/// The ground a drawn row's cell stands on: a busy cell's tint of the accent, a warn cell's
+/// wash where the warn ink has a hue ([`warn_wash`]), else the card's own.
+fn plot_ground(p: &PlotCell, c: &CardInks) -> [u8; 3] {
+    if p.busy {
+        return crate::chrome_band::mix3(c.ground, c.accent, 0.10);
+    }
+    match warn_wash(c) {
+        Some((wash, _)) if p.ink == PlotInk::Warn => wash,
+        _ => c.ground,
+    }
 }
 
 /// Recently closed menu card rect used to swallow the second press of a double-click.
@@ -1164,6 +1567,10 @@ pub(crate) struct AutopilotMenu {
     /// What the permission chip's box says and the cells of content its words were wrapped to
     /// ([`crate::permission_box`]); `None` on a fact's card.
     pub(crate) told: Option<(crate::permission_box::Told, usize)>,
+    /// The card's frame as the last frame drew it ([`crate::footer_card_plate`]).
+    pub(crate) plate: CardPlate,
+    /// The wash of the row the pointer or the keys rest on, and the one fading.
+    pub(crate) wash: WashState,
 }
 
 /// Last pointer position and hovered choice recorded while the menu is open.
@@ -1241,6 +1648,14 @@ impl AutopilotMenu {
             || (rest.frame_row == Some(frame_row)
                 && rest.choice.is_some()
                 && rest.choice == self.choice_at(hit))
+    }
+
+    /// What the wash lies under: the highlighted choice, and on a slider the stop the keys or
+    /// the pointer rest on, else the one its thumb stands on.
+    fn washed(&self) -> Option<Washed> {
+        let i = self.highlight?;
+        let row = self.rows.get(i).filter(|row| row.selectable())?;
+        Some((i, row.rested_stop()))
     }
 
     /// Rest the keys or the pointer on `stop` of the slider at row `i`, returning whether that
@@ -1437,6 +1852,13 @@ impl AutopilotMenu {
         }
         self.viewport.hash(&mut h);
         self.page_rows.hash(&mut h);
+        // A released wash is painted a step fainter each time one is asked for, and each frame
+        // its fade asks for is painted, the one that ends it too.
+        self.wash
+            .release
+            .map(|release| (release.washed, release.step))
+            .hash(&mut h);
+        self.wash.asked.hash(&mut h);
         h.finish() | 1
     }
 }
@@ -1566,6 +1988,19 @@ impl App {
         )
     }
 
+    /// The window owing a frame for the open card's released wash, whose fade reached its next
+    /// step or ended at `now`.
+    pub(crate) fn card_wash_due(&mut self, now: std::time::Instant) -> Option<WindowId> {
+        let menu = self.autopilot_menu.as_mut()?;
+        menu.wash.due(now).then_some(menu.wid)
+    }
+
+    /// The loop's next wake for the open card's released wash
+    /// (`metrics::DeadlineOwner::CardWash`).
+    pub(crate) fn card_wash_wake(&self) -> Option<std::time::Instant> {
+        self.autopilot_menu.as_ref()?.wash.wake()
+    }
+
     /// Request a redraw on `wid`.
     pub(crate) fn request_menu_frame(&self, wid: WindowId) {
         if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
@@ -1662,8 +2097,26 @@ impl App {
             theme,
             palette,
         );
+        let serious = self.serious_mode_enabled();
+        // A released wash fades only on glass, in a focused window where motion is not
+        // reduced; elsewhere it goes in the frame that lights the next row.
+        let effect = crate::motion::MotionEffect::CardWash;
+        let fades = self.windows.get(&wid).is_some_and(|ws| {
+            ws.os_window.is_some() && self.effect_policy(effect, ws.focused).animate(effect)
+        });
+        // The frame's cell, as the pointer's: the laid grid's where there is one.
+        let cell = laid.map_or((cw, ch), |grid| grid.cell());
         let ws = self.windows.get_mut(&wid)?;
         let ground = crate::tab_menu::ground_cell(theme, ws.input_scratch.default_bg);
+        // Outside the frame's rounded corners the pane's own ground shows.
+        let mut painted = painted;
+        for row in [0, rect.h - 1] {
+            for col in [0, rect.w - 1] {
+                if let Some(slot) = painted.get_mut(row).and_then(|line| line.get_mut(col)) {
+                    *slot = ground;
+                }
+            }
+        }
         let right = rect.col + rect.w;
         for (r, row) in painted.iter().enumerate() {
             let frame_row = rect.row + r;
@@ -1690,7 +2143,7 @@ impl App {
             }
         }
         crate::claude_card::cut_out(&mut ws.claude_card, &mut ws.input_scratch, rect, cw, pad);
-        crate::app_render::scrub_overlay_card(
+        let occluder = crate::app_render::scrub_overlay_card(
             &mut ws.input_scratch,
             rect,
             (cw, ch),
@@ -1701,6 +2154,37 @@ impl App {
         for (r, row) in painted.iter().enumerate().take(on_frame) {
             ws.claude_card
                 .paint_marks(&mut ws.input_scratch, rect.row + r, rect.col, row);
+        }
+        // The card's frame (§1.4): its line, its shadow and its rules' hairlines in pixels
+        // under the cells just painted, standing on the card as its own (its occluder, which
+        // cuts every other layer, does not cut it); stripped with the marks.
+        let inks = CardInks::of(theme, palette);
+        let key = plate_key(rect, &inks, cell, ws.scale, serious);
+        if let Some(menu) = self.autopilot_menu.as_mut() {
+            // The wash (§1.5) is a layer of its own over the frame's: the pill of the row the
+            // pointer or the keys rest on, over the fainter one of the row they left.
+            let washed = menu.washed();
+            menu.wash
+                .settle(washed, menu.generation, std::time::Instant::now(), fades);
+            let left = menu
+                .wash
+                .release
+                .map(|was| (was.washed, was.alpha(inks.wash.1)));
+            let layers = card_layers(
+                (rect, &menu.rows, menu.viewport),
+                (&inks, key),
+                occluder,
+                (
+                    crate::claude_footer::quota::card_plate_id(session),
+                    crate::claude_footer::quota::card_wash_id(session),
+                ),
+                (&mut menu.plate, &mut menu.wash.art),
+                left.into_iter()
+                    .chain(washed.map(|washed| (washed, inks.wash.1))),
+            );
+            for layer in layers.into_iter().flatten() {
+                ws.claude_card.paint_layer(&mut ws.input_scratch, layer);
+            }
         }
         ws.input_scratch.snapshot_seq = ws.input_scratch.snapshot_seq.wrapping_add(1);
         if let Some(menu) = self.autopilot_menu.as_mut() {
@@ -1993,6 +2477,35 @@ impl App {
                 .laid
                 .and_then(|laid| laid.cell_at(x, y))
                 .is_some_and(|(row, col)| spent.rect.contains(row, col))
+    }
+
+    /// The window pixel at the centre of the open footer card's row `item`, as `controls
+    /// fact-menu` counts `index=`, where a person's pointer lights that row (`pointer move
+    /// item=<n>`): the middle of the card's width, which on a slider snaps to the stop drawn
+    /// there. A row that is no choice, one scrolled out of view and a card no frame has laid
+    /// on this grid are no aim.
+    pub(crate) fn fact_card_item_px(
+        &self,
+        wid: WindowId,
+        item: usize,
+    ) -> Result<(f64, f64), String> {
+        let off = || format!("item {item} is not a row the card shows");
+        let menu = self
+            .autopilot_menu
+            .as_ref()
+            .filter(|m| m.wid == wid)
+            .ok_or("no footer card is open")?;
+        let rect = menu.rect.ok_or("the card is not laid yet")?;
+        let grid = self
+            .laid_grid(wid, menu.laid)
+            .ok_or("the card is not laid yet")?;
+        let (r, _, row) = laid_rows(rect, &menu.rows, menu.viewport)
+            .find(|&(_, i, _)| i == item)
+            .ok_or_else(off)?;
+        if !row.selectable() {
+            return Err(off());
+        }
+        Ok(grid.cell_centre(rect.row + r, rect.col + rect.w / 2))
     }
 
     /// Update hover highlight and pointer rest state on mouse motion in `wid`.

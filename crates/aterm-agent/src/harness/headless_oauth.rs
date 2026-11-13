@@ -8310,9 +8310,9 @@ fn authorize_pinned_browser_until(
         |profile_dir| {
             deadline.left()?;
             let (cmd_read, cmd_write) =
-                std::io::pipe().map_err(|_| "could not open CDP command pipe")?;
+                aterm_uds::pipe().map_err(|_| "could not open CDP command pipe")?;
             let (out_read, out_write) =
-                std::io::pipe().map_err(|_| "could not open CDP event pipe")?;
+                aterm_uds::pipe().map_err(|_| "could not open CDP event pipe")?;
 
             let cmd =
                 headless_browser_command(&browser, profile_dir, &|name| std::env::var_os(name));
@@ -10329,9 +10329,9 @@ impl VendorApprover {
         let home = self.home.as_deref();
         let ran = in_profile(profile_dir, |profile_dir| {
             let (cmd_read, cmd_write) =
-                std::io::pipe().map_err(|_| "could not open CDP command pipe")?;
+                aterm_uds::pipe().map_err(|_| "could not open CDP command pipe")?;
             let (out_read, out_write) =
-                std::io::pipe().map_err(|_| "could not open CDP event pipe")?;
+                aterm_uds::pipe().map_err(|_| "could not open CDP event pipe")?;
             let cmd =
                 headless_browser_command(browser, profile_dir, &|name| std::env::var_os(name));
             if self

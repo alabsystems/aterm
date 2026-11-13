@@ -502,7 +502,7 @@ fn a_broadcast_refill_floor_round_trips_and_goes_with_its_cursors_and_its_log() 
     );
 
     st.set_topic_floors("s-y", &floors).expect("write");
-    st.forget_log_offsets(100, None, None, None)
+    st.forget_log_offsets(100, None, None, None, None)
         .expect("re-base");
     assert!(
         st.topic_floors("s-y").unwrap().is_empty(),
@@ -2210,19 +2210,20 @@ fn a_re_base_drops_proven_old_references_and_keeps_uncertain_or_unrelated_mail()
     };
     st.set_in_flight(&note).unwrap();
     assert_eq!(
-        st.forget_log_offsets(100, Some(b), None, None).unwrap(),
+        st.forget_log_offsets(100, None, Some(b), None, None)
+            .unwrap(),
         vec![(1, face.to_string())]
     );
     let kept = vec![(2, entry(2, None)), (3, entry(3, Some(b))), (4, note)];
     assert_eq!(st.in_flight().unwrap(), kept);
     assert!(
-        st.forget_log_offsets(100, Some(b), None, None)
+        st.forget_log_offsets(100, None, Some(b), None, None)
             .unwrap()
             .is_empty(),
         "idempotent"
     );
     assert!(
-        st.forget_log_offsets(7, None, None, None)
+        st.forget_log_offsets(7, None, None, None, None)
             .unwrap()
             .is_empty(),
         "no identity proves no mismatch"
@@ -2233,7 +2234,7 @@ fn a_re_base_drops_proven_old_references_and_keeps_uncertain_or_unrelated_mail()
     assert_eq!(
         StateDir::open(&dir)
             .unwrap()
-            .forget_log_offsets(7, Some(b), None, None)
+            .forget_log_offsets(7, None, Some(b), None, None)
             .unwrap_err()
             .kind(),
         io::ErrorKind::InvalidData
@@ -2248,7 +2249,7 @@ fn a_re_base_drops_proven_old_references_and_keeps_uncertain_or_unrelated_mail()
     assert_eq!(
         StateDir::open(&dir)
             .unwrap()
-            .forget_log_offsets(7, Some(b), None, None)
+            .forget_log_offsets(7, None, Some(b), None, None)
             .unwrap_err()
             .kind(),
         io::ErrorKind::InvalidData,
@@ -2339,7 +2340,8 @@ fn a_moved_generation_clamps_the_offsets_it_continues_and_forgets_the_rest() {
     let st = StateDir::open(&dir).unwrap();
     fill(&st);
     assert_eq!(
-        st.forget_log_offsets(12, Some(new), Some(5), None).unwrap(),
+        st.forget_log_offsets(12, None, Some(new), Some(5), None)
+            .unwrap(),
         vec![answer(2)],
         "only the in-flight reply to a record the loss took goes"
     );
@@ -2386,14 +2388,14 @@ fn a_moved_generation_clamps_the_offsets_it_continues_and_forgets_the_rest() {
     };
     clamped(&st);
     assert!(
-        st.forget_log_offsets(12, Some(new), Some(5), None)
+        st.forget_log_offsets(12, None, Some(new), Some(5), None)
             .unwrap()
             .is_empty(),
         "idempotent"
     );
     clamped(&st);
     st.set_topics("s-z", &cursors(&[("d", 30)])).unwrap();
-    st.forget_log_offsets(12, Some(new), Some(40), None)
+    st.forget_log_offsets(12, None, Some(new), Some(40), None)
         .unwrap();
     assert_eq!(st.topics("s-z"), cursors(&[("d", 12)]));
 
@@ -2401,7 +2403,8 @@ fn a_moved_generation_clamps_the_offsets_it_continues_and_forgets_the_rest() {
     let st = StateDir::open(&twin).unwrap();
     fill(&st);
     assert_eq!(
-        st.forget_log_offsets(12, Some(new), None, None).unwrap(),
+        st.forget_log_offsets(12, None, Some(new), None, None)
+            .unwrap(),
         vec![answer(1), answer(2)]
     );
     assert_eq!((st.seen_off("s-low"), st.seen_off("s-high")), (None, None));
@@ -2459,7 +2462,7 @@ fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on
     .continues(Some(log(2)), Some(&lineage));
     assert_eq!(keep_below, Some(138), "the newest move's fork");
     assert_eq!(
-        st.forget_log_offsets(150, Some(log(2)), keep_below, Some(&lineage))
+        st.forget_log_offsets(150, None, Some(log(2)), keep_below, Some(&lineage))
             .unwrap(),
         vec![ack(2), ack(4)],
         "generation 0's reply at 41 and generation 1's at 138 go"
@@ -2482,12 +2485,56 @@ fn an_in_flight_reply_is_kept_only_below_the_fork_of_the_log_it_was_witnessed_on
     let st = StateDir::open(&twin).unwrap();
     fill(&st);
     assert_eq!(
-        st.forget_log_offsets(150, Some(log(2)), keep_below, None)
+        st.forget_log_offsets(150, None, Some(log(2)), keep_below, None)
             .unwrap(),
         vec![ack(4)]
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_dir_all(&twin);
+}
+
+/// **A PIN'S HEAD READS ANOTHER LOG FROM ITS START, AND NOTHING ELSE THAT CONTINUES NONE**
+/// (ATERM-KI-1111-4 hostile review): on another id told with its lineage every record landed
+/// after the pin, so the head comes down to 0 and the retry reads the log back from its start.
+/// A log that keeps the id and continues nothing (a restored or shortened copy) or one told
+/// without lineage may hold an earlier identical record, which a read back from 0 would settle
+/// the pin on, so the post would never be published: there the head is taken out, and the
+/// retry publishes unread, as before.
+#[test]
+fn a_pins_head_reads_back_from_0_only_on_another_log() {
+    let log = |id: u8, generation| astream_broker::LogIdentity {
+        id: [id; 16],
+        generation,
+    };
+    let none = astream_broker::Lineage::from_steps(&[]).expect("an empty lineage");
+    let headed = PublishPin {
+        at: Some(40),
+        ..in_flight_entry(7).pin
+    };
+    for (what, was, now, lineage, want) in [
+        ("another id", log(1, 0), log(2, 0), Some(&none), Some(0)),
+        (
+            "the same id continuing none",
+            log(1, 0),
+            log(1, 1),
+            Some(&none),
+            None,
+        ),
+        ("another id, no lineage", log(1, 0), log(2, 0), None, None),
+    ] {
+        let dir = scratch("pin-head-another-log");
+        let st = StateDir::open(&dir).expect("open");
+        st.take_incarnation(0).expect("an attach");
+        st.set_post_pin("s-a", 1, &headed).expect("reserved");
+        st.forget_log_offsets(20, Some(was), Some(now), None, lineage)
+            .expect("forgotten");
+        assert_eq!(
+            st.post_pin("s-a", 1).expect("reads").map(|pin| pin.at),
+            Some(want),
+            "{what}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 #[test]
@@ -3286,13 +3333,13 @@ fn a_log_switch_refuses_a_dangling_offset_directory() {
         }
         std::os::unix::fs::symlink(dir.join("missing"), &area).unwrap();
         assert!(
-            st.forget_log_offsets(20, None, None, None).is_err(),
+            st.forget_log_offsets(20, None, None, None, None).is_err(),
             "unreadable {blocked} was empty"
         );
         assert!(area.is_symlink(), "the unreadable directory entry stays");
         std::fs::remove_file(&area).unwrap();
         assert!(
-            st.forget_log_offsets(20, None, None, None).is_ok(),
+            st.forget_log_offsets(20, None, None, None, None).is_ok(),
             "an absent directory is empty"
         );
         let _ = std::fs::remove_dir_all(&dir);
@@ -4156,7 +4203,7 @@ fn resume_through(
     let mut cursors = BTreeMap::new();
     cursors.insert("t".to_string(), TopicCursor { next: c });
     st.set_topics("s-r", &cursors).expect("write the cursor");
-    st.forget_log_offsets(h, Some(log(g)), keep_below, Some(&lineage))
+    st.forget_log_offsets(h, None, Some(log(g)), keep_below, Some(&lineage))
         .expect("forget or clamp");
     i64::try_from(st.topics("s-r")["t"].next).expect("an offset")
 }
@@ -4261,14 +4308,14 @@ fn a_generation_clamp_preserves_uncertain_refill_evidence() {
         &BTreeMap::from([("topic".to_string(), 1), ("gone".to_string(), 7)]),
     )
     .unwrap();
-    st.forget_log_offsets(9, None, Some(6), None).unwrap();
+    st.forget_log_offsets(9, None, None, Some(6), None).unwrap();
     assert_eq!(
         st.topic_floors(sid).unwrap(),
         BTreeMap::from([("topic".into(), 1)])
     );
     assert_eq!(st.topics(sid)["topic"].next, 6);
     assert_eq!(st.seen_off(sid), Some(5));
-    st.forget_log_offsets(9, None, None, None).unwrap();
+    st.forget_log_offsets(9, None, None, None, None).unwrap();
     assert!(st.topic_floors(sid).unwrap().is_empty());
 
     let mut preserved = Vec::new();
@@ -4280,7 +4327,7 @@ fn a_generation_clamp_preserves_uncertain_refill_evidence() {
             std::fs::write(&floor, bytes).unwrap();
             let before_topics = std::fs::read(dir.path().join("topics").join(sid)).unwrap();
             let before_seen = std::fs::read(dir.path().join("seen").join(sid)).unwrap();
-            let result = st.forget_log_offsets(9, None, keep, None);
+            let result = st.forget_log_offsets(9, None, None, keep, None);
             preserved.push(
                 result.is_err()
                     && std::fs::read(&floor).is_ok_and(|got| got == bytes)
@@ -4437,7 +4484,7 @@ fn a_torn_file_after_an_unclean_stop_is_set_aside_and_within_a_boot_refused() {
                 Some(""),
                 "the mirror's pin stays, for the mirror to refuse"
             );
-            st.publication_offset_resets(None)
+            st.publication_offset_resets(None, false)
                 .expect("a log move's reset reads");
             assert!(st.set_aside_torn().expect("again").is_empty(), "idempotent");
             std::fs::write(&journal_path, &cut_journal).expect("a record cut short");
@@ -4485,7 +4532,7 @@ fn a_torn_file_after_an_unclean_stop_is_set_aside_and_within_a_boot_refused() {
                 next.post_pin("s-a", 2).expect_err("refused").kind(),
                 io::ErrorKind::InvalidData
             );
-            assert!(next.publication_offset_resets(None).is_err());
+            assert!(next.publication_offset_resets(None, false).is_err());
             assert!(next.topic_floors("s-a").is_err());
             assert!(next
                 .logpin()

@@ -973,6 +973,81 @@ fn the_light_reads_carry_a_light_schemes_light() {
     }
 }
 
+/// The glass reads' wiring (§15.2 1.12 leans on the pin): on a light configured scheme at the
+/// glass level, typed in an app's red, each read the pin holds absent on every dark ground that
+/// the glass's code draws by breaks, so each is read from the code that draws by it, not wired
+/// to an object no frame touches. Default Light's tables ship, so its glass draws from the first
+/// frame; a page with none (Iceberg Light, a pack theme) starts its palette's solve instead,
+/// which the ribbon holds. A read only another stand or page lights (a split's pane light, a
+/// wrapped composer's rows) is held by its own run.
+#[test]
+fn the_glass_reads_carry_the_glass() {
+    const RED: &str = "\x1b[38;2;196;38;46m";
+    let broke_at = |ground: Ground, scale: f64| -> std::collections::BTreeSet<&'static str> {
+        let (_, drawn) = run_at(
+            ground,
+            Page::Plain,
+            Stand::Instance,
+            Entry::Present,
+            "",
+            (Some(Live::Glass), RED, scale),
+        );
+        drawn.iter().flat_map(breaks).collect()
+    };
+    let broke = |ground: Ground| broke_at(ground, 2.0);
+    let shipped = broke(Ground::Builtin(LIGHT_INSTANCE));
+    for read in [
+        "light_arms_drawn",
+        "frame_light",
+        "latch",
+        "window_light",
+        "bed glass",
+        "light_words",
+        "ribbon_wedge_into",
+        "ribbon_glass_into",
+        "glass plan",
+        "glass exits",
+        "glass_px",
+        "glass_drew",
+        "glass_span",
+        "light_owned",
+        "ledger light_owned",
+        "yield",
+        "yield_spent",
+        "yield memo",
+    ] {
+        assert!(
+            shipped.contains(read),
+            "{read} carried the glass: {shipped:?}"
+        );
+    }
+    let iceberg = aterm_theme_pack::find("Iceberg Light").expect("a pack light theme");
+    let solving = broke(Ground::Pack {
+        id: iceberg.id,
+        text: iceberg.text,
+    });
+    assert!(
+        solving.contains("palettes"),
+        "the ribbon holds the solve: {solving:?}"
+    );
+    // §15.8 amendment 53: the same frames at the dump's 1x size, whose face lays its thinnest
+    // glyph with no pixel near the full ink, keep the latched light but draw main's paper arm: no
+    // glass read breaks.
+    let short = broke_at(Ground::Builtin(LIGHT_INSTANCE), 1.0);
+    assert!(short.contains("latch"), "the latch admits at 1x: {short:?}");
+    for read in [
+        "light_arms_drawn",
+        "bed glass",
+        "ribbon_glass_into",
+        "glass_px",
+        "glass_drew",
+        "glass_span",
+        "yield",
+    ] {
+        assert!(!short.contains(read), "{read} at 1x: {short:?}");
+    }
+}
+
 /// The pin's negative control (§15.1 P0.9): on a dark ground, a frame forced onto the light
 /// polarity fails it, through the real cursor frame and as a read with only `dark_theme`
 /// forced; so does a light arm drawing, a bed drawn by the glass, light words, a latched light
@@ -1041,9 +1116,6 @@ fn forcing_dark_theme_false_on_a_dark_ground_fails_the_pin() {
         theme_fg: 0x002B_2D33,
         theme_bg: 0x00F6_F7F9,
         light: Light::at(Live::Glass),
-        // The glass is the tall body's: the `rainbow` theme, the underline, lays none, so the
-        // bed this control syncs is the engine's own tall config.
-        ribbon_tall: true,
         ..cfg
     };
     let glassed = Drawn {

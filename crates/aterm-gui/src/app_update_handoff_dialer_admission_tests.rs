@@ -18,7 +18,7 @@ use aterm_models_update::native_update_rendezvous_admission_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, with_buggy};
 use std::cell::RefCell;
-use std::os::fd::{AsFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::AsFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::SyncSender;
@@ -171,14 +171,6 @@ fn bind() -> Rendezvous {
     Rendezvous::bind(&nonce).expect("bind a rendezvous for the Tier-1")
 }
 
-fn pipe() -> (OwnedFd, OwnedFd) {
-    let mut raw = [0i32; 2];
-    // SAFETY: `pipe` fills two fresh descriptors into the array.
-    assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0, "pipe");
-    // SAFETY: both are fresh descriptors this test owns from here.
-    unsafe { (OwnedFd::from_raw_fd(raw[0]), OwnedFd::from_raw_fd(raw[1])) }
-}
-
 fn this_binary() -> PathBuf {
     std::env::current_exe().expect("the test binary")
 }
@@ -251,9 +243,9 @@ fn received_by(stranger: crate::test_alone::Running) -> usize {
 /// The production tail after an accepted dial: one master and both pipes,
 /// granted on the held claim as `run_prelaunched_handoff` grants them.
 fn grant(peer: &crate::handoff_rendezvous::ClaimedPeer) {
-    let (master, _master_peer) = pipe();
-    let (_ready_rd, ready_wr) = pipe();
-    let (commit_rd, _commit_wr) = pipe();
+    let (master, _master_peer) = aterm_uds::pipe().expect("a master stand-in");
+    let (_ready_rd, ready_wr) = aterm_uds::pipe().expect("a ready pipe");
+    let (commit_rd, _commit_wr) = aterm_uds::pipe().expect("a commit pipe");
     peer.transfer(
         "0123456789abcdef0123456789abcdef",
         &[(1, 4242, master.as_fd())],

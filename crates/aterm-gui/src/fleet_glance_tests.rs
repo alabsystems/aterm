@@ -1156,6 +1156,7 @@ fn a_child_that_never_answers_is_killed_and_posts_its_failure() {
             program: PathBuf::from("/bin/sleep"),
             args: vec!["600".to_string()],
             cap: Duration::from_millis(200),
+            sighted: |_| {},
         }),
         seams(true, posts_tx),
     )
@@ -1172,6 +1173,7 @@ fn a_child_that_never_answers_is_killed_and_posts_its_failure() {
             program: PathBuf::from("/bin/echo"),
             args: vec!["[]".to_string()],
             cap: Duration::from_secs(60),
+            sighted: |_| {},
         }),
         seams(true, posts_tx),
     )
@@ -2027,6 +2029,7 @@ fn the_glance_spawns_no_child_process_and_shows_a_fixtures_now_needs_rows() {
         program: PathBuf::from("/bin/echo"),
         args: vec!["[]".to_string()],
         cap: Duration::from_secs(60),
+        sighted: |_| {},
     };
     assert!(survey.dials());
     let (surveyed, spawned) = aterm_uds::spawnfd::spawns_during(|| survey.read(None, &|| NOW));
@@ -3001,4 +3004,443 @@ fn answered_nodes_come_only_from_a_fresh_whole_read_and_count_carried_macs() {
     let mut outside = slot;
     outside.book.in_fleet = false;
     assert_eq!(answered_nodes(&outside, t0 + 1), None, "in no fleet");
+}
+
+/// THE SAME ANSWER, READ WHOLE FOR THE FLEET TABLES: `sightings` keeps this Mac's own windows'
+/// replies as one machine and every agent session with its account word, model, state and
+/// figures, where `parse` keeps the peers alone and reads the same answer as it always has.
+#[cfg(unix)]
+#[test]
+fn sightings_keep_this_mac_and_every_agent_row_and_parse_is_unchanged() {
+    use aterm_db::fleet::read::{Answer, Answered, Harness, How, MachineSeen, State, Tally, Task};
+
+    fn local(pid: &str, header: &[(&str, &str)], rows: &[&[(&str, &str)]]) -> String {
+        peer(&format!("pid {pid}"), header, rows).replace("\"fleet\":true,", "")
+    }
+    fn answered(seen: &MachineSeen) -> &Answered {
+        match &seen.answer {
+            Answer::Answered(answered) => answered,
+            Answer::Silent { why } => panic!("{:?} was silent: {why:?}", seen.label),
+        }
+    }
+    const WORKER: &[(&str, &str)] = &[
+        ("sid", "s-aaaa0001"),
+        ("state", "alive"),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", "busy"),
+        ("agent_ms", "42000"),
+        ("task", "working"),
+        ("model", "fable-5.2"),
+        ("ctx_left_pct", "61"),
+        ("usage_5h_pct", "12"),
+        ("usage_7d_pct", "40"),
+        ("account", "one@lab.example"),
+        ("needs", "-"),
+    ];
+    const WALLED: &[(&str, &str)] = &[
+        ("sid", "s-aaaa0002"),
+        ("state", "alive"),
+        ("program", "codex-alab"),
+        ("program_kind", "agent"),
+        ("agent", "wall:usage-weekly"),
+        ("account", "codex-one"),
+        ("needs", "wall"),
+    ];
+    const STALLED: &[(&str, &str)] = &[
+        ("sid", "s-aaaa0003"),
+        ("state", "alive"),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", "idle"),
+        ("task", "stalled"),
+        ("task_ms", "900000"),
+        ("needs", "stalled"),
+    ];
+    const GONE: &[(&str, &str)] = &[
+        ("sid", "s-aaaa0004"),
+        ("state", "exited"),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", "busy"),
+        ("needs", "-"),
+    ];
+    const OLDER: &[(&str, &str)] = &[
+        ("sid", "s-bbbb0001"),
+        ("state", "alive"),
+        ("program", "claude"),
+        ("program_kind", "agent"),
+        ("agent", "busy"),
+    ];
+
+    // This Mac: two windows' replies, both of node `own-node`, one session listed by both.
+    let mut own_header = header("own-node");
+    own_header.extend([
+        ("version", "0.141.0".to_string()),
+        ("label", "m3".to_string()),
+        ("home_free_mb", "51234".to_string()),
+    ]);
+    let own_header = pairs(&own_header);
+    let mut m7 = header("n7");
+    m7.extend([
+        ("version", "0.140.0".to_string()),
+        ("label", "m7".to_string()),
+    ]);
+    let mut cut = header("ncut");
+    cut[2].1 = "5".to_string();
+    let mut liar = header("nliar");
+    liar.push(("label", "m3".to_string()));
+    let hosts = [
+        local("1", &own_header, &[WORKER, QUIET]),
+        local("2", &own_header, &[WORKER, WALLED]),
+        // This Mac, answering its own fleet question: the same machine, named once.
+        peer("m3.local at 10.0.0.3:7100", &own_header, &[WORKER]),
+        peer(
+            "m7.local at 10.0.0.7:7100",
+            &pairs(&m7),
+            &[STALLED, GONE, QUIET],
+        ),
+        peer("mac-old.local", &pairs(&header("nold")), &[OLDER]),
+        peer("mac-cut.local", &pairs(&cut), &[QUIET, WORKER]),
+        peer("m9.local", &pairs(&liar), &[QUIET])
+            .replace("\"fleet\":true,", "\"fleet\":true,\"unproven\":true,"),
+        "{\"label\":\"m12.local at 10.0.0.12:7100\",\"fleet\":true,\
+          \"error\":\"did not answer in 3 s at 10.0.0.12\",\"reason\":\"nothing-listens\"}"
+            .to_string(),
+        "{\"label\":\"m13.local\",\"fleet\":true}".to_string(),
+    ];
+    let json = format!("[{}]", hosts.join(","));
+
+    // `parse` reads what it read before: the peers, not this Mac, and no account.
+    let glance = parse(&json, Some("own-node"), 1_000).expect("a survey");
+    let dials: Vec<&str> = glance.macs.iter().map(|mac| mac.dial.as_str()).collect();
+    assert_eq!(
+        dials,
+        ["m7.local", "mac-old.local", "mac-cut.local", "m9.local"]
+    );
+    let silent: Vec<&str> = glance
+        .unanswered
+        .iter()
+        .map(|mac| mac.dial.as_str())
+        .collect();
+    assert_eq!(silent, ["m12.local", "m13.local"]);
+    assert_eq!(glance.macs[0].sessions, Some(2));
+    assert_eq!(
+        glance.macs[0].activity,
+        Some(AgentTally {
+            agents: 1,
+            idle: 1,
+            ..AgentTally::default()
+        })
+    );
+
+    let read = sightings(&json, 1_000).expect("a survey");
+    assert_eq!(read.read_at_ms, 1_000);
+    assert_eq!(
+        parse(&json, Some("own-node"), 1_000).expect("a survey"),
+        glance
+    );
+
+    // This Mac is the first machine: its windows' replies as one, each session once.
+    let own = &read.machines[0];
+    assert_eq!((own.how, own.id.as_str()), (How::Own, "self"));
+    assert_eq!(own.label.as_deref(), Some("m3"));
+    assert_eq!(
+        read.machines
+            .iter()
+            .filter(|seen| seen.how == How::Own)
+            .count(),
+        1
+    );
+    let mine = answered(own);
+    assert_eq!(mine.build.as_deref(), Some("0.141.0"));
+    assert_eq!(mine.home_free_mb, Some(51_234));
+    assert_eq!(
+        mine.sessions,
+        Some(3),
+        "the worker both windows list is one session"
+    );
+    assert_eq!(
+        mine.tally,
+        Some(Tally {
+            agents: 2,
+            busy: 1,
+            walled: 1,
+            ..Tally::default()
+        })
+    );
+    let sids: Vec<&str> = mine.agents.iter().map(|agent| agent.sid.as_str()).collect();
+    assert_eq!(sids, ["s-aaaa0001", "s-aaaa0002"]);
+    let worker = &mine.agents[0];
+    assert_eq!(
+        (worker.harness, worker.state),
+        (Harness::Claude, State::Busy)
+    );
+    assert_eq!(worker.state_age_ms, Some(42_000));
+    assert_eq!(worker.task, Some(Task::Working));
+    assert_eq!(worker.model.as_deref(), Some("fable-5.2"));
+    assert_eq!(
+        (
+            worker.ctx_left_pct,
+            worker.usage_5h_pct,
+            worker.usage_7d_pct
+        ),
+        (Some(61), Some(12), Some(40))
+    );
+    assert!(
+        worker.account.is_some(),
+        "its account word goes on to be resolved"
+    );
+    assert!(
+        !format!("{read:?}").contains("lab.example"),
+        "and prints nowhere"
+    );
+    let walled = &mine.agents[1];
+    assert_eq!(
+        (walled.harness, walled.state),
+        (Harness::CodexAlab, State::Walled)
+    );
+    assert_eq!(walled.state_why.as_deref(), Some("usage-weekly"));
+    assert_eq!((walled.model.as_deref(), walled.ctx_left_pct), (None, None));
+
+    // Every peer is a machine, by the name the book dials: no address is kept.
+    let peers: Vec<(Option<&str>, Option<&str>)> = read.machines[1..]
+        .iter()
+        .map(|seen| (seen.host.as_deref(), seen.label.as_deref()))
+        .collect();
+    assert_eq!(
+        peers,
+        [
+            (Some("m7"), Some("m7")),
+            (Some("mac-old"), None),
+            (Some("mac-cut"), None),
+            // It proved no node key this Mac binds: the `m3` it claims is not taken.
+            (Some("m9"), None),
+            (Some("m12"), None),
+            (Some("m13"), None),
+        ]
+    );
+    assert!(
+        read.machines[1..]
+            .iter()
+            .all(|seen| seen.how == How::Survey)
+    );
+    assert!(read.fleet, "the fleet was asked");
+    // The peer that proved no key is marked: what it says of itself is a claim.
+    let unproven: Vec<Option<&str>> = read
+        .machines
+        .iter()
+        .filter(|seen| seen.unproven)
+        .map(|seen| seen.host.as_deref())
+        .collect();
+    assert_eq!(unproven, [Some("m9")]);
+    assert!(!format!("{read:?}").contains("10.0.0."));
+    let m7 = answered(&read.machines[1]);
+    assert_eq!(m7.sessions, Some(2), "an exited session is no session");
+    assert_eq!(m7.agents.len(), 1);
+    assert_eq!(
+        (m7.agents[0].state, m7.agents[0].task),
+        (State::Stuck, Some(Task::Stalled)),
+        "a stalled task says more than its agent's idle"
+    );
+    assert_eq!(
+        m7.tally.map(|tally| (tally.agents, tally.stuck)),
+        Some((1, 1))
+    );
+    // An older aterm's agents cannot be classed, and a cut answer is a lower bound: neither is
+    // a count, though the rows they sent are still rows.
+    let old = answered(&read.machines[2]);
+    assert_eq!(
+        (old.sessions, old.tally, old.agents.len()),
+        (Some(1), None, 1)
+    );
+    let cut = answered(&read.machines[3]);
+    assert_eq!((cut.sessions, cut.tally, cut.agents.len()), (None, None, 1));
+    assert_eq!(
+        read.machines[5].answer,
+        Answer::Silent {
+            why: Some("nothing-listens".to_owned())
+        },
+        "the reason token, never the prose that names an address"
+    );
+    assert_eq!(
+        read.machines[6].answer,
+        Answer::Silent {
+            why: Some("no-header".to_owned())
+        }
+    );
+
+    // Control: with no window of this Mac replying, no machine is this Mac, and its answer to
+    // its own fleet question is then a peer like any other.
+    let peers_only = format!("[{}]", hosts[2..].join(","));
+    let read = sightings(&peers_only, 2_000).expect("a survey");
+    assert!(read.machines.iter().all(|seen| seen.how == How::Survey));
+    assert_eq!(read.machines.len(), 7);
+    assert_eq!(read.machines[0].label.as_deref(), Some("m3"));
+
+    // The row that stands for a refused read of the whole fleet names no machine.
+    let fleet_unread = format!(
+        "{{\"label\":\"the fleet\",\"fleet\":true,\"error\":\"this Mac is away\",\"reason\":\"{}\"}}",
+        aterm_ctl::FLEET_UNREAD
+    );
+    assert!(sightings(&format!("[{fleet_unread}]"), 3_000).is_err());
+    assert!(sightings("{}", 3_000).is_err());
+
+    // Beside it, this Mac's own windows still answered: the read is this Mac alone, with
+    // every session they listed, and says the fleet was not asked.
+    let away = format!("[{},{},{fleet_unread}]", hosts[0], hosts[1]);
+    let read = sightings(&away, 4_000).expect("this Mac's windows answered");
+    assert!(!read.fleet, "no peer was asked");
+    assert_eq!(read.machines.len(), 1);
+    assert_eq!(read.machines[0].how, How::Own);
+    let mine = answered(&read.machines[0]);
+    assert_eq!((mine.sessions, mine.agents.len()), (Some(3), 2));
+    assert_eq!(mine.tally.map(|tally| tally.agents), Some(2));
+
+    // A LOCAL aterm PROCESS THAT DID NOT ANSWER: the sessions the others listed are a lower
+    // bound, so this Mac has no session count and no tally, though the rows heard are rows.
+    let hung = "{\"label\":\"pid 777\",\"error\":\"pid 777 did not answer\"}";
+    let partial = sightings(&format!("[{},{hung}]", hosts[0]), 5_000).expect("a survey");
+    assert!(partial.fleet);
+    let mine = answered(&partial.machines[0]);
+    assert_eq!(
+        (mine.sessions, mine.tally, mine.agents.len()),
+        (None, None, 1),
+        "a lower bound is no count"
+    );
+    // Control: the same reply with no unanswered process beside it is a count.
+    let whole = sightings(&format!("[{}]", hosts[0]), 5_000).expect("a survey");
+    let mine = answered(&whole.machines[0]);
+    assert_eq!(mine.sessions, Some(2));
+    assert_eq!(mine.tally.map(|tally| tally.agents), Some(1));
+    // With no window answering at all, an unanswered process is no machine.
+    let none = sightings(&format!("[{hung}]"), 5_000).expect("a survey");
+    assert!(none.machines.is_empty());
+}
+
+/// EVERY READ IS HANDED ON FOR THE FLEET TABLES: the answer with the time it came, and a read
+/// that gave none (an empty answer, a child killed at its cap) as none.
+#[cfg(unix)]
+#[test]
+fn every_read_is_handed_on_for_the_fleet_tables_answered_empty_or_failed() {
+    const AT: u64 = 1_800_000_000_000;
+    static HANDED: Mutex<Vec<Option<(String, u64)>>> = Mutex::new(Vec::new());
+    fn sink(answer: Option<(&str, u64)>) {
+        HANDED
+            .lock()
+            .expect("the tally")
+            .push(answer.map(|(json, at)| (json.to_owned(), at)));
+    }
+    let runner = |program: &str, args: &[&str], cap: Duration| ChildRunner {
+        program: PathBuf::from(program),
+        args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+        cap,
+        sighted: sink,
+    };
+    let hang = aterm_spec::wait::MUST_HAPPEN;
+    assert!(
+        runner("/bin/echo", &["[]"], hang)
+            .read(None, &|| AT)
+            .is_ok()
+    );
+    assert!(
+        runner("/usr/bin/true", &[], hang)
+            .read(None, &|| AT)
+            .is_err(),
+        "an empty answer is no survey"
+    );
+    assert!(
+        runner("/bin/sleep", &["600"], Duration::from_millis(200))
+            .read(None, &|| AT)
+            .is_err(),
+        "a child killed at its cap answered nothing"
+    );
+    assert_eq!(
+        *HANDED.lock().expect("the tally"),
+        [Some(("[]\n".to_owned(), AT)), None, None]
+    );
+    // The read the status item makes hands its answers to this process's tables.
+    assert!(std::ptr::fn_addr_eq(
+        ChildRunner::fleet().sighted,
+        tables_sink()
+    ));
+    assert!(!std::ptr::fn_addr_eq(
+        ChildRunner::fleet().sighted,
+        sink as fn(Option<(&str, u64)>)
+    ));
+}
+
+/// WHAT THE TABLES MAKE OF EACH READ HANDED ON: an answer is the live reading; a refused read
+/// of the fleet gives this Mac its own answer and holds the peers; a read that gave no answer,
+/// or none that is a survey, holds everything read before it.
+#[cfg(unix)]
+#[test]
+fn a_read_handed_on_is_folded_live_held_for_the_fleet_or_held_whole() {
+    use aterm_db::fleet::{HELD_FLEET_UNREAD, HELD_READ_FAILED};
+
+    let own = |sessions: &[&[(&str, &str)]]| {
+        peer("pid 1", &pairs(&header("own-node")), sessions).replace("\"fleet\":true,", "")
+    };
+    let m7 = peer("m7.local", &pairs(&header("n7")), &[QUIET]);
+    let folder = aterm_db::fleet::Folder::new();
+    let tables = |now_ms: u64| {
+        folder.fold_now(now_ms);
+        folder.tables().value
+    };
+    // This Mac's sessions, then the peer's (with no registry read, this Mac's row is `self`).
+    let sessions = |tables: &aterm_db::fleet::fold::FleetTables| -> [Option<u32>; 2] {
+        let of = |own: bool| {
+            tables
+                .machines
+                .iter()
+                .find(|row| (row.machine == "self") == own)
+                .and_then(|row| row.sessions.map(|at| at.v))
+        };
+        [of(true), of(false)]
+    };
+
+    offer_sightings_to(&folder, Some((&format!("[{},{m7}]", own(&[QUIET])), 1_000)));
+    let first = tables(1_000);
+    assert_eq!(first.sources.read.word(), "live");
+    assert_eq!(sessions(&first), [Some(1), Some(1)]);
+
+    // This Mac goes away: its windows answer, with one session more, and the fleet does not.
+    let second: &[(&str, &str)] = &[
+        ("sid", "s-2"),
+        ("state", "alive"),
+        ("program", "zsh"),
+        ("program_kind", "shell"),
+        ("agent", "-"),
+        ("needs", "-"),
+    ];
+    let away = format!(
+        "[{},{{\"label\":\"the fleet\",\"fleet\":true,\"error\":\"this Mac is away\",\"reason\":\"{}\"}}]",
+        own(&[QUIET, second]),
+        aterm_ctl::FLEET_UNREAD
+    );
+    offer_sightings_to(&folder, Some((&away, 61_000)));
+    let held = tables(61_000);
+    assert_eq!(
+        (held.sources.read.why(), held.sources.read.at_ms()),
+        (Some(HELD_FLEET_UNREAD), Some(1_000))
+    );
+    assert_eq!(
+        sessions(&held),
+        [Some(2), Some(1)],
+        "this Mac's row takes the answer its windows just gave; the peer's stands"
+    );
+    let mine = held
+        .machines
+        .iter()
+        .find(|row| row.machine == "self")
+        .expect("this Mac is a row");
+    assert_eq!(mine.sessions.map(|at| at.at_ms), Some(61_000));
+
+    // A read that gave no answer, and one that is no survey: everything read stays, held.
+    for (n, nothing) in [None, Some(("{}", 122_000))].into_iter().enumerate() {
+        offer_sightings_to(&folder, nothing);
+        let failed = tables(122_000);
+        assert_eq!(failed.sources.read.why(), Some(HELD_READ_FAILED), "{n}");
+        assert_eq!(sessions(&failed), [Some(2), Some(1)], "{n}");
+    }
 }

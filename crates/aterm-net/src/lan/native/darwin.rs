@@ -4,9 +4,9 @@
 //! XNU RTM_GET wire ABI, from Apple's bsd/net/route.h and network_cmds/route.
 //! Only bounded byte parsing is used; no unaligned native struct references.
 
+use super::{Heard, Route, align4, refuse, u16_at, u32_at};
 #[cfg(target_os = "macos")]
 use super::{MAX_REPLY, Socket, option, sequence, set_option};
-use super::{Route, align4, refuse, u16_at, u32_at};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -18,11 +18,28 @@ const AF_INET: u8 = 2;
 const AF_INET6: u8 = 30;
 const AF_LINK: u8 = 18;
 const IFT_ETHER: u8 = 6;
+/// `RTM_GET`: a route lookup, whose answer the kernel delivers to every routing socket, and the
+/// type of the answer to either lookup.
+const RTM_GET: u8 = 0x4;
+/// The lookup the kernel answers to the asking socket alone
+/// (`aterm_uds::network::RTM_GET_SILENT`, XNU-private).
+const RTM_GET_SILENT: u8 = 0x11;
 
-fn request(peer: SocketAddr, sequence: u32, pid: u32, bound: Option<u32>) -> io::Result<Vec<u8>> {
+/// The lookup of `peer`'s route as message type `kind`, which is one of the two lookups and
+/// never a message that changes a route.
+fn request(
+    peer: SocketAddr,
+    sequence: u32,
+    pid: u32,
+    bound: Option<u32>,
+    kind: u8,
+) -> io::Result<Vec<u8>> {
+    if !matches!(kind, RTM_GET | RTM_GET_SILENT) {
+        return Err(refuse("route request is not a lookup"));
+    }
     let mut bytes = vec![0; HEADER];
     bytes[2] = 5; // RTM_VERSION
-    bytes[3] = 4; // RTM_GET, never a mutating route message.
+    bytes[3] = kind;
     let zone = match peer {
         SocketAddr::V6(address) => address.scope_id(),
         _ => 0,
@@ -105,7 +122,8 @@ fn parse(bytes: &[u8], sequence: u32, pid: u32) -> io::Result<Option<Route>> {
     }
     // PF_ROUTE also broadcasts shorter interface/address notifications. Their
     // headers do not have an RTM_GET pid/sequence layout and are not our reply.
-    if bytes[3] != 4 {
+    // The kernel answers either lookup as RTM_GET.
+    if bytes[3] != RTM_GET {
         return Ok(None);
     }
     if bytes.len() < HEADER {
@@ -114,8 +132,12 @@ fn parse(bytes: &[u8], sequence: u32, pid: u32) -> io::Result<Option<Route>> {
     if u32_at(bytes, 16)? != pid || u32_at(bytes, 20)? != sequence {
         return Ok(None);
     }
-    if bytes[2] != 5 || bytes[3] != 4 || u32_at(bytes, 24)? != 0 {
-        return Err(refuse("Darwin rejected the route query"));
+    // The kernel's refusal keeps its errno (rtm_errno): a lookup heard by its asker alone is
+    // refused in its answer, where the write of a plain RTM_GET fails with the same errno, so
+    // "no route" (ESRCH) reads the same either way.
+    let errno = i32::from_ne_bytes(u32_at(bytes, 24)?.to_ne_bytes());
+    if errno != 0 {
+        return Err(io::Error::from_raw_os_error(errno));
     }
     let flags = u32_at(bytes, 8)?;
     let fields = u32_at(bytes, 12)?;
@@ -202,6 +224,10 @@ fn parse(bytes: &[u8], sequence: u32, pid: u32) -> io::Result<Option<Route>> {
     }))
 }
 
+/// Ask the kernel for `peer`'s route over a routing socket of this lookup's own. The lookup is
+/// heard by that socket alone where the kernel allows, under the process's one latch
+/// ([`aterm_uds::network::lookup_write`]): every other routing socket on the Mac, this
+/// process's listeners' among them, would otherwise be handed each answer.
 #[cfg(target_os = "macos")]
 pub(super) fn lookup(
     _local: Option<SocketAddr>,
@@ -209,15 +235,33 @@ pub(super) fn lookup(
     bound: Option<u32>,
     until: std::time::Instant,
 ) -> io::Result<Route> {
+    lookup_as(peer, bound, until, |write| {
+        aterm_uds::network::lookup_write(write)
+    })
+}
+
+/// [`lookup`], written the way `send` says: `send` is handed the writer of this lookup in a
+/// message type of its choosing, which a test calls with one type.
+#[cfg(target_os = "macos")]
+fn lookup_as(
+    peer: SocketAddr,
+    bound: Option<u32>,
+    until: std::time::Instant,
+    send: impl FnOnce(&mut dyn FnMut(u8) -> io::Result<()>) -> io::Result<()>,
+) -> io::Result<Route> {
     let sequence = sequence()?;
     let pid = std::process::id();
-    let bytes = request(peer, sequence, pid, bound)?;
     let socket = Socket::new(libc::PF_ROUTE, 0)?;
-    // SAFETY: bytes is readable for its stated length and the descriptor is live.
-    let sent = unsafe { libc::write(socket.0.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
-    if sent != bytes.len() as isize {
-        return Err(io::Error::last_os_error());
-    }
+    send(&mut |kind| {
+        let bytes = request(peer, sequence, pid, bound, kind)?;
+        // SAFETY: bytes is readable for its stated length and the descriptor is live.
+        let sent = unsafe { libc::write(socket.0.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+        match usize::try_from(sent) {
+            Ok(sent) if sent == bytes.len() => Ok(()),
+            Ok(_) => Err(io::ErrorKind::WriteZero.into()),
+            Err(_) => Err(io::Error::last_os_error()),
+        }
+    })?;
     let mut buffer = vec![0; MAX_REPLY];
     super::receive_route(until, || {
         socket.readable(until)?;
@@ -252,13 +296,23 @@ pub(super) const fn moves_interfaces(kind: u8) -> bool {
     !matches!(kind, 0x1..=0xb | 0x14)
 }
 
-/// A listener rechecks for route changes as well as attachment changes. Ordinary RTM_GET
-/// replies are ignored: a recheck must not wake itself by asking the kernel for its route.
-pub(super) fn route_changed(bytes: &[u8]) -> io::Result<bool> {
+/// What one routing message tells a listener. It rechecks for route changes as well as
+/// attachment changes, and reads its attachment afresh only for a type that can change one
+/// ([`moves_interfaces`], the types that move the interface generation): a route-table message
+/// leaves every interface and address as it was. A lookup changes nothing, so its messages tell
+/// nothing: an answer (`RTM_GET`, `RTM_GET2`), since a recheck must not wake itself by asking the
+/// kernel for its route, and a lookup that found no route (`RTM_MISS`), which the kernel sends
+/// for any program's socket whose destination no route takes, at whatever rate that program
+/// retries.
+pub(super) fn route_changed(bytes: &[u8]) -> io::Result<Heard> {
     if bytes.len() < 4 || usize::from(u16_at(bytes, 0)?) != bytes.len() || bytes[2] != 5 {
         return Err(refuse("invalid route notification"));
     }
-    Ok(!matches!(bytes[3], 0x4 | 0x14))
+    Ok(match bytes[3] {
+        0x4 | 0x7 | 0x14 => Heard::Nothing,
+        kind if moves_interfaces(kind) => Heard::Attachments,
+        _ => Heard::Routes,
+    })
 }
 
 /// The receive room [`Watch::open`] asks for on its routing socket: some 400 interface or

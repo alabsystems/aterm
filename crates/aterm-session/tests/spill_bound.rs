@@ -6,7 +6,7 @@
 
 use aterm_bench::allocator::{Observed, Observer};
 use std::alloc::System;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak, mpsc};
 use std::thread;
@@ -43,14 +43,7 @@ const FRAME: usize = 4096;
 /// read (measured: 508 frames and 511 bytes, two 8 KiB chunks under the cap).
 #[test]
 fn nonparking_spill_is_bounded_against_a_wedged_pty() {
-    let mut fds: [libc::c_int; 2] = [-1; 2];
-    // SAFETY: `fds` is two writable c_int slots, as pipe(2) requires.
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "pipe failed: {}", std::io::Error::last_os_error());
-    // SAFETY: `pipe` succeeded and returned two distinct owned descriptors.
-    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    // SAFETY: distinct write descriptor from `pipe`.
-    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let (read, write) = aterm_uds::pipe().expect("pipe");
 
     let sink = Arc::new(SinkWriter::new(write.as_raw_fd()));
     let baseline = net();

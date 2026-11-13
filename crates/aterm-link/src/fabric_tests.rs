@@ -884,7 +884,12 @@ fn tail_json_under_a_node_cap_prints_offsets_in_order_so_a_resume_misses_none() 
 /// A GUARDED BROKER AND A CAP THAT GRANTS TWO OF ITS FACES APART: the broker serves at
 /// `real`; `god` holds the fleet's root, so it publishes anywhere on f1; `cap` grants
 /// [`TwoFaces::FACES`] and not the root, so a tail under it reads the two faces apart
-/// ([`TailLink::open`]).
+/// ([`TailLink::open`]). Its idle mark is an hour (`set_idle_mark`), so a stream it serves
+/// marks only its catch-up within any test's run: a face's place moves only as the test
+/// moves it, never because astream's 10 s idle interval passed on a slow machine (review
+/// RV2, J2-2-R1). NEGATIVE CONTROL (run): with a 1 ms idle mark the stalled-fetch test failed
+/// 2 of 11 runs, the first face's mark taking it past the live record so the told fetch was
+/// never asked and the hang detector fired.
 #[cfg(unix)]
 struct TwoFaces {
     _server: astream_broker::BrokerHandle,
@@ -909,6 +914,7 @@ impl TwoFaces {
             astream_broker::Durability::Relaxed,
         )
         .expect("a guarded broker");
+        broker.set_idle_mark(std::time::Duration::from_secs(60 * 60));
         let real = dir.join("b.sock");
         let server = broker.serve(&real).expect("serve the broker");
         let (mut god, _) =
@@ -1129,7 +1135,9 @@ fn the_tails_fetch_link_waits_the_idle_mark_deadline_never_a_requests_timeout() 
 /// tail ends with an error of a timeout's kind that names the first face and, by the
 /// producer's own words ([`resume_from`]), the merge's floor, every record below it
 /// printed. The one-second limit is this silent-fetch adversary's explicit contract;
-/// a minute hang detector bounds waiting for its result.
+/// a minute hang detector bounds waiting for its result. However long the backlog takes,
+/// no idle mark of the first face's stream can take it past the live record before that
+/// fetch is told: the world's broker marks a stream idle only after an hour ([`TwoFaces`]).
 #[cfg(unix)]
 #[test]
 fn a_fetch_the_broker_never_answers_ends_the_tail_naming_the_face_and_the_from_that_resumes_it() {

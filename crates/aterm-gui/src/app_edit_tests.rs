@@ -496,17 +496,32 @@ fn dirty_close_answers_closed_only_after_checkpoint_ack() {
         "refused while saving"
     );
     assert_eq!(answer.try_recv(), Err(TryRecvError::Empty));
+    assert!(app.view_store.get(tab_view).is_some());
+    assert!(app.document_close_pending_for_test(document));
+    assert_eq!(std::fs::read_to_string(&g.path).unwrap(), "base\n");
+    let requested = app.document_store.snapshot(document).unwrap().seq;
+    assert!(app.document_store.checkpoint_seq(document).unwrap() < requested);
     app.land_held_document_save_for_test(document, tab_view, held)
         .unwrap();
+    let line = answer
+        .try_recv()
+        .expect("the checkpoint acknowledgement completes the original close");
+    let durable = app.document_store.checkpoint_seq(document).unwrap();
+    assert_eq!(durable, requested);
     assert_eq!(
-        answer.try_recv(),
-        Err(TryRecvError::Empty),
-        "the view is still open"
+        EditOutcome::parse(&line).unwrap(),
+        EditOutcome {
+            result: EditResult::Closed,
+            saved: true,
+            seq: durable.0,
+        }
     );
-    assert!(app.view_store.get(tab_view).is_some());
-    app.close_active_native_tab(wid).unwrap();
-    let outcome = EditOutcome::parse(&answer.try_recv().unwrap()).unwrap();
-    assert_eq!((outcome.result, outcome.saved), (EditResult::Closed, true));
+    assert_eq!(answer.try_recv(), Err(TryRecvError::Disconnected));
+    assert!(app.view_store.get(tab_view).is_none());
+    assert!(!app.document_close_pending_for_test(document));
+    assert_ne!(hold::get(sid).map(|hold| hold.ticket), Some(ticket));
+    let (_, late) = wait(&mut app, AwaitKey::Ticket(ticket));
+    assert_eq!(late.try_recv().unwrap(), line);
     assert_eq!(std::fs::read_to_string(&g.path).unwrap(), "again base\n");
     assert_eq!(
         active_tab(&app, wid),

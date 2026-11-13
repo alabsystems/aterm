@@ -109,6 +109,7 @@ fn in_tab<T>(name: &str, tab: Tab, act: impl FnOnce(&Opts, Snapshot, &dyn Kernel
         &[answer_at("claude-opus-5-5", "2099-01-01T00:00:00Z")],
     );
     let snap = Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         route: crate::harness::accounts::AuthRoute::Outside,

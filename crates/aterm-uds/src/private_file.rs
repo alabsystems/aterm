@@ -8,7 +8,7 @@ use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::secret::Secret;
 
@@ -172,13 +172,102 @@ pub fn read_private_with_metadata(
     read_capped_with_len(&file, metadata.len(), max, name).map(|bytes| (bytes, metadata))
 }
 
-/// Parsed private files, kept only for the exact bytes read under [`read_private`]'s rules
-/// and this call's byte cap. Every call opens, judges and reads its file; equal bytes at the
-/// same path reuse the parse, regardless of file timestamps or filesystem clock precision.
-/// At most `bound` files are kept, the first kept forgotten first. Input bytes are scrubbed
-/// on eviction and drop; parsed values must themselves be suitable for retention.
+/// How old a file's last change must be, by its own times, before [`KeptParse`] pins a parse
+/// to it: two in-place writes inside one tick of a filesystem's clock leave one stamp, and the
+/// coarsest clock a private file's volume keeps ticks every two seconds (FAT's modification
+/// time). A file younger than this is read again at every call.
+pub const SETTLE: Duration = Duration::from_secs(2);
+
+/// What a read of a file's open descriptor says of it without its bytes: which file it is, how
+/// long, and when it was last written and last changed. A `write`, a truncation and a change
+/// of owner, mode, access list or link count each move one of them on a volume whose times
+/// this kernel sets.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            dev: meta.dev(),
+            ino: meta.ino(),
+            len: meta.len(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        }
+    }
+
+    /// Whether the later of this stamp's two times is at least `settle` before `began`; a time
+    /// before the epoch or after `began` is not.
+    fn settled(&self, began: SystemTime, settle: Duration) -> bool {
+        let (secs, nanos) = self.mtime.max(self.ctime);
+        let (Ok(secs), Ok(nanos)) = (u64::try_from(secs), u32::try_from(nanos)) else {
+            return false;
+        };
+        UNIX_EPOCH
+            .checked_add(Duration::from_secs(secs))
+            .and_then(|at| at.checked_add(Duration::from_nanos(u64::from(nanos))))
+            .and_then(|changed| began.duration_since(changed).ok())
+            .is_some_and(|age| age >= settle)
+    }
+}
+
+/// The file a kept parse was read from, held open: while it is, no other file on its volume
+/// has its inode number, so a file opened later with this `stamp`'s device and inode is this
+/// very file, whatever a clock says.
+struct Pin {
+    _file: std::fs::File,
+    stamp: Stamp,
+    /// The wall clock just before the pinned file was opened.
+    began: SystemTime,
+}
+
+impl Pin {
+    /// Whether a file that opened with the stamp `opened`, the wall clock reading `now` just
+    /// before, is the pinned file with nothing written to it since: the same file by the held
+    /// inode, the same length and times, and a clock not behind the pin's own, where a write
+    /// could have been stamped with the time the pin holds.
+    fn stands(&self, opened: Stamp, now: SystemTime) -> bool {
+        self.stamp == opened && now >= self.began
+    }
+}
+
+/// One file's kept parse: the bytes it was made of, and the file itself where a later read can
+/// tell from its stamp alone that nothing wrote to it.
+struct Kept<T> {
+    path: PathBuf,
+    bytes: Secret,
+    parse: T,
+    pin: Option<Pin>,
+}
+
+/// Parsed private files. Every call opens and judges its file under [`read_private`]'s rules
+/// and this call's byte cap, a parse kept or not, and hands a kept one back in two cases only.
+///
+/// - The file opened is the very file the parse was read from, with the length and times it
+///   had then (a pin: that file is held open, so its inode number names no other). No byte is
+///   read. A replacement by rename, which is every write aterm makes ([`write_private`]), is
+///   another inode and never matches, with no clock involved. A write into the file moves its
+///   times, and a parse is pinned only to a file whose times are [`SETTLE`] old, on a volume
+///   whose times this kernel sets (not a network, user-space or virtual machine's one), and
+///   stands only under a wall clock not behind the one it was made under: a later write
+///   leaves other times unless that clock was set back past the pin's and forward again
+///   between two reads. A store through a writable mapping of the file is the one write the
+///   kernel does not stamp when it happens; no aterm writer makes one.
+/// - Otherwise the bytes are read, and equal bytes at the same path reuse the parse.
+///
+/// At most `bound` files are kept, the first kept forgotten first, each with one open
+/// descriptor at most; a file that cannot be opened or read, or is no longer private, is
+/// forgotten. Input bytes are scrubbed on eviction and drop; parsed values must themselves be
+/// suitable for retention.
 pub struct KeptParse<T> {
-    kept: Mutex<Vec<(PathBuf, Secret, T)>>,
+    kept: Mutex<Vec<Kept<T>>>,
     bound: usize,
 }
 
@@ -192,11 +281,12 @@ impl<T: Clone> KeptParse<T> {
         }
     }
 
-    /// `parse` of `name` in `dir`, read under [`read_private`]'s rules and byte cap `max`, or
-    /// what `parse` said of the exact bytes just read at that path before. Parsing runs
-    /// outside the cache mutex.
+    /// `parse` of `name` in `dir`, opened under [`read_private`]'s rules and held to the byte
+    /// cap `max`: what `parse` said before of this very file where nothing wrote to it since
+    /// (no byte read), or of the exact bytes just read at that path. Parsing runs outside the
+    /// cache mutex.
     /// # Errors
-    /// As [`read_private`]: the file is opened, judged and read at every call, a parse kept or not.
+    /// As [`read_private`]: the file is opened and judged at every call, a parse kept or not.
     pub fn read(
         &self,
         dir: &Path,
@@ -204,27 +294,96 @@ impl<T: Clone> KeptParse<T> {
         max: usize,
         parse: impl FnOnce(&[u8]) -> T,
     ) -> Result<T, PrivateFileError> {
-        let bytes = Secret::from_vec(read_private(dir, name, max)?);
+        let began = SystemTime::now();
         let path = dir.join(name);
-        if let Some((.., kept)) = self
+        let (file, meta) = open_private(dir, name).inspect_err(|_| self.forget(&path))?;
+        if meta.len() > max as u64 {
+            return Err(PrivateFileError::Malformed(
+                "longer than such a file can be",
+            ));
+        }
+        let stamp = Stamp::of(&meta);
+        if let Some(kept) = self.lock().iter().find(|kept| kept.path == path)
+            && kept
+                .pin
+                .as_ref()
+                .is_some_and(|pin| pin.stands(stamp, began))
+        {
+            return Ok(kept.parse.clone());
+        }
+        let bytes = read_capped_with_len(&file, meta.len(), max, name)
+            .map(Secret::from_vec)
+            .inspect_err(|_| self.forget(&path))?;
+        let known = self
             .lock()
             .iter()
-            .find(|(at, held, _)| *at == path && held.expose() == bytes.expose())
-        {
-            return Ok(kept.clone());
-        }
-        let parsed = parse(bytes.expose());
+            .find(|kept| kept.path == path && kept.bytes.expose() == bytes.expose())
+            .map(|kept| kept.parse.clone());
+        let parsed = known.unwrap_or_else(|| parse(bytes.expose()));
+        let pin = pins(&file, &meta, stamp, began).then_some(Pin {
+            _file: file,
+            stamp,
+            began,
+        });
         let mut kept = self.lock();
-        kept.retain(|(at, ..)| *at != path);
-        kept.push((path, bytes, parsed.clone()));
+        kept.retain(|kept| kept.path != path);
+        kept.push(Kept {
+            path,
+            bytes,
+            parse: parsed.clone(),
+            pin,
+        });
         let over = kept.len().saturating_sub(self.bound);
         kept.drain(..over);
         Ok(parsed)
     }
 
-    fn lock(&self) -> MutexGuard<'_, Vec<(PathBuf, Secret, T)>> {
+    /// Keep nothing of the file at `path`: its bytes are scrubbed and its descriptor closed.
+    fn forget(&self, path: &Path) {
+        self.lock().retain(|kept| kept.path != path);
+    }
+
+    /// How many kept parses hold their file open.
+    #[cfg(test)]
+    fn pinned(&self) -> usize {
+        self.lock().iter().filter(|kept| kept.pin.is_some()).count()
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Vec<Kept<T>>> {
         self.kept.lock().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// Whether a parse of the open `file`, whose descriptor read `meta` (`stamp`) after the wall
+/// clock read `began`, may be pinned to it ([`KeptParse`]): the file has its one name, its
+/// times are [`SETTLE`] old ([`settle`] in a test), and this kernel's clock sets them.
+fn pins(file: &std::fs::File, meta: &std::fs::Metadata, stamp: Stamp, began: SystemTime) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    #[cfg(any(test, debug_assertions))]
+    let settle = settle::now();
+    #[cfg(not(any(test, debug_assertions)))]
+    let settle = Some(SETTLE);
+    meta.nlink() == 1
+        && settle.is_none_or(|settle| stamp.settled(began, settle))
+        && times_are_this_kernels(file)
+}
+
+/// Whether this kernel sets the times of the files on the open `file`'s volume
+/// ([`crate::file_watch::volume_times_are_this_kernels`]); in a test, not on a thread that
+/// says its volume's times come from elsewhere ([`TIMES_FROM_ELSEWHERE`]).
+fn times_are_this_kernels(file: &std::fs::File) -> bool {
+    #[cfg(test)]
+    if TIMES_FROM_ELSEWHERE.get() {
+        return false;
+    }
+    crate::file_watch::volume_times_are_this_kernels(file)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Whether this thread's [`KeptParse`] reads take every volume as one whose times another
+    /// clock sets (a network, user-space or virtual machine's one), which no test can mount.
+    static TIMES_FROM_ELSEWHERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// `file`'s bytes, refused when there are more than `max` ([`read_capped_into`] for a vector).
@@ -1113,6 +1272,14 @@ pub fn create_private_dir(dir: &Path) -> io::Result<()> {
 ///   forked meanwhile.
 pub struct PrivateLock(std::fs::File);
 
+/// Duplicates share this lock description, including after this process dies.
+/// Ordinary owner drop explicitly unlocks them all; keep this owner until its receivers finish.
+impl std::os::fd::AsFd for PrivateLock {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self.0)
+    }
+}
+
 impl PrivateLock {
     /// Take the lock on `<dir>/<name>`, waiting at most `within`.
     ///
@@ -1299,6 +1466,54 @@ pub mod tally {
                 }
             }
         });
+    }
+}
+
+/// How old a file's last change must be before this thread's [`KeptParse`] reads pin a parse
+/// to it: [`SETTLE`], unless a test says otherwise for what it runs. A test that reads a file
+/// it has just written cannot wait out [`SETTLE`] and must not depend on how two clocks compare,
+/// so it says the age it wants.
+#[cfg(any(test, debug_assertions))]
+pub mod settle {
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    thread_local! {
+        static AGE: Cell<Option<Duration>> = const { Cell::new(Some(super::SETTLE)) };
+    }
+
+    /// The age this thread asks of a file's times now, or `None` for any.
+    pub(super) fn now() -> Option<Duration> {
+        AGE.with(Cell::get)
+    }
+
+    /// Puts the age back as a run ends, a panic's unwinding included.
+    struct Back(Option<Duration>);
+
+    impl Drop for Back {
+        fn drop(&mut self) {
+            AGE.with(|settle| settle.set(self.0));
+        }
+    }
+
+    fn with<R>(age: Option<Duration>, run: impl FnOnce() -> R) -> R {
+        let _back = Back(AGE.with(|settle| settle.replace(age)));
+        run()
+    }
+
+    /// `run`'s result, with every file this thread reads through a [`super::KeptParse`]
+    /// meanwhile counted old enough to pin, whatever its times. Every other condition of a pin
+    /// stands. A file written into in place afterwards, at the same length, may then keep the
+    /// stamp it was pinned under: a test under this replaces its files by rename
+    /// ([`super::write_private`]) or changes their length.
+    pub fn none<R>(run: impl FnOnce() -> R) -> R {
+        with(None, run)
+    }
+
+    /// `run`'s result, with the age asked of a file's times `age` meanwhile on this thread.
+    #[cfg(test)]
+    pub(super) fn after<R>(age: Duration, run: impl FnOnce() -> R) -> R {
+        with(Some(age), run)
     }
 }
 

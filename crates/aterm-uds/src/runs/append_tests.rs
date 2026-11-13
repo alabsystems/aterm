@@ -61,7 +61,7 @@ fn a_native_reader_does_not_discard_a_complete_record_write() {
         std::fs::read_to_string(&path).unwrap(),
         format!("{HEADER}{CLOSED}\n")
     );
-    assert!(read_records(dir.path()).unwrap()[0].1.groups[0].closed);
+    assert!(read_records(dir.path(), None).unwrap()[0].1.groups[0].closed);
 }
 
 #[test]
@@ -92,7 +92,7 @@ fn retained_writer_preserves_a_line_appended_through_another_open() {
     write_line(&retained, CLOSED).unwrap();
     let wanted = format!("{HEADER}{DEAD}\n{CLOSED}\n");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), wanted);
-    let records = read_records(dir.path()).unwrap();
+    let records = read_records(dir.path(), None).unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].1.dead_seen, Some(900));
     assert!(records[0].1.groups[0].closed);
@@ -140,7 +140,7 @@ fn a_short_line_write_excludes_an_independent_appender_until_its_newline() {
     if blocked {
         write_line(&competing, DEAD).unwrap();
     }
-    let read = read_records(dir.path());
+    let read = read_records(dir.path(), None);
     assert!(blocked, "the complete logical line owns the file lock");
     assert_eq!(
         std::fs::read_to_string(&path).unwrap(),
@@ -155,12 +155,12 @@ fn a_reader_does_not_admit_a_writer_midway_through_a_line() {
     let mut observed = None;
     write_line_with(&retained, CLOSED, |mut file, bytes| {
         file.write_all(&bytes[..6])?;
-        observed = Some(read_records(dir.path()).unwrap_err().kind());
+        observed = Some(read_records(dir.path(), None).unwrap_err().kind());
         file.write_all(&bytes[6..])
     })
     .unwrap();
     assert_eq!(observed, Some(std::io::ErrorKind::WouldBlock));
-    let records = read_records(dir.path()).unwrap();
+    let records = read_records(dir.path(), None).unwrap();
     assert!(records[0].1.groups[0].closed);
 }
 
@@ -180,7 +180,7 @@ fn an_expired_contended_write_preserves_the_record_and_its_error() {
     assert_eq!(std::fs::read_to_string(&path).unwrap(), HEADER);
     drop(reading);
     write_line(&competing, CLOSED).unwrap();
-    assert!(read_records(dir.path()).unwrap()[0].1.groups[0].closed);
+    assert!(read_records(dir.path(), None).unwrap()[0].1.groups[0].closed);
 }
 
 #[test]
@@ -196,7 +196,7 @@ fn a_partial_write_error_releases_the_lock_without_hiding_the_error() {
     let available = RecordLock::write(&competing, Instant::now()).unwrap();
     drop(available);
     assert_eq!(
-        read_records(dir.path()).unwrap_err().kind(),
+        read_records(dir.path(), None).unwrap_err().kind(),
         std::io::ErrorKind::InvalidData,
         "a torn record stays unavailable after the writer releases it"
     );
@@ -217,7 +217,7 @@ fn a_panicking_writer_releases_the_cross_process_lock() {
 #[test]
 fn stale_observers_receive_the_actual_first_recorded_horizon() {
     let (dir, path, _retained) = record();
-    let expected = read_records(dir.path()).unwrap().remove(0).1;
+    let expected = read_records(dir.path(), None).unwrap().remove(0).1;
     let first = append_dead_seen(&path, &expected, 300, 1).unwrap();
     let second = append_dead_seen(&path, &expected, 900, 2).unwrap();
     assert_eq!(
@@ -237,7 +237,7 @@ fn stale_observers_receive_the_actual_first_recorded_horizon() {
 #[test]
 fn dead_seen_refuses_moved_or_malformed_evidence_without_writing() {
     let (dir, path, _retained) = record();
-    let expected = read_records(dir.path()).unwrap().remove(0).1;
+    let expected = read_records(dir.path(), None).unwrap().remove(0).1;
     for text in [
         HEADER.replace("boot=b", "boot=other"),
         format!("{HEADER}root path=/different\n"),
@@ -254,7 +254,7 @@ fn dead_seen_refuses_moved_or_malformed_evidence_without_writing() {
 #[test]
 fn dead_seen_contention_does_not_invent_a_persisted_horizon() {
     let (dir, path, retained) = record();
-    let expected = read_records(dir.path()).unwrap().remove(0).1;
+    let expected = read_records(dir.path(), None).unwrap().remove(0).1;
     let held = RecordLock::read(&retained).unwrap();
     let error = append_dead_seen(&path, &expected, 300, 1).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
@@ -266,7 +266,7 @@ fn dead_seen_contention_does_not_invent_a_persisted_horizon() {
 fn an_already_observed_first_horizon_cannot_be_removed_or_replaced() {
     let (dir, path, _retained) = record();
     append(&path, "dead_seen uniqueid=300 at=1").unwrap();
-    let expected = read_records(dir.path()).unwrap().remove(0).1;
+    let expected = read_records(dir.path(), None).unwrap().remove(0).1;
     for text in [
         HEADER.to_owned(),
         format!("{HEADER}dead_seen uniqueid=900 at=2\n"),
@@ -287,7 +287,7 @@ fn dead_seen_never_returns_success_for_an_oversized_record() {
         let pad = RECORD_BYTES as usize - room - HEADER.len() - "root path=\n".len();
         let text = format!("{HEADER}root path={}\n", "x".repeat(pad));
         std::fs::write(&path, &text).unwrap();
-        let expected = read_records(dir.path()).unwrap().remove(0).1;
+        let expected = read_records(dir.path(), None).unwrap().remove(0).1;
         let result = append_dead_seen(&path, &expected, 300, 1);
         if room == line.len() {
             assert_eq!(
@@ -298,11 +298,73 @@ fn dead_seen_never_returns_success_for_an_oversized_record() {
                 }
             );
             assert_eq!(std::fs::metadata(&path).unwrap().len(), RECORD_BYTES);
-            assert_eq!(read_records(dir.path()).unwrap()[0].1.dead_seen, Some(300));
+            assert_eq!(
+                read_records(dir.path(), None).unwrap()[0].1.dead_seen,
+                Some(300)
+            );
         } else {
             assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
             assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-            assert_eq!(read_records(dir.path()).unwrap()[0].1.dead_seen, None);
+            assert_eq!(read_records(dir.path(), None).unwrap()[0].1.dead_seen, None);
         }
     }
+}
+
+/// A record cut short is another boot's to a reader that knows its own: its header line is
+/// whole and names a boot that ended, so nothing it names competes on this one and it is
+/// admitted as what it reads, where the reader that removes earlier boots' records finds it.
+/// To a reader on the record's own boot, and to one that knows no boot, it refuses the
+/// snapshot as before, and so does a record whose header line is itself cut short or is not
+/// this file's.
+/// NEGATIVE CONTROL: with `earlier_boot_record` answering none, the read on another boot
+/// refuses; with it not comparing the boots, the read on the record's own boot is admitted;
+/// with it taking a first line that has no newline, the cut header is admitted.
+#[test]
+fn a_torn_record_of_another_boot_is_admitted_and_one_of_this_boot_refuses() {
+    #[track_caller]
+    fn refused(dir: &Path, boot: Option<&str>) -> std::io::ErrorKind {
+        read_records(dir, boot)
+            .expect_err("the snapshot is refused")
+            .kind()
+    }
+    let (dir, path, retained) = record();
+    let torn = write_line_with(&retained, CLOSED, |mut file, bytes| {
+        file.write_all(&bytes[..6])?;
+        Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+    });
+    assert!(torn.is_err());
+    drop(retained);
+    assert_eq!(refused(dir.path(), None), std::io::ErrorKind::InvalidData);
+    assert_eq!(
+        refused(dir.path(), Some("b")),
+        std::io::ErrorKind::InvalidData
+    );
+    let admitted = read_records(dir.path(), Some("c")).unwrap();
+    assert_eq!(admitted.len(), 1);
+    assert_eq!(admitted[0].0, path);
+    assert_eq!(admitted[0].1.boot, "b");
+
+    // The shape m22 held from 2026-11-03: two lines run together, and a final newline.
+    std::fs::write(&path, format!("{HEADER}{CLOSED}{DEAD}\n")).unwrap();
+    assert_eq!(
+        refused(dir.path(), Some("b")),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(read_records(dir.path(), Some("c")).unwrap()[0].1.boot, "b");
+
+    let header = HEADER.lines().next().unwrap();
+    std::fs::write(&path, header).unwrap();
+    assert_eq!(
+        refused(dir.path(), Some("c")),
+        std::io::ErrorKind::InvalidData
+    );
+    std::fs::write(
+        &path,
+        format!("{}\n{CLOSED}", header.replace("71-100", "72-100")),
+    )
+    .unwrap();
+    assert_eq!(
+        refused(dir.path(), Some("c")),
+        std::io::ErrorKind::InvalidData
+    );
 }

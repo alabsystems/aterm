@@ -453,7 +453,7 @@ fn a_give_is_idempotent_and_expires_even_after_the_request_disappears() {
 }
 
 #[test]
-fn an_undelivered_offer_waits_for_its_window_then_uses_the_holder_away_fallback() {
+fn an_undelivered_offer_waits_for_its_window_then_retires_not_held() {
     let lab = fixture();
     give_from(&lab.paths[1], "mailbox:fixture", || {
         Ok(SecretBytes::from(SENTINEL))
@@ -464,19 +464,17 @@ fn an_undelivered_offer_waits_for_its_window_then_uses_the_holder_away_fallback(
     pass(&lab.paths[0]).unwrap();
     let now = now_ms();
     let immediate = custodian_pass_at(&lab.paths[0], now).unwrap().unwrap();
-    assert!(immediate.asked.is_empty());
+    assert!(immediate.retired.is_empty());
     assert_eq!(immediate.waiting.len(), 1);
     let expired = custodian_pass_at(&lab.paths[0], now + need::WANT_WINDOW_SECS * MS + 1_000)
         .unwrap()
         .unwrap();
-    assert_eq!(expired.asked.len(), 1);
+    assert_eq!(expired.retired.len(), 1);
+    assert_eq!(expired.retired[0].1, Reason::NotHeld);
     with_store(&lab.paths[0], |session, store, scope| {
         let log = Log::read_with(session, store, scope, decode)?;
-        assert!(log.eligible().iter().any(|(_, command)| {
-            record_of(command).is_ok_and(|record| {
-                record.kind == "needs-person"
-                    && record.body.get("template").and_then(Value::as_str) == Some("holder-away")
-            })
+        assert!(log.eligible().iter().all(|(_, command)| {
+            record_of(command).is_ok_and(|record| record.kind != "needs-person")
         }));
         Ok(())
     })

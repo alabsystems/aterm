@@ -65,6 +65,8 @@
 //!   number 2 on m27, `m3.2` number 2 on m3, a bare `m3` number 1. A machine matches a row by
 //!   fleet node, host, then label or alias ([`names`]), before a placeholder is minted, so a
 //!   re-import after a relabel finds the original row, and a name two rows answer is a finding.
+//!   The roster matches and never births by itself ([`Births`]): a row is born for a machine a
+//!   source of the run names, and a vault seat names no machine.
 //! - **Preferences are mappings** (design §0): each account of a row gets one preference per
 //!   machine its cells, or the harness's fleet and pool files, name. The number is a rank and
 //!   nothing else. No machine and no rank is ever read from an address, and no allocator move is
@@ -668,7 +670,8 @@ pub enum Kind {
     /// written, and a source row that only refers to it (a root, a receiving or a mailbox
     /// login) links nothing there.
     AddressAmbiguous,
-    /// A known Mac matched no row (`adopt` births none; step 7 does).
+    /// `adopt` found no row for a known Mac. It births none ([`Births`]): the Mac's own
+    /// registration births or adopts its row (step 7).
     Unadopted,
     /// An earlier import of a sheet read now made this row, and that sheet no longer lists it:
     /// left as it is for the owner to retire.
@@ -781,6 +784,26 @@ pub struct Plan {
     pub planned: Vec<Planned>,
 }
 
+/// Which machines that no row answers a plan births a row for. The roster an import reads is
+/// the stored label table with every standing membership-log seat on top, and a seat proves no
+/// Mac: it is a vault key that asked under a name, and a reinstall, a second account, a writer
+/// successor or a lab identity each leave one more (173 of m22's 279 standing seats on
+/// 2026-11-12 asked under another standing seat's name). A row is never removed, so a row per
+/// seat is junk for good, and each also reserves a label. A Mac needs no placeholder: its own
+/// registration births its row, or adopts one a sheet planned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Births {
+    /// None: `adopt` binds what the roster knows to rows that are there.
+    None,
+    /// A machine a source of this run names: a sheet's label with no row is born `planned`,
+    /// under its roster Mac's node where the roster knows that label. A roster Mac no source
+    /// names is matched to the row it has, and gets nothing where it has none.
+    Named,
+    /// Every Mac `macs` lists too: registration's one-time copy of the stored label table
+    /// (`store::roster_migration`), which holds the owner's labels and no log seat.
+    Listed,
+}
+
 /// Everything one import reads.
 pub struct Input<'a> {
     pub sheets: &'a [Sheet],
@@ -790,8 +813,8 @@ pub struct Input<'a> {
     pub sealer: &'a dyn Sealer,
     /// The importing Mac's clock, for the source rows' `at` (a claim, never an ordering input).
     pub now_ms: u64,
-    /// Whether a label that resolves to no row births one; `adopt` births none.
-    pub births: bool,
+    /// Which machines with no row this run births one for.
+    pub births: Births,
     /// The kinds with a file this run found and could not read.
     pub unread: &'a [SheetKind],
 }
@@ -1280,7 +1303,7 @@ fn roster_source(macs: &[KnownMac]) -> (String, String) {
     )
 }
 
-/// Plan an import of `input` over the registry's `cells`.
+/// Plan an import of `input` over the registry's canonical held view.
 ///
 /// A pass that gave a row's name up, while the node or host it came to want for that row reaches
 /// the name, plans again keeping it from the start: what a source states beside a name then still
@@ -1290,10 +1313,39 @@ fn roster_source(macs: &[KnownMac]) -> (String, String) {
 /// # Errors
 /// A value the importer built breaks its column's type, which is a bug, not a sheet problem
 /// (sheet problems are findings).
-pub fn plan(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
+pub fn plan(input: &Input<'_>, view: &crate::att::View) -> Result<Plan> {
+    plan_with(input, |collection| view.project(collection))
+}
+
+/// Plan a diagnostic preview where no registry is held; this never authorizes a write.
+pub(crate) fn plan_unheld(input: &Input<'_>) -> Result<Plan> {
+    plan_with(input, |collection| cell::project(collection, &Cells::new()))
+}
+
+#[cfg(test)]
+pub(crate) fn plan_cells(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
+    plan_with(input, |collection| cell::project(collection, cells))
+}
+
+fn plan_with(
+    input: &Input<'_>,
+    mut project: impl FnMut(&'static Collection) -> Projection,
+) -> Result<Plan> {
+    let current: BTreeMap<&'static str, Projection> = [
+        &ADDRESS,
+        &ACCOUNT,
+        &MACHINE,
+        &PREFERENCE,
+        &MAILBOX,
+        &PHONE,
+        &SOURCE,
+    ]
+    .into_iter()
+    .map(|collection| (collection.name, project(collection)))
+    .collect();
     let mut names_reached = BTreeMap::new();
     loop {
-        let mut planner = Planner::new(input, cells, names_reached);
+        let mut planner = Planner::new(input, current.clone(), names_reached);
         let mut order: Vec<usize> = (0..input.sheets.len()).collect();
         order.sort_by_key(|&n| (input.sheets[n].mode, input.sheets[n].kind));
         planner.dump_marks();
@@ -1317,21 +1369,9 @@ pub fn plan(input: &Input<'_>, cells: &Cells) -> Result<Plan> {
 impl<'a> Planner<'a> {
     fn new(
         input: &'a Input<'a>,
-        cells: &Cells,
+        current: BTreeMap<&'static str, Projection>,
         names_reached: BTreeMap<String, BTreeSet<String>>,
     ) -> Self {
-        let current: BTreeMap<&'static str, Projection> = [
-            &ADDRESS,
-            &ACCOUNT,
-            &MACHINE,
-            &PREFERENCE,
-            &MAILBOX,
-            &PHONE,
-            &SOURCE,
-        ]
-        .into_iter()
-        .map(|collection| (collection.name, cell::project(collection, cells)))
-        .collect();
         let address_index = AddressIndex::of(&current[ADDRESS.name]);
         Self {
             input,

@@ -1278,6 +1278,35 @@ pub(crate) struct ChildRunner {
     pub(crate) args: Vec<String>,
     /// The kill.
     pub(crate) cap: Duration,
+    /// What takes each read for the fleet tables: its answer and when it came, or `None` for a
+    /// read that gave none ([`tables_sink`]; a test passes its own).
+    pub(crate) sighted: fn(Option<(&str, u64)>),
+}
+
+/// What hands a survey's answer to this process's fleet tables (`aterm_db::fleet`), which are
+/// unix's: elsewhere nothing takes it.
+pub(crate) fn tables_sink() -> fn(Option<(&str, u64)>) {
+    #[cfg(unix)]
+    return offer_sightings;
+    #[cfg(not(unix))]
+    return |_| {};
+}
+
+/// Hand one fleet read to this process's fleet tables ([`offer_sightings_to`]).
+#[cfg(unix)]
+fn offer_sightings(answer: Option<(&str, u64)>) {
+    offer_sightings_to(aterm_db::fleet::folder(), answer);
+}
+
+/// Hand one fleet read to `folder`: its answer and when it came, or `None` for a read that gave
+/// none. A read that failed, or whose answer is no survey, holds the reads before it; one whose
+/// question of the fleet was refused still gives this Mac's own answer ([`sightings`]).
+#[cfg(unix)]
+fn offer_sightings_to(folder: &aterm_db::fleet::Folder, answer: Option<(&str, u64)>) {
+    match answer.map(|(json, now_ms)| sightings(json, now_ms)) {
+        Some(Ok(read)) => folder.offer_read(read),
+        Some(Err(_)) | None => folder.hold_read(aterm_db::fleet::HELD_READ_FAILED),
+    }
 }
 
 impl ChildRunner {
@@ -1289,6 +1318,7 @@ impl ChildRunner {
                 .map(str::to_string)
                 .to_vec(),
             cap: READ_CAP,
+            sighted: tables_sink(),
         }
     }
 }
@@ -1299,12 +1329,17 @@ impl FleetRunner for ChildRunner {
         own_node: Option<&str>,
         now_ms: &dyn Fn() -> u64,
     ) -> Result<FleetSnapshot, String> {
-        let ran = crate::bounded_child::run_bounded(&self.program, &self.args, Some(self.cap))?;
+        let ran = crate::bounded_child::run_bounded(&self.program, &self.args, Some(self.cap))
+            .inspect_err(|_| (self.sighted)(None))?;
         if ran.stdout.trim().is_empty() {
+            (self.sighted)(None);
             let why = ran.stderr.lines().next().unwrap_or("no answer").to_string();
             return Err(crate::needs::fold_clip(&why, 120));
         }
-        parse(&ran.stdout, own_node, now_ms())
+        // The same answer, read twice: once for the glance and once, whole, for the fleet tables.
+        let now = now_ms();
+        (self.sighted)(Some((&ran.stdout, now)));
+        parse(&ran.stdout, own_node, now)
     }
 }
 
@@ -2104,6 +2139,11 @@ impl crate::App {
         }
     }
 }
+
+#[cfg(unix)]
+mod sightings;
+#[cfg(unix)]
+pub(crate) use sightings::sightings;
 
 #[cfg(test)]
 #[path = "fleet_glance_tests.rs"]

@@ -128,6 +128,8 @@ pub(crate) use control_session::caller_actor_as;
 pub(crate) use control_session::cmd_cast;
 #[cfg(all(test, unix))]
 pub(crate) use control_session::cmd_history;
+#[cfg(all(test, any(target_vendor = "apple", target_os = "linux")))]
+pub(crate) use control_session::cmd_lease;
 #[cfg(test)]
 pub(crate) use control_session::cmd_meta;
 #[cfg(test)]
@@ -962,19 +964,31 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     if aterm_types::control_verbs::spec_for("update", rest).is_some_and(|form| form.owner_only)
         && !scope.is_owner_class()
     {
+        let word = rest.split_whitespace().next().unwrap_or_default();
         log_denial(
             AUDIT_SUBSYSTEM,
             &format!("update {}", rest.trim()),
             aterm_containment::mode_or_containment(),
-            "owner-only sub-command (check/apply) from a scoped edge",
+            &format!("owner-only sub-command ({word}) from a scoped edge"),
         );
-        return "ERR denied: update check/apply is owner-only\n".to_string();
+        return format!("ERR denied: update {word} is owner-only\n");
     }
-    let st = match rest.trim() {
+    let word = rest.trim();
+    if word == "holds" {
+        return update_holds_reply();
+    }
+    if word == "retry" {
+        // A person or an agent asks to try the held build again: the hold ends, and the check
+        // below stages it at once (Windows keeps no record and fetches nothing).
+        if let Err(error) = aterm_update::retry() {
+            return format!("ERR update retry: {error}\n");
+        }
+    }
+    let st = match word {
         "" | "status" => aterm_update::status(build),
         // Windows reads the staged build's pointer; there is nothing to fetch.
-        "check" if cfg!(windows) => None,
-        "check" => {
+        "check" | "retry" if cfg!(windows) => None,
+        "check" | "retry" => {
             // The check reads live settings on the main thread; under a dialog or
             // stall that hop is refused, which would otherwise surface as an
             // empty `OK` status hiding a stage on disk. Refuse typed, up front.
@@ -1034,7 +1048,7 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
                 };
             }
         }
-        _ => return "ERR usage: update [status|check|apply]\n".to_string(),
+        _ => return "ERR usage: update [status|check|apply|retry|holds]\n".to_string(),
     };
     let Some(mut st) = st else {
         return update_status_unreadable_line();
@@ -1084,9 +1098,6 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     let apply_phase = apply_snapshot
         .as_ref()
         .and_then(|live| live.apply_phase(&st));
-    let apply_held = apply_snapshot
-        .as_ref()
-        .and_then(|live| live.apply_held(&st));
     let failing = if st.failing_checks == 0 {
         "0".to_string()
     } else {
@@ -1151,8 +1162,12 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     if let Some(phase) = apply_phase {
         out = format!("{} apply_phase={phase}\n", out.trim_end_matches('\n'));
     }
-    if let Some(held) = apply_held {
-        out = format!("{} apply_held={held}\n", out.trim_end_matches('\n'));
+    if let Some(live) = apply_snapshot.as_ref() {
+        out = format!(
+            "{}{}\n",
+            out.trim_end_matches('\n'),
+            live.apply_hold_fields(&st)
+        );
     }
     if let Some(reason) = apply_policy_reason {
         out = format!(
@@ -1172,6 +1187,11 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         let line = out.trim_end_matches('\n');
         out = format!("{line} installable=false\n");
     }
+    let record = update_record_fields(&st);
+    if !record.is_empty() {
+        let line = out.trim_end_matches('\n');
+        out = format!("{line}{record}\n");
+    }
     if let Some(native) = &st.linux {
         out = format!(
             "{} linux_installed_build={} linux_staged_build={} linux_trial={} linux_trial_starts={} linux_trial_healthy={}\n",
@@ -1186,17 +1206,10 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
         );
     }
     if let Some(apply) = aterm_update::apply_lane_report(st.current_build) {
-        for (name, value) in [
-            ("apply_refusal", apply.last_refusal.as_str()),
-            ("apply_refusal_detail", apply.last_refusal_detail.as_str()),
-            ("apply_refusal_at", apply.last_refusal_at.as_str()),
-            ("apply_failure", apply.last_failure.as_str()),
-            ("trial_wait", apply.trial_wait.as_str()),
-        ] {
-            if !value.is_empty() {
-                let line = out.trim_end_matches('\n');
-                out = format!("{line} {name}={}\n", pct_encode(value));
-            }
+        let fields = apply_lane_fields(&apply);
+        if !fields.is_empty() {
+            let line = out.trim_end_matches('\n');
+            out = format!("{line}{fields}\n");
         }
         if let Some(capture) = &apply.handoff_capture {
             let ms = |us: u64| us as f64 / 1e3;
@@ -1226,6 +1239,174 @@ fn cmd_update(rest: &str, scope: Scope, proxy: &EventLoopProxy<Wake>) -> String 
     out
 }
 
+/// The update record's fields of `update status`: `offered=` (the newest build a check saw, where
+/// it is newer than the running one) and `behind=true` while it is not running yet, then the
+/// record's hold on a newer build: `hold=<version> hold_build= cause=<word> until=<unix>
+/// tries=<n> hold_live=true|false` and `hold_why=` (pct-encoded). A lapsed hold is kept as history
+/// until a start, a newer build or a person ends it; `hold_live=false` says the build is tried
+/// again.
+fn update_record_fields(st: &aterm_update::UpdateStatus) -> String {
+    use std::fmt::Write as _;
+    let mut fields = String::new();
+    if let Some(offered) = st.offered.filter(|offered| *offered > st.current_build) {
+        let _ = write!(fields, " offered={offered}");
+    }
+    if st.behind {
+        fields.push_str(" behind=true");
+    }
+    if let Some(hold) = &st.hold {
+        fields.push_str(&hold_fields(
+            &hold.version,
+            hold.build,
+            hold.cause,
+            hold.until,
+            hold.tries,
+            hold.live,
+            &hold.why,
+        ));
+    }
+    fields
+}
+
+/// A hold's fields, as `update status` and `update holds` answer them.
+fn hold_fields(
+    version: &str,
+    build: u64,
+    cause: aterm_update_core::update_record::Cause,
+    until: u64,
+    tries: u8,
+    live: bool,
+    why: &str,
+) -> String {
+    let version = if version.is_empty() {
+        "-".to_string()
+    } else {
+        pct_encode(version)
+    };
+    let mut fields = format!(
+        " hold={version} hold_build={build} cause={} until={until} tries={tries} hold_live={live}",
+        cause.word()
+    );
+    if !why.is_empty() {
+        fields.push_str(" hold_why=");
+        fields.push_str(&pct_encode(why));
+    }
+    fields
+}
+
+/// `update holds`: `OK <n>`, then one line for this copy's update record (`machine=self`), and one
+/// for each other lab Mac's live `upd` row (`machine=<commons uuid>`) where this Mac reads a lab:
+/// `running= proven= offered= hold= hold_build= cause= until= tries= hold_live= hold_why=`, the hold
+/// fields only where a hold stands, then `start_failed_build= start_failed_until=
+/// start_failed_live=` where a window-start failure is on record. A record that cannot be read answers `ERR`.
+fn update_holds_reply() -> String {
+    use aterm_update_core::update_record::UpdateRecord;
+    let now = aterm_time::unix_secs().unwrap_or(0);
+    let mut lines = Vec::new();
+    if let Some(path) = aterm_update::record_path() {
+        match UpdateRecord::read(&path) {
+            Ok(record) => lines.push(update_record_line("self", &record.unwrap_or_default(), now)),
+            Err(error) => {
+                return format!(
+                    "ERR update holds: the update record {} cannot be read ({}), so it holds \
+                     nothing\n",
+                    pct_encode(&path.display().to_string()),
+                    pct_encode(&error.to_string())
+                );
+            }
+        }
+    }
+    for row in aterm_update::lab::rows().unwrap_or_default() {
+        lines.push(update_record_line(&row.machine, &row.record, now));
+    }
+    let mut body = format!("OK {}\n", lines.len());
+    for line in lines {
+        body.push_str(&line);
+        body.push('\n');
+    }
+    body
+}
+
+/// One update record as `update holds` answers it.
+fn update_record_line(
+    machine: &str,
+    record: &aterm_update_core::update_record::UpdateRecord,
+    now: u64,
+) -> String {
+    let offered = record
+        .offered
+        .map_or_else(|| "-".to_string(), |offered| offered.to_string());
+    let mut line = format!(
+        "machine={} running={} proven={} offered={offered}",
+        pct_encode(machine),
+        record.running,
+        record.proven
+    );
+    if let Some(hold) = &record.hold {
+        line.push_str(&hold_fields(
+            &hold.version,
+            hold.build,
+            hold.cause,
+            hold.until,
+            hold.tries,
+            hold.live(now),
+            &hold.why,
+        ));
+    }
+    if let Some(failed) = &record.start_failure {
+        line.push_str(&format!(
+            " start_failed_build={} start_failed_until={} start_failed_live={}",
+            failed.build,
+            failed.until,
+            failed.live(now)
+        ));
+    }
+    line
+}
+
+/// The apply lane's ledger fields of `update status`, each ` name=<pct-encoded value>`, empty ones
+/// left out: the standing refusal, the last failure, the boot trial's wait, a stopped automatic
+/// lane's journal record (`apply_lane=`, `apply_lane_build=`, `failure_signature=`,
+/// `next_action=`, `apply_lane_at=`), which says what aterm does next by itself, and the bytes a
+/// window here saw fail to start, which the windowless lanes leave for a window
+/// (`start_failed=`, its build, with `start_failed_at=` and `start_failed_signature=`).
+fn apply_lane_fields(apply: &aterm_update::ApplyLaneReport) -> String {
+    let lane = apply.lane.clone().unwrap_or_default();
+    let lane_build = if lane.target_build == 0 {
+        String::new()
+    } else {
+        lane.target_build.to_string()
+    };
+    let start_failed = apply.window_start_failure.clone().unwrap_or_default();
+    let start_failed_build = if start_failed.build == 0 {
+        String::new()
+    } else {
+        start_failed.build.to_string()
+    };
+    use std::fmt::Write as _;
+    let mut fields = String::new();
+    for (name, value) in [
+        ("apply_refusal", apply.last_refusal.as_str()),
+        ("apply_refusal_detail", apply.last_refusal_detail.as_str()),
+        ("apply_refusal_at", apply.last_refusal_at.as_str()),
+        ("apply_failure", apply.last_failure.as_str()),
+        ("trial_wait", apply.trial_wait.as_str()),
+        ("apply_lane", lane.lane.as_str()),
+        ("apply_lane_build", lane_build.as_str()),
+        ("failure_signature", lane.failure_signature.as_str()),
+        ("next_action", lane.next_action.as_str()),
+        ("apply_lane_at", lane.at.as_str()),
+        ("start_failed", start_failed_build.as_str()),
+        ("start_failed_at", start_failed.at.as_str()),
+        ("start_failed_signature", start_failed.signature.as_str()),
+    ] {
+        if !value.is_empty() {
+            let _ = write!(fields, " {name}={}", pct_encode(value));
+        }
+    }
+    fields
+}
+
 fn fold_installed_activation(
     st: &mut aterm_update::UpdateStatus,
     stage: Option<&crate::native_updater_service::StagedUpdate>,
@@ -1248,6 +1429,10 @@ fn fold_installed_activation(
         st.outcome
     );
 }
+
+#[cfg(test)]
+#[path = "control_update_record_tests.rs"]
+mod update_record_tests;
 
 #[cfg(test)]
 #[path = "control_installed_activation_fold_tests.rs"]
@@ -2838,10 +3023,10 @@ pub(crate) fn attach_fabric_bridge(
     .is_ok()
 }
 
-/// Say the loss of a supervised bridge whose process has exited, on the supervisor's thread and
-/// ahead of its next launch ([`crate::fabric_launch`]); its lanes say it again as they end.
+/// Say the loss of a supervised bridge whose lanes are retired after exit or failed startup,
+/// on the supervisor's thread ahead of its next launch; its lanes say it again as they end.
 #[cfg(unix)]
-pub(crate) fn fabric_bridge_exited(generation: crate::fabric::BridgeGeneration) {
+pub(crate) fn fabric_bridge_retired(generation: crate::fabric::BridgeGeneration) {
     if let Some(context) = BRIDGE_CONTEXT.get() {
         say_bridge_lost(&context.store, generation);
     }
@@ -2867,7 +3052,7 @@ pub(crate) fn attach_fleet_connection(
 
 /// Whether this window hosts session `sid`, or keeps the row of a retired worker that was it
 /// ([`crate::retired_workers`]): what a fleet drive naming `sid` needs of the window node serve
-/// hands it to (`node_serve::serve_window_relay_at`). False before the control server is up.
+/// hands it to (`node_serve::serve_window_relay_with`). False before the control server is up.
 #[cfg(unix)]
 pub(crate) fn hosts_or_keeps(sid: &SessionId) -> bool {
     let Some(context) = BRIDGE_CONTEXT.get() else {
@@ -3037,6 +3222,7 @@ mod bound_control {
         latest_link: Option<&std::path::Path>,
         root_identity: Option<&(SessionId, LaunchNonce)>,
         store: &Store,
+        start_serving: impl FnOnce(),
     ) -> Option<CtlListener> {
         if !super::await_commit_to_publish(gate) {
             return None;
@@ -3044,7 +3230,9 @@ mod bound_control {
         if let Some(link) = latest_link {
             control_auth::publish_latest_link(link, &bound.sock_path);
         }
-        Some(publish_discovery(bound, root_identity, store))
+        let listener = publish_discovery(bound, root_identity, store);
+        start_serving();
+        Some(listener)
     }
 }
 #[cfg(all(test, unix))]
@@ -3415,14 +3603,6 @@ pub(crate) fn spawn(
             let _ = BRIDGE_CONTEXT.set(worker_context.clone());
             #[cfg(unix)]
             aterm_agent::service_repair_rpc::start_recovery_in_window(&sock_dir);
-            #[cfg(unix)]
-            crate::fleet_listen::node_serve::start_window_fleet_relay(
-                &sock_dir,
-                crate::fleet_listen::node_serve::window_applies_updates(
-                    headless,
-                    aterm_update::running_copy_installable(),
-                ),
-            );
             if workers != CONTROL_WORKERS {
                 aterm_log::warn!(
                     "control socket started with {workers}/{CONTROL_WORKERS} connection workers"
@@ -3447,10 +3627,20 @@ pub(crate) fn spawn(
                 plan.latest_link.as_deref(),
                 root_identity.as_ref(),
                 &store,
+                || {
+                    started.activate();
+                    #[cfg(unix)]
+                    crate::fleet_listen::node_serve::start_window_fleet_relay(
+                        &sock_dir,
+                        crate::fleet_listen::node_serve::window_applies_updates(
+                            headless,
+                            aterm_update::running_copy_installable(),
+                        ),
+                    );
+                },
             ) else {
                 return;
             };
-            started.activate();
             aterm_log::info!(
                 "control socket listening at {sock_path} ({workers} RPC lanes, up to {CONTROL_WAIT_WORKERS} wait lanes and {CONTROL_INLINE_WAITS} waits on RPC lanes, up to {connections_cap} connections, up to {subscriptions_cap} subscription lanes; excess peers, waits and subscriptions get retry)"
             );
@@ -3847,7 +4037,16 @@ fn dispatch_app_verb(
         "panes" => control_media::cmd_panes(proxy, aim.session()),
         "controls" => control_media::cmd_controls(proxy, rest),
         "inspect" => control_media::cmd_inspect(proxy, rest),
-        "open" => control_media::cmd_open(proxy, control_media::open_route(rest)),
+        "open" => {
+            let route = control_media::open_route(rest);
+            match route
+                .opens()
+                .then(|| crate::desk_door::admit(proxy, scope, crate::desk_door::Effect::Open))
+            {
+                Some(Err(refusal)) => refusal,
+                _ => control_media::cmd_open(proxy, route),
+            }
+        }
         "edit" => crate::control_edit::cmd_edit(proxy, scope, aim.session(), rest),
         "doc" => crate::control_doc::cmd_doc(proxy, rest),
         "act" => control_media::cmd_act(proxy, rest),
@@ -3870,6 +4069,10 @@ fn dispatch_app_verb(
             rest,
             aim.session(),
             control_session::caller_actor_of(scope, None, store),
+            &|| {
+                crate::desk_door::admit(proxy, scope, crate::desk_door::Effect::SpawnInFront)
+                    .is_ok()
+            },
             crate::requests_host::asker(scope, store),
         ),
         "telemetry" => crate::telemetry_host::cmd(rest, false),
@@ -4909,14 +5112,23 @@ fn dispatch_owner(
             poke_connections_on_ok(proxy, control_session::cmd_disconnect(store, scope, rest))
         }
         "flows" => control_session::cmd_flows(store, scope, rest),
-        "raise" => control_session::cmd_raise(proxy, store, scope, rest),
+        "raise" => match crate::desk_door::admit(proxy, scope, crate::desk_door::Effect::Raise) {
+            Ok(()) => control_session::cmd_raise(proxy, store, scope, rest),
+            Err(refusal) => refusal,
+        },
         "native-focus" => control_query::cmd_native_focus(proxy, rest),
         "appnotice" => control_query::cmd_appnotice(proxy, rest),
         "notice" => control_query::cmd_notice(proxy, rest),
         #[cfg(unix)]
         "members" => control_query::cmd_members(proxy, rest),
-        "devtools" => control_query::cmd_devtools(proxy, rest),
-        "permissions" => control_query::cmd_permissions(proxy, rest),
+        // Each brings System Settings up: the door first, once their words parse
+        // ([`crate::desk_door`]; a reading or a usage error asks nothing of it).
+        "devtools" => control_query::cmd_devtools(proxy, rest, &|| {
+            crate::desk_door::admit(proxy, scope, crate::desk_door::Effect::SystemSettings)
+        }),
+        "permissions" => control_query::cmd_permissions(proxy, rest, &|| {
+            crate::desk_door::admit(proxy, scope, crate::desk_door::Effect::SystemSettings)
+        }),
         "person" => control_media::cmd_person(proxy, rest),
         "fabric" => dispatch_fabric_verb(rest, selector, scope, store),
         _ => no_handler(verb),
@@ -4946,6 +5158,9 @@ fn dispatch_app(head: &Head<'_>, form: &Resolved, cx: &DispatchCx<'_>) -> Contro
     };
     let class = form.row.input_class();
     if let Some(refusal) = app_verb_halt(&aim, store, class, verb, rest) {
+        return refusal.into();
+    }
+    if let Some(refusal) = harness_window_input_refusal(serving_principal(), class, verb, rest) {
         return refusal.into();
     }
     let active = resolve_active(cx.active);
@@ -5955,6 +6170,31 @@ fn scoped_app_input_refusal(
     crate::input_stall::writes_input(class, verb, body.as_bytes())
         .then(|| scoped_untyped_input_refusal(ctx, crate::metrics::now_us()))
         .flatten()
+}
+
+/// What the window harness's own connection is answered for a write through the window
+/// ([`harness_window_input_refusal`]).
+const HARNESS_WINDOW_INPUT: &str = "ERR denied harness window input: the window harness \
+                                    types into a session by its own verbs, never through the \
+                                    window (hwkey, pointer, invoke)\n";
+
+/// THE ONE OBSERVE GATE'S WINDOW ARM: a write through the window itself (`hwkey`, a `pointer`
+/// that presses or moves, an `invoke` of a menu action that types) reaches whatever view the
+/// window delivers it to, which no session names when it is admitted, so the gate
+/// ([`admit_with`], `agent_act::withheld`) cannot weigh an agent for it: on the window harness's
+/// own connection (`principal`) it is refused whatever the act, and every other connection keeps
+/// it. A read of the pointer stays answerable.
+fn harness_window_input_refusal(
+    principal: Principal,
+    class: Input,
+    verb: &str,
+    rest: &str,
+) -> Option<String> {
+    let (_, body) = control_input::take_app_unread_ok(class, rest);
+    (principal == Principal::Harness
+        && crate::input_stall::writes_input(class, verb, body.as_bytes())
+        && !crate::control_edit::hold::reads_the_pointer(verb, body))
+    .then(|| HARNESS_WINDOW_INPUT.to_string())
 }
 
 fn supervisor_input_fence(
@@ -7485,12 +7725,6 @@ fn drive_spawn(
                 if aterm_agent::harness::worker::WORKERS
                     .iter()
                     .any(|w| w.word == value) => {}
-            "agent" if crate::task_launch::retired_worker(Some(value)).is_some() => {
-                return Err(format!(
-                    "spawn agent={value}: {}",
-                    aterm_phase::RETIRED_AGENT
-                ));
-            }
             "len" => framed = true,
             "model" => {}
             // The worker's Autopilot, as on one Mac: the drive names it here alone, serving no
@@ -8084,6 +8318,15 @@ fn serve_request_line(
     // An `await` stays parked for its client while it is forwarded or served, so the jobs pass
     // reads that client as waiting on aterm, never as making no progress.
     let _parked = crate::parked_awaits::enter(head.verb, head.rest);
+    if head.verb == "await"
+        && head.selector.is_none()
+        && crate::parked_awaits::is_elsewhere(head.rest)
+    {
+        let reply =
+            crate::parked_awaits::elsewhere(head.rest, aterm_control::hangup::caller_hung_up);
+        out.push_owned(reply.into_bytes());
+        return Some(ServeDisposition::Close);
+    }
     if try_proxy_forward(&request, scope, store, sock_dir, stream, reader) {
         return Some(ServeDisposition::Close);
     }
@@ -8631,9 +8874,6 @@ fn spawn_frame_len(head: &Head<'_>) -> Option<Result<usize, String>> {
     let named = tokens.iter().find_map(|tok| tok.strip_prefix("agent="));
     let program = tokens.iter().find_map(|tok| tok.strip_prefix("program="));
     let len = tokens.iter().find_map(|tok| tok.strip_prefix("len="))?;
-    if let Some(refusal) = crate::task_launch::retired_worker(named) {
-        return Some(Err(refusal));
-    }
     let form = crate::task_launch::spawn_form_word(named, program);
     Some(crate::task_launch::frame_len(len, &form))
 }
@@ -9014,6 +9254,7 @@ where
         args: &payload,
         unread_ok: false,
         usage: None,
+        lane: None,
     }) {
         Ok(warning) => warning,
         Err(refusal) => {
@@ -10220,6 +10461,8 @@ struct InputAdmission<'a> {
     args: &'a [u8],
     unread_ok: bool,
     usage: Option<String>,
+    /// The harness's lane the write names (`harness-lane=`), which the observe gate weighs.
+    lane: Option<aterm_agent::harness::agent_image::Lane>,
 }
 
 fn admit(a: InputAdmission<'_>) -> Result<Option<String>, String> {
@@ -10257,6 +10500,18 @@ fn admit_with<T>(
     }
     if let Some(usage) = a.usage {
         return Err(usage);
+    }
+    // THE ONE OBSERVE GATE: every write the window harness makes into a session reaches this
+    // admission, whichever lane makes it, and one into an agent the host has not confirmed is
+    // withheld unless its lane is one THE RULING exempts (`agent_act::withheld`). The write is
+    // judged, not only its connection: one that names a harness lane is the harness's on any
+    // connection (the token beside the socket, which a lane takes where the window's token is
+    // refused), so no lane passes by its route.
+    if a.class.contains(Input::WRITES)
+        && (serving_principal() == Principal::Harness || a.lane.is_some())
+        && let Some(refusal) = crate::agent_act::withheld(a.ctx, a.lane)
+    {
+        return Err(refusal);
     }
     let words = words()?;
     match crate::input_stall::gate(a.ctx, a.class, a.verb, a.args, a.unread_ok) {
@@ -10578,6 +10833,7 @@ fn serve_session_verb(
             args: rest.as_bytes(),
             unread_ok: leading.unread_ok,
             usage: leading.refusal,
+            lane: leading.harness_lane,
         },
         || input_words(scope, verb, rest, leading.cause, ctx),
     ) {

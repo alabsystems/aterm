@@ -247,8 +247,18 @@ pub fn dmi_type(dmi: &Dmi<'_>) -> MachineType {
     }
 }
 
+/// Whether `field` is in a device tree's `compatible` form, `vendor,device`
+/// (`linux,dummy-virt`, `raspberrypi,5-model-b`): one word with a comma in it, an identifier
+/// rather than a name. QEMU's `virt` board writes it as its `model` too.
+#[must_use]
+pub fn is_compatible(field: &str) -> bool {
+    let t = field.trim();
+    t.contains(',') && !t.contains(char::is_whitespace)
+}
+
 /// The type a device tree gives: its `model` (`Raspberry Pi 5 Model B Rev 1.0`) through the
-/// filter, and its first `compatible` entry (`raspberrypi,5-model-b`) as the identifier.
+/// filter where it is not in the `compatible` form ([`is_compatible`]), and its first
+/// `compatible` entry (`raspberrypi,5-model-b`) as the identifier.
 #[must_use]
 pub fn device_tree_type(model: Option<&str>, compatible: Option<&str>) -> MachineType {
     let first = |s: &str| {
@@ -260,6 +270,7 @@ pub fn device_tree_type(model: Option<&str>, compatible: Option<&str>) -> Machin
     MachineType {
         name: model
             .and_then(|m| m.split('\0').next())
+            .filter(|m| !is_compatible(m))
             .and_then(friendly)
             .map(str::to_owned),
         family: None,

@@ -1362,13 +1362,35 @@ fn a_missing_token_fact_says_not_checked_never_none() {
     );
 }
 
+/// BEFORE THE CARD, THE LOGIN ROW SAYS ONLY WHAT THE TOKEN READ HOLDS: with no card read yet,
+/// a row with no login on this Mac is said never to have signed in here, and an account whose
+/// login nothing read gets no Login row, rather than either being called signed in. CONTROL:
+/// a held login's row says it is signed in.
+#[test]
+fn before_the_card_the_login_row_follows_the_token_reads_login() {
+    let login_row = |login: LoginHere| {
+        let mut facts = state_a(60);
+        facts.card = None;
+        facts.token.as_mut().expect("a token").login = login;
+        fact_value(&account_rows(&facts), "Login")
+    };
+    let held = login_row(LoginHere::Half(LoginHalf::Ok)).expect("CONTROL: a Login row");
+    assert!(held.starts_with("signed in on this Mac"), "{held}");
+    let absent = login_row(LoginHere::Absent).expect("a Login row");
+    assert!(
+        absent.starts_with("never signed in on this Mac"),
+        "{absent}"
+    );
+    assert_eq!(login_row(LoginHere::Unread), None);
+}
+
 /// AN OUTSIDE LOGIN IS NEVER GIVEN AN END: nothing on this Mac knows when it ends, so the
 /// card says it is signed in and no more, whatever the token read holds of a login.
 #[test]
 fn an_outside_login_is_never_given_an_end() {
     let mut facts = state_a(60);
     let mut token = facts.token.take().expect("a token");
-    token.login = LoginHalf::Ending { end: NOV_30 };
+    token.login = LoginHere::Half(LoginHalf::Ending { end: NOV_30 });
     facts.token = Some(token);
     facts.card.as_mut().expect("a card").login = None;
     let rows = account_rows(&facts);
@@ -1420,7 +1442,7 @@ fn the_login_row_says_the_login_and_what_the_tab_runs_on() {
     for route in [AuthRoute::Stored, AuthRoute::Outside] {
         let mut facts = state_b(120);
         facts.route = Some(route);
-        facts.token.as_mut().expect("a token").login = LoginHalf::InUse;
+        facts.token.as_mut().expect("a token").login = LoginHere::Half(LoginHalf::InUse);
         facts.card.as_mut().expect("a card").login = Some(LoginHalf::Ok);
         let rows = lines(&super::build(&facts, 120, false));
         let want = if route == AuthRoute::Stored {

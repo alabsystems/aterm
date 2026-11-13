@@ -109,6 +109,8 @@ pub struct GridStorage {
     pub absolute_row_counter: u64,
     /// Monotonic content generation bumped by every content-damage mutation.
     pub content_gen: u64,
+    /// Monotonic generation bumped when off-screen history rows change in place or wholesale.
+    pub(crate) history_content_gen: u64,
     /// This grid's process-unique identity, fixed when it was built ([`Grid::instance`](crate::Grid::instance)).
     pub(crate) instance: u64,
     /// Generation bumped when a reader scroll primitive in [`crate::grid::scroll`] lands at `display_offset == 0`.
@@ -355,6 +357,7 @@ impl GridStorage {
     pub(crate) fn mark_content_full(&mut self) {
         self.damage.mark_full();
         self.content_gen += 1;
+        self.history_content_gen += 1;
     }
 
     /// Mark scroll damage for `n` scrolled rows and bump `content_gen`.

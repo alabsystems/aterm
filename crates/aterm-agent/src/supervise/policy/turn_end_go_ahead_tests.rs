@@ -160,7 +160,7 @@ fn a_go_ahead_beside_a_persons_needs_leaves_them_standing() {
 fn every_go_ahead_fits_the_typed_budget() {
     let long = format!(
         "NEEDS YOU: say \"{}\" when the disk has room, so I can rebuild.\nNEEDS YOU: the release \
-         credential.",
+         approval.",
         "rerun the checks ".repeat(20)
     );
     let mut st = TurnEndState::default();
@@ -2368,7 +2368,7 @@ fn under_land_the_hold_has_no_needs_leg_for_an_answered_line() {
     let alone = held(INCIDENT);
     assert!(alone.read && !alone.holds(HoldLeg::Needs), "{alone:?}");
     let beside = held(&format!(
-        "{INCIDENT}\nNEEDS YOU: the App Store signing credential."
+        "{INCIDENT}\nNEEDS YOU: the App Store release decision."
     ));
     assert!(
         beside.holds(HoldLeg::Needs),
@@ -2395,8 +2395,8 @@ fn says_no_need(a: &TurnEndAction) -> bool {
 #[test]
 fn a_done_check_says_the_go_ahead_is_no_need_only_outside_the_persons_hour() {
     const CLAIMS: [&str; 2] = [
-        "Fixed the lexer and pushed it. All done.",
-        "Fixed the parser and pushed it. All done.",
+        "Fixed the lexer and pushed it. All done.\n\nATERM-TASK-DONE",
+        "Fixed the parser and pushed it. All done.\n\nATERM-TASK-DONE",
     ];
     let start = t0();
     let typed = |text: String| TurnEndAction::Type {
@@ -2440,7 +2440,7 @@ fn a_done_check_says_the_go_ahead_is_no_need_only_outside_the_persons_hour() {
         "past the hour: the whole check"
     );
     assert!(says_no_need(&a), "{a:?}");
-    let offer = "All done. Shall I delete the old release branches?";
+    let offer = "All done. Shall I delete the old release branches?\n\nATERM-TASK-DONE";
     let mut st = TurnEndState::default();
     let (a, _) = until_acted_keyed(&mut st, &keyed(offer, key, start), start);
     assert_eq!(
@@ -2643,9 +2643,9 @@ fn an_owed_continuation_over_a_park_left_to_the_person_says_no_go_ahead_word() {
 #[test]
 fn a_key_read_at_the_decision_holds_the_hour_as_an_observed_one() {
     let mut st = TurnEndState::default();
-    st.observe(&idle("All done.", Some(3 * MIN)), t0());
+    st.observe(&idle("All done.\n\nATERM-TASK-DONE", Some(3 * MIN)), t0());
     let now = t0() + st.short_wait().unwrap_or_default();
-    let wake = idle("All done.", None);
+    let wake = idle("All done.\n\nATERM-TASK-DONE", None);
     st.observe(&wake, now);
     assert!(!st.go_ahead_held(now), "no point observed a key");
     for (key, want) in [
@@ -2747,7 +2747,7 @@ fn a_check_cut_within_the_persons_hour_is_typed_again_whole_past_it() {
     let claim = |now: Instant| TurnEndReading {
         person: Some(now - key),
         key: Some(now - key),
-        ..idle("All done.", Some(3 * MIN))
+        ..idle("All done.\n\nATERM-TASK-DONE", Some(3 * MIN))
     };
     let held_check = |st: &mut TurnEndState| {
         let (a, then) = until_acted_keyed(st, &claim(start), start);

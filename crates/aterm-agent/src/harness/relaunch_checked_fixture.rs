@@ -104,6 +104,12 @@ impl Kernel for SourceKernel {
         kernel_start(pid).map(|start| squash(&start))
     }
 
+    fn process_lifetime(&self, pid: u32) -> Option<ProcessLifetime> {
+        (pid == self.process.pid)
+            .then(|| ProcessLifetime::capture(pid))
+            .flatten()
+    }
+
     fn restart_background(&self, pid: u32) -> Vec<String> {
         if pid == self.process.pid {
             self.controls
@@ -228,6 +234,7 @@ impl World {
             press: None,
         };
         let snapshot = Snapshot {
+            lifetime: None,
             tab: tab.into(),
             pid,
             start: squash(&start),
@@ -422,7 +429,7 @@ struct Endpoint {
 impl Endpoint {
     fn new(path: &Path, tab: String, controls: Controls) -> std::io::Result<Self> {
         let listener = aterm_uds::kept_out(|| UnixListener::bind(path))?;
-        let (cancelled, cancel) = std::io::pipe()?;
+        let (cancelled, cancel) = aterm_uds::pipe()?;
         let active = Arc::new(Mutex::new(None::<UnixStream>));
         let serving = active.clone();
         let (done, completed) = std::sync::mpsc::sync_channel(1);
@@ -545,6 +552,10 @@ fn answer(tab: &str, controls: &Controls, line: &str) -> String {
         .unwrap_or("");
     match verb {
         "version" => "OK checked-source-fixture".into(),
+        "who" => format!(
+            "OK 1\n1 {tab} fgpgid={}",
+            controls.child.lock().unwrap().id()
+        ),
         "sessions" => format!("OK 1\nlocal {tab} 0 idle claude active=1 wfocus=1"),
         "text" => format!("OK {}", observations.screen),
         "cell" => "OK %20 d0d0d0 111318 none".into(),
@@ -584,3 +595,7 @@ fn answer(tab: &str, controls: &Controls, line: &str) -> String {
         _ => "ERR unsupported fixture request".into(),
     }
 }
+
+#[cfg(test)]
+#[path = "relaunch_checked_fixture_tests.rs"]
+mod tests;

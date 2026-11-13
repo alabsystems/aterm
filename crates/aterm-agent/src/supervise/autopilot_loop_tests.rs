@@ -407,6 +407,16 @@ fn a_loop_started_as_off_lifted_acts_on_the_point_it_finds() {
                 Some("2s"),
             ),
             (RULE_CONTINUE, "keep going"),
+            RULE_CONTINUE,
+        ),
+        (
+            "a done claim under Off",
+            answered(
+                &["❯ status?"],
+                "Nothing left: the parser is merged to main and pushed.",
+                Some("2s"),
+            ),
+            (RULE_CONTINUE, "keep going"),
             RULE_DONE_CHECK,
         ),
     ];

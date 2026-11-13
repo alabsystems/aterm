@@ -497,8 +497,29 @@ LINES
                        (an agent waits on it), agent-bg (in the background), agent (either),
                        nobody (an orphan)
             peer=      the process at the other end of a pipe wait (pipe, pipe-full, serves)
-  finding   kind=<k> …: a fact the engine found (process-table, program-check, translating,
-            stopped, …)
+  finding   kind=<k> …: a per-process fact the engine found, whatever the jobs' classes
+            stopped                 a process that reads stopped, any user's
+            zombies                 unreaped children of one parent, any user's (parent=
+                                    count= per_min=)
+            d-state                 a process of yours with a thread in an uninterruptible
+                                    wait ≥ 10 s
+            busy-orphan             an orphan that has burned a core ≥ 10 min with no side
+                                    writes
+            program-check           a program of yours aterm calls held at macOS's program
+                                    check (below)
+            translating             an x86_64 program of yours Rosetta has been translating
+                                    past 20 s
+            not-started             a program of yours whose one thread has not run past 20 s,
+                                    its cause unproven (cause=unknown program_check=unconfirmed)
+            program-check-stranded  a held one whose check went to a syspolicyd no longer
+                                    running (daemon= the one running now)
+            stopped-unstarted       an unstarted one of yours that reads stopped or traced
+                                    (stopped= traced=)
+            probably-program-check  while the check is backed up, a member that started but
+                                    whose CPU has not moved while it holds a fresh dylib open:
+                                    a guess (heuristic=fresh-dylib)
+            process-table           the processes you own (own=; their threads on Linux) and
+                                    the per-user limit (limit=)
   advice    one line on using these readings to choose work, then more=: the rows past top=,
             and the wait to put on one
   --json gives every field with integers in base units.
@@ -519,9 +540,13 @@ const JOBS_TAIL: &str = r#"  fine           nothing to say
   exited         no live member; kept a minute, then `aterm ctl telemetry` keeps its row
   phi= (φ) is how long the silence is against the job's usual gap (mu_ms=, stretched for a
   busy-silent, polling or thrashing job).
-  A program macOS's program check holds before its first instruction reads
+  A program aterm calls held at macOS's program check before its first instruction reads
   wait=program-check, and one Rosetta is still translating wait=translating: work in line,
-  never stuck (`aterm help sys left` lists what the check holds).
+  never stuck (`aterm help sys left` lists what the check holds). aterm calls a program held
+  only on per-process evidence of its check, which no reader of macOS gives yet: on a real
+  Mac a program the check holds reads no such wait, only a finding kind=not-started row, and
+  no program-check, program-check-stranded or probably-program-check row appears (`aterm help
+  sys machine`).
   `aterm ctl @self status` carries job= (the worst live verdict) and job_quiet_ms=, and
   `aterm ctl subscribe @self events` prints an EVENT … job line when a verdict changes.
 
@@ -628,9 +653,12 @@ LINES
 
 const LEFT_BODY: &str = r#"  aterm ctl @self sys left [scope=pane|tab|aterm] [top=<n>] [--json]
   aterm ctl end <token>…
-  What closed tabs and dead verify runs left running, and what macOS's program check holds,
-  each with its proof. A name is never proof: a row prints its executable's word only. With no
-  @ target it reads scope=aterm, the owner's alone; a closed tab's rows show only there.
+  What closed tabs and dead verify runs left running, and what aterm calls held at macOS's
+  program check, each with its proof. A name is never proof: a row prints its executable's word
+  only. With no @ target it reads scope=aterm, the owner's alone; a closed tab's rows show only
+  there. aterm calls a program held only on per-process evidence of its check, which no reader
+  of macOS gives yet: on a real Mac no row reads state=program-check or state=waiting, and
+  program_check= reads 0 (`aterm help sys machine`).
 
 LINES
   summary  in words: how many rows are left running (state=left), how many an end token
@@ -889,6 +917,11 @@ WHAT IT CANNOT MEASURE HERE
     coalition.
   - the size of a folder it does not walk (protected, another user's, remote, removable, too
     broad): unavailable(<why>), never zero.
+  - which program macOS's program check holds, or stranded when syspolicyd crashed and
+    launchd started another: no reader here names the check's per-process requests, so a
+    program it holds reads finding kind=not-started … program_check=unconfirmed in `sys
+    jobs` once 20 s past its launch, and the program-check counts read 0 (`aterm help
+    permissions`, SLOW FIRST RUNS).
 "#;
 
 /// What this build measures on the OS the page runs on, and what it cannot.

@@ -297,7 +297,7 @@ fn a_commit_the_worker_took_first_never_answers_a_live_take() {
         pending.arbiter.try_begin_reject(),
         "the worker takes the attempt"
     );
-    let (_commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
+    let (_commit_rd, commit_wr) = aterm_uds::pipe().expect("a commit pipe");
     let (reject, rejected) = std::sync::mpsc::sync_channel(1);
     app.finish_proven_handoff(crate::UpdateHandoffCompletion {
         attempt_id: 7,
@@ -310,6 +310,7 @@ fn a_commit_the_worker_took_first_never_answers_a_live_take() {
         detail: String::new(),
         input_drain_spins: 1,
         child_death: crate::ChildDeathEvidence::Unobserved,
+        successor_start: crate::app_update_handoff::SuccessorStart::Presented,
     });
     assert_eq!(
         app.pending_update_handoff
@@ -382,7 +383,7 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             aterm_messages::Message::new(
                 aterm_messages::tags::PACKAGES,
                 aterm_messages::Severity::Info,
-                "Checking ALab tools",
+                crate::toolchain_words::CHECKING_ALAB,
             )
             .in_flight()
             .key("toolchain.pass")
@@ -408,7 +409,7 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
         let arbiter = pending.arbiter.clone();
         app.handoff_reposts = Some(Vec::new());
-        let (commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
+        let (commit_rd, commit_wr) = aterm_uds::pipe().expect("a commit pipe");
         drop(commit_rd);
         let (reject, rejected) = std::sync::mpsc::sync_channel(1);
         app.finish_proven_handoff(crate::UpdateHandoffCompletion {
@@ -422,6 +423,7 @@ fn a_commit_whose_answers_took_time_holds_its_claim_through_the_fence() {
             detail: String::new(),
             input_drain_spins: 1,
             child_death: crate::ChildDeathEvidence::Unobserved,
+            successor_start: crate::app_update_handoff::SuccessorStart::Presented,
         });
         let (body, _retention) = reader
             .join()
@@ -623,7 +625,7 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
         Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
     let arbiter = pending.arbiter.clone();
     app.handoff_reposts = Some(Vec::new());
-    let (commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
+    let (commit_rd, commit_wr) = aterm_uds::pipe().expect("a commit pipe");
     drop(commit_rd);
     let (reject, rejected) = std::sync::mpsc::sync_channel(1);
     app.finish_proven_handoff(crate::UpdateHandoffCompletion {
@@ -637,6 +639,7 @@ fn a_held_claim_is_not_refused_by_the_supervisors_own_stop() {
         detail: String::new(),
         input_drain_spins: 1,
         child_death: crate::ChildDeathEvidence::Unobserved,
+        successor_start: crate::app_update_handoff::SuccessorStart::Presented,
     });
     assert!(replies.try_recv().is_ok(), "the claim answered the take");
     assert!(
@@ -754,7 +757,7 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             Some(std::time::Instant::now() - std::time::Duration::from_millis(100));
         let arbiter = pending.arbiter.clone();
         app.handoff_reposts = Some(Vec::new());
-        let (commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
+        let (commit_rd, commit_wr) = aterm_uds::pipe().expect("a commit pipe");
         drop(commit_rd);
         let (reject, rejected) = std::sync::mpsc::sync_channel(1);
         app.finish_proven_handoff(crate::UpdateHandoffCompletion {
@@ -768,6 +771,7 @@ fn a_held_claim_activates_the_successor_only_at_its_write() {
             detail: String::new(),
             input_drain_spins: 1,
             child_death: crate::ChildDeathEvidence::Unobserved,
+            successor_start: crate::app_update_handoff::SuccessorStart::Presented,
         });
         assert!(replies.try_recv().is_ok(), "the claim answered the take");
         assert_eq!(arbiter.phase(), crate::HandoffAttemptPhase::Committing);

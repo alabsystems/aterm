@@ -24,11 +24,11 @@ use aterm_uds::stop::Stop;
 
 use super::{
     NodeBoot, NodeMesh, NodeServeConfig, NodeUpdater, NodeUpdates, RETRY_LEFT_AFTER, RelayHeader,
-    WindowLauncher, WindowRelays, a_window_that_applies_answers, apply_at_node_boot,
-    arm_claims_off_on_quit, claims_off_on_quit, claims_upkeep, has_live_window_relay,
-    keeps_port_after, mind_node_checker, others_beside, own_node_job, query_window_survey_facts,
-    read_line_raw, relay_ask, relay_socket_path, restart_for, run_node_serve_with,
-    serve_window_relay_at, spawn_node_updates, wanted_for_node, why_the_run_ends,
+    WindowLauncher, WindowPresence, WindowRelays, apply_at_node_boot, arm_claims_off_on_quit,
+    claims_off_on_quit, claims_upkeep, has_live_window_relay, keeps_port_after, mind_node_checker,
+    others_beside, own_node_job, query_window_survey_facts, read_line_raw, relay_ask,
+    relay_socket_path, restart_for, run_node_serve_with, serve_window_relay_at, spawn_node_updates,
+    wanted_for_node, why_the_run_ends,
 };
 use aterm_session::SessionId;
 use aterm_types::MutexExt as _;
@@ -47,6 +47,18 @@ fn drive_bytes(lines: &str) -> String {
 /// A test window that stands for this Mac's only one: it hosts every session a drive names.
 fn hosts_every(_: &SessionId) -> bool {
     true
+}
+
+/// Whether some window's relay in `relay_dir` answers that it applies this Mac's updates.
+fn a_window_that_applies_answers(relay_dir: &Path) -> bool {
+    super::window_presences_by(relay_dir, super::runs_an_aterm_image)
+        .iter()
+        .any(|(_, presence)| *presence == WindowPresence::Answers { applies: true })
+}
+
+/// What the relays in `relay_dir` say of their windows, as the node job's updater reads them.
+fn presences(relay_dir: &Path) -> Vec<(u32, WindowPresence)> {
+    super::window_presences_by(relay_dir, super::runs_an_aterm_image)
 }
 
 const SECRET_BYTES: [u8; 24] = [0x5a; 24];
@@ -3098,6 +3110,8 @@ struct ScriptedUpdater {
     trial_pending: AtomicBool,
     trial_reads: AtomicUsize,
     restarts: std::sync::Mutex<Vec<String>>,
+    /// Each trial miss noted, with how many restarts had happened by then.
+    misses: std::sync::Mutex<Vec<(usize, String)>>,
     stop: Arc<Stop>,
     started: Instant,
     advanced: std::sync::Mutex<Duration>,
@@ -3113,6 +3127,10 @@ struct ScriptedUpdater {
     failed: std::sync::Mutex<Option<(u64, u64)>>,
     /// The installs over a failed activation run.
     failed_installs: AtomicUsize,
+    /// The launches given back as a run ended by choice.
+    forgives: AtomicUsize,
+    /// How long the waiting build has waited here, on the pending clock.
+    waited: std::sync::Mutex<Duration>,
 }
 
 impl ScriptedUpdater {
@@ -3133,6 +3151,7 @@ impl ScriptedUpdater {
             trial_pending: AtomicBool::new(true),
             trial_reads: AtomicUsize::new(0),
             restarts: std::sync::Mutex::new(Vec::new()),
+            misses: std::sync::Mutex::new(Vec::new()),
             stop: Arc::new(Stop::new()),
             started: Instant::now(),
             advanced: std::sync::Mutex::new(Duration::ZERO),
@@ -3142,6 +3161,8 @@ impl ScriptedUpdater {
             look_spawn_failures: AtomicUsize::new(0),
             failed: std::sync::Mutex::new(None),
             failed_installs: AtomicUsize::new(0),
+            forgives: AtomicUsize::new(0),
+            waited: std::sync::Mutex::new(Duration::ZERO),
         }
     }
 
@@ -3252,9 +3273,22 @@ impl NodeUpdater for ScriptedUpdater {
         lock(&self.stuck).take()
     }
 
+    fn note_trial_miss(&self, why: &str) {
+        let restarts = lock(&self.restarts).len();
+        lock(&self.misses).push((restarts, why.to_owned()));
+    }
+
     fn restart(&self, why: &str) {
         lock(&self.restarts).push(why.to_owned());
         self.stop.set();
+    }
+
+    fn forgive_launch(&self) {
+        self.forgives.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn waited_for(&self, _: u64) -> Duration {
+        *lock(&self.waited)
     }
 
     fn now(&self) -> Instant {
@@ -3397,13 +3431,8 @@ fn a_relay_that_never_applies_holds_no_update() {
 /// know, and one that answers nothing cannot be told from a window, so each is held for as before.
 #[test]
 fn only_a_relays_no_says_it_never_applies() {
-    assert!(!super::relay_reply_applies(Some("no\n")));
-    for reply in [
-        Some("yes\n"),
-        Some("OK\n"),
-        Some("ERR unknown relay command\n"),
-        None,
-    ] {
+    assert!(!super::relay_reply_applies("no\n"));
+    for reply in ["yes\n", "OK\n", "ERR unknown relay command\n"] {
         assert!(super::relay_reply_applies(reply), "{reply:?}");
     }
 }
@@ -3418,6 +3447,20 @@ fn only_a_window_on_an_installable_copy_applies_updates() {
     assert!(!applies(false, Some(false)), "a dev bundle or a bare build");
     assert!(!applies(true, Some(false)));
     assert!(applies(false, None), "off macOS");
+    use super::window_node_upkeep_applies as upkeep;
+    assert!(upkeep(true, true, false));
+    assert!(
+        !upkeep(false, true, false),
+        "a non-installed copy never changes the node"
+    );
+    assert!(
+        !upkeep(true, false, false),
+        "another account's home is left alone"
+    );
+    assert!(
+        !upkeep(true, true, true),
+        "raw CI/private-world markers leave the host alone"
+    );
 }
 
 /// Leave a relay file named for this live process that nothing listens on: its window crashed.
@@ -3530,7 +3573,7 @@ fn a_stale_relay_listener_is_not_kept_alive_by_a_neighbours_fork() {
                 (found == pid && libc::WIFSTOPPED(status)).then_some(())
             },
         );
-        let answers = a_window_that_applies_answers(relay.path());
+        let answers = super::relay_answers(&relay_socket_path(relay.path(), std::process::id()));
         drop(child);
         answers
     };
@@ -3547,7 +3590,8 @@ fn a_stale_relay_listener_is_not_kept_alive_by_a_neighbours_fork() {
 /// A NEWER BUILD ENDS THE NODE RUN ONLY WITH NO WINDOW HERE (§4.13): `restart_for` names a
 /// staged build while auto-apply is on and no window's relay answers. A window that runs,
 /// auto-apply off, or a boot that already failed to run that build within the hour (on the
-/// injected clock) holds it. A relay file nothing listens on is no window, though its pid lives.
+/// injected clock) holds it. A relay file nothing listens on, of a live process, is a silent window,
+/// which holds it for the bound of the build's wait.
 #[test]
 fn a_newer_build_ends_the_node_run_only_with_no_window_here() {
     let relay = crate::test_scratch::short_dir("node-update-restart");
@@ -3574,19 +3618,23 @@ fn a_newer_build_ends_the_node_run_only_with_no_window_here() {
     updater.auto_apply.store(true, Ordering::Release);
 
     let stale = stale_relay_file(relay.path());
-    assert!(
-        has_live_window_relay(relay.path()),
-        "CONTROL: by its live pid alone, a relay file whose listener is gone reads as a window"
-    );
-    assert!(
-        !a_window_that_applies_answers(relay.path()),
-        "a relay file nothing listens on answered"
+    assert_eq!(
+        presences(relay.path()),
+        [(std::process::id(), WindowPresence::Silent)],
+        "a relay that refuses, of a live aterm process, is silent, not gone"
     );
     assert_eq!(
         restart_for(&updater, boot, relay.path()),
-        Some(2),
-        "a relay file that does not answer is no window"
+        None,
+        "a silent window holds the build as one that applies it"
     );
+    *lock(&updater.waited) = super::WINDOW_HOLDS_AN_UPDATE_WITHIN;
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        Some(2),
+        "past the bound of the build's wait here, the job installs beside it"
+    );
+    *lock(&updater.waited) = Duration::ZERO;
     drop(stale);
 
     let window = WindowRelay::open(relay.path());
@@ -3664,7 +3712,7 @@ fn a_relay_file_answers_while_a_copy_of_its_listener_lives() {
         // The join result retains the listener until the actual product probe has returned.
         (copy, request)
     });
-    let answers = a_window_that_applies_answers(relay.path());
+    let read = presences(relay.path());
     let (copy, request) = crate::test_socket::join_after_hang_up(
         receive,
         "the copied listener finishes the probe's request",
@@ -3672,26 +3720,31 @@ fn a_relay_file_answers_while_a_copy_of_its_listener_lives() {
     drop(copy);
     assert_eq!(
         request.expect("the copied listener reads the real probe"),
-        Some(RelayHeader::Applies.encode())
+        Some(RelayHeader::Applies.encode()),
+        "CONTROL: a listener closed here takes the ask through a copy of its descriptor"
     );
-    assert!(
-        answers,
-        "CONTROL: a listener closed here answers through a copy of its descriptor"
+    assert_eq!(
+        read,
+        [(std::process::id(), WindowPresence::Silent)],
+        "an ask it took and never answered is silent"
     );
     let held = stale_relay_file(relay.path());
     assert!(
-        !a_window_that_applies_answers(relay.path()),
-        "a stale relay file answers nothing while its descriptor lives"
+        !super::relay_answers(&path),
+        "a stale relay file takes no connect while its descriptor lives"
     );
     drop(held);
 }
 
 /// THE NODE BOOT APPLIES ONLY WITH NO WINDOW HERE (§4.13): a start runs the boot apply where no
-/// relay answers, a stale relay file included, and auto-apply is on, whether or not its own look
+/// window holds it (a silent one holds it for the bound of the build's wait), and auto-apply is on, whether or not its own look
 /// found a build waiting (the apply reads the stage itself, and with nothing waiting it counts
 /// the start against its build's boot trial, so a build that crash-loops under launchd is
-/// reverted). While a window runs it neither applies nor counts. With auto-apply off, it only
-/// recovers an existing trial. A build it found and the apply did not run is the boot's left build.
+/// reverted). While a window that answers runs it neither applies nor counts. A window that does
+/// not answer holds the apply, not the trial: an armed headless trial is still counted and
+/// recovered beside it, so a build that crash-loops beside a frozen window is reverted. With
+/// auto-apply off, it only recovers an existing trial. A build it found and the apply did not run
+/// is the boot's left build.
 #[test]
 fn the_node_boot_applies_only_with_no_window_here() {
     let relay = crate::test_scratch::short_dir("node-update-boot");
@@ -3747,8 +3800,65 @@ fn the_node_boot_applies_only_with_no_window_here() {
     let _stale = stale_relay_file(relay.path());
     assert_eq!(
         boot_with(&updater),
+        (0, 1, None),
+        "a live window whose relay does not answer holds the boot's apply as one that applies \
+         it, and the armed trial is still counted and recovered beside it"
+    );
+    updater.trial_pending.store(false, Ordering::Release);
+    assert_eq!(
+        boot_with(&updater),
+        (0, 0, None),
+        "with no trial armed there is nothing to count"
+    );
+    lock(&updater.newer).take();
+    updater.trial_pending.store(true, Ordering::Release);
+    assert_eq!(
+        boot_with(&updater),
+        (0, 1, None),
+        "THE CRASH LOOP: a trial build with nothing newer waiting, beside a frozen window, still \
+         counts each start, so launchd's restarts of a build that crashes reach its revert"
+    );
+    updater.stage(2);
+    *lock(&updater.waited) = super::WINDOW_HOLDS_AN_UPDATE_WITHIN;
+    assert_eq!(
+        boot_with(&updater),
         (1, 0, Some(2)),
-        "a relay file that does not answer is no window"
+        "once build 2 has waited the bound here, the boot applies it beside that window"
+    );
+}
+
+/// A SILENT WINDOW'S BOUND RUNS WHERE NO CLOCK ANSWERS: the job's own check keeps no pending clock
+/// and a frozen window's check runs no more, so a wait that read `None` held the build for as long
+/// as the window's pid lived. The pending clock's answer is the wait where it answers; where it does
+/// not, the wait since this run first asked for that build, and a newer build starts it again.
+#[test]
+fn a_silent_windows_bound_runs_where_no_clock_answers() {
+    let first = std::sync::Mutex::new(None);
+    let t0 = Instant::now();
+    let hour = Duration::from_secs(3600);
+    assert_eq!(
+        super::waited_or_since(None, &first, 2, t0),
+        Duration::ZERO,
+        "the first ask starts it"
+    );
+    assert_eq!(
+        super::waited_or_since(None, &first, 2, t0 + 5 * hour),
+        5 * hour,
+        "THE STRANDING: with no clock the wait still grows to the bound"
+    );
+    assert!(
+        super::waited_or_since(None, &first, 2, t0 + 5 * hour)
+            >= super::WINDOW_HOLDS_AN_UPDATE_WITHIN
+    );
+    assert_eq!(
+        super::waited_or_since(Some(hour), &first, 2, t0 + 6 * hour),
+        hour,
+        "the pending clock, which outlives the run, answers where it can"
+    );
+    assert_eq!(
+        super::waited_or_since(None, &first, 3, t0 + 6 * hour),
+        Duration::ZERO,
+        "NEGATIVE CONTROL: a newer build waits afresh"
     );
 }
 
@@ -4037,7 +4147,12 @@ fn every_window_relay_hears_the_node_jobs_ask() {
             })
         })
         .collect();
-    assert!(a_window_that_applies_answers(relay.path()));
+    // The runner's image is no aterm's: the relay names stand in for two windows.
+    assert!(
+        super::window_presences_by(relay.path(), |_| true)
+            .iter()
+            .all(|(_, presence)| *presence == WindowPresence::Answers { applies: true })
+    );
     assert_eq!(
         asked.each_ref().map(|asked| asked.load(Ordering::Acquire)),
         [1, 1],
@@ -4460,8 +4575,9 @@ fn an_older_build_or_a_changed_checks_setting_ends_the_node_run_window_or_not() 
 
 /// AN ACTIVATION THE WINDOW HERE FAILED TO SWITCH TO GIVES WAY TO A NEWER STAGE THROUGH THE NODE
 /// JOB, WINDOW OR NOT: a window that cannot reach the build it pinned its switch to applies
-/// nothing newer, so the job installs the newer stage and ends its run, during a trial too; with no
-/// window the install's words end the run, not those of the newer build it took. CONTROLS:
+/// nothing newer, so the job installs the newer stage and ends its run once its own trial has
+/// settled; with no window the install's words end the run, not those of the newer build it took.
+/// CONTROLS:
 /// `[update] auto_apply` off installs nothing, window or not, and with no failed activation the
 /// newer build waits for the window as before, or ends the run by itself with no window.
 #[test]
@@ -4487,8 +4603,16 @@ fn a_failed_activation_gives_way_to_a_newer_stage_through_the_node_job_window_or
     );
     assert_eq!(updater.failed_installs.load(Ordering::Acquire), 0);
     updater.auto_apply.store(true, Ordering::Release);
+    assert_eq!(
+        why_the_run_ends(&updater, boot, relay.path()),
+        None,
+        "this build's own trial settles first: the install would end a run whose listener has \
+         not missed"
+    );
+    assert_eq!(updater.failed_installs.load(Ordering::Acquire), 0);
+    updater.trial_pending.store(false, Ordering::Release);
     let why = why_the_run_ends(&updater, boot, relay.path())
-        .expect("the job installs over a failed activation while a window runs, mid-trial");
+        .expect("the job installs over a failed activation while a window runs");
     assert!(why.contains("build 12 installed over 11"), "{why}");
     assert_eq!(updater.failed_installs.load(Ordering::Acquire), 1);
     drop(window);
@@ -4822,9 +4946,10 @@ fn a_stuck_check_said_during_a_trial_ends_the_node_run_once_it_settles() {
 
 /// WHAT A RUN WOULD END FOR WAITS FOR A TRIAL TO SETTLE: a start counts against a build whose listener has
 /// not missed, three revert it, and an armed trial applies nothing newer. A stage or a changed setting
-/// that landed during a held trial spent those starts on nothing the build did. The newer build gives way
-/// an hour on, since a trial the updater keeps refusing to settle must not hold it for good. CONTROL: a
-/// build put back in this copy's place goes at once, trial or not.
+/// that landed during a held trial spent those starts on nothing the build did. An hour on the newer
+/// build still waits: a run's deliberate end gives its launch back, so a restart then only met the same
+/// armed trial again, once an hour for good, and never installed the build. CONTROL: a build put back in
+/// this copy's place goes at once, trial or not, and a settled trial lets the build go at once.
 #[test]
 fn what_a_run_would_end_for_waits_for_a_trial_to_settle() {
     let relay = crate::test_scratch::short_dir("node-update-trial-wait");
@@ -4844,8 +4969,14 @@ fn what_a_run_would_end_for_waits_for_a_trial_to_settle() {
     updater.advance(Duration::from_secs(1));
     assert_eq!(
         restart_for(&updater, boot, relay.path()),
-        Some(2),
-        "an hour on, the trial gives way to the waiting build"
+        None,
+        "an hour on, a restart would meet the same armed trial: the build waits for it"
+    );
+    updater.advance(10 * RETRY_LEFT_AFTER);
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        None,
+        "however long"
     );
     let boot = NodeBoot::nothing_at(updater.now());
     assert_eq!(
@@ -5130,6 +5261,31 @@ fn a_trial_s_clocks_measure_an_unbroken_run_of_looks() {
     assert_eq!(updater.confirms.load(Ordering::Acquire), 1, "CONTROL");
 }
 
+/// A TRIAL WHOSE MISSES LASTED NOTES WHY BEFORE IT ENDS THE RUN: the update record gets the miss
+/// and the node's reason first, so the hold a later revert sets says why; misses that have not
+/// lasted note nothing.
+/// NEGATIVE CONTROL: with `failed_trial` noting after its restart, the note records one restart
+/// before it (`` noted before the restart ``).
+#[test]
+fn a_trial_whose_misses_lasted_notes_why_before_it_ends_the_run() {
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let dyn_updater: Arc<dyn NodeUpdater> = updater.clone();
+    let updates = NodeUpdates::new(dyn_updater, NodeBoot::nothing_at(updater.started));
+    updates.trial_proof_missed(&updater.stop, "no reply");
+    assert!(lock(&updater.misses).is_empty(), "one miss notes nothing");
+    updater.advance(super::TRIAL_SETTLES_WITHIN);
+    updates.trial_proof_missed(&updater.stop, "the backlog is full");
+    assert_eq!(updater.restarts().len(), 1);
+    assert_eq!(
+        *lock(&updater.misses),
+        vec![(
+            0,
+            "the node service could not prove its listener: the backlog is full".to_owned()
+        )],
+        "noted before the restart"
+    );
+}
+
 /// A TRIAL THE UPDATER WILL NOT SETTLE ASKS AGAIN, AND ENDS NO RUN: a held lock or a failed recovery
 /// proof at its bound is no more the build's than what kept it from asking.
 #[test]
@@ -5181,7 +5337,9 @@ fn a_look_that_could_not_read_its_inputs_keeps_the_listener() {
     assert!(
         updates.settle_service_with(&super::health::Inputs::of(&cfg), at, &cfg.stop, |_| {
             crate::test_scratch::write_config(&config, UNREAD);
-            Err("a dial the fault cut short".to_owned())
+            Err(super::health::Unproven::Missed(
+                "a dial the fault cut short".to_owned(),
+            ))
         }),
         "so does a fault that meets the read after the dial"
     );
@@ -5228,7 +5386,11 @@ fn a_listener_that_refuses_its_own_dial_fails_no_trial() {
                 &super::health::Inputs::of(&cfg),
                 (listen.parse().unwrap(), &secret, &proved, listen),
                 &cfg.stop,
-                |_| Err("the listener refused the dial".to_owned()),
+                |_| {
+                    Err(super::health::Unproven::Missed(
+                        "the listener refused the dial".to_owned(),
+                    ))
+                },
             )
         };
         assert!(look(), "{listen}");
@@ -5269,7 +5431,7 @@ fn a_broker_that_fails_between_misses_confirms_nothing() {
     let at = (listen.parse().unwrap(), &secret, &proved, listen);
     let miss = || {
         updates.settle_service_with(&super::health::Inputs::of(&cfg), at, &cfg.stop, |_| {
-            Err("no reply".to_owned())
+            Err(super::health::Unproven::Missed("no reply".to_owned()))
         })
     };
     assert!(miss());
@@ -5404,7 +5566,11 @@ fn a_self_dial_that_reached_a_loopback_holder_fails_no_trial() {
             &super::health::Inputs::of(&cfg),
             (addr, &secret, &proved, listen.as_str()),
             &cfg.stop,
-            |_| Err("the dial reached another node".to_owned()),
+            |_| {
+                Err(super::health::Unproven::Missed(
+                    "the dial reached another node".to_owned(),
+                ))
+            },
         )
     };
     assert!(look());
@@ -5703,7 +5869,9 @@ fn node_health_fences_probes_and_preserves_only_definite_holds() {
                     "key" => std::fs::write(state.join("fleet.key"), "ab".repeat(24)).unwrap(),
                     _ => {}
                 }
-                Err("controlled probe failure after its input capture".to_owned())
+                Err(super::health::Unproven::Missed(
+                    "controlled probe failure after its input capture".to_owned(),
+                ))
             },
         );
         assert_eq!(
@@ -5724,7 +5892,11 @@ fn node_health_fences_probes_and_preserves_only_definite_holds() {
                 &super::health::Inputs::of(&cfg),
                 (listen.parse().unwrap(), &secret, &proved, listen),
                 &cfg.stop,
-                |_| Err("the listener still does not answer".to_owned()),
+                |_| {
+                    Err(super::health::Unproven::Missed(
+                        "the listener still does not answer".to_owned(),
+                    ))
+                },
             );
             assert!(!result);
             assert_eq!(updater.confirms.load(Ordering::Acquire), 0);
@@ -5812,9 +5984,17 @@ impl NodeUpdater for FixtureStage {
         None
     }
 
+    fn note_trial_miss(&self, _why: &str) {}
+
     fn restart(&self, _why: &str) {
         self.restarted.store(true, Ordering::Release);
         self.stop.set();
+    }
+
+    fn forgive_launch(&self) {}
+
+    fn waited_for(&self, _: u64) -> Duration {
+        Duration::ZERO
     }
 
     fn now(&self) -> Instant {
@@ -6049,4 +6229,409 @@ fn other_windows_count_only_from_a_folder_holding_this_ones_relay() {
     assert_eq!(others_beside(me, relay.path()), Some(1));
     std::fs::remove_file(super::relay_socket_path(relay.path(), other)).unwrap();
     assert_eq!(others_beside(me, relay.path()), Some(0), "alone");
+}
+
+/// A pid no process holds: a child that has exited and been reaped.
+fn a_dead_pid() -> u32 {
+    let mut child = aterm_uds::spawnfd::command("/usr/bin/true")
+        .spawn()
+        .expect("spawn true");
+    let pid = child.id();
+    child.wait().expect("reap true");
+    assert!(
+        !crate::control_auth::pid_alive(pid),
+        "the reaped child's pid is free"
+    );
+    pid
+}
+
+/// A WINDOW THAT IS NOT SCHEDULED HOLDS THE UPDATE: a window process alive but not run for days
+/// stops accepting on its relay, its listen queue fills, and every later connect is refused. The
+/// node job read that refusal as "no window runs" and installed each new build beside it, then
+/// failed each trial and held the release. A live aterm pid whose relay refuses is silent and
+/// holds the build as a window that applies it does, for the bound of the build's wait here.
+/// NEGATIVE CONTROL: the same socket named for a dead pid is gone, and the job installs.
+#[test]
+fn a_window_whose_relay_backlog_is_full_holds_the_update_until_the_bound() {
+    let relay = crate::test_scratch::short_dir("node-update-backlog");
+    let updater = ScriptedUpdater::new(None);
+    updater.trial_pending.store(false, Ordering::Release);
+    let boot = NodeBoot::nothing_at(updater.started);
+    updater.stage(2);
+
+    let own = relay_socket_path(relay.path(), std::process::id());
+    let listener = aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(&own))
+        .expect("a relay listener that never accepts");
+    // Fill its listen queue: each connect nobody accepts takes a slot until one is refused.
+    let mut queued = Vec::new();
+    let refused = (0..4096).any(|_| {
+        match aterm_uds::connect::until(&own, Instant::now() + Duration::from_secs(1)) {
+            Ok(stream) => {
+                queued.push(stream);
+                false
+            }
+            Err(_) => true,
+        }
+    });
+    assert!(
+        refused,
+        "the listen queue filled after {} connects",
+        queued.len()
+    );
+    assert!(
+        aterm_uds::connect::until(&own, Instant::now() + Duration::from_secs(1)).is_err(),
+        "CONTROL: a full queue refuses the job's connect too"
+    );
+
+    assert_eq!(
+        presences(relay.path()),
+        [(std::process::id(), WindowPresence::Silent)]
+    );
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        None,
+        "THE STRANDING: a live window whose relay refuses holds the build"
+    );
+    *lock(&updater.waited) = super::WINDOW_HOLDS_AN_UPDATE_WITHIN - Duration::from_secs(1);
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        None,
+        "for the whole bound"
+    );
+    *lock(&updater.waited) = super::WINDOW_HOLDS_AN_UPDATE_WITHIN;
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        Some(2),
+        "a frozen window holds no update for good"
+    );
+    *lock(&updater.waited) = Duration::ZERO;
+
+    let dead = relay_socket_path(relay.path(), a_dead_pid());
+    std::fs::rename(&own, &dead).expect("name the socket for a dead pid");
+    assert_eq!(
+        presences(relay.path()),
+        [(
+            super::parse_relay_filename(dead.file_name().unwrap().to_str().unwrap()).unwrap(),
+            WindowPresence::Gone
+        )],
+        "NEGATIVE CONTROL: the socket of a dead pid is gone"
+    );
+    assert_eq!(
+        restart_for(&updater, boot, relay.path()),
+        Some(2),
+        "NEGATIVE CONTROL: with no window here the job installs"
+    );
+    drop(queued);
+    drop(listener);
+}
+
+/// A PID THAT RUNS ANOTHER PROGRAM IS NO WINDOW: a relay file whose window died and whose pid went
+/// to another program says nothing of a window. CONTROL: the same file, judged an aterm image, is
+/// silent.
+#[test]
+fn a_relay_whose_pid_runs_another_program_is_gone() {
+    let relay = crate::test_scratch::short_dir("node-relay-other-image");
+    let _stale = stale_relay_file(relay.path());
+    let me = std::process::id();
+    assert_eq!(
+        super::window_presences_by(relay.path(), |_| false),
+        [(me, WindowPresence::Gone)]
+    );
+    assert_eq!(
+        super::window_presences_by(relay.path(), |_| true),
+        [(me, WindowPresence::Silent)],
+        "CONTROL"
+    );
+    assert!(
+        super::runs_an_aterm_image(me),
+        "this process's own image is one of its windows'"
+    );
+}
+
+/// A RELAY SURVIVES A FAULT ITS ACCEPT CAN PASS: an accept that failed for want of descriptors or a
+/// connection its peer aborted ended the relay for good, its socket unlinked, and the node job then
+/// read a live window as gone. It keeps its socket and accepts again. NEGATIVE CONTROL: a fault
+/// that cannot pass still ends it, for its keeper to bind again.
+#[test]
+fn a_window_relay_survives_an_accept_fault_that_can_pass() {
+    let relay = crate::test_scratch::short_dir("node-relay-accept-fault");
+    let faults = Arc::new(AtomicUsize::new(3));
+    let stop = Arc::new(AtomicBool::new(false));
+    let ready = Arc::new(AtomicBool::new(false));
+    let maintained = Arc::new(AtomicBool::new(false));
+    let (entered, await_entered) = std::sync::mpsc::channel();
+    let (release, await_release) = std::sync::mpsc::channel();
+    let serving = {
+        let (dir, faults, stop) = (
+            relay.path().to_path_buf(),
+            Arc::clone(&faults),
+            Arc::clone(&stop),
+        );
+        let ready = Arc::clone(&ready);
+        let maintained = Arc::clone(&maintained);
+        std::thread::spawn(move || {
+            let path = relay_socket_path(&dir, std::process::id());
+            let mut first = true;
+            let mut readiness = super::RelayReadiness {
+                ready,
+                maintain: Box::new(move || {
+                    assert!(
+                        path.exists(),
+                        "the pending socket must precede node renewal"
+                    );
+                    maintained.store(true, Ordering::Release);
+                    if std::mem::replace(&mut first, false) {
+                        entered.send(()).unwrap();
+                        await_release
+                            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                            .unwrap();
+                    }
+                }),
+            };
+            super::serve_window_relay_with(
+                &dir,
+                std::process::id(),
+                Some(&stop),
+                hosts_every,
+                |header, stream| match header {
+                    RelayHeader::Applies => super::answer_applies(stream, true),
+                    _ => true,
+                },
+                Some(&mut readiness),
+                |listener, wait| {
+                    if faults
+                        .try_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                            left.checked_sub(1)
+                        })
+                        .is_ok()
+                    {
+                        return Err(std::io::Error::from_raw_os_error(libc::EMFILE));
+                    }
+                    aterm_uds::accept(listener, wait, aterm_uds::AcceptedMode::Blocking)
+                        .map(|(stream, _)| stream)
+                },
+            )
+        })
+    };
+    await_entered
+        .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+        .unwrap();
+    let windows = WindowRelays::new(
+        relay.path().to_path_buf(),
+        Arc::new(MockWindowLauncher::new(
+            true,
+            false,
+            Arc::new(AtomicBool::new(false)),
+        )),
+    );
+    assert!(
+        matches!(
+            super::relay_to_window_within(
+                &windows,
+                &RelayHeader::Survey {
+                    content: false,
+                    drive: false,
+                    peer: None
+                },
+                Duration::from_millis(50)
+            ),
+            super::RelayOpen::Busy(_)
+        ),
+        "the bound socket is Busy, never NoWindow, while renewal holds the accept loop"
+    );
+    ready.store(true, Ordering::Release);
+    release.send(()).unwrap();
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the relay answers after its faults",
+        || a_window_that_applies_answers(relay.path()).then_some(()),
+    );
+    assert_eq!(
+        faults.load(Ordering::Acquire),
+        0,
+        "every injected fault was met"
+    );
+    assert!(
+        maintained.load(Ordering::Acquire),
+        "the bound relay owns maintenance"
+    );
+    let path = relay_socket_path(relay.path(), std::process::id());
+    ready.store(false, Ordering::Release);
+    let old_header = "DRIVE node=abcd host=m59 peer=-\n";
+    assert!(matches!(
+        super::hand_over(&path, old_header),
+        super::HandOver::Busy(why) if why == "ERR fleet node updating"
+    ));
+    assert!(
+        has_live_window_relay(relay.path()),
+        "pending is not windowless"
+    );
+    ready.store(true, Ordering::Release);
+    assert!(
+        matches!(
+            super::hand_over(&path, old_header),
+            super::HandOver::Busy(why) if why == "ERR missing requester"
+        ),
+        "readiness never relaxes the requester boundary"
+    );
+    assert!(
+        a_window_that_applies_answers(relay.path()),
+        "a late renewal releases the same relay"
+    );
+    stop.store(true, Ordering::Release);
+    serving.join().unwrap().expect("a stop ends it cleanly");
+
+    let ended = super::serve_window_relay_with(
+        relay.path(),
+        std::process::id(),
+        None,
+        hosts_every,
+        |_, _| true,
+        None,
+        |_, _| Err(std::io::Error::from_raw_os_error(libc::EBADF)),
+    );
+    assert!(
+        ended.is_err(),
+        "NEGATIVE CONTROL: a fault that cannot pass ends it"
+    );
+    assert!(
+        !relay_socket_path(relay.path(), std::process::id()).exists(),
+        "its socket goes with it"
+    );
+}
+
+/// A WINDOW'S RELAY THAT ENDS IS BOUND AGAIN: its thread discarded the error and never served
+/// again. Its keeper says why and binds again after a pause that doubles to its bound; it returns
+/// only once a serve does without a fault.
+#[test]
+fn a_window_relay_that_ends_is_bound_again() {
+    let mut serves = 0;
+    let mut pauses = Vec::new();
+    super::keep_window_relay(
+        || {
+            serves += 1;
+            if serves <= 8 {
+                Err(std::io::Error::from_raw_os_error(libc::EBADF))
+            } else {
+                Ok(())
+            }
+        },
+        |pause| pauses.push(pause),
+    );
+    assert_eq!(serves, 9);
+    assert_eq!(pauses.len(), 8);
+    assert_eq!(pauses.first(), Some(&super::RELAY_BACKOFF_FIRST));
+    assert!(
+        pauses.windows(2).all(|pair| pair[0] <= pair[1]),
+        "{pauses:?}"
+    );
+    assert_eq!(pauses.last(), Some(&super::RELAY_BACKOFF_MAX));
+}
+
+/// A RUN THAT ENDS BY CHOICE GIVES ITS LAUNCH BACK: every start of the node job counted against the
+/// trial of the build it ran, so its own restarts for a newer build, a moved setting or a give-way
+/// reverted a build that served, and held it. NEGATIVE CONTROL: a failed trial's end still
+/// counts.
+#[test]
+fn a_node_run_that_ends_by_choice_gives_its_launch_back() {
+    let relay = crate::test_scratch::short_dir("node-update-forgive");
+    let updater = Arc::new(ScriptedUpdater::new(Some(2)));
+    updater.trial_pending.store(false, Ordering::Release);
+    let updates = NodeUpdates::new(
+        Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+        NodeBoot::nothing_at(updater.started),
+    );
+    spawn_node_updates(
+        &updates,
+        relay.path().to_path_buf(),
+        Arc::clone(&updater.stop),
+    );
+    aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, "the run ends", || {
+        (!updater.restarts().is_empty()).then_some(())
+    });
+    assert_eq!(updater.restarts().len(), 1);
+    assert_eq!(
+        updater.forgives.load(Ordering::Acquire),
+        1,
+        "an end for a newer build is no crash"
+    );
+
+    let updater = Arc::new(ScriptedUpdater::new(None));
+    let updates = NodeUpdates::new(
+        Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+        NodeBoot::nothing_at(updater.started),
+    );
+    updates.failed_trial(&Stop::new(), "the listener never answered");
+    assert_eq!(updater.restarts().len(), 1);
+    assert_eq!(
+        updater.forgives.load(Ordering::Acquire),
+        0,
+        "NEGATIVE CONTROL: a failed trial's end counts"
+    );
+}
+
+/// AN INSTALL OVER A FAILED ACTIVATION WAITS FOR THIS BUILD'S TRIAL: it ends the run, so during a
+/// trial it ended a run whose listener had not missed. CONTROL: once the trial settles it installs.
+#[test]
+fn an_install_over_a_failed_activation_waits_for_the_trial() {
+    let updater = ScriptedUpdater::new(None);
+    *lock(&updater.failed) = Some((2, 3));
+    assert_eq!(super::install_over_a_failed_activation(&updater), None);
+    assert_eq!(updater.failed_installs.load(Ordering::Acquire), 0);
+    updater.trial_pending.store(false, Ordering::Release);
+    assert!(
+        super::install_over_a_failed_activation(&updater).is_some(),
+        "CONTROL"
+    );
+}
+
+/// A SELF-DIAL THIS NODE ANSWERED, WHOSE REPLY CAME LATE, FAILS NO TRIAL: the node had accepted,
+/// and its TLS, secret and node proof held, and only the census reply missed the dial's single
+/// three-second bound, so one slow census input reverted a build that served. It is unprovable,
+/// and past the bound the trial settles. NEGATIVE CONTROL: a miss that lasts ends the run.
+#[test]
+fn a_late_reply_from_this_very_node_fails_no_trial() {
+    let listen = "192.168.1.2:7100";
+    for (unproven, missed) in [
+        (super::health::Unproven::ReplyLate("late".to_owned()), false),
+        (super::health::Unproven::Missed("no reply".to_owned()), true),
+    ] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let state = root.path().join("state");
+        let (secret, node) = seed_fleet_node(&state);
+        let config = root.path().join("aterm.toml");
+        crate::test_scratch::write_config(
+            &config,
+            format!("[fleet]\nlisten = \"{listen}\"\nallow = \"facts\"\n"),
+        );
+        let updater = Arc::new(ScriptedUpdater::new(None));
+        let cfg = idle_job_config(&updater, &state, &config, root.path());
+        let updates = NodeUpdates::new(
+            Arc::clone(&updater) as Arc<dyn NodeUpdater>,
+            NodeBoot::nothing_at(updater.started),
+        );
+        let proved = Some((node.node().to_owned(), node.key()));
+        let look = || {
+            let unproven = unproven.clone();
+            updates.settle_service_with(
+                &super::health::Inputs::of(&cfg),
+                (listen.parse().unwrap(), &secret, &proved, listen),
+                &cfg.stop,
+                |_| Err(unproven),
+            )
+        };
+        assert!(look());
+        updater.advance(super::TRIAL_SETTLES_WITHIN);
+        assert_eq!(look(), !missed, "{unproven:?}");
+        assert_eq!(
+            updater.restarts().len(),
+            usize::from(missed),
+            "{unproven:?}"
+        );
+        assert_eq!(
+            updater.confirms.load(Ordering::Acquire),
+            usize::from(!missed),
+            "{unproven:?}"
+        );
+    }
 }

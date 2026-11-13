@@ -886,7 +886,9 @@ fn confirm_slot(id: &str, invalid: usize) -> Result<bool, String> {
 /// The keychain profile name the notarytool credential is stored under.
 pub(crate) const NOTARY_PROFILE: &str = "notary";
 
-/// Store a notarytool credential in this machine's keychain.
+/// Set the notarytool keychain profile from the vault's notary entry: the one source of the
+/// credential. With none delivered here the step is blocked, and its caller files the want
+/// with the lab ([`aterm_secrets::need::Want::Notary`]); no person is asked for it.
 pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
     if !cfg!(target_os = "macos") {
         return Outcome::Skipped("cuts run on macOS (Tier APPLE); no keychain on this host".into());
@@ -894,101 +896,27 @@ pub(crate) fn ensure_notary(may_change: bool) -> Outcome {
     if !may_change {
         return Outcome::Todo {
             what: "no notarytool credential in the keychain".into(),
-            next: "re-run without --check to store one".into(),
+            next: "re-run without --check to set it from the vault".into(),
         };
     }
     match aterm_secrets::client::Paths::live()
         .and_then(|paths| aterm_secrets::client::release::sync_notary(&paths))
     {
-        Ok(Some(note)) => {
-            return Outcome::Ready {
-                ids: Vec::new(),
-                note: Some(note),
-            };
-        }
-        Ok(None) => {}
-        Err(error) => {
-            return Outcome::Waiting {
-                what: format!("shared notary credential could not be materialized: {error}"),
-                next: "retry after the authenticated vault credential or notary service recovers"
-                    .into(),
-            };
-        }
-    }
-    let profile = NOTARY_PROFILE;
-    step(
-        "notary",
-        "the password this step asks for is an APP-SPECIFIC password, NOT your Apple ID \
-         password. Mint one first — Apple shows it once:\n\
-         1. https://account.apple.com → Sign-In and Security\n\
-         2. App-Specific Passwords → +   (2FA required)\n\
-         3. copy the xxxx-xxxx-xxxx-xxxx string\n\
-         then paste it at the password prompt below.",
-    );
-    let apple_id = match tty_line(
-        &format!(
-            "\n{}",
-            crate::publish::grid_block(
-                "notary",
-                "Apple ID for notarization\n(blank skips it — but a cut is refused without \
-                 notarization, and on a first run no roster id is minted either): "
-            )
-        ),
-        128,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            return Outcome::Waiting {
-                what: format!("no notarytool credential, and no terminal to ask on ({e})"),
-                next: format!(
-                    "xcrun notarytool store-credentials {profile} --apple-id <your-apple-id> \
-                     --team-id {}",
-                    pins::APPLE_TEAM_ID
-                ),
-            };
-        }
-    };
-    if apple_id.is_empty() {
-        return Outcome::Waiting {
-            what: "no notarytool credential in the keychain".into(),
-            next: format!(
-                "xcrun notarytool store-credentials {profile} --apple-id <your-apple-id> \
-                 --team-id {} (password: an app-specific password — mint at https://account.apple.com → Sign-In and Security → App-Specific Passwords)",
-                pins::APPLE_TEAM_ID
-            ),
-        };
-    }
-    let status = command("/usr/bin/xcrun")
-        .args([
-            "notarytool",
-            "store-credentials",
-            profile,
-            "--apple-id",
-            &apple_id,
-            "--team-id",
-            pins::APPLE_TEAM_ID,
-        ])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .status();
-    match status {
-        Ok(s) if s.success() => Outcome::Ready {
+        Ok(Some(note)) => Outcome::Ready {
             ids: Vec::new(),
-            note: None,
+            note: Some(note),
         },
-        Ok(_) => Outcome::Waiting {
-            what: "notarytool did not store a credential".into(),
-            next: format!(
-                "check the Apple ID and app-specific password, then re-run; or run \
-                 `xcrun notarytool store-credentials {profile} --apple-id {apple_id} \
-                 --team-id {}` by hand",
-                pins::APPLE_TEAM_ID
+        Ok(None) => Outcome::Blocked {
+            what: format!(
+                "this Mac holds no {} entry to set notarytool profile '{NOTARY_PROFILE}' from",
+                aterm_secrets::need::catalog::NOTARY_ENTRY
             ),
+            fix: "`aterm secrets need notary`".into(),
         },
-        Err(e) => Outcome::Blocked {
-            what: format!("could not run xcrun notarytool: {e}"),
-            fix: "install the Xcode command-line tools (`xcode-select --install`)".into(),
+        Err(error) => Outcome::Waiting {
+            what: format!("shared notary credential could not be materialized: {error}"),
+            next: "retry after the authenticated vault credential or notary service recovers"
+                .into(),
         },
     }
 }

@@ -20,9 +20,16 @@ mod produced;
 pub use produced::RegisteredOutput;
 mod output;
 pub use output::RetainedOutputLocks;
+mod publication;
+pub use publication::{
+    CompletedLocalOperation, LocalAdmission, LocalCompletion, LocalIoScope, LocalNotAdmitted,
+};
 
+pub mod control_pin;
+mod member_context;
 mod store;
 mod worker;
+pub use member_context::MemberOriginalContext;
 pub use store::{
     EarlyHostStore, PendingHostStore, capture_host_store, capture_host_store_descriptor,
     snapshot_host_store, snapshot_host_store_descriptor,
@@ -45,7 +52,10 @@ impl std::fmt::Display for WorkloadControlError {
 impl std::error::Error for WorkloadControlError {}
 
 fn refused() -> io::Error {
-    io::Error::new(io::ErrorKind::PermissionDenied, "original workload CPU transfer unavailable")
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "original workload CPU transfer unavailable",
+    )
 }
 fn identity(fd: RawFd) -> io::Result<FileIdentity> {
     // SAFETY: initialized native output, observing one existing description.
@@ -61,7 +71,10 @@ fn identity(fd: RawFd) -> io::Result<FileIdentity> {
     {
         return Err(refused());
     }
-    Ok(FileIdentity { device: stat.st_dev as u64, inode: stat.st_ino as u64 })
+    Ok(FileIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    })
 }
 
 /// No descriptor allocation, locking or user configuration is performed here.
@@ -87,7 +100,9 @@ impl EarlyCpuSet {
 /// Call alongside snapshot_sdk_lease BEFORE GNU import or descriptor allocation.
 pub fn snapshot_cpu_set() -> io::Result<PendingCpuSet> {
     let Some(value) = std::env::var_os(host::CPU_SET_FDS_ENV) else {
-        return Ok(PendingCpuSet { originals: Vec::new() });
+        return Ok(PendingCpuSet {
+            originals: Vec::new(),
+        });
     };
     snapshot(value.to_str().ok_or_else(refused)?)
 }
@@ -169,6 +184,7 @@ pub struct AuthenticatedWorkloadStartup {
 pub struct AuthenticatedMemberCpu {
     reply: host::MemberOriginalReply,
     original: OwnedFd,
+    origin: std::sync::Arc<MemberOriginalContext>,
 }
 impl AuthenticatedMemberCpu {
     pub fn observation(&self) -> &host::MemberOriginalReply {
@@ -176,6 +192,17 @@ impl AuthenticatedMemberCpu {
     }
     pub fn into_original(self) -> (host::MemberOriginalReply, File) {
         (self.reply, File::from(self.original))
+    }
+    /// Continue SAME live owner alongside the actual CPU description. Neither
+    /// returned observations nor an arbitrary File can construct this owner.
+    pub fn into_retained_original(
+        self,
+    ) -> (
+        host::MemberOriginalReply,
+        File,
+        std::sync::Arc<MemberOriginalContext>,
+    ) {
+        (self.reply, File::from(self.original), self.origin)
     }
 }
 impl super::Client {
@@ -189,7 +216,9 @@ impl super::Client {
         let original = self.host.connect(deadline).map_err(super::before)?;
         let mut channel = Channel::new(original.stream().try_clone().map_err(super::before)?)
             .map_err(super::before)?;
-        channel.send(&request.hello().map_err(super::before)?, deadline).map_err(super::before)?;
+        channel
+            .send(&request.hello().map_err(super::before)?, deadline)
+            .map_err(super::before)?;
         let exchange = (|| {
             original.revalidate(deadline)?;
             channel.send(&payload, deadline)?;
@@ -198,10 +227,23 @@ impl super::Client {
             super::sdk::validate_sdk_keeper(&reply.context.context)?;
             let mut originals = receive_set(&channel, &[&reply.cpu], early, deadline)?;
             original.revalidate(deadline)?;
+            let origin = MemberOriginalContext::capture(
+                self.clone(),
+                request.clone(),
+                reply.context.context.clone(),
+                deadline,
+            )?;
             channel.send(&[1], deadline)?;
-            Ok(AuthenticatedMemberCpu { reply, original: originals.remove(0) })
+            Ok(AuthenticatedMemberCpu {
+                reply,
+                original: originals.remove(0),
+                origin,
+            })
         })();
-        exchange.map_err(|error| super::CallError { delivery: super::Delivery::Unknown, error })
+        exchange.map_err(|error| super::CallError {
+            delivery: super::Delivery::Unknown,
+            error,
+        })
     }
 }
 impl AuthenticatedWorkloadStartup {
@@ -211,7 +253,11 @@ impl AuthenticatedWorkloadStartup {
     /// Transfer exactly the original received kernel descriptions to the native
     /// lease owner. This method grants nothing to a decoded ReadyReply.
     pub fn into_originals(self) -> (ReadyReply, Vec<File>, WorkloadControl) {
-        (self.reply, self.originals.into_iter().map(File::from).collect(), self.control)
+        (
+            self.reply,
+            self.originals.into_iter().map(File::from).collect(),
+            self.control,
+        )
     }
 }
 
@@ -231,7 +277,11 @@ impl ReceivedOriginals {
             self.reply.context.context.root_attempt,
             self.reply.invocation_sha256,
         );
-        AuthenticatedWorkloadStartup { reply: self.reply, originals: self.originals, control }
+        AuthenticatedWorkloadStartup {
+            reply: self.reply,
+            originals: self.originals,
+            control,
+        }
     }
 }
 
@@ -251,12 +301,38 @@ impl WorkloadControl {
             invocation_sha256,
             last_sequence: 0,
             last_phase_sequence: 0,
+            last_local_sequence: 0,
+            local_active: None,
             active_phase: None,
             output_locks: None,
+            native_outputs: None,
+            retained_outputs: std::collections::BTreeMap::new(),
+            last_output_selection: 0,
             pending: None,
             failed: false,
             drained: false,
         }
+    }
+    /// Only distinct authenticated native49/v3 startup assembles this profile.
+    /// The declared paths constrain selection DATA; actual received Host roots
+    /// and retained original OFDs remain mandatory before any member dispatch.
+    pub(super) fn from_native_job_original_channel(
+        channel: Channel,
+        host: std::sync::Arc<trust_resource_provenance::PinnedHelper>,
+        root_attempt: [u8; 16],
+        invocation_sha256: [u8; 32],
+        plan: &crate::native_job::Plan,
+    ) -> io::Result<Self> {
+        plan.validate()?;
+        let mut control =
+            Self::from_original_channel(channel, host, root_attempt, invocation_sha256);
+        control.native_outputs = Some(
+            plan.outputs
+                .iter()
+                .map(|output| output.root.clone())
+                .collect(),
+        );
+        Ok(control)
     }
 }
 
@@ -270,8 +346,13 @@ pub struct WorkloadControl {
     invocation_sha256: [u8; 32],
     last_sequence: u64,
     last_phase_sequence: u64,
+    last_local_sequence: u64,
+    local_active: Option<std::sync::Arc<publication::Life>>,
     active_phase: Option<([u8; 16], u64)>,
     output_locks: Option<host::output::Request>,
+    native_outputs: Option<std::collections::BTreeSet<Vec<u8>>>,
+    retained_outputs: std::collections::BTreeMap<Vec<u8>, host::output::Request>,
+    last_output_selection: u64,
     pending: Option<host::bank::Request>,
     failed: bool,
     drained: bool,
@@ -378,7 +459,10 @@ impl WorkloadControl {
             if request.key.root_attempt != self.root_attempt
                 || request.key.invocation_sha256 != self.invocation_sha256
                 || request.key.sequence
-                    != self.last_phase_sequence.checked_add(1).ok_or_else(refused)?
+                    != self
+                        .last_phase_sequence
+                        .checked_add(1)
+                        .ok_or_else(refused)?
             {
                 return Err(refused());
             }
@@ -463,7 +547,10 @@ fn fifo_identity(fd: std::os::fd::BorrowedFd<'_>, access: libc::c_int) -> io::Re
     {
         return Err(refused());
     }
-    Ok(FileIdentity { device: stat.st_dev as u64, inode: stat.st_ino as u64 })
+    Ok(FileIdentity {
+        device: stat.st_dev as u64,
+        inode: stat.st_ino as u64,
+    })
 }
 
 pub(super) fn receive_originals(
@@ -492,7 +579,11 @@ pub(super) fn live_context(context: &crate::Context, member: Option<[u8; 16]>) -
     let birth_kind = crate::BirthKind::MacosWallMicroseconds;
     #[cfg(target_os = "linux")]
     let birth_kind = crate::BirthKind::LinuxStartTicks;
-    let identity = crate::Identity { pid: current.pid, birth: current.birth, birth_kind };
+    let identity = crate::Identity {
+        pid: current.pid,
+        birth: current.birth,
+        birth_kind,
+    };
     let subject = match member {
         None => crate::Subject::Root { identity },
         Some(attempt) => crate::Subject::RegisteredMember { identity, attempt },
@@ -537,7 +628,19 @@ pub(super) fn receive_set(
     Ok(originals)
 }
 
-fn receive(channel: &Channel, count: usize, deadline: Instant) -> io::Result<Vec<OwnedFd>> {
+pub(super) fn receive(
+    channel: &Channel,
+    count: usize,
+    deadline: Instant,
+) -> io::Result<Vec<OwnedFd>> {
+    receive_marked(channel, count, host::CPU_SET_MARKER, deadline)
+}
+pub(super) fn receive_marked(
+    channel: &Channel,
+    count: usize,
+    marker: u8,
+    deadline: Instant,
+) -> io::Result<Vec<OwnedFd>> {
     if count == 0 || count > host::MAX_CPU_SET {
         return Err(refused());
     }
@@ -545,7 +648,10 @@ fn receive(channel: &Channel, count: usize, deadline: Instant) -> io::Result<Vec
     // Large enough for every kernel-permitted SCM_RIGHTS population on our
     // supported Unix hosts, so rejection adopts every delivered descriptor.
     let mut control = [0usize; 4096 / size_of::<usize>()];
-    let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
     // SAFETY: zero initializes optional native pointers/counts.
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
     msg.msg_iov = &mut iov;
@@ -566,12 +672,21 @@ fn receive(channel: &Channel, count: usize, deadline: Instant) -> io::Result<Vec
             break n;
         }
         let error = io::Error::last_os_error();
-        if !matches!(error.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock) {
+        if !matches!(
+            error.kind(),
+            io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+        ) {
             return Err(error);
         }
-        let millis = deadline.saturating_duration_since(Instant::now()).as_millis().min(50) as i32;
-        let mut poll =
-            libc::pollfd { fd: channel.as_fd().as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let millis = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(50) as i32;
+        let mut poll = libc::pollfd {
+            fd: channel.as_fd().as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         // SAFETY: one initialized poll descriptor; deadline is never renewed.
         if unsafe { libc::poll(&mut poll, 1, millis) } < 0
             && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted
@@ -583,7 +698,7 @@ fn receive(channel: &Channel, count: usize, deadline: Instant) -> io::Result<Vec
     };
     let mut fds = Vec::new();
     let mut valid = received == 1
-        && byte == [host::CPU_SET_MARKER]
+        && byte == [marker]
         && msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) == 0;
     if msg.msg_controllen as usize > size_of_val(&control) {
         valid = false;

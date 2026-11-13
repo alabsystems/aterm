@@ -790,6 +790,7 @@ impl<C: Ctl> Session<'_, C> {
         // repository and left reads of the one before it are spent.
         self.repo_seen = None;
         self.left_seen = None;
+        self.credentials_seen = None;
         if let Some(act) = act {
             let reading = self
                 .reader(&screen.rows)

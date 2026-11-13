@@ -131,7 +131,7 @@ impl OperationCancellation {
 
     fn watch(reader: std::os::fd::OwnedFd) -> io::Result<Self> {
         use std::os::fd::AsFd as _;
-        let (shutdown, held) = aterm_uds::kept_out(std::io::pipe)?;
+        let (shutdown, held) = aterm_uds::pipe()?;
         let mut scope = Self::install(None)?;
         let stop = scope.stop.clone();
         scope.shutdown = Some(held);

@@ -3,6 +3,47 @@
 
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn a_retargeted_alias_does_not_prove_a_running_image_upgraded() {
+    use aterm_uds::deadline::{KeptUntilRan, ad_hoc_copy, cat_echoes};
+    use aterm_uds::spawnfd::{Stdio, command};
+    let mut scratch = KeptUntilRan::new(aterm_tempfile::tempdir().unwrap().keep());
+    let old = scratch.path().join("old");
+    let new = scratch.path().join("new");
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::create_dir_all(&new).unwrap();
+    let old = old.join("cat");
+    let new = new.join("cat");
+    ad_hoc_copy(Path::new("/bin/cat"), &old);
+    ad_hoc_copy(Path::new("/bin/cat"), &new);
+    let alias = scratch.path().join("selected");
+    std::os::unix::fs::symlink(&old, &alias).unwrap();
+    let mut child = command(&old)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let input = cat_echoes(&mut child);
+    scratch.ran();
+    let pid = i32::try_from(child.id()).unwrap();
+    let record = J::obj([
+        ("execGeneration", J::Int(2)),
+        ("exe", J::s(alias.to_str().unwrap())),
+    ]);
+    let matched_old = observed_upgrade(&record, pid, 1, &old);
+    std::fs::remove_file(&alias).unwrap();
+    std::os::unix::fs::symlink(&new, &alias).unwrap();
+    let matched_new = observed_upgrade(&record, pid, 1, &new);
+    drop(input);
+    assert!(child.wait().unwrap().success());
+    assert!(matched_old);
+    assert!(
+        !matched_new,
+        "retargeting a name cannot replace a loaded image"
+    );
+}
+
 /// A WORKER'S LANDING READS LANDED WHATEVER BECAME OF ITS TAB: live or reaped. NEGATIVE CONTROLS:
 /// a closed tab that did not land, a failed conclusion, and a row still running.
 #[test]

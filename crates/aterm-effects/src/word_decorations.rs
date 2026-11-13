@@ -7129,7 +7129,10 @@ struct CatGeom {
     w: u16,
     hart: u16,
     chin: u16,
-    x: u16,
+    /// The art's left edge in grid px. `i32`, as the sprite it places is: a grid of 4096
+    /// columns of 20 px puts a word past 65,535 px, where a `u16` edge wrapped the cat to the
+    /// far side of the frame.
+    x: i32,
 }
 
 /// §5.2 base art height before age scaling: `Hart = round(1.7·ch)`.
@@ -7236,7 +7239,7 @@ const fn anchored_geom(
         w,
         hart,
         chin: cat_chin(hart),
-        x: x as u16,
+        x,
     }
 }
 
@@ -7628,7 +7631,7 @@ fn emit_cat(
             ctx.peek_cues.push(PeekCue {
                 row: occ.row,
                 col: occ.start_col,
-                head_px: (i32::from(g.x), i32::from(g.x) + i32::from(g.w), top, bottom),
+                head_px: (g.x, g.x + i32::from(g.w), top, bottom),
             });
         }
         let traits = match accessory {
@@ -7800,7 +7803,7 @@ fn emit_peek<'a>(
     }
     if ctx
         .companion_px
-        .stacked_on(i32::from(g.x), i32::from(g.w), top, bottom)
+        .stacked_on(g.x, i32::from(g.w), top, bottom)
     {
         return None;
     }
@@ -7821,7 +7824,7 @@ fn emit_peek<'a>(
         CatIdlePose::STILL
     };
     debug_assert_eq!(tile.art.w(), g.w, "the peek tile is the design box");
-    push_cat_free(free, tile.art, i32::from(g.x), top, bottom, skip, pose, fp);
+    push_cat_free(free, tile.art, g.x, top, bottom, skip, pose, fp);
     if free.len() > n_free {
         Some((top, bottom))
     } else {

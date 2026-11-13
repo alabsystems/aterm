@@ -21,6 +21,12 @@ use crate::transport::{self, Backoff, Closer, Conn};
 #[path = "notify_journal.rs"]
 mod journal;
 
+#[path = "notify_directory.rs"]
+mod directory;
+use aterm_dirfd::OFlags;
+use directory::{Directory, TemporaryData};
+use std::sync::Arc;
+
 #[cfg(any(test, debug_assertions))]
 pub use journal::rewind_cursor;
 use journal::StepsFile;
@@ -601,19 +607,25 @@ pub enum Since {
     At(u64),
 }
 
-#[derive(Clone)]
-struct Store {
+#[derive(Clone, Debug)]
+struct Store<Access = Owned> {
     root: PathBuf,
+    directory: Arc<Directory>,
+    access: Access,
 }
 
-/// The file a notifier holds its store by, in the root store ([`Store::hold`]).
+#[derive(Clone, Copy, Debug)]
+struct ReadOnly;
+
+#[derive(Clone, Debug)]
+struct Owned(Arc<Hold>);
+
+/// PID diagnostic entry. Ownership rests on the directory descriptor, not this name.
 const LOCK: &str = "lock";
 
-/// [`Store::hold`]'s hold on a notify store for one notifier's life, released by `LOCK_UN`
-/// before the close (`clippy.toml`'s flock release rule). A `flock(2)` holds the open file,
-/// not its path, so it keeps the path it took and the file's `(dev, ino)`: while this
-/// descriptor is open no other file takes that inode number on its device, so the path names
-/// the locked file exactly when its `lstat` answers the same pair ([`StoreLock::moved`]).
+/// One independent directory description with an exclusive flock. Only its final owner
+/// releases LOCK_UN; store and journal clones share that owner through Arc<Hold>.
+#[derive(Debug)]
 struct StoreLock {
     file: std::fs::File,
     path: PathBuf,
@@ -626,8 +638,7 @@ impl Drop for StoreLock {
     }
 }
 
-/// How many times [`Store::hold`] takes [`LOCK`] again where the path was replaced between
-/// its open and its take, before it refuses.
+/// Complete directory capture attempts before refusing a root that keeps changing.
 const HOLD_TRIES: usize = 3;
 
 /// A file's `(dev, ino)`, what [`StoreLock`] holds it by.
@@ -637,11 +648,11 @@ fn file_id(meta: &std::fs::Metadata) -> (u64, u64) {
 }
 
 impl StoreLock {
-    /// The `(dev, ino)` its path names now (`lstat`, never following a link), or None where it
-    /// names nothing (`ENOENT`, or `ENOTDIR` where `notify/` was replaced by a file).
+    /// The directory name's current identity, without following a final symlink.
+    /// Missing or non-directory ancestors answer None; unreadable metadata is Unknown.
     ///
     /// # Errors
-    /// The `lstat`'s errno but `ENOENT` and `ENOTDIR`.
+    /// Metadata could not be read for a reason other than absence.
     fn named(&self) -> io::Result<Option<(u64, u64)>> {
         match std::fs::symlink_metadata(&self.path) {
             Ok(meta) => Ok(Some(file_id(&meta))),
@@ -657,14 +668,11 @@ impl StoreLock {
         }
     }
 
-    /// THE STORE BY ITS PATH: None while the path it took still names the file it locked, else
-    /// what it names instead. A `notify/` (or `notify/lock`) removed or replaced under a running
-    /// notifier is a new store a second notifier can take, while this lock goes on holding a
-    /// file no path names; a notifier that wrote on would write a store it no longer holds.
+    /// Whether the root pathname still names the directory this independent description
+    /// locks. Replacing the PID file cannot affect this directory's identity or lease.
     ///
     /// # Errors
-    /// The `lstat`'s errno ([`StoreLock::named`]): a read that did not answer, which says
-    /// nothing of whether the path names the lock.
+    /// The pathname's metadata is unavailable; no ownership loss is inferred from that.
     fn moved(&self) -> io::Result<Option<Moved>> {
         Ok(match self.named()? {
             Some(id) if id == self.id => None,
@@ -677,7 +685,7 @@ impl StoreLock {
     /// [`io::ErrorKind::NotFound`] where the path names nothing, [`io::ErrorKind::Other`] where
     /// it names another file, the words naming the store either way.
     fn lost(&self, moved: Moved) -> io::Error {
-        let store = self.path.parent().unwrap_or(&self.path).display();
+        let store = self.path.display();
         let (kind, now) = match moved {
             Moved::Removed => (io::ErrorKind::NotFound, "names nothing".to_string()),
             Moved::Replaced((dev, ino)) => (io::ErrorKind::Other, format!("names {dev}:{ino}")),
@@ -686,7 +694,7 @@ impl StoreLock {
             kind,
             format!(
                 "the notify store {store} was removed or replaced under this notifier: {} {now}, \
-                 not the lock it holds ({}:{}); it stops rather than write a store another \
+                 not the directory it holds ({}:{}); it stops rather than write a store another \
                  notifier may now hold",
                 self.path.display(),
                 self.id.0,
@@ -696,45 +704,39 @@ impl StoreLock {
     }
 }
 
-/// What a [`StoreLock`]'s path names in place of the file it locked ([`StoreLock::moved`]).
+/// What replaced the held directory at its original pathname ([`StoreLock::moved`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Moved {
-    /// Nothing: `notify/lock`, or `notify/` itself, was removed.
+    /// The root directory is no longer named here.
     Removed,
     /// Another file, by its `(dev, ino)`.
     Replaced((u64, u64)),
 }
 
-/// THE STORE BY ITS PATH, for the notifier and each of its readers: the root store's lock
-/// ([`Store::hold`]) and, once its path no longer names it, the refusal every write after
-/// answers. Every write to the store, the notifier's ([`Notifier::held`]) and a reader's
-/// ([`reader_store`]), runs [`Hold::check`] first. One `lstat` before a write that goes by
-/// path narrows the window a removal can fall in to that write's own; it does not close it
-/// (ATERM-KI-1112-97).
+/// The root directory's actual lease, shared by writers, journals and readers that can
+/// take up a writable log store. A changed name stops the notifier at its next check;
+/// operations already in progress remain rooted in their original open directories.
+#[derive(Debug)]
 struct Hold {
     /// The root store's directory, `notify/`.
     root: PathBuf,
+    directory: Arc<Directory>,
     lock: StoreLock,
     /// The refusal's kind and words, set by the first check that found the path moved.
     lost: std::sync::OnceLock<(io::ErrorKind, String)>,
-    /// A test's mutant: the store is held by its lock's file only, its path never checked, as a
-    /// build before the check held it.
-    #[cfg(test)]
-    by_file: std::sync::atomic::AtomicBool,
 }
 
 impl Hold {
-    fn new(root: PathBuf, lock: StoreLock) -> Self {
+    fn new(root: PathBuf, directory: Arc<Directory>, lock: StoreLock) -> Self {
         Self {
             root,
+            directory,
             lock,
             lost: std::sync::OnceLock::new(),
-            #[cfg(test)]
-            by_file: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
-    /// Whether the store's path still names the lock held ([`StoreLock::moved`], one `lstat`).
+    /// Whether the store's path still names the directory held ([`StoreLock::moved`], one `lstat`).
     /// Once it does not, the store was removed or replaced and is a new store a second
     /// notifier can take: the first check to find it warns once and records the refusal, and
     /// it and every check after answer that refusal, which ends the run.
@@ -747,10 +749,6 @@ impl Hold {
         if let Some(e) = self.lost() {
             return Err(e);
         }
-        #[cfg(test)]
-        if self.by_file.load(std::sync::atomic::Ordering::Relaxed) {
-            return Ok(());
-        }
         let Some(moved) = self.lock.moved()? else {
             return Ok(());
         };
@@ -761,7 +759,7 @@ impl Hold {
         Err(self.lost().unwrap_or(e))
     }
 
-    /// The refusal [`Hold::check`] recorded, once the store's path no longer named its lock.
+    /// The refusal [`Hold::check`] recorded, once the store's path no longer named its directory.
     fn lost(&self) -> Option<io::Error> {
         self.lost
             .get()
@@ -769,133 +767,152 @@ impl Hold {
     }
 }
 
-impl Store {
-    fn open(state_dir: &str) -> io::Result<Self> {
-        let root = Path::new(state_dir).join("notify");
-        std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
+impl<Access> Store<Access> {
+    fn read_only(&self) -> Store<ReadOnly> {
+        Store {
+            root: self.root.clone(),
+            directory: Arc::clone(&self.directory),
+            access: ReadOnly,
+        }
     }
 
-    /// ONE NOTIFIER PER STORE: take this root store, and with it every log's store under
-    /// `logs/`, for one notifier's life, by an exclusive `flock(2)` on [`LOCK`], and write this
-    /// process's pid into it. A second notifier on the same state dir is refused at its start,
-    /// naming the holder's pid, and never waits: it would page what the first pages. The lock
-    /// goes with the last descriptor on its open file description, so a crash, a `SIGKILL`
-    /// and a clean exit all let go and the next start takes it. A refused start has read and
-    /// written no journal or cursor (it may have made `notify/` and the [`LOCK`] file). A file system that takes no lock is refused too
-    /// ([`Store::judge_take`]): the journal appends to a descriptor it holds on the strength of
-    /// this lock, so a store it cannot hold is no store to run on. A take is checked against
-    /// the path after it ([`StoreLock::moved`], one `lstat`): a [`LOCK`] removed or replaced
-    /// between the open and the take is a lock of no store, let go and taken again, up to
-    /// [`HOLD_TRIES`] takes in all.
-    ///
-    /// # Errors
-    /// [`io::ErrorKind::WouldBlock`] where another notifier holds it,
-    /// [`io::ErrorKind::Unsupported`] where its file system takes no lock; the open (a [`LOCK`]
-    /// that is a link or not a regular file is refused), `flock(2)`'s other errno, the
-    /// `lstat`'s errno after a take ([`StoreLock::named`]), or [`io::ErrorKind::Other`] naming
-    /// the lock and the store where the path was removed or replaced under each of
-    /// [`HOLD_TRIES`] takes.
-    fn hold(&self) -> io::Result<StoreLock> {
-        let path = self.root.join(LOCK);
+    fn read_bytes(&self, name: &str, max: usize) -> io::Result<Vec<u8>> {
+        let (parent, leaf) = self.directory.parent(name, false)?;
+        parent.read(&leaf, max as u64)
+    }
+
+    fn read_text(&self, name: &str, max: usize) -> io::Result<String> {
+        String::from_utf8(self.read_bytes(name, max)?)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
+    fn metadata(&self, name: &str) -> io::Result<aterm_dirfd::Stat> {
+        let (parent, leaf) = self.directory.parent(name, false)?;
+        parent.stat(&leaf)
+    }
+
+    fn read(&self, name: &str) -> Option<String> {
+        self.read_text(name, HOLD_MAX)
+            .ok()
+            .map(|text| text.trim_end_matches('\n').to_owned())
+            .filter(|text| !text.is_empty())
+    }
+
+    fn carry_text(&self, name: &str) -> io::Result<Option<String>> {
+        match self.read_text(name, HOLD_MAX) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match self.metadata(name) {
+                Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(other) => Err(other),
+                Ok(_) => Err(error),
+            },
+            Err(error) => Err(error),
+        }
+    }
+}
+
+impl Store<ReadOnly> {
+    fn existing(root: PathBuf) -> io::Result<Self> {
+        let directory = Directory::open(&root)?;
+        Ok(Self {
+            root,
+            directory,
+            access: ReadOnly,
+        })
+    }
+}
+
+impl Store {
+    fn open(state_dir: &str) -> io::Result<Self> {
+        Self::at(Path::new(state_dir).join("notify"))
+    }
+
+    fn at(root: PathBuf) -> io::Result<Self> {
+        std::fs::create_dir_all(&root)?;
         for _ in 0..HOLD_TRIES {
-            let lock = self.take()?;
-            if lock.moved()?.is_none() {
-                let mut file = &lock.file;
-                file.set_len(0)?;
-                file.write_all(format!("{}\n", std::process::id()).as_bytes())?;
-                return Ok(lock);
+            let directory = Directory::open(&root)?;
+            // A fresh description is essential: flock on a duplicated I/O description
+            // could create two guards whose first LOCK_UN unlocks the other.
+            let file = directory.independent()?;
+            let id = file_id(&file.metadata()?);
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "StoreLock owns this independent descriptor and releases LOCK_UN in Drop"
+            )]
+            let taken = file.try_lock();
+            Self::judge_take_at(&root, &directory, taken)?;
+            let lock = StoreLock {
+                file,
+                path: root.clone(),
+                id,
+            };
+            if lock.moved()?.is_some() {
+                continue;
             }
+            let hold = Arc::new(Hold::new(root.clone(), Arc::clone(&directory), lock));
+            let store = Self {
+                root: root.clone(),
+                directory,
+                access: Owned(hold),
+            };
+            let mut pid = store.directory.open_file(
+                std::ffi::OsStr::new(LOCK),
+                OFlags::RDWR | OFlags::CREATE,
+                0o600,
+            )?;
+            use std::os::unix::fs::MetadataExt as _;
+            let metadata = pid.metadata()?;
+            if !metadata.is_file()
+                || metadata.nlink() != 1
+                || metadata.uid() != aterm_uds::peer::our_uid()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "notify PID entry is not a regular file",
+                ));
+            }
+            pid.set_len(0)?;
+            pid.write_all(format!("{}\n", std::process::id()).as_bytes())?;
+            return Ok(store);
         }
         Err(io::Error::other(format!(
-            "the notify lock {} was removed or replaced between the open and the take of each \
-             of {HOLD_TRIES} tries: something is removing or replacing the notify store {} as \
-             this notifier starts, and it does not start on a store it cannot hold",
-            path.display(),
-            self.root.display()
+            "the notify directory {} changed during every ownership attempt",
+            root.display()
         )))
     }
 
-    /// One open and `flock(2)` take of [`LOCK`] ([`Store::hold`]), not yet checked against its
-    /// path.
-    ///
-    /// # Errors
-    /// As [`Store::hold`]'s, but the path's.
-    fn take(&self) -> io::Result<StoreLock> {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        let path = self.root.join(LOCK);
-        let file = aterm_uds::kept_out(|| {
-            std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .custom_flags(aterm_uds::atomic_file::LOCK_OPEN_FLAGS)
-                .open(&path)
-        })?;
-        let meta = file.metadata()?;
-        if !meta.is_file() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("the notify lock {} is not a regular file", path.display()),
-            ));
-        }
-        #[cfg(test)]
-        BEFORE_TAKE.with(|seam| {
-            if let Some(seam) = seam.borrow_mut().as_mut() {
-                seam(&path);
-            }
-        });
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the guard's own take: StoreLock's Drop releases by LOCK_UN"
-        )]
-        let taken = file.try_lock();
-        self.judge_take(taken)?;
-        Ok(StoreLock {
-            file,
-            path,
-            id: file_id(&meta),
+    fn child(&self, name: &str, create: bool) -> io::Result<Self> {
+        let (parent, leaf) = self.directory.parent(name, create)?;
+        let directory = parent.child(&leaf, create)?;
+        Ok(Self {
+            root: self.root.join(name),
+            directory,
+            access: self.access.clone(),
         })
     }
 
-    /// What [`Store::hold`]'s `flock(2)` take of [`LOCK`] answered, judged: taken, or the
-    /// refusal it is. Another holder is [`io::ErrorKind::WouldBlock`], naming the pid it wrote;
-    /// a file system that takes no lock is [`io::ErrorKind::Unsupported`], never a take, for a
-    /// second notifier there would append to a journal the first renamed away.
+    /// Judge the directory flock, refusing contention and unsupported locking. The PID
+    /// entry can add diagnostic context to contention; it never grants ownership.
     ///
     /// # Errors
     /// Every answer but a take.
-    fn judge_take(&self, taken: Result<(), std::fs::TryLockError>) -> io::Result<()> {
+    fn judge_take_at(
+        root: &Path,
+        directory: &Directory,
+        taken: Result<(), std::fs::TryLockError>,
+    ) -> io::Result<()> {
         match taken {
             Ok(()) => Ok(()),
-            Err(std::fs::TryLockError::Error(e)) if e.kind() == io::ErrorKind::Unsupported => {
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!(
-                        "the file system of the notify store {} takes no lock ({e}), so one \
-                         notifier per store cannot be held there: give this one a --state on a \
-                         volume that locks",
-                        self.root.display()
-                    ),
-                ))
+            Err(std::fs::TryLockError::Error(error)) if error.kind() == io::ErrorKind::Unsupported => {
+                Err(io::Error::new(io::ErrorKind::Unsupported, format!("the file system of notify store {} takes no directory lock ({error}); use --state on a volume that locks", root.display())))
             }
-            Err(std::fs::TryLockError::Error(e)) => Err(e),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
             Err(std::fs::TryLockError::WouldBlock) => {
-                let holder = read_bounded_text(&self.root.join(LOCK), 64)
-                    .ok()
+                let holder = directory.read(std::ffi::OsStr::new(LOCK), 64).ok()
+                    .and_then(|bytes| String::from_utf8(bytes).ok())
                     .and_then(|text| crate::parse_uint::<u32>(text.trim()))
                     .map_or_else(String::new, |pid| format!(" (pid {pid})"));
-                Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    format!(
-                        "the notify store {} is held by another `aterm link notify`{holder}: one \
-                         notifier runs per state dir, and it takes every selector (`--on \
-                         ask:<person>,need`); stop that one, or give this one its own --state",
-                        self.root.display()
-                    ),
-                ))
+                Err(io::Error::new(io::ErrorKind::WouldBlock, format!("the notify store {} is held by another `aterm link notify`{holder}: one notifier runs per state dir", root.display())))
             }
         }
     }
@@ -910,39 +927,29 @@ impl Store {
     }
 
     /// [`Store::put_bytes`] of `value` and a newline: a file of lines.
-    fn put(&self, name: &str, value: &str) -> io::Result<PathBuf> {
+    fn put(&self, name: &str, value: &str) -> io::Result<Arc<Directory>> {
         self.put_bytes(name, format!("{value}\n").as_bytes())
     }
 
     /// Write `bytes` beside `name`, order them (`aterm_durable::ordered_or_fsync`) and rename
     /// them over `name`, and return the directory whose entry that moved, unflushed: the caller
     /// flushes it ([`Store::write`]).
-    fn put_bytes(&self, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+    fn put_bytes(&self, name: &str, bytes: &[u8]) -> io::Result<Arc<Directory>> {
         test_fault(name)?;
-        let target = self.root.join(name);
-        let dir = target.parent().unwrap_or(&self.root).to_path_buf();
-        std::fs::create_dir_all(&dir)?;
-        let (tmp, mut f) = crate::enable::create_temp_beside(&target, 0o600)?;
-        let staged = (|| {
-            f.write_all(bytes)?;
-            note_bytes(bytes.len());
-            aterm_durable::ordered_or_fsync(&f)?;
-            note_flush(Flush::Ordered);
-            drop(f);
-            std::fs::rename(&tmp, &target)
-        })();
-        if let Err(e) = staged {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e);
-        }
-        Ok(dir)
-    }
-
-    fn read(&self, name: &str) -> Option<String> {
-        read_bounded_text(&self.root.join(name), HOLD_MAX)
-            .ok()
-            .map(|s| s.trim_end_matches('\n').to_string())
-            .filter(|s| !s.is_empty())
+        let (parent, leaf) = self.directory.parent(name, true)?;
+        let prefix = leaf.to_str().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 notify target")
+        })?;
+        let mut temporary = parent.temporary(prefix, false)?;
+        let TemporaryData::File(file) = &mut temporary.data else {
+            return Err(io::Error::other("notify file temporary has the wrong kind"));
+        };
+        file.write_all(bytes)?;
+        note_bytes(bytes.len());
+        aterm_durable::ordered_or_fsync(file)?;
+        note_flush(Flush::Ordered);
+        temporary.publish(&parent, &leaf)?;
+        Ok(parent)
     }
 
     /// Return the [`Store`] for `log`.
@@ -955,26 +962,18 @@ impl Store {
             return Ok(self.clone());
         };
         let name = log.to_string();
-        let path = self.root.join("log");
-        let owner = match read_bounded_text(&path, 4096) {
+        let owner = match self.read_text("log", 4096) {
             Ok(saved) => Some(
                 astream_broker::LogIdentity::parse(saved.trim_end_matches('\n')).ok_or_else(
-                    || {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("{}: invalid notifier log identity", path.display()),
-                        )
-                    },
+                    || io::Error::new(io::ErrorKind::InvalidData, "invalid notifier log identity"),
                 )?,
             ),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                match std::fs::symlink_metadata(&path) {
-                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => None,
-                    Err(other) => return Err(other),
-                    Ok(_) => return Err(e),
-                }
-            }
-            Err(e) => return Err(e),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match self.metadata("log") {
+                Err(missing) if missing.kind() == io::ErrorKind::NotFound => None,
+                Err(other) => return Err(other),
+                Ok(_) => return Err(error),
+            },
+            Err(error) => return Err(error),
         };
         match owner {
             None => {
@@ -983,20 +982,29 @@ impl Store {
             }
             Some(owner) if owner == log => Ok(self.clone()),
             Some(owner) => {
-                let root = self.root.join("logs").join(&name);
-                if !root.exists() {
+                let logs = self.child("logs", true)?;
+                let absent = match logs.directory.stat(std::ffi::OsStr::new(&name)) {
+                    Ok(_) => false,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(error),
+                };
+                if absent {
                     if let Some((from, fork)) = self.predecessor(owner, log, lineage)? {
-                        self.carry(&from, &root, fork)?;
+                        logs.carry(&from, &name, fork)?;
                     }
                 }
-                std::fs::create_dir_all(&root)?;
-                if let Err(e) = self.prune_logs(&name) {
+                let directory = logs.directory.child(std::ffi::OsStr::new(&name), true)?;
+                if let Err(error) = self.prune_logs(&name) {
                     eprintln!(
-                        "aterm-link notify: could not prune the stores of old logs under {}: {e}",
-                        self.root.join("logs").display()
+                        "aterm-link notify: could not prune stores under {}: {error}",
+                        logs.root.display()
                     );
                 }
-                Ok(Store { root })
+                Ok(Store {
+                    root: self.root.join("logs").join(name),
+                    directory,
+                    access: self.access.clone(),
+                })
             }
         }
     }
@@ -1006,121 +1014,116 @@ impl Store {
         owner: astream_broker::LogIdentity,
         log: astream_broker::LogIdentity,
         lineage: Option<&astream_broker::Lineage>,
-    ) -> io::Result<Option<(Store, u64)>> {
+    ) -> io::Result<Option<(Store<ReadOnly>, u64)>> {
         let Some(lineage) = lineage else {
             return Ok(None);
         };
-        let mut held = vec![(owner, self.root.clone())];
-        match std::fs::read_dir(self.root.join("logs")) {
-            Ok(entries) => {
-                for entry in entries {
-                    let entry = entry?;
-                    let name = entry.file_name();
+        let mut held = vec![(owner, self.read_only())];
+        match self.directory.child(std::ffi::OsStr::new("logs"), false) {
+            Ok(logs) => {
+                for name in logs.names()? {
                     if let Some(id) = name.to_str().and_then(astream_broker::LogIdentity::parse) {
-                        held.push((id, entry.path()));
+                        let directory = logs.child(&name, false)?;
+                        held.push((
+                            id,
+                            Store {
+                                root: logs.path.join(name),
+                                directory,
+                                access: ReadOnly,
+                            },
+                        ));
                     }
                 }
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
         Ok(held
             .into_iter()
             .filter(|(earlier, _)| *earlier != log)
-            .filter_map(|(earlier, root)| {
-                let fork = log.continues(earlier, lineage)?;
-                Some((earlier.generation, Store { root }, fork))
+            .filter_map(|(earlier, store)| {
+                Some((earlier.generation, store, log.continues(earlier, lineage)?))
             })
             .max_by_key(|(generation, _, _)| *generation)
             .map(|(_, store, fork)| (store, fork)))
     }
 
-    fn carry_text(&self, name: &str) -> io::Result<Option<String>> {
-        let path = self.root.join(name);
-        match read_bounded_text(&path, HOLD_MAX) {
-            Ok(text) => Ok(Some(text)),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                match std::fs::symlink_metadata(&path) {
-                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(None),
-                    Err(other) => Err(other),
-                    Ok(_) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Build the store `to`, a log's that continues `from`'s from `fork`, whole or not at all
-    /// (in a scratch directory renamed to `to`): `from`'s verdicts below `fork`, its standing
-    /// values, and each of its selectors' cursors clamped to `fork`, read through
-    /// [`Store::read_verdicts`], which writes nothing to `from` (an old store's cursor files and
-    /// line files included). Its journal is written even where it holds nothing, so the store
-    /// built is never an empty directory a later rename could replace.
-    fn carry(&self, from: &Store, to: &Path, fork: u64) -> io::Result<()> {
-        let logs = to.parent().unwrap_or(&self.root).to_path_buf();
-        std::fs::create_dir_all(&logs)?;
-        let scratch = aterm_tempfile::Builder::new()
-            .prefix(".carry-")
-            .suffix(".noindex")
-            .tempdir_in(&logs)?;
-        let built = Store {
-            root: scratch.path().to_path_buf(),
+    fn carry(&self, from: &Store<ReadOnly>, name: &str, fork: u64) -> io::Result<()> {
+        let temporary = self.directory.temporary("carry", true)?;
+        let TemporaryData::Directory(directory) = &temporary.data else {
+            return Err(io::Error::other(
+                "notify directory temporary has the wrong kind",
+            ));
         };
-        let carried = (|| -> io::Result<()> {
-            let held = from.read_verdicts()?;
-            let below = journal::Verdicts {
-                lines: held
-                    .lines
-                    .into_iter()
-                    .filter(|line| journal::offset_of(line).is_some_and(|off| off < fork))
-                    .collect(),
-                standing: held.standing,
-                cursors: held
-                    .cursors
-                    .into_iter()
-                    .map(|(key, off)| (key, off.min(fork)))
-                    .collect(),
-                ..journal::Verdicts::default()
-            };
-            built.set_verdicts(&below, Flush::Ordered)?;
-            flush_dir(&built.root, Flush::Durable)
-        })();
-        carried?;
-        match std::fs::rename(scratch.path(), to) {
-            Ok(()) => {
-                let _ = scratch.keep();
-                flush_dir(&logs, Flush::Durable)
+        let built = Store {
+            root: directory.path.clone(),
+            directory: Arc::clone(directory),
+            access: self.access.clone(),
+        };
+        let held = from.read_verdicts()?;
+        let below = journal::Verdicts {
+            lines: held
+                .lines
+                .into_iter()
+                .filter(|line| journal::offset_of(line).is_some_and(|off| off < fork))
+                .collect(),
+            standing: held.standing,
+            cursors: held
+                .cursors
+                .into_iter()
+                .map(|(key, off)| (key, off.min(fork)))
+                .collect(),
+            ..journal::Verdicts::default()
+        };
+        built.set_verdicts(&below, Flush::Ordered)?;
+        flush_dir(&built.directory, Flush::Durable)?;
+        match temporary.publish(&self.directory, std::ffi::OsStr::new(name)) {
+            Ok(()) => flush_dir(&self.directory, Flush::Durable),
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && self
+                        .directory
+                        .child(std::ffi::OsStr::new(name), false)
+                        .is_ok() =>
+            {
+                Ok(())
             }
-            Err(_) if std::fs::symlink_metadata(to).is_ok_and(|m| m.is_dir()) => Ok(()),
-            Err(e) => Err(e),
+            Err(error) => Err(error),
         }
     }
 
-    /// Keep only the newest [`LOGS_KEEP`] stores under `logs/<identity>/`.
     fn prune_logs(&self, name: &str) -> io::Result<()> {
         let mut used: Vec<String> = self
             .read("logs/used")
             .map(|text| {
                 text.lines()
-                    .filter(|l| *l != name && astream_broker::LogIdentity::parse(l).is_some())
-                    .map(str::to_string)
+                    .filter(|line| {
+                        *line != name && astream_broker::LogIdentity::parse(line).is_some()
+                    })
+                    .map(str::to_owned)
                     .collect()
             })
             .unwrap_or_default();
-        used.push(name.to_string());
+        used.push(name.to_owned());
         let keep = used.split_off(used.len().saturating_sub(LOGS_KEEP));
         self.write("logs/used", &keep.join("\n"), Flush::Ordered)?;
-        for entry in std::fs::read_dir(self.root.join("logs"))? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let Some(id) = file_name
+        let logs = self.directory.child(std::ffi::OsStr::new("logs"), false)?;
+        for entry in logs.names()? {
+            let Some(id) = entry
                 .to_str()
-                .filter(|n| astream_broker::LogIdentity::parse(n).is_some())
+                .filter(|name| astream_broker::LogIdentity::parse(name).is_some())
             else {
                 continue;
             };
-            if !keep.iter().any(|k| k == id) {
-                std::fs::remove_dir_all(entry.path())?;
+            if !keep.iter().any(|kept| kept == id) {
+                let metadata = logs.stat(&entry)?;
+                if !aterm_dirfd::FileType::from_raw_mode(metadata.st_mode).is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "old notify log store is not a directory",
+                    ));
+                }
+                logs.remove_tree(&entry)?;
             }
         }
         Ok(())
@@ -1197,15 +1200,15 @@ fn test_fault(name: &str) -> io::Result<()> {
 /// one rule (`astream_sys::dir_flush_unavailable`, which `crate::state::sync_dir_as` keeps too).
 /// It takes the flush through `aterm_durable` in a test build as well, so a test's recording
 /// sees it.
-fn flush_dir(dir: &Path, flush: Flush) -> io::Result<()> {
+fn flush_dir(dir: &Directory, flush: Flush) -> io::Result<()> {
     note_flush(flush);
     #[cfg(test)]
     DIRS_FLUSHED.with(|dirs| {
         if let Some(dirs) = dirs.borrow_mut().as_mut() {
-            dirs.push(dir.to_path_buf());
+            dirs.push(dir.path.clone());
         }
     });
-    flush.dir_best_effort(dir).map(drop)
+    aterm_durable::DirFlushed::classify(flush.file(&dir.file)).map(drop)
 }
 
 /// One `aterm-link notify:` line on stderr.
@@ -1224,7 +1227,7 @@ impl Fault {
         let Some(fault) = aterm_types::dev_seam!("ATERM_LINK_NOTIFY_FAULT") else {
             return Fault::None;
         };
-        if store.root.join("fault-fired").exists() {
+        if store.metadata("fault-fired").is_ok() {
             return Fault::None;
         }
         match fault.to_str() {
@@ -1234,59 +1237,28 @@ impl Fault {
     }
 
     fn fire(self, store: &Store) -> ! {
-        let _ = write_unflushed_private(&store.root.join("fault-fired"), b"1\n");
+        let _ = write_unflushed_private(store, "fault-fired", b"1\n");
         eprintln!("aterm-link notify: ATERM_LINK_NOTIFY_FAULT={self:?}: dying");
         aterm_uds::process::kill_self_now()
     }
 }
 
-fn read_bounded_text(path: &Path, max_bytes: usize) -> io::Result<String> {
-    let bytes = read_bounded_bytes(path, max_bytes)?;
-    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
-}
-
-/// The bytes of the regular file at `path`, not following a link and not waiting on a FIFO:
-/// `InvalidInput` for another kind of file, `InvalidData` past `max_bytes`.
-fn read_bounded_bytes(path: &Path, max_bytes: usize) -> io::Result<Vec<u8>> {
-    use std::io::Read as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    let bound = max_bytes
-        .checked_add(1)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read limit overflow"))?;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-        .open(path)?;
-    let meta = f.metadata()?;
-    if !meta.is_file() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("{}: not a regular file", path.display()),
-        ));
-    }
-    if meta.len() > max_bytes as u64 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: exceeds {max_bytes} bytes", path.display()),
-        ));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(meta.len().saturating_add(1)).unwrap_or(0));
-    f.take(bound as u64).read_to_end(&mut bytes)?;
-    if bytes.len() > max_bytes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("{}: exceeds {max_bytes} bytes", path.display()),
-        ));
-    }
-    Ok(bytes)
-}
-
-/// Replace `path` with `bytes`, owner-only, whole by a rename and flushed by nothing: the dev
+/// Replace a named store entry with owner-only bytes, without a flush: the dev
 /// seams' files, among which no power loss falls. The bench reads the exec stamps and the flush
 /// tally (which a flush would add to) while this notifier runs; `fault-fired` is read after
 /// [`Fault::fire`] has killed it, by a later notifier's [`Fault::from_env`] and by the test.
-fn write_unflushed_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    aterm_uds::atomic_file::write_flushed(path, bytes, 0o600, None)
+fn write_unflushed_private(store: &Store, name: &str, bytes: &[u8]) -> io::Result<()> {
+    let (parent, leaf) = store.directory.parent(name, true)?;
+    let mut temporary = parent.temporary(
+        leaf.to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 notify seam"))?,
+        false,
+    )?;
+    let TemporaryData::File(file) = &mut temporary.data else {
+        return Err(io::Error::other("notify seam temporary has wrong kind"));
+    };
+    file.write_all(bytes)?;
+    temporary.publish(&parent, &leaf)
 }
 
 /// Everything the verb was told.
@@ -1317,7 +1289,7 @@ pub struct Counts {
 
 struct Notifier {
     cfg: Config,
-    /// The root store's lock, held for the notifier's life ([`Store::hold`]) and shared with its
+    /// The root store's lock, held for the notifier's life ([`Store::open`]) and shared with its
     /// readers: it is the one writer of every store under it while the store's path names it
     /// ([`Hold::check`]).
     hold: std::sync::Arc<Hold>,
@@ -1418,7 +1390,7 @@ struct Notifier {
     cursor_file: bool,
     /// Where [`FLUSH_TALLY_SEAM`] has the flushes told, and the counts last told there: the
     /// flushes by kind, then the bytes.
-    flush_tally: Option<(PathBuf, (u64, u64, u64))>,
+    flush_tally: Option<(u64, u64, u64)>,
     /// Where [`EXEC_STAMPS_SEAM`] has each fresh page's stamps told.
     exec_stamps: Option<ExecStamps>,
 }
@@ -1427,7 +1399,6 @@ struct Notifier {
 /// offset and stamps (`firing` written, the command's wait ended, `fired` written) not yet told
 /// there.
 struct ExecStamps {
-    path: PathBuf,
     origin: Instant,
     untold: Option<(u64, [Instant; 3])>,
 }
@@ -1435,12 +1406,11 @@ struct ExecStamps {
 impl Notifier {
     fn new(cfg: Config) -> io::Result<Self> {
         let store = Store::open(&cfg.state_dir)?;
-        let lock = store.hold()?;
+        let hold = Arc::clone(&store.access.0);
         let fault = Fault::from_env(&store);
-        let flush_tally = aterm_types::dev_seam!(FLUSH_TALLY_SEAM)
-            .map(|_| (store.root.join(FLUSH_TALLY), (u64::MAX, u64::MAX, u64::MAX)));
+        let flush_tally =
+            aterm_types::dev_seam!(FLUSH_TALLY_SEAM).map(|_| (u64::MAX, u64::MAX, u64::MAX));
         let exec_stamps = aterm_types::dev_seam!(EXEC_STAMPS_SEAM).map(|_| ExecStamps {
-            path: store.root.join(EXEC_STAMPS),
             origin: Instant::now(),
             untold: None,
         });
@@ -1451,7 +1421,7 @@ impl Notifier {
         held.keep_stamps(cfg.limit as usize);
         let (suppressed, suppressed_mark) = held.suppressed;
         Ok(Self {
-            hold: std::sync::Arc::new(Hold::new(store.root.clone(), lock)),
+            hold,
             journal: held.lines,
             root_file,
             log_file: None,
@@ -1538,14 +1508,14 @@ impl Notifier {
             us(at[1]),
             us(at[2])
         );
-        if let Err(e) = write_unflushed_private(&stamps.path, line.as_bytes()) {
+        if let Err(e) = write_unflushed_private(&self.store, EXEC_STAMPS, line.as_bytes()) {
             warn(&format!("{EXEC_STAMPS_SEAM}: {e}"));
         }
     }
 
     /// Rewrite the [`FLUSH_TALLY`] where its seam asked for it and the counts moved.
     fn tell_flushes(&mut self) {
-        let Some((path, told)) = self.flush_tally.as_mut() else {
+        let Some(told) = self.flush_tally.as_mut() else {
             return;
         };
         let (durable, ordered) = flushes();
@@ -1559,7 +1529,7 @@ impl Notifier {
             std::process::id(),
             now.2
         );
-        if let Err(e) = write_unflushed_private(path, tally.as_bytes()) {
+        if let Err(e) = write_unflushed_private(&self.store, FLUSH_TALLY, tally.as_bytes()) {
             warn(&format!("{FLUSH_TALLY_SEAM}: {e}"));
         }
     }
@@ -1999,7 +1969,11 @@ impl Notifier {
                 }
             }
             Some(log) => {
-                let first = Flush::ordered_if_same_device(log.root(), self.root_file.root());
+                let first = if log.same_device(&self.root_file) {
+                    Flush::Ordered
+                } else {
+                    Flush::Durable
+                };
                 if let Err(e) = log.write(&verdicts, first, None) {
                     return Err((Part::Journal, e));
                 }
@@ -2108,10 +2082,13 @@ impl Notifier {
     }
 
     /// THE STORE BY ITS PATH: before each write to a store (a part owed, a standing change, a
-    /// cursor, another log's store taken up), the root store's path still names the lock this
-    /// notifier holds ([`Hold::check`]). Once it does not, this one writes nothing more, to that
-    /// store or to the descriptors of the one removed, and every write after answers the same
-    /// refusal ([`Notifier::lost`]), which ends its run.
+    /// cursor, another log's store taken up), the root store's path (`notify/`) still names the
+    /// directory whose lock this notifier holds ([`Hold::check`]; `notify/lock` only names its
+    /// pid). The write itself goes through that directory's held descriptor, so one that falls
+    /// between a check and the store's removal reaches only the removed directory. Once the path
+    /// names another directory or nothing, this one writes nothing more, to that store or to the
+    /// descriptors of the one removed, and every write after answers the same refusal
+    /// ([`Notifier::lost`]), which ends its run.
     ///
     /// # Errors
     /// As [`Hold::check`]'s.
@@ -2119,7 +2096,7 @@ impl Notifier {
         self.hold.check()
     }
 
-    /// The refusal [`Hold::check`] recorded, once the store's path no longer named its lock.
+    /// The refusal [`Hold::check`] recorded, once the store's path no longer named its directory.
     fn lost(&self) -> Option<io::Error> {
         self.hold.lost()
     }
@@ -3138,7 +3115,7 @@ impl Notifier {
     }
 }
 
-fn reader(idx: usize, sel: &Sel, cfg: &Config, hold: &Hold, tx: &mpsc::SyncSender<Notice>) {
+fn reader(idx: usize, sel: &Sel, cfg: &Config, hold: &Arc<Hold>, tx: &mpsc::SyncSender<Notice>) {
     let filter = sel.filter(&cfg.fleet);
     let key = sel.key();
     let mut seen: Option<u64> = None;
@@ -3294,14 +3271,14 @@ fn reader(idx: usize, sel: &Sel, cfg: &Config, hold: &Hold, tx: &mpsc::SyncSende
 /// Connect reader `key` to the broker and find where it reads from: its cursor in the store of
 /// the log it reaches ([`Store::cursor`]), or past what this reader already handed on
 /// (`seen`), or `--since`. A reader writes nothing to the store's journal, whose one writer is
-/// the notifier ([`Store::hold`]): a start at the head it found with no cursor is handed back
+/// the notifier ([`Store::open`]): a start at the head it found with no cursor is handed back
 /// (the last item) for the notifier to write ([`Notice::Start`]), and the reader reads no
 /// record until the notifier answers that it is on the media, so a restart after any record
 /// was read re-reads from that head, never from a later one; where the write is refused the
 /// reader connects again after its backoff, as a refused connect does.
 fn connect_for_reader(
     cfg: &Config,
-    hold: &Hold,
+    hold: &Arc<Hold>,
     key: &str,
     filter: &str,
     seen: &mut Option<u64>,
@@ -3341,10 +3318,12 @@ fn connect_for_reader(
 ///
 /// # Errors
 /// [`Hold::check`]'s refusal, or [`Store::for_log`]'s.
-fn reader_store(hold: &Hold, log: &ReadLog) -> io::Result<Store> {
+fn reader_store(hold: &Arc<Hold>, log: &ReadLog) -> io::Result<Store> {
     hold.check()?;
     Store {
         root: hold.root.clone(),
+        directory: Arc::clone(&hold.directory),
+        access: Owned(Arc::clone(hold)),
     }
     .for_log(log.id, log.lineage.as_ref())
 }
@@ -3371,9 +3350,6 @@ fn log_of(conn: &mut Conn, cfg: &Config) -> io::Result<ReadLog> {
 
 #[cfg(test)]
 thread_local! {
-    /// Called by [`Store::take`] between its open of [`LOCK`] and its `flock(2)`, so a test can
-    /// replace or remove the path there.
-    static BEFORE_TAKE: std::cell::RefCell<Option<TakeSeam>> = const { std::cell::RefCell::new(None) };
     static FORGET_LINEAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Called as [`Notifier::exec`] starts a command, so a test can ask what was flushed
     /// before it.
@@ -3439,10 +3415,6 @@ fn refused(name: &str) -> Option<i32> {
 /// What [`AT_EXEC`] calls with the hit whose command starts.
 #[cfg(test)]
 type ExecSeam = Box<dyn FnMut(&Hit)>;
-
-/// What [`BEFORE_TAKE`] calls with the lock's path.
-#[cfg(test)]
-type TakeSeam = Box<dyn FnMut(&Path)>;
 
 /// What [`BEFORE_EXIT_WAIT`] calls with the command just spawned.
 #[cfg(test)]
@@ -3740,3 +3712,7 @@ fn parse_rate(s: &str) -> Result<(u32, u64), String> {
 #[cfg(test)]
 #[path = "notify_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "notify_store_custody_tests.rs"]
+mod store_custody_tests;

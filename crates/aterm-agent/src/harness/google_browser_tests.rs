@@ -17,8 +17,8 @@ fn a_browser_call_its_host_slept_through_ends_at_its_next_look() {
         let seam = super::super::wake_deadline::SleepSeam::hold();
         let sleeper = seam.sleeper();
         let (release, released) = std::sync::mpsc::channel::<()>();
-        let (mut commands, to_browser) = std::io::pipe().unwrap();
-        let (from_browser, answers) = std::io::pipe().unwrap();
+        let (mut commands, to_browser) = aterm_uds::pipe().unwrap();
+        let (from_browser, answers) = aterm_uds::pipe().unwrap();
         let browser = std::thread::spawn(move || {
             let mut byte = [0u8; 1];
             // A command ends at its NUL.

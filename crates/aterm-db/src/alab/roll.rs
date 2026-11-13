@@ -111,6 +111,26 @@ fn request_role(role: &str, log: &Log) -> String {
     )
 }
 
+#[cfg(test)]
+pub(crate) fn restate(
+    table: &typed::Table,
+    source: &Cells,
+    held: &BTreeSet<Digest>,
+    target: &Cells,
+    carried: &Carried,
+    reseal: (&dyn Sealer, &dyn Sealer),
+) -> Result<Vec<Vec<Change>>> {
+    restate_with_claims(
+        table,
+        source,
+        held,
+        target,
+        carried,
+        reseal,
+        &typed::claim::CarriedClaims::new(),
+    )
+}
+
 /// The registers to write into the new generation (`target`, whose rolls already carried
 /// `carried`) from the old one's `source` cells, `held` being every operation this Mac holds of
 /// the old one. A register carries candidates not carried before, retains ones the new
@@ -126,14 +146,16 @@ fn request_role(role: &str, log: &Log) -> String {
 /// # Errors
 /// A register would hold more candidates than a carried value lists, a key breaks a rule, or a
 /// `Secret` cannot be opened or sealed again.
-pub(crate) fn restate(
+fn restate_with_claims(
     table: &typed::Table,
     source: &Cells,
     held: &BTreeSet<Digest>,
     target: &Cells,
     carried: &Carried,
     reseal: (&dyn Sealer, &dyn Sealer),
+    claims: &typed::claim::CarriedClaims,
 ) -> Result<Vec<Vec<Change>>> {
+    let target_claims = typed::claim::carried_claims(target)?;
     let mut rows = Vec::new();
     for (coord @ (collection, key), cell) in source {
         if NOT_RESTATED.contains(&collection.as_str())
@@ -187,7 +209,14 @@ pub(crate) fn restate(
             .map(|(origin, value)| (*origin, (*value).clone()))
             .collect();
         merged.extend(old);
-        if merged.len() == now.len()
+        let provenance_unchanged = merged.keys().all(|origin| {
+            claims.get(coord).and_then(|origins| origins.get(origin))
+                == target_claims
+                    .get(coord)
+                    .and_then(|origins| origins.get(origin))
+        });
+        if provenance_unchanged
+            && merged.len() == now.len()
             && merged
                 .iter()
                 .all(|(origin, value)| now.get(origin) == Some(&value))
@@ -197,12 +226,30 @@ pub(crate) fn restate(
         let value = if merged.is_empty() {
             None
         } else {
-            Some(cell::carry(&merged).ok_or_else(|| {
+            let mut encoded = cell::carry(&merged).ok_or_else(|| {
                 Error::new(&format!(
                     "{collection}: a register holds more candidates than a roll carries; resolve it \
                      first"
                 ))
-            })?)
+            })?;
+            for (item, origin) in encoded
+                .as_object_mut()
+                .unwrap()
+                .get_mut("k")
+                .unwrap()
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .zip(merged.keys())
+            {
+                if let Some(provenance) = claims.get(coord).and_then(|origins| origins.get(origin))
+                {
+                    item.as_object_mut()
+                        .unwrap()
+                        .insert("c".into(), provenance.clone());
+                }
+            }
+            Some(encoded)
         };
         rows.push(vec![Change {
             collection: collection.clone(),
@@ -797,6 +844,8 @@ impl Registry {
             ));
         }
         let old_view = View::read(from.table, &session, &old_log);
+        old_view.require_roll_source(from.table)?;
+        let old_claims = old_view.claim_provenance(from.table)?;
         let old_snapshot = old_log.snapshot();
         let held_ops = held_of_ops(&old_snapshot.operations);
         let held: BTreeSet<Digest> = old_snapshot
@@ -815,7 +864,7 @@ impl Registry {
             .ok_or_else(|| Error::new("this Mac is not in its own Commons roster"))?;
 
         let plan = |new: Option<&Store>| -> Result<(Vec<Vec<Change>>, usize, usize, bool)> {
-            let (target, carried, done_archive, rolls) = match new {
+            let (target, carried, done_archive, rolls, target_claims) = match new {
                 Some(store) => {
                     let log = Log::read_with(&session, store, to_descriptor.scope, decode)?;
                     if !log.awaited(session.actor()).is_empty() {
@@ -835,7 +884,8 @@ impl Registry {
                             .map(|op| op.id)
                             .collect();
                     let rolls = view.project(&ROLL);
-                    (view.cells, carried, archived, rolls)
+                    let claims = view.claim_provenance(to.table)?;
+                    (view.cells, carried, archived, rolls, claims)
                 }
                 None => Default::default(),
             };
@@ -843,13 +893,16 @@ impl Registry {
             let to_name = to.name();
             let old_sealer = att::sealer(&from_name, &session, old_scope)?;
             let new_sealer = att::sealer(&to_name, &session, to_descriptor.scope)?;
-            let mut rows = restate(
+            let mut claims = target_claims;
+            typed::claim::merge_claims(&mut claims, old_claims.clone())?;
+            let mut rows = restate_with_claims(
                 from.table,
                 &old_view.cells,
                 &held,
                 &target,
                 &carried,
                 (&old_sealer, &new_sealer),
+                &claims,
             )?;
             let registers = rows.len();
             let mut archived = 0;

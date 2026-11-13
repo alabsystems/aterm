@@ -83,6 +83,10 @@ pub enum MotionEffect {
     /// (`⤓ land` back to `⤓`, `aterm-gui`'s `claude_lights::ChipWord`): at 0 the name still shows
     /// (it says what the click did) but goes at once when its hold ends.
     ChipWord,
+    /// The fade of the wash a footer card's row wore under the pointer or the keys, once they
+    /// left it (`aterm-gui`'s `autopilot_menu::WashRelease`): at 0 the wash goes in the one
+    /// frame that lights the next row.
+    CardWash,
 }
 
 /// The longest crossfade [`MotionEffect::NativeFade`] admits, in milliseconds (§5.5).
@@ -91,7 +95,7 @@ pub const NATIVE_FADE_MAX_MS: u32 = 150;
 impl MotionEffect {
     /// The complete governed-effect set, which the totality proof iterates.
     #[cfg(test)]
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::CursorGlow,
         Self::WordSparkles,
         Self::SmoothScroll,
@@ -105,6 +109,7 @@ impl MotionEffect {
         Self::NativeTravel,
         Self::NativeFade,
         Self::ChipWord,
+        Self::CardWash,
     ];
 
     /// Whether this effect is functional motion the host's load-shed latch (`perf_reduced`) must
@@ -124,7 +129,8 @@ impl MotionEffect {
             | Self::NativeInPlace
             | Self::NativeTravel
             | Self::NativeFade
-            | Self::ChipWord => false,
+            | Self::ChipWord
+            | Self::CardWash => false,
         }
     }
 }
@@ -259,7 +265,8 @@ impl MotionPolicy {
                 | MotionEffect::NativeInPlace
                 | MotionEffect::NativeTravel
                 | MotionEffect::NativeFade
-                | MotionEffect::ChipWord => 0.0,
+                | MotionEffect::ChipWord
+                | MotionEffect::CardWash => 0.0,
             },
         }
     }

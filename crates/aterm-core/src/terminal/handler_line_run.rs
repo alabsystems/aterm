@@ -267,12 +267,11 @@ impl TerminalHandler<'_> {
     /// [`Grid::screen_text_line`] takes, each line feed with the line after it, up to the first
     /// line it does not take; returns the rest of the run, from that line's line feed. It takes
     /// the run where [`Grid::begin_screen_text_lines`] begins one and the pen is the default,
-    /// and a line of at most 64 bytes that fits the row from the cursor: what `print_plain`
-    /// prints by the blast writer. Each such print leaves what that path leaves: the last
-    /// graphic character, the print anchor and its count. Its selection damage is none: the
-    /// row the line feed brought in is empty, so the print overwrites nothing, and it ends on
-    /// the row it starts on. A CR after a line puts the cursor at column 0, as `execute` does
-    /// with VT52 off, no single shift pending and DECLRMM off.
+    /// and a line that fits the row from the cursor. Each such print leaves what `print_plain`
+    /// leaves: the last graphic character, the print anchor and its count. Its selection damage is
+    /// none: the row the line feed brought in is empty, so the print overwrites nothing, and it
+    /// ends on the row it starts on. A CR after a line puts the cursor at column 0, as `execute`
+    /// does with VT52 off, no single shift pending and DECLRMM off.
     ///
     /// [`Grid::screen_text_line`]: crate::grid::Grid::screen_text_line
     /// [`Grid::begin_screen_text_lines`]: crate::grid::Grid::begin_screen_text_lines
@@ -289,7 +288,7 @@ impl TerminalHandler<'_> {
         let mut rest = run;
         while let Some((&b'\n', after)) = rest.split_first() {
             let len = printable_len(after);
-            if len > 64 || usize::from(self.grid.cursor_col()) + len > cols {
+            if usize::from(self.grid.cursor_col()) + len > cols {
                 break;
             }
             let (text, tail) = after.split_at(len);

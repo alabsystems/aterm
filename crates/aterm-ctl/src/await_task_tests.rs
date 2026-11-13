@@ -1905,3 +1905,23 @@ fn a_board_wait_starts_each_worker_from_its_row_in_legs_of_64() {
         "since= names every worker's edge"
     );
 }
+
+/// A WAIT ANOTHER ATERM SERVES IS VOUCHED FOR at the caller's own: one group at a sibling's socket
+/// is served elsewhere. NEGATIVE CONTROL: every group at the caller's own socket is not, and no
+/// vouch is asked.
+#[test]
+fn a_wait_a_sibling_serves_is_served_elsewhere() {
+    let at = |sock: &str| Group {
+        sock: sock.into(),
+        targets: Vec::new(),
+        order: Vec::new(),
+        recorded: None,
+    };
+    let own = "/no/such/aterm-own.sock";
+    assert!(!served_elsewhere(&[at(own)], own));
+    assert!(!served_elsewhere(&[], own));
+    assert!(served_elsewhere(
+        &[at(own), at("/no/such/aterm-dev.sock")],
+        own
+    ));
+}

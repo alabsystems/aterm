@@ -129,6 +129,11 @@ impl Drop for Flock {
     }
 }
 
+/// Serialize metadata edits through a stable lock file that publication never replaces.
+pub(crate) fn lock_metadata(path: &Path) -> io::Result<Flock> {
+    Flock::lock(open_lock_file(path)?)
+}
+
 /// Exclusive lock on a file carrying a holder record ([`crate::vendor_direct::watch`]).
 pub(crate) use aterm_toolchain::record_lock::RecordLock;
 

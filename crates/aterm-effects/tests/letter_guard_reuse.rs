@@ -573,69 +573,6 @@ fn kept_frames_and_verdicts_publish_what_judging_afresh_does() {
     );
 }
 
-/// The fold of every frame's guarded streams ([`guarded_fold`]) on main, captured at the parent
-/// of `docs/design/PRISM-GLASS.md` §15.2 1.9, which noted no light-owned range. At b11eed7965 it
-/// was `0x2f59_80aa_2780_cadd`. The trail/looks10 branch changes these styles' lights and the
-/// guard's cuts; this test, run on that branch's tip before it merged 1.9 (0088eabcf0), folded to
-/// `0xc907_d12e_9b56_8217`, and so did the merged tree: 1.9 still leaves the guard as its parent
-/// had it. Review 9's trail/rev9fix floats Comet's dark dust only into a row blank across on the
-/// page's own ground; merged onto main 227b056193 it folded to
-/// `0x0664_f9bc_280d_ea74`. Folded style by style there and on that main, 22 of the
-/// 24 styles and grounds fold alike, and the two that differ are Comet on the dark and dim
-/// grounds, where the dust is drawn. trail/composed round 3 keeps Sparkle's paper marks off the
-/// letters just typed and gives paper Lumen (`aurora` reads as Lumen) its lingering tracer along
-/// the letters' foot; folded style by style before and after, 22 of the 24 fold alike, and the
-/// two that differ are Sparkle and Lumen on the light ground: `0x386b_bd32_9b36_d7ab`. r24 K7-1
-/// takes the companion's flight off a typing run's first key (looks8's first keys' spring);
-/// folded style by style before and after, 18 of the 24 fold alike, and the six that differ
-/// are the two companion styles (`rainbow kitty pet`, `rainbow kitty`) on each ground, whose
-/// cat now gets going on foot with `echo`'s first keys (fold `0x2707_980b_81f4_ce4f`). r25 K8-4 takes
-/// away the pet's page veil, which lay beneath the body it was laid for: folded style by style
-/// before and after, 18 of the 24 fold alike, and the six that differ are the two companion
-/// styles on each ground (no veil in their under stream): `0xf0f3_3640_b18b_9c2b`. r27 LG1 reads
-/// a letter whose glyph the face's table holds a raster for by the ring round its strokes, as the
-/// judges do, and keeps the room a dim letter's bar keeps over its share (`OWN_ROOM`) for a letter
-/// read by its solid ink alone; replayed without the frame's glyph ink, as they were until then
-/// (every letter read by its solid ink), the guarded streams still fold to that value. Its review
-/// has the replays observe the frame's glyph ink as the GUI does, from the render suite's bundled
-/// face at its own cells, so they judge the guard that ships: `0x651f_3de5_5468_2007`.
-/// trail/leaders' after-land pass runs paper Comet's tail at the letters' foot (L1), burns the
-/// paper flame deep (L3) and lays paper Phaser as a crisp neon tube whose spectrum runs one way
-/// round (L4); on its own parent, whose replays read no glyph ink, it folded to
-/// `0x9310_bc61_da20_61f0` and, with that one-way spectrum, `0xa055_4d46_3c89_6c12`. Merged onto
-/// main f54c0d3933 and folded style by style there and on that main, 21 of the 24 fold alike, and
-/// the three that differ are Phaser, Comet and Fire on the light ground: `0x41a1_2d10_a9eb_9f80`.
-/// trail/lows' after-land pass springs Laser's crackle from the bolt's own cell, narrows Sparkle's
-/// paper body and its Solarized rail to their tails, and gives Lumen a quiet dark tracer and a
-/// soft paper end; on its own parent, whose replays read no glyph ink, it folded to
-/// `0xc8bf_042d_830d_21cb` and, with that tracer at half its light (was two fifths),
-/// `0xf5fb_ff10_5c1a_df95`. Merged onto trail/leaders' merge and folded style by style there and
-/// here, 17 of the 24 fold alike, and the seven that differ are Laser on all three grounds,
-/// Sparkle on the light and dim ones and Lumen on the dark and light ones:
-/// `0xbfd3_64f7_a2ec_fa7a`. The after-land review's repair holds paper Lumen's typed leg through
-/// a Backspace and walks its end in; folded style by style there and on its parent d8161deaca, 23
-/// of the 24 fold alike, and the one that differs is Lumen on the light ground:
-/// `0xb7ca_2008_2ee6_eafa`. The guard keeping each letter's whole reading as well as its ring's
-/// (after-land A1, `letter_guard::ring`) changes one stream: with the whole reading off
-/// (`set_letter_guard_whole(false)`) the fold is that value, and folded style by style 23 of the 24
-/// fold alike, and the one that differs is Fire on the dim ground, a flame foot whose letter read
-/// under its bar by its core against its bed: `0x2d33_01c0_9206_fb2c`. The paper Phaser's tube
-/// turning through yellow and holding its colour over a wide glyph (after-land B7) changes one more:
-/// folded style by style 23 of the 24 fold alike, and the one that differs is Phaser on the light
-/// ground: `0x4d3c_6974_83e6_d426`. A letter on a dim page keeping a level in hand over its share
-/// (`LEVEL_ROOM`) lowers every dim stream's light a little and no other's: the 16 dark and light
-/// streams fold alike and the eight dim ones differ, `0x98ff_5d2d_14c5_1c75`. After-land round 3's
-/// paper stream holds a letter that reads AA as the judges read it, and under the floor, at AA with
-/// a level in hand (`letter_bar`, c5f12a057c), where it kept 97% of its reading: such a letter on
-/// Solarized Dark now takes no light that lowers it. Folded style by style there and on its parent
-/// fac1b631f5, the 16 dark and light streams fold alike and the eight dim ones differ; the round's
-/// later commits move none of the 24: `0x9969_6521_89e5_f31b`. CT-08 makes the rainbow one
-/// theme, the underline, with the pet its own setting: the two tall-ribbon rows that fold named
-/// (`rainbow kitty pet` and its alias `rainbow kitty`, one stream folded twice) are now the one
-/// `rainbow` row beside the cat, so the fold reads 21 streams where it read 24 (the other
-/// styles' 18 were not folded apart for this change): the value below.
-const GUARDED_FOLD_AT_THE_PARENT: u64 = 0x41b2_2e84_a662_fb06;
-
 /// FNV-1a over `words`, from `h`.
 fn fold_words(h: u64, words: impl IntoIterator<Item = u64>) -> u64 {
     words.into_iter().fold(h, aterm_hash::fnv1a_64_u64_le)
@@ -681,34 +618,76 @@ fn guarded_fold(guard: bool) -> u64 {
     h
 }
 
-/// The guard's output on main is its parent's (§15.2 1.9 "One owner"): with no light-owned range
-/// noted, as on every frame of these grounds, the streams every frame publishes fold to the
-/// constant captured at the parent on `GOLDEN_TRACE_TARGET`. Off it, three of the fold's inputs
-/// may differ, so another target may fold to a digest of its own, the same on every run: the face's
-/// rasters (CoreText on macOS, the hinted portable rasterizer elsewhere), the default palette
-/// (Windows' slot 4, the `blue` of the line beside the typed one, is `#2973D0`, not `#3B8EEA`) and
-/// the system libm that computes the glow's `exp` and `ln`. The negative control, the guard off,
-/// folds otherwise on every target, so the fold weighed the guard's cuts.
+/// Replay the same observed glyphs and stream inputs twice, with the guard off as a
+/// negative control. Font rasters, palette and system libm are runtime inputs, so a target
+/// triple alone cannot identify a portable stream digest.
 #[test]
-fn the_guarded_streams_fold_as_at_the_parent() {
-    use aterm_effects::aos_momentum::{corpus::GOLDEN_TRACE_TARGET, target_name};
+fn guarded_streams_replay_deterministically_and_measure_the_guard() {
     let fold = guarded_fold(true);
     assert_ne!(
         guarded_fold(false),
         fold,
         "control: the streams with the guard off fold alike"
     );
-    if target_name() == GOLDEN_TRACE_TARGET {
-        assert_eq!(
-            fold, GUARDED_FOLD_AT_THE_PARENT,
-            "the guarded streams fold to {fold:#018x}"
-        );
-    } else {
-        assert_eq!(
-            guarded_fold(true),
-            fold,
-            "the guarded streams fold deterministically on {}",
-            target_name()
-        );
+    assert_eq!(
+        guarded_fold(true),
+        fold,
+        "the guarded streams replay deterministically"
+    );
+}
+
+/// A PASS LOWERS WHAT THE FRAME LAYS (CT-44's review). A row's cuts are one eased ramp
+/// (`ramp_row`): a cell beside a deeper cut is laid under its own cut, at the ramp's share. A
+/// verify pass that read such a cell under its bar lowered its own cut by what the frame let it
+/// keep, which could leave the cut over the ramp's share, so the row laid the cell where it was
+/// and the next pass read it as this one did, until the gallop or the last pass cut it far under
+/// what the frame let it keep. It lowers the share the frame laid now. Typing among two lettered
+/// rows and the fold's coloured line, every style on Solarized Light and Solarized Dark: no pass
+/// lowers a cell its row then lays no lower. Negative control (`set_letter_guard_lowered_by_cut`,
+/// the cut lowered as before): 26 such lowerings over 7 of the Solarized Light scenes, whose
+/// passes the fix spares (Sparkle typing took 209, 204 now). The rule lowers the laid share
+/// itself, so its half holds by construction; the control is what shows the old rule broke it.
+#[test]
+fn a_pass_lowers_what_the_frame_lays() {
+    let mut typing = vec![(
+        200,
+        Ev::Out(
+            b"\x1b[2J\x1b[2Hthe quick brown fox jumps over\r\nlazy dogs sleep in the sun\x1b[5H$ "
+                .to_vec(),
+        ),
+    )];
+    typing.extend(typed("echo poppy guppy foggy soggy", 1_000, 50));
+    let mut fold = vec![(
+        200,
+        Ev::Out(b"\x1b[2J\x1b[3H\x1b[31mred\x1b[0m \x1b[34mblue\x1b[0m plain\x1b[5H$ ".to_vec()),
+    )];
+    fold.extend(typed("echo hello world", 1_000, 50));
+    let styles = [
+        "rainbow", "phaser", "comet", "fire", "laser", "sparkle", "aurora",
+    ];
+    let mut control = 0;
+    for (scene, ev) in [("typing", &typing), ("the fold's line", &fold)] {
+        for style in styles {
+            for (look, theme) in [(DIM_PAPER, "Solarized Light"), (DIM, "Solarized Dark")] {
+                let vain = |by_cut: bool| {
+                    let mut r = Replay::new(style, look, true);
+                    r.fx.cursor_mut()
+                        .glow
+                        .set_letter_guard_lowered_by_cut(by_cut);
+                    let _ = run(&mut r, ev, 1_500);
+                    r.fx.cursor_mut().glow.letter_guard_vain()
+                };
+                assert_eq!(
+                    vain(false),
+                    0,
+                    "{style} on {theme}, {scene}: lowerings its row laid no lower"
+                );
+                control += vain(true);
+            }
+        }
     }
+    assert!(
+        control > 0,
+        "control: no pass lowering a cell's own cut left its row's ramp where it was"
+    );
 }

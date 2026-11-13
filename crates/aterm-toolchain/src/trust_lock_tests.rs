@@ -159,6 +159,69 @@ fn the_store_answers_the_locked_build_only_with_the_locks_tree() {
     assert_eq!(locked_build(&prefix, &lock), LockedBuild::Absent);
 }
 
+/// A REFUSAL NAMES WHAT PUTS THE LOCK'S BUILD HERE: the build's install where one is published
+/// for this machine, and, where the store's signed manifests say none is (`Found::unpublished`),
+/// why, and the local sysroot the caller's own resolution takes in the lock's place, never an
+/// install that cannot succeed; a store reader's names no `TRUST_STAGE2_BIN`, which it never
+/// reads; neither says "Mac". NEGATIVE CONTROL (2026-11-11): with `refusal`'s `fix` ignoring
+/// `found.unpublished`, the unpublished `Absent` refusal still read "run `aterm pkg install trust
+/// --build 16387`".
+#[test]
+fn a_refusal_names_what_puts_the_locks_build_here() {
+    let lock = sample();
+    let published = Found {
+        path: PathBuf::from("/c/trust.lock"),
+        lock: Ok(lock.clone()),
+        unpublished: None,
+    };
+    let why = "unavailable on aarch64-unknown-linux-gnu: Trust is published for ARM macOS only";
+    let unpublished = Found {
+        unpublished: Some(why.to_string()),
+        ..published.clone()
+    };
+    let states = [
+        LockedBuild::Absent,
+        LockedBuild::Unrecorded,
+        LockedBuild::Mismatch {
+            recorded: "1".repeat(64),
+        },
+    ];
+    for state in &states {
+        let install = state
+            .refusal(&published, &lock, LOCAL_SYSROOT_REMEDY)
+            .expect("refused");
+        assert!(
+            install.contains("run `aterm pkg install trust --build 16387`"),
+            "{install}"
+        );
+        let local = state
+            .refusal(&unpublished, &lock, LOCAL_SYSROOT_REMEDY)
+            .expect("refused");
+        assert!(
+            local.contains(&format!(
+                "no published install of it serves this machine ({why}); \
+                 {LOCAL_SYSROOT_REMEDY}"
+            )),
+            "{local}"
+        );
+        assert!(!local.contains("pkg install"), "{local}");
+        assert!(!local.contains("TRUST_STAGE2_BIN"), "{local}");
+        for line in [&install, &local] {
+            assert!(
+                line.contains("this machine's store") && !line.contains("Mac"),
+                "{line}"
+            );
+        }
+    }
+    assert_eq!(
+        LockedBuild::Present {
+            bin: PathBuf::from("/b")
+        }
+        .refusal(&unpublished, &lock, LOCAL_SYSROOT_REMEDY),
+        None
+    );
+}
+
 /// A record binds the tree it was taken of: a tree re-staged under the same number (a new
 /// directory swapped into place), or a record bound to another identity, reads as unrecorded
 /// until it is recorded again, while a rename of the same tree aside (`<build>.noindex`

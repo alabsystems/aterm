@@ -10,6 +10,44 @@ use crate::{
     App, TabAction, TabIndex, WindowId, WindowState, pane, session_store, tab_bar, term_lock,
 };
 
+/// Identities for one complete strip refresh, including parked tabs and shared sessions.
+/// This snapshot borrows no topology and is discarded when the refresh finishes.
+struct LabelIdentities {
+    ids: Vec<crate::tab_model::TabId>,
+    sessions: Vec<Option<u64>>,
+    live_tabs: std::collections::HashSet<crate::tab_model::TabId>,
+    live_sessions: std::collections::HashSet<u64>,
+}
+
+impl LabelIdentities {
+    fn capture(app: &App, wid: WindowId) -> Self {
+        let tabs = app
+            .windows
+            .get(&wid)
+            .map_or(&[][..], |ws| ws.tab_set.tabs());
+        let mut snapshot = Self {
+            ids: Vec::with_capacity(tabs.len()),
+            sessions: Vec::with_capacity(tabs.len()),
+            live_tabs: std::collections::HashSet::with_capacity(tabs.len()),
+            live_sessions: std::collections::HashSet::with_capacity(tabs.len()),
+        };
+        for tab in tabs {
+            #[cfg(test)]
+            crate::work_counts::title_identity_visited();
+            let session = app
+                .view_store
+                .get(tab.focus)
+                .copied()
+                .and_then(crate::tab_model::View::terminal_session);
+            snapshot.ids.push(tab.id);
+            snapshot.sessions.push(session);
+            snapshot.live_tabs.insert(tab.id);
+            snapshot.live_sessions.extend(session);
+        }
+        snapshot
+    }
+}
+
 /// How soon after its spawn a failed interactive shell can count as one that never started.
 pub(crate) const SHELL_START_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -1364,6 +1402,15 @@ impl App {
 
     /// One title per top-level tab of window `wid`, for the strip labels.
     pub(crate) fn tab_titles(&mut self, wid: WindowId) -> Vec<String> {
+        let identities = LabelIdentities::capture(self, wid);
+        self.tab_titles_from_identities(wid, &identities)
+    }
+
+    fn tab_titles_from_identities(
+        &mut self,
+        wid: WindowId,
+        identities: &LabelIdentities,
+    ) -> Vec<String> {
         let Some(ws) = self.windows.get(&wid) else {
             return Vec::new();
         };
@@ -1371,7 +1418,10 @@ impl App {
             .tab_set
             .tabs()
             .iter()
-            .map(|tab| {
+            .zip(&identities.sessions)
+            .map(|(tab, session)| {
+                #[cfg(test)]
+                crate::work_counts::title_read_visited();
                 if let Some(title) = self.workers_chip_title(ws, tab) {
                     return (title, None, None);
                 }
@@ -1380,12 +1430,10 @@ impl App {
                 } else {
                     "aterm".to_string()
                 };
-                let Some(crate::tab_model::View::Terminal(view)) =
-                    self.view_store.get(tab.focus).copied()
-                else {
+                let Some(session) = *session else {
                     return (fallback, None, None);
                 };
-                let Some(s) = self.pool.get(view.session) else {
+                let Some(s) = self.pool.get(session) else {
                     return (fallback, None, None);
                 };
                 let user_title = s
@@ -1399,7 +1447,7 @@ impl App {
                         title,
                         untitled: false,
                     });
-                    return (fallback, Some(view.session), pinned);
+                    return (fallback, Some(session), pinned);
                 }
                 let term_label = |t: &aterm_core::terminal::Terminal| {
                     use crate::cwd_native::ReportedCwd as _;
@@ -1415,15 +1463,28 @@ impl App {
                     Err(std::sync::TryLockError::Poisoned(p)) => Some(term_label(&p.into_inner())),
                     Err(std::sync::TryLockError::WouldBlock) => None,
                 };
-                (fallback, Some(view.session), fresh)
+                (fallback, Some(session), fresh)
+            })
+            .collect();
+        // A worker chip, native leaf or missing pool session must not retain a captured
+        // terminal title. A busy terminal still must: its last capture is the fallback.
+        let captured_sessions: std::collections::HashSet<_> = read
+            .iter()
+            .filter_map(|(_, session, _)| {
+                #[cfg(test)]
+                crate::work_counts::title_eligibility_read();
+                *session
             })
             .collect();
         let chrome_labels = &self.chrome_labels;
         let Some(ws) = self.windows.get_mut(&wid) else {
             return Vec::new();
         };
-        ws.tab_title_cache
-            .retain(|sid, _| read.iter().any(|(_, live, _)| *live == Some(*sid)));
+        ws.tab_title_cache.retain(|sid, _| {
+            #[cfg(test)]
+            crate::work_counts::title_cache_probed();
+            captured_sessions.contains(sid)
+        });
         read.into_iter()
             .map(|(fallback, sid, fresh)| {
                 let Some(sid) = sid else {
@@ -4476,7 +4537,8 @@ impl App {
         wid: WindowId,
     ) -> (Vec<String>, Vec<crate::tab_bar::TabStripMetadata>) {
         self.reap_stale_rename_edit(wid);
-        let titles = self.tab_titles(wid);
+        let identities = LabelIdentities::capture(self, wid);
+        let titles = self.tab_titles_from_identities(wid, &identities);
         let mut chrome_titles = crate::chrome_label::capped_labels(&titles);
         let ext = self.tab_chrome_ext(wid, &chrome_titles);
         self.stamp_tab_connection_roles(wid);
@@ -4498,45 +4560,46 @@ impl App {
             .windows
             .get(&wid)
             .map_or(titles.len(), |ws| ws.tab_set.shown_len());
-        let ids: Vec<crate::tab_model::TabId> =
-            self.windows.get(&wid).map_or_else(Vec::new, |ws| {
-                ws.tab_set.tabs().iter().map(|tab| tab.id).collect()
-            });
-        let Self {
-            windows,
-            view_store,
-            ..
-        } = self;
-        if let Some(ws) = windows.get_mut(&wid) {
-            let tab_session = |tab: &crate::tab_model::Tab| {
-                view_store
-                    .get(tab.focus)
-                    .copied()
-                    .and_then(crate::tab_model::View::terminal_session)
-            };
-            let tabs = ws.tab_set.tabs();
+        let ids = &identities.ids;
+        if let Some(ws) = self.windows.get_mut(&wid) {
             ws.strip_shadow.set((shown, active));
-            ws.tab_title_epochs
-                .retain(|sid, _| tabs.iter().any(|tab| tab_session(tab) == Some(*sid)));
-            ws.tab_chrome_titles
-                .retain(|sid, _| tabs.iter().any(|tab| tab_session(tab) == Some(*sid)));
-            for (tab, title) in tabs.iter().zip(&titles) {
-                if let Some(session) = tab_session(tab) {
+            ws.tab_title_epochs.retain(|sid, _| {
+                #[cfg(test)]
+                crate::work_counts::title_cache_probed();
+                identities.live_sessions.contains(sid)
+            });
+            ws.tab_chrome_titles.retain(|sid, _| {
+                #[cfg(test)]
+                crate::work_counts::title_cache_probed();
+                identities.live_sessions.contains(sid)
+            });
+            for (session, title) in identities.sessions.iter().zip(&titles) {
+                if let Some(session) = session {
+                    #[cfg(test)]
+                    crate::work_counts::title_cache_copy(title.len());
                     ws.tab_chrome_titles
-                        .entry(session)
+                        .entry(*session)
                         .or_default()
                         .clone_from(title);
                 }
             }
-            ws.tab_chrome_titles_by_tab
-                .retain(|tab_id, _| ids.contains(tab_id));
-            for (tab, title) in tabs.iter().zip(chrome_titles.iter()) {
-                let session = tab_session(tab);
+            ws.tab_chrome_titles_by_tab.retain(|tab_id, _| {
+                #[cfg(test)]
+                crate::work_counts::title_cache_probed();
+                identities.live_tabs.contains(tab_id)
+            });
+            for ((id, session), title) in ids
+                .iter()
+                .zip(&identities.sessions)
+                .zip(chrome_titles.iter())
+            {
+                #[cfg(test)]
+                crate::work_counts::title_cache_copy(title.len());
                 let entry = ws
                     .tab_chrome_titles_by_tab
-                    .entry(tab.id)
-                    .or_insert_with(|| (session, String::new()));
-                entry.0 = session;
+                    .entry(*id)
+                    .or_insert_with(|| (*session, String::new()));
+                entry.0 = *session;
                 entry.1.clone_from(title);
             }
         }
@@ -6659,6 +6722,7 @@ impl App {
         id: u64,
         keep: crate::session_log::ClosedKeep,
     ) {
+        self.restored_workers.remove(&id);
         #[cfg(target_os = "macos")]
         self.withdraw_askpass_session(id);
         let (reason, by) = session_store::current_close_attribution();

@@ -467,7 +467,7 @@ fn a_ready_vault_keeps_the_repository_inputs_typed_blocker() {
     use aterm_types::macos_setup::Standing;
 
     for (wait, standing) in [
-        (Wait::Token, Standing::NeedsYou),
+        (Wait::Token, Standing::Waiting),
         (Wait::GitReadiness, Standing::Waiting),
     ] {
         let root = aterm_tempfile::tempdir().unwrap();
@@ -486,7 +486,8 @@ fn a_ready_vault_keeps_the_repository_inputs_typed_blocker() {
         };
         sys.stat_fails(missing.to_str().unwrap(), std::io::ErrorKind::NotFound);
         let seen = observe(&sys, &ctx, Some(&plan), false).unwrap();
-        // A missing token needs its vault entry; Git readiness is retried automatically.
+        // A missing token blocks the stage until the vault delivers one; Git readiness is
+        // retried automatically. Neither is a person's.
         assert_eq!(seen.standing, standing, "{wait:?}");
         assert_eq!(seen.note.as_deref(), Some(wait.note()), "{wait:?}");
         assert!(
@@ -499,11 +500,10 @@ fn a_ready_vault_keeps_the_repository_inputs_typed_blocker() {
     }
 }
 
-/// A token GitHub refuses is a person's to renew in the vault, never a wait the run retries
-/// (System State design §3.6): the row needs you, signing in, with the remedy as its note,
-/// and the run's row for it parks the run instead of trying it again a minute later.
+/// A token GitHub refuses is never a person's: the row waits, signing in, with that wait as its
+/// note, and the run does not park on it.
 #[test]
-fn a_token_github_refuses_needs_you_and_parks_the_run() {
+fn a_token_github_refuses_waits_and_does_not_park() {
     use aterm_machines::init_observe::Wait;
     use aterm_machines::port::GithubFailure;
     use aterm_types::macos_setup::Standing;
@@ -541,21 +541,17 @@ fn a_token_github_refuses_needs_you_and_parks_the_run() {
     assert_eq!(
         (seen.standing, seen.now.as_deref(), seen.note.as_deref()),
         (
-            Standing::NeedsYou,
+            Standing::Waiting,
             Some("Needs sign-in"),
             Some(Wait::TokenRefused.note())
         )
     );
-    // The settings row before it has nothing to do, so the stage's own row decides the park.
+    // The settings row before it has nothing to do, so the stage's own row decides: no park.
     let rows = run(&sys, &ctx, None, Mode::Plan, None).unwrap();
-    assert_eq!(
-        rows.last().map(|row| row.status.as_str()),
-        Some(super::super::WAITING),
-        "{rows:?}"
-    );
-    assert_eq!(
+    assert_ne!(
         super::super::SetupNext::of(&rows),
-        super::super::SetupNext::Park
+        super::super::SetupNext::Park,
+        "{rows:?}"
     );
 }
 

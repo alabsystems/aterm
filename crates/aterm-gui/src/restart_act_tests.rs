@@ -22,6 +22,7 @@ fn a_changed_primary_cannot_publish_or_offer_an_older_root_restart() {
     };
     let copy = |thread: &str| self_claimed::Copy {
         pid: 0x3fff_ff69,
+        lifetime: None,
         start: "same process".to_string(),
         home: std::path::PathBuf::from("/private/tmp/codex"),
         seen: self_claimed::Seen::Never,
@@ -130,6 +131,7 @@ fn the_restart_verb_parses_its_three_arguments() {
             pid: Some(4242),
             if_stalled: true,
             quiet: Some(120),
+            account: None,
         })
     );
     assert_eq!(
@@ -138,6 +140,7 @@ fn the_restart_verb_parses_its_three_arguments() {
             pid: Some(7),
             if_stalled: false,
             quiet: Some(0),
+            account: None,
         })
     );
     for bad in [
@@ -269,6 +272,7 @@ fn the_act_is_not_offered_for_an_agent_its_relaunch_refuses() {
         auth_observed: true,
         tab: String::new(),
         pid: 0x3fff_ff01,
+        lifetime: None,
         start: "t".to_string(),
         shell: 1,
         program: std::path::PathBuf::from("/opt/claude"),
@@ -388,6 +392,7 @@ fn an_agy_is_offered_the_act_where_its_relaunch_resumes_it() {
                 auth_observed: true,
                 tab: ctx.self_id.as_str().to_string(),
                 pid: 0x3fff_ff21,
+                lifetime: None,
                 start: "t".to_string(),
                 shell: 1,
                 program: std::path::PathBuf::from("/opt/agy"),
@@ -477,6 +482,7 @@ fn a_codex_with_no_validated_copy_is_not_offered_the_act() {
             auth_observed: true,
             tab: sid.clone(),
             pid,
+            lifetime: None,
             start: "t".to_string(),
             shell: 1,
             program: std::path::PathBuf::from("/opt/codex/bin/codex"),
@@ -504,6 +510,7 @@ fn a_codex_with_no_validated_copy_is_not_offered_the_act() {
         );
         let copy = copy.map(|of| aterm_agent::harness::self_claimed::Copy {
             pid: of,
+            lifetime: None,
             start: "t".to_string(),
             home: home.join(".codex"),
             seen: aterm_agent::harness::self_claimed::Seen::Removed,
@@ -551,6 +558,7 @@ fn a_watch_that_lets_go_is_unlisted_in_that_look_and_a_raise_before_it_keeps_it(
         start: "t".to_string(),
         cause: Cause::Asked,
         at,
+        wanted: None,
         input: None,
     };
     let short = stamp(now + 10 - aterm_agent::harness::relaunch::STALE_S);
@@ -595,6 +603,7 @@ fn a_watch_whose_tabs_stamp_names_another_lets_go_in_that_look() {
         start: "t".to_string(),
         cause: Cause::Stall,
         at: now,
+        wanted: None,
         input: None,
     };
     stamped(&state, &ours);
@@ -627,6 +636,7 @@ fn a_watch_waits_on_while_another_take_judges_its_tabs_stamp() {
         start: "t".to_string(),
         cause: Cause::Stall,
         at: aterm_time::unix_secs().expect("clock"),
+        wanted: None,
         input: None,
     };
     stamped(&state, &ours);
@@ -660,6 +670,7 @@ fn a_stamp_dated_past_any_instant_gives_its_watch_no_time() {
             start: "t".to_string(),
             cause: Cause::Asked,
             at: u64::MAX,
+            wanted: None,
             input: None,
         },
     )
@@ -667,4 +678,218 @@ fn a_stamp_dated_past_any_instant_gives_its_watch_no_time() {
     assert!(w.lapsed(), "no KILL");
     assert_eq!(w.left(TAB), Err(LetGo::Lapsed), "let go at its first look");
     assert_eq!(watches(pid), 0);
+}
+
+/// `restart` takes one account word: a roster row's label or the pool's choice, in any place
+/// among `pid=` and `quiet=`. A row may be labelled `auto`, so the pool's choice is its own bare
+/// word and `account=auto` names that row. Refused as a bad argument: either word twice, both
+/// together, either with `if-stalled` in either order, and a label outside the roster grammar.
+#[test]
+fn the_restart_verb_parses_one_account_word() {
+    let row = |label: &str| Some(Wanted::Row(label.to_string()));
+    assert_eq!(
+        parse("account=work"),
+        Ok(Ask {
+            account: row("work"),
+            ..Ask::default()
+        })
+    );
+    assert_eq!(
+        parse("quiet=30 account=work pid=4242"),
+        Ok(Ask {
+            pid: Some(4242),
+            if_stalled: false,
+            quiet: Some(30),
+            account: row("work"),
+        })
+    );
+    assert_eq!(
+        parse("account-auto pid=4242"),
+        Ok(Ask {
+            pid: Some(4242),
+            account: Some(Wanted::Pool),
+            ..Ask::default()
+        })
+    );
+    assert_eq!(
+        parse("account=auto").map(|ask| ask.account),
+        Ok(row("auto")),
+        "a row labelled `auto` is a row"
+    );
+    for (bad, word) in [
+        ("account=work account=home", "account=home"),
+        ("account-auto account-auto", "account-auto"),
+        ("account=work account-auto", "account-auto"),
+        ("account-auto account=work", "account=work"),
+        ("if-stalled account=work", "account=work"),
+        ("account=work if-stalled", "if-stalled"),
+        ("if-stalled account-auto", "account-auto"),
+        ("account-auto if-stalled", "if-stalled"),
+        ("account=", "account="),
+        ("account=a/b", "account=a/b"),
+        ("account=a:b", "account=a:b"),
+        ("account-auto=work", "account-auto=work"),
+        ("account", "account"),
+    ] {
+        assert_eq!(
+            parse(bad),
+            Err(format!("ERR bad restart argument: {word}\n")),
+            "{bad}"
+        );
+    }
+}
+
+/// A published snapshot of tab `sid`'s self-claimed codex-alab `pid` started at `start`, with
+/// the shell `shell` under it.
+fn publish_codex(sid: &str, pid: u32, start: &str, shell: u32) {
+    let copy = aterm_agent::harness::self_claimed::Copy {
+        lifetime: None,
+        pid,
+        start: start.to_string(),
+        home: std::path::PathBuf::from("/u/.codex"),
+        seen: aterm_agent::harness::self_claimed::Seen::Removed,
+        resume: Ok(aterm_agent::harness::self_claimed::Resume {
+            argv: vec!["/opt/codex/bin/codex".to_string()],
+            session: "0badf00d-1111-2222-3333-444455556666".to_string(),
+            codex_home: None,
+            codex_auth_path: None,
+            cwd: None,
+        }),
+    };
+    let resume = copy.resume.clone().expect("a line");
+    let snap = aterm_agent::harness::relaunch::snapshot_of_copy(sid, &copy, &resume, shell, None);
+    crate::harness_host::publish_snapshot_for_test(sid, Some(&snap));
+}
+
+/// THE ACCOUNT FENCE REFUSES IN ITS ORDER, AFTER THE ACT'S OWN FENCES ([`account_fence`]): a
+/// judgement of another process, or none, is `account-unread`; a process the tab holds no
+/// validated self-claim copy of is `account-unmanaged`; a session with no shell under it is
+/// `account-not-resumable`; then the pool's own word; then a standing restart of the process
+/// that names another destination, or none, is `account-restart-pending`. CONTROLS: with each of
+/// those in order the ask passes, and it joins a standing stamp that names the same account.
+#[test]
+fn an_account_ask_is_refused_in_the_order_of_its_fences() {
+    let ctx = crate::session_store::test_handle_on(7741, -1).ctx;
+    let sid = ctx.self_id.as_str().to_string();
+    let (pid, start) = (0x3fff_ff21_u32, "t");
+    let work = Wanted::Row("work".to_string());
+    let judged = |copied: bool, refusal: Option<&'static str>| Judged {
+        pid,
+        start: start.to_string(),
+        copied,
+        refusal,
+    };
+    let stamp = |wanted: Option<Wanted>| Stamp {
+        pid,
+        start: start.to_string(),
+        cause: Cause::Asked,
+        at: 1,
+        wanted,
+        input: None,
+    };
+    let fence = |judged: Option<&Judged>, standing: Option<&Stamp>| {
+        account_fence(&ctx, (pid, start), &work, judged, standing)
+    };
+    publish_codex(&sid, pid, start, 1);
+    let ok = judged(true, None);
+    assert_eq!(fence(Some(&ok), None), None, "CONTROL: nothing refuses it");
+    assert_eq!(fence(None, None), Some(accounts_pool::MOVE_UNREAD));
+    let other = Judged {
+        start: "u".to_string(),
+        ..ok.clone()
+    };
+    assert_eq!(
+        fence(Some(&other), None),
+        Some(accounts_pool::MOVE_UNREAD),
+        "the judgement was of another process"
+    );
+    let limited = Some(accounts_pool::MOVE_LIMITED);
+    assert_eq!(
+        fence(Some(&judged(false, limited)), None),
+        Some(accounts_pool::MOVE_UNMANAGED),
+        "no validated copy comes before the pool's word"
+    );
+    publish_codex(&sid, pid, start, aterm_agent::harness::relaunch::NO_SHELL);
+    assert_eq!(
+        fence(Some(&judged(true, limited)), None),
+        Some(ACCOUNT_NOT_RESUMABLE),
+        "no shell comes before the pool's word"
+    );
+    publish_codex(&sid, pid + 1, start, 1);
+    assert_eq!(
+        fence(Some(&ok), None),
+        Some(ACCOUNT_NOT_RESUMABLE),
+        "the host's snapshot is of another process"
+    );
+    publish_codex(&sid, pid, start, 1);
+    assert_eq!(fence(Some(&judged(true, limited)), None), limited);
+    assert_eq!(
+        fence(Some(&judged(true, limited)), Some(&stamp(None))),
+        limited,
+        "the pool's word comes before a standing restart"
+    );
+    assert_eq!(
+        fence(Some(&ok), Some(&stamp(None))),
+        Some(ACCOUNT_RESTART_PENDING),
+        "a plain restart stands"
+    );
+    assert_eq!(
+        fence(Some(&ok), Some(&stamp(Some(Wanted::Pool)))),
+        Some(ACCOUNT_RESTART_PENDING),
+        "a restart for another destination stands"
+    );
+    assert_eq!(
+        fence(Some(&ok), Some(&stamp(Some(work.clone())))),
+        None,
+        "CONTROL: a restart for the same account is joined"
+    );
+    crate::harness_host::publish_snapshot_for_test(&sid, None);
+}
+
+/// A JUDGEMENT THAT DOES NOT ANSWER IN TIME IS NO ANSWER ([`bounded`]): the wait is bounded, so
+/// a pool whose files hang holds no ask, and no more than [`ACCOUNT_JUDGES`] such reads wait at
+/// once: one more is answered at once. CONTROLS: one that answers is its answer, and a slot
+/// freed by an answer is taken again.
+#[test]
+fn an_account_judgement_is_waited_for_only_so_long() {
+    static RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let brief = Duration::from_millis(50);
+    let long = aterm_spec::wait::MUST_HAPPEN;
+    assert_eq!(
+        bounded_among(&RUNNING, long, || 7),
+        Some(7),
+        "CONTROL: an answer in time"
+    );
+    let (release, held) = std::sync::mpsc::channel::<()>();
+    let held = Arc::new(std::sync::Mutex::new(held));
+    let hang = || {
+        let held = Arc::clone(&held);
+        move || held.lock().unwrap().recv().is_ok()
+    };
+    for n in 0..ACCOUNT_JUDGES {
+        let began = Instant::now();
+        assert_eq!(bounded_among(&RUNNING, brief, hang()), None, "no answer");
+        assert!(began.elapsed() >= brief, "judgement {n} was waited for");
+        assert!(
+            began.elapsed() < long,
+            "and for no longer than it was told: {:?}",
+            began.elapsed()
+        );
+    }
+    let began = Instant::now();
+    assert_eq!(
+        bounded_among(&RUNNING, long, hang()),
+        None,
+        "one more than may wait"
+    );
+    assert!(
+        began.elapsed() < long,
+        "it is answered at once, not waited for: {:?}",
+        began.elapsed()
+    );
+    drop(release);
+    let answered = aterm_spec::wait::within(long, Duration::from_millis(5), || {
+        bounded_among(&RUNNING, long, || 7)
+    });
+    assert_eq!(answered, Some(7), "CONTROL: a freed slot is taken again");
 }

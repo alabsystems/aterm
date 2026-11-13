@@ -48,8 +48,8 @@ fn lab(paths: &Paths) -> Result<(att::View, LabView)> {
     let view = Handle::at(paths.clone(), &att::REGISTRY).view()?;
     let empty = crate::typed::owned::OwnedRead::default();
     let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
-    let lab = LabView::read(
-        &view.cells,
+    let lab = LabView::read_view(
+        &view,
         owned(registry::MACHINE_FACTS.name),
         owned(registry::MAILBOX_OBS.name),
         None,
@@ -133,11 +133,15 @@ pub(super) fn machine_named(lab: &LabView, name: &str) -> Option<String> {
         .values()
         .filter(|m| m.label.as_deref() == Some(&wanted) || m.aliases.contains(&wanted))
         .collect();
-    let live: Vec<_> = found.iter().copied().filter(|m| m.live).collect();
-    match (live.as_slice(), found.as_slice()) {
-        ([m], _) | ([], [m]) => Some(m.pk.clone()),
-        _ => None,
-    }
+    let priority = |machine: &crate::alab::view::Machine| {
+        (machine.live, machine.label.as_deref() == Some(&wanted))
+    };
+    let best = found.iter().map(|machine| priority(machine)).max()?;
+    let mut matches = found
+        .into_iter()
+        .filter(|machine| priority(machine) == best);
+    let first = matches.next()?;
+    matches.next().is_none().then(|| first.pk.clone())
 }
 
 fn text(row: &cell::Row, column: &str) -> Value {

@@ -1267,14 +1267,14 @@ fn a_cut_command_line_keeps_its_file() {
             "less -R +1200 CHANGELOG.md",
         ),
         (
-            r"code --wait C:\Users\m6-an\aterm-winperfect\SPECS.md",
+            r"code --wait C:\Users\m6-an\aterm-winperfect\NOTES.md",
             32,
-            r"code … aterm-winperfect\SPECS.md",
+            r"code … aterm-winperfect\NOTES.md",
         ),
         (
-            r"code --wait C:\Users\m6-an\aterm-winperfect\SPECS.md",
+            r"code --wait C:\Users\m6-an\aterm-winperfect\NOTES.md",
             30,
-            "code --wait … SPECS.md",
+            "code --wait … NOTES.md",
         ),
         ("tail -f /var/log/syslog/", 14, "tail … syslog/"),
     ] {

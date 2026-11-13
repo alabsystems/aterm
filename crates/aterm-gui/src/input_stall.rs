@@ -442,6 +442,17 @@ pub(crate) fn pid_cpu_ns(pid: libc::pid_t) -> Option<u64> {
     u64::try_from(ticks.saturating_mul(1_000_000_000) / hz).ok()
 }
 
+/// `pid`'s major page faults, the ones that read a page in from backing store (`majflt`,
+/// `/proc/<pid>/stat`'s 12th field).
+#[cfg(target_os = "linux")]
+pub(crate) fn pid_major_faults(pid: libc::pid_t) -> Option<u64> {
+    linux_proc_stat_after_comm(pid)?
+        .split_whitespace()
+        .nth(9)?
+        .parse()
+        .ok()
+}
+
 /// The attention owner the server writes a stall under (`meta attention_owner= aterm`).
 pub(crate) const SERVER_ATTENTION_OWNER: &str = "aterm";
 

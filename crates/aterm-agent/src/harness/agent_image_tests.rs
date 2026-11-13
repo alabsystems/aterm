@@ -273,3 +273,31 @@ fn the_act_words_are_its_enumeration() {
     let proofs: Vec<&str> = Proof::ALL.into_iter().map(Proof::word).collect();
     assert_eq!(proofs, ["layout", "team", "seam"]);
 }
+
+/// Each lane reads back from its word, and no two share one; the gate withholds a write from an
+/// observed agent unless its lane is exempt, an unnamed one included, and from no confirmed
+/// agent or foreground that is no agent; and its refusal reads as one, bare or as a client says
+/// it. NEGATIVE CONTROL (run): with `withholds` passing an unnamed lane, the `None` row passes.
+#[test]
+fn the_gate_withholds_an_observed_agents_write_unless_its_lane_is_exempt() {
+    let words: std::collections::BTreeSet<&str> = Lane::ALL.into_iter().map(Lane::word).collect();
+    assert_eq!(words.len(), Lane::ALL.len(), "one word a lane");
+    for lane in Lane::ALL {
+        assert_eq!(Lane::of_word(lane.word()), Some(lane));
+    }
+    assert_eq!(Lane::of_word("disk"), None);
+    let lanes = std::iter::once(None).chain(Lane::ALL.map(Some));
+    for lane in lanes {
+        assert_eq!(
+            withholds(Some(Act::Observe), lane),
+            !lane.is_some_and(Lane::exempt),
+            "{lane:?}"
+        );
+        assert!(!withholds(Some(Act::On), lane), "{lane:?}");
+        assert!(!withholds(None, lane), "{lane:?}");
+    }
+    assert!(observe_refused(OBSERVE_REFUSAL));
+    assert!(observe_refused(&format!("aterm-ctl: {OBSERVE_REFUSAL}\n")));
+    assert!(!observe_refused("ERR busy sink"));
+    assert!(!observe_refused("OK"));
+}

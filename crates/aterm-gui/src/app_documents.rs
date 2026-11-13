@@ -341,7 +341,7 @@ enum NativeDocumentJob {
         document: DocumentId,
         path: std::path::PathBuf,
         key: crate::native_document_io::JournalDocumentKey,
-        plan: crate::native_document_io::JournalAppendPlan,
+        plan: crate::native_document_journal::JournalAppendPlan,
         proxy: aterm_window::event_loop::EventLoopProxy<crate::Wake>,
     },
     JournalRewrite {
@@ -418,7 +418,7 @@ pub(crate) struct HeldJournalAppend {
     pub(crate) document: DocumentId,
     path: std::path::PathBuf,
     key: crate::native_document_io::JournalDocumentKey,
-    pub(crate) plan: crate::native_document_io::JournalAppendPlan,
+    pub(crate) plan: crate::native_document_journal::JournalAppendPlan,
 }
 
 /// A re-seat the headless test seam held back from inline execution.
@@ -2373,7 +2373,7 @@ impl App {
         }
     }
 
-    /// Drive every journal owing work nothing is doing (a re-seat, or a head a failed append left behind) before an update asks whether each unsaved draft can be carried.
+    /// Drive every journal owing work nothing is doing (a re-seat, a checkpoint, or a head a failed append left behind) before an update asks whether each unsaved draft can be carried.
     pub(crate) fn drive_owed_document_journals(&mut self) {
         let Some(journals) = self.native_documents.journals.as_ref() else {
             return;
@@ -3835,6 +3835,11 @@ impl App {
                 .collect(),
         };
         if !self.drive_document_close_plan(&plan, true)? {
+            // A real worker completes after this request returns. Retain the whole-tab
+            // intent on every member; the next completion revalidates the atomic plan.
+            for item in &plan.documents {
+                self.queue_pending_document_close(item.document, tab_id, item.views.clone(), true);
+            }
             return Ok(false);
         }
         let batch = plan
@@ -4034,82 +4039,83 @@ impl App {
                 // The handoff now owns the stable close intent and its replay.
                 continue;
             }
-            if !close.whole_tab {
-                let sole_leaf = self.windows.get(&window).and_then(|window| {
-                    window
-                        .tab_set
-                        .tabs()
-                        .iter()
-                        .position(|tab| tab.id == close.tab && tab.root.len() == 1)
-                        .map(|index| (index, window.tab_set.active_id()))
-                });
-                if let Some((index, active)) = sole_leaf {
-                    // A sibling may have closed while saving. Reuse whole-tab
-                    // recovery and last-window shutdown before detaching anything.
-                    self.close_tab_at(window, index);
-                    if self
-                        .windows
-                        .get(&window)
-                        .is_some_and(|window| window.tab_set.get(close.tab).is_some())
+            let replay_tab = self.windows.get(&window).and_then(|window| {
+                window
+                    .tab_set
+                    .tabs()
+                    .iter()
+                    .position(|tab| tab.id == close.tab && (close.whole_tab || tab.root.len() == 1))
+                    .map(|index| (index, window.tab_set.active_id()))
+            });
+            if let Some((index, active)) = replay_tab {
+                // A whole tab (or a leaf whose sibling closed while saving) must use
+                // the full close barrier again. One saved member is no authority to
+                // detach another member whose checkpoint is still outstanding.
+                self.close_tab_at(window, index);
+                if self
+                    .windows
+                    .get(&window)
+                    .is_some_and(|window| window.tab_set.get(close.tab).is_some())
+                {
+                    if let Some(active) = active
+                        && let Some(window) = self.windows.get_mut(&window)
                     {
-                        if let Some(active) = active
-                            && let Some(window) = self.windows.get_mut(&window)
-                        {
-                            window.tab_set.switch_to(active);
-                        }
-                        self.resync_active_or_window(window);
-                        deferred.push(close);
+                        window.tab_set.switch_to(active);
                     }
-                    continue;
+                    self.resync_active_or_window(window);
+                    deferred.push(close);
+                } else {
+                    self.native_documents.pending_closes.retain(|_, closes| {
+                        closes.retain(|pending| pending.tab != close.tab);
+                        !closes.is_empty()
+                    });
                 }
+                continue;
             }
             self.document_store
                 .commit_detach(document, &close.views)
                 .map_err(|error| format!("could not finish document close: {error:?}"))?;
-            if close.whole_tab {
+            for document_view in close.views {
+                let view = crate::tab_model::ViewId::from_stored(document_view.0);
+                let recovery = self.closed_view_record_for(window, close.tab, view);
                 let removed = self
                     .windows
                     .get_mut(&window)
-                    .and_then(|ws| ws.tab_set.remove(close.tab));
-                if let Some(tab) = removed {
-                    self.remove_tab_views(&tab);
-                    self.resync_active_or_window(window);
-                    self.request_native_redraw(window);
-                }
-            } else {
-                for document_view in close.views {
-                    let view = crate::tab_model::ViewId::from_stored(document_view.0);
-                    let recovery = self.closed_view_record_for(window, close.tab, view);
-                    let removed = self
-                        .windows
-                        .get_mut(&window)
-                        .and_then(|window| {
-                            let index = window
-                                .tab_set
-                                .tabs()
-                                .iter()
-                                .position(|candidate| candidate.id == close.tab)?;
-                            window.tab_set.tab_at_mut(index)
-                        })
-                        .map(|tab| tab.remove_view(view));
-                    if removed == Some(crate::tab_model::RemoveLeaf::Removed) {
-                        self.remove_view_link(view);
-                        if let Some(recovery) = recovery {
-                            self.retain_closed_view(recovery);
-                        }
+                    .and_then(|window| {
+                        let index = window
+                            .tab_set
+                            .tabs()
+                            .iter()
+                            .position(|candidate| candidate.id == close.tab)?;
+                        window.tab_set.tab_at_mut(index)
+                    })
+                    .map(|tab| tab.remove_view(view));
+                if removed == Some(crate::tab_model::RemoveLeaf::Removed) {
+                    self.remove_view_link(view);
+                    if let Some(recovery) = recovery {
+                        self.retain_closed_view(recovery);
                     }
                 }
-                self.refresh_aggregate_tab_presentation(window, close.tab);
-                self.promote_terminal_projection_if_needed(window, close.tab);
-                self.resize_panes_after_collapse(window);
-                self.resync_active_or_window(window);
-                self.request_native_redraw(window);
             }
+            self.refresh_aggregate_tab_presentation(window, close.tab);
+            self.promote_terminal_projection_if_needed(window, close.tab);
+            self.resize_panes_after_collapse(window);
+            self.resync_active_or_window(window);
+            self.request_native_redraw(window);
         }
-        if !deferred.is_empty() {
-            self.native_documents
+        for close in deferred {
+            if self.tab_window(close.tab).is_none() {
+                dropped = true;
+                continue;
+            }
+            let retained = self
+                .native_documents
                 .pending_closes
-                .insert(document, deferred);
+                .entry(document)
+                .or_default();
+            if !retained.contains(&close) {
+                retained.push(close);
+            }
         }
         if dropped {
             self.release_unprotected_documents(BTreeSet::from([document]));

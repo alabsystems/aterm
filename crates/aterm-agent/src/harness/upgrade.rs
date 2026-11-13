@@ -346,6 +346,17 @@ impl Agent {
             | aterm_phase::Program::Generic => None,
         }
     }
+
+    /// Whether the upgrade ages this agent's walls, a login wall and a usage limit, and moves
+    /// past them once they outlast their bound ([`login_holds`], [`limit_holds`]): Claude Code's
+    /// alone, the one agent whose transcript rows date its walls.
+    #[must_use]
+    pub const fn walls_age(self) -> bool {
+        match self {
+            Agent::Claude => true,
+            Agent::Codex | Agent::Agy | Agent::Muse => false,
+        }
+    }
 }
 
 /// Candidate build on which a session can be relaunched.
@@ -1817,6 +1828,174 @@ pub fn own_of(held: &[Held], screen: bool, unreadable: bool) -> Own {
     Own::Waits(waits)
 }
 
+/// The package runners whose `dev` or `serve` script [`follow_command`] reads as a development
+/// server.
+const SERVE_RUNNERS: &[&str] = &["npm", "pnpm", "yarn", "bun"];
+
+/// The scripts a [`SERVE_RUNNERS`] line runs that serve a folder.
+const SERVE_SCRIPTS: &[&str] = &["dev", "serve"];
+
+/// Whether `command`, one background command line of an agent's, only follows what stands without
+/// it, after at most one `cd` into the folder it reads:
+/// - a `tail` that follows files (`-f`, `-F`, `--follow`);
+/// - a development server: a package runner's `dev` or `serve` script ([`SERVE_RUNNERS`]),
+///   `vite`, `next dev`, or `python3 -m http.server`, with only options, numbers and addresses
+///   after it.
+///
+/// Ending one loses nothing that stands. The files it followed or served are still there, what
+/// was written while nothing followed is still in them, and the same line started again follows
+/// or serves them again. A redirect into a file, a pipe, a substitution, a glob and anything not
+/// named here are work: it refuses where unsure ([`wait_command`] for a line that only waits).
+#[must_use]
+pub fn follow_command(command: &str) -> bool {
+    if command.trim().is_empty()
+        || command.chars().count() > REARM_COMMAND_CHARS
+        || command.contains(|c: char| {
+            c.is_control()
+                || matches!(
+                    c,
+                    '\\' | '`' | '(' | '{' | '$' | '|' | ';' | '*' | '?' | '[' | '\'' | '"'
+                )
+        })
+    {
+        return false;
+    }
+    let words: Vec<&str> = command
+        .split_whitespace()
+        .filter(|w| {
+            !matches!(
+                *w,
+                "2>&1" | ">/dev/null" | "1>/dev/null" | "2>/dev/null" | "</dev/null"
+            )
+        })
+        .collect();
+    if words
+        .iter()
+        .any(|w| w.contains(['<', '>', '&']) && *w != "&&")
+    {
+        return false;
+    }
+    let words = match words.as_slice() {
+        ["cd", dir, "&&", rest @ ..] if !dir.starts_with('-') => rest,
+        all => all,
+    };
+    if words.contains(&"&&") {
+        return false;
+    }
+    // What may follow a server's words: options, ports and addresses.
+    let tail_words = |rest: &[&str]| {
+        rest.iter().all(|w| {
+            w.starts_with('-')
+                || w.chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '.' | ':'))
+        })
+    };
+    match words {
+        ["tail", rest @ ..] => tail_follows(rest),
+        [runner, "run", script, rest @ ..] | [runner, script, rest @ ..]
+            if SERVE_RUNNERS.contains(runner) && SERVE_SCRIPTS.contains(script) =>
+        {
+            tail_words(rest)
+        }
+        ["npx", "vite", rest @ ..] | ["vite", rest @ ..] => match rest {
+            ["dev" | "serve", rest @ ..] => tail_words(rest),
+            rest => tail_words(rest),
+        },
+        ["npx", "next", "dev", rest @ ..] | ["next", "dev", rest @ ..] => tail_words(rest),
+        ["python3" | "python", "-m", "http.server", rest @ ..] => tail_words(rest),
+        _ => false,
+    }
+}
+
+/// Whether `rest`, the words after `tail`, follow at least one file: a follow option, counts and
+/// files only.
+fn tail_follows(rest: &[&str]) -> bool {
+    let (mut follows, mut files) = (false, 0);
+    let mut words = rest.iter();
+    while let Some(&word) = words.next() {
+        match word {
+            "-f" | "-F" | "--follow" | "--follow=name" | "--follow=descriptor" => follows = true,
+            "-q" | "--quiet" | "--retry" => {}
+            "-n" | "-c" => {
+                let Some(count) = words.next() else {
+                    return false;
+                };
+                if !count
+                    .trim_start_matches('+')
+                    .chars()
+                    .all(|c| c.is_ascii_digit())
+                {
+                    return false;
+                }
+            }
+            _ if word.starts_with('-') => {
+                let flags = &word[1..];
+                let (letters, count) = flags
+                    .find(|c: char| c.is_ascii_digit())
+                    .map_or((flags, ""), |at| flags.split_at(at));
+                if letters.is_empty()
+                    || !letters.chars().all(|c| matches!(c, 'f' | 'F' | 'q' | 'n'))
+                    || !count.chars().all(|c| c.is_ascii_digit())
+                    || (!count.is_empty() && !letters.ends_with('n'))
+                    || letters[..letters.len() - 1].contains('n')
+                {
+                    return false;
+                }
+                // `-fn 20`: the count is the next word.
+                if letters.ends_with('n')
+                    && count.is_empty()
+                    && !words.next().is_some_and(|c| {
+                        c.trim_start_matches('+')
+                            .chars()
+                            .all(|c| c.is_ascii_digit())
+                    })
+                {
+                    return false;
+                }
+                follows |= letters.contains(['f', 'F']);
+            }
+            _ => files += 1,
+        }
+    }
+    follows && files > 0
+}
+
+/// Whether what runs under an agent (`held`, `screen` and `unreadable` as [`own_of`] reads them)
+/// is only follows ([`follow_command`]) and proved waits, at least one of them a follow. Each is
+/// a top-level shell whose command is exact; a wait has nothing under it but [`WAIT_PROGRAMS`]
+/// and shells, and a follow may run anything its line starts (a server's own processes). Ending
+/// them loses nothing that stands, so a session nothing is typed into moves over them
+/// ([`Facts::follows_only`]); anything else is work that would be lost, which holds it.
+#[must_use]
+pub fn follows_only(held: &[Held], screen: bool, unreadable: bool) -> bool {
+    if screen || unreadable {
+        return false;
+    }
+    let mut follows = false;
+    for h in held {
+        match h.seat {
+            Seat::Loose => return false,
+            Seat::Under => {}
+            Seat::Top => {
+                if !h.exact {
+                    return false;
+                }
+                if follow_command(&h.command) {
+                    follows = true;
+                    continue;
+                }
+                let quiet_under = h.under.iter().all(|n| {
+                    WAIT_PROGRAMS.contains(&n.as_str()) || BACKGROUND.contains(&n.as_str())
+                });
+                if !quiet_under || !wait_command(&h.command) {
+                    return false;
+                }
+            }
+        }
+    }
+    follows
+}
+
 pub const HELD_NAMED: usize = 5;
 
 pub const HELD_COMMAND_CHARS: usize = 160;
@@ -1991,6 +2170,9 @@ pub enum Ended<'a> {
     Waits(&'a [String]),
     /// Work, at the deadline the agent was told `told_s` ago: `list` names what still ran.
     Work { told_s: u64, list: &'a str },
+    /// Work under a session nothing was typed into, once it had held the round `held_s`
+    /// ([`Yield::Outlasted`]): `list` names what still ran.
+    Outlasted { held_s: u64, list: &'a str },
 }
 
 /// What a continuation says of what the restart `ended` ([`continue_prompt`]).
@@ -2013,18 +2195,28 @@ fn ended_says(ended: Ended<'_>) -> String {
             said.push('.');
             said
         }
-        Ended::Work { told_s, list } => {
-            let what = if list.is_empty() {
-                "what still ran inside your own process".to_string()
-            } else {
-                format!("what still ran under you: {list}")
-            };
-            format!(
-                "The restart came at the deadline aterm told you {} ago and ended {what}. \
-                 {RELAUNCH_RESTORES}",
-                span(told_s)
-            )
-        }
+        Ended::Work { told_s, list } => format!(
+            "The restart came at the deadline aterm told you {} ago and ended {}. \
+             {RELAUNCH_RESTORES}",
+            span(told_s),
+            ended_what(list)
+        ),
+        Ended::Outlasted { held_s, list } => format!(
+            "Your task had finished, so aterm typed nothing before this restart: it came once \
+             background work of yours had held the upgrade {}, and ended {}. \
+             {RELAUNCH_RESTORES}",
+            span(held_s),
+            ended_what(list)
+        ),
+    }
+}
+
+/// What still ran when a restart ended the agent's work, from its process table's `list`.
+fn ended_what(list: &str) -> String {
+    if list.is_empty() {
+        "what still ran inside your own process".to_string()
+    } else {
+        format!("what still ran under you: {list}")
     }
 }
 
@@ -3172,6 +3364,7 @@ pub struct LoginScan {
     last: Option<LoginRow>,
     walled: bool,
     lifted: Option<u64>,
+    since: Option<u64>,
 }
 
 impl LoginScan {
@@ -3192,8 +3385,11 @@ impl LoginScan {
         };
         self.last = Some(row);
         match row {
-            LoginRow::Wall => (self.walled, self.lifted) = (true, None),
-            LoginRow::Lifted if self.walled => (self.walled, self.lifted) = (false, at),
+            LoginRow::Wall if self.walled => {}
+            LoginRow::Wall => (self.walled, self.lifted, self.since) = (true, None, at),
+            LoginRow::Lifted if self.walled => {
+                (self.walled, self.lifted, self.since) = (false, at, None);
+            }
             LoginRow::Lifted => {}
         }
     }
@@ -3208,6 +3404,14 @@ impl LoginScan {
     #[must_use]
     pub const fn lifted_at(&self) -> Option<u64> {
         self.lifted
+    }
+
+    /// Returns the Unix timestamp of the first row of the login wall the transcript stands at: the
+    /// first `authentication_failed` answer since the wall last lifted, every later one the same
+    /// wall. `None` where no wall stands or that row names no time.
+    #[must_use]
+    pub fn since(&self) -> Option<u64> {
+        self.since.filter(|_| self.wall())
     }
 }
 
@@ -3475,6 +3679,12 @@ fn reset_named(v: &Value) -> Option<u64> {
         .filter(|&at| at > 0)
 }
 
+/// Returns when the usage limit `jsonl` stands at was first answered ([`StandingScan::since`]).
+#[must_use]
+pub fn transcript_limit_since(jsonl: &str) -> Option<u64> {
+    StandingScan::of(jsonl).since()
+}
+
 /// Returns whether the standing usage limit in `jsonl` is a spend or credit wall.
 #[must_use]
 pub fn transcript_limit_spend(jsonl: &str) -> bool {
@@ -3607,6 +3817,7 @@ fn standing_limit_of(v: &Value) -> Option<StandingLimit> {
 pub struct StandingScan {
     row: Option<Value>,
     continued: bool,
+    since: Option<u64>,
 }
 
 impl StandingScan {
@@ -3635,7 +3846,7 @@ impl StandingScan {
             return;
         }
         if is_login_success_row(&v) {
-            (self.row, self.continued) = (None, false);
+            (self.row, self.continued, self.since) = (None, false, None);
             return;
         }
         match v.get("type").and_then(Value::as_str) {
@@ -3647,6 +3858,9 @@ impl StandingScan {
             _ => return,
         }
         if is_limit_row(&v) {
+            if self.row.is_none() || self.since.is_none() {
+                self.since = row_time(&v);
+            }
             (self.row, self.continued) = (Some(v), false);
         } else if v
             .get("message")
@@ -3654,7 +3868,7 @@ impl StandingScan {
             .and_then(Value::as_str)
             .is_some_and(is_model_id)
         {
-            (self.row, self.continued) = (None, false);
+            (self.row, self.continued, self.since) = (None, false, None);
         }
     }
 
@@ -3672,6 +3886,15 @@ impl StandingScan {
     #[must_use]
     pub fn reset(&self) -> Option<u64> {
         self.read(reset_named)
+    }
+
+    /// Returns the Unix timestamp of the first row of the usage limit the transcript stands at:
+    /// the first limit answer since the agent last answered or a `/login` succeeded, each later
+    /// one (a retry the vendor or a continuation drew) the same limit. `None` where no limit
+    /// stands or its rows name no time.
+    #[must_use]
+    pub fn since(&self) -> Option<u64> {
+        self.row.as_ref().and(self.since)
     }
 
     /// Returns [`transcript_limit_spend`] for the scanned rows.
@@ -3773,6 +3996,8 @@ pub fn transcript_reset_line(jsonl: &str, since: u64) -> Option<String> {
 pub struct TranscriptLogin {
     pub stands: bool,
     pub lifted_at: Option<u64>,
+    /// When the wall that stands was first written ([`LoginScan::since`]).
+    pub since: Option<u64>,
     pub undelivered: Option<bool>,
 }
 
@@ -3784,9 +4009,11 @@ pub fn transcript_login(phase: &Phase, marker: &str, tail: &str) -> TranscriptLo
         Phase::Failed(why) => why == GAVE_UP,
         _ => false,
     };
+    let scan = LoginScan::of(tail);
     TranscriptLogin {
-        stands: transcript_login_wall(tail),
-        lifted_at: login_lifted_at(tail),
+        stands: scan.wall(),
+        lifted_at: scan.lifted_at(),
+        since: scan.since(),
         undelivered: (asks && !marker.is_empty())
             .then(|| notice_fate(tail, marker))
             .flatten(),
@@ -4056,6 +4283,14 @@ pub struct Facts {
     pub taskless: bool,
     pub limited: bool,
     pub login: bool,
+    /// How long the login wall ([`Self::login`]) has stood since its first transcript row or a key
+    /// of the person's after it, whichever is later ([`login_holds`]); 0 with no wall, one nothing
+    /// dates, and at a look that sees a person.
+    pub login_s: u64,
+    /// How long the usage limit ([`Self::limited`]) has stood since its first transcript row or a
+    /// key of the person's after it, whichever is later ([`limit_holds`]); 0 with no limit, one
+    /// nothing dates, and at a look that sees a person.
+    pub limit_s: u64,
     pub undelivered: bool,
     pub queued: bool,
     pub ready_s: u64,
@@ -4076,6 +4311,10 @@ pub struct Facts {
     /// Whether all that runs under the agent is background waits, each proved one and named by
     /// the command that starts it again ([`Own::Waits`]).
     pub waits_only: bool,
+    /// Whether all that runs under the agent is follows and proved waits, at least one a follow
+    /// ([`follows_only`]): ending them loses nothing that stands, so a session nothing is typed
+    /// into moves over them once they have held it [`SILENT_HOLD_S`] ([`Yield::Outlasted`]).
+    pub follows_only: bool,
     /// Whether a deadline stands for this process: a line that reached it named one
     /// ([`Step::Tell`]), about this target or an earlier one (a retarget never tells it another),
     /// and no look since has voided it ([`deadline_voids`]).
@@ -4087,7 +4326,8 @@ pub struct Facts {
     pub may_tell: bool,
     /// Whether nothing is typed into the session before a move though its autopilot carries it:
     /// its task finished or landed. No deadline is told there ([`tell_due`]); the round still
-    /// moves over proved waits and past a deadline told before ([`own_yields`]).
+    /// moves over proved waits, past a deadline told before, and over its own work once that has
+    /// held the round [`SILENT_HOLD_S`] unbroken ([`own_yields`]).
     pub silent: bool,
     pub press: Press,
 }
@@ -4478,6 +4718,80 @@ pub const MAX_TELLS: u32 = 1;
 
 const _: () = assert!(WORK_TELL_S + WORK_DEADLINE_S < RUNG_LAND_S);
 
+/// How long the agent's own follows hold a quiet round in a session nothing is typed into before
+/// a move ([`Facts::silent`]: its task finished or landed) before the round moves over them
+/// ([`Yield::Outlasted`], [`Facts::follows_only`]): the earliest a working session's told
+/// deadline would let it move, so a finished session is never moved sooner than a working one
+/// could be, nor held longer. Real work there holds the round with no bound: no line is typed to
+/// warn it, and ending it would lose what it has not finished.
+pub const SILENT_HOLD_S: u64 = WORK_TELL_S + WORK_DEADLINE_S;
+
+const _: () = assert!(SILENT_HOLD_S < RUNG_LAND_S);
+
+/// How long a login wall nobody lifts holds a round ([`login_holds`]): the bound the login lane
+/// gives an account left unused over a limit, past the longest a headless sign-in it runs may
+/// take, so a sign-in in flight ends before the upgrade moves.
+pub const LOGIN_WALL_S: u64 = crate::supervise::policy::login::OVER_LIMIT_UNUSED.as_secs();
+
+const _: () = assert!(LOGIN_WALL_S > super::login_drive::HANG.as_secs());
+
+/// Whether the login wall at look `f` holds the round: it stands, and its age ([`Facts::login_s`],
+/// 0 at a look that sees a person) is below [`LOGIN_WALL_S`]. Past that, a wall nobody at the session lifted is no
+/// person's and no work of the agent's: the round moves quietly at an idle point with nothing of
+/// the agent's own running ([`past_wall`]), and the new build starts on the same login. The
+/// window's loop, which withholds its points at a wall, offers that one to the upgrade's step
+/// alone once the upgrade's own look found the move held by the wall
+/// (`crate::supervise::IdleHost::upgrade_wall_due`).
+#[must_use]
+pub const fn login_holds(f: &Facts) -> bool {
+    f.login && f.login_s < LOGIN_WALL_S
+}
+
+/// How long a usage limit nobody lifts holds a round ([`limit_holds`]): the patience a limit's
+/// named reset already gets past its reset, and more than one ask's cycle ([`REASK_S`]), so a
+/// rate limit that lifts at its first retry never moves the session.
+pub const LIMIT_WALL_S: u64 = 60 * 60;
+
+const _: () = assert!(LIMIT_WALL_S > REASK_S);
+
+/// Whether the usage limit at look `f` holds the round: it stands, and its age ([`Facts::limit_s`],
+/// 0 at a look that sees a person) is below [`LIMIT_WALL_S`]. A session at a limit runs nothing: its turn ended on the
+/// limit's notice. Past the bound the round moves quietly at an idle point as at a login wall
+/// ([`past_wall`]); the resumed session stands at the same limit, which the window's limit lane
+/// carries on past at its reset as it would have.
+#[must_use]
+pub const fn limit_holds(f: &Facts) -> bool {
+    f.limited && f.limit_s < LIMIT_WALL_S
+}
+
+/// Whether look `f` stands at a wall each of whose parts has outlasted its bound
+/// ([`login_holds`], [`limit_holds`]): where the round moves as at an idle point ([`past_wall`]),
+/// and the one place the window's loop offers a point at a wall to the upgrade's step
+/// (`upgrade_drive::WALL_RESTART`, `crate::supervise::IdleHost::upgrade_wall_due`).
+#[must_use]
+pub const fn walls_outlasted(f: &Facts) -> bool {
+    (f.login || f.limited) && !login_holds(f) && !limit_holds(f)
+}
+
+/// The step at a wall each of whose parts (a login wall, a usage limit) has stood its bound with
+/// nobody seen ([`login_holds`], [`limit_holds`]): the quiet move (afresh where the session has no
+/// task), gated as at any idle point with the wall set aside ([`restart_gate`]: a person's keys,
+/// box, draft or hold, a queued turn, a running turn and the agent's own work still hold it), and
+/// nothing told, asked or announced into the wall.
+fn past_wall(f: &Facts) -> Step {
+    let open = Facts {
+        login: false,
+        limited: false,
+        ..f.clone()
+    };
+    match restart_gate(&open, open.owner_now && status_lags(&open)) {
+        Gate::Go if f.unnoticed => Step::Wait(NOTICE_SHOWN),
+        Gate::Go if f.taskless => Step::Fresh,
+        Gate::Go => Step::Terminate,
+        Gate::Wait(w) => Step::Wait(w),
+    }
+}
+
 pub const RETRY_BACKOFF_MAX_SHIFT: u32 = 2;
 
 /// Additional retry backoff in seconds for the `streak`-th consecutive identical failure.
@@ -4571,6 +4885,9 @@ pub fn next_step(phase: &Phase, f: &Facts, ready: bool, now_s: u64) -> Step {
             Gate::Go => Step::Rearm,
             Gate::Wait(w) => Step::Wait(w),
         };
+    }
+    if walls_outlasted(f) && matches!(phase, Phase::Pending | Phase::Announced { .. }) {
+        return past_wall(f);
     }
     if f.taskless && matches!(phase, Phase::Pending | Phase::Announced { .. }) {
         if f.limited {
@@ -4745,15 +5062,24 @@ pub enum Yield {
     Waits,
     /// The deadline the agent was told has passed.
     Deadline,
+    /// Follows under a session nothing is typed into ([`Facts::silent`], [`Facts::follows_only`]),
+    /// or a status its in-process work keeps busy, have held the round [`SILENT_HOLD_S`] unbroken,
+    /// with no deadline standing and nobody at the session.
+    Outlasted,
 }
 
 /// Whether a quiet round, in a session its autopilot carries, moves over the agent's own
 /// background work: at once where only proved waits run ([`Facts::waits_only`]), and past the
 /// deadline it was told where work does ([`Facts::work_due`]). Where no autopilot carries the
 /// session at this look ([`Facts::may_tell`] clear: the tab's Autopilot off, a guard of its
-/// loop's holding the point for a person or a manager, a lane that reads neither) nothing may be
-/// typed, so neither holds and the hold stays. Real work under a session whose task finished or
-/// landed ([`Facts::silent`]) is told no deadline, so it holds too unless one was told before.
+/// loop's holding the point for a person, a lane that reads neither) nothing may be typed, so
+/// neither holds and the hold stays (`HarnessUpgradeQuiet`'s `off`). A session whose task finished
+/// or landed ([`Facts::silent`]) is told no deadline: its follows ([`Facts::follows_only`]) yield
+/// once they have held the round [`SILENT_HOLD_S`] unbroken with nobody seen
+/// ([`Yield::Outlasted`]), a deadline told before governing while it stands, and its real work
+/// holds the round, since nothing warns it there. Nothing yields at a wall: the move past a login
+/// wall or a usage limit nobody lifts ([`login_holds`], [`limit_holds`]) goes only with nothing of
+/// the agent's own running, so it ends none (the drive voids a deadline at a wall before the step).
 #[must_use]
 #[cfg_attr(
     any(test, debug_assertions),
@@ -4764,16 +5090,39 @@ pub enum Yield {
     )
 )]
 pub fn own_yields(f: &Facts) -> Option<Yield> {
-    if !f.quiet || !f.may_tell || f.taskless {
+    if !f.quiet || !f.may_tell || f.taskless || f.limited || f.login {
         return None;
     }
     if f.waits_only {
         Some(Yield::Waits)
     } else if f.work_due {
         Some(Yield::Deadline)
+    } else if silent_due(f) {
+        Some(Yield::Outlasted)
     } else {
         None
     }
+}
+
+/// Whether something of the agent's own runs at look `f`: a break of its background work, a
+/// status other than idle, a shell under it, or waits.
+fn own_runs(f: &Facts) -> bool {
+    f.background_point || f.status != "idle" || !f.background.is_empty() || f.waits_only
+}
+
+/// Whether the agent's own follows under a session nothing is typed into ([`Facts::silent`]) have
+/// held the round past [`SILENT_HOLD_S`] with no deadline standing (a told one governs), nobody at
+/// the session and no wall. A process of its own that is no follow ([`Facts::follows_only`]) is
+/// work that would be lost, which holds the round: nothing warns it there.
+fn silent_due(f: &Facts) -> bool {
+    f.silent
+        && !f.deadline_set
+        && own_runs(f)
+        && (f.background.is_empty() || f.follows_only)
+        && !person_seen(f)
+        && !f.limited
+        && !f.login
+        && f.own_hold_s >= SILENT_HOLD_S
 }
 
 /// Whether the quiet move may go now: the session at a genuine idle point with nothing of its
@@ -4840,9 +5189,7 @@ pub fn tell_due(phase: &Phase, f: &Facts) -> bool {
     )
 )]
 pub fn deadline_voids(f: &Facts) -> bool {
-    let nothing_runs =
-        !f.background_point && f.status == "idle" && f.background.is_empty() && !f.waits_only;
-    f.deadline_set && (f.limited || f.login || person_seen(f) || nothing_runs)
+    f.deadline_set && (f.limited || f.login || person_seen(f) || !own_runs(f))
 }
 
 /// Whether a look finds a person at the session: their box, draft or hold, their keys, or a key of
@@ -5264,16 +5611,22 @@ pub fn requested_step(
         }
         Press::None | Press::Stands | Press::Acting => {}
     }
-    let step = if *request == Request::Now {
-        let now = Facts {
+    let effective = requested_facts(request, f);
+    let step = next_step(phase, &effective, ready, now_s);
+    rearm_held(request, step, target, now_s)
+}
+
+/// The facts this request's step gates on, including the owner's immediate move.
+#[must_use]
+pub fn requested_facts<'a>(request: &Request, f: &'a Facts) -> std::borrow::Cow<'a, Facts> {
+    if *request == Request::Now {
+        std::borrow::Cow::Owned(Facts {
             owner_now: true,
             ..f.clone()
-        };
-        next_step(phase, &now, ready, now_s)
+        })
     } else {
-        next_step(phase, f, ready, now_s)
-    };
-    rearm_held(request, step, target, now_s)
+        std::borrow::Cow::Borrowed(f)
+    }
 }
 
 const fn held_word(request: &Request) -> &'static str {

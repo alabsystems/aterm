@@ -201,6 +201,7 @@ fn a_registry_label_waits_for_its_local_writer() {
         &aterm_ctl::FleetAsk {
             host: Some("m42"),
             within: Duration::ZERO,
+            holder: None,
         },
     ) else {
         panic!("an expired survey cannot resolve the label");
@@ -217,6 +218,7 @@ fn a_registry_label_waits_for_its_local_writer() {
         &aterm_ctl::FleetAsk {
             host: Some("m42"),
             within: HANG,
+            holder: None,
         },
     ) else {
         panic!("the resolved label names this machine");

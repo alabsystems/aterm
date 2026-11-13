@@ -118,12 +118,13 @@ pub fn scan_holders_of(rdevs: &[u64], skip: &[u32]) -> io::Result<Vec<HolderScan
 pub fn scan_file_holders(path: &std::path::Path, skip: &[u32]) -> io::Result<HolderScan> {
     use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(path)?;
-    let dev = u32::try_from(meta.dev() & u64::from(u32::MAX)).map_err(io::Error::other)?;
-    let file = Vnode {
-        dev,
-        ino: meta.ino(),
-        rdev: 0,
-    };
+    scan_file_identity(meta.dev(), meta.ino(), skip)
+}
+
+#[cfg(target_vendor = "apple")]
+fn scan_file_identity(dev: u64, ino: u64, skip: &[u32]) -> io::Result<HolderScan> {
+    let dev = u32::try_from(dev & u64::from(u32::MAX)).map_err(io::Error::other)?;
+    let file = Vnode { dev, ino, rdev: 0 };
     Ok(scan(&[file.file_key()], Lookup::BY_FILE, skip)?
         .pop()
         .unwrap_or_default())
@@ -153,6 +154,44 @@ pub fn scan_file_holders(_path: &std::path::Path, _skip: &[u32]) -> io::Result<H
         io::ErrorKind::Unsupported,
         "the holder scan reads libproc (macOS) or /proc (Linux)",
     ))
+}
+
+/// Scan live same-UID processes for descriptors on an already-open file. The file pins its
+/// inode throughout the scan, so a rename or replacement of its pathname cannot redirect it.
+/// The observer's own descriptor is included unless its PID is in `skip`.
+/// # Errors
+/// The file's metadata or process listing cannot be read, the bounded descriptor scan fails,
+/// or the platform has no reader.
+pub fn scan_open_file_holders(file: &std::fs::File, skip: &[u32]) -> io::Result<HolderScan> {
+    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = file.metadata()?;
+        scan_file_identity(meta.dev(), meta.ino(), skip)
+    }
+    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+    {
+        let _ = (file, skip);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "the holder scan reads libproc (macOS) or /proc (Linux)",
+        ))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scan_file_identity(dev: u64, ino: u64, skip: &[u32]) -> io::Result<HolderScan> {
+    use std::os::unix::fs::MetadataExt as _;
+    let me = std::fs::metadata("/proc/self")?.uid();
+    let skip = skip.to_vec();
+    within(SCAN_DEADLINE, TABLES, HUNG, move || {
+        procfs::scan_file_holders_by_key_in(
+            std::path::Path::new(procfs::PROC),
+            me,
+            (dev, ino),
+            &skip,
+        )
+    })
 }
 
 /// Scan live same-UID processes except `skip` for a listening `AF_UNIX` socket bound at `path`, by

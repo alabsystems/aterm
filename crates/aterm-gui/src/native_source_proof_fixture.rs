@@ -291,7 +291,13 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
             }
             let until = Instant::now() + MUST_HAPPEN;
             loop {
-                if let Ok(observation) = observed_registry.observe_source_proof(&caller) {
+                let observation = observed_registry.observe_source_proof(&caller);
+                if let Err(error) = &observation {
+                    // This explicit fixture records only the closed error enum,
+                    // never identifiers, credential data or a readiness grant.
+                    eprintln!("Source qualification native: observation failed {error:?}");
+                }
+                if let Ok(observation) = observation {
                     let current_fault = fault_candidate
                         .as_ref()
                         .is_some_and(|outcome| fault::ReadyLoss::current(outcome, &observation));
@@ -330,14 +336,42 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
         .spawn(move || {
             let mut workers: Vec<(CtlStream, std::thread::JoinHandle<io::Result<bool>>)> =
                 Vec::new();
+            let completed = |worker: std::thread::JoinHandle<io::Result<bool>>| -> io::Result<()> {
+                match worker
+                    .join()
+                    .map_err(|_| failure("source fixture control worker panicked"))?
+                {
+                    Ok(_) => Ok(()),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::BrokenPipe
+                                | io::ErrorKind::ConnectionReset
+                                | io::ErrorKind::ConnectionAborted
+                                | io::ErrorKind::UnexpectedEof
+                        ) =>
+                    {
+                        // The connection scope still performs actual native EOF
+                        // cleanup. A lost reply is never a Closed receipt, and
+                        // the listener must remain available for reconciliation.
+                        eprintln!(
+                            "Source qualification native: control channel disconnected {:?}",
+                            error.kind()
+                        );
+                        Ok(())
+                    }
+                    Err(error) => {
+                        eprintln!("Source qualification native: control worker failed: {error}");
+                        Err(error)
+                    }
+                }
+            };
             while !server_stop.load(Ordering::Acquire) {
                 let mut index = 0;
                 while index < workers.len() {
                     if workers[index].1.is_finished() {
                         let (_, worker) = workers.swap_remove(index);
-                        worker
-                            .join()
-                            .map_err(|_| failure("source fixture control worker panicked"))??;
+                        completed(worker)?;
                     } else {
                         index += 1;
                     }
@@ -370,9 +404,7 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
             }
             for (stream, worker) in workers {
                 let _ = stream.shutdown(std::net::Shutdown::Both);
-                worker
-                    .join()
-                    .map_err(|_| failure("source fixture control worker panicked"))??;
+                completed(worker)?;
             }
             Ok::<_, io::Error>(())
         })
@@ -583,6 +615,9 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
                 }
                 next_retry = Instant::now() + Duration::from_millis(200);
             }
+            if server.is_finished() {
+                return Err("source fixture control server ended while SDK was running".into());
+            }
             if let Some(status) = child
                 .try_wait()
                 .map_err(|_| "source proof child wait failed")?
@@ -601,6 +636,20 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
         }
         let trace = trace.lock().unwrap_or_else(|p| p.into_inner());
         if !trace.ready_seen || !trace.closed_seen || pending.is_some() {
+            eprintln!(
+                "Source qualification native: final ready={} closed={} closed_receipts={} issued={:?} members={:?} highwater={:?} unresolved={:?} custody={:?} active={:?} pending={:?} ending={:?}",
+                trace.ready_seen,
+                trace.closed_seen,
+                trace.closed_members.len(),
+                trace.last.as_ref().map(|last| last.issued),
+                trace.last.as_ref().map(|last| last.members),
+                trace.last.as_ref().map(|last| last.member_highwater),
+                trace.last.as_ref().map(|last| last.unresolved),
+                trace.last.as_ref().map(|last| last.unsettled_custody),
+                trace.last.as_ref().map(|last| last.active_uses),
+                trace.last.as_ref().map(|last| last.pending_uses),
+                trace.last.as_ref().map(|last| last.ending_uses),
+            );
             return Err("source proof did not observe native Ready and explicit Closed".into());
         }
         Ok(())
@@ -609,7 +658,10 @@ pub fn run_native_source_proof_fixture(frame: String) -> Result<(), String> {
     let served = server
         .join()
         .map_err(|_| "source fixture server panicked")?
-        .map_err(|_| "source fixture server failed".to_owned());
+        .map_err(|error| format!("source fixture server failed: {error}"));
+    if let Err(error) = &served {
+        eprintln!("Source qualification native: {error}");
+    }
     drop((context, launch, pty));
     result?;
     served

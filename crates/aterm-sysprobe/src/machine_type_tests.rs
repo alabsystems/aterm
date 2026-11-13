@@ -214,6 +214,24 @@ fn a_device_tree_names_the_board_by_its_model() {
     assert_eq!(device_tree_type(None, None), MachineType::default());
 }
 
+/// QEMU's `virt` board, booted on its device tree, writes its `compatible` identifier as its
+/// model: that names no machine, so the DMI table is read instead, and the identifier stays.
+#[test]
+fn a_device_tree_model_in_the_compatible_form_names_no_board() {
+    let virt = device_tree_type(Some("linux,dummy-virt\0"), Some("linux,dummy-virt\0"));
+    assert_eq!(named(&virt), None);
+    assert_eq!(virt.model_id.as_deref(), Some("linux,dummy-virt"));
+    for (field, compatible) in [
+        ("linux,dummy-virt", true),
+        (" raspberrypi,5-model-b\n", true),
+        ("Raspberry Pi 5 Model B Rev 1.0", false),
+        ("ThinkPad X1 Carbon, Gen 9", false),
+        ("dummy-virt", false),
+    ] {
+        assert_eq!(is_compatible(field), compatible, "{field:?}");
+    }
+}
+
 /// A Linux tree is read through the device tree first and the DMI table after, from the files
 /// the kernel writes (`/proc/device-tree`, `/sys/class/dmi/id`, each with its newline).
 #[test]

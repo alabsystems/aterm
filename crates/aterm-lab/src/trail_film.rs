@@ -74,13 +74,14 @@ pub const POSE_MS: u64 = 100;
 /// A fall, then a rise, of the pet's alpha by this much or more is a blink.
 pub const ALPHA_DIP: u8 = 26;
 /// A line's pixel is vivid at this chroma (its greatest channel less its least, of 255) or more. The flagship's
-/// rail under an open row, the line this reading asks for on every row, reads a median of 195 to 209 and a tenth
-/// of its pixels under 143 to 155 on its four pixel rows, dark and GitHub Light; the dim foot band it left on a
-/// row with letters under it read a median of 62 to 130.
+/// rail under an open row, the line this reading asks for on every row, reads a median of 188 to 207 and a tenth
+/// of its pixels under 151 to 173 on its four pixel rows, dark and GitHub Light (the typing scene, bar caret); the
+/// dim foot band it left on a row with letters under it read a median of 62 to 130.
 pub const LINE_CHROMA: u8 = 140;
-/// ...and at a relative luminance within this: the rail's ink is solved to 0.20 to 0.54, and its pixels under an
-/// open row read 0.16 to 0.47 on the dark page and 0.22 to 0.57 on GitHub Light's. The foot band read 0.02 to 0.07
-/// on dark (a median, row by row) and 0.68 to 0.75 on GitHub Light.
+/// ...and at a relative luminance within this: the rail's ink is solved to 0.20 to 0.54 on a dark page and 0.14 to
+/// 0.54 on paper, and its pixels under an open row read 0.12 to 0.44 on the dark page and 0.16 to 0.59 on GitHub
+/// Light's (a twentieth of them under, a twentieth over). The foot band read 0.02 to 0.07 on dark (a median, row
+/// by row) and 0.68 to 0.75 on GitHub Light.
 pub const LINE_LUMA: (f64, f64) = (0.12, 0.60);
 /// A cell has a line under it when half its pixel columns or more hold this many vivid pixels, one over the
 /// other, that the effects drew (they differ from the clean twin's): a line a pixel thick is a hairline.
@@ -227,7 +228,9 @@ FLASH     every pixel of every frame, by WCAG 2.3.1: a flash is a pair of opposi
           icon_* and trail_* are the same count apart by place, and a place is a box, not what drew the pixel:
           a pixel is the trail's own when fewer than half its turns fell in the pet's drawn box, the caret's
           cell or a word icon's box (sparkle words are on, as in the app), else it is the place's that held
-          the most of them. Trail light under a pet that stands on it counts as the pet's; trail_worst's
+          the most of them. The pet's box holds a turn on the frame it held the pixel and on the frame after,
+          when the pixel goes back to the page as the pet moves on; the caret's cell and an icon's box hold
+          their own frame's turns alone. Trail light under a pet that stands on it counts as the pet's; trail_worst's
           layers say what the census made of the pixel. Two readings are not the law:
           lightness_* counts the same turns in CIE L* (a swing of 10, no ceiling), which a dark page's lights
           reach and the law's tenth of linear light does not; twin_* is the earlier scratch probe's count (rises of
@@ -455,7 +458,10 @@ pub type Boxes = (Vec<Span>, Option<PxBox>, Vec<Span>);
 /// word icon's box. The pixel is the trail's own only when those together are fewer than half: a pixel the pet
 /// crossed on three turns and the caret on two of seven is not the trail's, though neither box alone held half.
 /// Otherwise it is the place's that held the most (the earlier of [`PLACES`] on a tie). A box is a sprite's
-/// bounds, so the trail under a pet that stands on it counts as the pet's while it stands there.
+/// bounds, so the trail under a pet that stands on it counts as the pet's while it stands there. A body's box
+/// also holds the turns on the frame after it held the pixel (`step_ms` on): a sprite that moves off a pixel
+/// turns it on the first frame its box no longer holds it, the cat's coat giving way to the page. The caret's
+/// cell and an icon's box are held on their own frame alone.
 #[must_use]
 pub fn by_place(
     turns: &HashMap<u32, Vec<u32>>,
@@ -480,7 +486,11 @@ pub fn by_place(
             let Some((bodies, cell, icons)) = boxes.get(t) else {
                 continue;
             };
-            if within(bodies) {
+            let left = t
+                .checked_sub(step_ms)
+                .and_then(|was| boxes.get(&was))
+                .is_some_and(|(before, _, _)| within(before));
+            if within(bodies) || left {
                 held[0] += 1;
             } else if cell.is_some_and(|c| c.holds(x, y)) {
                 held[1] += 1;

@@ -1529,6 +1529,7 @@ fn a_read_only_copy_admits_no_act() {
     let holder = format!("codex-alab@{}", stand_in());
     let copy = Copy {
         pid: proven.pid,
+        lifetime: None,
         start: proven.start.clone(),
         home: "/private/tmp/x/codex-home".into(),
         seen: Seen::Present(Record {
@@ -1639,6 +1640,7 @@ fn a_closed_tab_takes_its_read_only_copy_with_it() {
     let now = crate::metrics::now_us;
     let copy = |status: &str| Copy {
         pid: proven.pid,
+        lifetime: None,
         start: proven.start.clone(),
         home: "/private/tmp/x/codex-home".into(),
         seen: Seen::Present(Record {
@@ -3165,7 +3167,7 @@ fn a_land_hold_told_before_a_lapse_never_comes_back_with_the_next_claim() {
 }
 
 /// The `owner=needs` entry a codex-alab sets for three needs, as it sets it.
-const NEEDS_ENTRY: &str = "Codex needs you: the release credential to sign 0.48.0 (+2 more) \u{2014} \
+const NEEDS_ENTRY: &str = "Codex needs you: the release permission to sign 0.48.0 (+2 more) \u{2014} \
                            carrying on";
 
 /// [`NEEDS_ENTRY`] percent-encoded, as `meta set harness_needs entry=` carries it.

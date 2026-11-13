@@ -511,6 +511,21 @@ fn rows_show_now_and_wanted_and_at_most_one_chip() {
             wanted: "On".into()
         }
     );
+
+    let spotlight = Subject::Setting(Setting::Spotlight);
+    let mut pending = with_readings(Selection::all(), vec![Observation::unknown(spotlight)]);
+    pending.observing = vec![(spotlight, None, false)];
+    let unread = row_view(spotlight, &pending, Selection::all());
+    assert!(!unread.label.contains("as last read"));
+    assert!(!unread.label.contains("again"));
+    assert_eq!(unread.value, RowValue::One("—".into()));
+
+    pending.observed =
+        vec![reading(spotlight, Standing::InPlace, Some("Kept out")).stamped(1_700_000_000)];
+    let checking = row_view(spotlight, &pending, Selection::all());
+    assert_eq!(checking.value, RowValue::LastKnown("Kept out".into()));
+    assert!(checking.label.contains("as last read"));
+    assert_eq!(checking.standing, Some(Standing::Unknown));
 }
 
 /// A row changed since aterm set it (init design §6.6) reads as it is now, under "Changed since
@@ -4505,6 +4520,23 @@ fn the_headline_and_the_progress_reach_a_screen_reader_in_words() {
         assert_eq!(progress.numeric_value(), Some(10.0), "{width}");
         assert_eq!(progress.max_numeric_value(), Some(15.0), "{width}");
     }
+
+    let dock = Subject::Setting(Setting::Dock);
+    let spotlight = Subject::Setting(Setting::Spotlight);
+    let mut cold = with_readings(Selection::all(), vec![Observation::unknown(spotlight)]);
+    cold.last_known = vec![reading(dock, Standing::InPlace, Some("Retained Dock"))];
+    cold.observing = vec![(spotlight, None, false), (dock, None, false)];
+    let mut page = page_reading(&cold);
+    let hero = hero_of(&page);
+    assert_eq!((hero.done, hero.total), (0, 0));
+    assert!(!page.headline().set_up);
+    cold.observed
+        .push(reading(dock, Standing::InPlace, Some("Current Dock")).stamped(1_700_000_000));
+    cold.observing.retain(|(subject, _, _)| *subject != dock);
+    page.publish(cold);
+    let hero = hero_of(&page);
+    assert_eq!(hero.done, 1);
+    assert!(hero.total > hero.done);
 }
 
 #[test]
@@ -5875,7 +5907,7 @@ fn every_failure_kind_signals_alike_in_the_headline_the_row_the_line_the_menu_an
 
     // Needs a person: never waiting, never retried, said at once.
     for retrying in [false, true] {
-        let mut sign_in = status_of("github-sign-in");
+        let mut sign_in = status_of("github-account");
         sign_in.retrying = retrying;
         assert_eq!(
             signals(&sign_in, repositories),
@@ -5883,13 +5915,13 @@ fn every_failure_kind_signals_alike_in_the_headline_the_row_the_line_the_menu_an
             "retrying {retrying}"
         );
         let line = crate::system_state_access::menu_line(&sign_in).unwrap();
-        assert_eq!(line.note.as_deref(), Some(GITHUB_TOKEN_REFUSED));
+        assert_eq!(line.note.as_deref(), Some(GITHUB_OTHER_ACCOUNT));
         let row = row_view(repositories, &sign_in, Selection::all());
-        // The row says who renews the token and the line they run (§3.6).
+        // The row says the setting's remedy (§3.6).
         assert_eq!(
             (row.note.as_deref(), &row.value),
             (
-                Some(GITHUB_TOKEN_RENEW_NOTE),
+                Some(GITHUB_OTHER_ACCOUNT),
                 &RowValue::Change {
                     now: "Needs sign-in".into(),
                     wanted: Setting::Repositories.wanted().into(),
@@ -7297,37 +7329,6 @@ fn each_phrase_outcome_has_its_own_words_and_only_a_spent_phrase_empties_the_fie
     try_with(&mut app, &mut view, PhraseOutcome::Stopped);
     assert_eq!(app.phrase_help(), PHRASE_STOPPED);
     assert_eq!(typed(&app), "river stone lamp", "the words stay");
-}
-
-/// GitHub refusing the vault's token says who renews it (any member can) and the exact
-/// line they run, which the row's Copy Command puts on the clipboard (§3.6).
-#[test]
-fn a_refused_github_token_says_who_renews_it_and_copies_the_line() {
-    let repositories = Subject::Setting(Setting::Repositories);
-    let status = status_of("github-sign-in");
-    let plan = status.plan.clone().unwrap();
-    let row = row_view(repositories, &status, plan.selection);
-    let note = row.note.clone().unwrap();
-    assert!(note.contains("any member of the vault"), "{note}");
-    assert!(
-        note.ends_with(aterm_types::macos_setup::GITHUB_TOKEN_COMMAND),
-        "{note}"
-    );
-    assert!(row.copy_command);
-    let mut app = SystemStateApp::new(plan);
-    app.publish(status);
-    let compiled = compile(&app, &SystemStateViewState::default(), 999.0, 4000.0);
-    assert_eq!(label(&compiled, COPY_TOKEN_COMMAND), "Copy Command");
-    act(&mut app, COPY_TOKEN_COMMAND);
-    assert!(matches!(
-        app.actions.pop_front(),
-        Some(SystemStateAction::CopyCommand { command, .. })
-            if command == aterm_types::macos_setup::GITHUB_TOKEN_COMMAND
-    ));
-    // CONTROL: a row that needs a person for anything else has no Copy Command.
-    let tools = status_of("clt-missing");
-    let tools_plan = tools.plan.clone().unwrap();
-    assert!(!row_view(repositories, &tools, tools_plan.selection).copy_command);
 }
 
 /// A setting that changed since aterm set it is left as it is (init-on-by-default design

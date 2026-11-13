@@ -193,7 +193,7 @@ fn a_slow_relaunch_read_never_holds_the_step_after_an_act() {
                 if let Some(held) = &held {
                     held.hold();
                 }
-                "current".to_string()
+                UpgradeStep::unknown("current")
             });
         }
     };

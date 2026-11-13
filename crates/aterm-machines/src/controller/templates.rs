@@ -14,9 +14,9 @@ schema = 1
 # Hosts reached at once by plan, apply, run and rekey.
 parallel = 8
 
-# The GitHub machine user the hosts' keys are registered with (design §7). Create the
-# account, uncomment this, then `aterm machines github login` keeps its token (one with
-# the admin:public_key scope) in keys/github_token (0600), never the login keychain.
+# The GitHub machine user the hosts' keys are registered with (design §7). Its token (one
+# with the admin:public_key scope) is read from keys/github_token (0600), never the login
+# keychain.
 # [github]
 # account = "your-lab-bot"
 "#;

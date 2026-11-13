@@ -212,6 +212,7 @@ impl Grid {
         self.force_selection_invalidation();
         self.storage.damage = Damage::Full;
         self.storage.content_gen += 1;
+        self.storage.history_content_gen += 1;
         pull
     }
 

@@ -5721,6 +5721,7 @@ fn an_owners_word_kept_out_by_a_sweep_exits_75_and_writes_nothing() {
 #[test]
 fn a_dry_run_line_says_how_long_behind_and_how_long_waiting() {
     let report = super::super::upgrade_drive::Report {
+        rung: None,
         pid: 4205,
         tab: "s-b5cf".to_string(),
         session: "03396a15".to_string(),
@@ -13208,7 +13209,7 @@ fn person_agy(
     crate::harness::stand_in::proven(
         &program,
         &format!(
-            "printf '%s' \"$SSH_CONNECTION\" > \"$0.ran\"\ncat '{}'",
+            "printf '%s' \"$SSH_CONNECTION\" > \"$0.ran\"\n/bin/cat '{}'",
             doc.display()
         ),
     );

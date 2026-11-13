@@ -102,11 +102,20 @@ fn a_standby_server_waits_for_its_applied_records() {
     assert_eq!(eligible(), Ok("m7".to_owned()));
     let healthy = load_state(&lab.m7).unwrap();
     assert!(healthy.records_digest.is_some());
+    // A fresh setup waits for the active apply, and judges nothing past one that outlasts the
+    // wait: a vault pass's hold is not unavailable membership evidence.
+    let mut applying = Some(StateLock::take(&lab.m7).unwrap());
+    let (waited, tries) = test_while_state_lock_held(move || drop(applying.take()), eligible);
+    assert_eq!(waited, Ok("m7".to_owned()));
+    assert!(tries >= 1, "the check met the apply and waited");
     {
         let _applying = StateLock::take(&lab.m7).unwrap();
-        assert!(
-            eligible().is_err(),
-            "a fresh setup waits for the active apply"
+        let outlasted = with_current_wait(Duration::from_millis(50), || {
+            steward::check_standby_eligibility(&lab.m7, None)
+        });
+        assert_eq!(
+            outlasted.map_err(|error| error.kind()),
+            Err(crate::ErrorKind::VaultBusy)
         );
     }
     let mut failed = healthy.clone();
@@ -125,6 +134,38 @@ fn a_standby_server_waits_for_its_applied_records() {
     );
     save_records(&lab.m7, &records).unwrap();
     assert_eq!(eligible(), Ok("m7".to_owned()));
+    envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
+    lab.server.stop();
+}
+
+/// Off macOS an eligible member gets no member server: nothing finds one or feeds it there
+/// (`steward::MEMBER_SERVER_FOUND`), and the step had installed one advertising the member's label
+/// that held no vault for good. Its probe and apply idle, and say why.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn off_macos_an_eligible_member_gets_no_member_server() {
+    let _answering = ServersAnswering::set();
+    let lab = log_entries_tests::two_macs(&[]);
+    let config = configured(&lab.m7).unwrap();
+    envelope::TEST_RETIRED.with(|cell| {
+        *cell.borrow_mut() = Some(Retired {
+            keys: Vec::new(),
+            current: config.signer,
+        });
+    });
+    assert_eq!(
+        steward::check_standby_eligibility(&lab.m7, None).unwrap(),
+        Ok("m7".to_owned()),
+        "the member is eligible"
+    );
+    let idles = |outcome: StewardStandbyServer| {
+        assert!(
+            matches!(&outcome, StewardStandbyServer::Idle(why) if why.contains("macOS only")),
+            "{outcome:?}"
+        );
+    };
+    idles(steward::steward_standby_server_check(&lab.m7, None).unwrap());
+    idles(steward::steward_ensure_standby_server(&lab.m7, None).unwrap());
     envelope::TEST_RETIRED.with(|cell| *cell.borrow_mut() = None);
     lab.server.stop();
 }

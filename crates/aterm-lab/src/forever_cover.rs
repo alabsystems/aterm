@@ -633,11 +633,12 @@ pub(super) fn judge_wrote_land<'a>(
 pub(super) fn judge_wrote_cruise(seen: &Seen, done: Option<&(i64, String)>, t0: i64) -> Verdict {
     let first = seen.all_acts().first().copied();
     let before = first.map_or(seen.end_ms, |(t, _)| *t);
-    let (tr, lr) = match read_holding(seen, t0, before, W_DONE_KEY) {
+    let (tr, lr) = match read_holding(seen, t0, before, DONE_CLAIM_READ) {
         Ok(hit) => hit,
         Err(unread) => {
             return Verdict::Fail(format!(
-                "the done claim opening \"{W_DONE_KEY} …\" was never read before +{}: {unread}",
+                "the done claim opening \"{W_DONE_KEY} …\" (its last line {DONE_CLAIM_READ}) was \
+                 never read before +{}: {unread}",
                 at(t0, before)
             ));
         }
@@ -744,7 +745,7 @@ pub(super) fn judge_owner_continuation(
             crate::util::one_line(l, 120)
         ));
     }
-    let reply = reads().find(|(_, l)| idle_words(l).is_some_and(|w| w.contains(DONE_CLAIM_KEY)));
+    let reply = reads().find(|(_, l)| idle_words(l).is_some_and(|w| w.contains(DONE_CLAIM_READ)));
     let said = format!(
         "continue@v1 at +{} ({}); {}",
         at(t0, act.0),
@@ -761,7 +762,7 @@ pub(super) fn judge_owner_continuation(
         return match lost_after(seen, act.0, t0) {
             Some(lost) => Verdict::Fail(format!("{said}; its reply never read: {lost}")),
             None => Verdict::Unobserved(format!(
-                "{said}; its reply (\"{DONE_CLAIM_KEY} …\") not read{}",
+                "{said}; its reply (\"{DONE_CLAIM_KEY} … {DONE_CLAIM_READ}\") not read{}",
                 next.map_or_else(
                     || format!(" within {}", at(t0, seen.end_ms)),
                     |n| format!(" before the next act at +{}", at(t0, n))

@@ -17,18 +17,18 @@ use std::time::Duration;
 const BUDGET: Duration = Duration::from_secs(1800);
 
 /// [`checkout::git`] that cannot fetch an object lazily, the way `off` says this git keeps it
-/// from doing so ([`NoLazyFetch::git`]: `--no-lazy-fetch` where git takes it, the
+/// from doing so ([`checkout::lazy_fetch::guarded`]: `--no-lazy-fetch` where git takes it, the
 /// `GIT_NO_LAZY_FETCH` it was seen to obey where it refuses the option), with no fsmonitor, for
 /// the reads that run without [`checkout::NO_SIDE_RUNS`].
 fn local(sys: &dyn System, user: &User, path: Option<&Path>, off: NoLazyFetch) -> Cmd {
-    off.git(sys, user, path).args(["-c", "core.fsmonitor="])
+    checkout::lazy_fetch::guarded(off, sys, user, path).args(["-c", "core.fsmonitor="])
 }
 
-/// How this git keeps every read here from fetching lazily ([`NoLazyFetch::of`]), asked before
+/// How this git keeps every read here from fetching lazily ([`checkout::lazy_fetch::of`]), asked before
 /// any repository is read. The variable alone is not taken on trust: an older git ignores it
 /// silently, so a git that refuses the option must have been seen to obey it.
 fn require_local_reads(sys: &dyn System, user: &User) -> Result<NoLazyFetch, String> {
-    NoLazyFetch::of(sys, user)
+    checkout::lazy_fetch::of(sys, user)
         .map_err(|why| format!("{why}; required dependencies stay untouched"))?
         .ok_or_else(|| {
             "Git must support --no-lazy-fetch, or obey GIT_NO_LAZY_FETCH, to inspect required \

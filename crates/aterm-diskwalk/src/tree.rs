@@ -15,7 +15,8 @@ pub const HUGE_WARN: u32 = 100_000;
 /// Sizes and counts over a set of entries.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sums {
-    /// Σ allocated / link count (`du`-equivalent when hard links stay inside the root).
+    /// Σ allocated / link count (`du`-equivalent when hard links stay inside the root, up to
+    /// `links − 1` bytes of integer rounding down).
     pub alloc_fair: u64,
     /// Σ logical size (`TOTALSIZE`, `st_size`).
     pub logical: u64,

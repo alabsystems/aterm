@@ -1586,7 +1586,7 @@ fn a_git_that_neither_takes_the_option_nor_obeys_the_variable_tunes_nothing() {
         assert_eq!(
             why,
             format!(
-                "this {machine}'s git neither takes --no-lazy-fetch (git 2.44 has it) nor obeys \
+                "this {machine}'s git neither takes --no-lazy-fetch (git 2.45 has it) nor obeys \
                  GIT_NO_LAZY_FETCH (the 2.39.4 security release has it), one of which keeps \
                  aterm's reads of a clone on this {machine}"
             )
@@ -1606,7 +1606,7 @@ const VOLUME: u64 = 7;
 /// A fake git over one clone, `$HOME/trust`, as a plan, its writes and git's self-test run it, with
 /// every command it is given, in order: trust's declaration on origin's `main`, none of its keys
 /// set in any scope, no hook or filter named, its index at format 2, on [`VOLUME`]. Under
-/// [`NoLazyFetch::Variable`] it refuses `--no-lazy-fetch` as unknown (129), as a git before 2.44
+/// [`NoLazyFetch::Variable`] it refuses `--no-lazy-fetch` as unknown (129), as a git before 2.45
 /// does; under [`NoLazyFetch::Flag`] it takes it.
 fn fake_clone(off: NoLazyFetch) -> (Fake, User, PathBuf, Arc<Mutex<Vec<Cmd>>>) {
     const TIP: &str = "1111111111111111111111111111111111111111";
@@ -1678,7 +1678,7 @@ fn fake_clone(off: NoLazyFetch) -> (Fake, User, PathBuf, Arc<Mutex<Vec<Cmd>>>) {
 
 /// Every git run of a plan, its writes and git's self-test carries `GIT_NO_LAZY_FETCH`, and
 /// `--no-lazy-fetch` exactly where git takes it: under [`NoLazyFetch::Variable`] (a git before
-/// 2.44 seen to obey the variable, as Ubuntu 24.04's 2.43.0 is) no run passes the option the git
+/// 2.45 seen to obey the variable, as Ubuntu 24.04's 2.43.0 is) no run passes the option the git
 /// would refuse, and the clone is planned, tuned and self-tested as under one that takes it.
 /// NEGATIVE CONTROL: under [`NoLazyFetch::Flag`] every run passes it.
 #[test]

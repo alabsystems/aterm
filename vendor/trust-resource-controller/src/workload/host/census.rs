@@ -22,6 +22,7 @@ pub enum SourceKind {
     BuildScript,
     Inventory,
     Sample,
+    Coordinator,
 }
 impl SourceKind {
     fn number(self) -> u64 {
@@ -32,6 +33,7 @@ impl SourceKind {
             Self::BuildScript => 3,
             Self::Inventory => 4,
             Self::Sample => 5,
+            Self::Coordinator => 6,
         }
     }
     fn decode(value: u64) -> io::Result<Self> {
@@ -42,6 +44,7 @@ impl SourceKind {
             3 => Ok(Self::BuildScript),
             4 => Ok(Self::Inventory),
             5 => Ok(Self::Sample),
+            6 => Ok(Self::Coordinator),
             _ => Err(invalid()),
         }
     }
@@ -188,7 +191,11 @@ impl Reply {
                 for _ in 0..count {
                     entries.push(Entry::read(&mut d, request.root_attempt)?);
                 }
-                Self::Page(Page { request, total, entries })
+                Self::Page(Page {
+                    request,
+                    total,
+                    entries,
+                })
             }
             1 => Self::Busy { request },
             2 => Self::Refused {
@@ -237,11 +244,17 @@ fn boolean(d: &mut Decoder<'_>) -> io::Result<bool> {
 }
 impl Entry {
     fn frame(&self, root_attempt: [u8; 16], status: Status) -> StatusFrame {
-        StatusFrame { root_attempt, member_attempt: self.member_attempt, status }
+        StatusFrame {
+            root_attempt,
+            member_attempt: self.member_attempt,
+            status,
+        }
     }
     fn validate(&self) -> io::Result<()> {
         if self.member_attempt == [0; 16]
-            || self.started.is_some_and(|start| self.identity != Some(start.identity))
+            || self
+                .started
+                .is_some_and(|start| self.identity != Some(start.identity))
         {
             return Err(invalid());
         }
@@ -275,7 +288,11 @@ impl Entry {
     fn read(d: &mut Decoder<'_>, root: [u8; 16]) -> io::Result<Self> {
         let member_attempt = d.array()?;
         let kind = SourceKind::decode(d.number()?)?;
-        let identity = if boolean(d)? { Some(read_identity(d)?) } else { None };
+        let identity = if boolean(d)? {
+            Some(read_identity(d)?)
+        } else {
+            None
+        };
         let started = if boolean(d)? {
             match StatusFrame::decode(&d.frame_bytes()?, root, member_attempt)?.status {
                 Status::Started(started) => Some(started),

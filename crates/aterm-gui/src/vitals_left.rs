@@ -136,8 +136,8 @@ pub(crate) struct LeftPass {
     view: Option<Arc<LeftView>>,
 }
 
-/// The pids `jobs` names as not started for another reason than macOS's program check
-/// (translating, on a volume not proven local, or stopped or traced): each is tied to a tab by the
+/// The pids `jobs` names as not started but not as held at macOS's program check (translating,
+/// with nothing read to say why, or stopped or traced): each is tied to a tab by the
 /// same W-session rule as a held one, though only a held one reads held to the leftover reader.
 fn unstarted_of(jobs: &JobsView) -> BTreeSet<u32> {
     let f = &jobs.findings;
@@ -201,7 +201,7 @@ impl LeftPass {
         if !due {
             return;
         }
-        if let Ok(list) = aterm_uds::runs::read_records(dir) {
+        if let Ok(list) = aterm_uds::runs::read_records(dir, (self.readers.boot)().as_deref()) {
             self.records.list = list;
             self.records.folder_mtime = mtime;
             self.records.read_ms = Some(at_ms);
@@ -647,10 +647,11 @@ pub(crate) fn reread(
     if pid == self_pid {
         return Reread::Read(None);
     }
+    let boot = (readers.boot)();
     let records = match readers
         .records
         .as_deref()
-        .map(aterm_uds::runs::read_records)
+        .map(|dir| aterm_uds::runs::read_records(dir, boot.as_deref()))
     {
         None => Vec::new(),
         Some(Ok(records)) => records,
@@ -661,7 +662,6 @@ pub(crate) fn reread(
         .filter(|t| t.shell_pid > 0)
         .map(|t| (t.key, t.shell_pid))
         .collect();
-    let boot = (readers.boot)();
     let known = Known {
         self_pid,
         now_ms,

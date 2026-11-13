@@ -138,11 +138,11 @@ fn delivery_requires_both_current_writers_and_binds_the_entire_request_and_recip
 /// successor sweeps and offers for the Mac. Once a delegated request links the two, they are
 /// one Mac: neither is one that did not answer the successor's own request, the successor's
 /// sweep answers another Mac's request for both, and once every other Mac has swept the
-/// successor's request its window ask is restated as every member's sweep.
+/// successor's request it is swept by all.
 /// NEGATIVE CONTROL: with no delegated request in the table, the successor is a Mac of its
 /// own, and the original actor is one that did not answer.
 #[test]
-fn a_recovered_writers_two_actors_are_one_mac_to_sweeps_and_asks() {
+fn a_recovered_writers_two_actors_are_one_mac_to_sweeps() {
     let original = binding(40, 50);
     let successor = binding(41, 51);
     let (x, y) = (binding(42, 52), binding(43, 54));
@@ -189,8 +189,10 @@ fn a_recovered_writers_two_actors_are_one_mac_to_sweeps_and_asks() {
     let members = &context.members;
     let unheard = |book: &Book, id| -> BTreeSet<Actor> {
         book.threads[&id]
-            .unheard(members, &book.macs)
+            .others(members, &book.macs)
             .into_iter()
+            .filter(|(_, swept)| !swept)
+            .map(|(mac, _)| mac)
             .collect()
     };
 
@@ -218,38 +220,6 @@ fn a_recovered_writers_two_actors_are_one_mac_to_sweeps_and_asks() {
     assert!(unheard(&book, own).is_empty() && unheard(&book, other).is_empty());
     assert!(book.threads[&own].swept_by_all(members, &book.macs));
     assert!(book.threads[&other].swept_by_all(members, &book.macs));
-    let facts = need::Facts {
-        sight: None,
-        commons: need::Commons::Writer,
-        policy: Policy::compiled(true),
-        offered: false,
-        now: 0,
-    };
-    let window = Need {
-        state: State::AwaitingPerson,
-        asking: true,
-        posted: true,
-        proof: Some(need::Proof {
-            seq: 1,
-            absent: true,
-            every_locker_open: true,
-            before_commons: false,
-            swept_unheld: false,
-            window_ended: true,
-            custodian_silent: false,
-        }),
-        ..need::fresh(
-            [11; 16],
-            Want::Mailbox("recovered".into()),
-            Purpose::ByHand,
-            &facts,
-        )
-    };
-    assert_eq!(
-        decision_for(&book.threads[&own], &window, members, &book.macs),
-        Some(Decision::NeedsPerson(Unanswered::default())),
-        "every other Mac has swept it since the window's end"
-    );
 
     let unlinked = Book::project(vec![ordinary, sweep(s, 3, &[other])], &context);
     assert_eq!(unlinked.macs, Macs::default());

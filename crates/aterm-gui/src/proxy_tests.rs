@@ -12,6 +12,7 @@ fn unknown_host() -> ForwardHost {
         token: String::new(),
         pid: None,
         listener: None,
+        within: FORWARD_HANG,
     }
 }
 
@@ -300,13 +301,17 @@ fn required_proxy_keeps_a_scheduled_host_present() {
             token: "tok".into(),
             pid: Some(std::process::id()),
             listener: identity,
+            within: FORWARD_HANG,
         };
-        let gone = look.gone_line_with_clock(|| {
-            listening
-                .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
-                .unwrap();
-            std::time::Instant::now() - age
-        });
+        let gone = look.gone_line_with_clock(
+            || {
+                listening
+                    .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+                    .unwrap();
+                std::time::Instant::now() - age
+            },
+            || false,
+        );
         let heard = host.join().unwrap();
         if expired {
             assert_eq!(
@@ -471,6 +476,7 @@ fn a_busy_line_left_behind_answers_a_probe_whose_write_failed() {
         "tok",
         std::time::Duration::from_secs(60),
         std::time::Instant::now,
+        || false,
     );
     assert_eq!(
         answer.expect("the line left behind"),
@@ -593,6 +599,7 @@ fn relay_hop_pipes_handshake_and_response() {
     let sock = dir_guard.path().join("child.sock");
     let listener = aterm_uds::CtlListener::bind(&sock).expect("bind child");
 
+    let path = sock.clone();
     let child = std::thread::spawn(move || {
         let (mut conn, _) = aterm_uds::accept(
             &listener,
@@ -614,6 +621,8 @@ fn relay_hop_pipes_handshake_and_response() {
         let mut more = String::new();
         let _ = rdr.read_line(&mut more);
         let _ = conn.write_all(more.as_bytes());
+        // This host is done, and the relay looks at its path once the connection ends.
+        crate::test_socket::leave_no_listener(&path);
         let _ = conn.shutdown(std::net::Shutdown::Both);
     });
 
@@ -646,6 +655,49 @@ fn relay_hop_pipes_handshake_and_response() {
     hang_up(client_app);
     join_after_hang_up(relay, "the relay to end on its client's hang-up");
     join_after_hang_up(child, "the stand-in child to finish serving");
+}
+
+/// A client's hang-up ends the relay while it looks at a host that queues the look's connect and
+/// never answers it: a hung host. The look's wait here is two hang detectors, so a relay that
+/// sits it out is caught by the one below on every run; at `FORWARD_HANG`, as long as that
+/// detector, it would be caught only when the detector won the race. The client's ends are kept
+/// out of children: the relay sees a client gone at the last close of its end, and a child
+/// another test forked meanwhile would hold a copy of a plain pair's.
+#[test]
+#[cfg(unix)]
+fn a_client_hang_up_ends_the_look_at_a_host_that_never_answers() {
+    use std::os::fd::AsRawFd as _;
+    let dir = crate::test_scratch::short_dir("a silent host's socket");
+    let sock = dir.path().join("host.sock");
+    let listener = aterm_uds::CtlListener::bind(&sock).expect("bind, never accept");
+    let (client_app, client_relay) = aterm_uds::kept_out(CtlStream::pair).expect("client pair");
+    let (relay_child, child) = CtlStream::pair().expect("child pair");
+    let host = ForwardHost {
+        sock: sock.to_string_lossy().into_owned(),
+        token: "tok".into(),
+        pid: Some(std::process::id()),
+        listener: aterm_uds::listener::listener_at(&sock),
+        within: 2 * aterm_spec::wait::MUST_HAPPEN,
+    };
+    let relay = std::thread::spawn(move || relay_bidirectional(&client_relay, &relay_child, host));
+
+    hang_up(child);
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the relay's look to reach the silent host's backlog",
+        || {
+            matches!(
+                crate::control_listener::poll_readable(
+                    listener.as_raw_fd(),
+                    std::time::Duration::ZERO
+                ),
+                Ok(true)
+            )
+            .then_some(())
+        },
+    );
+    hang_up(client_app);
+    join_after_hang_up(relay, "the relay to end on its client's hang-up").expect("the relay");
 }
 
 #[test]

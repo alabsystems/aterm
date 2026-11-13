@@ -103,9 +103,18 @@
 //! * each batch the model rolls back, a publish's, a group commit's or a will's
 //!   a connection's end fires, is one whose real write fails half-way
 //!   (`InjectedFaults::write`), answered as the model answers it
-//!   ([`answer_refused`], [`end`]);
+//!   ([`answer_faulted`], [`end`]);
 //! * after every step the real head is the model's, so nothing of a rolled-back
-//!   batch is visible.
+//!   batch is visible;
+//! * each full flush the model fails (`bus::Broker::fail_next_full_flush`: an
+//!   escalated publish's, a `Settle`'s) is one the real device's `fsync` fails
+//!   while that request is served (`InjectedFaults::sync`, [`answer_faulted`]),
+//!   each answer compared, the poisoned log's refusals after it too; and at each
+//!   open the arms agree on whether it settled ANOTHER LOG (a fresh id, at every
+//!   open of an empty or retired log: `bus::State::mint`), and an open after a
+//!   lossy run is held to [`bus::law_check`] by the real `Hello`'s identity and
+//!   lineage ([`opened`]). [`REFINED_LOSSY`] are the worlds that draw them
+//!   (ATERM-KI-1111-4), a log set aside (`--retire-log`) a fresh device.
 //!
 //! Ordered keeps no horizon there, on both arms (`bus::State::no_horizon`): a
 //! horizon's full flush is the wall clock's, and the model's replay never runs
@@ -137,12 +146,7 @@
 //!   [`IMAGES`] for each prefix of the barrier epochs and a seeded sample past
 //!   that (none and all always among it), so a loss that needs particular blocks
 //!   among many is tried only if the sample lands on it. Nor the Ordered horizon's
-//!   full flush between batches: the refinement arm keeps none (above). A recovery
-//!   astream settles as ANOTHER LOG (no record kept: a fresh id at generation 0)
-//!   is one [`bus::law_check`] admits (`Restart::another_log`); the model never
-//!   mints one, so no seeded world explores the bridge's answer to it
-//!   (`LogIdentity::continues` answers none for another log, and the reader
-//!   forgets its offsets).
+//!   full flush between batches: the refinement arm keeps none (above).
 //! * AN UNCLEAN STOP IN A BOOT THE OPEN CANNOT NAME: aterm opens in
 //!   `Boot::Unknown` on a host whose kernel names no boot
 //!   (`durability::open_with`), and astream then takes every unclean stop of a
@@ -156,8 +160,12 @@
 //!   real write of each batch the model rolls back that a script sends alone or a
 //!   connection's end fires; never a will an open fires (astream fires them inside
 //!   its open, before a fault can be armed: [`held_over_the_open`]), and a script
-//!   pipelining a write while one is owed is refused. A failed FULL FLUSH (on a
-//!   weak tier it poisons the log) is astream's own test (`poisoned_log`), not here.
+//!   pipelining a write while one is owed is refused. Of a failed FULL FLUSH, a
+//!   multi-op batch's outcome unknown and a Strict batch's failure (rolled back,
+//!   nothing poisoned) are astream's own test (`poisoned_log`), not here: the
+//!   arms fail single publishes and `Settle`s. Nor the real `--retire-log`'s
+//!   refusals (a log that opens, a live broker), `bus-log-at-rest`'s: the file
+//!   arm sets the log's files aside, the refinement arm takes a fresh device.
 //! * A WILL LIVE AT A RESTART: astream's connection threads race its
 //!   shutdown; the model fires each producer's latest will at the next open,
 //!   one outcome the race allows, and the scripts end every connection first.
@@ -271,7 +279,7 @@ pub(crate) enum Step {
     Name(u64, String),
     /// The model rolls back the next this-many of a node's publishes and group commits
     /// (`bus::State::refuse_next`), and the real arm's write fails for each one it refuses
-    /// (`astream_broker::InjectedFaults::write`, [`answer_refused`]).
+    /// (`astream_broker::InjectedFaults::write`, [`answer_faulted`]).
     Refuse(u32),
     /// The broker opens again setting no rules: what `aterm link broker` serves when setting them fails.
     StartUnretained,
@@ -287,6 +295,13 @@ pub(crate) enum Step {
     RateLimit(Option<astream_broker::RateLimit>),
     /// The publishes each arm's rate limit refused so far (`BrokerStats::rate_limited`), compared.
     RateLimited,
+    /// The model's next full flush fails (`bus::Broker::fail_next_full_flush`), and the real
+    /// arm's full flushes fail while the request the model spends it on is served
+    /// (`InjectedFaults::sync`, [`answer_faulted`]).
+    FailFullFlush,
+    /// The stopped log is set aside on both arms, as `aterm link broker --retire-log` does
+    /// (`bus::Broker::retire_log`, [`Real::retire_log`]): the next open starts another log.
+    RetireLog,
 }
 
 /// THE RUN'S CLOCK for its retention ticks: an hour past the wall clock when the run began,
@@ -376,10 +391,16 @@ struct Real {
     device: Option<astream_broker::SimDevice>,
     /// What the refinement arm found so far.
     refined: Refined,
+    /// The logs this arm set aside so far ([`Real::retire_log`]).
+    retired_logs: u64,
+    /// THE MODEL'S LOG ID -> THIS ARM'S, for every log both arms served (ids are never
+    /// compared, so a request naming the model's log names this one's here,
+    /// [`Real::on_this_log`]).
+    ids: BTreeMap<[u8; 16], [u8; 16]>,
     dir: Scratch,
 }
 
-/// What the refinement arm saw over one run ([`refine`], [`answer_refused`]).
+/// What the refinement arm saw over one run ([`refine`], [`answer_faulted`]).
 #[derive(Debug, Default)]
 struct Refined {
     /// Power losses whose images were reopened.
@@ -394,6 +415,13 @@ struct Refined {
     sampled: u64,
     /// Publishes and group commits the model rolled back and the real arm's write failed.
     refused: u64,
+    /// Requests whose full flush the model failed and the real arm's failed too
+    /// (`InjectedFaults::sync`, [`answer_faulted`]).
+    poisoned: u64,
+    /// Reopens after a run the model recorded lossy, each held to [`bus::law_check`].
+    lossy_reopens: u64,
+    /// Opens that settled another log on both arms (a fresh id: [`run_arms`]' comparison).
+    fresh_ids: u64,
 }
 
 struct RealConn {
@@ -514,6 +542,8 @@ impl Real {
             queued: 0,
             device: None,
             refined: Refined::default(),
+            retired_logs: 0,
+            ids: BTreeMap::new(),
         }
     }
 
@@ -664,9 +694,10 @@ impl Real {
         );
     }
 
-    /// `req` as this arm takes it: a conditional `Retire` that names the model's log
-    /// ([`bus::LOG_ID`], what a script or a world's bridge read off the model's `Hello`)
-    /// names this broker's log at the same generation, which the `Hello`s are compared on.
+    /// `req` as this arm takes it: a conditional `Retire` that names a log of the model's
+    /// (what a script or a world's bridge read off the model's `Hello`) names this arm's log
+    /// that both served together ([`Real::ids`]) at the same generation, which the `Hello`s are
+    /// compared on; one naming any other log goes as it is.
     fn on_this_log(&self, req: &Request) -> Request {
         match req {
             Request::Retire {
@@ -674,16 +705,68 @@ impl Real {
                 subject,
                 offset,
                 log,
-            } if log.id == bus::LOG_ID => Request::Retire {
+            } if self.ids.contains_key(&log.id) => Request::Retire {
                 producer_id: *producer_id,
                 subject: subject.clone(),
                 offset: *offset,
                 log: astream_broker::LogIdentity {
-                    id: self.broker().log_identity().id,
+                    id: self.ids[&log.id],
                     generation: log.generation,
                 },
             },
             other => other.clone(),
+        }
+    }
+
+    /// THE STOPPED LOG SET ASIDE, as `aterm link broker --retire-log` moves a log, its sidecars
+    /// and its key aside (`at_rest::retire`, which refuses a log that opens, so not it): every
+    /// `bus.log*` file goes into a folder of its own beside the socket, or the refinement arm
+    /// takes a fresh device. The next open starts an empty log, whose wills none.
+    fn retire_log(&mut self) {
+        assert!(
+            self.up.is_none(),
+            "a log is retired while its broker is down"
+        );
+        self.retired_logs += 1;
+        self.will_producers.clear();
+        if self.device.is_some() {
+            self.device = Some(astream_broker::SimDevice::new(BLOCK));
+            return;
+        }
+        let aside = self
+            .dir
+            .path()
+            .join(format!("retired-{}", self.retired_logs));
+        std::fs::create_dir(&aside).expect("a folder for the retired log");
+        for entry in std::fs::read_dir(self.dir.path())
+            .expect("the scratch dir")
+            .flatten()
+        {
+            let name = entry.file_name();
+            if name.to_string_lossy().starts_with("bus.log") {
+                std::fs::rename(entry.path(), aside.join(&name)).expect("set the log aside");
+            }
+        }
+    }
+
+    /// The identity and lineage this arm's `Hello` names now, on a connection of its own.
+    fn hello_identity(&self) -> (astream_broker::LogIdentity, Vec<(u64, u64)>) {
+        let mut stream = UnixStream::connect(self.sock()).expect("dial the real broker");
+        stream
+            .set_read_timeout(Some(HANG))
+            .expect("bound the reads");
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &encode_request(&Request::Hello)).expect("frame to memory");
+        stream.write_all(&bytes).expect("write to the real broker");
+        let frame = read_frame(&mut stream)
+            .expect("the real broker's Hello")
+            .expect("an answer to Hello");
+        match decode_response(&frame) {
+            Some(Response::Nonce { log, ext, .. }) => (
+                log.expect("a Hello names its log"),
+                ext.lineage.map(|l| l.steps().to_vec()).unwrap_or_default(),
+            ),
+            other => panic!("the real broker answered Hello with {other:?}"),
         }
     }
 
@@ -812,20 +895,19 @@ impl Real {
         };
     }
 
-    /// A retention tick at `now_ms`; the log's base after it.
-    fn tick(&self, now_ms: u64) -> u64 {
+    /// A retention tick at `now_ms`: the log's base after it, and whether the broker refused
+    /// it (a poisoned log refuses every mutation).
+    fn tick(&self, now_ms: u64) -> (u64, bool) {
         let b = self.broker();
-        b.retention_tick_at(now_ms)
-            .expect("the real broker's retention tick");
-        b.base()
+        let refused = b.retention_tick_at(now_ms).is_err();
+        (b.base(), refused)
     }
 
-    /// A carried cut at `at`; the log's base after it.
-    fn cut(&self, at: u64) -> u64 {
+    /// A carried cut at `at`: the log's base after it, and whether the broker refused it.
+    fn cut(&self, at: u64) -> (u64, bool) {
         let b = self.broker();
-        b.retain_before_carrying_state(at)
-            .expect("the real broker's carried cut");
-        b.base()
+        let refused = b.retain_before_carrying_state(at).is_err();
+        (b.base(), refused)
     }
 }
 
@@ -903,15 +985,20 @@ impl Model {
         }
     }
 
-    fn stop(&mut self, how: Stop) {
+    fn stop(&mut self, how: Stop) -> bus::Restart {
         self.end_all();
-        self.core.broker.stop(how, &mut super::Rng::new(0));
+        self.core.broker.stop(how, &mut super::Rng::new(0))
     }
 
     /// The machine loses power, every record kept.
-    fn lose_power(&mut self) {
+    fn lose_power(&mut self) -> bus::Restart {
         self.end_all();
-        self.core.broker.stop_keeping_all(Stop::PowerLoss);
+        self.core.broker.stop_keeping_all(Stop::PowerLoss)
+    }
+
+    /// The log's id now.
+    fn id(&self) -> [u8; 16] {
+        lock(&self.core.broker.state).id
     }
 
     /// A retention tick at `now_ms`; the log's base after it.
@@ -1127,7 +1214,7 @@ fn run_keeping(
 /// each power loss the images the device could be left in (at most [`IMAGES`] for each prefix
 /// of the barrier epochs, a sample past that) are reopened and held to the model's law
 /// ([`refine`]), and each batch the model rolls back is a write the real arm fails
-/// ([`answer_refused`]). What it found.
+/// ([`answer_faulted`]). What it found.
 fn run_refining(tier: Tier, mutant: ArmMutant, steps: &[Step]) -> Result<Refined, String> {
     run_arms(tier, Real::on_device(tier), None, mutant, steps).map(|real| real.refined)
 }
@@ -1147,8 +1234,21 @@ fn run_arms(
     lock(&model.core.broker.state).no_horizon = real.device.is_some();
     let mut laws = [Law::default(), Law::default()];
     let mut answers = 0u64;
+    // The ids each arm served last, and the model's restart of a run it recorded lossy, which
+    // the next open holds to the law ([`opened`]).
+    real.ids.insert(model.id(), real.broker().log_identity().id);
+    let mut last_ids = (real.broker().log_identity().id, model.id());
+    let mut lossy: Option<bus::Restart> = None;
     for (i, step) in steps.iter().enumerate() {
         let at = |what: &str| format!("{tier} step {i} {step:?}: {what}");
+        let opens = matches!(
+            step,
+            Step::Start
+                | Step::Reboot
+                | Step::RebootUnnamed
+                | Step::StartUnretained
+                | Step::StartWith(_)
+        );
         match step {
             Step::Dial(c) => {
                 real.dial(*c);
@@ -1157,8 +1257,9 @@ fn run_arms(
             Step::Send(c, req) => {
                 let refusing = owed(&model) > 0
                     && matches!(req, Request::Publish { .. } | Request::Commit { .. });
-                if refusing {
-                    answer_refused(&mut real, &mut model, *c, req, &table, &mut laws, tier)
+                // A subscribe answers on its tail, and neither writes nor flushes there.
+                if !subscribes(req) && (refusing || model.core.broker.flush_fault_owed()) {
+                    answer_faulted(&mut real, &mut model, *c, req, &table, &mut laws, tier)
                 } else {
                     answer(
                         &mut real,
@@ -1174,6 +1275,12 @@ fn run_arms(
                 answers += 1;
             }
             Step::Pipeline(c, reqs) => {
+                if model.core.broker.flush_fault_owed() {
+                    return Err(at(
+                        "a pipeline while the model owes a failed full flush: the real arm's \
+                         fault would fail every flush of it",
+                    ));
+                }
                 if owed(&model) > 0
                     && reqs
                         .iter()
@@ -1216,7 +1323,8 @@ fn run_arms(
                 );
                 end_all(&mut real, &mut model);
                 real.stop(*how);
-                model.stop(*how);
+                let r = model.stop(*how);
+                lossy = Some(r).filter(|r| r.lossy);
             }
             Step::Start => held_over_the_open(&model, || {
                 real.open();
@@ -1225,7 +1333,8 @@ fn run_arms(
             }),
             Step::PowerLoss | Step::Reboot | Step::RebootUnnamed => {
                 let named = !matches!(step, Step::RebootUnnamed);
-                lose_power(&mut real, &mut model, tier, i, named).map_err(|e| at(&e))?;
+                let r = lose_power(&mut real, &mut model, tier, i, named).map_err(|e| at(&e))?;
+                lossy = Some(r).filter(|r| r.lossy);
                 if !matches!(step, Step::PowerLoss) {
                     held_over_the_open(&model, || {
                         real.open();
@@ -1249,7 +1358,17 @@ fn run_arms(
             }),
             Step::Tick(rel) => {
                 let now = clock.at(*rel);
-                let (r, m) = (real.tick(now), model.tick(now));
+                let poisoned = model.core.broker.poisoned();
+                let ((r, refused), m) = (real.tick(now), model.tick(now));
+                if refused && !poisoned {
+                    return Err(at("the real broker refused a tick the model took"));
+                }
+                // A poisoned log refuses every mutation, the tick's included.
+                if poisoned && !refused {
+                    return Err(at(
+                        "the real broker took a tick on a log the model poisoned",
+                    ));
+                }
                 if r != m {
                     return Err(at(&format!(
                         "the tick left the real base {r}, the model's {m}"
@@ -1257,7 +1376,14 @@ fn run_arms(
                 }
             }
             Step::Cut(off) => {
-                let (r, m) = (real.cut(*off), model.cut(*off));
+                let poisoned = model.core.broker.poisoned();
+                let ((r, refused), m) = (real.cut(*off), model.cut(*off));
+                if refused && !poisoned {
+                    return Err(at("the real broker refused a cut the model made"));
+                }
+                if poisoned && !refused {
+                    return Err(at("the real broker took a cut on a log the model poisoned"));
+                }
                 if r != m {
                     return Err(at(&format!(
                         "the cut left the real base {r}, the model's {m}"
@@ -1282,6 +1408,21 @@ fn run_arms(
                 }
                 answers += 1;
             }
+            Step::FailFullFlush => model.core.broker.fail_next_full_flush(),
+            Step::RetireLog => {
+                real.retire_log();
+                model
+                    .core
+                    .broker
+                    .retire_log()
+                    .ok_or_else(|| at("the model's broker is up"))?;
+                // The log set aside takes the run with it: the next open judges another log.
+                lossy = None;
+            }
+        }
+        // ANOTHER LOG starts its durable head and its escalated acks again at 0.
+        if opens && opened(&mut real, &model, &mut last_ids, &mut lossy).map_err(|e| at(&e))? {
+            laws = [Law::default(), Law::default()];
         }
         // Between steps the refinement arm's log holds what the model's does, so nothing of a
         // rolled-back batch (a publish's, a commit's, a fired will's) is visible past one.
@@ -1328,12 +1469,50 @@ fn answer(
     Ok(())
 }
 
-/// A BATCH THE MODEL ROLLS BACK, ON BOTH ARMS (critic item F10): `req` goes to the model first,
-/// and when the model spends one of its `refuse_next` on it the real arm's next write fails
-/// half-way (`InjectedFaults::write`) while `req` is served there, as a disk that fills does;
-/// then every answer is compared as [`answer`] compares them, and after a refusal the real
-/// head must be the model's: nothing of the rolled-back batch visible.
-fn answer_refused(
+/// AFTER AN OPEN of both arms: each settled another log (a fresh id) or kept its own alike
+/// (`fresh id:`), every model id is mapped to the real one it served beside
+/// ([`Real::ids`]), and a reopen after a run the model recorded lossy (a failed full flush) is
+/// held to [`bus::law_check`], its identity and lineage the real arm's: what the model's stop
+/// saw before it (its records, the durable head, the record held out of sight), what it kept
+/// (the per-step head comparison holds the real arm's to it), and the generation, lineage and
+/// id astream settled. Answers whether the open settled another log.
+fn opened(
+    real: &mut Real,
+    model: &Model,
+    last: &mut ([u8; 16], [u8; 16]),
+    lossy: &mut Option<bus::Restart>,
+) -> Result<bool, String> {
+    let (now, lineage) = real.hello_identity();
+    let (r, m) = (now.id != last.0, model.id() != last.1);
+    if r != m {
+        return Err(format!("fresh id: real {r} model {m}"));
+    }
+    real.refined.fresh_ids += u64::from(r);
+    real.ids.insert(model.id(), now.id);
+    *last = (now.id, model.id());
+    if let Some(mut restart) = lossy.take() {
+        restart.generation_after = now.generation;
+        restart.lineage_after = lineage;
+        restart.another_log = r;
+        let oracle = lock(&model.core.broker.state).oracle.clone();
+        let bad = bus::law_check(&restart, &oracle);
+        if !bad.is_empty() {
+            return Err(format!("the reopen after a failed full flush: {bad:?}"));
+        }
+        real.refined.lossy_reopens += 1;
+    }
+    Ok(r)
+}
+
+/// A BATCH THE MODEL ROLLS BACK OR A FULL FLUSH IT FAILS, ON BOTH ARMS (critic item F10): `req`
+/// goes to the model first. When the model spends one of its `refuse_next` on it the real arm's
+/// next write fails half-way (`InjectedFaults::write`) while `req` is served there, as a disk
+/// that fills does; when it spends its armed full-flush fault (`bus::State::fail_full_flush`,
+/// an escalated publish's or a `Settle`'s) every full flush of the real arm fails while `req`
+/// is served (`InjectedFaults::sync`, persistent while armed, so disarmed once the whole answer
+/// is read). Then every answer is compared as [`answer`] compares them, and after a refusal the
+/// real head must be the model's: nothing of the rolled-back batch visible.
+fn answer_faulted(
     real: &mut Real,
     model: &mut Model,
     c: u64,
@@ -1343,6 +1522,7 @@ fn answer_refused(
     tier: Tier,
 ) -> Result<(), String> {
     let before = owed(model);
+    let fault_before = model.core.broker.flush_fault_owed();
     model.write(c, std::slice::from_ref(req));
     let mut modelled = Vec::new();
     loop {
@@ -1354,10 +1534,11 @@ fn answer_refused(
         }
     }
     let refused = owed(model) < before;
-    if refused {
+    let synced = fault_before && !model.core.broker.flush_fault_owed();
+    if refused || synced {
         real.broker().inject_faults(astream_broker::InjectedFaults {
-            write: true,
-            sync: false,
+            write: refused,
+            sync: synced,
             truncate: false,
         });
     }
@@ -1371,14 +1552,15 @@ fn answer_refused(
             break;
         }
     }
-    if refused {
+    if refused || synced {
         real.broker()
             .inject_faults(astream_broker::InjectedFaults::default());
-        real.refined.refused += 1;
+        real.refined.refused += u64::from(refused);
+        real.refined.poisoned += u64::from(synced);
     }
     if answered.len() != modelled.len() {
         return Err(format!(
-            "{req:?}: real {answered:?}, model {modelled:?} (refused={refused})"
+            "{req:?}: real {answered:?}, model {modelled:?} (refused={refused} synced={synced})"
         ));
     }
     for (r, m) in answered.iter().zip(&modelled) {
@@ -1388,9 +1570,9 @@ fn answer_refused(
         real.broker().head(),
         lock(&model.core.broker.state).log.len() as u64,
     );
-    if refused && real_head != model_head {
+    if (refused || synced) && real_head != model_head {
         return Err(format!(
-            "{req:?}: rolled back, the real head is {real_head} and the model's {model_head}"
+            "{req:?}: faulted, the real head is {real_head} and the model's {model_head}"
         ));
     }
     Ok(())
@@ -1451,20 +1633,23 @@ fn owed(model: &Model) -> u32 {
 /// the model rolls back, the real arm's write fails while its will fires (critic item F10).
 fn end(real: &mut Real, model: &mut Model, c: u64) {
     let before = owed(model);
+    let fault_before = model.core.broker.flush_fault_owed();
     model.end(c);
     let refused = owed(model) < before;
-    if refused {
+    let synced = fault_before && !model.core.broker.flush_fault_owed();
+    if refused || synced {
         real.broker().inject_faults(astream_broker::InjectedFaults {
-            write: true,
-            sync: false,
+            write: refused,
+            sync: synced,
             truncate: false,
         });
     }
     real.end(c);
-    if refused {
+    if refused || synced {
         real.broker()
             .inject_faults(astream_broker::InjectedFaults::default());
-        real.refined.refused += 1;
+        real.refined.refused += u64::from(refused);
+        real.refined.poisoned += u64::from(synced);
     }
 }
 
@@ -1501,7 +1686,7 @@ fn lose_power(
     tier: Tier,
     step: usize,
     named: bool,
-) -> Result<(), String> {
+) -> Result<bus::Restart, String> {
     end_all(real, model);
     let before = real.broker().log_identity();
     let head = real.broker().head();
@@ -1519,8 +1704,7 @@ fn lose_power(
             &mut real.refined,
         )?;
     }
-    model.lose_power();
-    Ok(())
+    Ok(model.lose_power())
 }
 
 /// THE REFINEMENT AT ONE POWER LOSS (critic item F10): the real store's recoveries stay inside
@@ -1555,6 +1739,8 @@ fn refine(
 ) -> Result<(), String> {
     let (cuts, oracle, mut restart) = {
         let s = lock(&model.core.broker.state);
+        // A run recorded lossy moves at any cut, and a record its poison held out of sight was
+        // never acked: an image may cut it (P3e).
         let restart = bus::Restart {
             stop: Stop::PowerLoss,
             tier,
@@ -1565,6 +1751,9 @@ fn refine(
             generation_after: s.generation,
             lineage_after: Vec::new(),
             another_log: false,
+            lossy: s.lossy,
+            retired: false,
+            held_from: s.poison.and_then(|p| p.held_from),
         };
         (s.allowed_cuts(Stop::PowerLoss), s.oracle.clone(), restart)
     };
@@ -1692,6 +1881,8 @@ fn replay(journal: &[Event]) -> Vec<Step> {
                 steps.push(Step::Tick(last));
                 steps.push(Step::Cut(*at));
             }
+            Event::FailFullFlush => steps.push(Step::FailFullFlush),
+            Event::RetireLog => steps.push(Step::RetireLog),
         }
     }
     steps
@@ -2521,6 +2712,156 @@ pub(crate) mod scripts {
     }
 }
 
+/// THE SCRIPTS OF ANOTHER LOG AND A POISONED ONE (ATERM-KI-1111-4).
+pub(crate) mod lossy {
+    use super::scripts::{
+        budget, commit, fetch, last, publish, retire_on, seq, will, will_at, GROUP, HALT, LANE,
+        NODE, P, PERSON_GROUP, Q,
+    };
+    use super::{Request, Step, Stop};
+
+    /// The id of the model's `n`-th ANOTHER LOG (`bus::State::mint`), which the real arm maps to
+    /// its own (`Real::ids`).
+    pub(crate) fn minted(n: u64) -> [u8; 16] {
+        let mut id = super::bus::LOG_ID;
+        id[8..].copy_from_slice(&n.to_be_bytes());
+        id
+    }
+
+    fn look(c: u64) -> Vec<Step> {
+        vec![
+            Step::Send(c, fetch(0, "/>", 100)),
+            Step::Send(c, last("/>", "", 100)),
+            Step::Send(c, budget(P)),
+            Step::Send(c, budget(Q)),
+        ]
+    }
+
+    /// EVERY OPEN OF A LOG THAT HOLDS NO RECORD IS ANOTHER LOG (astream's `logid::settle`): a
+    /// clean stop and a crash of an empty log, each a fresh id at generation 0; a log that holds
+    /// a record keeps its id across a clean stop and a power loss (moving it on a weak tier); and
+    /// a log set aside (`--retire-log`) is another log, on which a conditional `Retire` naming the
+    /// first log is refused `log: ` and one naming the new log is served. `run_arms` compares,
+    /// at each open, whether each arm's id changed.
+    pub(crate) fn empty_restarts() -> Vec<Step> {
+        let mut s = vec![
+            Step::Dial(1),
+            Step::Send(1, Request::Hello),
+            Step::Stop(Stop::Clean),
+            Step::Start,
+            Step::Dial(2),
+            Step::Send(2, Request::Hello),
+            Step::Stop(Stop::Crash),
+            Step::Start,
+            Step::Dial(3),
+            Step::Send(3, Request::Hello),
+            Step::Send(3, publish(P, seq(1, 1), super::scripts::PRES_A, "live")),
+            Step::Stop(Stop::Clean),
+            Step::Start,
+            Step::Dial(4),
+            Step::Send(4, Request::Hello),
+            Step::Reboot,
+            Step::Dial(5),
+            Step::Send(5, Request::Hello),
+            Step::Stop(Stop::Clean),
+            Step::RetireLog,
+            Step::Start,
+            Step::Dial(6),
+            Step::Send(6, Request::Hello),
+            Step::Send(6, publish(P, seq(2, 1), LANE, "m1")),
+            Step::Send(
+                6,
+                retire_on(P, LANE, 0, super::bus::LOG_ID, 0), // the first log: log:
+            ),
+            Step::Send(6, retire_on(P, LANE, 0, minted(3), 0)), // this log: retired @1
+        ];
+        s.extend(look(6));
+        s
+    }
+
+    /// A POISONED LOG (astream's `BrokerLog::full_flush_failed`), on a weak tier: a plain record
+    /// a `Settle` covers; then the full flush an escalated publish asks for fails, answered
+    /// "outcome unknown", its record held out of sight; `Hello` latched to Strict; a publish, a
+    /// group commit, a will and a `Settle` each refused `log poisoned`, a resend of the held
+    /// publish too; reads that do not show the held record; a clean stop's reopen that moves the
+    /// generation and shows it, a resend of it deduped there; an escalated group commit's flush
+    /// failing; a crash's reopen; a `Settle`'s flush failing; and a power loss of a poisoned run,
+    /// whose images may cut the held record (the refinement arm's `refine`).
+    pub(crate) fn poisoned() -> Vec<Step> {
+        let mut s = vec![
+            Step::Dial(1),
+            Step::Send(1, Request::Hello),
+            Step::Send(1, publish(P, seq(1, 1), LANE, "m1")),
+            Step::Send(1, Request::Settle),
+            Step::FailFullFlush,
+            Step::Send(1, publish(Q, seq(1, 1), HALT, "on")),
+            Step::Send(1, Request::Hello),
+            Step::Send(1, publish(P, seq(1, 2), LANE, "m2")),
+            Step::Send(1, publish(Q, seq(1, 1), HALT, "on")),
+            Step::Send(1, commit(GROUP, 0)),
+            Step::Dial(2),
+            Step::Send(2, will(P, will_at(1), NODE, "away")),
+            Step::Send(1, Request::Settle),
+            Step::Send(1, Request::ClearGapFences),
+        ];
+        s.extend(look(1));
+        s.extend([
+            Step::Stop(Stop::Clean),
+            Step::Start,
+            Step::Dial(3),
+            Step::Send(3, Request::Hello),
+            Step::Send(3, publish(Q, seq(1, 1), HALT, "on")),
+            Step::Send(3, publish(P, seq(1, 2), LANE, "m2")),
+            Step::FailFullFlush,
+            Step::Send(3, commit(PERSON_GROUP, 0)),
+            Step::Send(3, Request::Hello),
+            Step::Stop(Stop::Crash),
+            Step::Start,
+            Step::Dial(4),
+            Step::Send(4, Request::Hello),
+            Step::FailFullFlush,
+            Step::Send(4, Request::Settle),
+            Step::Send(4, Request::Hello),
+            Step::Send(4, publish(P, seq(1, 3), LANE, "m3")),
+            Step::Stop(Stop::Clean),
+            Step::Start,
+            Step::Dial(5),
+            Step::Send(5, Request::Hello),
+            Step::Send(5, publish(P, seq(1, 4), LANE, "m4")),
+            Step::FailFullFlush,
+            Step::Send(5, publish(Q, seq(1, 2), HALT, "off")),
+            Step::PowerLoss,
+            Step::Start,
+            Step::Dial(6),
+            Step::Send(6, Request::Hello),
+        ]);
+        s.extend(look(6));
+        s
+    }
+
+    /// A STRICT `Settle` WHOSE FULL FLUSH FAILS poisons the log with no latch (astream's
+    /// `settle_full_flush`): refused "outcome unknown", `Hello` still Strict with no reason, a
+    /// publish refused `log poisoned`, and the reopen moves the generation.
+    pub(crate) fn strict_settle() -> Vec<Step> {
+        let mut s = vec![
+            Step::Dial(1),
+            Step::Send(1, Request::Hello),
+            Step::Send(1, publish(P, seq(1, 1), LANE, "m1")),
+            Step::FailFullFlush,
+            Step::Send(1, Request::Settle),
+            Step::Send(1, Request::Hello),
+            Step::Send(1, publish(P, seq(1, 2), LANE, "m2")),
+            Step::Stop(Stop::Clean),
+            Step::Start,
+            Step::Dial(2),
+            Step::Send(2, Request::Hello),
+            Step::Send(2, publish(P, seq(1, 2), LANE, "m2")),
+        ];
+        s.extend(look(2));
+        s
+    }
+}
+
 /// The scripts that need a long log.
 pub(crate) mod long {
     use super::scripts::{budget, fetch, last, publish, retire, seq, will, will_at, NODE, P, Q};
@@ -2685,7 +3026,7 @@ fn the_model_answers_every_script_as_astreams_broker_does() {
 }
 
 /// Each verb the bridge sends and each edge astream defines for it.
-fn every_script() -> [(&'static str, Vec<Step>); 10] {
+fn every_script() -> [(&'static str, Vec<Step>); 11] {
     [
         ("publishing", scripts::publishing()),
         ("the rate limit", scripts::rate_limited()),
@@ -2697,6 +3038,7 @@ fn every_script() -> [(&'static str, Vec<Step>); 10] {
         ("a commit and a publish in one write", scripts::corked()),
         ("restarts", scripts::restarts()),
         ("retention", scripts::retention()),
+        ("another log at every empty open", lossy::empty_restarts()),
     ]
 }
 
@@ -3059,7 +3401,7 @@ fn refined_opts(seed: u64, tier: Tier) -> super::world::Opts {
 /// ([`run_refining`]): every answer compared as every run's are, the images each power loss could
 /// leave on astream's simulated device (at most [`IMAGES`] for each prefix of its barrier epochs, a
 /// seeded sample past that) reopened and held to the model's law ([`refine`]), and each batch the
-/// model rolled back a write the real arm failed, nothing of it visible ([`answer_refused`]). Not
+/// model rolled back a write the real arm failed, nothing of it visible ([`answer_faulted`]). Not
 /// vacuous: every world loses power, an Ordered and a Relaxed log (neither keeps a horizon there,
 /// so their losses are the journal's alone) each lose acked records in some image, and some batch
 /// is refused.
@@ -3132,6 +3474,106 @@ fn control_a_model_that_takes_every_ack_for_durable_has_the_real_store_outside_i
     }
 }
 
+/// THE LOSSY WORLDS the refinement arm replays (ATERM-KI-1111-4), `(seed, tier)`: one a weak
+/// tier, each a [`refined_lossy_opts`] world whose replay fails a full flush on both arms and
+/// reopens the lossy run; Ordered's also settles another log, Relaxed's settles none.
+const REFINED_LOSSY: &[(u64, Tier)] = &[(1, Tier::Ordered), (1, Tier::Relaxed)];
+
+/// A world of [`REFINED_LOSSY`]: [`refined_opts`]' on the state dir's device, where the bridge
+/// sends `Settle` ([`super::world::Opts::same_device`]), with poisoned brokers and logs set aside
+/// among the faults ([`super::world::Opts::poisons`], [`super::world::Opts::retire_logs`]).
+fn refined_lossy_opts(seed: u64, tier: Tier) -> super::world::Opts {
+    super::world::Opts {
+        same_device: true,
+        poisons: true,
+        retire_logs: true,
+        ..refined_opts(seed, tier)
+    }
+}
+
+/// **A POISONED BROKER AND ANOTHER LOG STAY INSIDE THE MODEL'S LAW ON THE REAL STORE**
+/// (ATERM-KI-1111-4): the door's journal of each [`REFINED_LOSSY`] world replayed on the
+/// refinement arm, every full flush the model fails armed on the real arm's device
+/// (`InjectedFaults::sync`, [`answer_faulted`]) ahead of the escalated publish or `Settle` it
+/// fails, every answer compared, and each reopen of a lossy run held to [`bus::law_check`] with
+/// the real `Hello`'s identity ([`opened`]). Counted on the replay, not the world: on Ordered
+/// the world's horizon can take the fault the replay's model meets at its next escalated
+/// publish. Not vacuous: each world failed a flush on both arms and held a lossy reopen to the
+/// law, and some open settled another log on both.
+#[test]
+fn a_poisoned_broker_and_another_log_stay_inside_the_models_law_on_the_real_store() {
+    let refined = aterm_spec::check::each(REFINED_LOSSY, |&(seed, tier)| {
+        let out = super::world::run(&refined_lossy_opts(seed, tier));
+        assert!(
+            out.violations.is_empty(),
+            "seed {seed}'s world broke a law: {:?}",
+            out.violations
+        );
+        let steps = replay(&out.journal);
+        let verdict = run_refining(tier, ArmMutant::None, &steps)
+            .map_err(|e| format!("seed {seed} at {tier}: {e}"));
+        (seed, tier, verdict)
+    });
+    let mut failed = Vec::new();
+    let mut fresh = 0;
+    for (seed, tier, verdict) in &refined {
+        match verdict {
+            Ok(r) => {
+                eprintln!("seed {seed} at {tier}: {r:?}");
+                if r.poisoned == 0 || r.lossy_reopens == 0 {
+                    failed.push(format!("seed {seed} at {tier}: vacuous: {r:?}"));
+                }
+                fresh += r.fresh_ids;
+            }
+            Err(e) => failed.push(e.clone()),
+        }
+    }
+    assert!(
+        failed.is_empty(),
+        "the real store stepped outside the model:\n{}",
+        failed.join("\n")
+    );
+    assert!(fresh > 0, "no open settled another log on both arms");
+}
+
+/// Whether a refinement arm's error is the armed op's: an answer compared at a write the real
+/// store refused (its armed full flush failed) and the model acked, not any other divergence and
+/// not one of the harness's own refusals (a pipeline or a write owed a fault no arm can arm).
+fn armed_op_refused(err: &str) -> bool {
+    err.contains(": real error ") && err.contains(", model ack @")
+}
+
+/// CONTROL for the poisoned broker on the refinement arm: a model whose full flush never fails
+/// ([`ArmMutant::NeverPoisons`]) answers a write the real store refuses, and on a
+/// [`refined_lossy_opts`] world of each weak tier the refinement arm finds the real store
+/// outside it, at the armed op ([`armed_op_refused`]). Found as the bridge's controls are: a witness pinned within
+/// [`super::tests::CONTROL_SEEDS`] (`witness_of`'s pinned and discovery modes).
+#[test]
+fn control_a_model_that_never_poisons_has_the_real_store_outside_it() {
+    for (tier, witness) in [(Tier::Ordered, 1), (Tier::Relaxed, 1)] {
+        let opts = move |seed| refined_lossy_opts(seed, tier);
+        let caught = |out: &super::world::Outcome| {
+            run_refining(tier, ArmMutant::NeverPoisons, &replay(&out.journal))
+                .is_err_and(|e| armed_op_refused(&e))
+        };
+        let Some(out) =
+            super::tests::witnessed(&opts, witness, super::tests::CONTROL_SEEDS, &caught)
+        else {
+            panic!("CONTROL NeverPoisons at {tier}: seed {witness} kept the real store inside it");
+        };
+        let err = run_refining(tier, ArmMutant::NeverPoisons, &replay(&out.journal))
+            .expect_err("the witness caught it");
+        assert!(
+            armed_op_refused(&err),
+            "CONTROL NeverPoisons at {tier}: caught for another reason: {err}"
+        );
+        eprintln!(
+            "CONTROL NeverPoisons at {tier} caught at seed {}: {err}",
+            out.seed
+        );
+    }
+}
+
 /// **WHAT A RECLAIMING BRIDGE SENT, ASTREAM ANSWERS AS THE MODEL DID** (sim item B02):
 /// the door's journal of the reclaim scenario ([`super::world::run_reclaim`]: three
 /// sessions leave, the bridge gives their lanes and rows back, and one is revived just
@@ -3164,6 +3606,112 @@ fn what_a_reclaiming_bridge_sent_astream_answers_as_the_model_did() {
                 .unwrap_or_else(|e| panic!("the model diverged: {e}"));
         }
     }
+}
+
+/// **THE MODEL SETTLES EVERY OPEN OF AN EMPTY LOG AS ANOTHER LOG, AS ASTREAM DOES**
+/// (ATERM-KI-1111-4): [`lossy::empty_restarts`] on every tier the host serves, on the file arm
+/// and on the refinement arm, each open's fresh id compared ([`opened`]); a retired log is
+/// another log on both. Not vacuous: some open settled another log on both arms of every run.
+/// NEGATIVE CONTROLS: a model that never mints, or mints keeping its generation, is caught.
+#[test]
+fn the_model_settles_every_empty_open_as_another_log() {
+    for tier in [Tier::Strict, Tier::Ordered, Tier::Relaxed]
+        .into_iter()
+        .filter(|&tier| served_here(tier))
+    {
+        let file = run_keeping(
+            tier,
+            None,
+            None,
+            None,
+            ArmMutant::None,
+            &lossy::empty_restarts(),
+        )
+        .unwrap_or_else(|e| panic!("the file arm at {tier}: {e}"));
+        let device = run_refining(tier, ArmMutant::None, &lossy::empty_restarts())
+            .unwrap_or_else(|e| panic!("the refinement arm at {tier}: {e}"));
+        for (arm, fresh) in [
+            ("file", file.refined.fresh_ids),
+            ("device", device.fresh_ids),
+        ] {
+            assert!(
+                fresh >= 3,
+                "{arm} arm at {tier}: {fresh} opens settled another log, not the empty \
+                 ones and the retired one"
+            );
+        }
+    }
+    for (mutant, tier) in [
+        (ArmMutant::NeverMints, Tier::Strict),
+        (ArmMutant::MintKeepsGeneration, Tier::Relaxed),
+    ] {
+        let Err(e) = run(tier, mutant, &lossy::empty_restarts()) else {
+            panic!("CONTROL {mutant:?} at {tier}: answered as astream answers it");
+        };
+        eprintln!("CONTROL {mutant:?} caught: {e}");
+    }
+}
+
+/// **A POISONED LOG ANSWERS AS ASTREAM'S DOES** (ATERM-KI-1111-4): [`lossy::poisoned`] on the
+/// refinement arm on Ordered and Relaxed and on the file arm on Relaxed, and
+/// [`lossy::strict_settle`] on Strict on both: each full flush the model fails is a full flush
+/// the real arm's `InjectedFaults::sync` fails while the request is served
+/// ([`answer_faulted`]), every answer compared, and each reopen after the lossy run held to
+/// [`bus::law_check`] ([`opened`]). Not vacuous: each run failed a flush on both arms and held a
+/// lossy reopen to the law.
+#[test]
+fn a_poisoned_log_answers_as_astreams_does() {
+    let mut runs: Vec<(String, Result<Refined, String>)> = Vec::new();
+    for tier in [Tier::Ordered, Tier::Relaxed]
+        .into_iter()
+        .filter(|&tier| served_here(tier))
+    {
+        runs.push((
+            format!("poisoned on the device at {tier}"),
+            run_refining(tier, ArmMutant::None, &lossy::poisoned()),
+        ));
+    }
+    runs.push((
+        "poisoned on the file at Relaxed".to_string(),
+        run_keeping(
+            Tier::Relaxed,
+            None,
+            None,
+            None,
+            ArmMutant::None,
+            &lossy::poisoned(),
+        )
+        .map(|real| real.refined),
+    ));
+    runs.push((
+        "a Strict settle on the device".to_string(),
+        run_refining(Tier::Strict, ArmMutant::None, &lossy::strict_settle()),
+    ));
+    runs.push((
+        "a Strict settle on the file".to_string(),
+        run_keeping(
+            Tier::Strict,
+            None,
+            None,
+            None,
+            ArmMutant::None,
+            &lossy::strict_settle(),
+        )
+        .map(|real| real.refined),
+    ));
+    let mut failed = Vec::new();
+    for (what, verdict) in &runs {
+        match verdict {
+            Ok(r) => {
+                eprintln!("{what}: {r:?}");
+                if r.poisoned == 0 || r.lossy_reopens == 0 {
+                    failed.push(format!("{what}: vacuous: {r:?}"));
+                }
+            }
+            Err(e) => failed.push(format!("{what}: {e}")),
+        }
+    }
+    assert!(failed.is_empty(), "{}", failed.join("\n"));
 }
 
 /// THE DRIFT each fix in `bus.rs` this test found once undid, as an
@@ -3324,6 +3872,36 @@ fn drift() -> Vec<(ArmMutant, Vec<Step>, &'static str)> {
             ArmMutant::RateLatchesNoFence,
             scripts::rate_limited(),
             "a refusal for the rate that fenced nothing",
+        ),
+        (
+            ArmMutant::NeverMints,
+            lossy::empty_restarts(),
+            "an empty log's open that keeps its id",
+        ),
+        (
+            ArmMutant::MintKeepsGeneration,
+            lossy::empty_restarts(),
+            "another log that keeps the generation it had",
+        ),
+        (
+            ArmMutant::NeverPoisons,
+            lossy::poisoned(),
+            "a full flush that fails and poisons nothing",
+        ),
+        (
+            ArmMutant::PoisonKeepsGeneration,
+            lossy::poisoned(),
+            "the reopen of a lossy run that keeps its identity",
+        ),
+        (
+            ArmMutant::PoisonWithoutLatch,
+            lossy::poisoned(),
+            "a poisoned weak tier that serves its own tier",
+        ),
+        (
+            ArmMutant::PoisonedWritesLand,
+            lossy::poisoned(),
+            "a write that lands on a poisoned log",
         ),
     ]
 }

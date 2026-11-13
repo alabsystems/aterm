@@ -29,6 +29,7 @@ mod handoff_alt_screen_checkpoint;
 mod handoff_colour_and_shell_carry;
 mod handoff_parser_carry;
 mod handoff_saved_cursor_after_shrink;
+mod handoff_visible_cells;
 mod history_shed_alt_screen;
 mod image_horizon_offload;
 mod image_survives_column_reflow;

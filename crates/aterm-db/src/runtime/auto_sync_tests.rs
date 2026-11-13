@@ -368,7 +368,6 @@ fn a_request_retirement_reaches_the_holder_and_cleans_its_private_give_without_a
     need::retire(
         requester_paths,
         "mailbox:withdrawn",
-        false,
         "scratch request ended",
     )
     .unwrap();

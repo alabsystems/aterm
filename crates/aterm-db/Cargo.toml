@@ -8,12 +8,20 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "Embedded encrypted replicated application database over astream"
+[features]
+# The one `aterm_types::dev_seam!` read here: `ATERM_DEV_FLEET_FIXTURE`, which holds the fleet
+# tables to `fleet::fixture`'s lab (`fleet::fixture::under_seam`). A debug build compiles it
+# anyway; the release cutter never enables this (aterm's and aterm-gui's `dev-seams` forward
+# here), so a shipped binary reads no fixture.
+dev-seams = []
 [dependencies]
 # The grid round trip reads and writes a TSV with amacs's own table codec, so a lab table edited
 # in amacs's spreadsheet mode comes back exactly as the grid committed it.
 amacs.workspace = true
 aterm-db-core.workspace = true
 aterm-secrets.workspace = true
+# The update record type `alab::journal::upd` publishes (the updater itself is no dependency).
+aterm-update-core.workspace = true
 aterm-http.workspace = true
 serde.workspace = true
 aterm-spec-anchor.workspace = true

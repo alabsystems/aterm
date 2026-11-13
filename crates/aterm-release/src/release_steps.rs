@@ -338,6 +338,10 @@ pub struct Real {
     prefreeze_claim: Option<aterm_capacity::Claim>,
     prefrozen_step1: Option<PrefrozenStep1>,
     pub(crate) build_inputs: fn() -> Result<String, String>,
+    /// Whether the seal this process holds is still the named one, by status alone and whatever
+    /// interrupt was caught ([`crate::build_inputs::held`]): what an interrupted cut asks before
+    /// it records the rows its verifier finished.
+    pub(crate) inputs_held: fn(&str) -> bool,
     /// Keeps this process's build-inputs seal in the release state, its reports also in the
     /// named log ([`crate::build_inputs::arm`]).
     pub(crate) arm_inputs: fn(&Path, Option<&Path>),
@@ -366,8 +370,7 @@ pub struct Real {
     engine_source: PathBuf,
     /// The engine this release runs, syncs, reads and hands every child as `PUBLICATION_ENGINE`:
     /// its own copy ([`aterm_verify::engine::engine_copy`], made from `engine_source`'s origin by
-    /// [`Real::engine_copy`], at a real run's step 1 where the clone has none
-    /// ([`Real::engine_first_copy`])); in a dry run, which never makes or moves one,
+    /// [`Real::engine_copy`] at Sync); in a dry run, which never makes or moves one,
     /// `engine_source` until a real run has made it.
     engine: PathBuf,
     /// Captured once, when the release starts, and handed with `engine_source` to its own frozen
@@ -427,6 +430,8 @@ pub struct Real {
     line_priority: Option<aterm_capacity::Claim>,
     fleet_line: Option<crate::line_claim::Claim>,
     fleet_holder: Option<(String, String)>,
+    /// The fleet claim last read is another Mac's (`line_claim::Existing::elsewhere`).
+    fleet_elsewhere: bool,
     /// The qualify graph's one pool ([`Backend::qualify_begin`]), handed to every child it starts.
     pool: Option<Pool>,
     warming: Option<WarmingVerifier>,
@@ -612,6 +617,7 @@ struct RealBranches<'a> {
     /// lint restores the private shares; queued lint transfers the whole allocation to build.
     admission_barrier: std::sync::Mutex<Option<aterm_capacity::InitialReservation<'a>>>,
     tree_index: TreeIndexHandoff,
+    shared_tree: std::sync::Mutex<Option<SharedTreeMemory>>,
 }
 
 /// The tree branch's one-way handoff to the fixture consumer. The index file itself carries the
@@ -841,9 +847,40 @@ impl Branches for RealBranches<'_> {
         await_tree_memory_with_barrier(
             &self.admission_barrier,
             &|| ended() || interrupt::caught().is_some(),
-            || tree_lint_claim(me),
+            || {
+                let (observation, queued) = tree_lint_claim(me);
+                if queued.is_some() {
+                    *self
+                        .shared_tree
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = queued;
+                }
+                observation
+            },
             || std::thread::sleep(std::time::Duration::from_secs(1)),
         )
+    }
+
+    fn lend_tree_cpu(&self, ended: &dyn Fn() -> bool) {
+        let claim = self
+            .shared_tree
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let (Some(claim), Some(pool), Some(ledger)) = (
+            claim,
+            self.real.pool.as_ref(),
+            aterm_capacity::Ledger::user(),
+        ) else {
+            return;
+        };
+        let _ = await_tree_cpu_lending(
+            &pool.jobs,
+            &claim,
+            &|| ended() || interrupt::caught().is_some(),
+            || claim.held(&ledger),
+            || std::thread::sleep(std::time::Duration::from_secs(1)),
+        );
     }
 
     fn release_admission_barrier(&self) {
@@ -1236,6 +1273,143 @@ enum TreeLintObservation {
     Unavailable,
 }
 
+/// The exact shared-memory claim vetted by the tree's initial admission observation, already
+/// held or still queued. Later CPU loans require this same held claim; ALONE retains its path.
+#[derive(Clone, Debug)]
+pub(crate) struct SharedTreeMemory {
+    record: aterm_capacity::Record,
+}
+
+impl SharedTreeMemory {
+    pub(crate) fn new(record: &aterm_capacity::Record, state: TreeLintClaim) -> Option<Self> {
+        let shared = match (state, record.held) {
+            (TreeLintClaim::Waiting, None) => true,
+            (TreeLintClaim::Held, Some(held)) => !held.alone,
+            _ => false,
+        };
+        (shared && !record.need.alone).then(|| Self {
+            record: record.clone(),
+        })
+    }
+
+    fn held_in(&self, records: &[aterm_capacity::Record]) -> Option<aterm_capacity::Held> {
+        records.iter().find_map(|record| {
+            (record.order() == self.record.order()
+                && record.accounting == self.record.accounting
+                && record.checkout == self.record.checkout
+                && record.need == self.record.need)
+                .then_some(record.held)
+                .flatten()
+                .filter(|held| !held.alone)
+        })
+    }
+
+    pub(crate) fn held(&self, ledger: &aterm_capacity::Ledger) -> Option<aterm_capacity::Held> {
+        let first = ledger.list().ok()?;
+        let held = self.held_in(&first)?;
+        let second = ledger.list().ok()?;
+        (self.held_in(&second) == Some(held)).then_some(held)
+    }
+}
+
+/// Lend free build CPU to the exact admitted tree claim while retaining the build's protected
+/// half. Each transfer requires two consistent ledger reads. The observer's lifetime is not
+/// a starvation interval: a tree can already be doing useful work with its initial token.
+pub(crate) fn await_tree_cpu_lending(
+    jobs: &aterm_capacity::BranchShares,
+    claim: &SharedTreeMemory,
+    ended: &dyn Fn() -> bool,
+    mut held: impl FnMut() -> Option<aterm_capacity::Held>,
+    mut pause: impl FnMut(),
+) -> Option<aterm_json::Value> {
+    let started_ms = crate::cut_timing::epoch_ms();
+    let mut observed_held = false;
+    let mut transfers = Vec::new();
+    let mut total = 0_u32;
+    while !ended() && jobs.compiler_branches_active() {
+        match held().filter(|held| !held.alone) {
+            Some(held) => {
+                observed_held = true;
+                match jobs.lend_free_build_to_admitted_tree() {
+                    Ok(0) => {}
+                    Ok(moved) => {
+                        let record = &claim.record;
+                        let event = aterm_json::json!({
+                            "event":"qualify-tree-core-lent", "schema":1,
+                            "process_id":std::process::id(), "resource":"core",
+                            "at_unix_ms":crate::cut_timing::epoch_ms(),
+                            "claim":{"pid":record.pid,"start_ms":record.start_ms,"seq":record.seq},
+                            "claim_admitted_at_unix_ms":held.admitted_ms,
+                            "initial_memory_state":if record.held.is_some() { "held" } else { "queued" },
+                            "transferred_cores":moved, "memory_alone":false,
+                            "build_floor":"half the non-export allocation, rounded up",
+                        });
+                        eprintln!("release-event: {event}");
+                        transfers.push(event);
+                        total += moved;
+                    }
+                    Err(error) => {
+                        eprintln!("qualify-pool shared tree CPU lending unavailable: {error}");
+                        break;
+                    }
+                }
+            }
+            None if observed_held => break,
+            None => {}
+        }
+        pause();
+    }
+    (!transfers.is_empty()).then(|| {
+        aterm_json::json!({
+            "event":"qualify-tree-core-lending-finished", "schema":1,
+            "observed_from_unix_ms":started_ms,
+            "observed_until_unix_ms":crate::cut_timing::epoch_ms(),
+            "observer_residence_is_starvation":false,
+            "transferred_cores":total, "transfers":transfers,
+        })
+    })
+}
+
+/// Watch an already queued claim without admitting or resizing it. Only an actually free CPU
+/// byte moves; the existing build-completion handoff remains the fallback on tiny grants,
+/// unread observations, cancellation or a failed FIFO read.
+pub(crate) fn await_tree_cpu_resumption(
+    jobs: &aterm_capacity::BranchShares,
+    queued: &SharedTreeMemory,
+    ended: &dyn Fn() -> bool,
+    mut held: impl FnMut() -> Option<aterm_capacity::Held>,
+    mut pause: impl FnMut(),
+) -> Option<aterm_json::Value> {
+    let started_ms = crate::cut_timing::epoch_ms();
+    while !ended() && jobs.serial_tree_waiting() {
+        if let Some(held) = held().filter(|held| !held.alone) {
+            match jobs.resume_admitted_tree() {
+                Ok(true) => {
+                    let record = &queued.record;
+                    let event = aterm_json::json!({
+                        "event":"qualify-tree-core-resumed", "schema":1,
+                        "process_id":std::process::id(), "resource":"core",
+                        "started_at_unix_ms":started_ms,
+                        "ended_at_unix_ms":crate::cut_timing::epoch_ms(),
+                        "claim":{"pid":record.pid,"start_ms":record.start_ms,"seq":record.seq},
+                        "claim_admitted_at_unix_ms":held.admitted_ms,
+                        "transferred_cores":1, "memory_alone":false,
+                    });
+                    eprintln!("release-event: {event}");
+                    return Some(event);
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("qualify-pool queued tree CPU handoff unavailable: {error}");
+                    return None;
+                }
+            }
+        }
+        pause();
+    }
+    None
+}
+
 /// Wait for the tree's early claim. Once the slice parent is known held, an unread detector can
 /// safely release the CPU barrier: the private slice budget is already protected from tree
 /// claims. An immediate verifier admission failure ends the tree and reaches `ended`.
@@ -1282,28 +1456,32 @@ fn await_tree_memory_with_barrier(
     )
 }
 
-fn tree_lint_claim(me: u32) -> TreeLintObservation {
+fn tree_lint_claim(me: u32) -> (TreeLintObservation, Option<SharedTreeMemory>) {
     let Some(shapes) = tree_lint_claim_shapes() else {
-        return TreeLintObservation::Unavailable;
+        return (TreeLintObservation::Unavailable, None);
     };
     let Some(ledger) = aterm_capacity::Ledger::user() else {
-        return TreeLintObservation::Unavailable;
+        return (TreeLintObservation::Unavailable, None);
     };
     let Ok(records) = ledger.list() else {
-        return TreeLintObservation::Unavailable;
+        return (TreeLintObservation::Unavailable, None);
     };
     let Some(procs) = interrupt::listing() else {
-        return TreeLintObservation::Unavailable;
+        return (TreeLintObservation::Unavailable, None);
     };
-    tree_lint_claim_in(me, &records, &procs, &shapes)
-        .map(TreeLintObservation::Claim)
-        .unwrap_or(TreeLintObservation::Missing)
+    match selected_tree_lint_claim(me, &records, &procs, &shapes) {
+        Some((record, state)) => (
+            TreeLintObservation::Claim(state),
+            SharedTreeMemory::new(record, state),
+        ),
+        None => (TreeLintObservation::Missing, None),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TreeLintClaim {
-    /// The whole-lint claim stands beside the slice parent: one tree compiler may overlap build
-    /// under the build-first split.
+    /// The whole-lint claim stands beside the slice parent. The initial build-first split lets
+    /// tree begin; its exact held shared claim can then qualify for free CPU loans.
     Held,
     /// The whole-lint claim is queued. Release CPU tokens so build can finish and
     /// free its parent; lint remains bounded and then runs serially on a smaller host.
@@ -1314,12 +1492,22 @@ pub(crate) enum TreeLintClaim {
     Invalid,
 }
 
+#[cfg(test)]
 fn tree_lint_claim_in(
     me: u32,
     records: &[aterm_capacity::Record],
     procs: &[interrupt::Proc],
     shapes: &[TreeLintClaimShape],
 ) -> Option<TreeLintClaim> {
+    selected_tree_lint_claim(me, records, procs, shapes).map(|(_, state)| state)
+}
+
+fn selected_tree_lint_claim<'a>(
+    me: u32,
+    records: &'a [aterm_capacity::Record],
+    procs: &[interrupt::Proc],
+    shapes: &[TreeLintClaimShape],
+) -> Option<(&'a aterm_capacity::Record, TreeLintClaim)> {
     let parent: std::collections::BTreeMap<i32, i32> = procs
         .iter()
         .map(|process| (process.pid, process.parent))
@@ -1335,7 +1523,7 @@ fn tree_lint_claim_in(
         }
         false
     };
-    let mut outcome = None;
+    let mut outcome: Option<(&aterm_capacity::Record, TreeLintClaim)> = None;
     for record in records.iter().filter(|record| descends(record.pid)) {
         let Some(this) = classify_tree_lint_claim(record, shapes) else {
             continue;
@@ -1343,7 +1531,10 @@ fn tree_lint_claim_in(
         // Duplicate live rows can briefly coexist while a process hands a claim on. Their file
         // order is not policy: a held valid row dominates a queued one, and either dominates a
         // malformed row with the same production label.
-        outcome = Some(stronger_tree_lint_claim(outcome, this));
+        let stronger = stronger_tree_lint_claim(outcome.map(|(_, state)| state), this);
+        if outcome.is_none_or(|(_, state)| state != stronger) {
+            outcome = Some((record, stronger));
+        }
     }
     outcome
 }
@@ -1480,6 +1671,7 @@ impl Real {
             prefrozen_step1: None,
             automatic_prefreeze: None,
             build_inputs: crate::build_inputs::current,
+            inputs_held: crate::build_inputs::held,
             arm_inputs: crate::build_inputs::arm,
             arm_prefrozen_inputs: crate::build_inputs::arm_prefrozen,
             handed_inputs: crate::build_inputs::handed_path,
@@ -1521,6 +1713,7 @@ impl Real {
             line_priority: None,
             fleet_line: None,
             fleet_holder: None,
+            fleet_elsewhere: false,
             pool: None,
             warming: None,
             warm_verifier: None,
@@ -2415,28 +2608,46 @@ impl Real {
     /// Step 1's read of the engine's origin main ([`Real::origin_main`]), or why it could not
     /// be read. An engine that names no origin is step 1's own refusal
     /// ([`Real::engine_unready`]), so it reads nothing here.
-    fn fetch_engine_origin(&mut self) -> Result<(), Refusal> {
+    pub(crate) fn fetch_engine_origin(&mut self) -> Result<(), Refusal> {
         if let Ok(engine_origin) = self.source_origin() {
             self.origin_main = Some(self.read_origin_main(&engine_origin)?);
         }
         Ok(())
     }
 
-    /// A real run's first engine: where this clone holds no copy of its own yet, make it
-    /// ([`Real::engine_copy`]) as step 1 fetches the engine's origin, so nothing step 1 asks
-    /// after that fetch meets a checkout that is not there: its input judgment
-    /// ([`Backend::input_checks`]) seals the HEAD of the engine it hands its verifier, a step
-    /// before the sync. A copy that is there is the sync's to point and fast-forward
-    /// ([`Real::engine_sync`]); a dry run makes none and keeps the engine it was named; an
-    /// engine that names no origin is step 1's own refusal ([`Real::engine_unready`]).
-    ///
-    /// # Errors
-    /// The copy could not be made: [`Real::engine_copy`]'s refusal, as COULD NOT RUN.
-    fn engine_first_copy(&self) -> Result<(), Refusal> {
-        if self.scratch_logs || self.engine.join(".git").exists() || self.source_origin().is_err() {
-            return Ok(());
-        }
-        self.engine_copy().map_err(Refusal::could_not_run)
+    /// Capture one policy for a source-reader judgment. Before sync it is the retained
+    /// authenticated origin snapshot; after sync it is the owned engine's exact commit.
+    fn input_engine(&self) -> Result<crate::input_record::EngineInput, String> {
+        let authority = self.engine_repository.as_ref().map_err(Clone::clone)?;
+        let (git_dir, commit) = if !self
+            .engine_synced
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            let snapshot = self
+                .origin_main
+                .as_ref()
+                .ok_or("release input has no retained publication engine snapshot")?;
+            let git_dir = snapshot.git_dir();
+            let _bound = self.engine_remote(&git_dir)?;
+            (git_dir, snapshot.commit().to_owned())
+        } else {
+            let _bound = self.engine_remote(&self.engine)?;
+            let mut command = crate::ledger::object_git(&self.engine).map_err(|e| e.to_string())?;
+            command.args(["rev-parse", "--absolute-git-dir", "HEAD^{commit}"]);
+            let output = self
+                .output_forwarded(&mut command)
+                .map_err(|e| e.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+            }
+            let text = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+            let lines: Vec<_> = text.lines().collect();
+            if lines.len() != 2 {
+                return Err("the publication engine did not name one directory and commit".into());
+            }
+            (PathBuf::from(lines[0]), lines[1].to_owned())
+        };
+        crate::input_record::EngineInput::selected(&self.engine, authority, git_dir, commit)
     }
 
     /// Refresh source refs before admitting `--fix`, without reading the engine or roster.
@@ -2454,8 +2665,8 @@ impl Real {
 
     /// Step 1's reads of both origins: aterm's main and tags through `aterm` (agh's fetch, in
     /// `Backend::fetch`), then the engine's main ([`Real::fetch_engine_origin`]), which step 1
-    /// judges the ledger and `bin/pub` on until step 2 syncs the release's engine, and a real
-    /// run's first copy of that engine ([`Real::engine_first_copy`]); aterm's main.
+    /// judges through its retained snapshot until step 2 creates or syncs the operational
+    /// engine. Neither dry nor real preflight needs an operational copy; aterm's main.
     fn fetch_origins(
         &mut self,
         aterm: impl FnOnce(&Path) -> Result<crate::github_remote::FetchedOrigin, String>,
@@ -2472,7 +2683,6 @@ impl Real {
             .map_err(|why| cut_refusal("owned bump recovery", &why))?;
         }
         self.fetch_engine_origin()?;
-        self.engine_first_copy()?;
         Ok(origin.main)
     }
 
@@ -2695,14 +2905,23 @@ impl Real {
         Ok(())
     }
 
+    /// The engine's origin is a main every publisher and session appends records to, so the
+    /// expected-old write of this release's rows can lose to another's. A lost write leaves the
+    /// rows committed here, and the next pass fetches that main, merges it (the audit log merges
+    /// by union) and writes again: a moved main costs a pass, never the stage that made the rows.
     fn engine_fast_forward(&self) -> Result<(), Refusal> {
+        landed_within(ENGINE_RECORD_PASSES, || self.engine_records_pass())
+    }
+
+    fn engine_records_pass(&self) -> Result<(), NotLanded> {
         let e = self.engine.display().to_string();
         let (native, tip) = self.refreshed_engine()?;
         if self.engine_dirty() {
             return Err(Refusal::new(
                 format!("the release's engine {e} has local changes besides its audit log"),
                 copy_remedy(&e, "status --short"),
-            ));
+            )
+            .into());
         }
         let rows: Vec<String> = self
             .engine_git(&["diff", "verification-log.jsonl"])
@@ -2726,7 +2945,7 @@ impl Real {
                 let text = crate::durable::read_text(&path).unwrap_or_default();
                 let _ = crate::durable::write_fresh(&path, audit_rows_merged(&text, &rows));
             }
-            Err(refusal)
+            Err(NotLanded::Refused(refusal))
         };
         // Commits its origin lacks are records whose push failed (an audit row's, a ledger row
         // `pub publish` made): nothing else writes this engine, so nothing else delivers them.
@@ -2793,51 +3012,51 @@ impl Real {
             }
             let written = self.engine_commit("HEAD").and_then(|head| {
                 let head = head.ok_or("the engine has no records commit")?;
-                match native.write_ref("refs/heads/main", Some(&tip), &head)? {
-                    crate::ledger::RefWrite::Written => Ok(()),
-                    crate::ledger::RefWrite::Transient(why) => Err(why),
-                    crate::ledger::RefWrite::Conflict => {
-                        Err("the engine main moved before its records could land".into())
-                    }
-                }
+                native.write_ref("refs/heads/main", Some(&tip), &head)
             });
-            return written.map_err(|why| {
+            let refusal = |why: String| {
                 Refusal::new(
                     format!("could not push the records the engine {e} holds to its origin's main"),
                     format!("{RELEASE_COMMAND} again (they stay in {e} until they land)"),
                 )
                 .detail([why])
-            });
+            };
+            return not_landed(
+                written,
+                "the engine main moved before its records could land",
+                refusal,
+            );
         }
         let path = self.engine.join("verification-log.jsonl");
         let text = crate::durable::read_text(&path).unwrap_or_default();
         let merged = audit_rows_merged(&text, &rows);
-        let recorded = crate::durable::write_fresh(&path, merged).is_ok()
-            && self
-                .engine_git(&[
+        let recorded = crate::durable::write_fresh(&path, merged)
+            .map_err(|why| format!("could not write {}: {why}", path.display()))
+            .and_then(|()| {
+                let (code, out) = self.engine_git_code(&[
                     "commit",
                     "-q",
                     "-m",
                     "chore(audit): record stage verification rows",
                     "--",
                     "verification-log.jsonl",
-                ])
-                .is_some();
-        let published = if recorded {
-            self.engine_commit("HEAD").and_then(|head| {
-                let head = head.ok_or("the engine has no audit commit")?;
-                match native.write_ref("refs/heads/main", Some(&tip), &head)? {
-                    crate::ledger::RefWrite::Written => Ok(()),
-                    crate::ledger::RefWrite::Transient(why) => Err(why),
-                    crate::ledger::RefWrite::Conflict => {
-                        Err("the engine's main changed before the audit commit could land".into())
-                    }
+                ])?;
+                if code == 0 {
+                    Ok(())
+                } else {
+                    Err(format!(
+                        "git -C {e} commit exited {code}: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    ))
                 }
-            })
-        } else {
-            Err("the local audit commit could not be recorded".into())
-        };
-        published.map_err(|why| {
+            });
+        let published = recorded.and_then(|()| {
+            let head = self
+                .engine_commit("HEAD")?
+                .ok_or("the engine has no audit commit")?;
+            native.write_ref("refs/heads/main", Some(&tip), &head)
+        });
+        let refusal = |why: String| {
             Refusal::new(
                 "could not record the engine's audit rows (commit and push of \
                  verification-log.jsonl)",
@@ -2847,7 +3066,12 @@ impl Real {
                 ),
             )
             .detail([why])
-        })
+        };
+        not_landed(
+            published,
+            "the engine's main changed before the audit commit could land",
+            refusal,
+        )
     }
 
     fn engine_dirty(&self) -> bool {
@@ -4668,6 +4892,11 @@ impl Real {
                     "compiler or SDK bytes changed during release verification".into(),
                 )));
             }
+            // An interrupt this cut caught ends the seal's own walk too. The run it stopped
+            // still judged R's tree under this seal where the held seal stands by status, so
+            // what its verifier finished is recorded: each FAIL it showed, and each test binary
+            // and lint package that passed, which the next hop may be offered.
+            Err(_) if (self.inputs_held)(&seal) => {}
             Err(e) => return Err(abandoned(unsealed(e))),
         }
         let log_sha256 = crate::artifact::file_sha256(&log).unwrap_or_else(|e| {
@@ -5155,10 +5384,10 @@ struct LoggedPipe {
 
 impl LoggedPipe {
     fn new() -> std::io::Result<(Self, std::io::PipeWriter, std::io::PipeWriter)> {
-        let (reader, writer) = std::io::pipe()?;
+        let (reader, writer) = aterm_uds::pipe()?;
         let stderr = writer.try_clone()?;
         #[cfg(unix)]
-        let (cancel_reader, cancel_writer) = std::io::pipe()?;
+        let (cancel_reader, cancel_writer) = aterm_uds::pipe()?;
         Ok((
             Self {
                 reader,
@@ -5744,6 +5973,64 @@ fn engine_code(path: &str) -> bool {
         || path.starts_with("crates/");
     let prose = path.starts_with("docs/") || (!path.contains('/') && path.ends_with(".md"));
     !path.is_empty() && !engine_data_plane(path) && !port && !prose
+}
+
+/// The passes [`Real::engine_fast_forward`] makes over a main that keeps moving before it
+/// refuses: each lost pass means another writer's records landed, so five in a row is a main
+/// written faster than a fetch, a merge and a push, which no further pass here outruns.
+const ENGINE_RECORD_PASSES: usize = 5;
+
+/// Why one pass did not land the engine's records on its origin's main.
+#[derive(Debug)]
+enum NotLanded {
+    /// The origin's main moved between this pass's fetch and its expected-old write. The records
+    /// are a commit of the engine, and another pass merges that main and writes again.
+    Moved(Refusal),
+    /// Anything else: another pass would meet it again.
+    Refused(Refusal),
+}
+
+impl From<Refusal> for NotLanded {
+    fn from(refusal: Refusal) -> Self {
+        Self::Refused(refusal)
+    }
+}
+
+/// One expected-old write's outcome as a pass's: a conflict is a moved main, and a transient
+/// fault or an unreadable commit is refused with its cause.
+fn not_landed(
+    written: Result<crate::ledger::RefWrite, String>,
+    moved: &str,
+    refusal: impl Fn(String) -> Refusal,
+) -> Result<(), NotLanded> {
+    match written {
+        Ok(crate::ledger::RefWrite::Written) => Ok(()),
+        Ok(crate::ledger::RefWrite::Conflict) => Err(NotLanded::Moved(refusal(moved.into()))),
+        Ok(crate::ledger::RefWrite::Transient(why)) | Err(why) => {
+            Err(NotLanded::Refused(refusal(why)))
+        }
+    }
+}
+
+/// Repeat `pass` while it loses only to a moved main, at most `passes` times; the last lost
+/// pass's refusal says how many were made.
+fn landed_within(
+    passes: usize,
+    mut pass: impl FnMut() -> Result<(), NotLanded>,
+) -> Result<(), Refusal> {
+    for made in 1..=passes {
+        match pass() {
+            Ok(()) => return Ok(()),
+            Err(NotLanded::Refused(refusal)) => return Err(refusal),
+            Err(NotLanded::Moved(refusal)) if made == passes => {
+                return Err(refusal.detail([format!(
+                    "its origin's main moved before each of {passes} writes"
+                )]));
+            }
+            Err(NotLanded::Moved(_)) => {}
+        }
+    }
+    unreachable!("the last pass returns")
 }
 
 /// Each kept audit row put back in time order (the pub-sync pattern).
@@ -7927,6 +8214,83 @@ impl Real {
         Ok((msg, declared))
     }
 
+    /// The bump commit `from` -> `to` on `origin`'s main, pushed as a compare-and-swap on the
+    /// tip it was edited on and recomposed on a moved one, at most
+    /// [`crate::bump_claim::MAX_ATTEMPTS`] times ([`crate::bump_claim::push`]): what `--bump`
+    /// starts a line at and `--open-next` leaves on main with no line. `submodules` brings the
+    /// checkout's submodule to the gitlink of the commit it is on.
+    fn bump_on(
+        &mut self,
+        from: &str,
+        to: &str,
+        prover: &Prover,
+        origin: &crate::github_remote::Remote,
+        submodules: &dyn Fn(&Self) -> Result<(), Refusal>,
+    ) -> Result<String, Refusal> {
+        let undo = |s: &mut Self| {
+            let _ = s.git().git(&["checkout", "-q", "--", "."]);
+        };
+        let journal = self.release.join("bump-claim.json");
+        let tip = self
+            .git_out(&["rev-parse", "origin/main"])
+            .unwrap_or_default();
+        let git = GitCli::new(&self.repo);
+        let log = self.step_log(self.step);
+        let bumped = crate::bump_claim::push(
+            &git,
+            &journal,
+            tip,
+            |tip| {
+                self.main_to(tip)?;
+                {
+                    let _phase = crate::cut_timing::Timer::start(
+                        &self.step_log(self.step),
+                        "bump-submodule-sync",
+                    );
+                    submodules(self)?;
+                }
+                let cur = self.version_at("HEAD").unwrap_or_default();
+                if cur != from {
+                    return Err(Refusal::new(
+                        format!(
+                            "origin/main's version moved to {cur} while this release bumped {from}"
+                        ),
+                        format!(
+                            "{RELEASE_COMMAND} again (without --bump when {cur} is unreleased)"
+                        ),
+                    ));
+                }
+                let (msg, declared) = self.edit_bump(from, to, prover, origin)?;
+                let mut commit = local_git()?;
+                commit
+                    .args(["commit", "-q", "-m", &msg, "--"])
+                    .args(&declared)
+                    .current_dir(&self.repo);
+                let commit_timing =
+                    crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-git-commit");
+                if self.logged(Step::Commit, &mut commit).code != 0 {
+                    undo(self);
+                    return Err(Refusal::new(
+                        "could not commit the bump; it is undone",
+                        "read the commit step's log",
+                    ));
+                }
+                drop(commit_timing);
+                let bumped = self.head();
+                crate::bump_claim::record(&self.git(), &journal, &msg, declared)
+                    .map_err(|why| cut_refusal("bump custody journal", &why))?;
+                Ok(bumped)
+            },
+            |tip, bumped| {
+                let _timing = crate::cut_timing::Timer::start(&log, "bump-native-ref-write");
+                origin.write_ref("refs/heads/main", Some(tip), bumped)
+            },
+            || origin.refresh_main(),
+        )?;
+        submodules(self)?;
+        Ok(bumped)
+    }
+
     /// The bump `c` names, committed in this release's private input checkout and on no ref.
     /// The editor's own refusals ([`Real::edit_bump`]) are verdicts on the tree; a failure of
     /// the construction around it (the checkout, its path, a git step, the cleanup) judged
@@ -8034,13 +8398,6 @@ impl Real {
         let claim = crate::input_record::claim(&self.release)?;
         let root = crate::input_record::directory(&self.release);
         crate::input_record::checkout(&self.git(), &root, commit)?;
-        if root.join(".gitmodules").exists() {
-            crate::ledger::git_ok(
-                &GitCli::new(&root),
-                &["submodule", "update", "--init", "vendor/astream"],
-            )
-            .map_err(|e| e.to_string())?;
-        }
         Ok((root, claim))
     }
 
@@ -8064,6 +8421,7 @@ impl Real {
         };
         let mut report = |gate: &str, refusal: &Refusal| notice.emit(gate, refusal);
         let git = self.git();
+        let run = self.run_name();
         // Bracket remote readers, but never pay for an inputs seal before a cheap red.
         let tags = (!dry).then(|| {
             crate::cut_timing::measure("commit-gate tags", || {
@@ -8178,6 +8536,7 @@ impl Real {
                 }
                 let inputs = crate::build_inputs::current()?;
                 crate::gates::CommitGateRecord::new(&c.commit, &c.version, inputs, tags)
+                    .judged_by(&run)
                     .save(&git)
                     .map_err(|e| e.to_string())
             })();
@@ -8192,6 +8551,69 @@ impl Real {
             notes,
             found: blocks,
         }
+    }
+
+    /// This run's name: its log directory's.
+    fn run_name(&self) -> String {
+        self.logs
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
+
+    /// [`Backend::commit_gates_standing`] over `origin`: the record's four inputs are read
+    /// now (origin's advertised tags, this machine's build-inputs seal), never taken from the
+    /// journal, and a record that names no run carries nothing.
+    fn commit_gates_standing_at(
+        &mut self,
+        c: &Candidate,
+        origin: crate::ledger::Result<crate::github_remote::Remote>,
+    ) -> Option<(String, Vec<Refusal>)> {
+        let log = self.step_log(self.step);
+        let _timing = crate::cut_timing::Timer::start(&log, "commit-preflight carry");
+        let git = self.git();
+        let recorded = (|| {
+            let tags = crate::cut_timing::measure("commit-gate tags", || {
+                origin
+                    .as_ref()
+                    .map_err(ToString::to_string)?
+                    .tag_fingerprint()
+            })?;
+            let inputs = crate::build_inputs::current()?;
+            crate::gates::CommitGateRecord::new(&c.commit, &c.version, inputs, tags)
+                .recorded(&git)
+                .map_err(|e| e.to_string())?
+                .ok_or_else(|| "the record names no run".to_owned())
+        })();
+        let transcript = self.transcript();
+        let run = match recorded {
+            Ok(run) => run,
+            Err(why) => {
+                say_to(
+                    &transcript,
+                    &format!(
+                        "        commit preflight: nothing carried ({why}); every gate is asked"
+                    ),
+                );
+                return None;
+            }
+        };
+        let notice = CommitGateNotice {
+            candidate: c,
+            step: self.step,
+            gate_dry: false,
+            log: &log,
+            transcript: &transcript,
+        };
+        let mut report = |gate: &str, refusal: &Refusal| notice.emit(gate, refusal);
+        let mut blocks = Vec::new();
+        let _ = check_commit_gate("prerequisites", &mut blocks, &mut report, || {
+            crate::cut_timing::measure("commit-gate prerequisites", || self.prepare_prerequisites())
+        });
+        let _ = check_commit_gate("engine readiness", &mut blocks, &mut report, || {
+            self.engine_readiness()
+        });
+        Some((run, blocks))
     }
 }
 
@@ -8374,6 +8796,47 @@ fn cached_prefrozen_seal(real: &Real, commit: &str) -> Option<(String, PathBuf)>
     let seal = cutter.inputs?.seal;
     let path = (real.prefrozen_inputs)(&cache.join("state"), &seal)?;
     Some((seal, path))
+}
+
+impl Real {
+    /// Run `f` over the claim plan a reservation of `c` makes: this clone's git, its native
+    /// origin, the plan (its harness window's start from origin's tags) and today's date in Los
+    /// Angeles, which the roll is dated.
+    fn with_claim_plan<T>(
+        &mut self,
+        c: &Candidate,
+        f: impl FnOnce(
+            &dyn crate::ledger::GitRunner,
+            &dyn crate::ledger::Origin,
+            &crate::ledger::ClaimPlan<'_>,
+            &str,
+        ) -> crate::ledger::Result<T>,
+    ) -> crate::ledger::Result<T> {
+        let date = crate::changelog::today_la().map_err(|e| {
+            crate::ledger::Error::new(format!("cannot date the changelog's roll: {e}"))
+        })?;
+        let origin = crate::publish::native_origin(&self.repo).map_err(|why| {
+            crate::ledger::Error::new(format!(
+                "cannot bind the native source origin to this workspace: {why}"
+            ))
+        })?;
+        let git = self.git();
+        let base = crate::gates::harness_versions_base(&git, &origin, &c.commit, &c.version)
+            .map_err(|e| {
+                crate::ledger::Error::new(format!(
+                    "cannot name the release the harness announcement counts from: {e}"
+                ))
+            })?;
+        let plan = crate::ledger::ClaimPlan {
+            version: &c.version,
+            now: crate::publish::unix_now(),
+            allow_existing_section: false,
+            max_attempts: crate::ledger::MAX_CLAIM_ATTEMPTS,
+            source: &c.commit,
+            harness_base: base.as_ref().map(|(r, c)| (r.as_str(), c.as_str())),
+        };
+        f(&git, &origin, &plan, &date)
+    }
 }
 
 impl Backend for Real {
@@ -8742,6 +9205,7 @@ impl Backend for Real {
         let snapshot = crate::line_claim::existing_with_holder(&self.repo, version)
             .map_err(|why| Refusal::new(why, retry()).could_not_run())?;
         self.fleet_holder = snapshot.holder;
+        self.fleet_elsewhere = snapshot.elsewhere;
         let mut line = snapshot.line;
         // Source discovery must see durable supersessions even when the independent claim
         // read was stale. It reads no engine or roster, and step 1 consumes the same result.
@@ -8760,6 +9224,10 @@ impl Backend for Real {
             .as_ref()
             .filter(|(h, _)| h == head)
             .map(|(_, holder)| holder.clone())
+    }
+
+    fn fleet_held_elsewhere(&mut self) -> bool {
+        self.fleet_elsewhere
     }
 
     fn main_past_line(&mut self, head: &str, main: &str) -> Option<(usize, usize)> {
@@ -9090,266 +9558,7 @@ impl Backend for Real {
         tip: &str,
         prover: &Prover,
     ) -> Result<String, InputFinding> {
-        let unavailable = |why: String| {
-            InputFinding::Unanswered(format!("release input could not be judged: {why}"))
-        };
-        // Both a dry preflight and its eventual cut use this one owned checkout. A temporary
-        // dry-run path followed by the release clone changes every compiler path input even
-        // when the package bytes are equal. Never reset or clean it: refuse unexpected edits.
-        let root = crate::input_record::directory(&self.release);
-        let _checkout_claim = crate::input_record::claim(&self.release).map_err(unavailable)?;
-        crate::input_record::checkout(&self.git(), &root, tip).map_err(unavailable)?;
-        let root = root.as_path();
-        let initialized = crate::ledger::GitCli::new(root).git(&[
-            "submodule",
-            "update",
-            "--init",
-            "vendor/astream",
-        ]);
-        (|| match initialized {
-            Ok(out) if out.success() => {
-                let input = aterm_verify::release_input::discover(
-                    root,
-                    &std::env::var_os("PATH").unwrap_or_default(),
-                    base,
-                    tip,
-                )
-                .map_err(unavailable)?;
-                if let Some(note) = input.no_work_note() {
-                    return Ok(note);
-                }
-                let environment = verify_environment();
-                let plan =
-                    aterm_verify::NativeBuildPlan::capture(&environment, root).map_err(|e| {
-                        unavailable(format!("select release-input build directory: {e}"))
-                    })?;
-                let mut bootstrap = aterm_verify::native_verifier::build_command(
-                    root,
-                    &prover.bin.join("targo"),
-                    &plan,
-                )
-                .map_err(unavailable)?;
-                publication_environment(&self.engine, &mut bootstrap);
-                let mut bootstrap =
-                    self.configure_child(self.scrubbed_command(bootstrap), Some(prover));
-                bootstrap.current_dir(root);
-                crate::input_record::detach_launcher(&mut bootstrap);
-                plan.apply_to_command(&mut bootstrap).map_err(|e| {
-                    unavailable(format!("configure release-input build environment: {e}"))
-                })?;
-                let (built, accounting) = self
-                    .output_accounted(Step::Checks, &mut bootstrap)
-                    .map_err(|e| unavailable(e.to_string()))?;
-                if let Ok(mut log) = crate::durable::open_append(&self.step_log(Step::Checks), true)
-                {
-                    let _ = log.write_all(&built.stdout);
-                    let _ = log.write_all(&built.stderr);
-                    let _ = writeln!(log, "{accounting}");
-                }
-                if !built.status.success() {
-                    return Err(unavailable(format!(
-                        "release-input verifier bootstrap exited {}: {}",
-                        built.status,
-                        String::from_utf8_lossy(&built.stderr)
-                    )));
-                }
-                let verifier = aterm_verify::native_verifier::built(root, &built.stdout)
-                    .map_err(unavailable)?;
-                let runtime = || -> Result<Command, InputFinding> {
-                    let mut command =
-                        aterm_verify::native_verifier::command(&verifier, root, &environment)
-                            .map_err(unavailable)?;
-                    publication_environment(&self.engine, &mut command);
-                    let mut command =
-                        self.configure_child(self.scrubbed_command(command), Some(prover));
-                    aterm_verify::native_verifier::configure_runtime(
-                        &mut command,
-                        root,
-                        &environment,
-                    );
-                    command
-                        .current_dir(root)
-                        .args(["release-input", "--base", base]);
-                    crate::input_record::detach_launcher(&mut command);
-                    Ok(command)
-                };
-                let mut child = runtime()?;
-                let seal = (self.build_inputs)().map_err(unavailable)?;
-                let scanner = atpkg::prerequisite::configured(
-                    &[atpkg::prerequisite::Prerequisite::Gitleaks],
-                    "release input records",
-                )
-                .map_err(unavailable)?;
-                let scanner = scanner
-                    .tool(atpkg::prerequisite::Prerequisite::Gitleaks)
-                    .ok_or_else(|| unavailable("no signed scanner was acquired".into()))?;
-                scanner.validate().map_err(unavailable)?;
-                let input_tools = format!("{seal}\ngitleaks {}", scanner.tree_root());
-                // The handoff filename is a capability for reading this already-bound seal.
-                // It differs between a dry run and a real run, without changing any input.
-                let mut identity_child = runtime()?;
-                self.finalize_spawn_environment(&mut identity_child)
-                    .map_err(unavailable)?;
-                identity_child.env_remove(crate::build_inputs::SEAL_ENV);
-                let carry_context =
-                    crate::input_record::context(root, &self.engine, &input_tools, &identity_child)
-                        .map_err(unavailable)?;
-                child.args(["--carry-context", &carry_context]);
-                identity_child.args(["--carry-context", &carry_context]);
-                let git = crate::ledger::GitCli::new(root);
-                let identity = || {
-                    crate::input_record::identity(
-                        &git,
-                        root,
-                        &self.engine,
-                        tip,
-                        base,
-                        &input_tools,
-                        &identity_child,
-                    )
-                };
-                let (tree, input_seal) = identity().map_err(unavailable)?;
-                let records = self
-                    .release
-                    .join(crate::check_record::DIR)
-                    .join("release-input");
-                let description = crate::input_record::describe(&identity_child, &input_tools)
-                    .map_err(unavailable)?;
-                crate::durable::write_atomic_durable(
-                    &records
-                        .join(&tree)
-                        .join(crate::check_record::seal_dir(&input_seal))
-                        .join("inputs.json"),
-                    description.as_bytes(),
-                    0o600,
-                )
-                .map_err(|e| unavailable(e.to_string()))?;
-                let _input_claim = crate::input_record::claim(
-                    &records
-                        .join(&tree)
-                        .join(crate::check_record::seal_dir(&input_seal)),
-                )
-                .map_err(unavailable)?;
-                let missing = crate::check_record::input_missing(&records, &tree, &input_seal)
-                    .map_err(|why| match why {
-                        crate::check_record::InputError::Failed(why) => InputFinding::Failed(why),
-                        crate::check_record::InputError::Unavailable(why) => unavailable(why),
-                    })?;
-                if missing.is_empty() {
-                    crate::input_record::attempted(&records, base, &tree, &input_seal)
-                        .map_err(unavailable)?;
-                    return Ok(format!(
-                        "release input: reused {} checks for tree {tree}; 0 checks run",
-                        aterm_verify::release_input::CHECKS.len()
-                    ));
-                }
-                let run_id = self
-                    .logs
-                    .file_name()
-                    .ok_or_else(|| unavailable("no run name".into()))?
-                    .to_string_lossy();
-                let evidence = records
-                    .join(&tree)
-                    .join(crate::check_record::seal_dir(&input_seal));
-                let events = evidence.join(format!("{run_id}.events.jsonl"));
-                let retained_log = evidence.join(format!("{run_id}.log"));
-                let items =
-                    crate::input_record::previous_items(&records, base).map_err(unavailable)?;
-                let item_file = evidence.join(format!("{run_id}.inputs.json"));
-                crate::durable::write_atomic_durable(
-                    &item_file,
-                    aterm_json::to_string(&items)
-                        .map_err(|e| unavailable(e.to_string()))?
-                        .as_bytes(),
-                    0o600,
-                )
-                .map_err(|e| unavailable(e.to_string()))?;
-                child.arg("--passed-input-items").arg(item_file);
-                crate::durable::write_atomic_durable(&events, b"", 0o600)
-                    .map_err(|e| unavailable(e.to_string()))?;
-                child
-                    .arg("--checks")
-                    .arg(missing.join(","))
-                    .arg("--events")
-                    .arg(&events);
-                let log_path = self.step_log(Step::Checks);
-                let facts = crate::check_record::RunFacts {
-                    commit: tip,
-                    tree: &tree,
-                    seal: &input_seal,
-                    executable: None,
-                    log: &retained_log,
-                    run: &run_id,
-                    asked: &missing,
-                    content: None,
-                };
-                crate::check_record::begin_run(&records, &facts).map_err(unavailable)?;
-                crate::input_record::attempted(&records, base, &tree, &input_seal)
-                    .map_err(unavailable)?;
-                let (out, record) = self
-                    .output_accounted(Step::Checks, &mut child)
-                    .map_err(|e| unavailable(e.to_string()))?;
-                let mut log = crate::durable::open_append(&self.step_log(Step::Checks), true)
-                    .map_err(|e| unavailable(e.to_string()))?;
-                log.write_all(&out.stdout)
-                    .map_err(|e| unavailable(e.to_string()))?;
-                log.write_all(&out.stderr)
-                    .map_err(|e| unavailable(e.to_string()))?;
-                writeln!(log, "{record}").map_err(|e| unavailable(e.to_string()))?;
-                crate::durable::sync_all(&log).map_err(|e| unavailable(e.to_string()))?;
-                std::fs::copy(&log_path, &retained_log).map_err(|e| unavailable(e.to_string()))?;
-                let same_scanner = atpkg::prerequisite::configured(
-                    &[atpkg::prerequisite::Prerequisite::Gitleaks],
-                    "release input records",
-                )
-                .is_ok_and(|held| {
-                    held.tool(atpkg::prerequisite::Prerequisite::Gitleaks)
-                        .is_some_and(|now| {
-                            now.tree_root() == scanner.tree_root() && now.validate().is_ok()
-                        })
-                });
-                if !(self.build_inputs)().is_ok_and(|now| now == seal)
-                    || !identity().is_ok_and(|now| now == (tree.clone(), input_seal.clone()))
-                    || !same_scanner
-                {
-                    crate::check_record::abandon_run(&records, &facts).map_err(unavailable)?;
-                    return Err(unavailable(
-                        "inputs changed during release-input; no verdict retained".into(),
-                    ));
-                }
-                let read = crate::check_record::events(&events).map_err(|e| e.to_string());
-                crate::check_record::write_run(
-                    &records,
-                    &facts,
-                    crate::check_record::RunEnd {
-                        exit: out.status.code().unwrap_or(-1),
-                        log_sha256: &crate::artifact::file_sha256(&retained_log)
-                            .map_err(unavailable)?,
-                        events: read.as_ref().map_err(String::as_str),
-                    },
-                )
-                .map_err(unavailable)?;
-                let text = format!(
-                    "{}\n{}",
-                    String::from_utf8_lossy(&out.stdout),
-                    String::from_utf8_lossy(&out.stderr)
-                );
-                if out.status.success() {
-                    Ok(text
-                        .lines()
-                        .rev()
-                        .find(|line| line.starts_with("release input:"))
-                        .unwrap_or("release input passed")
-                        .to_string())
-                } else if out.status.code() == Some(aterm_verify::exit::FAILED) {
-                    Err(InputFinding::Failed(text))
-                } else {
-                    Err(InputFinding::Unanswered(text))
-                }
-            }
-            Ok(out) => Err(unavailable(out.stderr_utf8())),
-            Err(why) => Err(unavailable(why.to_string())),
-        })()
+        self.input_checks_using(base, tip, prover, Self::input_engine)
     }
 
     fn branch_is_main(&mut self) -> bool {
@@ -9582,6 +9791,27 @@ impl Backend for Real {
         path.is_dir()
     }
 
+    fn host_fit(&mut self) -> Result<String, Refusal> {
+        let (_, warm) = self.disk();
+        let bytes = crate::release_disk::need(&self.disk_record(), warm).bytes;
+        let basis = crate::release_disk::basis(bytes, warm);
+        crate::host_fit::live(&self.repo, (bytes, basis.to_owned()))
+    }
+
+    fn fixtures_at(&mut self, rev: &str, version: &str) -> Result<bool, Refusal> {
+        crate::fixtures::on_commit(&self.git(), rev, version)
+            .map(|found| found.is_some())
+            .map_err(|why| {
+                Refusal::new(
+                    format!("v{version}'s handoff fixtures at {}: {why}", short(rev)),
+                    format!(
+                        "repair them on main ({}), then run it again",
+                        crate::gates::HANDOFF_FIXTURE_README
+                    ),
+                )
+            })
+    }
+
     fn tree_has(&mut self, rev: &str, path: &str) -> Result<bool, Refusal> {
         Ok(crate::line::tree_has(&self.git(), rev, path)?)
     }
@@ -9745,68 +9975,9 @@ impl Backend for Real {
             )
             .detail([why.to_string()])
         })?;
-        let undo = |s: &mut Self| {
-            let _ = s.git().git(&["checkout", "-q", "--", "."]);
-        };
-        let journal = self.release.join("bump-claim.json");
-        let tip = self
-            .git_out(&["rev-parse", "origin/main"])
-            .unwrap_or_default();
-        let git = GitCli::new(&self.repo);
-        let log = self.step_log(self.step);
-        let bumped = crate::bump_claim::push(
-            &git,
-            &journal,
-            tip,
-            |tip| {
-                self.main_to(tip)?;
-                {
-                    let _phase = crate::cut_timing::Timer::start(
-                        &self.step_log(self.step),
-                        "bump-submodule-sync",
-                    );
-                    self.submodule_sync(Step::Commit)?;
-                }
-                let cur = self.version_at("HEAD").unwrap_or_default();
-                if cur != from {
-                    return Err(Refusal::new(
-                        format!(
-                            "origin/main's version moved to {cur} while this release bumped {from}"
-                        ),
-                        format!(
-                            "{RELEASE_COMMAND} again (without --bump when {cur} is unreleased)"
-                        ),
-                    ));
-                }
-                let (msg, declared) = self.edit_bump(from, to, prover, &origin)?;
-                let mut commit = local_git()?;
-                commit
-                    .args(["commit", "-q", "-m", &msg, "--"])
-                    .args(&declared)
-                    .current_dir(&self.repo);
-                let commit_timing =
-                    crate::cut_timing::Timer::start(&self.step_log(self.step), "bump-git-commit");
-                if self.logged(Step::Commit, &mut commit).code != 0 {
-                    undo(self);
-                    return Err(Refusal::new(
-                        "could not commit the bump; it is undone",
-                        "read the commit step's log",
-                    ));
-                }
-                drop(commit_timing);
-                let bumped = self.head();
-                crate::bump_claim::record(&self.git(), &journal, &msg, declared)
-                    .map_err(|why| cut_refusal("bump custody journal", &why))?;
-                Ok(bumped)
-            },
-            |tip, bumped| {
-                let _timing = crate::cut_timing::Timer::start(&log, "bump-native-ref-write");
-                origin.write_ref("refs/heads/main", Some(tip), bumped)
-            },
-            || origin.refresh_main(),
-        )?;
-        self.submodule_sync(Step::Commit)?;
-        Ok(bumped)
+        self.bump_on(from, to, prover, &origin, &|real| {
+            real.submodule_sync(Step::Commit)
+        })
     }
 
     fn validation_tools(&mut self) -> Result<String, Refusal> {
@@ -10189,6 +10360,10 @@ impl Backend for Real {
         let origin = crate::publish::native_origin(&self.repo);
         self.commit_gates_from_origin(c, dry, origin)
     }
+    fn commit_gates_standing(&mut self, c: &Candidate) -> Option<(String, Vec<Refusal>)> {
+        let origin = crate::publish::native_origin(&self.repo);
+        self.commit_gates_standing_at(c, origin)
+    }
     fn cut_gates(
         &mut self,
         c: &Candidate,
@@ -10258,14 +10433,14 @@ impl Backend for Real {
     }
 
     fn repair(&mut self, failure: &aterm_release::repair::Failure) -> Vec<String> {
+        use aterm_release::repair::Spawner as _;
         let record = self.release.join(aterm_release::repair::RECORD_FILE);
-        aterm_release::repair::open(
-            &record,
-            &self.repo,
-            failure,
-            &mut aterm_release::repair::Ctl,
-        )
-        .lines(&record)
+        // A cut the pump runs has no session: its worker starts in this Mac's newest aterm.
+        let mut spawner = aterm_release::repair::spawner(
+            aterm_release::repair::Ctl.in_session(),
+            std::env::var_os(aterm_release::repair::PUMP_ENV).is_some(),
+        );
+        aterm_release::repair::open(&record, &self.repo, failure, spawner.as_mut()).lines(&record)
     }
 
     fn qualify_slice_memory(&mut self) -> Result<crate::buildplan::SliceMemoryForecast, String> {
@@ -10278,29 +10453,8 @@ impl Backend for Real {
     }
 
     fn reserve(&mut self, c: &Candidate) -> Result<Reservation, Refusal> {
-        let date = crate::changelog::today_la().map_err(|e| {
-            Refusal::new(
-                format!("cannot date the changelog's roll: {e}"),
-                "check this machine's clock",
-            )
-        })?;
-        let plan = crate::ledger::ClaimPlan {
-            version: &c.version,
-            now: crate::publish::unix_now(),
-            allow_existing_section: false,
-            max_attempts: crate::ledger::MAX_CLAIM_ATTEMPTS,
-            source: &c.commit,
-        };
-        let version = c.version.clone();
-        let origin = crate::publish::native_origin(&self.repo).map_err(|why| {
-            Refusal::new(
-                "cannot bind the native source origin to this workspace",
-                "restore the configured repository matching Cargo.toml before rerunning",
-            )
-            .detail([why.to_string()])
-        })?;
-        crate::ledger::reserve(&self.git(), &origin, &plan, &|source, main| {
-            crate::changelog::claim_changelogs(source, main, &version, &date)
+        self.with_claim_plan(c, |git, origin, plan, date| {
+            crate::ledger::reserve(git, origin, plan, date)
         })
         .map(|r| Reservation {
             build: r.build,
@@ -10311,6 +10465,24 @@ impl Backend for Real {
             Refusal::new(
                 format!("could not reserve the release's identity: {e}"),
                 format!("fix what it names, then {RELEASE_COMMAND} (nothing was claimed)"),
+            )
+        })
+    }
+
+    fn preview_roll(&mut self, c: &Candidate) -> Result<String, Refusal> {
+        self.with_claim_plan(c, |git, _, plan, date| {
+            crate::ledger::release_roll(git, plan, date)
+        })
+        .map(|(text, removals)| {
+            crate::changelog::roll_words(
+                crate::changelog::note_entries(&text, &c.version).len(),
+                removals.len(),
+            )
+        })
+        .map_err(|e| {
+            Refusal::new(
+                format!("the release commit's changelog roll would refuse: {e}"),
+                format!("fix what it names, then {RELEASE_COMMAND}"),
             )
         })
     }
@@ -10385,6 +10557,7 @@ impl Backend for Real {
             real,
             admission_barrier: std::sync::Mutex::new(admission_barrier),
             tree_index: TreeIndexHandoff::default(),
+            shared_tree: std::sync::Mutex::new(None),
         })
     }
 
@@ -12069,6 +12242,7 @@ pub fn input_check(repo: &Path, base: &str) -> Result<(), String> {
     }
     let tip = real.head();
     let prover = real.prover(None)?;
+    real.fetch_engine_origin().map_err(|refusal| refusal.why)?;
     let start = std::time::Instant::now();
     let result = real.input_checks(base, &tip, &prover);
     println!(
@@ -12317,3 +12491,302 @@ pub(crate) mod dry_tools_tests;
 #[cfg(test)]
 #[path = "release_steps_tests.rs"]
 mod tests;
+
+impl Real {
+    /// Read-only instrument entry. The supplied policy is data, not publication authority;
+    /// normal release orchestration always selects its captured repository through Backend.
+    #[cfg(test)]
+    pub(crate) fn input_checks_with_policy(
+        &mut self,
+        base: &str,
+        tip: &str,
+        prover: &Prover,
+        policy: crate::input_record::EngineInput,
+    ) -> Result<String, InputFinding> {
+        self.input_checks_using(base, tip, prover, |_| Ok(policy))
+    }
+
+    fn input_checks_using(
+        &mut self,
+        base: &str,
+        tip: &str,
+        prover: &Prover,
+        select: impl FnOnce(&Self) -> Result<crate::input_record::EngineInput, String>,
+    ) -> Result<String, InputFinding> {
+        let unavailable = |why: String| {
+            InputFinding::Unanswered(format!("release input could not be judged: {why}"))
+        };
+        let log = self.step_log(Step::Checks);
+        let transcript = self.transcript();
+        let progress = |name: &str| {
+            say_to(&transcript, &format!("        {name} (starting)"));
+            crate::cut_timing::Timer::start(&log, name)
+        };
+        // Both a dry preflight and its eventual cut use this one owned checkout. A temporary
+        // dry-run path followed by the release clone changes every compiler path input even
+        // when the package bytes are equal. Never reset or clean it: refuse unexpected edits.
+        let root = crate::input_record::directory(&self.release);
+        let _checkout_claim = crate::input_record::claim(&self.release).map_err(unavailable)?;
+        {
+            let _phase = progress("release-input checkout");
+            crate::input_record::checkout(&self.git(), &root, tip).map_err(unavailable)?;
+        }
+        let root = root.as_path();
+        (|| {
+            let input = {
+                let _phase = progress("release-input source discovery");
+                aterm_verify::release_input::discover(
+                    root,
+                    &std::env::var_os("PATH").unwrap_or_default(),
+                    base,
+                    tip,
+                )
+                .map_err(unavailable)?
+            };
+            if let Some(note) = input.no_work_note() {
+                return Ok(note);
+            }
+            let engine_input = select(self).map_err(unavailable)?;
+            let environment = verify_environment();
+            let bootstrap_phase = progress("release-input verifier bootstrap");
+            let plan = aterm_verify::NativeBuildPlan::capture(&environment, root)
+                .map_err(|e| unavailable(format!("select release-input build directory: {e}")))?;
+            let mut bootstrap = aterm_verify::native_verifier::build_command(
+                root,
+                &prover.bin.join("targo"),
+                &plan,
+            )
+            .map_err(unavailable)?;
+            publication_environment(&self.engine, &mut bootstrap);
+            let mut bootstrap =
+                self.configure_child(self.scrubbed_command(bootstrap), Some(prover));
+            bootstrap.current_dir(root);
+            crate::input_record::detach_launcher(&mut bootstrap);
+            plan.apply_to_command(&mut bootstrap).map_err(|e| {
+                unavailable(format!("configure release-input build environment: {e}"))
+            })?;
+            let (built, accounting) = self
+                .output_accounted(Step::Checks, &mut bootstrap)
+                .map_err(|e| unavailable(e.to_string()))?;
+            if let Ok(mut log) = crate::durable::open_append(&self.step_log(Step::Checks), true) {
+                let _ = log.write_all(&built.stdout);
+                let _ = log.write_all(&built.stderr);
+                let _ = writeln!(log, "{accounting}");
+            }
+            if !built.status.success() {
+                return Err(unavailable(format!(
+                    "release-input verifier bootstrap exited {}: {}",
+                    built.status,
+                    String::from_utf8_lossy(&built.stderr)
+                )));
+            }
+            let verifier =
+                aterm_verify::native_verifier::built(root, &built.stdout).map_err(unavailable)?;
+            drop(bootstrap_phase);
+            let runtime = || -> Result<Command, InputFinding> {
+                let mut command =
+                    aterm_verify::native_verifier::command(&verifier, root, &environment)
+                        .map_err(unavailable)?;
+                publication_environment(&self.engine, &mut command);
+                let mut command =
+                    self.configure_child(self.scrubbed_command(command), Some(prover));
+                engine_input.apply(&mut command);
+                aterm_verify::native_verifier::configure_runtime(&mut command, root, &environment);
+                command
+                    .current_dir(root)
+                    .args(["release-input", "--base", base]);
+                crate::input_record::detach_launcher(&mut command);
+                Ok(command)
+            };
+            let mut child = runtime()?;
+            let seal = (self.build_inputs)().map_err(unavailable)?;
+            let scanner = atpkg::prerequisite::configured(
+                &[atpkg::prerequisite::Prerequisite::Gitleaks],
+                "release input records",
+            )
+            .map_err(unavailable)?;
+            let scanner = scanner
+                .tool(atpkg::prerequisite::Prerequisite::Gitleaks)
+                .ok_or_else(|| unavailable("no signed scanner was acquired".into()))?;
+            scanner.validate().map_err(unavailable)?;
+            let input_tools = format!("{seal}\ngitleaks {}", scanner.tree_root());
+            // The handoff filename is a capability for reading this already-bound seal.
+            // It differs between a dry run and a real run, without changing any input.
+            let mut identity_child = runtime()?;
+            self.finalize_spawn_environment(&mut identity_child)
+                .map_err(unavailable)?;
+            // The held prerequisites' command directory is likewise a path of this run alone.
+            // Name what it exposes, so a dry run's records and an earlier run's answer this one.
+            if let Some(tools) = &self.prerequisites {
+                tools.name_in_mirror(&mut identity_child);
+            }
+            identity_child.env_remove(crate::build_inputs::SEAL_ENV);
+            let carry_context = {
+                let _phase = progress("release-input execution context");
+                crate::input_record::context(root, &engine_input, &input_tools, &identity_child)
+                    .map_err(unavailable)?
+            };
+            child.args(["--carry-context", &carry_context]);
+            identity_child.args(["--carry-context", &carry_context]);
+            let git = crate::ledger::GitCli::new(root);
+            let identity = || {
+                let _phase = progress("release-input identity discovery");
+                crate::input_record::identity(
+                    &git,
+                    root,
+                    &engine_input,
+                    tip,
+                    base,
+                    &input_tools,
+                    &identity_child,
+                )
+            };
+            let (tree, input_seal) = identity().map_err(unavailable)?;
+            let records = self
+                .release
+                .join(crate::check_record::DIR)
+                .join("release-input");
+            let description =
+                crate::input_record::describe(&identity_child, &input_tools, &engine_input)
+                    .map_err(unavailable)?;
+            crate::durable::write_atomic_durable(
+                &records
+                    .join(&tree)
+                    .join(crate::check_record::seal_dir(&input_seal))
+                    .join("inputs.json"),
+                description.as_bytes(),
+                0o600,
+            )
+            .map_err(|e| unavailable(e.to_string()))?;
+            let _input_claim = crate::input_record::claim(
+                &records
+                    .join(&tree)
+                    .join(crate::check_record::seal_dir(&input_seal)),
+            )
+            .map_err(unavailable)?;
+            let missing = crate::check_record::input_missing(&records, &tree, &input_seal)
+                .map_err(|why| match why {
+                    crate::check_record::InputError::Failed(why) => InputFinding::Failed(why),
+                    crate::check_record::InputError::Unavailable(why) => unavailable(why),
+                })?;
+            if missing.is_empty() {
+                crate::input_record::attempted(&records, base, &tree, &input_seal)
+                    .map_err(unavailable)?;
+                let judged = crate::check_record::input_judged_by(&records, &tree, &input_seal);
+                return Ok(format!(
+                    "release input: carried from run {}: reused {} checks for tree {tree}; 0 checks run",
+                    if judged.is_empty() {
+                        "unnamed".to_owned()
+                    } else {
+                        judged.join(" and ")
+                    },
+                    aterm_verify::release_input::CHECKS.len()
+                ));
+            }
+            let run_id = self
+                .logs
+                .file_name()
+                .ok_or_else(|| unavailable("no run name".into()))?
+                .to_string_lossy();
+            let evidence = records
+                .join(&tree)
+                .join(crate::check_record::seal_dir(&input_seal));
+            let events = evidence.join(format!("{run_id}.events.jsonl"));
+            let retained_log = evidence.join(format!("{run_id}.log"));
+            let items = crate::input_record::previous_items(&records, base).map_err(unavailable)?;
+            let item_file = evidence.join(format!("{run_id}.inputs.json"));
+            crate::durable::write_atomic_durable(
+                &item_file,
+                aterm_json::to_string(&items)
+                    .map_err(|e| unavailable(e.to_string()))?
+                    .as_bytes(),
+                0o600,
+            )
+            .map_err(|e| unavailable(e.to_string()))?;
+            child.arg("--passed-input-items").arg(item_file);
+            crate::durable::write_atomic_durable(&events, b"", 0o600)
+                .map_err(|e| unavailable(e.to_string()))?;
+            child
+                .arg("--checks")
+                .arg(missing.join(","))
+                .arg("--events")
+                .arg(&events);
+            let log_path = self.step_log(Step::Checks);
+            let facts = crate::check_record::RunFacts {
+                commit: tip,
+                tree: &tree,
+                seal: &input_seal,
+                executable: None,
+                log: &retained_log,
+                run: &run_id,
+                asked: &missing,
+                content: None,
+            };
+            crate::check_record::begin_run(&records, &facts).map_err(unavailable)?;
+            crate::input_record::attempted(&records, base, &tree, &input_seal)
+                .map_err(unavailable)?;
+            let (out, record) = {
+                let _phase = progress("release-input child discovery and checks");
+                self.output_accounted(Step::Checks, &mut child)
+                    .map_err(|e| unavailable(e.to_string()))?
+            };
+            let mut log = crate::durable::open_append(&self.step_log(Step::Checks), true)
+                .map_err(|e| unavailable(e.to_string()))?;
+            log.write_all(&out.stdout)
+                .map_err(|e| unavailable(e.to_string()))?;
+            log.write_all(&out.stderr)
+                .map_err(|e| unavailable(e.to_string()))?;
+            writeln!(log, "{record}").map_err(|e| unavailable(e.to_string()))?;
+            crate::durable::sync_all(&log).map_err(|e| unavailable(e.to_string()))?;
+            std::fs::copy(&log_path, &retained_log).map_err(|e| unavailable(e.to_string()))?;
+            let same_scanner = atpkg::prerequisite::configured(
+                &[atpkg::prerequisite::Prerequisite::Gitleaks],
+                "release input records",
+            )
+            .is_ok_and(|held| {
+                held.tool(atpkg::prerequisite::Prerequisite::Gitleaks)
+                    .is_some_and(|now| {
+                        now.tree_root() == scanner.tree_root() && now.validate().is_ok()
+                    })
+            });
+            if !(self.build_inputs)().is_ok_and(|now| now == seal)
+                || !identity().is_ok_and(|now| now == (tree.clone(), input_seal.clone()))
+                || !same_scanner
+            {
+                crate::check_record::abandon_run(&records, &facts).map_err(unavailable)?;
+                return Err(unavailable(
+                    "inputs changed during release-input; no verdict retained".into(),
+                ));
+            }
+            let read = crate::check_record::events(&events).map_err(|e| e.to_string());
+            crate::check_record::write_run(
+                &records,
+                &facts,
+                crate::check_record::RunEnd {
+                    exit: out.status.code().unwrap_or(-1),
+                    log_sha256: &crate::artifact::file_sha256(&retained_log)
+                        .map_err(unavailable)?,
+                    events: read.as_ref().map_err(String::as_str),
+                },
+            )
+            .map_err(unavailable)?;
+            let text = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if out.status.success() {
+                Ok(text
+                    .lines()
+                    .rev()
+                    .find(|line| line.starts_with("release input:"))
+                    .unwrap_or("release input passed")
+                    .to_string())
+            } else if out.status.code() == Some(aterm_verify::exit::FAILED) {
+                Err(InputFinding::Failed(text))
+            } else {
+                Err(InputFinding::Unanswered(text))
+            }
+        })()
+    }
+}

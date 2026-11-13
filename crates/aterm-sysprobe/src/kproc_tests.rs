@@ -264,6 +264,16 @@ mod live {
         crate::procargs::read(pid).is_none() && record(pid).is_some_and(|r| !r.zombie)
     }
 
+    /// Whether `ps` printed `pid`'s kernel name in parentheses, its word for a process whose
+    /// arguments it could not read, while the process lives with arguments this crate reads: a
+    /// `ps` whose own read failed (another program's process caught at its exec on a loaded Mac)
+    /// is no oracle for that row. A fixture is never excused: each must be compared, and the
+    /// zombie's row, which both print in parentheses, does not differ.
+    fn ps_read_no_arguments(pid: u32, ps_comm: &str) -> bool {
+        record(pid).is_some_and(|r| !r.zombie && ps_comm == format!("({})", r.comm))
+            && crate::procargs::read(pid).is_some()
+    }
+
     #[test]
     fn the_comm_and_args_columns_are_the_ones_ps_prints() {
         type Columns = (String, String, String, String);
@@ -322,7 +332,7 @@ mod live {
                 continue;
             };
             let differs = (&mine.0, &mine.1, &mine.2, &mine.3) != (c, g, cu, gu);
-            if differs && past_what_the_kernel_hands_over(*pid) {
+            if differs && (past_what_the_kernel_hands_over(*pid) || ps_read_no_arguments(*pid, c)) {
                 continue;
             }
             assert_eq!(&mine.0, c, "comm of {pid}");

@@ -1821,6 +1821,10 @@ fn typed_here(key: &str, sid: &str, now: i64) -> bool {
 enum Stepped {
     /// The lease handed the ask on.
     Released(ask::Said),
+    /// The server's observe gate withheld the line (the session's agent is unconfirmed,
+    /// [`aterm_agent::harness::agent_image::WITHHELD`]), and the lease handed the ask on, as for
+    /// a session that may not be asked: no later turn break of this agent would take it.
+    Withheld(ask::Said),
     /// The step's word: `typed`, `wait:<why>` or `gone`.
     Step(String),
 }
@@ -1867,7 +1871,15 @@ pub(super) fn act(
         level,
     };
     let step = at.step(
-        || disk::type_resume(sock, token.as_ref(), sid, &owed.text),
+        || {
+            disk::type_resume(
+                sock,
+                token.as_ref(),
+                sid,
+                &owed.text,
+                aterm_agent::harness::agent_image::Lane::DiskFree,
+            )
+        },
         || free_now(&owed.key),
     );
     if step == "typed" {
@@ -1942,6 +1954,11 @@ impl AtBreak<'_> {
                 ask::Break::Gone => Stepped::Step("gone".to_owned()),
                 ask::Break::Yours => {
                     let step = type_line();
+                    if step == aterm_agent::harness::agent_image::WITHHELD
+                        && let Some(said) = ask::release(l, key, self.host, self.sid, self.now)
+                    {
+                        return Stepped::Withheld(said);
+                    }
                     if step == "typed" {
                         let at = now_ms();
                         let free = measure().unwrap_or(self.free);
@@ -1966,6 +1983,12 @@ impl AtBreak<'_> {
                 );
                 format!("released:{}", self.unfit.unwrap_or("unfit"))
             }
+            Ok(Some(Stepped::Withheld(said))) => {
+                journal(
+                    self.state, self.now, key, &said, self.level, self.free, self.host,
+                );
+                RELEASED_UNCONFIRMED.to_owned()
+            }
             Ok(Some(Stepped::Step(step))) => step,
             Ok(None) => "wait:lease-held".to_owned(),
             Err(e) if self.unfit.is_none() && typed_here(key, self.sid, now_ms()) => {
@@ -1981,6 +2004,10 @@ impl AtBreak<'_> {
         }
     }
 }
+
+/// The step's word for a line the observe gate withheld and the lease handed on
+/// ([`Stepped::Withheld`]).
+pub(super) const RELEASED_UNCONFIRMED: &str = "released:unconfirmed";
 
 /// The free bytes of the volume the lease keys `key`, read now: the home volume's, the one the
 /// ask covers; `None` where it cannot be read or is no longer that volume.

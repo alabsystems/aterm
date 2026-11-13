@@ -308,12 +308,12 @@ fn advancing_progress_does_not_renew_an_absolute_native_child_deadline() {
 fn output_within_from_feeds_its_stdin_and_ends_the_child_at_its_bound() {
     use std::io::Write as _;
     let cat = || crate::spawnfd::command("/bin/cat");
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = crate::pipe().expect("pipe");
     writer.write_all(b"fed\n").expect("write");
     drop(writer);
     let out = super::output_within_from(&mut cat(), reader.into(), HANG).expect("cat");
     assert_eq!(out.stdout, b"fed\n");
-    let (reader, writer) = std::io::pipe().expect("pipe");
+    let (reader, writer) = crate::pipe().expect("pipe");
     let (done, ended) = mpsc::channel();
     std::thread::spawn(move || {
         let _ = done.send(super::output_within_from(
@@ -337,7 +337,7 @@ fn output_within_from_feeds_its_stdin_and_ends_the_child_at_its_bound() {
 #[test]
 fn a_pipe_no_writer_holds_is_read_to_its_end_past_the_grace() {
     use std::io::Write as _;
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = crate::pipe().expect("pipe");
     writer
         .write_all(b"Thu Oct 22 16:44:35 2026\n")
         .expect("write");
@@ -368,7 +368,7 @@ fn a_pipe_no_writer_holds_is_read_to_its_end_past_the_grace() {
         }
     }
     for panics in [false, true] {
-        let (reader, mut writer) = std::io::pipe().expect("cancellable pipe");
+        let (reader, mut writer) = crate::pipe().expect("cancellable pipe");
         writer.write_all(b"unpublished tail").unwrap();
         drop(writer);
         let pipe = super::pipe_end(&reader);
@@ -417,7 +417,7 @@ fn a_pipe_no_writer_holds_is_read_to_its_end_past_the_grace() {
 #[test]
 fn a_pipe_held_outside_the_childs_group_is_read_until_it_lets_go() {
     use std::io::Write as _;
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = crate::pipe().expect("pipe");
     writer.write_all(b"one ").expect("write");
     let pipe = super::pipe_end(&reader);
     let drain = super::drain(reader, pipe, "outside").expect("reader");
@@ -440,7 +440,7 @@ fn a_pipe_held_while_the_childs_group_lives_gives_what_it_gave_by_the_grace() {
         .process_group(0)
         .spawn()
         .expect("a member of the group");
-    let (reader, writer) = std::io::pipe().expect("pipe");
+    let (reader, writer) = crate::pipe().expect("pipe");
     let pipe = super::pipe_end(&reader);
     let drain = super::drain(reader, pipe, "descendant").expect("reader");
     let begun = Instant::now();
@@ -1180,6 +1180,60 @@ fn stalled_process_progress_is_named_and_the_owned_group_ends() {
     assert!(
         !crate::process::pid_alive(child),
         "stalled child {child} outlived the progress collector"
+    );
+}
+
+/// NEGATIVE CONTROL of [`stalled_process_progress_is_named_and_the_owned_group_ends`]: the same
+/// collector, window and clock (one that steps past a whole window on each read) keep a child
+/// that writes nothing alive while the probe's reading advances on every read, and its output
+/// comes back. The probe drops the flag the child waits for only on its fourth read, four
+/// windows in on the injected clock, so a collector that stalled on the clock alone, or read
+/// only captured bytes, would have ended the child at the second. The probe stops advancing
+/// after [`HANG`], so a child that never answers stalls rather than hangs the test.
+#[cfg(unix)]
+#[test]
+fn an_advancing_progress_probe_keeps_a_quiet_child_past_its_window() {
+    let dir = scratch("process-progress-advancing");
+    let flag = dir.join("flag");
+    let mut cmd = sh(
+        "while [ ! -e \"$0\" ]; do sleep 0.02; done; printf done",
+        &[&flag],
+    );
+    let start = Instant::now();
+    let mut reads = 0u32;
+    let mut now = || {
+        let at = start + Duration::from_secs(u64::from(reads) * 61);
+        reads = reads.saturating_add(1);
+        at
+    };
+    let mut reading = 0u64;
+    let mut dropped = false;
+    let mut probe = |_| {
+        if start.elapsed() < HANG {
+            reading += 1;
+        }
+        if reading >= 4 && !dropped {
+            std::fs::write(&flag, b"").expect("the flag");
+            dropped = true;
+        }
+        Some(reading)
+    };
+    let result = super::output_from_while_process_progressing_with(
+        &mut cmd,
+        crate::spawnfd::Stdio::null(),
+        Duration::from_secs(60),
+        "the quiet fixture".to_owned(),
+        &mut now,
+        &mut probe,
+        None,
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let out = result.expect("an advancing probe is no stall");
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, b"done");
+    assert!(
+        dropped && reads > 4,
+        "the child answered only after the probe's fourth read: {reads} clock reads"
     );
 }
 

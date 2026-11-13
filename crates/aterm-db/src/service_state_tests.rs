@@ -320,7 +320,11 @@ fn vault_blockers_never_claim_usable_entries_or_reuse_a_previous_revision() {
     let mut details = std::collections::BTreeSet::new();
     for (reason, availability) in [
         (
-            MaterializationBlocker::LockUnavailable,
+            MaterializationBlocker::WriterBusy,
+            ServiceAvailability::Unknown,
+        ),
+        (
+            MaterializationBlocker::LockMissing,
             ServiceAvailability::Unknown,
         ),
         (

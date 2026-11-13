@@ -5,13 +5,13 @@
 
 #[cfg(target_os = "macos")]
 use super::tests::StagedHandoff;
-use super::tests::{ENV_LOCK, RestoreVar, env_alone, pipe_pair, stage_outgoing_handoff};
+use super::tests::{ENV_LOCK, RestoreVar, env_alone, stage_outgoing_handoff};
 use super::*;
 use crate::handoff_env::{HANDOFF_ENV_KEYS, HandoffEnv};
 use aterm_models_update::native_update_successor_warm_before_claim_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{self, State};
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::IntoRawFd;
 use std::sync::PoisonError;
 
 #[cfg(target_os = "macos")]
@@ -122,15 +122,6 @@ fn this_build() -> String {
     )
 }
 
-/// [`pipe_pair`] with both ends owned. The fork-lane intake adopts the ends it is handed (the ready
-/// write end, the commit read end) and closes them on drop, so a test publishes those with
-/// `into_raw_fd()` and drops the others: each number has one closer.
-fn owned_pipe(label: &str) -> (OwnedFd, OwnedFd) {
-    let (read, write) = pipe_pair(label);
-    // SAFETY: Pipe(2) just returned both numbers to this thread; nothing else holds them.
-    unsafe { (OwnedFd::from_raw_fd(read), OwnedFd::from_raw_fd(write)) }
-}
-
 /// The launched lane end to end over the snapshot: capture, a thread, the real dial and grant, the
 /// claim installed into the snapshot, the intake and both channels admitted, and no
 /// process-environment access after the spawn.
@@ -147,8 +138,10 @@ fn the_launched_lane_claims_into_the_snapshot_and_adopts_without_touching_the_en
         .entries;
     let rendezvous =
         crate::handoff_rendezvous::Rendezvous::bind(&staged.nonce).expect("bind the rendezvous");
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     // SAFETY: `getpid` has no preconditions.
     let own = unsafe { libc::getpid() };
     let parent = AttestedParent::attest_live_for_test(own).expect("this process attests");
@@ -430,8 +423,8 @@ fn the_fork_lane_intake_from_the_snapshot_proves_what_the_parent_expects() {
     let Some(_env) = env_alone() else { return };
     let _restore = restore_all();
     let staged = stage_outgoing_handoff("p1-fork", 3, None);
-    let (ready_read, ready_write) = owned_pipe("ready");
-    let (commit_read, commit_write) = owned_pipe("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
     for key in HANDOFF_ENV_KEYS {
         aterm_log::env::unset(key);
     }
@@ -845,8 +838,8 @@ fn the_hint_never_reaches_the_adoption_proof() {
         ),
     ] {
         let staged = stage_outgoing_handoff(&format!("p2-hint-{label}"), 2, None);
-        let (ready_read, ready_write) = owned_pipe("ready");
-        let (commit_read, commit_write) = owned_pipe("commit");
+        let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+        let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
         for key in HANDOFF_ENV_KEYS {
             aterm_log::env::unset(key);
         }
@@ -961,8 +954,8 @@ fn a_fork_lane_successor_makes_room_for_the_sessions_it_adopts() {
     let _env = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let _restore = restore_all();
     let staged = stage_outgoing_handoff("u9-fork-room", SESSIONS, None);
-    let (ready_read, ready_write) = owned_pipe("ready");
-    let (commit_read, commit_write) = owned_pipe("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
     for key in HANDOFF_ENV_KEYS {
         aterm_log::env::unset(key);
     }
@@ -987,16 +980,9 @@ fn a_fork_lane_successor_makes_room_for_the_sessions_it_adopts() {
     #[cfg_attr(not(target_vendor = "apple"), allow(unused_mut))]
     let mut witnesses: Vec<aterm_uds::exitwatch::ExitWatch> = Vec::new();
     for index in 0..incoming.adopted.len() {
-        let mut fds = [0i32; 2];
-        // SAFETY: Plain pipe(2) into a valid 2-slot out-array.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            panic!(
-                "adopted session {index} of {SESSIONS}: its wake pipe could not open: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        // SAFETY: Pipe(2) just returned both numbers; nothing else holds them.
-        pipes.push(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) });
+        pipes.push(aterm_uds::pipe().unwrap_or_else(|error| {
+            panic!("adopted session {index} of {SESSIONS}: its wake pipe could not open: {error}")
+        }));
         #[cfg(target_vendor = "apple")]
         {
             let Some(witness) = aterm_uds::exitwatch::ExitWatch::watch(std::process::id()) else {

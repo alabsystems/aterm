@@ -1,116 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Changelog gate/roll/extract (release spec §3): the one Rust port of `changelog_real_body` semantics (strip HTML comments, `###` scaffolds, blanks) over the hand-written Keep-a-Changelog `CHANGELOG.md`.
+//! Changelog gate/roll/extract (release spec §3): the one Rust port of `changelog_real_body` semantics (strip HTML comments, `###` scaffolds, blanks) over the Keep-a-Changelog `CHANGELOG.md`, whose `[Unreleased]` a release writes from the entry files under `changes/` ([`Window`]).
 
-use crate::ledger::{Error, Result};
+use crate::ledger::{Error, GitRunner, Result, git_read_ok};
 
+use aterm_census::changelog::is_section_header;
 pub use aterm_census::changelog::{
     CHANGELOG_FILE, GateSummary, HARNESS_ENTRY_HEAD, has_section, real_body,
 };
-use aterm_census::changelog::{body_line, is_section_header};
+pub use aterm_verify::changelog_fragments::{FRAGMENT_DIR, Fragment};
+use aterm_verify::changelog_fragments::{
+    MAX_FRAGMENT_BYTES, MAX_FRAGMENTS, MAX_TOTAL_BYTES, Section, assemble, entries, entry_key,
+    unreleased_entries,
+};
 
-#[path = "changelog_history.rs"]
-mod history;
-pub use history::gate as gate_history;
 #[path = "changelog_published.rs"]
 mod published;
-#[cfg(test)]
-pub(crate) use history::gate_with_keys as gate_history_with_keys;
 pub(crate) use published::gate as gate_published;
-
-/// Count each [`note_keys`] key across sections, excluding the next release's
-/// Unreleased after a recut's roll. A move preserves the count; a surviving
-/// misplaced copy cannot hide the removal and restoration of another copy.
-#[derive(Default)]
-pub(crate) struct NoteCounter {
-    sections: std::collections::BTreeMap<String, usize>,
-    bodies: Vec<(String, std::collections::BTreeMap<String, usize>)>,
-    snapshots: std::collections::BTreeMap<String, Vec<usize>>,
-}
-
-#[derive(Clone, Copy, Default)]
-pub(crate) struct NoteMembership {
-    pub(crate) anywhere: usize,
-    pub(crate) copies: usize,
-    pub(crate) active: usize,
-}
-
-impl NoteCounter {
-    /// Decode each distinct section's bytes once. Most release sections repeat
-    /// unchanged across thousands of snapshots; only their small IDs repeat here.
-    pub(crate) fn counts(
-        &mut self,
-        oid: &str,
-        snapshot: Option<&str>,
-        section: &str,
-        candidates: &[String],
-    ) -> Option<Vec<NoteMembership>> {
-        if !self.snapshots.contains_key(oid) {
-            let text = snapshot?;
-            let mut starts = Vec::new();
-            let mut offset = 0;
-            for line in text.split_inclusive('\n') {
-                if line.starts_with("## ") {
-                    starts.push(offset);
-                }
-                offset += line.len();
-            }
-            starts.push(text.len());
-            let mut ids = Vec::new();
-            for span in starts.windows(2) {
-                let source = &text[span[0]..span[1]];
-                let header = source.lines().next().unwrap_or("");
-                if !header.starts_with("## [") {
-                    continue;
-                }
-                let id = if let Some(id) = self.sections.get(source) {
-                    *id
-                } else {
-                    let mut in_comment = false;
-                    let body: Vec<_> = source
-                        .lines()
-                        .skip(1)
-                        .filter_map(|line| body_line(line, &mut in_comment))
-                        .collect();
-                    let mut counts = std::collections::BTreeMap::new();
-                    for key in keys_of(&body) {
-                        *counts.entry(key).or_default() += 1;
-                    }
-                    let id = self.bodies.len();
-                    self.bodies.push((header.to_owned(), counts));
-                    self.sections.insert(source.to_owned(), id);
-                    id
-                };
-                ids.push(id);
-            }
-            self.snapshots.insert(oid.to_owned(), ids);
-        }
-        let ids = &self.snapshots[oid];
-        let rolled = ids
-            .iter()
-            .any(|id| is_section_header(&self.bodies[*id].0, section));
-        let active = if rolled { section } else { "Unreleased" };
-        let skip = section != "Unreleased" && rolled;
-        let mut held = vec![NoteMembership::default(); candidates.len()];
-        for id in ids {
-            let (header, counts) = &self.bodies[*id];
-            let excluded = skip && is_section_header(header, "Unreleased");
-            for (index, key) in candidates.iter().enumerate() {
-                let count = counts.get(key).copied().unwrap_or(0);
-                held[index].anywhere += count;
-                if excluded {
-                    continue;
-                }
-                held[index].copies += count;
-                if is_section_header(header, active) {
-                    held[index].active += count;
-                }
-            }
-        }
-        Some(held)
-    }
-}
 
 /// Judge the notes the next release will ship.
 pub fn gate_unreleased(text: &str) -> Result<GateSummary> {
@@ -160,47 +67,8 @@ pub fn roll(text: &str, version: &str, date: &str) -> Result<String> {
     Ok(rolled)
 }
 
-/// The two changelogs a release claim writes, from the published commit's `source` and
-/// main's current `main`:
-///
-/// * the release commit's: `source` rolled ([`roll`]), so the notes that ship are exactly
-///   the entries the published commit carried (taken as it stands if already rolled);
-/// * main's: [`roll_shipped`], the same section with the same shipped body, while main's
-///   `[Unreleased]` keeps every entry added after the publish, for the next release
-///   (taken as it stands if it already has the section, from an earlier wedged claim).
-pub fn claim_changelogs(
-    source: &str,
-    main: &str,
-    version: &str,
-    date: &str,
-) -> Result<(String, String)> {
-    let source_rolled = has_section(source, version);
-    let release = release_changelog(source, version, date)?;
-    let landing = if has_section(main, version) {
-        main.to_string()
-    } else if source_rolled {
-        return Err(Error::new(format!(
-            "the published commit's {CHANGELOG_FILE} already carries \"## [{version}]\" and \
-             main's does not — main has dropped a released section; restore it before cutting"
-        )));
-    } else {
-        roll_shipped(main, source, version, date)?
-    };
-    Ok((release, landing))
-}
-
-/// The release commit's changelog ([`claim_changelogs`]' first half, shared by the reservation that writes it and the claim that checks it): `source` rolled for `version` on `date`, or `source` as it stands when it already carries the section.
-/// # Errors
-/// [`roll`]'s.
-pub fn release_changelog(source: &str, version: &str, date: &str) -> Result<String> {
-    if has_section(source, version) {
-        Ok(source.to_string())
-    } else {
-        roll(source, version, date)
-    }
-}
-
-/// The date of `version`'s section, `## [version] - <date>`: what the release commit's roll was dated, read back so a claim on a later day checks the roll it was made with.
+/// The date of `version`'s section, `## [version] - <date>`: what the release commit's roll was
+/// dated, read back so a claim on a later day lands the roll it was made with.
 #[must_use]
 pub fn section_date<'a>(text: &'a str, version: &str) -> Option<&'a str> {
     text.lines().find_map(|l| {
@@ -211,53 +79,448 @@ pub fn section_date<'a>(text: &'a str, version: &str) -> Option<&'a str> {
     })
 }
 
-/// Roll `main` for a release whose notes are `source`'s (the published commit's) `[Unreleased]` body rather than main's own.
-pub fn roll_shipped(main: &str, source: &str, version: &str, date: &str) -> Result<String> {
+/// One commit's release-note sources: `CHANGELOG.md`'s text and each entry file under
+/// `changes/` with its blob id, read from objects alone.
+#[derive(Debug, Clone)]
+pub struct Window {
+    /// `CHANGELOG.md` as the commit holds it.
+    pub raw: String,
+    /// Every file under `changes/`, by path, with its blob id.
+    pub fragments: Vec<(Fragment, String)>,
+}
+
+impl Window {
+    /// The release-note sources `commit` holds for releasing `version`. A recut (its changelog
+    /// already carries `version`'s section) ships that section as it stands and deletes no file,
+    /// so it reads none: the files under `changes/` belong to the next window, whose own step 1
+    /// judges them, and a stray one never blocks the recovery release. Otherwise strict:
+    /// `changes/` (spelled exactly so; a root entry another case of it is refused) holds only
+    /// regular, non-executable files within the bounds, each UTF-8.
+    ///
+    /// # Errors
+    /// Any of those refusals, or git cannot read the objects.
+    pub fn at(git: &dyn GitRunner, commit: &str, version: &str) -> Result<Window> {
+        let raw = blob_text(git, &format!("{commit}:{CHANGELOG_FILE}"))?;
+        if has_section(&raw, version) {
+            return Ok(Window {
+                raw,
+                fragments: Vec::new(),
+            });
+        }
+        let Some(tree) = fragment_tree(git, commit, true)? else {
+            return Ok(Window {
+                raw,
+                fragments: Vec::new(),
+            });
+        };
+        let listed = git_read_ok(
+            git,
+            &[
+                "--no-lazy-fetch",
+                "--no-replace-objects",
+                "ls-tree",
+                "-r",
+                "-l",
+                "-z",
+                &tree,
+            ],
+        )?
+        .stdout;
+        let mut fragments = Vec::new();
+        let mut total = 0usize;
+        for record in listed.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+            let (meta, rel) = split_record(record)?;
+            let path = format!("{FRAGMENT_DIR}/{rel}");
+            let fields: Vec<&str> = meta.split_whitespace().collect();
+            let [mode, kind, oid, size] = fields.as_slice() else {
+                return Err(Error::new(format!(
+                    "{path}: unreadable tree entry {meta:?}"
+                )));
+            };
+            if *mode != "100644" || *kind != "blob" {
+                return Err(Error::new(format!(
+                    "{path}: is not a regular, non-executable file (git mode {mode} {kind}) — a \
+                     changelog entry is a plain file the release ships as written"
+                )));
+            }
+            let size: usize = size.parse().unwrap_or(usize::MAX);
+            total = total.saturating_add(size);
+            if size > MAX_FRAGMENT_BYTES {
+                return Err(Error::new(format!(
+                    "{path}: is {size} bytes, over the {MAX_FRAGMENT_BYTES} one entry may hold"
+                )));
+            }
+            if fragments.len() >= MAX_FRAGMENTS || total > MAX_TOTAL_BYTES {
+                return Err(Error::new(format!(
+                    "{FRAGMENT_DIR}/ holds more than {MAX_FRAGMENTS} entries or {MAX_TOTAL_BYTES} \
+                     bytes, more than one release may ship"
+                )));
+            }
+            let text = blob_text(git, oid)
+                .map_err(|_| Error::new(format!("{path}: is not readable UTF-8 text")))?;
+            fragments.push((Fragment { path, text }, (*oid).to_string()));
+        }
+        Ok(Window { raw, fragments })
+    }
+
+    /// `CHANGELOG.md` with `[Unreleased]` written from this window's raw entries and files
+    /// ([`assemble`]), `announcement` (the derived harness-versions line) leading `### Changed`.
+    ///
+    /// # Errors
+    /// Every finding [`assemble`] has, one per line.
+    pub fn assembled(&self, announcement: Option<&str>) -> Result<String> {
+        let fragments: Vec<Fragment> = self.fragments.iter().map(|(f, _)| f.clone()).collect();
+        assemble(&self.raw, &fragments, announcement).map_err(|found| Error::new(found.join("\n")))
+    }
+
+    /// Whether this window's changelog already carries `version`'s section: a recut, whose
+    /// release commit ships that section as it stands and deletes no file (and whose window
+    /// [`Window::at`] read none).
+    #[must_use]
+    pub fn is_recut(&self, version: &str) -> bool {
+        has_section(&self.raw, version)
+    }
+}
+
+/// A blob's text by object name (`<rev>:<path>` or an id), strict UTF-8.
+fn blob_text(git: &dyn GitRunner, spec: &str) -> Result<String> {
+    let out = git_read_ok(
+        git,
+        &[
+            "--no-lazy-fetch",
+            "--no-replace-objects",
+            "cat-file",
+            "blob",
+            spec,
+        ],
+    )?;
+    String::from_utf8(out.stdout).map_err(|_| Error::new(format!("{spec} is not valid UTF-8")))
+}
+
+/// One `ls-tree -z` record's metadata and path.
+fn split_record(record: &[u8]) -> Result<(&str, &str)> {
+    let text = std::str::from_utf8(record)
+        .map_err(|_| Error::new(format!("a {FRAGMENT_DIR}/ path is not UTF-8")))?;
+    text.split_once('\t')
+        .ok_or_else(|| Error::new(format!("unreadable tree entry {text:?}")))
+}
+
+/// The id of `commit`'s `changes/` tree, `None` where it holds none. `strict` refuses a root
+/// entry whose name is another case of `changes` and a `changes` that is not a directory; the
+/// landing's read is not strict, since it never judges main's tip.
+fn fragment_tree(git: &dyn GitRunner, commit: &str, strict: bool) -> Result<Option<String>> {
+    let listed = git_read_ok(
+        git,
+        &[
+            "--no-lazy-fetch",
+            "--no-replace-objects",
+            "ls-tree",
+            "-z",
+            &format!("{commit}^{{tree}}"),
+        ],
+    )?
+    .stdout;
+    let mut found = None;
+    for record in listed.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let Ok((meta, name)) = split_record(record) else {
+            continue;
+        };
+        if !name.eq_ignore_ascii_case(FRAGMENT_DIR) {
+            continue;
+        }
+        let fields: Vec<&str> = meta.split_whitespace().collect();
+        match fields.as_slice() {
+            [_, "tree", oid] if name == FRAGMENT_DIR => found = Some((*oid).to_string()),
+            _ if strict => {
+                return Err(Error::new(format!(
+                    "{name}: changelog entries live in a directory spelled exactly \
+                     {FRAGMENT_DIR}/, which no release would otherwise read"
+                )));
+            }
+            _ => {}
+        }
+    }
+    Ok(found)
+}
+
+/// Every blob under `commit`'s `changes/`, by path, with its id: a plain listing with no rules,
+/// for the landing on main's tip.
+///
+/// # Errors
+/// git cannot list the tree.
+pub fn fragment_listing(git: &dyn GitRunner, commit: &str) -> Result<Vec<(String, String)>> {
+    let Some(tree) = fragment_tree(git, commit, false)? else {
+        return Ok(Vec::new());
+    };
+    let listed = git_read_ok(
+        git,
+        &[
+            "--no-lazy-fetch",
+            "--no-replace-objects",
+            "ls-tree",
+            "-r",
+            "-z",
+            &tree,
+        ],
+    )?
+    .stdout;
+    let mut out = Vec::new();
+    for record in listed.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let Ok((meta, rel)) = split_record(record) else {
+            continue;
+        };
+        let fields: Vec<&str> = meta.split_whitespace().collect();
+        if let [_, "blob", oid] = fields.as_slice() {
+            out.push((format!("{FRAGMENT_DIR}/{rel}"), (*oid).to_string()));
+        }
+    }
+    Ok(out)
+}
+
+/// The release commit's changelog: `source`'s window assembled with `announcement` and rolled
+/// for `version` on `date`, or `source`'s changelog as it stands when it already carries the
+/// section (a recut).
+///
+/// # Errors
+/// [`Window::assembled`]'s and [`roll`]'s.
+pub fn release_text(
+    source: &Window,
+    announcement: Option<&str>,
+    version: &str,
+    date: &str,
+) -> Result<String> {
+    if source.is_recut(version) {
+        return Ok(source.raw.clone());
+    }
+    roll(&source.assembled(announcement)?, version, date)
+}
+
+/// What a roll ships, in words: `entries` entries in its section and `removed` entry files the
+/// release commit deletes.
+#[must_use]
+pub fn roll_words(entries: usize, removed: usize) -> String {
+    let plural =
+        |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
+    format!(
+        "its roll ships {} and deletes {}",
+        plural(entries, "entry", "entries"),
+        plural(removed, "entry file", "entry files")
+    )
+}
+
+/// The files the release commit deletes: every one `source` holds, or none for a recut, whose
+/// files belong to the next window.
+#[must_use]
+pub fn release_removals(source: &Window, version: &str) -> Vec<(String, String)> {
+    if source.is_recut(version) {
+        return Vec::new();
+    }
+    source
+        .fragments
+        .iter()
+        .map(|(f, oid)| (f.path.clone(), oid.clone()))
+        .collect()
+}
+
+/// Main's changelog once the claim lands on its tip `main`, from the published commit's
+/// changelog `source` and the release commit's `release`. Main's text is never judged here:
+/// its lines up to and including `## [Unreleased]`, then its `[Unreleased]` body less the raw
+/// entries `source` carried (each consuming one match), then `release`'s `## [version]` section
+/// exactly as the release commit holds it, then the rest of main. So the section main records
+/// is byte for byte the one that shipped, and anything else on main stays for the dev check and
+/// the next cut's step 1. Main as it stands where it already carries the section (an earlier
+/// wedged claim); a main without `[Unreleased]` takes the section above its first `## `.
+///
+/// # Errors
+/// `release` has no `## [version]` section, or `source` carries it while main does not (main
+/// dropped a released section).
+pub fn landing_text(main: &str, source: &str, release: &str, version: &str) -> Result<String> {
     if has_section(main, version) {
+        return Ok(main.to_string());
+    }
+    if has_section(source, version) {
         return Err(Error::new(format!(
-            "{CHANGELOG_FILE} already has a \"## [{version}]\" section — already rolled"
+            "the published commit's {CHANGELOG_FILE} already carries \"## [{version}]\" and \
+             main's does not — main has dropped a released section; restore it before cutting"
         )));
     }
-    let shipped = unreleased_body(source)?;
+    let section = section_lines(release, version).ok_or_else(|| {
+        Error::new(format!(
+            "the release commit's {CHANGELOG_FILE} has no \"## [{version}]\" section"
+        ))
+    })?;
     let lines: Vec<&str> = main.lines().collect();
-    let start = lines
+    let mut out: Vec<&str> = Vec::with_capacity(lines.len() + section.len() + 2);
+    let leftovers;
+    match lines
         .iter()
         .position(|l| is_section_header(l, "Unreleased"))
-        .ok_or_else(|| {
-            Error::new(format!(
-                "{CHANGELOG_FILE} has no \"## [Unreleased]\" section"
-            ))
-        })?;
+    {
+        Some(start) => {
+            let end = lines[start + 1..]
+                .iter()
+                .position(|l| l.starts_with("## "))
+                .map_or(lines.len(), |p| start + 1 + p);
+            // Serves the drain of entries written before fragments: what the source carried
+            // raw shipped, so main's copy of it goes; it goes once [Unreleased] holds none.
+            let shipped = unreleased_lines(source);
+            leftovers = unshipped_entries(&lines[start + 1..end], &shipped);
+            out.extend_from_slice(&lines[..=start]);
+            out.push("");
+            out.extend_from_slice(&leftovers);
+            out.extend_from_slice(&section);
+            out.extend_from_slice(&lines[end..]);
+        }
+        None => {
+            let first = lines
+                .iter()
+                .position(|l| l.starts_with("## "))
+                .unwrap_or(lines.len());
+            out.extend_from_slice(&lines[..first]);
+            out.extend_from_slice(&section);
+            out.extend_from_slice(&lines[first..]);
+        }
+    }
+    let mut text = out.join("\n");
+    if main.ends_with('\n') || main.is_empty() {
+        text.push('\n');
+    }
+    Ok(text)
+}
+
+/// `text`'s `## [version]` heading and every line after it up to the next `## ` heading.
+fn section_lines<'a>(text: &'a str, version: &str) -> Option<Vec<&'a str>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|l| is_section_header(l, version))?;
     let end = lines[start + 1..]
         .iter()
         .position(|l| l.starts_with("## "))
         .map_or(lines.len(), |p| start + 1 + p);
-    let leftovers = unshipped_entries(&lines[start + 1..end], &shipped);
-
-    let mut out: Vec<&str> = lines[..=start].to_vec();
-    out.push("");
-    out.extend_from_slice(&leftovers);
-    let heading = format!("## [{version}] - {date}");
-    out.push(&heading);
-    out.extend(shipped.iter().copied());
-    out.extend_from_slice(&lines[end..]);
-    let mut rolled = out.join("\n");
-    if main.ends_with('\n') {
-        rolled.push('\n');
-    }
-    Ok(rolled)
+    Some(lines[start..end].to_vec())
 }
 
-/// The raw lines of `text`'s `[Unreleased]` body, between its header and the next
-/// `## ` heading.
-fn unreleased_body(text: &str) -> Result<Vec<&str>> {
+/// The raw lines of `text`'s `[Unreleased]` body, empty where it has none.
+fn unreleased_lines(text: &str) -> Vec<&str> {
     let mut lines = text.lines();
     if !lines.any(|l| is_section_header(l, "Unreleased")) {
-        return Err(Error::new(format!(
-            "{CHANGELOG_FILE} has no \"## [Unreleased]\" section"
-        )));
+        return Vec::new();
     }
-    Ok(lines.take_while(|l| !l.starts_with("## ")).collect())
+    lines.take_while(|l| !l.starts_with("## ")).collect()
+}
+
+/// The files the claim deletes from main's tip, given the files the release shipped
+/// (`shipped`, path and blob id) and main's `listing`: each shipped blob removes at most one of
+/// main's files with the same id, the same path first, so a shipped file renamed or moved to
+/// another kind since the publish still goes, and one edited since stays and ships next. Where
+/// main already carries the section (an earlier wedged claim), only files whose entry that
+/// section holds go.
+#[must_use]
+pub fn landing_removals(
+    shipped: &[(Fragment, String)],
+    main: &str,
+    listing: &[(String, String)],
+    version: &str,
+) -> Vec<(String, String)> {
+    let recorded: Option<Vec<String>> = has_section(main, version).then(|| {
+        entries(main)
+            .into_iter()
+            .filter(|e| e.section == Section::Released(version))
+            .map(|e| e.text)
+            .collect()
+    });
+    let mut taken = vec![false; listing.len()];
+    let mut out = Vec::new();
+    let mut pending = Vec::new();
+    for (fragment, oid) in shipped {
+        if let Some(held) = &recorded {
+            let entry = fragment.text.strip_suffix('\n').unwrap_or(&fragment.text);
+            if !held.iter().any(|text| text == entry) {
+                continue;
+            }
+        }
+        match listing
+            .iter()
+            .enumerate()
+            .position(|(i, (path, id))| !taken[i] && *path == fragment.path && id == oid)
+        {
+            Some(i) => {
+                taken[i] = true;
+                out.push(listing[i].clone());
+            }
+            None => pending.push(oid),
+        }
+    }
+    for oid in pending {
+        if let Some(i) = listing
+            .iter()
+            .enumerate()
+            .position(|(i, (_, id))| !taken[i] && id == oid)
+        {
+            taken[i] = true;
+            out.push(listing[i].clone());
+        }
+    }
+    out
+}
+
+/// The files the claim deletes from main's tip because they carry, word for word or
+/// re-wrapped ([`entry_key`]), an entry the release shipped raw from `source`'s `[Unreleased]`:
+/// main moved it into a file after the publish, and left there the next release would refuse it
+/// as a repeat. Each shipped entry removes at most one of main's files, none that `removed`
+/// already holds; `text_of` reads a listed blob's text (`None` where it cannot).
+/// Serves the drain of entries written before fragments; it goes once `[Unreleased]` holds none.
+#[must_use]
+pub fn landing_raw_removals(
+    source: &str,
+    listing: &[(String, String)],
+    removed: &[(String, String)],
+    text_of: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    let mut shipped: Vec<String> = unreleased_entries(source)
+        .iter()
+        .map(|text| entry_key(text))
+        .collect();
+    let mut out = Vec::new();
+    for listed in listing {
+        if shipped.is_empty() {
+            break;
+        }
+        if removed.contains(listed) {
+            continue;
+        }
+        let Some(text) = text_of(&listed.1) else {
+            continue;
+        };
+        let key = entry_key(&text);
+        if let Some(at) = shipped.iter().position(|held| *held == key) {
+            shipped.swap_remove(at);
+            out.push(listed.clone());
+        }
+    }
+    out
+}
+
+/// A blob's text by id where it is UTF-8 within the one-entry bound, for the landing's
+/// reads of main's files, which never refuse.
+#[must_use]
+pub fn small_blob_text(git: &dyn GitRunner, oid: &str) -> Option<String> {
+    let size = git_read_ok(
+        git,
+        &[
+            "--no-lazy-fetch",
+            "--no-replace-objects",
+            "cat-file",
+            "-s",
+            oid,
+        ],
+    )
+    .ok()?
+    .stdout;
+    let size: usize = std::str::from_utf8(&size).ok()?.trim().parse().ok()?;
+    if size > MAX_FRAGMENT_BYTES {
+        return None;
+    }
+    blob_text(git, oid).ok()
 }
 
 /// One unit of a changelog section body: a `###` heading, or an entry — a line

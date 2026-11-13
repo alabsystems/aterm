@@ -75,7 +75,7 @@ fn native_cancel_worker_if_requested() {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::ExitStatusExt as _;
     let world = PathBuf::from(std::env::var_os(WORLD).unwrap());
-    let (mut read, write) = std::io::pipe().unwrap();
+    let (mut read, write) = aterm_uds::pipe().unwrap();
     // SAFETY: this worker's new pipe writer, before publishing it to its handler.
     assert_eq!(
         unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },

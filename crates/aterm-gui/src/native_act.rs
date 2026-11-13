@@ -194,7 +194,7 @@ pub(crate) fn renewal_pending(ctx: &crate::SessionCtx) -> bool {
 pub(crate) fn retain_exec_claim(ctx: &crate::SessionCtx, connection: u64) -> bool {
     #[cfg(unix)]
     {
-        exec_handoff::retain_claim(ctx, connection)
+        source_exec::retain_claim(ctx, connection) || exec_handoff::retain_claim(ctx, connection)
     }
     #[cfg(not(unix))]
     {
@@ -4121,7 +4121,7 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
             continue;
         }
         let Some(reason) = retirement(&op, kernel) else {
-            if starts_nothing_more(&op)
+            if starts_nothing_more(&op, kernel)
                 && let Some(custody) = &op.custody
             {
                 custody.release_handoff_guard();
@@ -4135,19 +4135,32 @@ fn reconcile_extinct_by(ctx: &crate::SessionCtx, kernel: &dyn Kernel) {
     }
 }
 
-/// A restart signalled before its deadline and past it now, with no Resume, grant or child: Signal
-/// and Resume refuse past the deadline and no child exists without a Resume, so all it can still
-/// do is wait for the source's own exit, which a source that outlives its SIGTERM, or a group that
-/// keeps a member, may never make. The update's handoff stops waiting on that
-/// ([`NativeCustody::release_handoff_guard`]); the input position stays until it retires.
-fn starts_nothing_more(op: &Operation) -> bool {
-    matches!(op.request.plan, NativePlan::Restart { .. })
-        && op.clock.remaining(op.request.deadline_us).is_none()
-        && op.signal_accepted == Some(true)
-        && !op.resume_sent
-        && op.resume_attempt.is_none()
-        && op.grant_record == GrantRecord::None
-        && op.children.iter().all(Option::is_none)
+/// An abandoned operation that can start nothing more, though its processes may outlive it by
+/// days. A restart signalled before its deadline and past it now, with no Resume, grant or
+/// child: Signal and Resume refuse past the deadline and no child exists without a Resume, so
+/// all it can still do is wait for the source's own exit, which a source that outlives its
+/// SIGTERM, or a group that keeps a member, may never make. An own-image move whose actor is
+/// gone: every request on it must come from that actor's exact process ([`same_actor`]), so
+/// nothing is left to move or record the child it moved, which may run on. The update's handoff
+/// stops waiting on either ([`NativeCustody::release_handoff_guard`]); the input position stays
+/// until it retires. A restart that granted a child Execute is not one: past its deadline its
+/// Precommit and Commit still seal and record its outcome, which no successor could answer.
+fn starts_nothing_more(op: &Operation, kernel: &dyn Kernel) -> bool {
+    match &op.request.plan {
+        NativePlan::Restart { .. } => {
+            op.clock.remaining(op.request.deadline_us).is_none()
+                && op.signal_accepted == Some(true)
+                && !op.resume_sent
+                && op.resume_attempt.is_none()
+                && op.grant_record == GrantRecord::None
+                && op.children.iter().all(Option::is_none)
+        }
+        NativePlan::OwnImage { .. } => op
+            .authority
+            .actor
+            .as_ref()
+            .is_some_and(|actor| kernel.birth_alive(actor) == Some(false)),
+    }
 }
 
 pub(crate) fn serve(

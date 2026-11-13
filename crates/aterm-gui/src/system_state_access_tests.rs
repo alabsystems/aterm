@@ -1425,12 +1425,15 @@ fn the_steps_moment_holds_no_step_while_macos_idle_time_cannot_be_read() {
     assert!(app.access_step_moment(clicked), "a click in aterm");
 }
 
-/// Keys typed while no aterm window had keyboard focus (into another app before a click brought
-/// aterm's System State to the front) are not aterm's keys, and the steps' moment reads no focus
-/// ([`App::step_moment_is_quiet`]): neither aterm losing focus nor taking it back holds the steps.
-/// NEGATIVE CONTROL: a key typed in aterm restarts the steps' key rest.
+/// A step's page, panel or folder question comes up over whatever the person is looking at, so
+/// the steps' moment waits for an aterm window to hold keyboard focus
+/// ([`App::step_moment_is_quiet`], owner ruling 2026-11-09): behind another app no step starts,
+/// and aterm coming to the front lets it go on at once, since a focus change is no key of
+/// aterm's and restarts no key rest.
+/// NEGATIVE CONTROL: with aterm in front the same moment admits the step, and a key typed in
+/// aterm restarts the steps' key rest.
 #[test]
-fn the_steps_moment_reads_no_keyboard_focus() {
+fn the_steps_moment_waits_for_an_aterm_window_in_front() {
     use crate::devtools_helper::COLD_START_SETTLE;
     let mut app = App::headless_for_test();
     app.access_steps.set_reach(StepsReach {
@@ -1443,17 +1446,21 @@ fn the_steps_moment_reads_no_keyboard_focus() {
     approve(&mut app, 5);
     let wid = crate::WindowId(0);
     let settled = Instant::now() + COLD_START_SETTLE + Duration::from_secs(1);
+    assert!(
+        app.access_step_moment(settled),
+        "control: aterm in front, the keyboard at rest"
+    );
 
     app.window_focus_event(wid, false);
     assert!(!app.any_os_window_focused(), "precondition: away");
     assert!(
-        app.access_step_moment(settled),
-        "aterm losing keyboard focus does not hold the steps"
+        !app.access_step_moment(settled),
+        "behind another app a step would come up over it: it waits"
     );
     app.window_focus_event(wid, true);
     assert!(
         app.access_step_moment(settled),
-        "a focus change does not restart automatic setup's keyboard rest"
+        "aterm in front again: the step goes on, with no key rest restarted"
     );
 
     app.last_keystroke_at = Some(settled);

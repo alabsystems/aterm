@@ -434,6 +434,8 @@ pub enum Seen {
 /// Host-side snapshot of a live process's session record ([`read_copy`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Copy {
+    /// Precise lifetime captured during the live read, retained after the process ends.
+    pub lifetime: Option<super::relaunch::ProcessLifetime>,
     /// Process ID and kernel start timestamp.
     pub pid: u32,
     pub start: String,
@@ -586,6 +588,7 @@ fn copy_seen(
         Seen::Removed | Seen::Unreadable(_) => Err("no-record"),
     };
     Copy {
+        lifetime: None,
         pid,
         start: start.to_string(),
         home,
@@ -647,6 +650,7 @@ pub fn read_record_goal(home: &Path, pid: u32, thread: &str) -> Option<String> {
 #[must_use]
 pub fn read_copy(pid: u32, start: &str, typed: Option<&Resume>) -> Option<Copy> {
     use super::restart_stamp::alive_as;
+    let lifetime = super::relaunch::ProcessLifetime::capture(pid);
     if !alive_as(pid, start) {
         return None;
     }
@@ -656,7 +660,9 @@ pub fn read_copy(pid: u32, start: &str, typed: Option<&Resume>) -> Option<Copy> 
     if !alive_as(pid, start) {
         return None;
     }
-    Some(copy_seen(pid, start, home, seen, &live, typed))
+    let mut copy = copy_seen(pid, start, home, seen, &live, typed);
+    copy.lifetime = lifetime.and_then(super::relaunch::ProcessLifetime::retained_if_current);
+    Some(copy)
 }
 
 /// Read the record of live process `(pid, start)` under `home` now, with no resume line

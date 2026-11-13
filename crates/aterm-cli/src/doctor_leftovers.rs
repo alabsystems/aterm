@@ -289,7 +289,7 @@ pub(crate) fn table_fact(t: &TableReads<'_>) -> LeftoversFact {
     let dir = t
         .records
         .ok_or_else(|| "this user's rendezvous is unknown, so no run record was read".to_owned())?;
-    let mut records = aterm_uds::runs::read_records(dir)
+    let mut records = aterm_uds::runs::read_records(dir, t.boot)
         .map_err(|why| format!("this boot's verify run records did not read ({why})"))?;
     let read = |records: &[(PathBuf, aterm_uds::runs::Record)]| {
         let known = aterm_uds::left::Known {

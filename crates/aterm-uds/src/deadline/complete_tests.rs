@@ -55,7 +55,7 @@ fn complete_output_keeps_both_streams_and_refuses_stderr_overflow() {
 fn complete_stderr_requires_eof_and_reports_read_errors() {
     use std::io::Write as _;
     for finished in [false, true] {
-        let (input, mut writer) = std::io::pipe().unwrap();
+        let (input, mut writer) = crate::pipe().unwrap();
         writer.write_all(b"diagnostic").unwrap();
         let stream =
             StderrDrain::Complete(drain_complete_with_limit(None, input, 32, "stderr").unwrap());
@@ -328,7 +328,7 @@ fn dispatch_witness_distinguishes_spawn_from_post_spawn_reader_failure() {
                 "--nocapture",
             ])
             .env("ATERM_COMPLETE_CANCEL_CHILD", &ready);
-        let (reader, writer) = std::io::pipe().unwrap();
+        let (reader, writer) = crate::pipe().unwrap();
         let pid = std::cell::Cell::new(None);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut stopped = || match std::fs::read_to_string(&ready) {
@@ -633,6 +633,62 @@ fn a_progress_capture_is_cancelled_when_its_caller_stops() {
     assert_eq!(output.stdout, b"done\n");
 }
 
+/// THE PROGRESS-BOUND LISTING KEEPS SIXTEEN MEBIBYTES OF RECORDS: a child printing 2 MiB of
+/// NUL-ended paths, as `git ls-files -z` does, comes back whole through the progress-bound
+/// records reader held to [`MAX_COMPLETE_STDOUT_BYTES`] with every record kept; its window is a
+/// one-minute hang detector. NEGATIVE CONTROL: the default progress-bound reader, held to
+/// [`OUTPUT_KEEP`] (1 MiB), refuses the same output.
+#[cfg(unix)]
+#[test]
+fn the_progress_bound_listing_keeps_sixteen_mebibytes_of_records() {
+    let world = aterm_tempfile::tempdir().unwrap();
+    let path = world.path().join("listing");
+    let mut listing = Vec::new();
+    let mut n = 0u32;
+    while listing.len() < 2 << 20 {
+        listing.extend_from_slice(format!("crates/c{n:06}/src/lib.rs\0").as_bytes());
+        n += 1;
+    }
+    std::fs::write(&path, &listing).unwrap();
+    let cat = crate::deadline::stand_in(std::path::Path::new("/bin/cat"));
+    let command = || {
+        let mut command = crate::spawnfd::command(&cat);
+        command.arg(&path);
+        command
+    };
+    let output = output_while_process_progressing_complete_stdout_records_unless(
+        &mut command(),
+        HANG,
+        "the listing fixture",
+        b'\0',
+        MAX_COMPLETE_STDOUT_BYTES,
+        |_| true,
+        &mut || false,
+    )
+    .expect("a 2 MiB listing is within the records reader's limit");
+    assert!(output.status.success(), "{}", output.status);
+    assert!(
+        output.stdout == listing,
+        "{} of the listing's {} bytes came back",
+        output.stdout.len(),
+        listing.len()
+    );
+    let refused = output_while_process_progressing_complete_stdout(
+        &mut command(),
+        HANG,
+        "the listing fixture",
+    );
+    assert!(
+        matches!(
+            &refused,
+            Err(CompleteProgressError::Complete(CompleteOutputError::StdoutTooLarge { limit }))
+                if *limit == OUTPUT_KEEP
+        ),
+        "{:?}",
+        refused.map(|output| output.stdout.len())
+    );
+}
+
 /// A LISTING IS READ WHOLE PAST THE SHARED HARD MAXIMUM, UP TO ITS OWN: one byte past
 /// [`MAX_COMPLETE_STDOUT_BYTES`] comes back whole. NEGATIVE CONTROLS: the shared entry point
 /// refuses that limit before dispatch, and the listing's refuses one past its own maximum.
@@ -803,7 +859,7 @@ fn complete_stdout_refuses_a_still_open_stream_and_accepts_proven_completion() {
 fn complete_stdout_reads_a_pipe_no_writer_holds_to_its_end() {
     use crate::deadline::tests::{Late, an_empty_group};
     use std::io::Write as _;
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = crate::pipe().expect("pipe");
     writer.write_all(b"owned prefix").expect("write");
     drop(writer);
     let pipe = pipe_end(&reader);
@@ -826,7 +882,7 @@ fn complete_stdout_reads_a_pipe_no_writer_holds_to_its_end() {
 fn complete_stdout_reads_a_pipe_held_outside_the_childs_group_until_it_lets_go() {
     use crate::deadline::tests::{an_empty_group, lets_go};
     use std::io::Write as _;
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = crate::pipe().expect("pipe");
     writer.write_all(b"one ").expect("write");
     let pipe = pipe_end(&reader);
     let drain = drain_stdout(pipe, reader).expect("reader");
@@ -850,7 +906,7 @@ fn complete_stdout_reads_a_pipe_held_outside_a_group_left_only_a_zombie_until_it
     use crate::deadline::tests::{a_group_left_only_a_zombie, lets_go};
     use std::io::Write as _;
     let zombie = a_group_left_only_a_zombie();
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = crate::pipe().expect("pipe");
     writer.write_all(b"one ").expect("write");
     let pipe = pipe_end(&reader);
     let drain = drain_stdout(pipe, reader).expect("reader");
@@ -908,7 +964,7 @@ fn record_capture_reads_past_its_limit_keeping_only_the_records_it_accepts() {
 #[cfg(unix)]
 #[test]
 fn a_child_past_its_deadline_is_ended_not_left_running() {
-    let (read, write) = std::io::pipe().expect("a pipe");
+    let (read, write) = crate::pipe().expect("a pipe");
     let mut command =
         crate::spawnfd::command(crate::deadline::stand_in(std::path::Path::new("/bin/sh")));
     command
@@ -944,4 +1000,23 @@ fn a_child_past_its_deadline_is_ended_not_left_running() {
         crate::process::ProcessPresence::Absent,
         "the timed-out child {pid} when the call returned"
     );
+}
+
+#[test]
+fn strict_record_stream_never_offers_an_unterminated_tail() {
+    let total = AtomicU64::new(0);
+    let mut observed = Vec::new();
+    let result = read_records_counted_policy(
+        Cursor::new(b"complete\npartial"),
+        b'\n',
+        42,
+        &total,
+        |record| {
+            observed.push(record.to_vec());
+            false
+        },
+        true,
+    );
+    assert!(matches!(result, Err(CompleteOutputError::StdoutIncomplete)));
+    assert_eq!(observed, [b"complete".to_vec()]);
 }

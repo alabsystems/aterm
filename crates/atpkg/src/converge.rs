@@ -124,6 +124,8 @@ ids! {
     CLAUDE_DEFAULTS = "base.agents.claude-defaults";
     /// A dev link.
     DEV_LINK = "base.pkg.dev-link";
+    /// A local update pin, `@<program>`, or unreadable pin decisions.
+    PIN = "base.pkg.pin";
     /// The toolset against the signed index.
     TOOLSET = "base.pkg.toolset";
     /// The toolset on a platform no build is published for.

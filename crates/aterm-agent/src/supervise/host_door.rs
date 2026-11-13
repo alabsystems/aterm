@@ -278,6 +278,15 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     fn launch_model(&self) -> crate::supervise::policy::turn_end::LaunchModel {
         crate::supervise::policy::turn_end::LaunchModel::Unread
     }
+    /// FABLE'S WEEK AS THE ACCOUNT'S RECORD HAS IT
+    /// ([`crate::supervise::policy::turn_end::FableWeek`]): the week a session's screen last said
+    /// for the account the session's process runs on, its reset where a read named it (or the
+    /// one a later read named for that week). Asked only at Fable's limit, beside
+    /// [`Self::launch_model`], for a launch that may move: it times the return of a move whose
+    /// notice names no reset. `None` where the host keeps no such record.
+    fn fable_week(&self) -> Option<crate::supervise::policy::turn_end::FableWeek> {
+        None
+    }
     fn relaunch_off(&self) -> bool {
         false
     }
@@ -338,6 +347,18 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     /// `None` while the read goes on, as that door's is. A host that reads none was not asked.
     fn leftover(&self) -> Option<crate::harness::leftover::LeftRead> {
         Some(crate::harness::leftover::LeftRead::NotAsked)
+    }
+    /// HOW THE CREDENTIAL `wants` THE TURN NAMED RESOLVE
+    /// ([`crate::supervise::policy::credential_need::CredentialRead`]): the registry entries that
+    /// hold each, value-free, else `aterm secrets need` filed for it. Asked only where the turn
+    /// names a credential line, and `None` while the host works, as [`Self::leftover`]'s is. A
+    /// host that resolves none was not asked.
+    fn credentials(
+        &self,
+        wants: Vec<String>,
+    ) -> Option<crate::supervise::policy::credential_need::CredentialRead> {
+        drop(wants);
+        Some(crate::supervise::policy::credential_need::CredentialRead::NotAsked)
     }
     fn lifted_off(&self) -> bool {
         false
@@ -580,6 +601,16 @@ pub trait IdleHost: Send + Sync + std::fmt::Debug {
     }
 
     fn upgrade_due(&self) -> bool {
+        false
+    }
+
+    /// Whether the upgrade's own last look at this tab found its move held only by the loop's
+    /// guard at a wall: a login wall or a usage limit nobody lifted past the bound the upgrade
+    /// keeps for it (`upgrade::LOGIN_WALL_S`, `upgrade::LIMIT_WALL_S`, nobody at the tab), its
+    /// record saying the move waits for the loop's next point. The loop then offers that point to
+    /// the upgrade's step alone ([`IdlePoint::walled`]), where at any other wall it withholds every
+    /// step; the step looks again and moves only where it still may.
+    fn upgrade_wall_due(&self) -> bool {
         false
     }
 

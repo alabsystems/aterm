@@ -32,6 +32,16 @@
 //! Where no file identity can be read ([`FileId`]), nothing confirms by identity.
 //! [`Act::Observe`] is what an unconfirmed agent gets: the claim stands and its boxes are read,
 //! logged and escalated to the person, and nothing is typed.
+//!
+//! Every write the harness makes into a session passes one gate, where every one of them goes
+//! through: the control server's input admission, for a write on the window harness's own
+//! connection or one that names a [`Lane`] on any connection (the token beside the socket, which
+//! a lane falls back to where the window's token is refused). It asks [`withholds`] of the host's
+//! act for the agent the foreground names and of the lane the write names itself by, so a lane
+//! added later is judged there whether or not it asks anything first; only the lanes THE RULING
+//! exempts ([`Lane::exempt`]) pass an observed agent, and only by naming themselves. The window's
+//! own input (`hwkey`, `pointer`, `invoke`), which reaches whatever view the window delivers it
+//! to, is refused to the window harness's connection whatever the act.
 
 use std::path::{Path, PathBuf};
 
@@ -180,6 +190,122 @@ impl Act {
     #[must_use]
     pub fn of_word(word: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|act| act.word() == word)
+    }
+}
+
+/// Declares [`Lane`] from its rows, each a variant with its word and THE RULING's verdict on it,
+/// so [`Lane::ALL`], [`Lane::word`] and [`Lane::exempt`] are the lanes the code has, never a
+/// list kept beside them.
+macro_rules! lanes {
+    ($($(#[doc = $doc:literal])* $variant:ident => $word:literal, exempt: $exempt:literal;)+) => {
+        /// A lane of the harness that types into a session through a connection of its own, not
+        /// a hosted loop's (the loop's own gate refuses each of its writes first): each names
+        /// itself at every write it makes ([`LANE_OPTION`]), and the control server's one gate
+        /// ([`withholds`]) passes a write into an agent the host has not confirmed only for a
+        /// lane THE RULING exempts ([`Self::exempt`]). A write that names no lane is judged as a
+        /// lane no ruling exempts.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+        pub enum Lane {
+            $($(#[doc = $doc])* $variant,)+
+        }
+
+        impl Lane {
+            /// Every lane, as the gate reads its word.
+            pub const ALL: [Self; [$(stringify!($variant)),+].len()] = [$(Self::$variant),+];
+
+            /// The word a write names the lane by (`harness-lane=<word>`) and a log line says
+            /// it by.
+            #[must_use]
+            pub const fn word(self) -> &'static str {
+                match self {
+                    $(Self::$variant => $word,)+
+                }
+            }
+
+            /// THE RULING's exemption (2026-10-27): whether this lane may type into an agent the
+            /// host has not confirmed. The ruling holds a relaunch after the agent exits, the
+            /// live upgrade and the codex-alab, agy and Muse Code drives safe on the agent's own
+            /// session record. The disk lanes are none of them: their lines are owed from what
+            /// the screen showed (an `ENOSPC` while the volume measured full) and from the seat
+            /// rule, never from a record.
+            #[must_use]
+            pub const fn exempt(self) -> bool {
+                match self {
+                    $(Self::$variant => $exempt,)+
+                }
+            }
+        }
+    };
+}
+
+lanes! {
+    /// The disk resume (`disk-resume@v1`): the carry-on typed into a session whose screen said
+    /// the disk was full, once space is back.
+    DiskResume => "disk-resume", exempt: false;
+    /// The ask to free space (`disk-free@v1`): the line typed into the session the seat rule
+    /// seats.
+    DiskFree => "disk-free", exempt: false;
+    /// A relaunch after the agent exits (or a restart ends it): the relaunch line and its
+    /// continuation.
+    Relaunch => "relaunch", exempt: true;
+    /// The live upgrade's own lines: its notice, its release line and its model visit.
+    Upgrade => "upgrade", exempt: true;
+    /// The codex-alab drive.
+    CodexAlab => "codex-alab", exempt: true;
+    /// agy's drive.
+    Agy => "agy", exempt: true;
+    /// Muse Code's drive.
+    Muse => "muse", exempt: true;
+}
+
+impl Lane {
+    /// The lane `word` names.
+    #[must_use]
+    pub fn of_word(word: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|lane| lane.word() == word)
+    }
+}
+
+/// The leading option a lane's write names it by: `harness-lane=<word>` ([`Lane::word`]).
+pub const LANE_OPTION: &str = "harness-lane=";
+
+/// What the one gate answers a write it withholds: an `ERR busy` (every write path reads it as
+/// "nothing was written, back off"; never `busy sink`, which is retried, and never a
+/// `supervisor=` word, which names another holder).
+pub const OBSERVE_REFUSAL: &str = "ERR busy supervisor_act=observe (the agent's image is \
+                                   unconfirmed: the harness types nothing into it)";
+
+/// The head [`observe_refused`] reads a refusal by.
+const OBSERVE_REFUSED: &str = "ERR busy supervisor_act=observe";
+
+/// Whether `reply` (a reply's line, or a client's `aterm-ctl: ERR …` text) is the one gate's
+/// refusal ([`OBSERVE_REFUSAL`]).
+#[must_use]
+pub fn observe_refused(reply: &str) -> bool {
+    let reply = reply.trim_start();
+    reply
+        .strip_prefix("aterm-ctl:")
+        .map_or(reply, str::trim_start)
+        .starts_with(OBSERVE_REFUSED)
+}
+
+/// The step a lane says of a line the gate withheld ([`observe_refused`]): nothing was typed,
+/// and the lane does not offer that line again.
+pub const WITHHELD: &str = "withheld:unconfirmed";
+
+/// THE ONE GATE's decision on a write the harness makes into a session: whether it is withheld.
+/// `act` is the host's act for the agent the session's foreground names (`None` where it names
+/// no agent: the write goes into none), and `lane` the lane the write names. A confirmed agent,
+/// and a foreground that is no agent, take every lane's write; an agent the host observes takes
+/// only an exempt lane's ([`Lane::exempt`]).
+#[must_use]
+pub const fn withholds(act: Option<Act>, lane: Option<Lane>) -> bool {
+    match act {
+        Some(Act::Observe) => match lane {
+            Some(lane) => !lane.exempt(),
+            None => true,
+        },
+        Some(Act::On) | None => false,
     }
 }
 

@@ -149,8 +149,8 @@ impl SourceRead {
             .map(|binding| keys::uuid32(binding.machine()));
         let empty = crate::typed::owned::OwnedRead::default();
         let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
-        let projection = Arc::new(LabView::read(
-            &view.cells,
+        let projection = Arc::new(LabView::read_view(
+            view,
             owned(MACHINE_FACTS.name),
             owned(MAILBOX_OBS.name),
             uuid.as_deref(),

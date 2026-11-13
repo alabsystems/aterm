@@ -4,7 +4,8 @@
 //! `lab tables-page`: the Tables page (docs/PLAN.md LT-08) on a private instance whose home holds
 //! a scratch registry with synthetic rows, two of its Macs' concurrent edits to one cell among
 //! them. It opens the page, takes a frame, stages an edit through `act`, takes a frame, writes
-//! it, and takes a frame; the frames go to the folder named. No live vault, fleet or Commons is
+//! it, takes a frame, selects the grid's last column, and takes a frame; the frames go to the
+//! folder named. No live vault, fleet or Commons is
 //! reached, and every value is synthetic (`example.invalid`).
 
 use std::path::{Path, PathBuf};
@@ -131,6 +132,28 @@ pub fn cmd(args: &[String]) -> Res {
         )?]])
         .map_err(fail)?;
     repair_commons(&lab, 4);
+    // Each Mac registers as aterm does: its facts row binds it to its machine row, which is how
+    // the page names a writer by its label.
+    aterm_secrets::client::admin_seed_swarm_roster(&lab.paths[0], &[]).map_err(fail)?;
+    aterm_secrets::client::sync(&lab.paths[1], None).map_err(fail)?;
+    for (n, host) in ["m73", "m55"].into_iter().enumerate() {
+        let probe = aterm_db::alab::register::Probe {
+            hw_model: "Mac16,8".into(),
+            hosts: vec![host.into()],
+            node: Some(format!("{:016x}", n + 1)),
+            platform_uuid: format!("00000000-0000-4000-8000-00000000000{n}"),
+            ..aterm_db::alab::register::Probe::default()
+        };
+        Registry::at(lab.paths[n].clone())
+            .register(
+                &lab.paths[n].home.join("config.toml"),
+                &probe,
+                true,
+                aterm_time::unix_millis().ok_or_else(|| fail("no clock"))?,
+            )
+            .map_err(fail)?;
+        repair_commons(&lab, 4);
+    }
 
     let out = out.unwrap_or_else(|| world.dir.clone());
     std::fs::create_dir_all(&out).map_err(fail)?;
@@ -227,7 +250,7 @@ fn drive(inst: &mut Instance, out: &Path) -> Result<Vec<PathBuf>, Fail> {
     ok(inst, &["open", "app", "tables"])?;
     let view = tables_view(inst)?;
     until(inst, &view, "its machines", |text| {
-        text.contains("Machines: 3 rows")
+        text.contains("Machines: ")
     })?;
     let mut shots = vec![frame(inst, out, "tables-1-read.png")?];
     act(
@@ -257,5 +280,8 @@ fn drive(inst: &mut Instance, out: &Path) -> Result<Vec<PathBuf>, Fail> {
     until(inst, &view, "the write", |text| text.contains("Wrote "))?;
     act(inst, &view, location, None)?;
     shots.push(frame(inst, out, "tables-4-written.png")?);
+    // The grid's last column selected scrolls it across: the row's label stays at the left.
+    act(inst, &view, "tables/cell/mc-000000000000000c/hosts", None)?;
+    shots.push(frame(inst, out, "tables-5-across.png")?);
     Ok(shots)
 }

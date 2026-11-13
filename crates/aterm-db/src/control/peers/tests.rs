@@ -70,6 +70,49 @@ fn a_roster_of_peers_keeps_each_hint() {
     }
 }
 
+/// C3: an announce reaches every hint the cache keeps: an idle one at once, a leased one as its
+/// round releases it, whatever that round left in it. A peer with no hint has none to take it.
+///
+/// NEGATIVE CONTROL (2026-11-12): with a release not giving its hint what was announced while
+/// the lease ran, the leased peer's hint named no table (`a leased hint takes it as its round
+/// releases it`: `left: {}`, `right: {[7, 7, …]}`).
+#[test]
+fn an_announce_reaches_an_idle_hint_now_and_a_leased_one_as_it_is_released() {
+    let cache = Cache::default();
+    let named = BTreeSet::from([[7; 32]]);
+    let mut repair = Repair::default();
+    drop(cache.acquire(actor(0), &mut repair).unwrap());
+    let mut leased = Repair::default();
+    let lease = cache.acquire(actor(1), &mut leased).unwrap();
+    cache.announce(&named, false);
+
+    let mut repair = Repair::default();
+    let idle = cache.acquire(actor(0), &mut repair).unwrap();
+    assert_eq!(idle.announced().0, &named, "an idle hint takes it at once");
+    drop(idle);
+    assert!(
+        lease.announced().0.is_empty(),
+        "the round in flight keeps its own state"
+    );
+    drop(lease);
+    let mut repair = Repair::default();
+    let released = cache.acquire(actor(1), &mut repair).unwrap();
+    assert_eq!(
+        released.announced().0,
+        &named,
+        "a leased hint takes it as its round releases it"
+    );
+    drop(released);
+    assert!(
+        cache.0.lock().unwrap().told.is_empty(),
+        "and it is kept once"
+    );
+
+    let mut repair = Repair::default();
+    let fresh = cache.acquire(actor(2), &mut repair).unwrap();
+    assert!(fresh.announced().0.is_empty(), "a peer with no hint");
+}
+
 #[test]
 fn a_lone_channel_in_either_direction_needs_no_preference_or_wait() {
     let cache = Cache::default();

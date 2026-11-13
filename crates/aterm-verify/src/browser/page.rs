@@ -70,7 +70,7 @@ impl Chrome {
         let (out, err) = log_stdio(&log).map_err(|stop| match stop {
             Stop::CouldNotRun(why) | Stop::Fail(why) | Stop::Lacks(why) => unavailable(why),
         })?;
-        let pipe = || std::io::pipe().map_err(|e| unavailable(format!("no pipe: {e}")));
+        let pipe = || aterm_uds::pipe().map_err(|e| unavailable(format!("no pipe: {e}")));
         let ((cmd_read, cmd_write), (out_read, out_write)) = (pipe()?, pipe()?);
         let mut cmd = LaneCommand::new(&browser.path);
         cmd.args(chromium::launch_args(

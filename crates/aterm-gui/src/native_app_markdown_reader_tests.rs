@@ -1043,7 +1043,7 @@ fn markdown_image_actions_select_local_source_and_gate_remote_open() {
     assert!(matches!(
         remote.effects.as_slice(),
         [AppEffect::OpenExternal {
-            request: ExternalOpenRequest { uri, user_initiated: true },
+            request: ExternalOpenRequest { uri },
             ..
         }] if uri == "https://example.com/pic.png"
     ));
@@ -1107,7 +1107,7 @@ fn markdown_outline_and_links_use_typed_policy_without_local_file_access() {
     assert!(matches!(
         external.effects.as_slice(),
         [AppEffect::OpenExternal {
-            request: ExternalOpenRequest { uri, user_initiated: true },
+            request: ExternalOpenRequest { uri },
             ..
         }] if uri == "https://example.com/docs"
     ));

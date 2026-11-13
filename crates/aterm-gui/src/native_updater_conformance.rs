@@ -55,6 +55,8 @@ fn status(staged_build: Option<u64>, failing_checks: u32) -> DurableUpdateStatus
         installable: Some(true),
         channel_unreadable: false,
         checked_at: None,
+        hold: None,
+        behind: false,
     }
 }
 
@@ -2689,15 +2691,30 @@ fn a_spent_count_read_past_the_bound_holds_for_the_trial() {
         "and said"
     );
     use crate::update_words::LiveHealth as _;
-    let said = app
-        .messages
-        .live_health()
-        .map(|live| live.msg.detail.join("; "))
-        .expect("the warning is up");
     assert!(
-        !said.contains(crate::update_words::INSTALL_FROM_MENU),
-        "the notice names no start the trial rolls back: {said}"
+        app.messages.live_health().is_none(),
+        "said as a journal record, never a row"
     );
+    if cfg!(target_os = "macos") {
+        let record =
+            aterm_update::apply_lane_report(app.native_updater_service.snapshot().current_build)
+                .and_then(|report| report.lane)
+                .expect("the ledger has the lane's record");
+        assert_eq!(
+            (record.lane.as_str(), record.target_build),
+            ("awaiting-newer", 11)
+        );
+        assert!(
+            record
+                .next_action
+                .contains(crate::update_words::NEWER_RELEASE_REPLACES)
+                && !record
+                    .next_action
+                    .contains(crate::update_words::INSTALL_FROM_MENU),
+            "the record names no start the trial rolls back: {}",
+            record.next_action
+        );
+    }
 }
 
 /// A TRIAL THAT REGAINS ROOM RELEASES THE LATCH: a hold for the trial dropped the re-sample, so a

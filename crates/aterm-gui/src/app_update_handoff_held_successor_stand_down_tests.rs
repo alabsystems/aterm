@@ -278,7 +278,7 @@ fn a_witness_the_hold_loop_already_read_still_names_the_exit_at_the_stand_down()
     );
 }
 
-/// A successor ignoring the EOF for the whole grace is killed and proven gone; the kill is ours, so the death is `Unobserved`.
+/// A successor ignoring the EOF for the whole grace is killed and proven gone; the kill is ours, so the death is `EndedHere`.
 #[test]
 fn a_successor_that_ignores_eof_is_killed_after_the_grace_and_proven_gone() {
     let (held, child, stream) = hold("sleep 30");
@@ -291,7 +291,7 @@ fn a_successor_that_ignores_eof_is_killed_after_the_grace_and_proven_gone() {
     assert_eq!(stood.warrant, HandoffRollbackWarrant::Vanished);
     assert_eq!(
         stood.death,
-        crate::ChildDeathEvidence::Unobserved,
+        crate::ChildDeathEvidence::EndedHere,
         "our own SIGKILL is not evidence about the bytes"
     );
     assert!(reads_eof(&stream), "the dialer read the stand-down as EOF");
@@ -417,7 +417,7 @@ fn a_successor_undialled_at_the_dial_deadline_is_killed_and_proven_gone_before_t
     assert_eq!(reaper.join().expect("reaper").signal(), Some(libc::SIGKILL));
     assert_eq!(
         death,
-        crate::ChildDeathEvidence::Unobserved,
+        crate::ChildDeathEvidence::EndedHere,
         "our own SIGKILL is not evidence about the bytes"
     );
     assert!(
@@ -436,6 +436,11 @@ fn a_successor_undialled_at_the_dial_deadline_is_killed_and_proven_gone_before_t
 }
 
 /// Both undialled termination arms (`Cancelled` and `Deadline`) retire via [`super::file_undialled_retire`] only after the successor is proven gone.
+///
+/// A successor still running undialled past the dial deadline and the self-exit grace, which
+/// this process had to kill, ran its own code and hung before its dial: it is booked `Stalled`
+/// against its image, not `TimedOut` (NEGATIVE CONTROL: book every deadline `TimedOut` and the
+/// `Deadline` row fails). A cancel is this process's own reason, whatever it had to kill.
 #[test]
 fn the_undialled_ends_retire_only_over_a_successor_proven_gone() {
     use std::os::unix::process::ExitStatusExt as _;
@@ -453,7 +458,7 @@ fn the_undialled_ends_retire_only_over_a_successor_proven_gone() {
             super::LaunchedDialEnd::Rendezvous(
                 crate::handoff_rendezvous::RendezvousError::Deadline,
             ),
-            crate::UpdateHandoffOutcome::TimedOut,
+            crate::UpdateHandoffOutcome::Stalled,
         ),
     ] {
         let rendezvous = bind_rendezvous();
@@ -496,10 +501,74 @@ fn the_undialled_ends_retire_only_over_a_successor_proven_gone() {
         );
         assert_eq!(
             completion.child_death,
-            crate::ChildDeathEvidence::Unobserved,
+            crate::ChildDeathEvidence::EndedHere,
             "our own SIGKILL is not evidence about the bytes"
         );
+        assert_eq!(
+            crate::update_apply_trouble::named_clause(&format!(
+                "overlap handoff failed safely: {}",
+                completion.detail
+            )),
+            Some(match outcome {
+                crate::UpdateHandoffOutcome::Stalled => {
+                    "the new version stopped partway through starting"
+                }
+                _ => "the terminal was too busy to hand over",
+            }),
+            "{end:?}: the ledger's reason is one the Updates surface names: {}",
+            completion.detail
+        );
     }
+}
+
+/// A successor that missed the dial deadline but exited by itself within the self-exit grace (a
+/// slow one that dialled late, found no rendezvous and stood down by its own rule) was not shown
+/// hung, so the deadline stays `TimedOut`, Transient.
+#[test]
+fn an_undialled_successor_that_exits_by_itself_is_timed_out_not_stalled() {
+    let job = super::launched_dialer_admission_conformance::launched_job(true, false, false, false);
+    let rendezvous = bind_rendezvous();
+    let child = aterm_uds::spawnfd::command("/bin/sh")
+        .args(["-c", "sleep 0.2"])
+        .stdin(aterm_uds::spawnfd::Stdio::null())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .stderr(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("spawn the late stand-in");
+    let pid = child.id();
+    let reaper = reap_in_background(child);
+    let in_flight = crate::app_launch_successor::LaunchInFlight::scripted(Some(
+        i32::try_from(pid).expect("a pid fits pid_t"),
+    ));
+    let retire = super::file_undialled_retire(
+        &job,
+        "late".to_string(),
+        &super::LaunchedDialEnd::Rendezvous(crate::handoff_rendezvous::RendezvousError::Deadline),
+        rendezvous,
+        &in_flight,
+        super::NamedSuccessorWatch::default(),
+        aterm_spec::wait::MUST_HAPPEN,
+        aterm_spec::wait::MUST_HAPPEN,
+    );
+    assert!(
+        reaper.join().expect("reaper").success(),
+        "it exited by itself"
+    );
+    assert_eq!(
+        retire.completion.outcome,
+        crate::UpdateHandoffOutcome::TimedOut
+    );
+    assert_eq!(
+        crate::app_native::HandoffFailureLane::classify(
+            crate::native_updater_service::ApplyMode::Automatic,
+            retire.completion.outcome,
+            retire.completion.child_death,
+            false,
+        ),
+        crate::app_native::HandoffFailureLane::Physical(
+            crate::app_native::PhysicalFailureShape::Transient
+        )
+    );
 }
 
 /// An undialled successor cancelled before LaunchServices answers is identified by its launch stamp, killed, and proven gone.

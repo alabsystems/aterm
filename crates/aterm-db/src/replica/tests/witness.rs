@@ -316,6 +316,146 @@ fn a_peer_from_before_cr1_neither_asks_nor_answers_and_keeps_the_scan() {
     }
 }
 
+/// C3: a table this side wrote to and its endpoint announced is its next round's, ahead of the
+/// scan's turn and without asking the peer anything, and the scan goes on from where it was.
+/// An append whose table went unnamed has the next round ask which tables differ, inside the
+/// gap it would otherwise wait out, and the table that differs is taken the same way: the
+/// scan's place stays. The endpoint keeps each peer's hint and a round starts from that copy,
+/// so the announce goes to the endpoint, not into the caller's repair.
+///
+/// NEGATIVE CONTROL (2026-11-12): with [`Repair::announce`] naming no table, the round after the
+/// write took the scan's next table (`the announced table, not the scan's next`: `left: (1,
+/// false)`, `right: (3, false)`).
+#[test]
+fn an_announced_table_is_the_next_rounds_before_the_scans_turn() {
+    let lab = Lab::new(&[Role::Writer; 2]);
+    let tables = tables(&lab, 4);
+    let endpoints = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables, 1)];
+    let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
+    let mut round = |ours: &mut PeerRepair| {
+        exchange_round(&endpoints[0], &endpoints[1], ours, &mut theirs);
+        let report = ours.application().unwrap();
+        (selected(ours, &tables), report.witnesses_asked)
+    };
+    assert_eq!(
+        round(&mut ours),
+        (0, true),
+        "a first round asks, and nothing differs"
+    );
+
+    write(&lab, &tables, 3, 0);
+    endpoints[0].announce(&BTreeSet::from([tables[3].0.digest()]), false);
+    assert_eq!(
+        round(&mut ours),
+        (3, false),
+        "the announced table, not the scan's next"
+    );
+    assert_eq!(
+        held(&lab, &tables, 3, 1),
+        1,
+        "that round carried the record"
+    );
+    assert_eq!(
+        round(&mut ours),
+        (1, false),
+        "the scan goes on from where it was"
+    );
+
+    write(&lab, &tables, 0, 0);
+    endpoints[0].announce(&BTreeSet::new(), true);
+    assert_eq!(
+        round(&mut ours),
+        (0, true),
+        "an unnamed append asks, and the table that differs comes first"
+    );
+    assert_eq!(held(&lab, &tables, 0, 1), 1);
+    assert_eq!(
+        round(&mut ours),
+        (2, false),
+        "and the scan goes on from where it was"
+    );
+}
+
+/// Announced tables leave the regular scan its place and its turns, over four common tables
+/// and rounds that move nothing. With table 3 announced before every second round, the rounds
+/// between go on through tables 1, 2, 3 and 0: every table is selected within eight rounds.
+/// With it announced before every round, each fifth round is the scan's (the `TABLE_BURST`th
+/// announced round in a row yields to it): every table is selected within fifteen. And two
+/// tables announced before every round take turns.
+///
+/// NEGATIVE CONTROL (2026-11-12): with [`Repair::announce`] naming its tables among those whose
+/// witnesses differed, which the regular turn visits and follows, as it did, tables 1 and 2
+/// were never selected (`announced before every second round: the scan keeps its place
+/// between`: `left: [3, 0, 3, 0, 3, 0, 3, 0]`, `right: [3, 1, 3, 2, 3, 3, 3, 0]`).
+/// NEGATIVE CONTROL (2026-11-12): with an announced table's round never yielding, the scan had
+/// no round (`announced before every round: each fifth round is the scan's`: `left: [3, 3, 3,
+/// 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3]`).
+/// NEGATIVE CONTROL (2026-11-12): with the announced table taken always the first of them,
+/// table 3 waited behind table 1 (`two announced tables take turns`: `left: [1, 1, 1, 1]`,
+/// `right: [1, 3, 1, 3]`).
+#[test]
+fn announced_tables_leave_the_scan_its_place_and_its_turns() {
+    let lab = Lab::new(&[Role::Writer; 2]);
+    let tables = tables(&lab, 4);
+    let endpoints = [endpoint(&lab, &tables, 0), endpoint(&lab, &tables, 1)];
+    let (mut ours, mut theirs) = (PeerRepair::default(), PeerRepair::default());
+    // The tables `rounds` rounds select, `announced` named to the endpoint before each round
+    // whose number `when` passes.
+    let mut rounds = |rounds: usize, announced: &[usize], when: &dyn Fn(usize) -> bool| {
+        let named: BTreeSet<_> = announced.iter().map(|n| tables[*n].0.digest()).collect();
+        (0..rounds)
+            .map(|n| {
+                if when(n) {
+                    endpoints[0].announce(&named, false);
+                }
+                exchange_round(&endpoints[0], &endpoints[1], &mut ours, &mut theirs);
+                selected(&ours, &tables)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rounds(1, &[], &|_| false), [0], "the scan's first table");
+    assert_eq!(
+        rounds(8, &[3], &|n| n % 2 == 0),
+        [3, 1, 3, 2, 3, 3, 3, 0],
+        "announced before every second round: the scan keeps its place between"
+    );
+    assert_eq!(
+        rounds(15, &[3], &|_| true),
+        [3, 3, 3, 3, 1, 3, 3, 3, 3, 2, 3, 3, 3, 3, 3],
+        "announced before every round: each fifth round is the scan's"
+    );
+    assert_eq!(
+        rounds(4, &[1, 3], &|_| true),
+        [1, 3, 1, 3],
+        "two announced tables take turns"
+    );
+}
+
+/// An announce names at most a round's list of tables ([`MAX_TABLES`]); one past that, like an
+/// append whose table went unnamed, has the next round ask for witnesses instead.
+///
+/// NEGATIVE CONTROL (2026-11-12): with [`Repair::announce`] naming no table, the hint named
+/// none of the 64 (`left: ({}, false)`).
+#[test]
+fn an_announce_past_a_lists_bound_asks_for_witnesses() {
+    let table = |n: u8| -> Digest { [n; 32] };
+    let listed = || Repair {
+        listed_ms: Some(1),
+        ..Repair::default()
+    };
+    let full: BTreeSet<_> = (0..MAX_TABLES).map(|n| table(n as u8)).collect();
+    let mut repair = listed();
+    repair.announce(&full, false);
+    assert_eq!(repair.announced(), (&full, false));
+    repair.announce(&BTreeSet::from([table(3)]), false);
+    assert_eq!(repair.announced(), (&full, false), "a table named already");
+    repair.announce(&BTreeSet::from([table(200)]), false);
+    assert_eq!(repair.announced(), (&full, true), "one past the bound asks");
+    let mut repair = listed();
+    repair.announce(&BTreeSet::new(), true);
+    assert_eq!(repair.announced(), (&BTreeSet::new(), true));
+}
+
 /// Two rounds on `tables`' first table, unreadable on Mac 1 (its checkpoint gone), each deferred,
 /// then the scan's next: the initiator's repair after each round.
 fn deferred_rounds(passes: bool) -> (Vec<PeerRepair>, Vec<usize>) {

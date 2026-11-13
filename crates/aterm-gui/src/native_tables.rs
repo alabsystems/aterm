@@ -8,15 +8,24 @@
 //!
 //! - **Rail.** One line per table: its name and its rows; the cells of it not yet written, where
 //!   there are any.
-//! - **Grid.** Columns under STORED (the owner's), SET BY ATERM (cells aterm keeps) and LINKED
-//!   ROWS (how many rows of another table name this one). A stored cell is edited in place: a
-//!   press selects it, a second press opens it, Return stages it, Escape leaves it.
-//! - **Blue** means only "not yet written": a staged cell, the rail's count of them, the Write
-//!   bar. Nothing else on the page is blue.
+//! - **Grid.** The row's key column (`label`, an address's `addr`) stays at the left while
+//!   the rest scroll across beside it: columns under STORED (the owner's), SET BY ATERM (cells
+//!   aterm keeps) and LINKED ROWS (how many rows of another table name this one). A stored cell
+//!   is edited in place: a press selects it, a second press opens it, Return stages it, Escape
+//!   leaves it.
+//! - **Blue** means only "not yet written" ([`StyleRef::Unwritten`], the palette's one fixed
+//!   [`crate::native_appearance::NOT_WRITTEN`], never the accent): a staged cell, the rail's
+//!   count of them, the Write bar. Nothing else on the page wears it.
+//! - **Writers** are named by their Mac's label (`m73`), resolved from what aterm holds; a writer
+//!   none names shows the start of its machine id, dimmed.
 //! - **A conflict** shows every value, sorted by its words, and the pane lists each with its
 //!   writer and a Keep; no clock picks one.
 //! - **Secrets** never reach the page: a secret cell shows the grid's mask, and the pane and
 //!   history say only whether it holds one.
+//! - **As of.** Each history entry offers the table as that operation's causal past holds it
+//!   (`aterm db table get|scan|export --at`, the same projection), read only, each cell changed
+//!   since marked in the grid and listed in the pane with what it holds now and who wrote that
+//!   (`aterm db table diff <operation> head`); Now returns to the table as it is.
 //!
 //! The page reads and writes on its own thread; a read answers in a [`Reply`] the host polls on
 //! [`crate::Wake::TablesChanged`].
@@ -86,8 +95,12 @@ pub(crate) enum AuthorKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Author {
     pub(crate) kind: AuthorKind,
-    /// The writing Mac's label, or the start of its machine id where no label is known.
-    pub(crate) machine: Option<String>,
+    /// The writing Mac's label (`m73`), where aterm knows one: its actor's seat, that seat's
+    /// machine, that machine's label ([`crate::tables_store`]'s `Writers`).
+    pub(crate) label: Option<String>,
+    /// The start of the writer's Commons machine id (of its actor where none is known), which
+    /// the page shows, dimmed, where no label is known.
+    pub(crate) id: String,
     /// The time the writer's clock claimed, signed with the operation.
     pub(crate) at_ms: u64,
     /// The operation's place in the causal order: the latest claim among it and everything it
@@ -98,25 +111,43 @@ pub(crate) struct Author {
 impl Author {
     /// When the history places the operation, and the time its writer's clock claimed.
     fn when(&self, now: u64) -> String {
+        format!(
+            "{} \u{b7} claimed {}",
+            self.placed(now),
+            when_words(self.at_ms, now)
+        )
+    }
+
+    /// When the history places the operation: its causal clock's time, and its count past
+    /// ancestors with that same time.
+    fn placed(&self, now: u64) -> String {
         let (ms, counter) = self.hlc;
         let mut words = when_words(ms, now);
         if counter > 0 {
             words.push_str(&format!(" +{counter}"));
         }
-        format!("{words} \u{b7} claimed {}", when_words(self.at_ms, now))
+        words
     }
 }
 
 impl Author {
-    /// `m73`, `aterm · m73`, `import`.
+    /// `m73`, `aterm · m73`, `import · m73`; the short id in a label's place where none is known.
     pub(crate) fn who(&self) -> String {
-        let machine = self.machine.as_deref();
-        match (self.kind, machine) {
-            (AuthorKind::Import, _) => "import".into(),
-            (AuthorKind::Aterm, Some(m)) => format!("aterm \u{b7} {m}"),
-            (AuthorKind::Aterm, None) => "aterm".into(),
-            (AuthorKind::Person, Some(m)) => m.to_owned(),
-            (AuthorKind::Person, None) => "a person".into(),
+        let name = self.label.as_deref().unwrap_or(&self.id);
+        match self.kind {
+            AuthorKind::Import => format!("import \u{b7} {name}"),
+            AuthorKind::Aterm => format!("aterm \u{b7} {name}"),
+            AuthorKind::Person => name.to_owned(),
+        }
+    }
+
+    /// How the writer's words are set: as `known` is where its Mac's label is known; where only
+    /// its short id is, dimmed at `known`'s size.
+    fn style(&self, known: StyleRef) -> StyleRef {
+        match (&self.label, known) {
+            (Some(_), _) => known,
+            (None, StyleRef::Note) => StyleRef::FaintNote,
+            (None, _) => StyleRef::Faint,
         }
     }
 }
@@ -167,6 +198,8 @@ pub(crate) struct WrittenCell {
 /// One operation on a table: one Write, however many cells it set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Written {
+    /// The operation's digest: the point an as-of read names.
+    pub(crate) operation: [u8; 32],
     pub(crate) by: Author,
     pub(crate) cells: Vec<WrittenCell>,
 }
@@ -178,17 +211,44 @@ pub(crate) struct Sheet {
     pub(crate) title: &'static str,
     pub(crate) singular: &'static str,
     pub(crate) columns: Vec<SheetColumn>,
+    /// The column that names a row (`label`, an address's `addr`): the grid keeps it at its
+    /// left while the rest scroll across.
+    pub(crate) key: String,
     pub(crate) rows: Vec<SheetRow>,
     /// Its operations, oldest first.
     pub(crate) written: Vec<Written>,
+    /// In a read as of a past point, each cell that changed since, by row and column.
+    pub(crate) since: BTreeMap<(String, String), Since>,
     /// The export the grid shows: what a Write is compared against.
     pub(crate) base: Base,
+}
+
+/// A cell that changed after the point a past read is at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Since {
+    /// What it holds now, as the pane shows it: empty for a cleared cell; a set's members put in
+    /// (`+ x`) or taken out (`− x`).
+    pub(crate) now: String,
+    /// Who wrote what it holds now: each concurrent writer of a conflict, in causal order.
+    pub(crate) by: Vec<Author>,
+    /// `now` lists a set's members put in or taken out, not a value.
+    pub(crate) members: bool,
+}
+
+/// The past point a read is at.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AsOf {
+    pub(crate) operation: [u8; 32],
+    /// Its writer, where history names the operation.
+    pub(crate) by: Option<Author>,
 }
 
 /// Every shown collection, as one read found them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Snapshot {
     pub(crate) sheets: Vec<Sheet>,
+    /// The past point this read is at; `None` for the table as it is.
+    pub(crate) at: Option<AsOf>,
     pub(crate) read_ms: u64,
 }
 
@@ -211,12 +271,19 @@ pub(crate) struct Wrote {
 }
 
 enum Work {
+    /// Read again at the point the reader is at.
     Read,
+    /// Read as of an operation (the table as it is, where `None`), and stay there once read.
+    At(Option<[u8; 32]>),
     Write(Vec<Staged>),
 }
 
 pub(crate) enum Reply {
-    Read(Result<Snapshot, String>),
+    /// A read, and whether it answers a move to another point ([`Work::At`]).
+    Read {
+        read: Result<Snapshot, String>,
+        moved: bool,
+    },
     Wrote(Result<Wrote, String>),
 }
 
@@ -240,6 +307,9 @@ pub(crate) struct TablesApp {
     sent: BTreeMap<At, String>,
     /// The rule a Write was refused by, at its cell.
     refused: BTreeMap<At, String>,
+    /// Moves to another point asked for that have not answered: the page takes no edit until
+    /// the last of them has, since each answer may land it on a past table.
+    asked: usize,
 }
 
 impl TablesApp {
@@ -259,6 +329,8 @@ impl TablesApp {
                 Some(paths) => Ok(paths),
                 None => crate::tables_store::live(),
             };
+            // The point the page shows: a read at another point moves it only once it reads.
+            let mut point = None;
             loop {
                 let work = match work_rx.recv_timeout(READ_AGAIN) {
                     Ok(work) => work,
@@ -268,21 +340,32 @@ impl TablesApp {
                 let paths = match &paths {
                     Ok(paths) => paths,
                     Err(why) => {
-                        if reply_tx.send(Reply::Read(Err(why.clone()))).is_err() {
+                        let moved = matches!(work, Work::At(_));
+                        let read = Err(why.clone());
+                        if reply_tx.send(Reply::Read { read, moved }).is_err() {
                             return;
                         }
                         wake();
                         continue;
                     }
                 };
-                if let Work::Write(staged) = work {
-                    let wrote = crate::tables_store::write(paths, staged);
-                    if reply_tx.send(Reply::Wrote(wrote)).is_err() {
-                        return;
+                let mut at = point;
+                let moved = matches!(work, Work::At(_));
+                match work {
+                    Work::Write(staged) => {
+                        let wrote = crate::tables_store::write(paths, staged);
+                        if reply_tx.send(Reply::Wrote(wrote)).is_err() {
+                            return;
+                        }
                     }
+                    Work::At(asked) => at = asked,
+                    Work::Read => {}
                 }
-                let read = crate::tables_store::read(paths);
-                if reply_tx.send(Reply::Read(read)).is_err() {
+                let read = crate::tables_store::read(paths, at);
+                if read.is_ok() {
+                    point = at;
+                }
+                if reply_tx.send(Reply::Read { read, moved }).is_err() {
                     return;
                 }
                 wake();
@@ -300,6 +383,7 @@ impl TablesApp {
             seen: BTreeMap::new(),
             sent: BTreeMap::new(),
             refused: BTreeMap::new(),
+            asked: 0,
         };
         let _ = app.work.send(Work::Read);
         Ok(app)
@@ -336,7 +420,7 @@ impl TablesApp {
                 .expect("the Tables reader answers within a minute");
             let (is_wrote, is_read) = (
                 matches!(reply, Reply::Wrote(_)),
-                matches!(reply, Reply::Read(_)),
+                matches!(reply, Reply::Read { .. }),
             );
             self.take(reply);
             if wrote && is_read {
@@ -349,18 +433,35 @@ impl TablesApp {
     /// Take `snapshot` as if the reader had read it.
     #[cfg(all(test, unix))]
     pub(crate) fn show(&mut self, snapshot: Snapshot) {
-        self.take(Reply::Read(Ok(snapshot)));
+        self.take(Reply::Read {
+            read: Ok(snapshot),
+            moved: false,
+        });
     }
 
     fn take(&mut self, reply: Reply) {
         match reply {
-            Reply::Read(Ok(snapshot)) => {
+            Reply::Read {
+                read: Ok(snapshot),
+                moved,
+            } => {
                 self.snapshot = Some(snapshot);
                 self.unread = None;
+                if moved {
+                    self.asked = self.asked.saturating_sub(1);
+                }
             }
-            Reply::Read(Err(why)) => {
+            Reply::Read {
+                read: Err(why),
+                moved,
+            } => {
+                if moved {
+                    self.asked = self.asked.saturating_sub(1);
+                }
                 if self.snapshot.is_none() {
                     self.unread = Some(why);
+                } else if moved {
+                    self.note = Some(format!("Not read: {why}"));
                 }
             }
             Reply::Wrote(wrote) => {
@@ -428,6 +529,34 @@ impl TablesApp {
         self.note = Some(words.join(" \u{b7} "));
     }
 
+    /// The past point the page shows, where it shows one.
+    fn as_of(&self) -> Option<&AsOf> {
+        self.snapshot.as_ref().and_then(|s| s.at.as_ref())
+    }
+
+    /// Whether the page may move to another point: nothing staged or being written, which a
+    /// past table could not take.
+    fn movable(&self) -> bool {
+        self.staged.is_empty() && !self.writing
+    }
+
+    /// Whether the page takes no edit: it shows a past point, or is moving to another one.
+    fn fixed(&self) -> bool {
+        self.asked > 0 || self.as_of().is_some()
+    }
+
+    /// Read the table as of `at` (as it is, where `None`); with cells not written, say why not.
+    fn go(&mut self, at: Option<[u8; 32]>) {
+        if !self.movable() {
+            self.note = Some("Write or discard the changes not written first".to_owned());
+            return;
+        }
+        if self.work.send(Work::At(at)).is_ok() {
+            self.asked += 1;
+            self.note = None;
+        }
+    }
+
     fn sheet(&self, name: &str) -> Option<&Sheet> {
         self.snapshot
             .as_ref()
@@ -438,8 +567,12 @@ impl TablesApp {
         self.staged.keys().filter(|(c, ..)| c == sheet).count()
     }
 
-    /// Stage `text` in a cell, or take back what was staged where it is the written value.
+    /// Stage `text` in a cell, or take back what was staged where it is the written value. A
+    /// past table takes no edit.
     fn stage(&mut self, sheet: &str, pk: &str, column: &str, text: String) {
+        if self.fixed() {
+            return;
+        }
         let at = (sheet.to_owned(), pk.to_owned(), column.to_owned());
         let shown = self
             .sheet(sheet)
@@ -493,6 +626,9 @@ impl TablesApp {
     /// Whether Keep may stage one of a conflicted cell's values: a cell the page writes, whose
     /// values it shows as they are stored.
     fn keepable(&self, sheet: &str, pk: &str, column: &str) -> bool {
+        if self.fixed() {
+            return false;
+        }
         let Some(sheet) = self.sheet(sheet) else {
             return false;
         };
@@ -510,7 +646,7 @@ impl TablesApp {
     }
 
     fn write(&mut self) {
-        if self.staged.is_empty() || self.writing {
+        if self.staged.is_empty() || self.writing || self.fixed() {
             return;
         }
         let Some(snapshot) = &self.snapshot else {
@@ -617,6 +753,8 @@ const EDIT: &str = "tables/edit";
 const FIND: &str = "tables/find";
 const WRITE: &str = "tables/write";
 const DISCARD: &str = "tables/discard";
+const AS_OF: &str = "tables/pane/asof/";
+const NOW: &str = "tables/now";
 
 impl TablesViewState {
     /// Scroll an `act` on a cell outside the grid's room into view; whether anything moved.
@@ -702,7 +840,7 @@ impl TablesViewState {
             .iter()
             .find(|r| r.pk == pk)
             .and_then(|r| r.cells.get(column));
-        if !col.editable || shown.is_some_and(|c| c.raw) {
+        if !col.editable || shown.is_some_and(|c| c.raw) || app.fixed() {
             return;
         }
         let at = (self.sheet.to_owned(), pk.to_owned(), column.to_owned());
@@ -789,11 +927,11 @@ fn cell_key(pk: &str, column: &str) -> String {
     format!("{CELL}{pk}/{column}")
 }
 
-/// A sheet's columns in the grid's order: STORED, then SET BY ATERM, then LINKED ROWS, each as
-/// the schema declares them.
+/// A sheet's columns in the grid's order: its key column, then STORED, SET BY ATERM and LINKED
+/// ROWS, each as the schema declares them.
 fn ordered(sheet: &Sheet) -> Vec<&SheetColumn> {
     let mut columns: Vec<&SheetColumn> = sheet.columns.iter().collect();
-    columns.sort_by_key(|c| c.group);
+    columns.sort_by_key(|c| (c.name != sheet.key, c.group));
     columns
 }
 
@@ -951,7 +1089,25 @@ impl TablesApp {
                     }
                     return true;
                 }
+                if let Some(hex) = key.strip_prefix(AS_OF) {
+                    let operation = self.snapshot.as_ref().and_then(|s| {
+                        s.sheets
+                            .iter()
+                            .flat_map(|sheet| &sheet.written)
+                            .map(|w| w.operation)
+                            .find(|op| aterm_codec::hex::encode_lower(op) == hex)
+                    });
+                    if let Some(operation) = operation {
+                        view.close_edit(self, false);
+                        self.go(Some(operation));
+                    }
+                    return true;
+                }
                 match key.as_str() {
+                    NOW => {
+                        self.go(None);
+                        true
+                    }
                     // Find (Command-F, or a press on the field) puts the keyboard in it.
                     FIND => {
                         view.close_edit(self, false);
@@ -1370,7 +1526,7 @@ fn rail(app: &TablesApp, view: &TablesViewState, width: f32) -> UiNode {
         let staged_w = if staged == 0 {
             0.0
         } else {
-            text_width(&staged_words, SemanticRole::Text, StyleRef::Accent) + 4.0
+            text_width(&staged_words, SemanticRole::Text, StyleRef::Unwritten) + 4.0
         };
         let name_w = (inner - 20.0 - count_w - staged_w - 8.0).max(1.0);
         let mut painted = vec![fitted(
@@ -1387,7 +1543,7 @@ fn rail(app: &TablesApp, view: &TablesViewState, width: f32) -> UiNode {
             painted.push(words(
                 format!("{key}/staged"),
                 staged_words,
-                StyleRef::Accent,
+                StyleRef::Unwritten,
                 Length::Fixed(staged_w),
             ));
         }
@@ -1475,35 +1631,67 @@ fn padded(key: String, inner: UiNode, width: f32) -> UiNode {
 #[expect(clippy::too_many_lines, reason = "one grid, laid out in one pass")]
 fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, height: f32) -> UiNode {
     let columns = ordered(sheet);
-    let widths = widths(sheet, &columns);
+    let mut widths = widths(sheet, &columns);
     let line = row_height();
     let head_line = 22.0 * scale().max(1.0);
-    let total: f32 = widths.iter().sum();
     let room_across = (width - 2.0).max(1.0);
-    view.grid_room.set(room_across);
+    // The key column (the first) stays at the left, at most half the room; the rest scroll
+    // across in the room beside it.
+    if let Some(key) = widths.first_mut() {
+        *key = key.min(room_across * 0.5);
+    }
+    let pinned = widths.first().copied().unwrap_or(0.0);
+    let room_beside = (room_across - pinned).max(1.0);
+    view.grid_room.set(room_beside);
+    let beside: f32 = widths.iter().skip(1).sum();
     {
         let mut spans = view.spans.borrow_mut();
         spans.clear();
         let mut at = 0.0;
-        for (column, w) in columns.iter().zip(&widths) {
+        for (column, w) in columns.iter().zip(&widths).skip(1) {
             spans.push((column.name.clone(), at, at + w));
             at += w;
         }
     }
-    let across = view.across.min((total - room_across).max(0.0));
-    let lane = |key: String, children: Vec<UiNode>, h: f32| {
+    let across = view.across.min((beside - room_beside).max(0.0));
+    // A line of the grid: its key column's seat, then the rest, scrolled across and clipped
+    // where the key column ends.
+    let lane = |key: String, mut children: Vec<UiNode>, h: f32| {
+        let rest = if children.is_empty() {
+            Vec::new()
+        } else {
+            children.split_off(1)
+        };
+        children.push(
+            group(format!("{key}/across"))
+                .layout(
+                    Layout::row()
+                        .height(Length::Fixed(h))
+                        .clipped()
+                        .scrolled(across),
+                )
+                .children(rest),
+        );
         group(key)
-            .layout(
-                Layout::row()
-                    .height(Length::Fixed(h))
-                    .clipped()
-                    .scrolled(across),
-            )
+            .layout(Layout::row().height(Length::Fixed(h)))
             .children(children)
     };
-    // The group header: each group's word over its first column, its span ruled off.
+    // The group header: each group's word over its first column, its span ruled off. The key
+    // column carries its group's word, so a group it begins reads once, over it.
     let mut groups = Vec::new();
-    let mut at = 0;
+    if let Some(first) = columns.first() {
+        groups.push(padded(
+            "tables/groups/0".into(),
+            fitted(
+                "tables/groups/0/word",
+                first.group.word(),
+                StyleRef::Note,
+                pinned - 10.0,
+            ),
+            pinned,
+        ));
+    }
+    let mut at = 1;
     while at < columns.len() {
         let group_of = columns[at].group;
         let mut end = at;
@@ -1512,7 +1700,9 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             span += widths[end];
             end += 1;
         }
-        let word = if group_of == Group::Linked && span < 96.0 {
+        let word = if at == 1 && group_of == columns[0].group {
+            ""
+        } else if group_of == Group::Linked && span < 96.0 {
             "LINKED"
         } else {
             group_of.word()
@@ -1576,7 +1766,7 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 );
             } else {
                 if staged.is_some() {
-                    seat.push(styled(format!("{key}/staged"), StyleRef::Primary));
+                    seat.push(styled(format!("{key}/staged"), StyleRef::Unwritten));
                 } else if focused {
                     seat.push(styled(format!("{key}/focus"), StyleRef::Secondary));
                 }
@@ -1584,6 +1774,10 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                     .cloned()
                     .unwrap_or_else(|| shown.map(|c| c.text.clone()).unwrap_or_default());
                 let conflict = staged.is_none() && shown.is_some_and(|c| !c.values.is_empty());
+                let changed = app.as_of().is_some()
+                    && sheet
+                        .since
+                        .contains_key(&(row.pk.clone(), column.name.clone()));
                 let mut spoken = format!(
                     "{} of {}: {}",
                     column.label,
@@ -1596,6 +1790,9 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 if staged.is_some() {
                     spoken.push_str(", not written");
                 }
+                if changed {
+                    spoken.push_str(", changed since");
+                }
                 seat.push(press(&key, spoken));
                 let style = if column.group == Group::Stored {
                     StyleRef::Plain
@@ -1603,9 +1800,13 @@ fn grid(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                     StyleRef::Secondary
                 };
                 let mut face = Vec::new();
-                if conflict {
+                if conflict || changed {
                     let n = shown.map_or(0, |c| c.values.len());
-                    let tag = format!("{n} values");
+                    let tag = if conflict {
+                        format!("{n} values")
+                    } else {
+                        "changed".to_owned()
+                    };
                     let tag_w = text_width(&tag, SemanticRole::Text, StyleRef::Chip) + 6.0;
                     face.push(fitted(
                         format!("{key}/text"),
@@ -1738,19 +1939,19 @@ fn write_bar(app: &TablesApp, width: f32) -> Option<UiNode> {
             "Write"
         },
         &format!("Write {count}"),
-        StyleRef::Primary,
+        StyleRef::Unwritten,
         !app.writing,
     );
     let buttons_w = crate::native_ui::native_button_label_width("Discard")
         + crate::native_ui::native_button_label_width("Writing\u{2026}")
         + 48.0
         + 8.0;
-    let count_w = text_width(&count, SemanticRole::Text, StyleRef::Primary);
+    let count_w = text_width(&count, SemanticRole::Text, StyleRef::Unwritten);
     let note_w = (width - 28.0 - count_w - buttons_w - 24.0).max(0.0);
     let mut children = vec![fitted(
         "tables/bar/count",
         &count,
-        StyleRef::Primary,
+        StyleRef::Unwritten,
         count_w,
     )];
     children.push(fitted(
@@ -1770,7 +1971,7 @@ fn write_bar(app: &TablesApp, width: f32) -> Option<UiNode> {
             .children(vec![discard, write]),
     );
     Some(
-        styled("tables/bar", StyleRef::Primary)
+        styled("tables/bar", StyleRef::Unwritten)
             .layout(
                 Layout::row()
                     .gap(12.0)
@@ -1779,6 +1980,23 @@ fn write_bar(app: &TablesApp, width: f32) -> Option<UiNode> {
             )
             .children(children),
     )
+}
+
+/// A writer and when it wrote, in `width`: `{key}/who`, its Mac's label set as `style` (its short
+/// id dimmed where no label is known), and `{key}/when`, `· when`.
+fn writer(key: &str, by: &Author, when: &str, style: StyleRef, width: f32) -> [UiNode; 2] {
+    let who = by.who();
+    let when = format!("\u{b7} {when}");
+    let who_w = text_width(&who, SemanticRole::Text, by.style(style)).min(width * 0.5);
+    [
+        fitted(format!("{key}/who"), &who, by.style(style), who_w),
+        fitted(
+            format!("{key}/when"),
+            &when,
+            style,
+            (width - who_w - 8.0).max(1.0),
+        ),
+    ]
 }
 
 /// The pane's word for a value: `empty`, a secret only as `set`.
@@ -1885,9 +2103,6 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
         ordered_values
             .sort_by_key(|(_, (_, by))| std::cmp::Reverse(by.as_ref().map_or(0, |b| b.at_ms)));
         for (n, (value, by)) in ordered_values {
-            let who = by.as_ref().map_or_else(String::new, |by| {
-                format!("{} \u{b7} {}", by.who(), when_words(by.at_ms, now))
-            });
             // Keep stages a value, so it is offered only where the page writes the cell.
             let keep = app.keepable(sheet.name, &row.pk, &column.name).then(|| {
                 button(
@@ -1903,28 +2118,26 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 )
             });
             let keep_w = crate::native_ui::native_button_label_width("Keep") + 24.0;
+            let half = (inner - 36.0 - keep_w) * 0.5;
+            let mut parts = vec![fitted(
+                format!("{key}/{n}/value"),
+                &value_words(column, value),
+                StyleRef::Plain,
+                half,
+            )];
+            if let Some(by) = by {
+                parts.extend(writer(
+                    &format!("{key}/{n}"),
+                    by,
+                    &when_words(by.at_ms, now),
+                    StyleRef::Note,
+                    half,
+                ));
+            }
             boxed.push(
                 group(format!("{key}/{n}"))
                     .layout(Layout::row().gap(8.0).height(Length::Fixed(line + 4.0)))
-                    .children(
-                        [
-                            fitted(
-                                format!("{key}/{n}/value"),
-                                &value_words(column, value),
-                                StyleRef::Plain,
-                                (inner - 36.0 - keep_w) * 0.5,
-                            ),
-                            fitted(
-                                format!("{key}/{n}/who"),
-                                &who,
-                                StyleRef::Note,
-                                (inner - 36.0 - keep_w) * 0.5,
-                            ),
-                        ]
-                        .into_iter()
-                        .chain(keep)
-                        .collect(),
-                    ),
+                    .children(parts.into_iter().chain(keep).collect()),
             );
         }
         let h = line + (shown.values.len() as f32) * (line + 8.0) + 20.0;
@@ -1981,7 +2194,7 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 .cloned()
                 .unwrap_or_else(|| shown.map(|c| c.text.clone()).unwrap_or_default());
             let value_style = if staged.is_some() {
-                StyleRef::Accent
+                StyleRef::Unwritten
             } else {
                 StyleRef::Plain
             };
@@ -2013,7 +2226,7 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 parts.push(fitted(
                     format!("{key}/by"),
                     &by.who(),
-                    StyleRef::Note,
+                    by.style(StyleRef::Note),
                     meta_w,
                 ));
             }
@@ -2065,7 +2278,78 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             push(&mut children, node, h);
         }
     }
-    // History: newest first, one entry per operation that set a cell of this row.
+    // In a past table: each cell of this row changed since, what it holds now and who wrote it.
+    if app.as_of().is_some() {
+        let changed: Vec<(&&SheetColumn, &Since)> = columns
+            .iter()
+            .filter_map(|column| {
+                sheet
+                    .since
+                    .get(&(row.pk.clone(), column.name.clone()))
+                    .map(|since| (column, since))
+            })
+            .collect();
+        if !changed.is_empty() {
+            push(
+                &mut children,
+                fitted("tables/pane/now", "CHANGED SINCE", StyleRef::Note, inner),
+                line + 6.0,
+            );
+        }
+        for (column, since) in changed {
+            let key = format!("tables/pane/now/{}", column.name);
+            let then = row.cells.get(&column.name).map_or("", |c| c.text.as_str());
+            let words = if since.members {
+                format!("{}: {}", field_words(column), since.now)
+            } else if column.secret {
+                let word = match (then.is_empty(), since.now.is_empty()) {
+                    (true, false) => "set",
+                    (false, true) => "cleared",
+                    _ => "changed",
+                };
+                format!("{}: {word}", field_words(column))
+            } else {
+                format!(
+                    "{}: {} \u{2192} {}",
+                    field_words(column),
+                    value_words(column, then),
+                    value_words(column, &since.now)
+                )
+            };
+            let who = since
+                .by
+                .iter()
+                .map(Author::who)
+                .collect::<Vec<_>>()
+                .join(" / ");
+            // One writer is set as its label is known; several in the note's own style.
+            let who_style = match since.by.as_slice() {
+                [one] => one.style(StyleRef::Note),
+                _ => StyleRef::Note,
+            };
+            let who_w = if since.by.is_empty() {
+                0.0
+            } else {
+                text_width(&who, SemanticRole::Text, who_style).min(meta_w * 1.5)
+            };
+            let mut parts = vec![fitted(
+                format!("{key}/what"),
+                &words,
+                StyleRef::Plain,
+                (inner - who_w - 8.0).max(1.0),
+            )];
+            if !since.by.is_empty() {
+                parts.push(fitted(format!("{key}/who"), &who, who_style, who_w));
+            }
+            push(
+                &mut children,
+                group(key).layout(Layout::row().gap(8.0)).children(parts),
+                line + 2.0,
+            );
+        }
+    }
+    // History: newest first, one entry per operation that set a cell of this row, each offering
+    // the table as that operation's causal past holds it.
     let history = row_history(sheet, &row.pk);
     if !history.is_empty() {
         push(
@@ -2074,16 +2358,20 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
             line + 6.0,
         );
     }
-    for (n, (by, changes)) in history.iter().enumerate().take(60) {
+    let shown_at = app.as_of().map(|at| at.operation);
+    for (n, (operation, by, changes)) in history.iter().enumerate().take(60) {
         let key = format!("tables/pane/written/{n}");
+        let here = shown_at == Some(*operation);
+        let style = if here {
+            StyleRef::Primary
+        } else {
+            StyleRef::Plain
+        };
         push(
             &mut children,
-            fitted(
-                format!("{key}/who"),
-                &format!("{} \u{b7} {}", by.who(), by.when(now)),
-                StyleRef::Plain,
-                inner,
-            ),
+            group(format!("{key}/line"))
+                .layout(Layout::row().gap(6.0))
+                .children(writer(&key, by, &by.when(now), style, inner).into()),
             line,
         );
         for (m, change) in changes.iter().enumerate() {
@@ -2098,12 +2386,30 @@ fn pane(app: &TablesApp, view: &TablesViewState, sheet: &Sheet, width: f32, heig
                 line - 2.0,
             );
         }
+        // The table as this operation's causal past holds it.
+        push(
+            &mut children,
+            group(format!("{key}/asof"))
+                .layout(Layout::row().padding(Insets {
+                    left: 12.0,
+                    ..Insets::default()
+                }))
+                .children(vec![button(
+                    &format!("{AS_OF}{}", aterm_codec::hex::encode_lower(operation)),
+                    "As of",
+                    &format!("The table as of {} \u{b7} {}", by.who(), by.when(now)),
+                    StyleRef::Secondary,
+                    !here && app.movable(),
+                )]),
+            line + 2.0,
+        );
     }
     pane_frame(children, width, height, view, tall)
 }
 
-/// A row's history, newest first: who, and each field it set as `Field: was → now`.
-fn row_history(sheet: &Sheet, pk: &str) -> Vec<(Author, Vec<String>)> {
+/// A row's history, newest first: the operation, who, and each field it set as
+/// `Field: was → now`.
+fn row_history(sheet: &Sheet, pk: &str) -> Vec<([u8; 32], Author, Vec<String>)> {
     let mut last: BTreeMap<&str, &str> = BTreeMap::new();
     let mut out = Vec::new();
     for written in &sheet.written {
@@ -2140,7 +2446,7 @@ fn row_history(sheet: &Sheet, pk: &str) -> Vec<(Author, Vec<String>)> {
             last.insert(cell.column.as_str(), cell.now.as_str());
         }
         if !lines.is_empty() {
-            out.push((written.by.clone(), lines));
+            out.push((written.operation, written.by.clone(), lines));
         }
     }
     out.reverse();
@@ -2215,12 +2521,62 @@ fn page(app: &TablesApp, view: &TablesViewState, width: f32, height: f32) -> UiT
                 fitted("tables/count", &singular_count, StyleRef::Note, count_w),
             ]),
     );
+    let find_w = 220.0 * scale().max(1.0);
+    let mut tools = vec![
+        field(FIND, "Find", &view.find, view, false)
+            .layout(Layout::default().width(Length::Fixed(find_w))),
+    ];
+    // A past table: which point, how much changed since, and the way back to now.
+    if let Some(at) = app.as_of() {
+        let now_ms = aterm_time::unix_millis().unwrap_or(0);
+        // The cells the past grid shows and marks: a row born since has no line there.
+        let changed = sheet.map_or(0, |s| {
+            s.rows
+                .iter()
+                .flat_map(|row| {
+                    s.columns
+                        .iter()
+                        .map(move |c| (row.pk.clone(), c.name.clone()))
+                })
+                .filter(|at| s.since.contains_key(at))
+                .count()
+        });
+        let mut words = match &at.by {
+            Some(by) => format!("As of {} \u{b7} {}", by.who(), by.placed(now_ms)),
+            None => "As of an earlier point".to_owned(),
+        };
+        words.push_str(&match changed {
+            0 => " \u{b7} nothing changed since".to_owned(),
+            1 => " \u{b7} 1 cell changed since".to_owned(),
+            n => format!(" \u{b7} {n} cells changed since"),
+        });
+        let now_w = crate::native_ui::native_button_label_width("Now") + 24.0;
+        tools.push(fitted(
+            "tables/asof",
+            &words,
+            StyleRef::Plain,
+            (main_w - find_w - now_w - 24.0).max(1.0),
+        ));
+        tools.push(
+            group("tables/now-seat")
+                .layout(
+                    Layout::row()
+                        .width(Length::Fixed(now_w))
+                        .padding(Insets::symmetric(0.0, 3.0)),
+                )
+                .children(vec![button(
+                    NOW,
+                    "Now",
+                    "Show the table as it is now",
+                    StyleRef::Secondary,
+                    true,
+                )]),
+        );
+    }
     main.push(
         group("tables/tools")
-            .layout(Layout::row().height(Length::Fixed(line + 4.0)))
-            .children(vec![field(FIND, "Find", &view.find, view, false).layout(
-                Layout::default().width(Length::Fixed(220.0 * scale().max(1.0))),
-            )]),
+            .layout(Layout::row().gap(12.0).height(Length::Fixed(line + 4.0)))
+            .children(tools),
     );
     let bar = write_bar(app, main_w);
     let bar_h = if bar.is_some() {

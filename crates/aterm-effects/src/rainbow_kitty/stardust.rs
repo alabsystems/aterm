@@ -4655,6 +4655,9 @@ fn push_halo_quads_clipped(
     }
     let (bl, bt) = (geom.fx_left().max(clip.0), geom.fx_top().max(clip.1));
     let (br, bb) = (geom.fx_right().min(clip.2), geom.fx_bot().min(clip.3));
+    // The clip inside the overlay pixel space: every narrowing below is then exact.
+    let space = crate::cursor_glow::OVERLAY_PX_MAX;
+    let (br, bb) = (br.min(space), bb.min(space));
     let (rx, ry) = (radii.0.max(1), radii.1.max(1));
     let (cx, cy) = centre;
     let x0 = (cx - rx).max(bl);
@@ -4662,6 +4665,10 @@ fn push_halo_quads_clipped(
     let y0 = (cy - ry).max(bt);
     let y1 = (cy + ry).min(bb);
     if x1 <= x0 || y1 <= y0 || cx < 0 || cy < 0 {
+        return;
+    }
+    // A halo whose centre or radius the space cannot hold has only its dim tail in it.
+    if cx > space || cy > space || rx > space || ry > space {
         return;
     }
     let ch = geom.ch as i32;

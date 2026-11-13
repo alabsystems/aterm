@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use super::*;
 use crate::private::stamp;
 use crate::schema::{FileId, digest_shaped};
-const MAX_IMAGE: u64 = 1024 * 1024 * 1024;
+pub(super) const MAX_IMAGE: u64 = 1024 * 1024 * 1024;
 
 pub(super) struct ImageRef<'a> {
     pub store: &'a Store,
@@ -66,15 +66,15 @@ impl ImageRef<'_> {
     }
     pub(super) fn check(&self, image: &Image) -> io::Result<()> {
         self.store.check()?;
-        let parent =
-            private::directory(self.path.parent().ok_or_else(|| refused("missing image parent"))?)?;
-        let current = private::open_private(&parent, OsStr::new("aterm"))?;
-        if identity(&parent.metadata()?) != self.directory
-            || identity(&current.metadata()?) != self.image
-            || stamp(&parent.metadata()?) != stamp(&image.directory_before)
+        private::named_directory(
+            self.path.parent().ok_or_else(|| refused("missing image parent"))?,
+            &image.directory,
+        )?;
+        private::named_file(self.path, &image.file)?;
+        if identity(&image.directory.metadata()?) != self.directory
+            || identity(&image.file.metadata()?) != self.image
             || stamp(&image.directory.metadata()?) != stamp(&image.directory_before)
-            || parent.metadata()?.mode() & 0o7777 != 0o500
-            || stamp(&current.metadata()?) != stamp(&image.before)
+            || image.directory.metadata()?.mode() & 0o7777 != 0o500
             || stamp(&image.file.metadata()?) != stamp(&image.before)
         {
             return Err(refused("pinned image backing changed"));

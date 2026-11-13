@@ -9,7 +9,7 @@ use std::sync::Arc;
 use atpkg_keys::roster_ops::{add, revoke};
 use atpkg_publish::artifact::pkgdoc::{self, Kind, Row};
 use atpkg_publish::artifact::sign;
-use atpkg_publish::ctx::Ctx;
+use atpkg_publish::ctx::{Ctx, HostChoice};
 use atpkg_publish::error::Error;
 use atpkg_publish::host::Slug;
 use atpkg_publish::host::fake::FakeHost;
@@ -22,7 +22,9 @@ use super::pkgdoc::{header, provenance, row};
 
 fn channel(keys: &Keys, home: &Path) -> (Ctx, Arc<FakeHost>) {
     let host = Arc::new(FakeHost::new());
-    let ctx = keys.ctx(home, host.clone());
+    let ctx = keys
+        .ctx(home, host.clone())
+        .with_host_choice(HostChoice::Agh);
     keys.publish_quad(
         &host,
         &ctx.index_slug(),
@@ -96,13 +98,13 @@ fn a_key_no_roster_lists_writes_no_signature_and_leaves_an_existing_one_alone() 
 fn an_unproven_row_is_signed_only_while_the_switch_reads_dormant() {
     let tmp = scratch("sign-unproven");
     let keys = Keys::mint("m3", &[]);
-    let (mut ctx, _) = channel(&keys, tmp.path());
+    let (mut ctx, host) = channel(&keys, tmp.path());
     let mut r = row(AARCH64_APPLE_DARWIN, Kind::Binary);
     r.provenance = provenance("unproven");
     let pkg = staged(tmp.path(), &r);
 
     ctx.trust_repo = tmp.path().join("trust-live");
-    trust_repo(&ctx.trust_repo, MINTED_LEDGER);
+    trust_repo(&ctx.trust_repo, MINTED_LEDGER, &ctx, &host);
     let err = sign::sign_all(&ctx, std::slice::from_ref(&pkg)).expect_err("live switch");
     let text = err.to_string();
     assert!(
@@ -119,7 +121,7 @@ fn an_unproven_row_is_signed_only_while_the_switch_reads_dormant() {
     );
 
     ctx.trust_repo = tmp.path().join("trust-dormant");
-    trust_repo(&ctx.trust_repo, DORMANT_LEDGER);
+    trust_repo(&ctx.trust_repo, DORMANT_LEDGER, &ctx, &host);
     sign::sign_all(&ctx, std::slice::from_ref(&pkg)).expect("dormant: signed");
     let parsed = client_verifies(&ctx, &pkg, &sign::sig_path(&pkg)).expect("verifies");
     assert!(sign::has_unproven_row(&parsed));
@@ -242,7 +244,7 @@ fn two_rosters_at_one_generation_are_a_fork_and_nothing_is_signed() {
 fn the_verb_reads_the_switch_from_the_trust_repo_it_names() {
     let tmp = scratch("sign-verb-trust");
     let keys = Keys::mint("m3", &[]);
-    let (ctx, _) = channel(&keys, tmp.path());
+    let (ctx, host) = channel(&keys, tmp.path());
     let mut r = row(AARCH64_APPLE_DARWIN, Kind::Binary);
     r.provenance = provenance("unproven");
     let pkg = staged(tmp.path(), &r);
@@ -252,7 +254,7 @@ fn the_verb_reads_the_switch_from_the_trust_repo_it_names() {
         "no $HOME/trust: nothing shows the switch is dormant"
     );
     let elsewhere = tmp.path().join("src/trust");
-    trust_repo(&elsewhere, DORMANT_LEDGER);
+    trust_repo(&elsewhere, DORMANT_LEDGER, &ctx, &host);
     sign::run(
         &ctx,
         &[

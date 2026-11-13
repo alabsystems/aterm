@@ -12,23 +12,27 @@ description = "Private native resource member proxy protocol"
 default = ["channel"]
 # DTO/codec consumers disable defaults and retain a std-only leaf.
 channel = ["dep:libc", "dep:jobserver_utils", "dep:sha2"]
-client = ["channel", "dep:trust-resource-provenance", "dep:jobserver_utils", "dep:sha2"]
+# Native reception does not enable helper spawning or unstable std APIs.
+bootstrap-receiver = ["channel", "dep:trust-resource-provenance"]
+client = ["bootstrap-receiver", "dep:jobserver_utils", "dep:sha2"]
 # One fixed trusted compiler probe borrows the caller implicit execution.
-probe-scheduler = ["client", "jobserver_utils/client"]
+probe-scheduler = ["client", "jobserver_utils/client", "dep:tempfile"]
 # A separately packaged command owner; ordinary protocol/SDK builds do not enable it.
 serial-command = ["client", "jobserver_utils/client"]
 
 [dependencies]
+tempfile = { package = "aterm-tempfile", path = "../../crates/aterm-tempfile", optional = true }
 libc = { path = "../../crates/aterm-libc", optional = true }
 trust-resource-provenance = { path = "../trust-resource-provenance", optional = true }
 jobserver_utils = { path = "../trust-jobserver-utils", default-features = false, optional = true }
 sha2 = { package = "trust-sha2", path = "../trust-sha2", default-features = false, optional = true }
 
 [dev-dependencies]
-aterm-tempfile = { path = "../../crates/aterm-tempfile" }
+tempfile = { package = "aterm-tempfile", path = "../../crates/aterm-tempfile" }
 
 
 [package.metadata.aterm-vendor]
 upstream = "https://github.com/alabsystems/trust"
-commit = "6441b55c27ed2da4cd6bda5f85ce40277d22ef70"
+commit = "b27fbd29fd181a19d806fa8c8b9c57a0bc160b76"
 subdir = "crates/trust-resource-controller"
+native-job-commit = "9ae1247137ea513af499cac1073d07dda78339da"

@@ -28,7 +28,7 @@
 //!   not session-gated, since writing a value shows none: it is how an agent edits.
 //!
 //! Until any Mac's import fills this Mac's registry, a Mac that holds a fleet_db replica keeps
-//! fleet_db's views under these names ([`serves`]), so the owner edits on m104 as before until
+//! fleet_db's views under these names ([`kept`]), so the owner edits on that Mac as before until
 //! the import there; fleet_db's own writes refuse once this Mac's import recorded it covered.
 
 use super::{named_row, verbs};
@@ -234,25 +234,46 @@ pub struct ViewIo<'a> {
     pub now_ms: u64,
 }
 
-/// Whether the registry serves the four nouns on this Mac: it does unless this Mac holds a
-/// fleet_db replica, its own import recorded nothing beside it, and no Mac's import has filled
-/// its registry yet, when fleet_db keeps them. Once this Mac's import ran, a registry that
-/// cannot be read says so rather than handing the nouns back to the replica. A rekey cut short
-/// right after its rename holds the replica in its kept folder, and fleet_db's refusal names it.
+/// Why fleet_db's replica, not the registry, answers the four nouns on this Mac ([`kept`]).
+#[derive(Debug)]
+pub enum Kept {
+    /// The registry could not be read.
+    Unread(Error),
+    /// The registry reads and holds no source row: no Mac's import has filled it.
+    Empty,
+}
+
+impl std::fmt::Display for Kept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unread(error) => write!(f, "the registry could not be read ({error})"),
+            Self::Empty => f.write_str("the registry holds no rows yet: no Mac's import filled it"),
+        }
+    }
+}
+
+/// Why fleet_db keeps the four nouns on this Mac, none where the registry serves them. The
+/// registry serves them unless this Mac holds a fleet_db replica, its own import recorded
+/// nothing beside it, and the registry cannot be read here or no Mac's import has filled it
+/// yet. Once this Mac's import ran, a registry that cannot be read says so rather than handing
+/// the nouns back to the replica. A rekey cut short right after its rename holds the replica in
+/// its kept folder, and fleet_db's refusal names it.
 #[must_use]
-pub fn serves(paths: &Paths) -> bool {
+pub fn kept(paths: &Paths) -> Option<Kept> {
     let dir = super::replica_dir(paths);
     if std::fs::symlink_metadata(dir.join("database.json")).is_err()
         && crate::fleet_db::refuse_unfinished(&dir).is_ok()
     {
-        return true;
+        return None;
     }
     if !matches!(crate::alab::import::covered::read(&dir), Ok(None)) {
-        return true;
+        return None;
     }
-    Handle::at(paths.clone(), &att::REGISTRY)
-        .view()
-        .is_ok_and(|view| !view.project(&registry::SOURCE).rows.is_empty())
+    match Handle::at(paths.clone(), &att::REGISTRY).view() {
+        Ok(view) if !view.project(&registry::SOURCE).rows.is_empty() => None,
+        Ok(_) => Some(Kept::Empty),
+        Err(error) => Some(Kept::Unread(error)),
+    }
 }
 
 /// Run one view: `words` after the noun.
@@ -529,8 +550,8 @@ fn mac_name(lab: &LabView, uuid: &str) -> String {
 fn seen_columns(paths: &Paths, view: &att::View, rows: &mut [Value], now_ms: u64) {
     let empty = crate::typed::owned::OwnedRead::default();
     let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
-    let lab = LabView::read(
-        &view.cells,
+    let lab = LabView::read_view(
+        view,
         owned(registry::MACHINE_FACTS.name),
         owned(registry::MAILBOX_OBS.name),
         None,
@@ -602,8 +623,8 @@ fn shown_seen(rows: &mut [Value], seen: &BTreeMap<String, SeenOn>, now_ms: u64) 
 fn seats(paths: &Paths, view: &att::View, rows: &mut [Value]) -> Result<Vec<Value>> {
     let empty = crate::typed::owned::OwnedRead::default();
     let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
-    let lab = LabView::read(
-        &view.cells,
+    let lab = LabView::read_view(
+        view,
         owned(registry::MACHINE_FACTS.name),
         owned(registry::MAILBOX_OBS.name),
         None,
@@ -795,8 +816,8 @@ fn row_named(view: &att::View, noun: Noun, name: &str) -> Result<String> {
         Noun::Computers => {
             let empty = crate::typed::owned::OwnedRead::default();
             let owned = |n: &str| view.owned.get(n).unwrap_or(&empty);
-            let lab = LabView::read(
-                &view.cells,
+            let lab = LabView::read_view(
+                view,
                 owned(registry::MACHINE_FACTS.name),
                 owned(registry::MAILBOX_OBS.name),
                 None,
@@ -921,14 +942,32 @@ fn set(
     Ok(Value::Object(out))
 }
 
+/// What the command line says on standard error before fleet_db answers `noun` in the registry's
+/// place: which store answers and why ([`Kept`]). Until this was said, a reader took a replica
+/// last written days before for the registry (ATERM-KI-1112-140). Nothing where no replica is
+/// at its path (a rekey cut short): fleet_db's own refusal names that.
+fn handed_back(paths: &Paths, noun: Noun, kept: &Kept) -> Option<String> {
+    let dir = super::replica_dir(paths);
+    std::fs::symlink_metadata(dir.join("database.json")).ok()?;
+    Some(format!(
+        "aterm db {}: read from this Mac's fleet_db replica ({}), not the registry: {kept}",
+        noun.word(),
+        dir.display()
+    ))
+}
+
 /// `aterm db emails|computers|phones|ai-accounts …` from the command line: `None` where `words`
-/// name none of them or fleet_db keeps them on this Mac ([`serves`]).
+/// name none of them or fleet_db keeps them on this Mac ([`kept`]), which it says on standard
+/// error first ([`handed_back`]); standard output stays the answering store's own.
 #[must_use]
 pub fn main_entry(words: &[String]) -> Option<std::process::ExitCode> {
     use std::io::Write as _;
     let noun = Noun::parse(words.first()?)?;
     let paths = Paths::live().ok()?;
-    if !serves(&paths) {
+    if let Some(kept) = kept(&paths) {
+        if let Some(line) = handed_back(&paths, noun, &kept) {
+            let _ = writeln!(std::io::stderr(), "{line}");
+        }
         return None;
     }
     let report = |error: &Error| {

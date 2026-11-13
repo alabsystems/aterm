@@ -343,8 +343,8 @@ impl<'a> MemoryBrowser<'a> {
             path: browser,
             is_headless_shell: false,
         };
-        let (commands, to_browser) = std::io::pipe().map_err(|_| Error::Launch)?;
-        let (from_browser, replies) = std::io::pipe().map_err(|_| Error::Launch)?;
+        let (commands, to_browser) = aterm_uds::pipe().map_err(|_| Error::Launch)?;
+        let (from_browser, replies) = aterm_uds::pipe().map_err(|_| Error::Launch)?;
         let command =
             super::headless_oauth::headless_browser_command(&browser, profile.path(), &|name| {
                 std::env::var_os(name)

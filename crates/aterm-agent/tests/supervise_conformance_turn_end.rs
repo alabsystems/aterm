@@ -53,7 +53,7 @@ const CHOICE: &str = "Should I rewrite the parser or patch the lexer?";
 /// task's end.
 const FINISHED_REPLY: &str = "Committed the parser and its tests.\nATERM-TASK-DONE";
 /// The line a reply names a need on.
-const NEED: &str = "NEEDS YOU: the release credential, to sign the build";
+const NEED: &str = "NEEDS YOU: the release permission, to sign the build";
 
 thread_local! {
     /// What this walk's turns end on ([`REPORT`], [`CHOICE`]).
@@ -214,6 +214,7 @@ fn reading(
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
+        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
         fact: None,
         wake: None,
     }

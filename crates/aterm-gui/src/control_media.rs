@@ -1863,6 +1863,18 @@ pub(crate) enum OpenRoute {
     Refused(String),
 }
 
+impl OpenRoute {
+    /// Whether the route brings something up over what the window shows, which the desk door
+    /// judges ([`crate::desk_door::Effect::Open`]): every route but a close and a refusal.
+    pub(crate) const fn opens(&self) -> bool {
+        match self {
+            Self::App(_) | Self::FactMenu(Some(_)) => true,
+            Self::Aux { close, .. } => !*close,
+            Self::FactMenu(None) | Self::Refused(_) => false,
+        }
+    }
+}
+
 /// Route `open`'s words: a native app, fact menu, or auxiliary surface.
 pub(crate) fn open_route(rest: &str) -> OpenRoute {
     let trimmed = rest.trim();
@@ -2880,12 +2892,6 @@ pub(crate) fn parse_spawn_args(rest: &str) -> Result<SpawnForm, Option<String>> 
     }
 }
 
-/// The refusal of a spawn line naming a retired agent (`agent=gemini`), ahead of the usage line.
-fn spawn_retired_refusal(rest: &str) -> Option<String> {
-    let tokens = split_quoted_tokens(rest)?;
-    crate::task_launch::retired_worker(tokens.iter().find_map(|tok| tok.strip_prefix("agent=")))
-}
-
 fn spawn_cwd_refusal(form: &SpawnForm) -> Option<String> {
     use crate::spawn_folder::Fault;
     let (SpawnForm::Plain { cwd, .. } | SpawnForm::Connected { cwd, .. }) = form;
@@ -2929,6 +2935,13 @@ pub(crate) const fn raise_after_spawn(window_named: bool, raise: Option<bool>) -
     }
 }
 
+/// Whether a spawned tab lands in front: it was asked to (`raise`, [`raise_after_spawn`]) and
+/// the desk door admits its client (`in_front`, read only then, since it hops to the main
+/// thread).
+pub(crate) fn lands_in_front(raise: bool, in_front: &dyn Fn() -> bool) -> bool {
+    raise && in_front()
+}
+
 fn worker_order(
     frame: Option<Vec<u8>>,
     agent: aterm_phase::Program,
@@ -2941,13 +2954,10 @@ fn worker_order(
         .map(|order| order.under(autopilot))
 }
 
-/// The form of a `spawn ...` line, or its refusal: a retired agent by name, else the usage line
+/// The form of a `spawn ...` line, or its refusal: the usage line
 /// naming the word it refuses ([`spawn_refusal`]), else a program a harness here concludes
 /// ([`spawn_harnessed_refusal`]), else a folder that is not there.
 fn spawn_form(rest: &str) -> Result<SpawnForm, String> {
-    if let Some(refusal) = spawn_retired_refusal(rest) {
-        return Err(refusal);
-    }
     let form = parse_spawn_args(rest).map_err(|refused| spawn_refusal(refused.as_deref()))?;
     if let Some(refusal) = spawn_harnessed_refusal(&form) {
         return Err(refusal);
@@ -2984,10 +2994,11 @@ pub(crate) fn cmd_spawn_metered(
     rest: &str,
     session: Option<u64>,
     by: crate::session_store::ExitActor,
+    in_front: &dyn Fn() -> bool,
     asker: Option<crate::requests_host::Asker>,
 ) -> String {
     let began = std::time::Instant::now();
-    let reply = cmd_spawn(proxy, rest, session, by, asker.as_ref());
+    let reply = cmd_spawn(proxy, rest, session, by, in_front, asker.as_ref());
     let (agent, cwd) = match parse_spawn_args(rest) {
         Ok(SpawnForm::Plain { agent, cwd, .. }) => {
             (agent.as_ref().map_or("shell", AgentSpec::word), cwd)
@@ -3018,8 +3029,11 @@ fn under_drive(
 }
 
 /// Handles `spawn ...`, creating a new terminal session or worker on the main thread; `by` the
-/// caller its tab's open names (`crate::control::control_session::caller_actor_of`), `asker`
-/// who asks where a request is made for it (`crate::requests_host::asker`): its request is
+/// caller its tab's open names (`crate::control::control_session::caller_actor_of`). A tab that
+/// would land in front ([`raise_after_spawn`]) does so only for a client the desk door admits
+/// (`in_front`, [`crate::desk_door::admit`], asked only then): for one whose own tab is behind, it
+/// opens behind what the window shows, as `raise=false` asks for, and the spawn goes on. `asker`
+/// is who asks where a request is made for it (`crate::requests_host::asker`): its request is
 /// opened, or joined (`req=`), before the spawn reaches the main thread, and the reply names it
 /// (`OK <sid> req=<id>`).
 pub(crate) fn cmd_spawn(
@@ -3027,6 +3041,7 @@ pub(crate) fn cmd_spawn(
     rest: &str,
     session: Option<u64>,
     by: crate::session_store::ExitActor,
+    in_front: &dyn Fn() -> bool,
     asker: Option<&crate::requests_host::Asker>,
 ) -> String {
     use crate::requests_host::Made;
@@ -3094,7 +3109,7 @@ pub(crate) fn cmd_spawn(
                 .flatten()
                 .map(|driver| driver.node);
             let aim = SpawnAim::from_request(window, session);
-            let raise = raise_after_spawn(aim.is_aimed(), raise);
+            let raise = lands_in_front(raise_after_spawn(aim.is_aimed(), raise), in_front);
             let begun = match crate::requests_host::begin(prepared) {
                 Ok(begun) => begun,
                 Err(refusal) => return refusal,

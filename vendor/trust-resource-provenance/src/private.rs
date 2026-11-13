@@ -30,7 +30,7 @@ pub(crate) fn stamp(meta: &Metadata) -> (FileId, u64, u64, u32, u64, i64, i64, i
         meta.ctime_nsec(),
     )
 }
-fn owned(file: &File, directory: bool) -> io::Result<()> {
+pub(crate) fn owned(file: &File, directory: bool) -> io::Result<()> {
     let m = file.metadata()?;
     // SAFETY: geteuid reads the current effective account identity only.
     if m.uid() != unsafe { libc::geteuid() } {
@@ -46,14 +46,79 @@ fn owned(file: &File, directory: bool) -> io::Result<()> {
     Ok(())
 }
 
+/// Recheck a held directory's current name without opening any replacement.
+/// Every component is observed without following its final symlink. The held
+/// descriptor remains the input owner; metadata at a name only vetoes reuse.
+pub(crate) fn named_directory(path: &Path, held: &File) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(refused("absolute provenance path required"));
+    }
+    let mut prefix = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Normal(_) => prefix.push(component.as_os_str()),
+            _ => return Err(refused("noncanonical provenance path")),
+        }
+        if !std::fs::symlink_metadata(&prefix)?.is_dir() {
+            return Err(refused("provenance directory component changed"));
+        }
+    }
+    owned(held, true)?;
+    if identity(&std::fs::symlink_metadata(path)?) != identity(&held.metadata()?) {
+        return Err(refused("provenance directory replaced"));
+    }
+    Ok(())
+}
+
+/// A current-name check is never an open or an import of newly selected bytes.
+pub(crate) fn named_file(path: &Path, held: &File) -> io::Result<()> {
+    owned(held, false)?;
+    if stamp(&std::fs::symlink_metadata(path)?) != stamp(&held.metadata()?) {
+        return Err(refused("provenance original file name changed"));
+    }
+    Ok(())
+}
+
+pub(crate) fn read_original(file: &File, max: usize) -> io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt as _;
+    owned(file, false)?;
+    let before = file.metadata()?;
+    if before.len() > max as u64 {
+        return Err(refused("oversized original private record"));
+    }
+    let mut bytes = vec![0; before.len() as usize];
+    file.read_exact_at(&mut bytes, 0)?;
+    if stamp(&before) != stamp(&file.metadata()?) {
+        return Err(refused("original private record changed during read"));
+    }
+    Ok(bytes)
+}
+
 /// Read-only ACL admission shared with native owners. The caller must also
 /// check its required owner, kind, link count, POSIX modes and path custody.
 /// No cache, process, resource or proof authority is created by this check.
 pub fn require_no_acl_grants(file: &File) -> io::Result<()> {
-    if acl_allows(file)? {
+    if acl_forbids(file, AclPolicy::NoGrants)? {
         return Err(refused("provenance backing ACL grants access"));
     }
     Ok(())
+}
+
+/// Require an empty extended ACL, including inherited and deny-only entries.
+/// This is stricter than owner-only access: a proof store need not interpret
+/// platform-specific ACL ordering or inheritance. Other descriptor checks
+/// remain the caller's responsibility.
+pub fn require_no_acl_entries(file: &File) -> io::Result<()> {
+    if acl_forbids(file, AclPolicy::NoEntries)? {
+        return Err(refused("provenance backing has extended ACL entries"));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum AclPolicy {
+    NoGrants,
+    NoEntries,
 }
 fn open_at(parent: i32, name: &OsStr, flags: i32) -> io::Result<File> {
     let name = CString::new(name.as_bytes()).map_err(|_| refused("path contains NUL"))?;
@@ -119,7 +184,7 @@ pub(crate) fn read_private(dir: &File, name: &OsStr, max: usize) -> io::Result<(
 }
 
 #[cfg(target_os = "macos")]
-fn acl_allows(file: &File) -> io::Result<bool> {
+fn acl_forbids(file: &File, policy: AclPolicy) -> io::Result<bool> {
     use std::ffi::{c_int, c_void};
     // ABI and constants are the maintained astream-sys owner.rs declarations
     // from Apple's sys/acl.h, not a filesystem permission inference.
@@ -159,6 +224,9 @@ fn acl_allows(file: &File) -> io::Result<bool> {
             let error = io::Error::last_os_error();
             return if error.raw_os_error() == Some(libc::EINVAL) { Ok(false) } else { Err(error) };
         }
+        if matches!(policy, AclPolicy::NoEntries) {
+            return Ok(true);
+        }
         which = -1;
         let mut tag = 0;
         // SAFETY: entry is from the live ACL and tag is writable.
@@ -174,15 +242,33 @@ fn acl_allows(file: &File) -> io::Result<bool> {
     }
 }
 #[cfg(not(target_os = "macos"))]
-fn acl_allows(_: &File) -> io::Result<bool> {
+fn acl_forbids(file: &File, policy: AclPolicy) -> io::Result<bool> {
     // On Linux POSIX ACL permissions to other users are bounded by group mask
     // bits, which owned() rejects. Other platforms have no qualified route.
     #[cfg(target_os = "linux")]
     {
+        if matches!(policy, AclPolicy::NoGrants) {
+            return Ok(false);
+        }
+        for name in [c"system.posix_acl_access", c"system.posix_acl_default"] {
+            // SAFETY: live descriptor and constant NUL-terminated name. A
+            // null/zero buffer asks only whether this ACL attribute exists.
+            let size = unsafe {
+                libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0)
+            };
+            if size >= 0 {
+                return Ok(true);
+            }
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ENODATA) | Some(libc::ENOTSUP)) {
+                return Err(error);
+            }
+        }
         Ok(false)
     }
     #[cfg(not(target_os = "linux"))]
     {
+        let _ = (file, policy);
         Err(io::ErrorKind::Unsupported.into())
     }
 }

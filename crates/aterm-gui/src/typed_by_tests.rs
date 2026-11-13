@@ -176,9 +176,10 @@ fn no_tab_takes_a_word_aterm_credits_by() {
 #[test]
 #[cfg(unix)]
 fn an_invoked_paste_is_its_callers_typing() {
-    let mut pipe = [0; 2];
-    // SAFETY: `pipe` is two writable ints; the ends are this test's.
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "a pipe");
+    use std::os::fd::IntoRawFd;
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("a pipe");
     let sink = Arc::new(aterm_session::sink::SinkWriter::new(pipe[1]));
     let mut app = crate::App::headless_for_test_with_sink(sink);
     let wid = crate::WindowId(0);

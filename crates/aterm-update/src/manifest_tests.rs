@@ -70,96 +70,28 @@ fn each_record_write_names_its_flush() {
     InstalledReceipt::record(&staging.installed_receipt(), 3, &"c".repeat(40), &digest, O)
         .expect("receipt");
     assert_eq!(recording.take(), [O, O], "an ordered receipt");
-    FailedMark::record_required(&staging.trial(), 3, &digest, Some(&staging.root)).expect("trial");
+    Trial::record_required(&staging.trial(), 3, &digest, Some(&staging.root)).expect("trial");
     assert_eq!(
         recording.take(),
         [O, O],
         "a trial beside a root on its device"
     );
-    FailedMark::record_required(&staging.trial(), 3, &digest, None).expect("trial");
+    Trial::record_required(&staging.trial(), 3, &digest, None).expect("trial");
     assert_eq!(recording.take(), [D, D], "a trial with no root");
-    quarantine_artifact(&staging, 3, &digest, O);
-    assert_eq!(
-        recording.take(),
-        [O, O, O, O],
-        "the ledger, then failed.toml"
-    );
-    FailedMark::record_quarantine(&staging.failed(), 5, &"ef".repeat(32), O);
-    assert_eq!(recording.take(), [O, O], "an older build's verdict alone");
-    FailedMark::record_stage_failure(&staging.failed(), 6, &"cd".repeat(32), 100);
-    assert_eq!(
-        recording.take(),
-        [O, O],
-        "the quarantine carried into the ledger; the memo itself is not flushed"
-    );
 }
 
 #[test]
-fn a_timed_memo_never_erases_a_quarantine() {
-    let staging = crate::paths::Staging::scratch("timed-keeps-quarantine");
-    let (x, y) = ("aa".repeat(32), "bb".repeat(32));
-    let failed = staging.failed();
-    FailedMark::record_quarantine(&failed, 7, &x, aterm_durable::Flush::Durable);
-    assert!(
-        !Quarantine::read(&staging.quarantine()).holds(7, &x),
-        "PRECONDITION"
-    );
-    for at in 0..5 {
-        FailedMark::record_stage_moment(&failed, 8, &y, 1_000 + at);
-    }
-    FailedMark::record_stage_failure(&failed, 8, &y, 2_000);
-    assert!(artifact_quarantined(&staging, 7, &x), "still withdrawn");
-    assert!(
-        FailedMark::read(&failed).is_some_and(|m| m.matches(8, &y)),
-        "the new artifact's memo is recorded"
-    );
-
-    let fresh = crate::paths::Staging::scratch("timed-plain");
-    FailedMark::record_stage_failure(&fresh.failed(), 7, &x, 1_000);
-    FailedMark::record_stage_moment(&fresh.failed(), 8, &y, 2_000);
-    assert!(!artifact_quarantined(&fresh, 7, &x));
-}
-
-#[test]
-fn a_record_the_writer_could_not_read_survives() {
-    use std::os::unix::fs::PermissionsExt;
-    let staging = crate::paths::Staging::scratch("unreadable-keeps-quarantine");
-    let (x, y, z) = ("aa".repeat(32), "bb".repeat(32), "cc".repeat(32));
-    FailedMark::record_quarantine(&staging.failed(), 7, &x, aterm_durable::Flush::Durable);
-    Quarantine::record(&staging.quarantine(), 9, &z, aterm_durable::Flush::Durable).unwrap();
-    let mode =
-        |path: &Path, bits| std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits));
-    for locked in [staging.failed(), staging.quarantine()] {
-        mode(&locked, 0o000).unwrap();
-        if std::fs::File::open(&locked).is_ok() {
-            aterm_uds::host::could_not_run(
-                "a mode-0 file opened anyway: root, or a file system that ignores modes",
-            );
-        }
-        FailedMark::record_stage_moment(&staging.failed(), 8, &y, 1_000);
-        FailedMark::record_stage_failure(&staging.failed(), 8, &y, 2_000);
-        FailedMark::clear_backoff(&staging.failed());
-        let _ = mode(&locked, 0o600);
-        let at = locked.display();
-        assert!(artifact_quarantined(&staging, 7, &x), "{at}");
-        assert!(artifact_quarantined(&staging, 9, &z), "{at}");
-    }
-}
-
-#[test]
-fn a_vacuous_marker_reads_as_absent_not_as_an_empty_memo() {
+fn a_vacuous_trial_marker_reads_as_absent() {
     let dir = crate::paths::scratch_dir("vacuous");
-    let path = dir.join("failed.toml");
-
+    let path = dir.join("trial.toml");
     std::fs::write(&path, "").unwrap();
-    assert!(FailedMark::read(&path).is_none(), "zero length is absent");
+    assert!(Trial::read(&path).is_none(), "zero length is absent");
     std::fs::write(&path, "build_number = 0\nsha256 = \"\"\n").unwrap();
-    assert!(FailedMark::read(&path).is_none(), "all-defaults is absent");
-
-    FailedMark::record_quarantine(&path, 42, &"ab".repeat(32), aterm_durable::Flush::Durable);
-    let read = FailedMark::read(&path).expect("a real memo reads back");
+    assert!(Trial::read(&path).is_none(), "all-defaults is absent");
+    Trial::record_required(&path, 42, &"AB".repeat(32), None).unwrap();
+    let read = Trial::read(&path).expect("a real marker reads back");
     assert_eq!(read.build_number, 42);
-    assert!(read.quarantined, "and keeps its verdict");
+    assert_eq!(read.sha256, "ab".repeat(32), "stored lowercase");
     let strays: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .filter_map(Result::ok)
@@ -173,384 +105,24 @@ fn a_vacuous_marker_reads_as_absent_not_as_an_empty_memo() {
 }
 
 #[test]
-fn a_stage_failure_suppresses_then_expires_instead_of_being_permanent() {
-    let root = crate::paths::scratch_dir("failedmark-ttl");
-    let path = root.join("failed.toml");
-    const BUILD: u64 = 1785125098;
-    const SHA: &str = "62605231daafe06037584df32414f02120f0f040b2b20ba77bdaff214ba028d6";
-
-    FailedMark::record_stage_failure(&path, BUILD, SHA, 1_000);
-    let m = FailedMark::read(&path).expect("marker persisted");
-    assert_eq!(m.attempts, 1);
-    assert_eq!(m.retry_after, 1_000 + RETRY_BACKOFF_SECS[0]);
-
-    assert!(m.suppresses(BUILD, SHA, 1_000));
-    assert!(m.suppresses(BUILD, SHA, 1_000 + RETRY_BACKOFF_SECS[0] - 1));
-    assert!(!m.suppresses(BUILD, SHA, 1_000 + RETRY_BACKOFF_SECS[0]));
-
-    assert!(!m.suppresses(BUILD + 1, SHA, 1_000));
-    assert!(!m.suppresses(BUILD, &"a".repeat(64), 1_000));
-}
-
-#[test]
-fn the_retry_budget_widens_saturates_and_resets_on_a_new_artifact() {
-    let root = crate::paths::scratch_dir("failedmark-widen");
-    let path = root.join("failed.toml");
-    const SHA: &str = "deadbeef";
-
-    for (n, expected) in RETRY_BACKOFF_SECS.iter().enumerate() {
-        FailedMark::record_stage_failure(&path, 7, SHA, 0);
-        let m = FailedMark::read(&path).unwrap();
-        assert_eq!(m.attempts as usize, n + 1, "attempt {n} count");
-        assert_eq!(m.retry_after, *expected, "attempt {n} backoff");
-    }
-    FailedMark::record_stage_failure(&path, 7, SHA, 0);
-    let m = FailedMark::read(&path).unwrap();
-    assert_eq!(m.retry_after, *RETRY_BACKOFF_SECS.last().unwrap());
-
-    FailedMark::record_stage_failure(&path, 8, SHA, 0);
-    let m = FailedMark::read(&path).unwrap();
-    assert_eq!(m.attempts, 1);
-    assert_eq!(m.retry_after, RETRY_BACKOFF_SECS[0]);
-}
-
-#[test]
-fn a_pre_budget_marker_parses_and_becomes_retryable() {
-    let m: FailedMark = aterm_toml::from_str("build_number = 9\nsha256 = \"ff\"\n").unwrap();
-    assert_eq!(m.attempts, 0);
-    assert_eq!(m.retry_after, 0);
-    assert!(m.matches(9, "ff"));
-    assert!(
-        !m.suppresses(9, "ff", 0),
-        "old markers must not strand a machine"
-    );
-    assert_eq!(m.next_attempt(9, "ff"), 2);
-    assert_eq!(m.next_attempt(10, "ff"), 1);
-    assert!(!m.is_quarantine());
-}
-
-#[test]
-fn a_quarantine_survives_a_later_stage_failure_of_another_build() {
-    const NOW: u64 = 1_000_000;
-    let staging = crate::paths::Staging::scratch("quarantine-survives");
-    let (x, sx) = (41, "ab".repeat(32));
-    let (y, sy) = (42, "cd".repeat(32));
-    quarantine_artifact(&staging, x, &sx, aterm_durable::Flush::Durable);
-    assert!(artifact_quarantined(&staging, x, &sx));
-
-    FailedMark::record_stage_failure(&staging.failed(), y, &sy, NOW);
-    assert!(
-        artifact_quarantined(&staging, x, &sx),
-        "another build's backoff must not erase the crash-loop verdict"
-    );
-    FailedMark::clear_backoff(&staging.failed());
-    assert!(
-        artifact_quarantined(&staging, x, &sx),
-        "nor may a later successful stage"
-    );
-    quarantine_artifact(&staging, y, &sy, aterm_durable::Flush::Durable);
-    assert!(artifact_quarantined(&staging, x, &sx));
-    assert!(artifact_quarantined(&staging, y, &sy));
-    assert!(!artifact_quarantined(&staging, x, &"ef".repeat(32)));
-    assert!(!artifact_quarantined(&staging, x + 2, &sx));
-    let _ = std::fs::remove_dir_all(&staging.root);
-}
-
-#[test]
-fn a_quarantine_suppresses_forever_while_the_shape_it_used_to_take_does_not() {
-    let staging = crate::paths::Staging::scratch("quarantine");
-    let path = staging.failed();
-    let sha = "ab".repeat(32);
-
-    FailedMark::record(&path, 42, &sha);
-    let old = FailedMark::read(&path).expect("parses");
-    assert!(old.matches(42, &sha), "it names the right artifact…");
-    assert!(!old.is_quarantine());
-    assert!(!old.suppresses(42, &sha, 0), "…and suppresses nothing");
-
-    FailedMark::record_quarantine(&path, 42, &sha, aterm_durable::Flush::Durable);
-    let q = FailedMark::read(&path).expect("parses");
-    assert!(q.is_quarantine());
-    assert!(q.suppresses(42, &sha, 0));
-    assert!(
-        q.suppresses(42, &sha, u64::MAX),
-        "no clock lapses a quarantine"
-    );
-    assert!(q.suppresses(42, &sha.to_ascii_uppercase(), 0));
-
-    assert!(!q.suppresses(43, &sha, 0));
-    assert!(!q.suppresses(42, &"cd".repeat(32), 0));
-
-    FailedMark::record_stage_failure(&path, 42, &sha, 100);
-    let timed = FailedMark::read(&path).expect("parses");
-    assert!(!timed.is_quarantine());
-    assert!(timed.suppresses(42, &sha, 100));
-    assert!(!timed.suppresses(42, &sha, 100 + RETRY_BACKOFF_SECS[3]));
-    assert!(
-        artifact_quarantined(&staging, 42, &sha),
-        "record_stage_failure migrates a legacy quarantine in failed.toml to quarantine.toml"
-    );
-
-    let _ = std::fs::remove_dir_all(&staging.root);
-}
-
-/// A clock that ran ahead when a failure was booked, and has been corrected since, leaves a
-/// stamp further off than any schedule writes: it says nothing of how long to wait. The
-/// longest step itself still suppresses to its last second, and a quarantine is no timed memo.
-#[test]
-fn a_stamp_further_ahead_than_any_schedule_suppresses_nothing() {
-    const BOOKED: u64 = 1_000_000;
-    let sha = "ab".repeat(32);
-    let longest = FailedMark {
-        retry_after: BOOKED + RETRY_BACKOFF_SECS[3],
-        ..FailedMark::default().stage_failure_mark(42, &sha, BOOKED, false)
-    };
-    assert!(longest.suppresses(42, &sha, BOOKED));
-    assert_eq!(longest.retry_in_secs(BOOKED), RETRY_BACKOFF_SECS[3]);
-    assert!(longest.suppresses(42, &sha, BOOKED + RETRY_BACKOFF_SECS[3] - 1));
-    assert!(!longest.suppresses(42, &sha, BOOKED + RETRY_BACKOFF_SECS[3]));
-
-    let corrected = BOOKED - 1;
-    assert!(!longest.suppresses(42, &sha, corrected));
-    assert_eq!(longest.retry_in_secs(corrected), 0);
-
-    let quarantine = FailedMark::quarantine_mark(42, &sha);
-    assert!(quarantine.suppresses(42, &sha, corrected));
-}
-
-fn timeline_class(now: u64, deadline: u64) -> i64 {
-    if deadline == 0 {
-        i64::try_from(now.min(3)).expect("bounded class fits i64")
-    } else if now == 0 {
-        0
-    } else if now < deadline {
-        1
-    } else if now == deadline {
-        2
-    } else {
-        3
-    }
-}
-
-#[test]
-fn failed_mark_suppression_exhaustively_refines_the_model() {
-    use std::collections::BTreeSet;
-
-    let model = aterm_models_update::native_update_failed_mark_suppression_model();
-    let reachable_inputs: BTreeSet<_> = model
-        .successors("PickSuppressionInputs", &model.init_state())
-        .into_iter()
-        .collect();
+fn a_trial_marker_an_earlier_updater_wrote_still_reads() {
+    let dir = crate::paths::scratch_dir("trial-earlier");
+    let path = dir.join("trial.toml");
+    std::fs::write(
+        &path,
+        format!(
+            "build_number = 42\nsha256 = \"{}\"\nattempts = 0\nretry_after = 0\n\
+             quarantined = false\ninstall_root = \"/Applications/aterm.app\"\n",
+            "ab".repeat(32)
+        ),
+    )
+    .unwrap();
+    let read = Trial::read(&path).expect("the in-flight trial's marker reads");
+    assert!(read.matches(42, &"AB".repeat(32)));
     assert_eq!(
-        reachable_inputs.len(),
-        16,
-        "2 writers × 4 timeline classes × 2 identity classes"
+        read.install_root.as_deref(),
+        Some("/Applications/aterm.app")
     );
-
-    const BUILD: u64 = 42;
-    let sha = "ab".repeat(32);
-    let wrong_sha = "cd".repeat(32);
-    let candidates = [
-        (BUILD, sha.clone(), true),
-        (BUILD + 1, sha.clone(), false),
-        (BUILD, wrong_sha, false),
-    ];
-
-    let quarantine = FailedMark::quarantine_mark(BUILD, &sha);
-    assert!(quarantine.quarantined);
-    assert_eq!(
-        quarantine.retry_after, 0,
-        "the verdict must NOT ride the deadline field — that was the bug"
-    );
-
-    const NOW0: u64 = 1_000;
-    let backoff = FailedMark::default().stage_failure_mark(BUILD, &sha, NOW0, false);
-    assert_eq!(backoff.retry_after, NOW0 + RETRY_BACKOFF_SECS[0]);
-    assert_eq!(backoff.attempts, 1);
-    assert!(!backoff.quarantined && !backoff.moment);
-    let first_moment = FailedMark::default().stage_failure_mark(BUILD, &sha, NOW0, true);
-    assert_eq!(first_moment.retry_after, NOW0 + MOMENT_BACKOFF_SECS[0]);
-    assert_eq!(first_moment.retry_after, NOW0, "one moment costs nothing");
-    let second_moment = first_moment.stage_failure_mark(BUILD, &sha, NOW0, true);
-    assert_eq!(second_moment.retry_after, NOW0 + MOMENT_BACKOFF_SECS[1]);
-    assert_eq!(second_moment.attempts, 2);
-    assert!(second_moment.moment && !second_moment.quarantined);
-
-    let mut projected_inputs = BTreeSet::new();
-    let mut calls = 0usize;
-    for (mark, quarantine_writer) in [
-        (&quarantine, true),
-        (&backoff, false),
-        (&first_moment, false),
-        (&second_moment, false),
-    ] {
-        let deadline = mark.retry_after;
-        let probes = if quarantine_writer {
-            [0, 1, 2, u64::MAX]
-        } else {
-            [0, deadline - 1, deadline, u64::MAX]
-        };
-        for now in probes {
-            for (cand_build, cand_sha, matches) in &candidates {
-                let suppressed = mark.suppresses(*cand_build, cand_sha, now);
-                if quarantine_writer {
-                    assert_eq!(
-                        suppressed, *matches,
-                        "quarantine must suppress its artifact at every now (now={now})"
-                    );
-                } else {
-                    assert_eq!(
-                        suppressed,
-                        *matches && now < deadline,
-                        "backoff must suppress iff now < deadline (now={now})"
-                    );
-                }
-
-                let (picked, recorded, probed) = failed_mark_suppression_projection(
-                    quarantine_writer,
-                    timeline_class(now, mark.retry_after),
-                    *matches,
-                    mark.quarantined,
-                    if mark.retry_after == 0 { 0 } else { 2 },
-                    suppressed,
-                );
-                assert!(
-                    reachable_inputs.contains(&picked),
-                    "real input projection is unreachable: {picked:?}"
-                );
-                projected_inputs.insert(picked.clone());
-
-                let label = format!(
-                    "failed-mark suppression quarantine={quarantine_writer} now={now} matches={matches}"
-                );
-                let writer_action = if quarantine_writer {
-                    "RecordQuarantine"
-                } else {
-                    "RecordStageFailure"
-                };
-                let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-                    &model,
-                    &[],
-                    &picked,
-                    &recorded,
-                    Some(writer_action),
-                    &label,
-                );
-                assert!(admitted, "real writer transition rejected: {why}");
-                let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-                    &model,
-                    &[],
-                    &recorded,
-                    &probed,
-                    Some("ProbeSuppresses"),
-                    &label,
-                );
-                assert!(admitted, "real reader transition rejected: {why}");
-                for invariant in &model.invariants {
-                    assert!(
-                        model.check_invariant(invariant.name, &recorded),
-                        "real writer violated {}: {recorded:?}",
-                        invariant.name
-                    );
-                    assert!(
-                        model.check_invariant(invariant.name, &probed),
-                        "real round trip violated {}: {probed:?}",
-                        invariant.name
-                    );
-                }
-                calls += 1;
-            }
-        }
-    }
-
-    assert_eq!(
-        calls, 48,
-        "the concrete decision lattice must stay exhaustive"
-    );
-    assert_eq!(
-        projected_inputs, reachable_inputs,
-        "Tier-1 must cover every bounded PickSuppressionInputs class"
-    );
-}
-
-#[test]
-fn failed_mark_suppression_model_negative_controls_are_non_vacuous() {
-    let model = aterm_models_update::native_update_failed_mark_suppression_model();
-    let buggy = aterm_spec::interp::with_buggy(&model, 1);
-
-    let legacy_poison = FailedMark {
-        build_number: 42,
-        sha256: "ab".repeat(32),
-        attempts: 0,
-        retry_after: 0,
-        quarantined: false,
-        install_root: None,
-        moment: false,
-    };
-    let suppressed = legacy_poison.suppresses(42, &"ab".repeat(32), 0);
-    assert!(
-        !suppressed,
-        "the regression shape: the poison does not hold"
-    );
-    let (picked, leaked, retried) =
-        failed_mark_suppression_projection(true, 0, true, legacy_poison.quarantined, 0, suppressed);
-    let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &picked,
-        &leaked,
-        Some("RecordQuarantine"),
-        "failed-mark suppression writer negative control",
-    );
-    assert!(
-        !admitted,
-        "healthy model admitted the quarantine-as-timed-memo writer: {why}"
-    );
-    assert!(
-        buggy
-            .successors("RecordQuarantine", &picked)
-            .contains(&leaked),
-        "Buggy=1 must reproduce the 5ffcc15d writer"
-    );
-    assert!(!buggy.check_invariant("QuarantineVerdictLandsInTheQuarantineField", &leaked));
-    assert!(
-        buggy
-            .successors("ProbeSuppresses", &leaked)
-            .contains(&retried),
-        "Buggy=1 must complete the written-then-ignored round trip"
-    );
-    assert!(!buggy.check_invariant("QuarantineSuppressesAtEveryProbe", &retried));
-
-    let (picked, recorded, flipped) =
-        failed_mark_suppression_projection(false, 3, true, false, 2, true);
-    let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &picked,
-        &recorded,
-        Some("RecordStageFailure"),
-        "failed-mark suppression reader negative control (prefix)",
-    );
-    assert!(admitted, "the recorded prefix must be healthy: {why}");
-    let (admitted, why) = aterm_spec::verify::validate_transition_tiered(
-        &model,
-        &[],
-        &recorded,
-        &flipped,
-        Some("ProbeSuppresses"),
-        "failed-mark suppression reader negative control",
-    );
-    assert!(
-        !admitted,
-        "healthy model admitted a memo suppressing past its deadline: {why}"
-    );
-    assert!(
-        buggy
-            .successors("ProbeSuppresses", &recorded)
-            .contains(&flipped),
-        "Buggy=1 must reproduce the flipped comparison"
-    );
-    assert!(!buggy.check_invariant("BackoffSuppressesIffBeforeDeadline", &flipped));
 }
 
 #[test]
@@ -1020,20 +592,17 @@ fn a_floor_the_write_could_not_read_is_never_replaced_with_defaults() {
 }
 
 #[test]
-fn failed_mark_matches_on_build_and_hash_only() {
-    let dir = crate::paths::scratch_dir("failed-match");
-    let p = dir.join("failed.toml");
-    assert!(FailedMark::read(&p).is_none());
-    FailedMark::record(&p, 42, "ABCdef");
-    let m = FailedMark::read(&p).unwrap();
+fn a_trial_marker_matches_on_build_and_hash_only() {
+    let dir = crate::paths::scratch_dir("trial-match");
+    let p = dir.join("trial.toml");
+    assert!(Trial::read(&p).is_none());
+    Trial::record(&p, 42, "ABCdef");
+    let m = Trial::read(&p).unwrap();
     assert!(m.matches(42, "abcdef"), "hash compare is case-insensitive");
-    assert!(!m.matches(43, "abcdef"), "different build ⇒ retry");
-    assert!(
-        !m.matches(42, "999"),
-        "different hash (re-published) ⇒ retry"
-    );
-    FailedMark::clear(&p);
-    assert!(FailedMark::read(&p).is_none());
+    assert!(!m.matches(43, "abcdef"), "different build");
+    assert!(!m.matches(42, "999"), "different hash (re-published)");
+    Trial::clear(&p);
+    assert!(Trial::read(&p).is_none());
 }
 
 fn confirmed_ready(confirmed: Option<u64>) -> Ready {

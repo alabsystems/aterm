@@ -7,12 +7,13 @@
 //!
 //! * [`reserve`] fixes the release's identity before anything is built from it: `n` from
 //!   origin's ledger tail and the clock, and the release commit C (the published commit
-//!   plus the ledger line and the rolled changelog), made from git objects and pushed
-//!   nowhere. The binary is built and verified from C carrying `n`, so the bytes `verify
+//!   plus the ledger line and the rolled changelog, less the entry files under `changes/`
+//!   it shipped), made from git objects and pushed nowhere. The binary is built and verified from C carrying `n`, so the bytes `verify
 //!   release` judged are the bytes that ship, and a release that refuses before the claim
 //!   burns no number.
 //! * [`claim`] lands the reservation: main takes C (a fast-forward, or a merge onto a tip
-//!   peers moved), through the native expected-old main transaction. Only a typed conflict
+//!   peers moved, whose changelog section is C's byte for byte and which deletes the files
+//!   C shipped by their blobs), through the native expected-old main transaction. Only a typed conflict
 //!   without side effects retries, up to [`MAX_CLAIM_ATTEMPTS`] times; an unknown result
 //!   stops before rereading can reinterpret it. A successful write is verified against the
 //!   remote tail byte for byte. A reservation whose `n` the tail has reached is never
@@ -613,6 +614,10 @@ pub struct ClaimPlan<'a> {
     pub max_attempts: u32,
     /// The published commit (full sha) the release is cut from: on `origin/main`, the release commit's one parent, and where the cut tree sits until the claim lands.
     pub source: &'a str,
+    /// The public release that opened this release's harness window and its commit
+    /// (`gates::harness_versions_base`), from which the release derives its harness-versions
+    /// announcement ([`crate::harness_versions::announcement`]); `None` where none precedes.
+    pub harness_base: Option<(&'a str, &'a str)>,
 }
 
 /// The ref that keeps a reservation's release commit safe from gc until [`claim`] puts it on main.
@@ -623,7 +628,7 @@ pub const RESERVED_REF: &str = "refs/aterm-release/reserved";
 pub struct Reserved {
     /// `n`: `max(origin tail + 1, now)` when reserved.
     pub build: u64,
-    /// The release commit C (full sha): the published commit plus `line` appended to its ledger and its rolled changelog, nothing else.
+    /// The release commit C (full sha): the published commit plus `line` appended to its ledger and its rolled changelog, less the entry files it shipped, nothing else.
     pub commit: String,
     /// The ledger line C appends, e.g. "1783918101 0.2.0".
     pub line: String,
@@ -639,17 +644,16 @@ pub struct Claim {
     pub landed: String,
     /// The exact ledger line appended, e.g. "1783918101 0.2.0".
     pub ledger_line: String,
+    /// The harness versions the landing merge raised: one for each harness whose sources main changed past the release commit under a version the release already carries ([`crate::harness_versions::landing`]); empty for a fast-forward.
+    pub harness: Vec<crate::harness_versions::Owed>,
 }
 
-/// The changelog texts a claim writes, from `(published commit's, main tip's)` CHANGELOG.md: `(release commit's, main's)`.
-pub type ClaimChangelogs<'a> = &'a dyn Fn(&str, &str) -> Result<(String, String)>;
-
-/// Reserve the release's identity before anything is built: read origin's ledger tail, `n = max(tail + 1, plan.now)`, and make the release commit C (`plan.source` plus `n version` appended to its ledger and its rolled changelog, `changelogs`' first half) from git objects ([`commit_with`]), with no worktree, index or push.
+/// Reserve the release's identity before anything is built: read origin's ledger tail, `n = max(tail + 1, plan.now)`, and make the release commit C from git objects ([`commit_with`]), with no worktree, index or push: `plan.source` plus `n version` appended to its ledger and its changelog window assembled and rolled for the version on `date` ([`changelog::release_text`], the harness announcement derived from `plan.harness_base`), less every entry file under `changes/` that roll shipped ([`changelog::release_removals`]).
 pub fn reserve(
     git: &dyn GitRunner,
     origin: &dyn Origin,
     plan: &ClaimPlan<'_>,
-    changelogs: ClaimChangelogs<'_>,
+    date: &str,
 ) -> Result<Reserved> {
     check_version_shape(plan.version)?;
     let main = origin.refresh_main().map_err(|e| {
@@ -660,10 +664,8 @@ pub fn reserve(
     })?;
     source_on_main(git, plan.source, &main)?;
     let source_ledger = show_utf8(git, plan.source, LEDGER_FILE)?;
-    let source_changelog = show_utf8(git, plan.source, changelog::CHANGELOG_FILE)?;
     let n = next_build(tail(&show_utf8(git, &main, LEDGER_FILE)?)?.build, plan.now)?;
-    let main_changelog = show_utf8(git, &main, changelog::CHANGELOG_FILE)?;
-    let (release_changelog, _) = changelogs(&source_changelog, &main_changelog)?;
+    let (release_changelog, removals) = release_roll(git, plan, date)?;
     let line = format!("{n} {}", plan.version);
     let commit = commit_with(
         git,
@@ -672,6 +674,7 @@ pub fn reserve(
             (changelog::CHANGELOG_FILE, &release_changelog),
             (LEDGER_FILE, &appended(&source_ledger, &line)),
         ],
+        &pairs(&removals),
         &[plan.source],
         &format!("release: v{} (build {n})", plan.version),
     )?;
@@ -683,14 +686,36 @@ pub fn reserve(
     })
 }
 
-/// Claim a reservation: main takes the release commit `reserved.commit` whatever its tip is, as a fast-forward when main has not moved past the published commit, else as a merge onto the tip (the tip's tree plus the same ledger line and the shipped notes moved out of `[Unreleased]`, `changelogs`' second half).
+/// The release commit's changelog and the entry files it deletes (path and blob id), from
+/// `plan.source`'s objects alone: what [`reserve`] commits and what a dry run prints.
+///
+/// # Errors
+/// The published commit's window breaks a rule, or git cannot read it.
+pub fn release_roll(
+    git: &dyn GitRunner,
+    plan: &ClaimPlan<'_>,
+    date: &str,
+) -> Result<(String, Vec<(String, String)>)> {
+    let window = changelog::Window::at(git, plan.source, plan.version)?;
+    let announcement = crate::harness_versions::announcement(git, plan.harness_base, plan.source)?;
+    let text = changelog::release_text(&window, announcement.as_deref(), plan.version, date)?;
+    Ok((text, changelog::release_removals(&window, plan.version)))
+}
+
+fn pairs(owned: &[(String, String)]) -> Vec<(&str, &str)> {
+    owned
+        .iter()
+        .map(|(path, oid)| (path.as_str(), oid.as_str()))
+        .collect()
+}
+
+/// Claim a reservation: main takes the release commit `reserved.commit` whatever its tip is, as a fast-forward when main has not moved past the published commit, else as a merge onto the tip: the tip's tree plus the same ledger line, the release commit's `## [version]` section placed under the tip's `[Unreleased]` ([`changelog::landing_text`], which never judges the tip's own text), and the entry files the release shipped deleted by blob ([`changelog::landing_removals`]), with any file the tip moved a shipped raw entry into ([`changelog::landing_raw_removals`]), and the harness versions the tip owes the window this release opens raised in their version files ([`crate::harness_versions::landing`]).
 pub fn claim(
     git: &dyn GitRunner,
     origin: &dyn Origin,
     worktree: &Path,
     plan: &ClaimPlan<'_>,
     reserved: &Reserved,
-    changelogs: ClaimChangelogs<'_>,
 ) -> Result<Claim> {
     check_version_shape(plan.version)?;
 
@@ -711,10 +736,15 @@ pub fn claim(
     crate::cut_timing::measure("claim source ancestry", || {
         source_on_main(git, plan.source, &tip)
     })?;
-    let (source_ledger, source_changelog) =
-        crate::cut_timing::measure("claim reservation proof", || {
-            reservation_is_the_claims(git, plan, reserved)
-        })?;
+    let (source_ledger, window) = crate::cut_timing::measure("claim reservation proof", || {
+        reservation_is_the_claims(git, plan, reserved)
+    })?;
+    let release_changelog = show_utf8(git, &reserved.commit, changelog::CHANGELOG_FILE)?;
+    let shipped_files = if window.is_recut(plan.version) {
+        Vec::new()
+    } else {
+        window.fragments.clone()
+    };
     let (n, release, line) = (
         reserved.build,
         reserved.commit.as_str(),
@@ -729,6 +759,7 @@ pub fn claim(
     } else {
         format!("{source_ledger}\n")
     };
+    let mut harness = Vec::new();
     let landed = loop {
         attempt += 1;
         if base != source_ledger && !base.starts_with(&source_prefix) {
@@ -748,23 +779,87 @@ pub fn claim(
             )));
         }
         let landed = if tip == plan.source {
+            harness.clear();
             release.to_string()
         } else {
             let main_changelog = show_utf8(git, &tip, changelog::CHANGELOG_FILE)?;
-            let (_, landing_changelog) = changelogs(&source_changelog, &main_changelog)?;
+            let landing_changelog = changelog::landing_text(
+                &main_changelog,
+                &window.raw,
+                &release_changelog,
+                plan.version,
+            )?;
+            // Where main already records the section (an earlier claim of this version whose
+            // cut wedged, which only `allow_existing_section` reaches) it stands as it is;
+            // otherwise main records the release commit's section byte for byte.
+            if !changelog::has_section(&main_changelog, plan.version)
+                && changelog::rolled_body(&landing_changelog, plan.version)?
+                    != changelog::rolled_body(&release_changelog, plan.version)?
+            {
+                return Err(Error::new(format!(
+                    "main's {} would record a \"## [{}]\" section other than the release \
+                     commit's; nothing was claimed",
+                    changelog::CHANGELOG_FILE,
+                    plan.version
+                )));
+            }
+            let listing = changelog::fragment_listing(git, &tip)?;
+            let mut removals = changelog::landing_removals(
+                &shipped_files,
+                &main_changelog,
+                &listing,
+                plan.version,
+            );
+            // Serves the drain of entries written before fragments: a raw entry the release
+            // shipped that main moved into a file since goes with it; it goes once
+            // [Unreleased] holds none.
+            if !window.is_recut(plan.version)
+                && !changelog::has_section(&main_changelog, plan.version)
+            {
+                let raw =
+                    changelog::landing_raw_removals(&window.raw, &listing, &removals, &|oid| {
+                        changelog::small_blob_text(git, oid)
+                    });
+                removals.extend(raw);
+            }
+            // Main's own changes past the release commit open the next harness window the
+            // moment this merge puts the release commit in main's history, so the merge
+            // carries the versions that window owes ([`crate::harness_versions::landing`]).
+            harness = crate::harness_versions::landing(git, release, &tip)?;
+            let ledger_text = appended(&base, line);
+            let mut files = vec![
+                (changelog::CHANGELOG_FILE, landing_changelog.as_str()),
+                (LEDGER_FILE, ledger_text.as_str()),
+            ];
+            files.extend(
+                harness
+                    .iter()
+                    .map(|(owed, text)| (owed.harness.version_file(), text.as_str())),
+            );
+            let mut message = format!(
+                "release: v{} (build {n}) lands on main — cut from the published {}",
+                plan.version,
+                plan.source.get(..12).unwrap_or(plan.source)
+            );
+            if !harness.is_empty() {
+                let names: Vec<String> = harness
+                    .iter()
+                    .map(|(o, _)| format!("alab {} harness {}.{}", o.harness.cli(), o.to.0, o.to.1))
+                    .collect();
+                message.push_str(&format!(
+                    "\n\nMain changed these harnesses' sources past the release commit, so the \
+                     window v{} opens owes each one version, written here: {}.",
+                    plan.version,
+                    names.join(", ")
+                ));
+            }
             commit_with(
                 git,
                 &tip,
-                &[
-                    (changelog::CHANGELOG_FILE, &landing_changelog),
-                    (LEDGER_FILE, &appended(&base, line)),
-                ],
+                &files,
+                &pairs(&removals),
                 &[&tip, release],
-                &format!(
-                    "release: v{} (build {n}) lands on main — cut from the published {}",
-                    plan.version,
-                    plan.source.get(..12).unwrap_or(plan.source)
-                ),
+                &message,
             )?
         };
 
@@ -856,6 +951,7 @@ pub fn claim(
         commit: release.to_string(),
         landed,
         ledger_line: line.to_string(),
+        harness: harness.into_iter().map(|(owed, _)| owed).collect(),
     })
 }
 
@@ -874,14 +970,16 @@ fn source_on_main(git: &dyn GitRunner, source: &str, main: &str) -> Result<()> {
 
 /// The reservation is this claim's release commit: its one parent is the published commit,
 /// its ledger is the published commit's plus the version's line, its changelog is the
-/// published commit's rolled for the version ([`changelog::release_changelog`], on the
-/// date its section names, or as it stands when it already carries the section), and
-/// nothing else moved.
+/// published commit's window assembled and rolled for the version ([`changelog::release_text`],
+/// on the date its section names, with the harness announcement derived since the release its
+/// section names, or as it stands when the published commit already carries the section), and
+/// its tree is exactly the published commit's with those two files and without the entry files
+/// that roll shipped ([`tree_with`]), so nothing else moved.
 fn reservation_is_the_claims(
     git: &dyn GitRunner,
     plan: &ClaimPlan<'_>,
     reserved: &Reserved,
-) -> Result<(String, String)> {
+) -> Result<(String, changelog::Window)> {
     let refuse = |why: String| {
         Err(Error::new(format!(
             "the reserved release commit {} is not this claim's: {why} — nothing was claimed; \
@@ -905,17 +1003,34 @@ fn reservation_is_the_claims(
     }
     let ledger = show_utf8(git, &reserved.commit, LEDGER_FILE)?;
     let source_ledger = show_utf8(git, plan.source, LEDGER_FILE)?;
-    if ledger != appended(&source_ledger, &reserved.line) {
+    let expected_ledger = appended(&source_ledger, &reserved.line);
+    if ledger != expected_ledger {
         return refuse(format!(
             "its ledger is not the published commit's plus {:?}",
             reserved.line
         ));
     }
+    let window = match changelog::Window::at(git, plan.source, plan.version) {
+        Ok(window) => window,
+        Err(e) => return refuse(format!("the published commit's changelog window: {e}")),
+    };
     let released = show_utf8(git, &reserved.commit, changelog::CHANGELOG_FILE)?;
     let date = changelog::section_date(&released, plan.version);
-    let source_changelog = show_utf8(git, plan.source, changelog::CHANGELOG_FILE)?;
-    let expected =
-        changelog::release_changelog(&source_changelog, plan.version, date.unwrap_or(""))?;
+    let base = match announced_base(git, plan, &released) {
+        Ok(base) => base,
+        Err(e) => return refuse(e.to_string()),
+    };
+    let announcement = crate::harness_versions::announcement(
+        git,
+        base.as_ref().map(|(r, c)| (r.as_str(), c.as_str())),
+        plan.source,
+    )?;
+    let expected = changelog::release_text(
+        &window,
+        announcement.as_deref(),
+        plan.version,
+        date.unwrap_or(""),
+    )?;
     if released != expected {
         return refuse(match date {
             None => format!(
@@ -924,39 +1039,132 @@ fn reservation_is_the_claims(
                 plan.version
             ),
             Some(_) => format!(
-                "its {} is not the published commit's rolled for v{}",
+                "its {} is not the published commit's window assembled and rolled for v{}",
                 changelog::CHANGELOG_FILE,
                 plan.version
             ),
         });
     }
-    let moved = rev_trimmed(git, &["diff", "--name-only", plan.source, &reserved.commit])?;
-    let stray: Vec<&str> = moved
-        .lines()
-        .filter(|path| *path != changelog::CHANGELOG_FILE && *path != LEDGER_FILE)
-        .collect();
-    if !stray.is_empty() {
-        return refuse(format!("it moves {stray:?} against the published commit"));
+    let removals = changelog::release_removals(&window, plan.version);
+    let tree = tree_with(
+        git,
+        plan.source,
+        &[
+            (changelog::CHANGELOG_FILE, &expected),
+            (LEDGER_FILE, &expected_ledger),
+        ],
+        &pairs(&removals),
+    )?;
+    if tree
+        != rev_trimmed(
+            git,
+            &["rev-parse", &format!("{}^{{tree}}", reserved.commit)],
+        )?
+    {
+        let moved = rev_trimmed(
+            git,
+            &[
+                "diff",
+                "--name-status",
+                "--no-renames",
+                plan.source,
+                &reserved.commit,
+            ],
+        )?;
+        return refuse(format!(
+            "its tree is not the published commit's with the ledger line and the changelog roll, \
+             less the {} entry files that roll shipped; against the published commit it \
+             moves:\n{moved}",
+            removals.len()
+        ));
     }
-    Ok((source_ledger, source_changelog))
+    Ok((source_ledger, window))
 }
 
-/// A commit made from git objects alone, with no worktree or index: `base`'s root tree with each top-level `files` entry's bytes replaced (each must already be a blob there), committed with `parents` and `message` under the repository's configured identity.
+/// The release the release commit's harness announcement counts from, read back from its
+/// `## [version]` section like its date, so a claim checks the announcement the reservation
+/// derived: the plan's base where the section names it, else that release's local tag (an
+/// older public release, never a newer one); the plan's base where the section has none.
+fn announced_base(
+    git: &dyn GitRunner,
+    plan: &ClaimPlan<'_>,
+    released: &str,
+) -> Result<Option<(String, String)>> {
+    let owned = plan
+        .harness_base
+        .map(|(r, c)| (r.to_string(), c.to_string()));
+    let Some(anchor) = crate::harness_versions::announcement_anchor(released, plan.version)? else {
+        return Ok(owned);
+    };
+    if plan.harness_base.is_some_and(|(r, _)| r == anchor) {
+        return Ok(owned);
+    }
+    if let Some((base, _)) = plan.harness_base
+        && crate::gates::version_triple(&anchor) > crate::gates::version_triple(base)
+    {
+        return Err(Error::new(format!(
+            "its harness announcement counts from v{anchor}, newer than the window's v{base}"
+        )));
+    }
+    let commit = git_read_ok(
+        git,
+        &[
+            "--no-lazy-fetch",
+            "--no-replace-objects",
+            "rev-parse",
+            "--verify",
+            &format!("refs/tags/v{anchor}^{{commit}}"),
+        ],
+    )
+    .map_err(|e| {
+        Error::new(format!(
+            "its harness announcement counts from v{anchor}, whose tag this clone cannot \
+             resolve: {e}"
+        ))
+    })?
+    .stdout_utf8()
+    .trim()
+    .to_string();
+    Ok(Some((anchor, commit)))
+}
+
+/// A commit made from git objects alone, with no worktree or index: [`tree_with`]'s tree,
+/// committed with `parents` and `message` under the repository's configured identity.
+///
 /// # Errors
-/// A `base` with no such top-level blob, and any git failure.
+/// As [`tree_with`], and any git failure.
 pub fn commit_with(
     git: &dyn GitRunner,
     base: &str,
     files: &[(&str, &str)],
+    removes: &[(&str, &str)],
     parents: &[&str],
     message: &str,
 ) -> Result<String> {
-    let listed = git_ok(git, &["ls-tree", "-z", &format!("{base}^{{tree}}")])?.stdout;
-    let mut entries: Vec<std::borrow::Cow<'_, [u8]>> = listed
-        .split(|b| *b == 0)
-        .filter(|e| !e.is_empty())
-        .map(std::borrow::Cow::Borrowed)
-        .collect();
+    let tree = tree_with(git, base, files, removes)?;
+    let mut args = vec!["commit-tree", tree.as_str()];
+    for parent in parents {
+        args.extend(["-p", parent]);
+    }
+    args.extend(["-m", message]);
+    rev_trimmed(git, &args)
+}
+
+/// `base`'s root tree with each `files` entry's bytes replaced (a repository path, which must
+/// already be a regular blob there) and each `removes` path deleted, which must be a blob of
+/// exactly that id; a directory a removal empties goes with it, as git records no empty
+/// directory.
+///
+/// # Errors
+/// A `base` with no such regular blob, a removal whose path is not a blob of its id, and any
+/// git failure.
+pub fn tree_with(
+    git: &dyn GitRunner,
+    base: &str,
+    files: &[(&str, &str)],
+    removes: &[(&str, &str)],
+) -> Result<String> {
+    let mut written = Vec::with_capacity(files.len());
     for (name, text) in files {
         let path = format!("--path={name}");
         let hash = ["hash-object", "-w", "--stdin", path.as_str()];
@@ -968,39 +1176,145 @@ pub fn commit_with(
                 blob.stderr_utf8().trim()
             )));
         }
-        let blob_out = blob.stdout_utf8();
-        let blob = blob_out.trim();
-        let at = entries
-            .iter()
-            .position(|e| {
-                e.starts_with(b"100644 blob ")
-                    && e.split(|b| *b == b'\t').nth(1) == Some(name.as_bytes())
-            })
-            .ok_or_else(|| {
-                Error::new(format!("{base} holds no top-level file {name} to replace"))
-            })?;
-        entries[at] = std::borrow::Cow::Owned(format!("100644 blob {blob}\t{name}").into_bytes());
+        written.push((*name, blob.stdout_utf8().trim().to_string()));
     }
-    let mut listing = Vec::with_capacity(listed.len() + files.len() * 64);
+    let blobs: Vec<(Vec<&str>, &str)> = written
+        .iter()
+        .map(|(path, oid)| (path.split('/').collect(), oid.as_str()))
+        .collect();
+    let removes: Vec<(Vec<&str>, &str)> = removes
+        .iter()
+        .map(|(path, oid)| (path.split('/').collect(), *oid))
+        .collect();
+    edit_tree(git, &format!("{base}^{{tree}}"), "", &blobs, &removes)?
+        .map_or_else(|| empty_tree(git), Ok)
+}
+
+/// One level of [`tree_with`]: `tree` (at `prefix`) with `blobs` (path components below this
+/// level, with each new blob's id) replacing its files and `removes` (likewise, with each
+/// blob's id) deleted; `None` once nothing is left.
+fn edit_tree(
+    git: &dyn GitRunner,
+    tree: &str,
+    prefix: &str,
+    blobs: &[(Vec<&str>, &str)],
+    removes: &[(Vec<&str>, &str)],
+) -> Result<Option<String>> {
+    let listed = git_ok(git, &["ls-tree", "-z", tree])?.stdout;
+    let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut replaced = vec![false; blobs.len()];
+    let mut removed = vec![false; removes.len()];
+    for record in listed.split(|b| *b == 0).filter(|e| !e.is_empty()) {
+        let (meta, name) = std::str::from_utf8(record)
+            .ok()
+            .and_then(|r| r.split_once('\t'))
+            .ok_or_else(|| Error::new(format!("{tree}: an unreadable tree entry")))?;
+        let fields: Vec<&str> = meta.split_whitespace().collect();
+        let here = format!("{prefix}{name}");
+        if let Some(i) = blobs
+            .iter()
+            .position(|(path, _)| path.len() == 1 && path[0] == name)
+        {
+            if !meta.starts_with("100644 blob ") {
+                return Err(Error::new(format!(
+                    "{tree} holds no regular file {here} to replace"
+                )));
+            }
+            replaced[i] = true;
+            entries.push(format!("100644 blob {}\t{name}", blobs[i].1).into_bytes());
+            continue;
+        }
+        let gone: Vec<usize> = (0..removes.len())
+            .filter(|i| removes[*i].0.len() == 1 && removes[*i].0[0] == name)
+            .collect();
+        if let Some(&i) = gone.first() {
+            if gone.len() > 1
+                || !matches!(fields.as_slice(), [_, "blob", oid] if *oid == removes[i].1)
+            {
+                return Err(Error::new(format!(
+                    "{here} is not the blob {} the release removes",
+                    removes[i].1
+                )));
+            }
+            removed[i] = true;
+            continue;
+        }
+        let below: Vec<usize> = (0..removes.len())
+            .filter(|i| removes[*i].0.len() > 1 && removes[*i].0[0] == name)
+            .collect();
+        let inside: Vec<usize> = (0..blobs.len())
+            .filter(|i| blobs[*i].0.len() > 1 && blobs[*i].0[0] == name)
+            .collect();
+        if below.is_empty() && inside.is_empty() {
+            entries.push(record.to_vec());
+            continue;
+        }
+        let [_, "tree", oid] = fields.as_slice() else {
+            return Err(Error::new(format!(
+                "{here} is not the directory the release {}",
+                if inside.is_empty() {
+                    "removes files from"
+                } else {
+                    "replaces a file in"
+                }
+            )));
+        };
+        let deeper: Vec<(Vec<&str>, &str)> = below
+            .iter()
+            .map(|i| (removes[*i].0[1..].to_vec(), removes[*i].1))
+            .collect();
+        let nested: Vec<(Vec<&str>, &str)> = inside
+            .iter()
+            .map(|i| (blobs[*i].0[1..].to_vec(), blobs[*i].1))
+            .collect();
+        let child = edit_tree(git, oid, &format!("{here}/"), &nested, &deeper)?;
+        for i in below {
+            removed[i] = true;
+        }
+        for i in inside {
+            replaced[i] = true;
+        }
+        if let Some(child) = child {
+            entries.push(format!("040000 tree {child}\t{name}").into_bytes());
+        }
+    }
+    if let Some(i) = replaced.iter().position(|done| !done) {
+        return Err(Error::new(format!(
+            "{tree} holds no file {prefix}{} to replace",
+            blobs[i].0.join("/")
+        )));
+    }
+    if let Some(i) = removed.iter().position(|done| !done) {
+        return Err(Error::new(format!(
+            "{prefix}{} is not there for the release to remove",
+            removes[i].0.join("/")
+        )));
+    }
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut listing = Vec::with_capacity(listed.len());
     for entry in &entries {
         listing.extend_from_slice(entry);
         listing.push(0);
     }
-    let tree = git.git_input(&["mktree", "-z"], &listing)?;
-    if !tree.success() {
+    let made = git.git_input(&["mktree", "-z"], &listing)?;
+    if !made.success() {
         return Err(Error::new(format!(
             "git mktree failed (exit {}): {}",
-            tree.status,
-            tree.stderr_utf8().trim()
+            made.status,
+            made.stderr_utf8().trim()
         )));
     }
-    let tree = tree.stdout_utf8().trim().to_string();
-    let mut args = vec!["commit-tree", tree.as_str()];
-    for parent in parents {
-        args.extend(["-p", parent]);
+    Ok(Some(made.stdout_utf8().trim().to_string()))
+}
+
+fn empty_tree(git: &dyn GitRunner) -> Result<String> {
+    let made = git.git_input(&["mktree", "-z"], b"")?;
+    if !made.success() {
+        return Err(Error::new("git mktree of the empty tree failed"));
     }
-    args.extend(["-m", message]);
-    rev_trimmed(git, &args)
+    Ok(made.stdout_utf8().trim().to_string())
 }
 
 fn rev_trimmed(git: &dyn GitRunner, args: &[&str]) -> Result<String> {

@@ -324,7 +324,7 @@ impl Scratch {
 /// A scratch dropped while its test is failing (its thread unwinding) is kept, and its path said
 /// on stderr. A run cut off (a hang detector, or install.sh's own bound) may have left macOS still
 /// checking a program's first start in it, and macOS 27.0.1's syspolicyd crashes when the file it
-/// is checking at a first exec is removed, stranding every later exec until a restart
+/// is checking at a first exec is removed, stranding every exec then waiting on it
 /// (install.sh's `showed_it_ran`): a program that has not shown it ran stays where it is. Only a
 /// failing test keeps its scratch, so a test that lays a program install.sh's bound may cut off
 /// with no change to what it checks fails unless the program wrote a line as it ran

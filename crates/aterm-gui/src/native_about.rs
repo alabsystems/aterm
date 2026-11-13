@@ -159,10 +159,7 @@ impl NativeAppModel for AboutApp {
                 let Some(uri) = crate::about::site_url(&self.about) else {
                     return EventResult::Bubble;
                 };
-                let operation = cx.open_external(ExternalOpenRequest {
-                    uri,
-                    user_initiated: true,
-                });
+                let operation = cx.open_external(ExternalOpenRequest { uri });
                 view.pending = Some(Pending {
                     operation,
                     kind: PendingKind::Site,

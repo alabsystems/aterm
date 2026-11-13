@@ -30,7 +30,7 @@ pub fn observe(observer: impl Fn(&str) + Send + Sync + 'static) {
 /// The pipe, its nonblocking mode, or the resolver thread could not be created.
 pub fn start() -> Result<(), String> {
     SIGNAL_ORIGIN_START.get_or_init(|| {
-        let (mut read, write) = std::io::pipe().map_err(|e| e.to_string())?;
+        let (mut read, write) = crate::pipe().map_err(|e| e.to_string())?;
         // SAFETY: fcntl changes only this owned pipe's status flags.
         if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } < 0 {
             return Err(io::Error::last_os_error().to_string());

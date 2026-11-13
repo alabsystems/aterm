@@ -899,3 +899,38 @@ fn only_the_files_a_cut_of_head_writes_can_clear_a_hit() {
     write("untracked.bin", b"\0new");
     assert_eq!(committed(root, &path).expect("lists"), ["kept.bin"]);
 }
+
+#[test]
+fn export_scan_consumes_the_pinned_baseline_after_the_named_engine_moves() {
+    let (_dir, mut ctx) = checkout("// a fixture\n// wombatword\n");
+    let engine = std::path::PathBuf::from(ctx.env.publication_engine.clone().unwrap());
+    let head = || {
+        let output = crate::changed::git(&engine, &ctx.path_env)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    let selected = head();
+    ctx.env.publication_engine_git_dir = Some(engine.join(".git").into_os_string());
+    ctx.env.publication_engine_commit = Some(selected.into());
+    std::fs::write(
+        engine.join(rows::BASELINE),
+        "# Paths\nquokkaword\nwombatword\n",
+    )
+    .unwrap();
+    git(&engine, &["commit", "-q", "-am", "new policy"]);
+    let (_, pinned, _) = verdict(&ctx, Err("fixture scanner unavailable".into()));
+    assert!(!pinned.contains(&"crates/x/src/lib.rs:2".to_string()));
+    ctx.env.publication_engine_commit = Some(head().into());
+    let (_, successor, _) = verdict(&ctx, Err("fixture scanner unavailable".into()));
+    assert!(successor.contains(&"crates/x/src/lib.rs:2".to_string()));
+    ctx.env.publication_engine_commit = None;
+    let (_, _, refused) = verdict(&ctx, Err("fixture scanner unavailable".into()));
+    assert!(
+        shown(&refused).contains("publication engine pin requires"),
+        "{}",
+        shown(&refused)
+    );
+}

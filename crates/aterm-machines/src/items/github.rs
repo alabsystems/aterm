@@ -333,7 +333,7 @@ pub(crate) fn need_native_git() -> &'static str {
 
 /// [`need_native_git`] for a test of code that reads a clone only where git cannot fetch an
 /// object lazily, through `--no-lazy-fetch` or, where git refuses the option, the
-/// `GIT_NO_LAZY_FETCH` it was seen to obey ([`crate::checkout::NoLazyFetch::of`], as the code
+/// `GIT_NO_LAZY_FETCH` it was seen to obey ([`crate::checkout::lazy_fetch::of`], as the code
 /// asks): how this host's native git does, or COULD NOT RUN where it does neither (a git before
 /// 2.39.4 without the May 2024 security fixes).
 ///
@@ -345,7 +345,7 @@ pub(crate) fn need_native_git() -> &'static str {
 pub(crate) fn need_native_git_barring_lazy_fetch() -> crate::checkout::NoLazyFetch {
     let git = need_native_git();
     let live = crate::port::Live::new();
-    let off = crate::checkout::NoLazyFetch::of_git(&live, &|| crate::port::Cmd::new(git))
+    let off = crate::checkout::lazy_fetch::of_git(&live, crate::port::Cmd::new(git))
         .unwrap_or_else(|why| panic!("{git}: {why}"));
     off.unwrap_or_else(|| {
         let version = live
@@ -353,7 +353,7 @@ pub(crate) fn need_native_git_barring_lazy_fetch() -> crate::checkout::NoLazyFet
             .map_or_else(|_| String::new(), |ran| ran.out());
         aterm_uds::host::could_not_run(format!(
             "{git} ({}) neither takes --no-lazy-fetch nor obeys GIT_NO_LAZY_FETCH, one of \
-             which this code needs (git 2.44 has both, the 2.39.4 security release the variable)",
+             which this code needs (git 2.45 has both, the 2.39.4 security release the variable)",
             version.trim()
         ))
     })

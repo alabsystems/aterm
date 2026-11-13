@@ -3,21 +3,32 @@
 
 //! Lineage receipt switch tests over local bare git origins.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use atpkg_publish::artifact::lineage_switch::{self, Switch};
-use atpkg_publish::ctx::Ctx;
+use atpkg_publish::ctx::{Ctx, HostChoice, STAGING_OWNER};
 use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::testkit::Keys;
 
 use super::fixture::{
-    DORMANT_LEDGER, MINTED_LEDGER, git, push_from_elsewhere, scratch, trust_repo,
+    DORMANT_LEDGER, MINTED_LEDGER, git, push_from_elsewhere, scratch, trust_checkout,
 };
 
+/// The `gh` arm's context, said outright: every test here reads the switch through the
+/// checkout's own `origin` (`git ls-remote` and the quarantined fetch), which only
+/// `HostChoice::Gh` keeps. The native arm's reading is `pack`'s, `bundle`'s and `sign`'s, over
+/// the trust fixture's clone source.
 fn ctx(home: &Path) -> Ctx {
-    Keys::mint("m3", &[]).ctx(home, Arc::new(FakeHost::new()))
+    Keys::mint("m3", &[])
+        .ctx(home, Arc::new(FakeHost::new()))
+        .with_host_choice(HostChoice::Gh)
+}
+
+/// A trust checkout at `dir` with `ledger` on its origin's main; the origin.
+fn trust_repo(dir: &Path, ledger: &str) -> PathBuf {
+    trust_checkout(dir, ledger, STAGING_OWNER)
 }
 
 fn read(home: &Path, repo: &Path) -> Switch {

@@ -198,6 +198,16 @@ fn look_at(
             return out;
         }
     };
+    // The aged wall's move is the live conversation's alone: a record another conversation left in
+    // the tab (its agent exited and a new one started there) opens no door ([`wall_due`]).
+    if let Some(live) = session.as_deref() {
+        for (name, mut st) in tab_records(opts, tab) {
+            if st.wall_move && st.tab == tab && name != live {
+                st.wall_move = false;
+                save_at(opts, &name, &st, now);
+            }
+        }
+    }
     let mut moved = false;
     for (name, before) in owed {
         let Ok(Some(mut st)) = load_record(opts, &name) else {
@@ -227,7 +237,11 @@ fn look_at(
             continue;
         }
         let rearmed = changed.iter().any(|w| w.starts_with("rearmed:"));
-        if ours && st.held_past_go(&r.step) {
+        // The move past an outlasted wall is noted however the last wet step went: the loop offers
+        // a point at the wall only for a look that says so ([`wall_due`]), so the word a refused
+        // restart left would hold the session there for good.
+        let wall_move = ours && super::wall_step(&r.step);
+        if ours && st.held_past_go(&r.step) && !wall_move {
             out.wait.clone_from(&st.wait);
         } else if ours && !out.wait.is_empty() && (rearmed || !r.step.starts_with("would-rearm:")) {
             st.note_wait(&out.wait, now);
@@ -236,6 +250,7 @@ fn look_at(
                 st.held_by.clear();
             }
         }
+        st.wall_move = wall_move;
         if let Some(tail) = tail
             .as_deref()
             .filter(|_| ours && reads_transcript(st.agent))
@@ -282,6 +297,35 @@ pub(super) fn look_word(step: &str, claude: bool, status: impl FnOnce() -> Strin
         || upgrade::NEXT_POINT.to_string(),
         |(_, held)| held.to_string(),
     )
+}
+
+/// Whether tab `tab`'s upgrade record says its round's last look found the move held only by the
+/// loop's guard at a wall (`crate::supervise::IdleHost::upgrade_wall_due`): a pending or announced
+/// round of Claude Code's whose look would move it past a wall that outlasted its bound at the
+/// loop's next point ([`upgrade::NEXT_POINT`], `St::wall_move`: a login wall or a usage limit
+/// nobody lifted, `upgrade::walls_outlasted`) while the loop withheld its points for a wall
+/// ([`walls_guard`]). A look that found any other move (a limit the reducer reads as lifted, an
+/// announcement) opens nothing, and the step the loop offers looks again before it moves. The mark
+/// is the tab's live conversation's: each look clears one another conversation left in the tab.
+#[must_use]
+pub fn wall_due(opts: &Opts, tab: &str) -> bool {
+    tab_records(opts, tab).iter().any(|(_, st)| {
+        matches!(st.phase, Phase::Pending | Phase::Announced { .. })
+            && st.agent.walls_age()
+            && st.wait == upgrade::NEXT_POINT
+            && st.wall_move
+            && walls_guard(&st.guard)
+    })
+}
+
+/// Whether the loop's guard `word` ([`crate::supervise::Guard::word`]) withholds its points for a
+/// wall: its `wall` guard, a usage limit's episode, or the limit's own notice, which the loop
+/// reads as no idle point until the carry passes it.
+fn walls_guard(word: &str) -> bool {
+    use crate::supervise::Guard;
+    [Guard::Wall, Guard::LimitEpisode, Guard::NotIdle]
+        .iter()
+        .any(|guard| guard.word() == word)
 }
 
 fn tab_records(opts: &Opts, tab: &str) -> Vec<(String, St)> {

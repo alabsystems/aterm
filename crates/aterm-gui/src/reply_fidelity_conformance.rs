@@ -50,6 +50,7 @@ fn host() -> Host {
     std::fs::write(dir.path().join("host.sock.token"), "abcd\n").expect("the host's token");
     let listener = aterm_uds::CtlListener::bind(&path).expect("bind host");
     let (tx, read) = mpsc::channel();
+    let gone = path.clone();
     let thread = std::thread::spawn(move || {
         let (mut conn, _) = aterm_uds::accept(
             &listener,
@@ -66,6 +67,8 @@ fn host() -> Host {
         let _ = reader.read_line(&mut line);
         let _ = tx.send(line);
         let _ = conn.write_all(b"OK\n");
+        // This host is done, and a relay looks at its path once the connection ends.
+        crate::test_socket::leave_no_listener(&gone);
         let _ = conn.shutdown(std::net::Shutdown::Both);
     });
     Host {

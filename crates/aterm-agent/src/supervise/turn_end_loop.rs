@@ -9,12 +9,13 @@ use super::super::policy::notice;
 use super::super::policy::sleeps::InTurn;
 use super::super::policy::trace::{Outcome as TraceOutcome, TraceStep};
 use super::super::policy::turn_end::{
-    ANSWERS_OFF, AccountAnswer, AccountAt, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD, Composer,
-    ComposerRead, Conversation, CreditsCarry, GoAheadVerdict, LOGIN_SHARED_LOOK, ProbeGate,
-    RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_USAGE_PROBE, RecordTurn,
-    Restart, RestartAnswer, RestartAsk, RestartClaim, RouteTo, TRY_ANSWER_SLACK, WAKE_KEPT,
-    account_hold, act_turn_work, budget_frees, conversation_mark, decide_turn_end,
-    decide_turn_end_traced, done_row_work, is_wait_resume, outage_of, reads_conversation,
+    ANSWERS_OFF, AccountAnswer, AccountAt, BackBy, CREDITS_HOLD_MODEL_TOLD, CREDITS_HOLD_TOLD,
+    Composer, ComposerRead, Conversation, CreditsCarry, GoAheadVerdict, LOGIN_SHARED_LOOK,
+    ProbeGate, RULE_ACCOUNT, RULE_INPUT_LOST, RULE_LAND, RULE_LEFT, RULE_LOGIN, RULE_MODEL_RESTORE,
+    RULE_USAGE_PROBE, RecordTurn, Restart, RestartAnswer, RestartAsk, RestartClaim, RouteTo,
+    Sampled, TRY_ANSWER_SLACK, WAKE_KEPT, account_hold, act_turn_work, budget_frees,
+    conversation_mark, decide_turn_end, decide_turn_end_traced, done_row_work, is_wait_resume,
+    outage_of, reads_conversation,
 };
 use super::super::tap_clock::{TapClock, TapSays, Timed, UsageWindow, timed};
 use super::wall_confirm::{Check, LeftRead};
@@ -24,7 +25,8 @@ use crate::harness::acts::TaskFace;
 use crate::harness::profile::AccountKey;
 use crate::harness::upgrade_drive::HAND_RENEW;
 use crate::harness::usage::{
-    PanelRead, PanelWindow, USAGE_COMMAND, panel_sample_local, usage_panel_read,
+    FABLE_WEEK_WINDOW, PanelRead, PanelWindow, USAGE_COMMAND, panel_sample_local,
+    panel_window_local, usage_panel_read,
 };
 use crate::supervise::custody::{self, CustodyGate, LeftStands};
 #[cfg(test)]
@@ -92,7 +94,10 @@ fn draft_holds(composer: &Composer, action: &TurnEndAction) -> bool {
 /// Whether executing `action` drives the agent: what an observed agent's turn end withholds
 /// ([`Session::observing`]). A restart drives it too: the host ends the process, types its
 /// relaunch line into the tab and its continuation into the new process, through its own
-/// connection rather than [`Session::call`]'s gate, so an observed agent is never restarted.
+/// connection, as the relaunch lane the server's observe gate exempts. Withheld here, as the
+/// stall remedy's and the memory ceiling's restarts are before they send theirs
+/// ([`super::observe::RESTART_WITHHELD`]) and [`Session::call`]'s gate refuses any `restart`
+/// or `signal` ([`super::observe::drives_agent`]), an observed agent is never restarted.
 const fn types_input(action: &TurnEndAction) -> bool {
     match action {
         TurnEndAction::Type { .. }
@@ -894,6 +899,9 @@ impl<C: Ctl> Session<'_, C> {
             to: open.to,
             launch: open.launch,
             back_at: open.back_at_unix.map(|unix| self.instant_of(unix)),
+            back_by: open.back_at_unix.map(|_| BackBy::Notice),
+            sample_at: None,
+            samples: 0,
             proc: open.proc,
             unproven: false,
         }
@@ -2167,6 +2175,7 @@ impl<C: Ctl> Session<'_, C> {
         if check == Check::Decide {
             reading.repo = self.repo_read(&reading, host, worked.is_some());
             reading.leftover = self.left_read(&reading, host, worked.is_some());
+            reading.credentials = self.credentials_read(&reading, host, worked.is_some());
         }
         if check == Check::Decide
             && !self.left_keys.is_empty()
@@ -2229,6 +2238,16 @@ impl<C: Ctl> Session<'_, C> {
             && let Some(h) = host
         {
             reading.launch_model = h.launch_model();
+            // The account's record of Fable's week, read where a move can be made: it times the
+            // return of a move whose notice names no reset (`TurnEndState::fable_recorded`).
+            let recorded = reading
+                .launch_model
+                .admits_fallback()
+                .then(|| h.fable_week())
+                .flatten()
+                .and_then(|w| w.reset)
+                .map(|unix| self.instant_of(unix));
+            self.turn_end.fable_recorded(recorded);
         }
         if let Some(over) = measured {
             reading.wall = Some(aterm_phase::WallKind::Memory);
@@ -2710,6 +2729,47 @@ impl<C: Ctl> Session<'_, C> {
             }
         };
         self.left_seen = Some((mark, now, read.clone()));
+        read
+    }
+
+    /// HOW THE TURN'S CREDENTIAL LINES RESOLVE at this yield ([`IdleHost::credentials`],
+    /// [`TurnEndReading::credential_lines`]): asked only where the turn names one whose wants the
+    /// host resolves, and kept for the same words as the left rows are; not asked anywhere else,
+    /// nor where a tape recorded without the door replays.
+    fn credentials_read(
+        &mut self,
+        reading: &TurnEndReading,
+        host: Option<&Arc<dyn IdleHost>>,
+        worked: bool,
+    ) -> super::super::policy::credential_need::CredentialRead {
+        use super::super::policy::credential_need::{CredentialRead, host_wants};
+        let wants = host_wants(&reading.credential_lines());
+        if wants.is_empty() || self.fx.replay_lacks_host_door("host.credentials") {
+            return CredentialRead::NotAsked;
+        }
+        let Some(host) = host else {
+            return CredentialRead::NotAsked;
+        };
+        let mark = said_mark(reading.said_tail.as_deref());
+        let now = self.fx.mono();
+        if let Some((_, _, read)) = self.credentials_seen.as_ref().filter(|(m, at, _)| {
+            !worked && *m == mark && now.saturating_duration_since(*at) < REPO_REPROBE
+        }) {
+            return read.clone();
+        }
+        let read = loop {
+            if let Some(read) = host.credentials(wants.clone()) {
+                break read;
+            }
+            if self.stopped() {
+                // Stopped while the host worked: nothing it found is known.
+                return CredentialRead::NotAsked;
+            }
+            if self.metadata_context == claim::MetadataContext::Normal {
+                self.renew_claim_if_due();
+            }
+        };
+        self.credentials_seen = Some((mark, now, read.clone()));
         read
     }
 
@@ -4727,6 +4787,7 @@ impl<C: Ctl> Session<'_, C> {
         // `Session::left_read`), so what the agent ended or pushed in that turn holds nothing.
         self.repo_seen = None;
         self.left_seen = None;
+        self.credentials_seen = None;
         if let Some(fact) = &fact {
             self.fact_rode(fact, None, seq, review);
         }
@@ -5064,10 +5125,16 @@ impl<C: Ctl> Session<'_, C> {
                     (Some(m), _) => format!(
                         " (from {}, {}; session-only)",
                         m.from.as_deref().unwrap_or("the launch's model"),
-                        m.back_at.map_or_else(
-                            || "no return scheduled: the notice names no reset".to_string(),
-                            |at| format!("back at {}", self.stamp_in(at))
-                        )
+                        match (m.back_at, m.back_by) {
+                            (Some(at), Some(BackBy::Record)) => format!(
+                                "back at {}, the reset the account's record of Fable's week names",
+                                self.stamp_in(at)
+                            ),
+                            (Some(at), _) => format!("back at {}", self.stamp_in(at)),
+                            (None, _) => "the notice names no reset: the return waits on a \
+                                          /usage sample of Fable's week"
+                                .to_string(),
+                        }
                     ),
                     (
                         None,
@@ -6743,16 +6810,19 @@ const PROBE_READS: u32 = 2;
 /// Idle settle duration (ms) between consecutive `/usage` panel reads ([`Session::probe_pace`]).
 const PROBE_STILL_MS: &str = "50";
 
-/// Guard ensuring [`IdleHost::account_probed`] is called at most once for a claimed probe.
+/// Guard ensuring [`IdleHost::account_probed`] is called at most once for a claimed probe. A
+/// sample of Fable's week for a switch's return claims nothing (`claimed` false) and tells its
+/// host no read: what it read is the switch's ([`TurnEndState::model_sampled`]).
 struct Telling<'h> {
     host: &'h dyn IdleHost,
+    claimed: bool,
     told: bool,
     use_token: Option<crate::harness::provider_read::Use>,
 }
 
 impl Telling<'_> {
     fn tell(&mut self, read: Result<&Sample, ProbeMiss>) {
-        if !std::mem::replace(&mut self.told, true) {
+        if !std::mem::replace(&mut self.told, true) && self.claimed {
             self.host.account_probed(read);
         }
     }
@@ -6792,27 +6862,39 @@ impl<C: Ctl> Session<'_, C> {
         let Some(host) = opts.idle_host.clone() else {
             return Ok(Probed::No);
         };
-        if !self.probe_advised(&point.screen) {
+        let advised = self.probe_advised(&point.screen);
+        if !self.probe_due(&point.screen) {
             return Ok(Probed::No);
         }
         if let Some(gate) = self.probe_gates(point, decided, host.as_ref(), opts)? {
             self.probe_shut(point, gate, None, review)?;
             return Ok(Probed::No);
         }
-        let use_token = match host.account_probe() {
-            Ok(token) => token,
-            Err(why) => {
-                self.probe_shut(point, ProbeGate::Claim, Some(why.word()), review)?;
-                return Ok(Probed::No);
+        // The accounts probe claims its account's one read; a sample of Fable's week for a
+        // switch's return is the session's own and claims nothing.
+        let use_token = if advised {
+            match host.account_probe() {
+                Ok(token) => Some(token),
+                Err(why) => {
+                    self.probe_shut(point, ProbeGate::Claim, Some(why.word()), review)?;
+                    return Ok(Probed::No);
+                }
             }
+        } else {
+            None
         };
         self.probe_said = Some(self.review_key(point));
         let mut tell = Telling {
             host: host.as_ref(),
+            claimed: advised,
             told: false,
-            use_token: Some(use_token),
+            use_token,
         };
+        self.probe_fable = None;
         let done = self.probe_step(point, &mut tell, opts, review);
+        if let Some(read) = self.probe_fable.take() {
+            self.fable_sampled(point.screen.seq, read, review);
+        }
         if !tell.told {
             tell.tell(Err(ProbeMiss::Lost));
             review.note(&format!(
@@ -6822,6 +6904,61 @@ impl<C: Ctl> Session<'_, C> {
             ));
         }
         done
+    }
+
+    /// Whether a `/usage` probe is due at `screen`: the host advised one, or a model switch waits
+    /// on a sample of Fable's week ([`TurnEndState::model_sample_due`]).
+    fn probe_due(&self, screen: &Screen) -> bool {
+        self.probe_advised(screen) || self.turn_end.model_sample_due(self.fx.mono())
+    }
+
+    /// WHAT A `/usage` SAMPLE READ OF FABLE'S WEEK (`read`: the `Current week (Fable)` row's
+    /// percent and reset, unix seconds; `None`: no row, or no panel read once the `/usage` was
+    /// entered), told the switch that waited on it ([`TurnEndState::model_sampled`]) and
+    /// journaled with its evidence and what it scheduled: a record, never an alert.
+    fn fable_sampled(
+        &mut self,
+        seq: u64,
+        read: Option<(u32, Option<i64>)>,
+        review: &mut dyn Review,
+    ) {
+        let now = self.fx.mono();
+        let placed = read.map(|(pct, reset)| (pct, reset.map(|unix| self.instant_of(unix))));
+        let Some(said) = self.turn_end.model_sampled(placed, now) else {
+            return;
+        };
+        let row = match placed {
+            Some((pct, Some(reset))) => {
+                format!(
+                    "Current week (Fable) {pct}% used, resets {}",
+                    self.stamp_in(reset)
+                )
+            }
+            Some((pct, None)) => format!("Current week (Fable) {pct}% used, no reset read"),
+            None => "no Current week (Fable) row read".to_string(),
+        };
+        let then = match said {
+            Sampled::Room { at } if at <= now => {
+                "room left: the return to the launch's model is due at the next quiet moment"
+                    .to_string()
+            }
+            Sampled::Room { at } => format!(
+                "room left: the return is due at {}, a rung after the last return made on room left",
+                self.stamp_in(at)
+            ),
+            Sampled::Reset { at } => {
+                format!(
+                    "at its limit: the return is due at its reset, {}",
+                    self.stamp_in(at)
+                )
+            }
+            Sampled::Again { at } => {
+                format!("no return named: sampled again at {}", self.stamp_in(at))
+            }
+        };
+        review.note(&format!(
+            "NOTE seq={seq} rule={RULE_MODEL_RESTORE} {USAGE_COMMAND} {row}; {then}"
+        ));
     }
 
     /// Whether the host advised a `/usage` probe at `screen.seq` ([`Self::account_advise`]).
@@ -6841,7 +6978,7 @@ impl<C: Ctl> Session<'_, C> {
         host: Option<&str>,
         review: &mut dyn Review,
     ) -> Result<(), Fail> {
-        if !self.probe_advised(&point.screen) {
+        if !self.probe_due(&point.screen) {
             return Ok(());
         }
         let key = self.review_key(point);
@@ -7127,6 +7264,8 @@ impl<C: Ctl> Session<'_, C> {
                 if let Some(use_token) = tell.use_token.take() {
                     tell.host.account_probe_typed(use_token);
                 }
+                // Entered: a sample of Fable's week was taken, read or not.
+                self.probe_fable = Some(None);
                 (at, human)
             }
             ProbeTyped::Not {
@@ -7217,11 +7356,18 @@ impl<C: Ctl> Session<'_, C> {
                         let offset = self.local_offset_s(now);
                         let local = self.local_at(offset);
                         let zone = self.zone_lookup();
-                        break (
-                            panel_sample_local(&windows, now, &local, &zone)
-                                .ok_or(ProbeMiss::Unsettled),
-                            panel,
+                        let fable = panel_window_local(
+                            &windows,
+                            FABLE_WEEK_WINDOW,
+                            crate::harness::accounts::RESET_BELIEVED_S,
+                            now,
+                            &local,
+                            &zone,
                         );
+                        let sample = panel_sample_local(&windows, now, &local, &zone);
+                        drop((local, zone));
+                        self.probe_fable = Some(fable);
+                        break (sample.ok_or(ProbeMiss::Unsettled), panel);
                     }
                     prior = Some(windows);
                 }

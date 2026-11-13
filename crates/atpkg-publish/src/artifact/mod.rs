@@ -13,6 +13,7 @@ pub mod lineage_switch;
 pub mod pack;
 pub mod package;
 pub mod pkgdoc;
+pub mod qualify;
 mod relink;
 pub mod relocate;
 pub mod sign;

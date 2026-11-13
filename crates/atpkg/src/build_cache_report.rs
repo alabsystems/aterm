@@ -71,7 +71,7 @@ impl std::fmt::Display for KeepReason {
                     Some(false) => "former store build",
                     None => "unavailable",
                 };
-                let release = if observed.release_record {
+                let used = if observed.used_record {
                     "present"
                 } else {
                     "unavailable"
@@ -82,7 +82,7 @@ impl std::fmt::Display for KeepReason {
                      recognized survey entries only: incremental quiet/not-quiet/unknown \
                      {}/{}/{}, units {}/{}/{}; last build {compiler}, \
                      {}/{} profiles with post-switch compiler references, {} units without \
-                     compiler fingerprints; release record {release}, {} profiles naming used units",
+                     compiler fingerprints; used-units record {used}, {} profiles naming used units",
                     observed.incremental.quiet,
                     observed.incremental.not_quiet,
                     observed.incremental.unknown,

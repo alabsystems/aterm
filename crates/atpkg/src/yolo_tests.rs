@@ -33,7 +33,6 @@ fn every_row_spells_its_yolo_policy_in_full() {
     assert!(policy_of("kimi").after.is_empty());
     assert_eq!(policy_of("muse").after, &["exec", "resume"]);
     assert!(policy_of("muse").skip.contains(&"skills"));
-    assert_eq!(policy_of("gemini"), Policy::NONE);
     for row in crate::vendor_direct::VENDORS {
         let p = policy_of(row.program);
         assert!(!p.flags.is_empty(), "{}", row.program);

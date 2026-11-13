@@ -3,11 +3,13 @@
 
 //! Shared release-note structural rules, used before landing and before release.
 
-/// The changelog's repo-root-relative path: the one hand-written source of release notes.
+/// The changelog's repo-root-relative path: the notes each release writes into it from the entry
+/// files under `changes/` (aterm-verify's `changelog_fragments`), above the releases before.
 pub const CHANGELOG_FILE: &str = "CHANGELOG.md";
 
-/// The head of the line `ship harness-bump` (and `ship release --bump`'s version commit) writes
-/// under `[Unreleased]`: generated, so it never counts as a section's release notes.
+/// The head of the harness-versions announcement the release derives and writes into its own
+/// section (aterm-release's `harness_versions`): generated, so it never counts as a section's
+/// release notes.
 pub const HARNESS_ENTRY_HEAD: &str = "- **Harness versions since v";
 
 /// What the pre-claim gate learned about a section: `entries`, the count of top-level bullets in the real body, for the transcript only.
@@ -124,7 +126,8 @@ fn entry_above_every_section(text: &str) -> Option<usize> {
     None
 }
 
-/// Keep a Changelog's section order, shared with landing's entry placement.
+/// Keep a Changelog's section order, shared with the release's assembly of `[Unreleased]` from
+/// the entry files under `changes/<kind>/` (aterm-verify's `changelog_fragments`).
 pub const KINDS: [&str; 6] = [
     "Added",
     "Changed",

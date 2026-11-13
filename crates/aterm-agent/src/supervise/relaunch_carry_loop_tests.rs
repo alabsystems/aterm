@@ -359,7 +359,8 @@ fn a_relaunch_that_owes_no_carry_on_goes_on_at_the_loops_first_point() {
 #[test]
 fn a_held_carry_ons_short_reply_measures_the_back_off_from_the_reply() {
     use crate::supervise::policy::turn_end::{RULE_CONTINUE, RULE_DONE_CHECK};
-    const DONE: &str = "All tasks are complete and verified; nothing is left to do.";
+    const DONE: &str =
+        "All tasks are complete and verified; nothing is left to do.\n\nATERM-TASK-DONE";
     const HALF: &str = "The parser reads the first half.";
     const GOES_ON: &str = "Picked it up; the second half is next.";
     let at_rest = |said: &str| {

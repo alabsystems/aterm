@@ -191,9 +191,12 @@ fn the_sample_bootstrap_execs_the_sampled_head_image() {
         .args(["--exact", SAMPLE_EXEC_TEST_NAME, "--nocapture"])
         .env(SAMPLE_EXEC_TEST_MODE, "controller")
         .env(SAMPLE_EXEC_TEST_CANDIDATE, &candidate);
-    let output =
-        aterm_uds::deadline::output_until(&mut command, Instant::now() + Duration::from_secs(60))
-            .expect("the exec proof must finish before the hang detector");
+    let output = aterm_uds::deadline::output_while_process_progressing(
+        &mut command,
+        Duration::from_secs(60),
+        "the sampled head image exec proof",
+    )
+    .expect("the exec proof must finish before the hang detector");
     let text = format!(
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),

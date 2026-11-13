@@ -22,6 +22,18 @@ impl std::os::fd::AsFd for Multicast {
 /// Maximum discovery datagram, below an ordinary LAN MTU.
 pub const MAX_PACKET: usize = 1200;
 
+/// What one read of a discovery socket came to ([`Multicast::hear`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Heard {
+    /// Nothing waits in the socket.
+    Empty,
+    /// A datagram was read and dropped: oversized, or from a source this socket takes none
+    /// from. More may wait behind it.
+    Discarded,
+    /// One untrusted hint, and the address it came from.
+    Hint(Vec<u8>, SocketAddr),
+}
+
 /// A nonblocking one-hop IPv4 multicast socket. An attachment or socket policy
 /// change withdraws it permanently. Data still requires a checked Connection.
 pub struct Multicast {
@@ -140,13 +152,28 @@ impl Multicast {
     }
 
     /// Receive at most one untrusted hint. Oversized packets are discarded
-    /// without parsing or allocation beyond the fixed receive buffer.
+    /// without parsing or allocation beyond the fixed receive buffer. `None` is an empty socket
+    /// or a discarded datagram alike; a reader that drains the socket asks [`Self::hear`], which
+    /// tells them apart.
     pub fn receive(&self) -> io::Result<Option<(Vec<u8>, SocketAddr)>> {
+        Ok(match self.hear()? {
+            Heard::Hint(bytes, source) => Some((bytes, source)),
+            Heard::Empty | Heard::Discarded => None,
+        })
+    }
+
+    /// Read at most one datagram: an untrusted hint, a datagram dropped by this socket's checks
+    /// (oversized, or from a source it takes none from) without parsing or allocation beyond
+    /// the fixed receive buffer, or nothing where none waits.
+    ///
+    /// # Errors
+    /// The attachment was withdrawn or changed ([`Self::recheck`]), or the socket's error.
+    pub fn hear(&self) -> io::Result<Heard> {
         self.recheck()?;
         let mut bytes = [0; MAX_PACKET + 1];
         let (length, source) = match self.socket.recv_from(&mut bytes) {
             Ok(result) => result,
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(Heard::Empty),
             Err(error) => return Err(error),
         };
         self.recheck()?;
@@ -157,9 +184,9 @@ impl Multicast {
             })
             || (self.attachment.is_none() && !source.ip().is_loopback())
         {
-            return Ok(None);
+            return Ok(Heard::Discarded);
         }
-        Ok(Some((bytes[..length].to_vec(), source)))
+        Ok(Heard::Hint(bytes[..length].to_vec(), source))
     }
 }
 

@@ -60,11 +60,11 @@ fn overlap_model_at_proof_ready() -> (aterm_spec::derive::Model, aterm_spec::int
 
 #[test]
 fn a_rollback_resume_never_reattaches_an_exited_pane() {
+    use std::os::fd::AsRawFd as _;
     let mut app = App::headless_for_test();
-    let mut fds = [0i32; 2];
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let (read, write) = aterm_uds::pipe().expect("pipe");
     let id = *app.pool.sessions.keys().next().expect("fixture session");
-    app.pool.sessions.get_mut(&id).unwrap().session.master = fds[0];
+    app.pool.sessions.get_mut(&id).unwrap().session.master = read.as_raw_fd();
     assert!(
         !app.attach_deferred_readers(),
         "a parked live pane is matched for re-attach"
@@ -78,9 +78,7 @@ fn a_rollback_resume_never_reattaches_an_exited_pane() {
         "an exited pane is left without a reader"
     );
     app.pool.sessions.get_mut(&id).unwrap().session.master = -1;
-    for fd in fds {
-        aterm_pty::close_fd(fd);
-    }
+    drop((read, write));
 }
 
 #[test]
@@ -260,34 +258,21 @@ fn arm_incoming_proof(
     app: &mut App,
     nonce: &str,
 ) -> (
-    std::fs::File,
-    std::fs::File,
+    std::io::PipeReader,
+    std::io::PipeWriter,
     crate::spawn::DeferredReaderGate,
 ) {
-    use std::os::fd::FromRawFd as _;
-    let (mut ready, mut commit) = ([0i32; 2], [0i32; 2]);
-    // SAFETY: both arrays provide pipe(2)'s two writable descriptor slots.
-    assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "ready pipe");
-    assert_eq!(unsafe { libc::pipe(commit.as_mut_ptr()) }, 0, "commit pipe");
-    for fd in ready.into_iter().chain(commit) {
-        aterm_pty::set_cloexec(fd, true).expect("close-on-exec");
-    }
-    // SAFETY: these four newly created descriptors have one owner each.
-    let (ready_read, ready_write, commit_read, commit_write) = unsafe {
-        (
-            std::fs::File::from_raw_fd(ready[0]),
-            std::os::fd::OwnedFd::from_raw_fd(ready[1]),
-            std::os::fd::OwnedFd::from_raw_fd(commit[0]),
-            std::fs::File::from_raw_fd(commit[1]),
-        )
-    };
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
     app.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
-        ready_write,
+        ready_write.into(),
         nonce,
         [7; 32],
         [8; 32],
     ));
-    app.handoff_commit = Some(crate::seamless::CommitReceiver::for_test(commit_read));
+    app.handoff_commit = Some(crate::seamless::CommitReceiver::for_test(
+        commit_read.into(),
+    ));
     let gate = crate::spawn::DeferredReaderGate::closed();
     app.handoff_reader_gate = Some(gate.clone());
     (ready_read, commit_write, gate)

@@ -40,8 +40,9 @@ pub enum GuardedItem {
     LaunchdBootstrap,
     /// An admitted harness native mutation (an image move, a fixed child restart, a Codex exec
     /// handoff or its cancellation's settlement, an account claim, fence or closure), through its
-    /// kernel outcome and the durable record of it. A signalled restart past its deadline, which
-    /// can start nothing more, stops holding it.
+    /// kernel outcome and the durable record of it, or until it can start nothing more: a
+    /// signalled restart past its deadline, or an image move whose actor is gone, stops holding
+    /// it, and a record it still makes takes a fresh hold.
     HarnessNativeMutation,
 }
 

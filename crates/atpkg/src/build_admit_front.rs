@@ -24,7 +24,7 @@
 //! default, so the build starts with its own. One front at a time arms a process's dispositions
 //! ([`crate::platform::FORWARDING_TURN`]), and [`Front::disarm`] puts back what it found.
 
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread::JoinHandle;
@@ -199,30 +199,6 @@ fn install(sig: libc::c_int, handler: extern "C" fn(libc::c_int)) -> Option<libc
     }
 }
 
-/// A non-blocking pipe, both ends close-on-exec: its read end and write end.
-fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
-    aterm_uds::kept_out(|| {
-        let mut fds = [0; 2];
-        // SAFETY: `pipe` writes two descriptors into the two-element array.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: both descriptors are this process's own, each owned once here.
-        let (read, write) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-        for fd in [read.as_raw_fd(), write.as_raw_fd()] {
-            // SAFETY: `fcntl` on a descriptor this function owns, with plain integers.
-            if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        // SAFETY: as above.
-        if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok((read, write))
-    })
-}
-
 /// The byte [`Front::disarm`] writes to end the forwarding thread: no signal's number.
 const STOP: u8 = 0;
 
@@ -295,7 +271,13 @@ impl Front {
         let turn = crate::platform::FORWARDING_TURN
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let (read, write) = pipe().ok()?;
+        let (read, write) = aterm_uds::pipe().ok()?;
+        let (read, write) = (OwnedFd::from(read), OwnedFd::from(write));
+        // A handler never waits on a full pipe: its write end is non-blocking.
+        // SAFETY: `fcntl` on a descriptor this function owns, with plain integers.
+        if unsafe { libc::fcntl(write.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) } != 0 {
+            return None;
+        }
         let shared = Arc::new(Shared {
             observed: AtomicI32::new(0),
             aim: Mutex::new(Aim::Arming),

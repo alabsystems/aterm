@@ -33,6 +33,11 @@ path = "tests/land_lifetime.rs"
 harness = false
 
 [[test]]
+name = "land_watchers"
+path = "tests/land_watchers.rs"
+harness = false
+
+[[test]]
 name = "remote_lifetime"
 path = "tests/remote_lifetime.rs"
 harness = false
@@ -60,6 +65,7 @@ harness = false
 # stops this CLI from building until it is fixed: the price of running the
 # walks in-process rather than as children of a second build.
 [dependencies]
+aterm-land = { workspace = true }
 # aterm-cores: the cores a pool here may use (`available_parallelism`, bounded by a test's grant).
 aterm-cores = { workspace = true }
 # `verify census` (the census and its guards): the walks themselves; `verify

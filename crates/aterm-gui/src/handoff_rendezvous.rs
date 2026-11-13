@@ -1482,6 +1482,17 @@ impl ClaimedHandoff {
         self.parked_for
     }
 
+    /// Tell a parent that reads progress reports (`seamless::parent_reads_progress`) that the
+    /// grant landed: its first report, written before intake arms the channel for the rest and
+    /// the one that starts its silence clock before intake. Nothing is written to a parent that
+    /// did not offer to read reports, for which the proof is the only frame. Whether a report
+    /// was written.
+    pub(crate) fn report_claim(&self, env: &crate::handoff_env::HandoffEnv) -> bool {
+        use std::os::fd::AsFd as _;
+        crate::seamless::parent_reads_progress(env)
+            && crate::handoff_progress::report_once(self.ready.as_fd(), "claimed")
+    }
+
     /// Converts this handoff into a [`ClaimedIntake`] ready for intake installation.
     #[must_use]
     pub(crate) fn into_intake(self) -> ClaimedIntake {

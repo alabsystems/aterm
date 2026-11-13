@@ -237,6 +237,7 @@ fn event_and_sample(
         exe_sha256: Some("ab".repeat(32)),
         content_key: Some("cd".repeat(32)),
         reason: None,
+        parts: crate::test_content::KeyParts::new(),
     };
     let (_, line, sample) = binary_event(binary, &ran, started, Some(&evidence), false);
     let event: aterm_json::Value =

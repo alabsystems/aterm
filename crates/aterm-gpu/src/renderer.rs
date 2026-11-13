@@ -5209,11 +5209,6 @@ impl GpuRenderer {
         self.raster_changed(|cpu| cpu.set_font_hinting(mode));
     }
 
-    /// Record the Linux subpixel-RGB mode (`font_subpixel`) on the wrapped CPU face.
-    pub fn set_font_subpixel(&mut self, mode: &str) {
-        let _ = self.cpu.set_font_subpixel(mode);
-    }
-
     /// Replace the theme live on the GPU state and the CPU face without a rebuild.
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme;

@@ -30,7 +30,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-use sha2::{Digest as _, Sha256};
+use sha2::{Digest as _, NativeSha256};
 
 use crate::private::{identity, stamp};
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -117,9 +117,21 @@ pub struct HeldProgram {
 
 mod system_command;
 pub use system_command::HeldSystemCommand;
+mod target_sysroot;
+pub use target_sysroot::{HeldRustTargetSysroot, RustTargetSysrootPlan};
+mod package_source;
+pub use package_source::{HeldPackageSource, PackageEntry, PackageSourcePlan};
+mod current_code;
+pub use current_code::{CURRENT_CODE_POLICY, HeldExecutingProgram};
+mod directory_input;
+pub use directory_input::HeldDirectoryInput;
 
 fn time(deadline: Instant) -> io::Result<()> {
-    if Instant::now() >= deadline { Err(io::ErrorKind::TimedOut.into()) } else { Ok(()) }
+    if Instant::now() >= deadline {
+        Err(io::ErrorKind::TimedOut.into())
+    } else {
+        Ok(())
+    }
 }
 
 fn canonical(path: &Path) -> io::Result<()> {
@@ -129,10 +141,14 @@ fn canonical(path: &Path) -> io::Result<()> {
     }
     let parts = path.components().collect::<Vec<_>>();
     if parts.len() > MAX_COMPONENTS
-        || parts.iter().any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
+        || parts
+            .iter()
+            .any(|part| !matches!(part, Component::RootDir | Component::Normal(_)))
         || path.as_os_str() != parts.iter().collect::<PathBuf>().as_os_str()
     {
-        return Err(refused("native input path is not canonical component syntax"));
+        return Err(refused(
+            "native input path is not canonical component syntax",
+        ));
     }
     Ok(())
 }
@@ -144,10 +160,16 @@ fn owned(file: &File, directory: bool, executable: bool) -> io::Result<Metadata>
         return Err(refused("native input belongs to another account"));
     }
     if meta.mode() & 0o7022 != 0
-        || if directory { !meta.is_dir() } else { !meta.is_file() || meta.nlink() == 0 }
+        || if directory {
+            !meta.is_dir()
+        } else {
+            !meta.is_file() || meta.nlink() == 0
+        }
         || executable && meta.mode() & 0o111 == 0
     {
-        return Err(refused("native input has unsupported kind or writable/special mode"));
+        return Err(refused(
+            "native input has unsupported kind or writable/special mode",
+        ));
     }
     require_no_acl_grants(file)?;
     Ok(meta)
@@ -211,7 +233,11 @@ fn hold_directory(
         let before = owned(&file, true, false)?;
         directories.insert(
             walked.clone(),
-            HeldDirectory { file, before, selected: walked.starts_with(root) },
+            HeldDirectory {
+                file,
+                before,
+                selected: walked.starts_with(root),
+            },
         );
     }
     Ok(())
@@ -226,19 +252,25 @@ fn file(
     deadline: Instant,
 ) -> io::Result<(HeldFile, Vec<u8>)> {
     canonical(path)?;
-    let parent = path.parent().ok_or_else(|| refused("native input has no parent"))?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| refused("native input has no parent"))?;
     hold_directory(directories, parent, root, deadline)?;
-    let dir = &directories.get(parent).ok_or_else(|| refused("native input parent absent"))?.file;
+    let dir = &directories
+        .get(parent)
+        .ok_or_else(|| refused("native input parent absent"))?
+        .file;
     let file = openat(
         dir.as_raw_fd(),
-        path.file_name().ok_or_else(|| refused("native filename absent"))?,
+        path.file_name()
+            .ok_or_else(|| refused("native filename absent"))?,
         false,
     )?;
     let before = owned(&file, false, executable)?;
     if before.len() == 0 || before.len() > MAX_IMAGE {
         return Err(refused("native image size exceeds supported bound"));
     }
-    let mut hash = Sha256::new();
+    let mut hash = NativeSha256::new();
     let mut offset = 0u64;
     let mut header = Vec::new();
     let mut bytes = [0u8; 65536];
@@ -265,10 +297,39 @@ fn file(
         device: before.dev(),
         inode: before.ino(),
     };
-    Ok((HeldFile { file, before, observation }, header))
+    Ok((
+        HeldFile {
+            file,
+            before,
+            observation,
+        },
+        header,
+    ))
 }
 
 impl HeldProgram {
+    /// Physical negative ancestry facts from SAME retained input descriptions.
+    /// This cannot construct SDK/source/output or operation authority.
+    pub fn original_tree_identities(&self, deadline: Instant) -> io::Result<Vec<(u64, u64)>> {
+        self.validate(deadline)?;
+        Ok(self.directories.values().map(|held| (held.before.dev(), held.before.ino())).collect())
+    }
+    /// Conservative capacity request for this supported capture profile: all
+    /// original directory/runtime descriptions, the executable and two
+    /// simultaneous descriptor-relative validation scratch descriptions. This
+    /// is demand data only: the caller must reserve actual process capacity
+    /// before capture and retain that reservation until every input closes.
+    pub fn capture_descriptor_bound() -> io::Result<usize> {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Ok(MAX_DIRECTORIES + MAX_RUNTIME + 1 + 2)
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            Err(io::ErrorKind::Unsupported.into())
+        }
+    }
+
     /// Open the exact native executable and supported runtime once. The expected
     /// digest is an equality assertion, never writer or release authority.
     pub fn open(
@@ -299,24 +360,36 @@ impl HeldProgram {
         canonical(root)?;
         canonical(program)?;
         if program.parent() != Some(root.join("bin").as_path()) {
-            return Err(refused("native metadata executable must be directly inside root/bin"));
+            return Err(refused(
+                "native metadata executable must be directly inside root/bin",
+            ));
         }
         let mut directories = BTreeMap::new();
         let (executable, header) = file(&mut directories, program, true, root, deadline)?;
         if executable.observation.sha256 != hex(expected) {
-            return Err(refused("native executable digest differs from original request"));
+            return Err(refused(
+                "native executable digest differs from original request",
+            ));
         }
         let commands = macho::commands(&header, true)?;
         let mut loader_paths = Vec::new();
-        for path in [root.join("lib"), root.join("lib/rustlib/aarch64-apple-darwin/lib")] {
+        for path in [
+            root.join("lib"),
+            root.join("lib/rustlib/aarch64-apple-darwin/lib"),
+        ] {
             match hold_directory(&mut directories, &path, root, deadline) {
                 Ok(()) => loader_paths.push(path),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
         }
-        if loader_paths.iter().any(|path| path.as_os_str().as_bytes().contains(&b':')) {
-            return Err(refused("native runtime search root contains loader separator"));
+        if loader_paths
+            .iter()
+            .any(|path| path.as_os_str().as_bytes().contains(&b':'))
+        {
+            return Err(refused(
+                "native runtime search root contains loader separator",
+            ));
         }
         let mut pending = commands.loads;
         let mut system = BTreeSet::new();
@@ -367,7 +440,9 @@ impl HeldProgram {
                 continue;
             }
             let Some(selected) = selected else {
-                return Err(refused("non-system runtime dependency is absent from selected roots"));
+                return Err(refused(
+                    "non-system runtime dependency is absent from selected roots",
+                ));
             };
             let Some((held, header)) = selected else {
                 continue;
@@ -395,13 +470,22 @@ impl HeldProgram {
             policy: RUNTIME_POLICY,
             scope: INPUT_SCOPE,
             executable: executable.observation.clone(),
-            runtime: runtime.iter().map(|held| held.observation.clone()).collect(),
+            runtime: runtime
+                .iter()
+                .map(|held| held.observation.clone())
+                .collect(),
             loader_paths,
             system_dependencies: system.into_iter().collect(),
             host,
             boot,
         };
-        let held = Self { root: root.to_owned(), executable, runtime, directories, observation };
+        let held = Self {
+            root: root.to_owned(),
+            executable,
+            runtime,
+            directories,
+            observation,
+        };
         held.validate(deadline)?;
         Ok(held)
     }
@@ -440,8 +524,11 @@ impl HeldProgram {
         for (path, held) in &self.directories {
             time(deadline)?;
             let current = directory(path, deadline)?;
-            if !same_directory(&held.before, &owned(&held.file, true, false)?, held.selected)
-                || !same_directory(&held.before, &owned(&current, true, false)?, held.selected)
+            if !same_directory(
+                &held.before,
+                &owned(&held.file, true, false)?,
+                held.selected,
+            ) || !same_directory(&held.before, &owned(&current, true, false)?, held.selected)
             {
                 return Err(refused("original native runtime directory changed"));
             }
@@ -451,18 +538,24 @@ impl HeldProgram {
             let path = &held.observation.path;
             let parent = self
                 .directories
-                .get(path.parent().ok_or_else(|| refused("native parent absent"))?)
+                .get(
+                    path.parent()
+                        .ok_or_else(|| refused("native parent absent"))?,
+                )
                 .ok_or_else(|| refused("held native parent absent"))?;
             let current = openat(
                 parent.file.as_raw_fd(),
-                path.file_name().ok_or_else(|| refused("native filename absent"))?,
+                path.file_name()
+                    .ok_or_else(|| refused("native filename absent"))?,
                 false,
             )?;
             if stamp(&owned(&held.file, false, false)?) != stamp(&held.before)
                 || stamp(&owned(&current, false, false)?) != stamp(&held.before)
                 || identity(&current.metadata()?) != FileId::of_metadata(&held.before)
             {
-                return Err(refused("original native executable/runtime backing changed"));
+                return Err(refused(
+                    "original native executable/runtime backing changed",
+                ));
             }
         }
         time(deadline)
@@ -543,6 +636,29 @@ impl HeldProgram {
         self.validate(deadline)
     }
 
+    /// Require the distinct general native-job declaration from this SAME
+    /// held image. This support predicate grants no Root, SDK, CPU or execution.
+    pub fn require_native_job_protocol_marker(
+        &self,
+        _expected: &[u8; 64],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.validate(deadline)?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        protocol_marker::require(
+            &self.executable.file,
+            protocol_marker::Profile::NativeJob,
+            _expected,
+            deadline,
+        )?;
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "native general-job image declarations require macOS arm64",
+        ));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        self.validate(deadline)
+    }
     /// Require the distinct in-process Bootstrap graph declaration from this
     /// SAME held image. Its existence grants no graph, CPU/GNU, manager, SDK,
     /// execution or retirement authority; actual live enrollment is required.

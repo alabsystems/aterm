@@ -10,6 +10,7 @@ use std::fmt;
 use std::mem;
 use std::panic::AssertUnwindSafe;
 use std::rc::Weak;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -31,6 +32,64 @@ pub(crate) fn set_quit_confirm_hook(hook: fn(ReplyWait) -> TerminateAnswer) {
 /// The handler's answer to an ask `wait` describes; with none registered, AppKit terminates now.
 fn quit_confirm_answer(wait: ReplyWait) -> TerminateAnswer {
     QUIT_CONFIRM_HOOK.get().map_or(TerminateAnswer::Now, |hook| hook(wait))
+}
+
+/// How far AppKit's launch of this process has come.
+///
+/// LOCAL PATCH (aterm): readable from any thread ([`appkit_launch_stage`]), so the application
+/// can name where a launch stopped while its main thread is still inside AppKit: aterm's launch
+/// watch reads it from its sampler thread.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum AppKitLaunchStage {
+    /// `-[NSApplication run]` has not been entered for the launch yet. The event loop's
+    /// construction is here: its `+[NSApplication sharedApplication]` checks the process in with
+    /// LaunchServices.
+    NotRun = 0,
+    /// Inside `-[NSApplication run]`, before `applicationDidFinishLaunching:`: AppKit's own
+    /// launch work, window restoration and any alert it raises there.
+    Running = 1,
+    /// Inside `applicationDidFinishLaunching:`: this crate's setup, then the `Init` and `Resumed`
+    /// it hands the event handler installed then. That is the application's own where the loop's
+    /// run launches AppKit; where `prepare_launch` launches it, a no-op one, and the loop's later
+    /// run hands the application's handler `Init` and `Resumed` at [`Self::Finished`].
+    DidFinish = 2,
+    /// `applicationDidFinishLaunching:` returned.
+    Finished = 3,
+}
+
+impl AppKitLaunchStage {
+    const fn from_u8(stage: u8) -> Self {
+        match stage {
+            0 => Self::NotRun,
+            1 => Self::Running,
+            2 => Self::DidFinish,
+            _ => Self::Finished,
+        }
+    }
+}
+
+/// The process's one launch, as [`AppKitLaunchStage`].
+static LAUNCH_STAGE: AtomicU8 = AtomicU8::new(AppKitLaunchStage::NotRun as u8);
+
+/// How far AppKit's launch has come, read from any thread.
+pub(crate) fn appkit_launch_stage() -> AppKitLaunchStage {
+    AppKitLaunchStage::from_u8(LAUNCH_STAGE.load(Ordering::Acquire))
+}
+
+/// Move `cell` on to `stage`; a launch never goes back, so an earlier stage is ignored.
+fn advance_launch_stage(cell: &AtomicU8, stage: AppKitLaunchStage) {
+    cell.fetch_max(stage as u8, Ordering::AcqRel);
+}
+
+/// Marks the launch [`AppKitLaunchStage::Finished`] as `applicationDidFinishLaunching:` returns,
+/// whichever way it returns.
+struct LaunchFinishedOnReturn;
+
+impl Drop for LaunchFinishedOnReturn {
+    fn drop(&mut self) {
+        advance_launch_stage(&LAUNCH_STAGE, AppKitLaunchStage::Finished);
+    }
 }
 
 type HandlerCallback = Box<dyn FnOnce(&ApplicationDelegate)>;
@@ -326,6 +385,8 @@ impl ApplicationDelegate {
     fn did_finish_launching(&self) {
         trace_scope!("applicationDidFinishLaunching:");
         self.ivars().is_launched.set(true);
+        advance_launch_stage(&LAUNCH_STAGE, AppKitLaunchStage::DidFinish);
+        let _finished = LaunchFinishedOnReturn;
 
         let mtm = self.mtm();
         let ns_app = app();
@@ -535,6 +596,14 @@ impl ApplicationDelegate {
 
     pub fn is_launched(&self) -> bool {
         self.ivars().is_launched.get()
+    }
+
+    /// LOCAL PATCH (aterm): `-[NSApplication run]` is about to be entered; before
+    /// `applicationDidFinishLaunching:` that run is the launch ([`AppKitLaunchStage::Running`]).
+    pub fn entering_run(&self) {
+        if !self.is_launched() {
+            advance_launch_stage(&LAUNCH_STAGE, AppKitLaunchStage::Running);
+        }
     }
 
     pub fn set_is_running(&self, value: bool) {

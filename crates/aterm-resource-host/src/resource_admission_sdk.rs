@@ -138,6 +138,14 @@ impl Keeper {
         )?;
         self.validate()
     }
+    pub(super) fn require_native_job_protocol(&self, deadline: Instant) -> io::Result<()> {
+        self.validate()?;
+        self.held.require_native_job_protocol_marker(
+            &trust_resource_controller::native_job::PROTOCOL_MARKER,
+            deadline,
+        )?;
+        self.validate()
+    }
     /// Capture the compiler from this SAME selected manager artifact before
     /// the Bootstrap Root can execute. No request-selected directory or marker
     /// creates SDK custody, and this does not enable a producing profile.

@@ -25,6 +25,7 @@ mod closure;
 mod conflict;
 mod identified;
 mod lazy_index;
+mod membership;
 mod policy;
 
 #[test]
@@ -484,7 +485,7 @@ fn ingest(lab: &Lab, node: &Node) {
     }
 }
 
-fn missing_selected_key() -> bool {
+fn missing_selected_key(mut next: aterm_spec::interp::State) -> aterm_spec::interp::State {
     let lab = Lab::with_enrolled(&[Role::Writer, Role::Reader], 1);
     let a = lab.bootstrap(0);
     let session = Session::open(&a).unwrap();
@@ -526,13 +527,34 @@ fn missing_selected_key() -> bool {
         )),
         || {
             // Retain successful payload facts before taking the real history key away. Both a fresh
-            // writing replay and an observation of those retained wires must still ask for that key.
+            // writing replay and payload materialization must still ask for that key. An observer
+            // may retain the witnessed bytes without treating them as readable evidence.
             Store::observe(&Session::observe(&b).unwrap(), &dirs[1], scope).unwrap();
             for file in std::fs::read_dir(lab.paths[1].dir.join("commons/history")).unwrap() {
                 std::fs::remove_file(file.unwrap().path()).unwrap();
             }
-            Store::open(&Session::open(&b).unwrap(), &dirs[1], scope).is_ok()
-                || Store::observe(&Session::observe(&b).unwrap(), &dirs[1], scope).is_ok()
+            next.insert(
+                "writable",
+                i64::from(Store::open(&Session::open(&b).unwrap(), &dirs[1], scope).is_ok()),
+            );
+            let session = Session::observe(&b).unwrap();
+            if let Ok(store) = Store::observe(&session, &dirs[1], scope) {
+                next.insert("opened", 1);
+                next.insert(
+                    "retained",
+                    store.inventory(&session).unwrap().count() as i64,
+                );
+                next.insert("visible", store.catalog(&session).unwrap().len() as i64);
+                next.insert(
+                    "offered",
+                    store.replication_inventory(&session).unwrap().count() as i64,
+                );
+                next.insert(
+                    "complete",
+                    i64::from(store.liability_evidence(&session).is_ok()),
+                );
+            }
+            next
         },
     )
 }
@@ -558,8 +580,7 @@ fn quarantine_transition(
     let mut next = state.clone();
     next.insert("scenario", scenario as i64);
     if action == "MissingSelectedKey" {
-        next.insert("opened", i64::from(missing_selected_key()));
-        return next;
+        return missing_selected_key(next);
     }
     let f = Fixture::new(
         action == "OwnDiscarded",
@@ -697,6 +718,7 @@ fn witnessed_quarantine_conforms_and_unwitnessed_promotion_is_detected() {
                     Identified::new(f.wire.clone()),
                     0,
                     catalog,
+                    false,
                 )
             })
             .is_err()
@@ -705,10 +727,10 @@ fn witnessed_quarantine_conforms_and_unwitnessed_promotion_is_detected() {
     // exact same unwitnessed tail. The model must reject that unsafe composition.
     let promoted = session
         .with_read_batch(f.scope, |batch| {
-            restore(batch, f.receipt, Identified::new(f.wire), 1, catalog)
+            restore(batch, f.receipt, Identified::new(f.wire), 1, catalog, false)
         })
         .unwrap();
-    assert!(promoted.quarantine.is_some());
+    assert!(promoted.payload.quarantine().is_some());
     let mut bad = initial.clone();
     bad.insert("scenario", 4);
     bad.insert("opened", 1);

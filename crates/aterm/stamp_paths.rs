@@ -10,10 +10,10 @@
 //! A stamp is dirty when `git status --porcelain` over [`PATHSPEC`] prints anything: a tracked
 //! file changed, staged or removed, or an untracked file, anywhere in the work tree but the
 //! measured ledger `docs/measured`. No build reads the ledger (no `include!` names it and no
-//! build script opens it), and the measurement lanes write their entries into it between the
-//! runs of one set: counted, a set's first entry stamped the second run's build `-dirty`, and
-//! that new stamp rebuilt the first run's source. A changed or new source file still marks the
-//! stamp dirty. A build script that watches the tracked files skips the ledger's too, since no
+//! build script opens it): it holds committed measurement notes, and `lab claude-measure` and
+//! `lab codex-measure` write their note into it as a run's last step, so a note written or
+//! edited there never stamps a build `-dirty` or rebuilds one. A changed or new source file
+//! still marks the stamp dirty. A build script that watches the tracked files skips the ledger's too, since no
 //! edit there can change the stamp. Both pathspecs are anchored at the work tree's top, so a
 //! build script, which runs in its package's folder, asks of the whole tree.
 

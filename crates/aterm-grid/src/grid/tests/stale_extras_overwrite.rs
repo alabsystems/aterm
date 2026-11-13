@@ -291,3 +291,62 @@ fn wide_run_autowrap_tightens_len_when_the_run_orphans_the_row_tail() {
         "len must tighten to 5 — a stale-high len paints a phantom trailing space"
     );
 }
+
+/// `assert_extras_claimed` judges each entry against the live screen row the map keys it by,
+/// wherever the reader has scrolled.
+#[test]
+fn extras_claimed_is_judged_on_the_live_row_while_scrolled_back() {
+    let build = || {
+        let mut grid = Grid::with_scrollback(3, 10, 100);
+        for c in ['A', 'B', 'C', 'D', 'E', 'F'] {
+            grid.write_char(c);
+            grid.line_feed();
+            grid.carriage_return();
+        }
+        grid.write_char('Z');
+        assert!(
+            grid.scrollback_lines() >= 2,
+            "precondition: history to scroll over"
+        );
+        // Live (0, 0) and live (2, 0) each claim an entry.
+        plant_hyperlink_unchecked(&mut grid, 0, 0);
+        plant_hyperlink_unchecked(&mut grid, 2, 0);
+        grid
+    };
+    let mut grid = build();
+    grid.assert_extras_claimed();
+    grid.scroll_display(1);
+    assert_eq!(grid.display_offset(), 1);
+    assert!(
+        grid.cell(2, 0).is_some_and(|c| !c.has_extras()),
+        "precondition: the viewport's (2, 0) is the unflagged live row 1"
+    );
+    grid.assert_extras_claimed();
+    grid.scroll_display(-1);
+    grid.assert_extras_claimed();
+
+    // Negative control: an entry on live (1, 0), whose cell does not claim it, is reported
+    // scrolled back too, where the viewport's (1, 0) is live row 0 and carries the bit.
+    let mut grid = build();
+    grid.cell_extra_mut_preflagged(1, 0)
+        .set_hyperlink(Some(Arc::from("https://orphan.example")));
+    grid.scroll_display(1);
+    assert!(
+        grid.cell(1, 0).is_some_and(Cell::has_extras),
+        "precondition: the viewport's (1, 0) carries the bit"
+    );
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        grid.assert_extras_claimed();
+    }));
+    assert!(
+        caught.is_err(),
+        "an entry its live cell does not claim must be reported while scrolled back"
+    );
+}
+
+/// [`plant_hyperlink`] without its one-entry count check.
+fn plant_hyperlink_unchecked(grid: &mut Grid, row: u16, col: u16) {
+    grid.cell_extra_mut(row, col)
+        .set_hyperlink(Some(Arc::from("https://example.com")));
+    assert!(grid.cell(row, col).is_some_and(Cell::has_extras));
+}

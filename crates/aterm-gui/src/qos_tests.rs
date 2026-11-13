@@ -132,7 +132,8 @@ fn class_a_fork_ran_at() -> u32 {
     use std::os::fd::AsRawFd as _;
     use std::os::unix::process::CommandExt as _;
 
-    let (mut probe, probe_end) = std::io::pipe().unwrap();
+    let (mut probe, probe_end) = aterm_uds::pipe().unwrap();
+    let probe_fd = probe_end.as_raw_fd();
     let mut command = std::process::Command::new("/usr/bin/true");
     // SAFETY: the probe loads this thread's QoS word (a thread-specific
     // slot) and makes one 4-byte `write`; it allocates nothing and takes
@@ -148,7 +149,12 @@ fn class_a_fork_ran_at() -> u32 {
             Ok(())
         });
     }
-    let status = command.status().unwrap();
+    // Held across the spawn's fork alone: the write end the forked child keeps loses its
+    // close-on-fork mark (`aterm_uds::pipe`) for this fork, or the probe writes nowhere.
+    let handing = aterm_uds::spawn_lock::handing(&[probe_fd]);
+    let spawned = command.spawn();
+    drop(handing);
+    let status = spawned.unwrap().wait().unwrap();
     assert!(status.success(), "{status}");
     let mut class = [0; 4];
     probe

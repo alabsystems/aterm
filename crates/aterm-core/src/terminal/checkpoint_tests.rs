@@ -118,7 +118,15 @@ fn restoring_short_and_alternate_grids_keeps_the_visible_rows() {
         let bytes = serialize_lines(&lines);
         let first_visible = count.saturating_sub(4);
         for is_alt in [false, true] {
-            let restored = restore_grid(4, 20, &bytes, &cursor, is_alt, None);
+            let restored = restore_grid(
+                4,
+                20,
+                &bytes,
+                &VisibleCells::default(),
+                &cursor,
+                is_alt,
+                None,
+            );
             let visible = restored.checkpoint_visible_lines();
             for (row, actual) in visible.iter().enumerate() {
                 let expected = lines

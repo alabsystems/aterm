@@ -841,7 +841,7 @@ fn loop_scratch(tag: &str) -> PathBuf {
 #[cfg(unix)]
 fn loop_git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command(crate::test_program::git())
+        crate::test_program::kept_git_command()
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -1755,36 +1755,71 @@ fn recent_person(screens: Vec<Vec<String>>, agent: &'static str) -> Mock {
     m
 }
 
+/// A person whose last gesture is 60 s old, inside their whole grace and long past the settle
+/// (`approval_loop::PERSON_SETTLE`): a Claude Code trust dialog or Bash box nobody touched is
+/// answered, every key fenced on the person count it was decided on. Another driver's hand on the
+/// session touches it and holds it; a host that reports no person count to fence an answer inside
+/// the person's grace on hands it over unpressed.
 #[test]
-fn a_recent_persons_trust_dialog_keeps_their_grace() {
+fn a_recent_persons_untouched_trust_dialog_is_answered_once_their_keys_settle() {
+    let answered = || vec![trust_dialog(false), trust_dialog(true), idle_screen()];
     for agent in [
         TRUST_PUBLISHED_1S,
         "prompt agent_detail=trust agent_rev=1 agent_since_ms=120000",
         "prompt agent_detail=trust agent_rev=1",
         "unknown agent_detail=- agent_rev=0 agent_since_ms=1500",
     ] {
-        let mut m = recent_person(vec![trust_dialog(false)], agent);
-        held_for_the_person(agent, &mut m);
+        let mut m = recent_person(answered(), agent);
+        let (_, noted) = full_power_watch(&mut m, "trust-settled");
+        assert_eq!(
+            m.presses().len(),
+            2,
+            "{agent}: {noted:#?}\n{:#?}",
+            m.requests
+        );
+        assert!(
+            m.presses()
+                .iter()
+                .all(|p| p.starts_with("key if-human=4 if-gen=")),
+            "{agent}: {:#?}",
+            m.requests
+        );
+        assert!(
+            !noted.iter().any(|l| l.starts_with("HELD ")),
+            "{agent}: {noted:#?}"
+        );
     }
     let mut m = recent_person(vec![trust_dialog(false)], TRUST_PUBLISHED_1S);
     m.hand = "lease:mgr";
     held_for_the_person("another driver's hand", &mut m);
     let mut m = recent_person(vec![trust_dialog(false)], TRUST_PUBLISHED_1S);
     m.human_seq = None;
-    held_for_the_person("a host with no person-count fence", &mut m);
+    let (_, noted) = full_power_watch(&mut m, "trust-no-count");
+    assert!(m.presses().is_empty(), "{noted:#?}\n{:#?}", m.requests);
+    assert!(
+        !noted.iter().any(|l| l.starts_with("HELD ")),
+        "handed over, not held: {noted:#?}"
+    );
     let mut m = recent_person(
-        vec![bash_box(&["⏺ Cleaning."], "rm -rf build")],
+        vec![bash_box(&["⏺ Cleaning."], "rm -rf build"), idle_screen()],
         "prompt agent_detail=bash:not-read-only agent_rev=1 agent_since_ms=1000",
     );
-    held_for_the_person("the ordinary Bash hold", &mut m);
+    let (_, noted) = full_power_watch(&mut m, "bash-settled");
+    assert_eq!(m.presses().len(), 1, "{noted:#?}\n{:#?}", m.requests);
+    assert!(
+        m.presses()[0].starts_with("key if-human=4 if-gen=") && m.presses()[0].ends_with(" 1"),
+        "{:#?}",
+        m.requests
+    );
 }
 
 /// The review of 9744af4ee8: only a question dialog had the short bound on a person's grace, so a
 /// keystroke 60 s old held a plan-mode switch, a plan approval or a goal proposal for the whole
 /// 120 s. Every choice that grants nothing waits at most `QUESTION_PERSON_GRACE` of the person's
-/// quiet and is answered; a permission box with the same input whose touch cannot be told (it is
-/// the session's first read) keeps the whole grace (the ordinary Bash hold, the positive control;
-/// an untouched one takes the bound: `an_untouched_box_is_held_by_older_input_no_longer_than_a_question`).
+/// quiet and is answered; a permission box with the same input whose focus a key moved off its
+/// first option (a person deciding it) keeps the whole grace (the positive control; an untouched
+/// one waits only for the person's keys to settle:
+/// `box_hold::an_untouched_box_is_answered_once_the_persons_keys_settle`).
 #[test]
 fn a_choice_dialog_waits_a_short_fixed_quiet_and_a_permission_box_the_whole_grace() {
     use aterm_phase::prompt::fixtures as f;
@@ -1814,12 +1849,20 @@ fn a_choice_dialog_waits_a_short_fixed_quiet_and_a_permission_box_the_whole_grac
         );
         assert!(!m.presses().is_empty(), "{what}: {:#?}", m.requests);
     }
+    let on_no: Vec<String> = bash_box(&["⏺ Cleaning."], "rm -rf build")
+        .into_iter()
+        .map(|r| match r.as_str() {
+            " ❯ 1. Yes" => "   1. Yes".to_string(),
+            "   3. No" => " ❯ 3. No".to_string(),
+            _ => r,
+        })
+        .collect();
     let mut m = recent_person(
-        vec![bash_box(&["⏺ Cleaning."], "rm -rf build")],
+        vec![on_no],
         "prompt agent_detail=bash:not-read-only agent_rev=1 agent_since_ms=1000",
     );
     held_for_the_person(
-        "a permission box whose touch cannot be told keeps the whole grace",
+        "a permission box a person's key moved the focus of keeps the whole grace",
         &mut m,
     );
     let mut m = recent_person(
@@ -1840,17 +1883,53 @@ fn a_choice_dialog_waits_a_short_fixed_quiet_and_a_permission_box_the_whole_grac
     );
 }
 
+/// Input `status` reads unread by the worker (`input=pending|typeahead`) goes to an untouched box
+/// ahead of any answer: the box is looked at again, never keyed, until `status` reads it clear. A
+/// host that does not measure unread input holds nothing.
 #[test]
-fn unknown_input_keeps_the_persons_trust_dialog_held() {
-    for input in [
-        "",
-        "input=- input_bytes=-",
-        "input=pending input_bytes=1 input_wait_ms=40 fg_footprint_mb=-",
-        "input=typeahead input_bytes=9",
+fn unread_input_holds_an_untouched_box_until_the_worker_reads_it() {
+    for (input, waits) in [
+        ("", false),
+        ("input=- input_bytes=-", false),
+        (
+            "input=pending input_bytes=1 input_wait_ms=40 fg_footprint_mb=-",
+            true,
+        ),
+        ("input=typeahead input_bytes=9", true),
     ] {
-        let mut m = recent_person(vec![trust_dialog(false)], TRUST_PUBLISHED_1S);
+        let mut m = recent_person(
+            vec![
+                trust_dialog(false),
+                trust_dialog(false),
+                trust_dialog(true),
+                idle_screen(),
+            ],
+            TRUST_PUBLISHED_1S,
+        );
         m.input = input;
-        held_for_the_person(input, &mut m);
+        m.input_after = vec![(1, INPUT_CLEAR)];
+        let (_, noted) = full_power_watch(&mut m, "trust-unread");
+        assert_eq!(
+            m.presses().len(),
+            2,
+            "{input}: {noted:#?}\n{:#?}",
+            m.requests
+        );
+        let first_key = m
+            .requests
+            .iter()
+            .position(|r| verb_of(r) == "key")
+            .expect("a key");
+        let statuses = m.requests[..first_key]
+            .iter()
+            .filter(|r| verb_of(r) == "status")
+            .count();
+        assert_eq!(
+            statuses > 1,
+            waits,
+            "{input}: the first key after a clear status only where input was unread: {:#?}",
+            m.requests
+        );
     }
 }
 
@@ -1971,8 +2050,13 @@ fn a_person_who_keys_while_a_trust_answer_is_pressed_gets_the_dialog() {
     }
 }
 
+/// The Enter that started the agent, as old as the trust dialog it drew: inside the settle
+/// (`approval_loop::PERSON_SETTLE`), so only THE LAUNCH answers the dialog this soon.
+const LAUNCHED_MS: u64 = 1_000;
+
 fn launched(screens: Vec<Vec<String>>, program: &'static str) -> Mock {
     let mut m = recent_person(screens, TRUST_PUBLISHED_1S);
+    m.human_ms = Some(LAUNCHED_MS);
     m.program = program;
     m.launch = Some(ServerLaunch {
         id: 1,
@@ -2405,8 +2489,8 @@ fn the_limit_options_dialog_waits_for_the_reset_by_itself() {
     assert_eq!(
         m.presses(),
         [
-            format!("key if-gen=1.101 if={title} down").as_str(),
-            format!("key if-gen=1.102 if={wait} enter").as_str(),
+            format!("key if-human=7 if-gen=1.101 if={title} down").as_str(),
+            format!("key if-human=7 if-gen=1.102 if={wait} enter").as_str(),
         ],
         "{:?}",
         m.requests
@@ -7703,7 +7787,14 @@ fn the_host_tells_a_carry_on_from_a_notice_and_only_the_carry_on_is_checked() {
         ..SuperviseOpts::hosted()
     };
     let done_screen = || {
-        let mut r = rows(&["⏺ All done.", "", "✻ Cogitated for 4s · done 2:41 PM", ""]);
+        let mut r = rows(&[
+            "⏺ All done.",
+            "",
+            "  ATERM-TASK-DONE",
+            "",
+            "✻ Cogitated for 4s · done 2:41 PM",
+            "",
+        ]);
         r.extend(composer("  ? for shortcuts"));
         r
     };
@@ -7773,7 +7864,14 @@ fn a_release_typed_at_a_break_is_a_carry_on_and_its_done_answer_is_checked() {
         r
     };
     let done_screen = || {
-        let mut r = rows(&["⏺ All done.", "", "✻ Cogitated for 4s · done 2:41 PM", ""]);
+        let mut r = rows(&[
+            "⏺ All done.",
+            "",
+            "  ATERM-TASK-DONE",
+            "",
+            "✻ Cogitated for 4s · done 2:41 PM",
+            "",
+        ]);
         r.extend(composer("  ? for shortcuts"));
         r
     };

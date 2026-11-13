@@ -564,7 +564,7 @@ impl Input {
     pub const APP_UNREAD: Self = Self(1 << 9);
     /// Its argument is the program's own bytes (`send`, `feed`, a frame's body), not a gesture.
     pub const PINNED: Self = Self(1 << 10);
-    /// Takes a leading `if-supervisor=<holder>` fence and the paired `if-supervisor-revision=<n>`/`harness-duty=<scope>` typed authority fields.
+    /// Takes a leading `if-supervisor=<holder>` fence and the paired `if-supervisor-revision=<n>`/`harness-duty=<scope>` typed authority fields, and the `harness-lane=<lane>` the window harness's write names itself by.
     pub const SUPERVISED: Self = Self(1 << 11);
     /// Takes a leading `cause=@<off>|<seq>` naming the mail or session-log record the input acts on, checked against what the session holds before a byte is written.
     pub const CAUSE: Self = Self(1 << 12);
@@ -1376,7 +1376,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Meta,
         AnyScopeMeta,
-        "self-updater [status|check|apply]: OK current_build= staged_build= outcome=",
+        "self-updater [status|check|apply|retry|holds]: OK current_build= staged_build= outcome=",
         "— one line: `enabled= auto_apply= current_build= commit= staged_build= staged_version= staged_commit= \
          staged_is_same_commit= relaunch_ready= apply_posture= failing=<n>[:<kind>] \
          failing_applies= persistent= outcome=\"…\"`, plus, where they apply, \
@@ -1386,7 +1386,11 @@ pub const VERBS: &[VerbSpec] = &[
          `delivery=deferred|blocked`, `installable=false` (a disk-image, translocated or dev copy \
          never updates), on Linux \
          `linux_installed_build= linux_staged_build= linux_trial=<phase|none> linux_trial_starts= \
-         linux_trial_healthy=`, `apply_refusal= apply_refusal_detail= apply_refusal_at= apply_failure= trial_wait=`, the \
+         linux_trial_healthy=`, `apply_refusal= apply_refusal_detail= apply_refusal_at= apply_failure= trial_wait=`, \
+         a stopped automatic lane's journal record \
+         `apply_lane=resampling|awaiting-newer|replacing|held apply_lane_build= \
+         failure_signature=<shape>/<cause> next_action= apply_lane_at=` \
+         (`next_action` is what aterm does next by itself), the \
          handoff timings `freeze_seed_ms= handoff_capture_ms= handoff_park_ms=`, and `changelog=` \
          (prose pct-encoded). `enabled` is automatic checking; `auto_apply=true|false|unknown` \
          is the live automatic-install setting, even with no staged update (`unknown` when \
@@ -1410,11 +1414,21 @@ pub const VERBS: &[VerbSpec] = &[
          whether anyone is at the Mac. `apply_held=account-work` names an accepted apply \
          waiting for admitted account work to retire. `check` (Owner-only) runs one channel \
          check and answers the same line. `apply` (Owner-only) queues the staged build on macOS (a \
-         live-session handoff keeps shells) or replaces the executable in place on Linux.",
+         live-session handoff keeps shells) or replaces the executable in place on Linux. The \
+         update record adds `offered=` (a newer build a check saw), `behind=true` while it is \
+         not running, and its hold on a newer build: `hold=<version> hold_build= \
+         cause=crash-loop|unproven|apply|stage|smoke|linux-rollback|start-failed until=<unix> \
+         tries=<n> hold_live=true|false hold_why=`; every hold lapses by itself within a day, \
+         and a lapsed one is tried again. `retry` (Owner-only) ends the hold and checks now, \
+         answering the same line. `holds` answers `OK <n>` then one line for this copy's record \
+         (`machine=self`) and one per other lab Mac's row (`machine=<uuid>`): `running= \
+         proven= offered=` and the hold's fields.",
     )
     .forms(&[
         form(Word("check")).owner_only().lane(Wait),
         form(Word("apply")).owner_only(),
+        form(Word("retry")).owner_only().lane(Wait),
+        form(Word("holds")),
     ])
     .input(Input::NONE),
     va(
@@ -2086,7 +2100,7 @@ pub const VERBS: &[VerbSpec] = &[
          verb does. Otherwise answers why nothing ran: `OK granted` (already listed and on), `OK unknown` \
          (list and tccd unreadable), `OK declined` (owner clicked Not now; 30 d / 90 d cooldown), \
          `OK unstable` (ad hoc/dev build, bare only), `OK listed` (row on while macOS still \
-         checks, bare only), or `OK recent` (opened within 10 min). Headless \
+         checks, bare only), or `OK recent` (opened within 10 min). From a tab not in front of the person (another tab shows, or aterm is behind another app) it answers `ERR desk refused behind: …` and brings nothing up. Headless \
          answers `ERR headless: …`, non-macOS `ERR unsupported: …`, bad args `ERR usage: devtools \
          hand-over [now]`.",
     )
@@ -2119,7 +2133,8 @@ pub const VERBS: &[VerbSpec] = &[
          does not come back; a page the walk never had joins all the same), `OK declined` \
          (the owner's Not now holds back every page named that is missing), `ERR late: …` \
          (the window did not take the ask within 5 s: no walk starts for it, then or later), \
-         headless `ERR headless: …`, \
+         `ERR desk refused behind: …` (the asking tab is not the one in front of the person: \
+         nothing comes up), headless `ERR headless: …`, \
          non-macOS `ERR unsupported: …`, bad args `ERR usage: permissions walk now \
          [fda|devtools|accessibility]...`.",
     )
@@ -2681,7 +2696,12 @@ pub const VERBS: &[VerbSpec] = &[
          `present_glass`, `out_req`, `ime`, `status_glance` (`max_status_glance_ms=`), \
          `need_publish` (`max_need_publish_ms=`), and `tx_chunk`/`tx_last` (`max_tx_hold_ms=`), \
          plus `turns_by_root=<root>:<n>/<p50>/<p95>/<p99>` and counters `input_edges_dropped= \
-         input_predicted= ime_cancelled= input_refused= reply_dropped=`. Plain `metrics` prints \
+         input_predicted= ime_cancelled= input_refused= reply_dropped=`. Both forms print, beside \
+         `n_input=`, `n_input_cold=` and `input_cold_p50/_p95/_p99_ms=` (the `input` slices \
+         booked in a present 2 s or more after the process's previous present; \
+         last/max are also printed as `last_input_cold_ms=` and `max_input_cold_ms=`) and \
+         `n_rest_wake_key=` (those booked in a window's first present after a person's event \
+         woke it from rest while it was focused). Plain `metrics` prints \
          the frame and present counters (`max_frame_gap_ms=`, `first_present_ms=`, \
          `first_visible_ms=`), the startup phases (`startup_*_ms` with their \
          `*_schema=`/`*_valid=` flags, `process_birth_to_rust_main_ms=`, \
@@ -2696,7 +2716,11 @@ pub const VERBS: &[VerbSpec] = &[
          `echo_dropped_locked=`), the main-loop census (`max_turn_ms= max_turn_owner= … \
          main_busy_ms_per_s=`), the update handoff counters (`input_dropped= input_incoherent= \
          handoff_claim_stamps= handoff_warm_pre_dial_ms=`), `control_accepts=` … \
-         `control_busy_replies=`, and the PTY fd census (`pty_masters= pty_sessions= pty_kits=`). \
+         `control_busy_replies=`, the PTY fd census (`pty_masters= pty_sessions= pty_kits=`), and, \
+         on macOS and Linux, Commons repair's counts in this process since it started, which no \
+         `reset` clears (`commons_rounds_out= commons_rounds_in= commons_rounds_quiet= \
+         commons_owner_ticks= commons_beacons= commons_announces= commons_signature_checks= \
+         commons_deadline_spawns=`). \
          `echo_*` is the child round trip; `input_*` is key to the next content present (or a \
          proven prediction, when `input_predicted=` > 0). Its start uses native arrival when \
          available, otherwise dispatch time. `key_queue` and `key_write` include only observed \
@@ -2877,7 +2901,8 @@ pub const VERBS: &[VerbSpec] = &[
          stdin too; no other escape is decoded, and `feed-bin` keeps every byte. \
          Leading options (before `--`): `[id=<epoch>:<producer>:<seq>] [if=<re>] \
          [if-gen=<epoch>.<seq>] [if-fp=<hex16>] [if-human=<n>] [if-supervisor=<holder>] \
-         [unread=ok] [cause=@<off>|<seq>] [act=approve|deny|answer] [as=person]`. `id=` (shared \
+         [harness-lane=<lane>] [unread=ok] [cause=@<off>|<seq>] [act=approve|deny|answer] \
+         [as=person]`. `id=` (shared \
          by `send`, `key`, `feed-bin`, `turn`) makes the write idempotent against the session's \
          `nonce=` (a repeat is `OK dup=1`, or `OK 0 dup=1` for `turn`; `ERR epoch` across a \
          relaunch). A refusal at admission or of the request's own words (`ERR halted`, `ERR \
@@ -2924,7 +2949,8 @@ pub const VERBS: &[VerbSpec] = &[
          sanitized and LF made CR, with no `confirm_multiline_paste` banner. Takes a leading \
          `if-supervisor=<holder>` fence. A scoped harness also names \
          `if-supervisor-revision=<n> harness-duty=<scope>` (from status); `--` ends those \
-         leading authority options before a literal option-like body.",
+         leading authority options before a literal option-like body. The window harness's \
+         write also names its lane, `harness-lane=<lane>` (see `key`).",
     )
     .lane(WaitWhenAimed)
     .input(DRIVEN.with(Input::STAMPS_SEQ).with(Input::SUPERVISED)),
@@ -2937,8 +2963,9 @@ pub const VERBS: &[VerbSpec] = &[
         "— delivered beneath window shortcuts (`key ctrl+shift+t` sends ^T to the PTY; use \
          `invoke <action>`, `tab new` or `find open` for window actions). Leading options (in any \
          order): `[id=<epoch>:<producer>:<seq>] [if=<re>] [if-gen=<epoch>.<seq>] [if-fp=<hex16>] \
-         [if-human=<n>] [if-supervisor=<holder>] [unread=ok] [act=approve|deny|answer] \
-         [as=person]`. `if=<re>` tests visible rows under the same terminal lock hold as the \
+         [if-human=<n>] [if-supervisor=<holder>] [harness-lane=<lane>] [unread=ok] \
+         [act=approve|deny|answer] [as=person]`. `if=<re>` tests visible rows under the same \
+         terminal lock hold as the \
          write (write spaces as `.` since the wire splits on whitespace, e.g. `key \
          if=Do.you.want.to.proceed 1`): a match writes and replies `OK seq=<n>`; no match writes \
          nothing, releases `id=` (so a retry is re-evaluated rather than `dup=1`), and replies \
@@ -2957,8 +2984,15 @@ pub const VERBS: &[VerbSpec] = &[
          `if-supervisor-revision=<n> harness-duty=<scope>`: the exact status revision and the \
          claimed typing duty, or the private builtin harness's retained duty. Authority changes \
          reject a not-started queue; a started command finishes before the transition ACK. \
-         Upgrade/relaunch scope grants no typing. Refusal order: `ERR halted`, `ERR rate`, `ERR busy \
-         turn=`, `ERR usage` (the options, then the key name), `ERR busy input-unread bytes=<n> \
+         Upgrade/relaunch scope grants no typing. A write on the window harness's own connection, \
+         or one naming a harness lane on any connection, into an agent its host has not \
+         confirmed (`status supervisor_act=observe`) is `ERR busy supervisor_act=observe`, \
+         nothing written, unless the lane it names is one the harness's ruling exempts \
+         (`harness-lane=relaunch|upgrade|codex-alab|agy|muse`; `disk-resume` and `disk-free` are \
+         not); any other write, and one into no agent, passes it. \
+         Refusal order: `ERR halted`, `ERR rate`, `ERR busy \
+         turn=`, `ERR usage` (the options), `ERR busy supervisor_act=observe`, `ERR usage` \
+         (the key name), `ERR busy input-unread bytes=<n> \
          wait_ms=<ms> input=<stalled|stopped>`, `ERR badregex`, `ERR busy supervisor=`, `id=`, \
          then the `if=`/`if-gen=`/`if-fp=`/`if-human=` guards. On macOS, raw input unread >= 1 s \
          appends `warn=input-unread input_bytes=<n> input_wait_ms=<ms>`; stalled or \
@@ -2999,7 +3033,8 @@ pub const VERBS: &[VerbSpec] = &[
          leading `unread=ok`; `ERR hwkey` while a palette, Overview or tab menu is open, or \
          System State is the front window's active view, and `ERR hwkey: refused private view: \
          the front window holds a private document` while any of its tabs holds a private \
-         edit's document (one in a `*.private.noindex` folder).",
+         edit's document (one in a `*.private.noindex` folder). The window harness's own \
+         connection is refused it (`ERR denied harness window input`).",
     )
     .input(Input::PTY.with(Input::WRITES).with(Input::APP_UNREAD)),
     va(
@@ -3083,7 +3118,10 @@ pub const VERBS: &[VerbSpec] = &[
          action's outcome unknown. Over an open palette or Overview `move item=<n>` aims at the \
          centre of the card's row for item `<n>` (the palette's filtered row as `menu` counts \
          `selected=`, the Overview's item as `controls overview` does), where a person's pointer \
-         selects it (`ERR item <n> is not a row the card shows` when scrolled off). `pointer \
+         selects it (`ERR item <n> is not a row the card shows` when scrolled off). Over an open \
+         footer card `<n>` is the row's `index=` in `controls fact-menu`: the pointer lands on \
+         the middle of that row and lights it as a person's does (a row that is no choice is \
+         the same `ERR`). `pointer \
          leave`, and `status` with no position, reply `OK at=-`. \
          `click` (Owner-only) left-clicks where the pointer is. `wheel dy=<n> [dx=<n>] \
          [unit=lines|pt] [key=<ui-key>|xy=<x>,<y>]` scrolls (each `|n|<=10000`, not both 0). \
@@ -3091,7 +3129,8 @@ pub const VERBS: &[VerbSpec] = &[
          `shift`, `link`, or `none`) until the next physical event (`cell <r> <c>` `link=` reads a \
          hovered link). Takes a leading `unread=ok`. While a private edit's document shows in \
          any pane of the front tab, every form is `ERR pointer command failed: refused private \
-         view: …`.",
+         view: …`. On the window harness's own connection every form but a read (`pointer`, \
+         `status`) is `ERR denied harness window input`.",
     )
     .forms(&[form(AnyOf(&["click", "mods"])).owner_only()])
     .input(Input::PTY.with(Input::WRITES).with(Input::APP_UNREAD)),
@@ -3164,7 +3203,7 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         Session,
         "observe this Codex session's account pool",
-        "Authenticated Codex only. Versioned cached account metadata, without credentials or assignment authority.",
+        "Authenticated Codex only. `snapshot schema=<1|2> request=<32 lowercase hex>`: versioned cached account metadata, without credentials or assignment authority. Schema 2 also says what `restart account=` may ask for this session: the row aterm judges it to run on from the login its launch carried (`assignment.account_id`), the pool's choice, pin and rotation (`pool`), the rows a move would not be refused on record (`eligible`), and whether that restart would be carried now (`capabilities.select`, and `.auto` for `account-auto`). The relaunch still proves the row.",
     ).input(Input::NONE),
     v(
         "codex-auth",
@@ -3272,7 +3311,7 @@ pub const VERBS: &[VerbSpec] = &[
         Signal,
         Status,
         Session,
-        "restart [pid=<n>] [if-stalled] [quiet=<s>]: restart the tab's agent in place",
+        "restart [pid=<n>] [if-stalled] [quiet=<s>] [account=<label>|account-auto]: restart the agent",
         "— POSIX only (`ERR restart unsupported on this platform` on Windows). Stamps the \
          supervised foreground agent (Claude Code, agy, codex-alab), sends `SIGTERM` (escalating \
          to `SIGKILL` after 5 s if still stalled and deaf, or 30 s otherwise), and has the window \
@@ -3290,17 +3329,35 @@ pub const VERBS: &[VerbSpec] = &[
          under `off`, after a person's own message, or into work Land finished or the agent \
          defended as landed. Options: `pid=<n>` (must lead foreground \
          pgrp), `if-stalled` (requires `status input=stalled`), `quiet=<s>` (`ERR busy person \
-         human_ms=<ms>` if human input within `<s>` s). Replies `OK restarting pid <n> \
-         cause=<stall|asked>[ discarded=<bytes>]`, `OK restart gone pid <n>`, or `ERR restart \
+         human_ms=<ms>` if human input within `<s>` s), and one account word at most, never with \
+         `if-stalled`: `account=<label>` (a roster row) or `account-auto` (the row a new launch \
+         would get) moves a codex-alab session that runs on one of the pool's stored Codex \
+         logins: its relaunch starts on that row once the row proves it serves there (signed in \
+         on this Mac, not at a limit, a usage read answered within the last 5 minutes, read then \
+         if due), else it resumes as a relaunch with no account asked would (on the row it ran \
+         on, or on the serving row if that one no longer serves) and its tab is told once, as \
+         its line lands. The move is that session's alone: no pin, active row or rotation is \
+         written, and nobody is signed in. Replies `OK restarting pid <n> \
+         cause=<stall|asked>[ discarded=<bytes>]`, ending ` account=<label>` or ` account-auto` \
+         where one was asked, `OK restart gone pid <n>`, or `ERR restart \
          unavailable: \
-         <not-the-hosts-agent|not-relaunchable|not-supervised|driver-lease|driver-turn|halted|start-unread|no-state>` \
+         <not-the-hosts-agent|not-relaunchable|not-supervised|driver-lease|driver-turn|halted|start-unread|no-state|exit-owner-not-ready>` \
+         and after those, for an account, in order: `account-unread` (the pool was judged for \
+         another process than the one now leading the tab), `account-unmanaged`, \
+         `account-not-resumable`, `account-recovery-pending`, the pool's word \
+         `<account-unmanaged|account-off|account-unknown|account-no-choice|account-current|account-same|account-not-enrolled|account-signed-out|account-held|account-limited|account-identity|account-unread>`, \
+         then `account-restart-pending` \
          (or `ERR not-stalled`, `ERR bad restart argument: <word>`, `ERR restart failed: <what>`). \
+         A refused account writes and sends nothing. \
          `OK restarting` acknowledges acceptance; verify the new live process and its version \
          after resuming. Earlier typing does not hold an accepted restart's resume line; new \
          input, a draft, a hold or another driver's hand still does. \
          Works even when `[harness] relaunch = false`. Restart requires a matching host snapshot \
          and a validated relaunch route. Codex's `supervisor_proven=1` confirms a direct foreground \
-         claim. `not-the-hosts-agent` means the host lacks a snapshot for this PID and kernel start. \
+         claim. A restored task also needs its harness ready to keep it open through the restart. \
+         `exit-owner-not-ready` means the harness is not ready; this request sends no signal. \
+         Record the refusal, continue other work and retry later. `not-the-hosts-agent` means the \
+         host lacks a snapshot for this PID and kernel start. \
          Snapshot-read or resume-line validation failures are recorded in `aterm.log` \
          (`aterm help update`, LOG).",
     )
@@ -3352,7 +3409,10 @@ pub const VERBS: &[VerbSpec] = &[
         App,
         "open a tab app: `open app mail|about|settings|tables`",
         concat!(
-            "`open app settings [/route]` selects a Settings page; `open app system-state` \
+            "From a tab not in front of the person (another tab shows, or aterm is behind \
+             another app) an open answers `ERR desk refused behind: …` and brings nothing up; \
+             a close is answered as ever. \
+             `open app settings [/route]` selects a Settings page; `open app system-state` \
              opens setup; `open app markdown|editor <local-file-uri>` opens a document. \
              `open <target> [close]` opens or \
              closes a front-window surface (",
@@ -3442,7 +3502,8 @@ pub const VERBS: &[VerbSpec] = &[
         Status,
         App,
         "invoke <action>: fire a menu action by name (enabled-gated; names via `controls menu`)",
-        "— `Paste` honors the unread-input gate (it takes a leading `unread=ok`). A close or \
+        "— `Paste` honors the unread-input gate (it takes a leading `unread=ok`), and the window \
+         harness's own connection is refused it (`ERR denied harness window input`). A close or \
          quit that needs confirmation parks a question (a sheet on macOS) and replies `OK confirm \
          pending kind=<quit|close-window|close-tab|close-pane> window=<n>; …`; `confirm \
          yes|no` answers a control client's question. The main thread keeps serving other \
@@ -4243,7 +4304,7 @@ pub const VERBS: &[VerbSpec] = &[
         Lines,
         Meta,
         OwnerOnly,
-        "OK 1 verdict=<word> session=<sid|->: may the asking process see a secret",
+        "OK 1 verdict=<word> session=<sid|-> fleet=<yes|no>: may the asking process see a secret",
         "— Owner-only and local (never a fleet peer's): whether the process asking may be shown a \
          secret in plaintext, decided by the session of this instance its process lineage leads \
          to, never by its environment. One line, `verdict=` the first of: `remote` (asked through \
@@ -4253,7 +4314,9 @@ pub const VERBS: &[VerbSpec] = &[
          of who started or drove it), `held` (under the `origin=remote` hold), `driven` (a control \
          client other than aterm's own was admitted to type into it), `agent` (an agent runs in its process tree), \
          else `allowed`. `aterm db emails --show-passwords`, `phones --show-numbers` and `--edit` \
-         show plaintext only on `allowed`.",
+         show plaintext only on `allowed`. `fleet=yes` where another Mac is behind the question \
+         (the bridge or a fleet driver asked, or a fleet driver was admitted to type into that \
+         session): a sign-in started there opens nothing on this Mac's desk.",
     ),
     va(
         "survey",
@@ -4458,7 +4521,7 @@ pub const VERBS: &[VerbSpec] = &[
         Meta,
         OwnerOnly,
         "raise <sid>: raise the window hosting that session and select its tab",
-        "— Owner-only: the connection card's Show button, on the wire.",
+        "— Owner-only: the connection card's Show button, on the wire. From a tab not in front of the person (another tab shows, or aterm is behind another app) it answers `ERR desk refused behind: …` and brings nothing up.",
     )
     .input(Input::NONE),
 ];

@@ -18,6 +18,8 @@ mod callbacks;
 pub mod caret_path;
 mod checkpoint;
 mod checkpoint_canon;
+#[cfg(feature = "serde")]
+mod checkpoint_cells;
 mod checkpoint_heap;
 mod checkpoint_holder;
 mod checkpoint_output;
@@ -150,6 +152,8 @@ pub use checkpoint_canon::{
     CHECKPOINT_CANON_VERSION, CONFIG_CANON_VERSION, CanonFault, PANE_CARRY_CANON_VERSION,
     POLICY_CANON_VERSION, are_canonical_hyperlink_schemes, policy_canonical, policy_from_canonical,
 };
+#[cfg(feature = "serde")]
+pub use checkpoint_cells::VisibleCellsRepr;
 pub use checkpoint_holder::{
     HolderAnchorRepr, HolderMarkRepr, HolderRepr, HolderSealRepr, HolderSpanRepr,
 };

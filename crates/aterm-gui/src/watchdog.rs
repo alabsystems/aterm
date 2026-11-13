@@ -34,9 +34,17 @@
 //! counting through a suspend there, so each wake reads how long the machine was suspended
 //! (`suspended`) and the sampler's clock skips it (`Sampler::skip`): a sleep is neither a
 //! stall nor a span this process "was not running".
+//!
+//! The launch is judged too ([`launching`], [`Breadcrumb::Launching`]): before the event loop's
+//! first root the breadcrumb was `Startup`, a park point, so a main thread stuck inside AppKit's
+//! launch (m16's 0.187.0 successors, 15 of 15, behind an alert no window showed) was never
+//! reported. A launch not finished [`LAUNCH_STALL_BAR`] after it began is logged with the AppKit
+//! stage it reached and a main-thread sample. A handoff successor whose parent reads no progress
+//! exits with a named code when its launch is still unfinished at its bound; one whose parent
+//! reads progress leaves the verdict to that parent ([`launch_stall_policy`]).
 
 use crate::label_enum::label_enum;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn sample_interval() -> Duration {
@@ -52,6 +60,95 @@ const STALL_REPEAT_INTERVAL: Duration = Duration::from_secs(60);
 /// thread that wakes between samples is sampled on the interval with no ring (a ring is a wake
 /// of the sampler's and a `write(2)` of the main thread's).
 const QUIET_SAMPLES: u32 = 4;
+
+/// A launch not finished this long after it began is reported, in either lane, with a
+/// main-thread sample. Healthy ones take well under a second (m16's one journaled pre-dial AppKit
+/// launch: 79 ms), and 2 s is far under any outgoing build's dial bound (30 s in 0.177.0), so a
+/// successor's line and its sample are in aterm.log long before its outgoing process gives up.
+/// Not the exit: a loaded Mac can slow a healthy launch past it.
+const LAUNCH_STALL_BAR: Duration = Duration::from_secs(2);
+
+/// A handoff successor whose parent reads no progress ([`launch_stall_policy`]) and whose AppKit
+/// launch has not finished this long after the PROCESS began (the kernel's start record, not the
+/// launch's start) exits ([`OnLaunchStall::Exit`], [`launch_exit_after`]), unless that would give
+/// the launch less than [`LAUNCH_EXIT_FLOOR`]. Why from the birth: the outgoing process waits for
+/// the dial 30 s from its launch request in 0.177.0, a clock that starts before this process
+/// does, and the successor's own start before the watch (dyld, the config read, the warm
+/// prologue, the boot apply) runs unbounded; counted from the birth, that start is inside the
+/// bound instead of added to it. Why 20 s: LaunchServices' start of this process and the
+/// outgoing process's notice of the exit fit in the rest, and a healthy launch is hundreds of
+/// times shorter, so a launch this late has stopped (behind an alert no window shows, or a
+/// deadlock), not slowed.
+const LAUNCH_EXIT_BOUND: Duration = Duration::from_secs(20);
+
+/// The least time a launch that exits gets, however late it began ([`launch_exit_after`]): four
+/// times the report bar and about a hundred times m16's measured healthy launch (79 ms), so a
+/// launch a loaded Mac slowed past its report is not condemned for it; one frozen in a single
+/// stage this long has stopped.
+const LAUNCH_EXIT_FLOOR: Duration = Duration::from_secs(8);
+
+/// The shortest dial bound of any outgoing build that hands off to this one (0.177.0's).
+const OLDEST_DIAL_BOUND: Duration = Duration::from_secs(30);
+
+const _: () = assert!(
+    LAUNCH_STALL_BAR.as_millis() * 5 <= LAUNCH_EXIT_BOUND.as_millis()
+        && LAUNCH_EXIT_BOUND.as_millis() + 5_000 <= OLDEST_DIAL_BOUND.as_millis(),
+    "the report comes well before the exit, and the exit at least 5 s before the outgoing \
+     process's dial bound"
+);
+
+const _: () = assert!(
+    LAUNCH_EXIT_FLOOR.as_millis() >= LAUNCH_STALL_BAR.as_millis() * 4
+        && LAUNCH_EXIT_FLOOR.as_millis() <= LAUNCH_EXIT_BOUND.as_millis(),
+    "a launch that exits gets at least four report bars, and the floor lies within the bound"
+);
+
+/// How long a launch that exits ([`OnLaunchStall::Exit`]), beginning `age` after the process did,
+/// may go unfinished before it exits: what is left of [`LAUNCH_EXIT_BOUND`] since the birth, but
+/// never less than [`LAUNCH_EXIT_FLOOR`]. 0.177.0's 30 s dial clock starts at its launch request,
+/// before this process's birth, and the bound leaves the rest of its 30 s, 10 s, for
+/// LaunchServices' start of this process (before the birth) and the outgoing process's notice of
+/// the exit (after it). Where the exit lands follows
+/// from `age` in three ranges. Up to 12 s (the bound less the floor) the exit comes 20 s after the
+/// birth, the same point of the outgoing process's dial wait whatever the start took. From
+/// 12 s to 22 s (the 30 s less the floor) the floor moves the exit later, up to 30 s after the
+/// birth: it eats that margin, so it can come after 0.177.0's dial bound. Past 22 s it comes more
+/// than 30 s after the birth, always after that bound, where 0.177.0 books TimedOut as it did
+/// before the launch watch existed. An unread birth (`None`) counts the bound from the launch's
+/// start.
+#[cfg(any(target_os = "macos", test))]
+fn launch_exit_after(age: Option<Duration>) -> Duration {
+    LAUNCH_EXIT_BOUND
+        .saturating_sub(age.unwrap_or_default())
+        .max(LAUNCH_EXIT_FLOOR)
+}
+
+/// What a handoff successor's launch before its dial does past its report, from whether its
+/// parent reads progress (`seamless::parent_reads_progress`, the `progress1` offer) and how long
+/// after the process's birth the launch begins (`age`; `None`: unread).
+///
+/// A parent that reads progress judges a hang before the dial itself: a dial that ends at its
+/// deadline while the successor LaunchServices named to it still runs is booked Stalled, an
+/// unexplained failure whose repeats converge. So the launch only reports
+/// ([`OnLaunchStall::Log`]) and the parent's verdict stands; an exit here would be booked
+/// structural, against the bytes, even where a loaded Mac had only slowed the launch. A parent
+/// that reads no progress (an older build: 0.177.0 waits 30 s for the dial and books its end
+/// TimedOut, a transient it retries) learns of the hang only from the successor's exit, so the
+/// launch exits with `seamless::EXIT_SUCCESSOR_LAUNCH_STALLED` after [`launch_exit_after`].
+#[cfg(any(target_os = "macos", all(unix, test)))]
+pub(crate) fn launch_stall_policy(
+    parent_reads_progress: bool,
+    age: Option<Duration>,
+) -> OnLaunchStall {
+    if parent_reads_progress {
+        OnLaunchStall::Log
+    } else {
+        OnLaunchStall::Exit {
+            after: launch_exit_after(age),
+            code: crate::seamless::EXIT_SUCCESSOR_LAUNCH_STALLED,
+        }
+    }
+}
 
 /// The sampler's doorbell: a pipe on Unix, an event on Windows.
 #[cfg(unix)]
@@ -74,10 +171,16 @@ pub(crate) struct MainWatch {
     /// beat takes this claim and rings [`MainWatch::bell`]. Set and read against `breadcrumb` in
     /// sequentially consistent order ([`MainWatch::claim_rest`], [`beat_into`]).
     resting: AtomicBool,
-    /// The sampler's doorbell, made as it starts; `None` where no pipe could be made (it then
-    /// never rests).
+    /// The sampler's doorbell ([`Bell`]), made by whichever comes first: the judging sampler as it
+    /// starts (before it chooses its first pace) or a ring ([`MainWatch::ring`]), so no ring is
+    /// lost. A loop that judges nothing never polls it (it hears the wall alone). `None` where no
+    /// pipe (Unix) or event (Windows) could be made (the sampler then never rests).
     #[cfg(any(unix, windows))]
     bell: std::sync::OnceLock<Option<Bell>>,
+    /// The current launch's exit bound in milliseconds ([`OnLaunchStall::Exit`]); 0: it only logs.
+    launch_exit_ms: AtomicU64,
+    /// The code that exit leaves with.
+    launch_exit_code: AtomicI32,
 }
 
 impl MainWatch {
@@ -90,6 +193,41 @@ impl MainWatch {
             resting: AtomicBool::new(false),
             #[cfg(any(unix, windows))]
             bell: std::sync::OnceLock::new(),
+            launch_exit_ms: AtomicU64::new(0),
+            launch_exit_code: AtomicI32::new(0),
+        }
+    }
+
+    /// Set what the launch about to begin does past its report ([`launching`]).
+    fn set_launch_policy(&self, on_stall: OnLaunchStall) {
+        let (ms, code) = match on_stall {
+            OnLaunchStall::Log => (0, 0),
+            OnLaunchStall::Exit { after, code } => (
+                u64::try_from(after.as_millis()).unwrap_or(u64::MAX).max(1),
+                code,
+            ),
+        };
+        self.launch_exit_code.store(code, Ordering::SeqCst);
+        self.launch_exit_ms.store(ms, Ordering::SeqCst);
+    }
+
+    /// The breadcrumb and what the current launch does past its report, read so that a
+    /// `Launching` read comes with that launch's policy: [`launching`] stores the policy before its
+    /// beat stamps the breadcrumb with a `SeqCst` swap (a release), and the breadcrumb is read
+    /// here with `Acquire` before the policy.
+    fn launch_state(&self) -> (Breadcrumb, OnLaunchStall) {
+        let bc = Breadcrumb::from_u8(self.breadcrumb.load(Ordering::Acquire));
+        (bc, self.on_launch_stall())
+    }
+
+    /// What the current launch does past its report, as [`launching`] set it.
+    fn on_launch_stall(&self) -> OnLaunchStall {
+        match self.launch_exit_ms.load(Ordering::SeqCst) {
+            0 => OnLaunchStall::Log,
+            ms => OnLaunchStall::Exit {
+                after: Duration::from_millis(ms),
+                code: self.launch_exit_code.load(Ordering::SeqCst),
+            },
         }
     }
 
@@ -128,10 +266,17 @@ impl MainWatch {
     /// A beat's half of the claim: ring the resting sampler once.
     fn ring_if_resting(&self) {
         if self.resting.load(Ordering::SeqCst) && self.resting.swap(false, Ordering::SeqCst) {
-            #[cfg(any(unix, windows))]
-            if let Some(bell) = self.bell.get().and_then(Option::as_ref) {
-                bell.ring();
-            }
+            self.ring();
+        }
+    }
+
+    /// Ring the sampler's doorbell, which ends its wait whether it rests or waits for its next
+    /// sample. A ring that comes first makes the doorbell, so a wait that follows finds it rung:
+    /// no ring is lost, however the sampler's start and the ring fall.
+    fn ring(&self) {
+        #[cfg(any(unix, windows))]
+        if let Some(bell) = self.bell() {
+            bell.ring();
         }
     }
 
@@ -140,7 +285,7 @@ impl MainWatch {
     }
 
     fn parked(&self) -> bool {
-        Breadcrumb::from_u8(self.breadcrumb.load(Ordering::Acquire)).is_park_point()
+        Breadcrumb::from_u8(self.breadcrumb.load(Ordering::Acquire)).lets_a_fork_go()
     }
 
     fn wait_for_park(&self, bound: Duration) -> bool {
@@ -198,6 +343,12 @@ label_enum! {
         /// `NewEvents`) or has ended, and teardown is waiting for accepted work to
         /// become durable.
         ShutdownWait => "shutdown_wait",
+        /// The launch ([`launching`]): a handoff successor's AppKit launch before its dial, and
+        /// every windowed launch from `run_app` until the loop's first root beats (AppKit's
+        /// launch there, and the first `Init` and `Resumed`, which enter no root). Judged
+        /// against [`LAUNCH_STALL_BAR`], not the stall threshold. Otherwise it is `Startup`: it
+        /// books no turn, refuses no control verb and holds no fork.
+        Launching => "launching",
     }
 }
 
@@ -223,6 +374,19 @@ impl Breadcrumb {
                 | Breadcrumb::Modal
                 | Breadcrumb::ShutdownWait
         )
+    }
+
+    /// Whether a turn ended here is aterm's handler work, booked in the turn census: a work
+    /// root's. The launch is judged but not booked: it was `Startup` until the launch watch, and
+    /// AppKit's launch is no handler of aterm's.
+    const fn books_turns(self) -> bool {
+        !self.is_park_point() && !matches!(self, Breadcrumb::Launching)
+    }
+
+    /// Whether a fork waiting for the main thread to park goes at once here: at a park point, and
+    /// in the launch, as it did at `Startup` before the launch was judged.
+    const fn lets_a_fork_go(self) -> bool {
+        self.is_park_point() || matches!(self, Breadcrumb::Launching)
     }
 }
 
@@ -270,7 +434,9 @@ fn main_stall(
     returned: bool,
     hop_since_ns: Option<u64>,
 ) -> Option<MainStall> {
-    if last_beat_ns == 0 {
+    // A verb sent during the launch waits for the loop's first turn, as it did at `Startup`; the
+    // launch watch reports a launch that does not come to one.
+    if last_beat_ns == 0 || root == Breadcrumb::Launching {
         return None;
     }
     let quiet = Duration::from_nanos(now_ns.saturating_sub(last_beat_ns));
@@ -345,6 +511,10 @@ struct Sampler {
     open: Option<OpenStall>,
     /// A reported stall that has since ended, waiting for [`Sampler::take_ended`].
     ended: Option<Ended>,
+    /// The bar the launch is judged against ([`LAUNCH_STALL_BAR`]; a test's is shorter).
+    launch_bar: Duration,
+    /// This launch's exit was already decided ([`Sampler::leave_due`]), until the next beat.
+    left: bool,
 }
 
 /// A reported stall that has not ended yet ([`Sampler::open`]).
@@ -390,6 +560,25 @@ impl Sampler {
             busy_since: None,
             open: None,
             ended: None,
+            launch_bar: LAUNCH_STALL_BAR,
+            left: false,
+        }
+    }
+
+    /// This sampler judging the launch against `bar` instead of [`LAUNCH_STALL_BAR`].
+    const fn with_launch_bar(self, bar: Duration) -> Self {
+        Self {
+            launch_bar: bar,
+            ..self
+        }
+    }
+
+    /// The bar a stall at `bc` is judged against.
+    fn bar(&self, bc: Breadcrumb) -> Duration {
+        if bc == Breadcrumb::Launching {
+            self.launch_bar
+        } else {
+            self.threshold
         }
     }
 
@@ -403,12 +592,32 @@ impl Sampler {
             ..stall
         });
         let ended = self.ended.take();
-        *self = Self::with_threshold(now, beat, self.threshold);
+        *self = Self::with_threshold(now, beat, self.threshold).with_launch_bar(self.launch_bar);
         self.open = open;
         self.ended = ended;
         if moved {
             self.end_open(now, EndedBy::Beat);
         }
+    }
+
+    /// The launch's exit, decided once: the launch frozen this long when, at
+    /// [`Breadcrumb::Launching`] with an exit bound (`after`), it has gone that long without a beat.
+    /// Call after [`Sampler::wake`] for the same reading, which brought the heartbeat's clock up to
+    /// it (a process gap restarts it there, so time this process did not run is not charged).
+    fn leave_due(
+        &mut self,
+        now: Instant,
+        beat: u64,
+        bc: Breadcrumb,
+        after: Option<Duration>,
+    ) -> Option<Duration> {
+        let after = after.filter(|_| bc == Breadcrumb::Launching && beat == self.last_beat)?;
+        let frozen = now.saturating_duration_since(self.last_advance);
+        if self.left || frozen < after {
+            return None;
+        }
+        self.left = true;
+        Some(frozen)
     }
 
     /// The machine was suspended for `slept` of the span since the last wake, and the clock
@@ -483,6 +692,7 @@ impl Sampler {
             self.last_advance = now;
             self.clear_reports();
             self.busy_since = None;
+            self.left = false;
             return None;
         }
         if bc.is_park_point() {
@@ -519,7 +729,7 @@ impl Sampler {
             }
         }
         let frozen = now.saturating_duration_since(self.last_advance);
-        if !is_stall_at(bc, frozen, self.threshold) || !self.report_due(now) {
+        if !is_stall_at(bc, frozen, self.bar(bc)) || !self.report_due(now) {
             return None;
         }
         let since = self.last_advance;
@@ -884,7 +1094,7 @@ impl TurnLedger {
     }
 
     fn attributable_span(previous: Breadcrumb, open_ns: u64, now_ns: u64) -> Option<u64> {
-        if open_ns == 0 || previous.is_park_point() {
+        if open_ns == 0 || !previous.books_turns() {
             return None;
         }
         Some(now_ns.saturating_sub(open_ns))
@@ -1082,6 +1292,54 @@ impl Drop for RootGuard {
         }
         self.main.returned.store(true, Ordering::Relaxed);
     }
+}
+
+/// What a launch still unfinished past its report does ([`launching`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OnLaunchStall {
+    /// Nothing more: the report is all, and the launch goes on (an ordinary launch, and a handoff
+    /// successor whose parent reads progress, which judges a hang before the dial itself:
+    /// [`launch_stall_policy`]).
+    Log,
+    /// A launch unfinished `after` its start ([`launch_exit_after`]: what is left of the bound
+    /// since the process's birth, never under the floor) exits with `code`: the AppKit launch
+    /// before its dial of a handoff successor whose parent reads no progress
+    /// ([`launch_stall_policy`]), so that parent, which keeps every session meanwhile, sees the
+    /// successor exit by itself. It books that exit as structural only where it watches the
+    /// successor's pid, which LaunchServices named to it, and sees the exit before its dial bound;
+    /// one LaunchServices never named reads as gone before its check-in, a death no outgoing
+    /// process observed.
+    Exit { after: Duration, code: i32 },
+}
+
+/// Enter the launch ([`Breadcrumb::Launching`]): judged from now until the next root's beat or
+/// [`launch_finished`], and what a stall past the report does. Call on the main thread, with the
+/// sampler armed ([`arm`]).
+pub(crate) fn launching(on_stall: OnLaunchStall) {
+    launching_on(&MAIN, on_stall);
+}
+
+fn launching_on(main: &MainWatch, on_stall: OnLaunchStall) {
+    // The policy before the breadcrumb: the beat's `SeqCst` swap releases it, and a sampler that
+    // reads `Launching` with `Acquire` ([`MainWatch::launch_state`]) reads this launch's.
+    main.set_launch_policy(on_stall);
+    beat_on(main, Breadcrumb::Launching);
+    // A sampler waiting for its next sample samples now too (a beat rings only a resting one), so
+    // the launch's clock starts at its beat and the launch's pace applies from there.
+    main.ring();
+}
+
+/// AppKit's launch finished before the event loop runs (a handoff successor's, before its dial):
+/// the synchronous launch goes on at `Startup`, unjudged, as before the launch began.
+#[cfg(target_os = "macos")]
+pub(crate) fn launch_finished() {
+    launch_finished_on(&MAIN);
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launch_finished_on(main: &MainWatch) {
+    beat_on(main, Breadcrumb::Startup);
+    main.launch_exit_ms.store(0, Ordering::SeqCst);
 }
 
 /// The turn census, for the `metrics` verb.
@@ -1480,8 +1738,8 @@ fn abort_on_stall() -> bool {
     abort_on_stall_for(seam().as_deref())
 }
 
-/// How the sampler judges: its bar, its pace, whether a stall aborts, and the main thread's
-/// probes (a test's are inert).
+/// How the sampler judges: its bars, its pace, whether a stall aborts, the main thread's probes
+/// and how a stalled launch leaves (a test's are inert).
 #[derive(Clone, Copy)]
 struct Judge {
     threshold: Duration,
@@ -1489,6 +1747,66 @@ struct Judge {
     abort: bool,
     cpu: fn() -> Option<Duration>,
     stack: fn() -> Option<Vec<String>>,
+    /// The launch's bar ([`LAUNCH_STALL_BAR`]). The launch's beat ends the sampler's wait,
+    /// whichever it was in ([`launching`]), and from that sample on it samples at [`Judge::pace`],
+    /// at most half this bar, so a launch frozen from its start is reported at most half a bar
+    /// past its bar.
+    launch_bar: Duration,
+    /// Where AppKit's launch has come, in words (`None` off macOS).
+    stage: fn() -> Option<&'static str>,
+    /// Leave the process with this code ([`OnLaunchStall::Exit`]); a test's records it and
+    /// returns.
+    leave: fn(i32),
+}
+
+impl Judge {
+    /// How long the sampler waits before its next sample with the main thread at `bc`.
+    fn pace(&self, bc: Breadcrumb) -> Duration {
+        if bc == Breadcrumb::Launching {
+            self.sample.min(self.launch_bar / 2)
+        } else {
+            self.sample
+        }
+    }
+}
+
+/// Where AppKit's launch has come, for the launch's report.
+#[cfg(target_os = "macos")]
+fn launch_stage_words() -> Option<&'static str> {
+    use aterm_window::platform::macos::{AppKitLaunchStage, appkit_launch_stage};
+    Some(match appkit_launch_stage() {
+        AppKitLaunchStage::NotRun => {
+            "before AppKit's launch ran (`-[NSApplication run]` not entered yet): where a handoff \
+             successor builds its event loop, whose `+[NSApplication sharedApplication]` checks \
+             in with LaunchServices"
+        }
+        AppKitLaunchStage::Running => {
+            "inside `-[NSApplication run]`, before `applicationDidFinishLaunching:` (AppKit's own \
+             launch work, window restoration, and any alert it raises there, which no window of \
+             aterm's shows yet)"
+        }
+        AppKitLaunchStage::DidFinish => {
+            "inside `applicationDidFinishLaunching:` (aterm-window's setup, then the `Init` and \
+             `Resumed` it hands the handler installed then: aterm's own in an ordinary launch, a \
+             no-op one in a handoff successor's launch before its dial)"
+        }
+        AppKitLaunchStage::Finished => {
+            "after AppKit's launch finished, before the event loop's first turn (in a handoff \
+             successor, aterm's first `Init` and `Resumed`, which its event loop hands aterm as \
+             it starts)"
+        }
+    })
+}
+
+/// Off macOS there is no AppKit launch to name.
+#[cfg(not(target_os = "macos"))]
+const fn launch_stage_words() -> Option<&'static str> {
+    None
+}
+
+/// The production [`Judge::leave`]: the launch-fatal exit, its crash marker released.
+fn leave_now(code: i32) {
+    crate::exit_without_process_teardown(code)
 }
 
 /// What the loop did, for a test's eyes ([`run`]); production passes a closure that ignores it
@@ -1503,13 +1821,48 @@ enum Seen {
     Hit(Breadcrumb),
     /// The wall moved, heard from the system or (with no wall watch) the clocks' drift.
     WallMoved,
+    /// A stalled launch left with this code ([`OnLaunchStall::Exit`]): seen only after
+    /// [`Judge::leave`] returned, which a test's does and production's never does.
+    Left(i32),
 }
 
-/// Spawn the background stall sampler; call once, just before `run_app`. `on_wall_moved` runs
-/// on its thread whenever the system announces a sleep's wake or a wall-clock step
-/// ([`aterm_uds::wall_watch`]), also with the stall judging switched off (`ATERM_WATCHDOG=off`);
-/// where the system announces neither, the sampler hears both by its clocks' drift as before.
+/// The sampler is running (or found nothing to run: no judging and no wall watch).
+static ARMED: std::sync::Once = std::sync::Once::new();
+
+/// What a wall move does, once [`start`] installed it; until then (during the launch) nothing.
+type WallMoved = Box<dyn Fn() + Send>;
+static ON_WALL_MOVED: std::sync::Mutex<Option<WallMoved>> = std::sync::Mutex::new(None);
+
+fn wall_moved() {
+    if let Some(on_wall_moved) = ON_WALL_MOVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+    {
+        on_wall_moved();
+    }
+}
+
+/// Spawn the background stall sampler if it is not running yet; call on the main thread, which
+/// it registers as the thread it probes. A handoff successor arms it before its AppKit launch
+/// ([`launching`]); [`start`] arms it in every launch.
+pub(crate) fn arm() {
+    ARMED.call_once(spawn_sampler);
+}
+
+/// Install what a wall move does and arm the sampler ([`arm`]); call once, just before `run_app`.
+/// `on_wall_moved` runs on the sampler's thread whenever the system announces a sleep's wake or a
+/// wall-clock step ([`aterm_uds::wall_watch`]), also with the stall judging switched off
+/// (`ATERM_WATCHDOG=off`); where the system announces neither, the sampler hears both by its
+/// clocks' drift as before.
 pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
+    *ON_WALL_MOVED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Box::new(on_wall_moved));
+    arm();
+}
+
+fn spawn_sampler() {
     let judge = enabled().then(|| {
         crate::main_thread_probe::register();
         let threshold = threshold();
@@ -1519,6 +1872,9 @@ pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
             abort: abort_on_stall(),
             cpu: crate::main_thread_probe::cpu_time,
             stack: crate::main_thread_probe::stack,
+            launch_bar: LAUNCH_STALL_BAR,
+            stage: launch_stage_words,
+            leave: leave_now,
         }
     });
     #[cfg(any(unix, windows))]
@@ -1529,7 +1885,7 @@ pub(crate) fn start(on_wall_moved: impl Fn() + Send + 'static) {
         return;
     }
     let builder = std::thread::Builder::new().name("aterm-watchdog".into());
-    let _ = builder.spawn(move || run(&MAIN, judge, wall.as_ref(), &on_wall_moved, &|_| true));
+    let _ = builder.spawn(move || run(&MAIN, judge, wall.as_ref(), &wall_moved, &|_| true));
 }
 
 /// Where no wall watch exists (off Unix and Windows): never made.
@@ -1554,18 +1910,18 @@ const STEPS_ANNOUNCED: bool = false;
 /// of the sampler's per this span while it rests.
 const STEP_POLL: Duration = Duration::from_secs(10);
 
-/// The deadline of a sampler wait that starts at `asleep`: the next sample (`sample` on) off a
-/// rest; on a rest, none where `steps_announced` (the wall watch rings for a step) and
-/// [`STEP_POLL`] on where it does not, so the clocks are read for a step that nothing would
-/// ring for. PURE.
+/// The deadline of a sampler wait that starts at `asleep`: the next sample (`pace` on: the
+/// sample interval, or the launch's shorter one, [`Judge::pace`]) off a rest; on a rest, none
+/// where `steps_announced` (the wall watch rings for a step) and [`STEP_POLL`] on where it does
+/// not, so the clocks are read for a step that nothing would ring for. PURE.
 fn wait_until(
     rest: bool,
     asleep: Instant,
-    sample: Duration,
+    pace: Duration,
     steps_announced: bool,
 ) -> Option<Instant> {
     if !rest {
-        Some(asleep + sample)
+        Some(asleep + pace)
     } else if steps_announced {
         None
     } else {
@@ -1573,12 +1929,14 @@ fn wait_until(
     }
 }
 
-/// Wait until `until` (`None`: no deadline) or until the doorbell or the wall watch polls ready;
-/// a failing poll, or nothing to poll, sleeps until `until` (or a `fallback` with no deadline),
-/// never a spin. `true` when the wall watch may have news (it polled ready, or nothing was
-/// polled), so a sample with nothing from it reads nothing of it.
+/// Wait until `until` (`None`: no deadline) or until the doorbell (polled where `rings`, and the
+/// caller clears it) or the wall watch polls ready (`poll(2)` on Unix, `WaitForMultipleObjects`
+/// on Windows); a failing poll, or nothing to poll, sleeps until `until` (or a `fallback` with no
+/// deadline), never a spin. `true` when the wall watch may have news (it polled ready, or nothing
+/// was polled), so a sample with nothing from it reads nothing of it.
 fn wait(
     main: &MainWatch,
+    rings: bool,
     wall: Option<&WallSource>,
     until: Option<Instant>,
     fallback: Duration,
@@ -1586,7 +1944,10 @@ fn wait(
     #[cfg(unix)]
     {
         let mut fds = Vec::with_capacity(3);
-        let bell = main.bell().map(aterm_uds::ready::Doorbell::fd);
+        let bell = rings
+            .then(|| main.bell())
+            .flatten()
+            .map(aterm_uds::ready::Doorbell::fd);
         let first_wall = usize::from(bell.is_some());
         fds.extend(bell);
         fds.extend(wall.into_iter().flat_map(WallSource::fds));
@@ -1599,7 +1960,7 @@ fn wait(
     #[cfg(windows)]
     {
         let mut bells = Vec::with_capacity(2);
-        let bell = main.bell();
+        let bell = rings.then(|| main.bell()).flatten();
         let first_wall = usize::from(bell.is_some());
         bells.extend(bell);
         bells.extend(wall.map(WallSource::bell));
@@ -1610,7 +1971,7 @@ fn wait(
         }
     }
     #[cfg(not(any(unix, windows)))]
-    let _ = (main, wall);
+    let _ = (main, rings, wall);
     let left = until.map_or(fallback, |until| {
         until.saturating_duration_since(Instant::now())
     });
@@ -1670,7 +2031,9 @@ fn run(
         while seen(Seen::Waits { rest: true }) {
             let asleep = Instant::now();
             let until = wait_until(true, asleep, Duration::ZERO, STEPS_ANNOUNCED);
-            let heard = wait(main, wall, until, Duration::from_secs(60)) && heard_wall(wall);
+            // The wall alone: with nothing judged, a ring (a launch's, [`launching`]) has nothing
+            // to wake, and a doorbell this loop polled but never cleared would wake it on and on.
+            let heard = wait(main, false, wall, until, Duration::from_secs(60)) && heard_wall(wall);
             #[cfg(windows)]
             let stepped = {
                 let here = Clocks::now();
@@ -1697,20 +2060,28 @@ fn run(
         abort,
         cpu,
         stack,
+        launch_bar,
+        stage,
+        leave,
     } = judge;
+    // The doorbell is made before the first pace is chosen, wall watch or not, so a ring that
+    // comes before the first wait (a launch's beat, [`launching`]) is held for it, never lost.
     #[cfg(any(unix, windows))]
-    let can_rest = wall.is_some() && main.bell().is_some();
+    let rings = main.bell().is_some();
+    #[cfg(any(unix, windows))]
+    let can_rest = rings && wall.is_some();
     #[cfg(not(any(unix, windows)))]
     let can_rest = false;
     aterm_log::info!(
-        "main-thread stall watchdog armed (sample {sample:?}, threshold {threshold:?}, repeat \
-         {STALL_REPEAT_INTERVAL:?}, abort={abort}, rests={can_rest})"
+        "main-thread stall watchdog armed (sample {sample:?}, threshold {threshold:?}, launch \
+         bar {launch_bar:?}, repeat {STALL_REPEAT_INTERVAL:?}, abort={abort}, rests={can_rest})"
     );
     let mut last = Clocks::now();
     #[cfg(windows)]
     let mut awake = aterm_sysprobe::power::windows::unbiased_time();
     let mut sampler =
-        Sampler::with_threshold(last.mono, main.heartbeat.load(Ordering::Relaxed), threshold);
+        Sampler::with_threshold(last.mono, main.heartbeat.load(Ordering::Relaxed), threshold)
+            .with_launch_bar(launch_bar);
     let mut cpu_read = cpu().is_some();
     // Samples in a row that found no beat since the one before ([`QUIET_SAMPLES`]).
     let mut quiet = 0_u32;
@@ -1719,12 +2090,15 @@ fn run(
         let asleep = Instant::now();
         let rest =
             can_rest && quiet >= QUIET_SAMPLES && sampler.settled() && main.claim_rest(cpu_read);
+        // Chosen before the wait is told: a launch whose beat comes after this wakes it by its
+        // ring ([`launching`]), not by this pace.
+        let pace = judge.pace(main.current());
         if !seen(Seen::Waits { rest }) {
             main.resting.store(false, Ordering::SeqCst);
             return;
         }
-        let until = wait_until(rest, asleep, sample, STEPS_ANNOUNCED);
-        let wall_ready = wait(main, wall, until, sample);
+        let until = wait_until(rest, asleep, pace, STEPS_ANNOUNCED);
+        let wall_ready = wait(main, true, wall, until, pace);
         if rest {
             main.resting.store(false, Ordering::SeqCst);
         }
@@ -1760,7 +2134,7 @@ fn run(
             elapsed.wall = Some(elapsed.mono);
             elapsed.mono
         } else {
-            sample
+            pace
         };
         let reading = cpu();
         cpu_read = reading.is_some();
@@ -1772,7 +2146,14 @@ fn run(
             (true, false) => quiet.saturating_add(1),
         };
         last_beat = beat;
-        let wake = sampler.wake(here.mono, requested, elapsed, beat, main.current(), reading);
+        // A `Launching` read here comes with this launch's policy ([`MainWatch::launch_state`]).
+        let (bc, on_stall) = main.launch_state();
+        let wake = sampler.wake(here.mono, requested, elapsed, beat, bc, reading);
+        let exit_after = match on_stall {
+            OnLaunchStall::Exit { after, .. } => Some(after),
+            OnLaunchStall::Log => None,
+        };
+        let left = sampler.leave_due(here.mono, beat, bc, exit_after);
         let _ = seen(Seen::Sampled);
         last = here;
         // With a wall watch, only a step it cannot announce (Windows) is still read off the
@@ -1797,7 +2178,14 @@ fn run(
         for line in wake.notices() {
             aterm_log::warn!("{line}");
         }
-        if let Some(hit) = wake.hit {
+        if let Some(hit) = wake.hit.filter(|hit| hit.root == Breadcrumb::Launching) {
+            let _ = seen(Seen::Hit(hit.root));
+            aterm_log::warn!(
+                "{}",
+                launch_stall_message(sampler.reports, hit.frozen, stage(), on_stall, hit.busy)
+            );
+            log_stack(stack, aterm_log::Level::Warn);
+        } else if let Some(hit) = wake.hit {
             let _ = seen(Seen::Hit(hit.root));
             let locus = if main.returned.load(Ordering::Relaxed) {
                 Locus::Returned
@@ -1815,13 +2203,7 @@ fn run(
                     hit.busy
                 )
             );
-            let captured = SystemTime::now();
-            if let Some(frames) = stack() {
-                let cap = aterm_log::record_cap(aterm_log::Level::Error);
-                for line in stack_lines(&frames, captured, cap) {
-                    aterm_log::error!("{line}");
-                }
-            }
+            log_stack(stack, aterm_log::Level::Error);
             if abort {
                 let _ = crate::logging::flush_within(crate::logging::LOG_FLUSH_EXIT_WAIT);
                 #[expect(
@@ -1831,7 +2213,77 @@ fn run(
                 std::process::abort();
             }
         }
+        if let (Some(frozen), OnLaunchStall::Exit { code, .. }) = (left, on_stall) {
+            let line = launch_exit_message(frozen, stage(), code);
+            aterm_log::error!("{line}");
+            log_stack(stack, aterm_log::Level::Error);
+            crate::logging::stderr_line!("aterm-gui: {line}");
+            // The exit first: production's never returns, so a test sees `Left` only after its own
+            // `leave` ran and recorded the code.
+            leave(code);
+            let _ = seen(Seen::Left(code));
+        }
     }
+}
+
+/// The main thread's stack, sampled now, in numbered lines at `level`.
+fn log_stack(stack: fn() -> Option<Vec<String>>, level: aterm_log::Level) {
+    let captured = SystemTime::now();
+    let Some(frames) = stack() else {
+        return;
+    };
+    for line in stack_lines(&frames, captured, aterm_log::record_cap(level)) {
+        match level {
+            aterm_log::Level::Error => aterm_log::error!("{line}"),
+            _ => aterm_log::warn!("{line}"),
+        }
+    }
+}
+
+/// The launch's report: how long it has gone unfinished, the AppKit stage it reached, and what
+/// comes next. Words only: a test reads them, the log keeps them.
+fn launch_stall_message(
+    reports: u32,
+    frozen: Duration,
+    stage: Option<&str>,
+    on_stall: OnLaunchStall,
+    busy: bool,
+) -> String {
+    let at = stage.unwrap_or("in the event loop's start, before its first turn");
+    let cpu = if busy {
+        ", ON-CPU the whole time (a spin, not a park)"
+    } else {
+        ""
+    };
+    if reports > 1 {
+        return format!(
+            "LAUNCH STALL CONTINUES: the launch still has not finished after {frozen:?}, {at}{cpu}."
+        );
+    }
+    let next = match on_stall {
+        OnLaunchStall::Log => "This launch only reports it and goes on waiting.".to_string(),
+        OnLaunchStall::Exit { after, code } => format!(
+            "This handoff successor's parent reads no progress, so it exits with {code} if its \
+             launch has not finished {after:?} after it began: the outgoing process keeps every \
+             session and, where it sees the exit before its dial bound, books this build's launch \
+             as structural, which a newer build replaces."
+        ),
+    };
+    format!(
+        "LAUNCH STALL: the launch has not finished {frozen:?} after it began, {at}{cpu}; a \
+         healthy one takes well under a second. {next} The stack lines that follow name the frame."
+    )
+}
+
+/// The line a stalled handoff successor leaves with ([`OnLaunchStall::Exit`]).
+fn launch_exit_message(frozen: Duration, stage: Option<&str>, code: i32) -> String {
+    let at = stage.unwrap_or("in the event loop's start, before its first turn");
+    format!(
+        "aterm could not start: the launch stalled {frozen:?}, {at}; this handoff successor, \
+         whose parent reads no progress, exits with {code}: the outgoing process keeps every \
+         session and, where it sees the exit before its dial bound, books this build's launch as \
+         structural, which a newer build replaces."
+    )
 }
 
 #[cfg(test)]

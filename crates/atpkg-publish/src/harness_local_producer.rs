@@ -15,33 +15,57 @@ use crate::artifact::build_local::{self, Plan};
 use crate::artifact::tools::{Run, Tools};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::rest::{GitAuth, git_environment_removals, git_tracing_environment};
+use crate::git::{git_environment_removals, git_tracing_environment};
 
-fn source_git(
-    tools: &dyn Tools,
-    config: &Config,
-    args: &[&str],
-    auth: Option<&GitAuth>,
-) -> Result<String> {
+/// The names a harness-checkout git's environment drops: every ambient repository selector,
+/// then [`git_environment_removals`] (ambient tokens, trace and shell start-up selectors, and
+/// agh's runner-only `AGH_GIT_*`). The variables [`source_git`] then sets are git and SSH
+/// hygiene alone, so this process's environment without these names is the one git, and the
+/// credential helper git starts, read agh's routing from ([`FetchEnv`]).
+fn source_git_removals() -> Vec<String> {
+    let mut removed: Vec<String> = [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_NAMESPACE",
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    removed.extend(git_environment_removals());
+    removed
+}
+
+/// This process's environment as a harness-checkout git, and the credential helper it starts,
+/// sees it: without each name in `removed` ([`source_git_removals`]). An agh.toml profile whose
+/// `token_env` names a removed variable (`GH_TOKEN`, say) is absent here, as it is to the helper.
+struct FetchEnv {
+    removed: Vec<String>,
+}
+
+impl agh::identity::EnvSource for FetchEnv {
+    fn var_os(&self, name: &str) -> Option<std::ffi::OsString> {
+        if self.removed.iter().any(|removed| removed == name) {
+            return None;
+        }
+        agh::identity::ProcessEnv.var_os(name)
+    }
+}
+
+/// One bounded git in the harness checkout, through `tools` (the guardian's worker group), with
+/// no ambient repository, trace, prompt or credential selector. Its error text is redacted of
+/// every token shape (`agh::redact::Redactor::shapes`): a helper's answer is git's to hold, and
+/// this process knows no token to redact by value.
+fn source_git(tools: &dyn Tools, config: &Config, args: &[&str]) -> Result<String> {
     let mut run = Run::new("git", args.iter().copied()).bounded();
     run.cwd = Some(config.checkout.clone());
-    run.env_remove.extend(
-        [
-            "GIT_DIR",
-            "GIT_WORK_TREE",
-            "GIT_COMMON_DIR",
-            "GIT_INDEX_FILE",
-            "GIT_OBJECT_DIRECTORY",
-            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-            "GIT_NAMESPACE",
-            "GIT_CONFIG",
-            "GIT_CONFIG_COUNT",
-            "GIT_CONFIG_PARAMETERS",
-        ]
-        .into_iter()
-        .map(String::from),
-    );
-    run.env_remove.extend(git_environment_removals());
+    run.env_remove.extend(source_git_removals());
     run.env.extend(git_tracing_environment());
     run.env.extend([
         ("GIT_TERMINAL_PROMPT".into(), "0".into()),
@@ -53,17 +77,7 @@ fn source_git(
             "ssh -oBatchMode=yes -oNumberOfPasswordPrompts=0".into(),
         ),
     ]);
-    if let Some(auth) = auth {
-        run.args.splice(0..0, auth.arguments());
-        run.env.extend(
-            auth.environment()
-                .map_err(|e| Error::refused(e.to_string()))?,
-        );
-    }
-    let redact = |text: String| match auth {
-        Some(auth) => auth.redact(&text),
-        None => text,
-    };
+    let redact = |text: String| agh::redact::Redactor::shapes(&text);
     let ran = tools
         .run(&run)
         .map_err(|e| Error::cannot_run(redact(format!("local source git: {e}"))))?;
@@ -79,33 +93,129 @@ fn source_git(
         .map_err(|_| Error::refused("local source git returned non-UTF-8 identity"))
 }
 
-fn fetch_source(tools: &dyn Tools, config: &Config, origin: &str, token: &Path) -> Result<()> {
-    // The caller already matched origin against its configured development repository.
-    let auth = if origin.starts_with("https://") {
-        Some(
-            GitAuth::required(token, "https://github.com")
-                .map_err(|e| Error::refused(format!("local source credential: {e}")))?,
-        )
-    } else {
-        None
+/// agh's own git credential helper for a fetch of `slug`, once it will answer that fetch: the
+/// `credential.helper` value of `agh::git::HelperCommand::current()` (the retained executable,
+/// then `agh auth git-credential`), after [`routed_helper`] learned and checked the identity it
+/// answers with over this process's agh directories (`Dirs::from_env`) and the fetch's
+/// environment ([`FetchEnv`]), which are the helper's own, since the fetch hands it no
+/// `AGH_GIT_*` variable. Else why not.
+fn agh_helper(slug: &agh::Slug) -> std::result::Result<String, String> {
+    let dirs = agh::config::Dirs::from_env().ok_or_else(|| {
+        "agh's directories cannot be resolved: no absolute home, config or state directory"
+            .to_string()
+    })?;
+    let env = FetchEnv {
+        removed: source_git_removals(),
     };
-    let mut args = vec![
-        "-c",
-        "core.askPass=/usr/bin/false",
-        "-c",
-        "protocol.ext.allow=never",
-        "-c",
-        "protocol.file.allow=never",
-        "fetch",
-        "--no-tags",
-        "origin",
-        "refs/heads/main:refs/remotes/origin/main",
-    ];
-    // Authenticated requests reset helpers before installing the known scoped helper.
-    if auth.is_none() {
-        args.splice(0..0, ["-c", "credential.helper="]);
+    routed_helper(
+        &dirs,
+        &env,
+        slug,
+        &|dirs| agh::routing::adopt(&crate::host::agh::AghHost::base_client(dirs), dirs),
+        &|| {
+            agh::git::HelperCommand::current()
+                .and_then(|helper| helper.config_value())
+                .map_err(|e| e.to_string())
+        },
+    )
+}
+
+/// `helper()`, once agh's git credential helper over `dirs` and `env` (the fetch's
+/// environment) will answer a fetch of `slug`; else why not, and `helper` is not asked.
+/// `learn(dirs)` resolves agh's routing as a routed agh call does (`agh::routing::adopt`), so a
+/// vault token whose login agh has not recorded (no agh call has routed it yet, or it was
+/// rotated since) is learned with one `GET /user` and recorded: the helper reads only the
+/// record. A release-tier owner refuses, since the helper answers one only under a grant agh's
+/// own git runner writes. Otherwise the fetch speaks as the profile that routing sends a read
+/// of `slug` as, and a routing that reads it anonymously or refuses it refuses the fetch, which
+/// has always needed an identity. Then the helper must answer as that profile, ungranted and by
+/// agh.toml's strict policy (`agh::git::credential::require_answer`), so a login that could not
+/// be recorded, or an agh.toml that changed, refuses with agh's reason and next step, never
+/// with git's "credential helper told us to quit".
+fn routed_helper(
+    dirs: &agh::config::Dirs,
+    env: &dyn agh::identity::EnvSource,
+    slug: &agh::Slug,
+    learn: &dyn Fn(&agh::config::Dirs) -> agh::Result<agh::routing::Configured>,
+    helper: &dyn Fn() -> std::result::Result<String, String>,
+) -> std::result::Result<String, String> {
+    use agh::policy::{Decision, RouteRequest, RouteTarget, Tier};
+    let with_next = |e: &agh::Error| format!("{}; next: {}", e.why, e.next);
+    let learned = learn(dirs).map_err(|e| with_next(&e))?;
+    let router = learned.router().map_err(|e| with_next(&e))?;
+    if router.tier_of(slug.owner()) == Tier::Release {
+        return Err(format!(
+            "{slug} is release tier, and agh's git credential helper answers a release-tier \
+             repository only under a grant agh's own git runner writes"
+        ));
     }
-    source_git(tools, config, &args, auth.as_ref()).map(|_| ())
+    let read = RouteRequest::read(RouteTarget::Repo(slug.clone()));
+    let profile = match router.decide(&read, &|name| router.presence(name, env)) {
+        Decision::Send { profile, .. } => profile,
+        Decision::Refuse(refusal) => {
+            return Err(format!("{}; next: {}", refusal.why, refusal.next));
+        }
+        _ => {
+            let next = learned
+                .adoption()
+                .and_then(|adoption| adoption.next_step())
+                .unwrap_or_else(|| format!("agh whoami --for {slug}"));
+            return Err(format!(
+                "agh routes {slug} with no identity, and the harness source is fetched as one; \
+                 next: {next}"
+            ));
+        }
+    };
+    agh::git::credential::require_answer(env, dirs, slug, &profile, false, false)
+        .map_err(|e| with_next(&e))?;
+    helper()
+}
+
+/// Fetch the checkout's `origin` main into `refs/remotes/origin/main`, inside the worker group.
+/// Every helper the user's or the system's config names is reset first. An `https://` origin
+/// then gets the one helper `helper` names, scoped to `https://github.com`, with
+/// `credential.useHttpPath=true` so it can route by repository; it reads agh.toml's routing
+/// and its own token files, so no token is in the fetch's argv or the child's environment, and
+/// this module reads no token file. No helper means no git: there is no token fallback. An SSH
+/// origin gets no helper and keeps batch mode.
+fn fetch_source(
+    tools: &dyn Tools,
+    config: &Config,
+    origin: &str,
+    helper: &dyn Fn() -> std::result::Result<String, String>,
+) -> Result<()> {
+    // The caller already matched origin against its configured development repository.
+    let mut args = vec!["-c".to_string(), "credential.helper=".to_string()];
+    if origin.starts_with("https://") {
+        let helper = helper().map_err(|why| {
+            Error::refused(agh::redact::Redactor::shapes(&format!(
+                "local source credential: {why}"
+            )))
+        })?;
+        args.extend([
+            "-c".to_string(),
+            format!("credential.https://github.com.helper={helper}"),
+            "-c".to_string(),
+            "credential.useHttpPath=true".to_string(),
+        ]);
+    }
+    args.extend(
+        [
+            "-c",
+            "core.askPass=/usr/bin/false",
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "protocol.file.allow=never",
+            "fetch",
+            "--no-tags",
+            "origin",
+            "refs/heads/main:refs/remotes/origin/main",
+        ]
+        .map(String::from),
+    );
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    source_git(tools, config, &args).map(|_| ())
 }
 
 /// Minted only inside the verified worker gate. The detached owner holds its lifeline,
@@ -189,7 +299,7 @@ impl<'a> Producer<'a> {
     }
 
     fn git(&self, config: &Config, args: &[&str]) -> Result<String> {
-        source_git(self.tools, config, args, None)
+        source_git(self.tools, config, args)
     }
 
     fn clean_main(&self, config: &Config) -> Result<()> {
@@ -332,7 +442,12 @@ impl Driver for Producer<'_> {
                 "origin is not the configured harness development repository",
             ));
         }
-        fetch_source(self.tools, config, &origin, &self.ctx.tokens.staging)?;
+        let staging = &self.ctx.accounts.staging;
+        fetch_source(self.tools, config, &origin, &|| {
+            agh::Slug::new(staging, repo)
+                .map_err(|e| e.why.clone())
+                .and_then(|slug| agh_helper(&slug))
+        })?;
         self.clean_main(config)?;
         self.git(
             config,

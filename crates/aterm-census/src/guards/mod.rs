@@ -27,6 +27,7 @@ mod census_thread;
 mod changelog_repeat;
 mod closure_anchor;
 mod conflict_marker;
+mod credential_claim;
 mod debug_seam;
 mod doc_sentence;
 mod doors;
@@ -145,6 +146,7 @@ pub const GUARDS: &[Rule] = &[
     conflict_marker::CONFLICT_MARKER,
     changelog_repeat::CHANGELOG_REPEAT,
     issue_id::ISSUE_ID,
+    credential_claim::CREDENTIAL_CLAIM,
     mirror_rows::MIRROR_ROWS,
     no_reach_read::NO_REACH_READ,
     unmounted_test::UNMOUNTED_TEST,

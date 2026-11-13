@@ -669,7 +669,7 @@ fn nonblocking(fd: &std::os::fd::OwnedFd) -> bool {
 
 impl Inbox {
     fn new(shell: i32) -> Option<Self> {
-        let (rd, wr) = std::io::pipe().ok()?;
+        let (rd, wr) = crate::pipe().ok()?;
         let (wake_rd, wake_wr) = (
             std::os::fd::OwnedFd::from(rd),
             std::os::fd::OwnedFd::from(wr),

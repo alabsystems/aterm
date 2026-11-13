@@ -118,6 +118,12 @@ fn owners_state_for(sf: &SessionFile) -> St {
     St::from_json(&text).expect("the owner's state reads")
 }
 
+/// The owner's idle screen under a key of theirs 10 minutes ago: their wall's hour of patience
+/// ([`upgrade::LIMIT_WALL_S`]) runs from that key, so a limit hours old still holds the round.
+fn keyed_idle_screen() -> String {
+    idle_screen().replace("\"human_ms\":null", "\"human_ms\":600000")
+}
+
 #[cfg(unix)]
 #[test]
 fn a_notice_queued_behind_the_limit_is_never_asked_again_behind_it() {
@@ -127,7 +133,7 @@ fn a_notice_queued_behind_the_limit_is_never_asked_again_behind_it() {
         OWNERS_SESSION,
         announced(1),
         &owners_rows(now, &MARKERS[..1], None),
-        idle_screen(),
+        keyed_idle_screen(),
         &to_2_1_283(),
         usize::MAX,
     );
@@ -210,7 +216,7 @@ fn the_give_up_0_93_0_spent_behind_the_limit_rests_then_waits_out_the_limit() {
             OWNERS_SESSION,
             |sf, _| owners_state_for(sf),
             &rows,
-            idle_screen(),
+            keyed_idle_screen(),
             &to_2_1_283(),
             usize::MAX,
         );
@@ -226,7 +232,7 @@ fn the_give_up_0_93_0_spent_behind_the_limit_rests_then_waits_out_the_limit() {
             OWNERS_SESSION,
             move |_, _| pending,
             &rows,
-            idle_screen(),
+            keyed_idle_screen(),
             &to_2_1_283(),
             usize::MAX,
         );
@@ -298,7 +304,7 @@ fn a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point() {
             "c9-quiet",
             OWNERS_SESSION,
             pending,
-            &parked(past.clone()),
+            &parked(past),
             screen(),
             &to_2_1_283(),
             4,
@@ -309,10 +315,22 @@ fn a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point() {
         ("wait:changed-before-signal", 0),
         "the restart reached, nothing typed: {moved:?}"
     );
+    // A wall first answered 10 minutes ago is within the bound a limit nobody lifts holds the
+    // round (`upgrade::LIMIT_WALL_S`): short of its named reset's grace, naming no reset, or in
+    // the ask flow, it holds.
+    let young = now - 600;
     for (label, row, quiet) in [
-        ("c9-short", named(now - LIMIT_GRACE_S + 60), true),
-        ("c9-unnamed", api_limit_row(now - 8_000), true),
-        ("c9-ask", past, false),
+        (
+            "c9-short",
+            limit_row_until(&ts(young), OWNERS_SESSION, now - LIMIT_GRACE_S + 60),
+            true,
+        ),
+        ("c9-unnamed", api_limit_row(young), true),
+        (
+            "c9-ask",
+            limit_row_until(&ts(young), OWNERS_SESSION, now - LIMIT_GRACE_S - 60),
+            false,
+        ),
     ] {
         let visit = || {
             visit_at(
@@ -332,6 +350,201 @@ fn a_limit_notice_a_grace_past_its_named_reset_is_moved_as_any_idle_point() {
             "{label}: {r:?}"
         );
     }
+}
+
+/// A usage limit nobody lifts holds the round [`upgrade::LIMIT_WALL_S`] from its first answer
+/// and no longer ([`upgrade::limit_holds`]): past it, through the real visit, the restart is
+/// reached with nothing typed, whether the limit names no reset (a rate limit), names one days
+/// ahead (a weekly limit in the ask flow), is a spend wall, or drew retries since. NEGATIVE
+/// CONTROLS: the same aged wall under a key of the person's 10 minutes ago, and one first answered
+/// within the bound, wait `limited`.
+#[cfg(unix)]
+#[test]
+fn a_usage_limit_nobody_lifts_holds_the_round_only_for_its_bound() {
+    let now = now_s();
+    let aged = now - upgrade::LIMIT_WALL_S - 600;
+    let screen = || {
+        let rows: Vec<String> =
+            aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::END_SESSION_LIMIT);
+        assert!(upgrade::limited(&rows), "the notice stands on the screen");
+        screen_json(&rows)
+    };
+    let keyed = || screen().replace("\"human_ms\":null", "\"human_ms\":600000");
+    let parked = |limits: &[String]| {
+        let mut rows = vec![
+            tasked_at(now),
+            model_row(
+                &ts(aged - 60),
+                OWNERS_SESSION,
+                "Running the gate.",
+                "tool_use",
+            ),
+        ];
+        rows.extend_from_slice(limits);
+        rows.join("\n") + "\n"
+    };
+    let pending = |_: &SessionFile, now: u64| St {
+        phase: Phase::Pending,
+        from: "1.0.0".to_string(),
+        to: "2.1.283".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        last_seq: 77,
+        seq_since_s: now - 3_600,
+        salt: OWNERS_SALT,
+        ..St::default()
+    };
+    let spend = |at: u64| {
+        api_limit_row(at).replace(
+            "API Error: Rate limit reached for requests",
+            "You've hit your monthly spend limit.",
+        )
+    };
+    let weekly = limit_row_until(&ts(aged), OWNERS_SESSION, now + 3 * 86_400);
+    let visit = |label: &str, limits: &[String], quiet: bool, screen: String| {
+        let at = || {
+            visit_at(
+                label,
+                OWNERS_SESSION,
+                pending,
+                &parked(limits),
+                screen.clone(),
+                &to_2_1_283(),
+                4,
+            )
+        };
+        if quiet { quietly(at) } else { at() }
+    };
+    for (label, limits, quiet) in [
+        ("c10-unnamed", vec![api_limit_row(aged)], true),
+        ("c10-ask-weekly", vec![weekly.clone()], false),
+        ("c10-weekly", vec![weekly.clone()], true),
+        ("c10-spend", vec![spend(aged)], true),
+        (
+            "c10-retried",
+            vec![api_limit_row(aged), api_limit_row(now - 60)],
+            true,
+        ),
+    ] {
+        let r = visit(label, &limits, quiet, screen());
+        assert_eq!(
+            (r.step.as_str(), r.typed.len()),
+            ("wait:changed-before-signal", 0),
+            "{label}: the restart is reached, nothing typed: {r:?}"
+        );
+        let saved = r.saved.expect("saved");
+        assert!(saved.quiet, "{label}: nothing is typed after the resume");
+        let r = visit(&format!("{label}-keyed"), &limits, quiet, keyed());
+        assert_eq!(
+            (r.step.as_str(), r.typed.len()),
+            ("wait:limited", 0),
+            "{label}: a key of the person's starts the hour again: {r:?}"
+        );
+    }
+    let r = visit(
+        "c10-young",
+        &[api_limit_row(now - upgrade::LIMIT_WALL_S + 600)],
+        true,
+        screen(),
+    );
+    assert_eq!(
+        (r.step.as_str(), r.typed.len()),
+        ("wait:limited", 0),
+        "within its bound: {r:?}"
+    );
+}
+
+/// A limit that names no reset and that only the transcript shows (the screen idle again) stands
+/// for the quiet flow as long as its row does, as the window's loop holds it: past the re-ask
+/// ([`upgrade::REASK_S`]) the round still waits `limited`, and past [`upgrade::LIMIT_WALL_S`] it
+/// reaches the restart with nothing typed, as the aged wall's own move. The ask flow keeps its
+/// re-ask: there the same row lapses at `REASK_S` and the move is no wall's. NEGATIVE CONTROL:
+/// the quiet flow's row answered by the model since (the limit lifted) holds nothing.
+#[cfg(unix)]
+#[test]
+fn a_transcript_limit_naming_no_reset_holds_the_quiet_round_until_its_bound() {
+    let now = now_s();
+    let pending = |_: &SessionFile, now: u64| St {
+        phase: Phase::Pending,
+        from: "1.0.0".to_string(),
+        to: "2.1.283".to_string(),
+        source: "managed".to_string(),
+        tab: TAB.to_string(),
+        last_seq: 77,
+        seq_since_s: now - 3_600,
+        salt: OWNERS_SALT,
+        ..St::default()
+    };
+    let parked = |at: u64, after: &[String]| {
+        let mut rows = vec![
+            tasked_at(now),
+            model_row(
+                &ts(at - 60),
+                OWNERS_SESSION,
+                "Running the gate.",
+                "tool_use",
+            ),
+            api_limit_row(at),
+        ];
+        rows.extend_from_slice(after);
+        rows.join("\n") + "\n"
+    };
+    let visit = |label: &str, tail: &str, quiet: bool, dry: bool| {
+        let at = || {
+            visit_at_with(
+                label,
+                OWNERS_SESSION,
+                pending,
+                tail,
+                idle_screen(),
+                &to_2_1_283(),
+                4,
+                dry,
+            )
+        };
+        if quiet { quietly(at) } else { at() }
+    };
+    let reasked = now - upgrade::REASK_S - 600;
+    let aged = now - upgrade::LIMIT_WALL_S - 600;
+    let r = visit("c11-quiet-reasked", &parked(reasked, &[]), true, false);
+    assert_eq!(
+        (r.step.as_str(), r.typed.len()),
+        ("wait:limited", 0),
+        "past the re-ask, within its bound: {r:?}"
+    );
+    let r = visit("c11-quiet-aged-dry", &parked(aged, &[]), true, true);
+    assert_eq!(r.step, WALL_RESTART, "the aged wall's own move: {r:?}");
+    let r = visit("c11-quiet-aged", &parked(aged, &[]), true, false);
+    assert_eq!(
+        (r.step.as_str(), r.typed.len()),
+        ("wait:changed-before-signal", 0),
+        "past its bound, the restart is reached with nothing typed: {r:?}"
+    );
+    assert!(
+        r.saved.expect("saved").quiet,
+        "nothing is typed after the resume"
+    );
+    let r = visit("c11-ask-reasked-dry", &parked(reasked, &[]), false, true);
+    assert!(
+        r.step != "wait:limited" && !wall_step(&r.step),
+        "the ask flow's re-ask lapses it, and its move is no wall's: {r:?}"
+    );
+    let answered = [model_row(
+        &ts(reasked + 60),
+        OWNERS_SESSION,
+        "Done.",
+        "end_turn",
+    )];
+    let r = visit(
+        "c11-quiet-lifted-dry",
+        &parked(reasked, &answered),
+        true,
+        true,
+    );
+    assert!(
+        r.step != "wait:limited" && !wall_step(&r.step),
+        "a lifted limit holds nothing: {r:?}"
+    );
 }
 
 #[cfg(unix)]
@@ -1031,5 +1244,189 @@ fn the_real_queue_conforms_to_the_limit_queue_model() {
     assert!(
         uncaught.is_empty(),
         "the real code has these defects: {uncaught:?}"
+    );
+}
+
+/// The usage limit's bound in the reducer ([`upgrade::limit_holds`]): a limit nobody lifts holds
+/// a pending or asked round [`upgrade::LIMIT_WALL_S`] and no longer, in the quiet flow and the ask
+/// flow alike; past it the round moves as at an idle point (afresh where the session has no task),
+/// gated as there (a person's keys, box, draft or hold, a login wall within its bound, a queued
+/// turn, a running turn, the agent's own work and a break all still hold it), and nothing is told,
+/// announced or asked into the limit. NEGATIVE CONTROL: the same limit a second short of the
+/// bound waits `limited` in every flow.
+#[test]
+fn a_usage_limit_nobody_lifts_holds_the_reducer_only_for_its_bound() {
+    use crate::harness::upgrade::{LIMIT_WALL_S, LOGIN_WALL_S, limit_holds};
+    let aged = Facts {
+        limited: true,
+        limit_s: LIMIT_WALL_S,
+        ..idle()
+    };
+    let fresh = Facts {
+        limit_s: LIMIT_WALL_S - 1,
+        ..aged.clone()
+    };
+    assert!(limit_holds(&fresh) && !limit_holds(&aged));
+    let t0 = WALK_NOW;
+    let asked = Phase::Announced { at_s: t0, asks: 1 };
+    let later = t0 + 4 * upgrade::REASK_S;
+    let knocks = [
+        (
+            "their keys",
+            Facts {
+                typing: true,
+                ..aged.clone()
+            },
+        ),
+        (
+            "a key within grace",
+            Facts {
+                attended: true,
+                ..aged.clone()
+            },
+        ),
+        (
+            "their box",
+            Facts {
+                approval_box: true,
+                ..aged.clone()
+            },
+        ),
+        (
+            "their draft",
+            Facts {
+                composer_empty: false,
+                ..aged.clone()
+            },
+        ),
+        (
+            "a held session",
+            Facts {
+                held: true,
+                ..aged.clone()
+            },
+        ),
+        (
+            "a login wall within its bound",
+            Facts {
+                login: true,
+                ..aged.clone()
+            },
+        ),
+        (
+            "a queued turn",
+            Facts {
+                queued: true,
+                ..aged.clone()
+            },
+        ),
+        (
+            "a running turn",
+            Facts {
+                busy_footer: true,
+                ..aged.clone()
+            },
+        ),
+        (
+            "its own work",
+            Facts {
+                background: vec!["zsh".into()],
+                status: "shell".into(),
+                ..aged.clone()
+            },
+        ),
+        (
+            "a break",
+            Facts {
+                background_point: true,
+                status: "busy".into(),
+                ..aged.clone()
+            },
+        ),
+    ];
+    for quiet in [false, true] {
+        for (phase, ready) in [(&Phase::Pending, false), (&asked, false), (&asked, true)] {
+            let at = |f: &Facts| next_step(phase, &Facts { quiet, ..f.clone() }, ready, later);
+            let case = format!("quiet={quiet} {phase:?} ready={ready}");
+            assert_eq!(
+                at(&fresh),
+                Step::Wait("limited"),
+                "{case}: within its bound"
+            );
+            assert_eq!(at(&aged), Step::Terminate, "{case}: past it, nobody there");
+            for (why, f) in &knocks {
+                let step = at(f);
+                assert!(
+                    !matches!(
+                        step,
+                        Step::Terminate | Step::Fresh | Step::Announce | Step::Tell(_)
+                    ),
+                    "{case}: {why}: {step:?}"
+                );
+            }
+        }
+    }
+    let taskless = Facts {
+        taskless: true,
+        ..aged.clone()
+    };
+    assert_eq!(
+        next_step(&Phase::Pending, &taskless, false, later),
+        Step::Fresh,
+        "a session with no task starts afresh"
+    );
+    let both = Facts {
+        login: true,
+        login_s: LOGIN_WALL_S,
+        ..aged.clone()
+    };
+    assert_eq!(
+        next_step(&Phase::Pending, &both, false, later),
+        Step::Terminate,
+        "both walls past their bounds"
+    );
+    assert_eq!(
+        next_step(&Phase::Pending, &Facts { limit_s: 0, ..both }, false, later),
+        Step::Wait("limited"),
+        "a limit within its bound under an aged login wall"
+    );
+}
+
+/// The limit's age runs from its first answer since the agent last answered
+/// ([`upgrade::StandingScan::since`]): a retry the vendor or a continuation drew is the same
+/// limit, an answer of the model's ends it, and a limit after that answer is a new one.
+#[test]
+fn the_usage_limits_age_runs_from_its_first_row() {
+    let now = WALK_NOW;
+    let first = now - 2_000;
+    let rows = [api_limit_row(first), api_limit_row(now - 60)].join("\n");
+    assert_eq!(upgrade::transcript_limit_since(&rows), Some(first));
+    let answered = format!(
+        "{rows}\n{}",
+        model_row(&ts(now - 30), OWNERS_SESSION, "Done.", "end_turn")
+    );
+    assert_eq!(
+        upgrade::transcript_limit_since(&answered),
+        None,
+        "it lifted"
+    );
+    let again = format!("{answered}\n{}", api_limit_row(now - 10));
+    assert_eq!(
+        upgrade::transcript_limit_since(&again),
+        Some(now - 10),
+        "a limit after an answer is a new one"
+    );
+    let aged = Facts {
+        limited: true,
+        ..idle()
+    };
+    assert_eq!(
+        wall_age(true, &aged, Some(first), HandAt::Never, now),
+        2_000
+    );
+    assert_eq!(
+        wall_age(true, &aged, None, HandAt::Never, now),
+        0,
+        "a limit only the screen shows never ages"
     );
 }

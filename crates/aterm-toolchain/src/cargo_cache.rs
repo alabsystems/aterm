@@ -9,8 +9,9 @@
 
 use std::{io, path::Path};
 
-/// An actual owned shared Cargo source-cache lock, released by `LOCK_UN` when dropped, so a
-/// child forked meanwhile, which holds a copy of the descriptor until its exec, keeps nothing.
+/// An actual owned shared Cargo source-cache lock. Its acquiring process releases by
+/// `LOCK_UN` when dropped, so a forked child's descriptor cannot prolong that original
+/// release. A foreign process copy can neither validate custody nor unlock the parent.
 /// No descriptor, unlock, cloning or path-only recovery authority escapes this guard.
 #[derive(Debug)]
 #[must_use = "keep the actual guard until all source-cache users have settled"]
@@ -57,6 +58,7 @@ mod imp {
 
     #[derive(Debug)]
     pub(super) struct Held {
+        pub(super) creator: u32,
         file: File,
         directory: File,
         original: PathBuf,
@@ -86,6 +88,12 @@ mod imp {
 
     impl Held {
         pub(super) fn check_current(&self) -> io::Result<()> {
+            if self.creator != std::process::id() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Cargo source-cache guard belongs to another process",
+                ));
+            }
             let named = std::fs::canonicalize(&self.original)?;
             let held_home = self.directory.metadata()?;
             let named_home = std::fs::symlink_metadata(&named)?;
@@ -109,10 +117,13 @@ mod imp {
     }
 
     impl Drop for Held {
-        /// Let go by `LOCK_UN` before the close (clippy.toml's flock release rule): the lock lives
-        /// on the open file description, which a child between fork and exec still shares.
+        /// The creator releases by `LOCK_UN` before closing: a child between
+        /// fork and exec still shares that description. A foreign copy closes
+        /// only its own descriptor and cannot unlock the original holder.
         fn drop(&mut self) {
-            let _ = self.file.unlock();
+            if self.creator == std::process::id() {
+                let _ = self.file.unlock();
+            }
         }
     }
 
@@ -195,6 +206,7 @@ mod imp {
         // Reject that file's unsupported filesystem before trying any lock.
         filesystem(&file)?;
         let held = Held {
+            creator: std::process::id(),
             file,
             directory,
             original: cargo_home.into(),

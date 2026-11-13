@@ -9,6 +9,7 @@ const BORN: u64 = 100;
 
 pub(super) fn snapshot() -> Snapshot {
     Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         tab: SID.into(),

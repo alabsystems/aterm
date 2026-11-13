@@ -35,6 +35,7 @@ use crate::supervise::occupancy::{
     WakeClaim, WakeDoor, WakeFacts, WakesSeen,
 };
 use crate::supervise::overlap::OverlapReading;
+use crate::supervise::policy::credential_need::{CredentialRead, Resolution, VaultEntry};
 use crate::supervise::policy::exception::Exception;
 use crate::supervise::policy::login::LoginShared;
 use crate::supervise::policy::reset::{
@@ -255,6 +256,7 @@ macro_rules! tape_arg_debug {
 tape_arg_debug!(
     str,
     String,
+    Vec<String>,
     bool,
     u16,
     u32,
@@ -1181,6 +1183,38 @@ impl TapeValue for crate::supervise::policy::turn_end::LaunchModel {
     }
 }
 
+/// `fable_week`'s answer as a tape holds it ([`crate::supervise::policy::turn_end::FableWeek`]).
+#[derive(Serialize, Deserialize)]
+struct FableWeekWire {
+    pct: Option<u32>,
+    reset: Option<i64>,
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.fable_week` asked nothing there,
+/// and its loop timed no return by the account's record ([`TapeValue::absent`]: `None`), where
+/// the tape's header says that build lacked the door, and only there.
+impl TapeValue for Option<crate::supervise::policy::turn_end::FableWeek> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&self.map(|w| FableWeekWire {
+            pct: w.pct,
+            reset: w.reset,
+        }))
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(of_json::<Option<FableWeekWire>>(bytes)?.map(|w| {
+            crate::supervise::policy::turn_end::FableWeek {
+                pct: w.pct,
+                reset: w.reset,
+            }
+        }))
+    }
+
+    fn absent() -> Option<Self> {
+        Some(None)
+    }
+}
+
 /// A DOOR NEWER THAN THE TAPE: a recording build with no `host.restart_left` asked nothing there,
 /// and its loop went by the process the host named ([`TapeValue::absent`]: `None`), where the
 /// tape's header says that build lacked the door, and only there.
@@ -1851,6 +1885,86 @@ impl TapeValue for Option<LeftRead> {
 
     fn absent() -> Option<Self> {
         Some(Some(LeftRead::NotAsked))
+    }
+}
+
+/// `credentials`' answer as a tape holds it ([`CredentialRead`]): `reading` while the host works
+/// (the door's `None`), `not-asked`, or each want with the entries that hold it (name, pointer and
+/// purpose: the registry holds no value to tape), `filed`, or why it failed.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum CredentialReadWire {
+    Reading,
+    NotAsked,
+    Resolved(Vec<(String, ResolutionWire)>),
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum ResolutionWire {
+    Held(Vec<(String, Option<String>, String)>),
+    Filed,
+    Failed(String),
+}
+
+/// A DOOR NEWER THAN THE TAPE: a recording build with no `host.credentials` asked nothing there,
+/// so its replay reads nothing asked ([`TapeValue::absent`]) where the tape's header says that
+/// build lacked the door, and only there.
+impl TapeValue for Option<CredentialRead> {
+    fn to_tape(&self) -> Vec<u8> {
+        json(&match self {
+            None => CredentialReadWire::Reading,
+            Some(CredentialRead::NotAsked) => CredentialReadWire::NotAsked,
+            Some(CredentialRead::Resolved(all)) => CredentialReadWire::Resolved(
+                all.iter()
+                    .map(|(want, r)| {
+                        let wire = match r {
+                            Resolution::Held(entries) => ResolutionWire::Held(
+                                entries
+                                    .iter()
+                                    .map(|e| (e.name.clone(), e.pointer.clone(), e.purpose.clone()))
+                                    .collect(),
+                            ),
+                            Resolution::Filed => ResolutionWire::Filed,
+                            Resolution::Failed(why) => ResolutionWire::Failed(why.clone()),
+                        };
+                        (want.clone(), wire)
+                    })
+                    .collect(),
+            ),
+        })
+    }
+
+    fn from_tape(bytes: &[u8]) -> Result<Self, CodecError> {
+        Ok(match of_json::<CredentialReadWire>(bytes)? {
+            CredentialReadWire::Reading => None,
+            CredentialReadWire::NotAsked => Some(CredentialRead::NotAsked),
+            CredentialReadWire::Resolved(all) => Some(CredentialRead::Resolved(
+                all.into_iter()
+                    .map(|(want, r)| {
+                        let r = match r {
+                            ResolutionWire::Held(entries) => Resolution::Held(
+                                entries
+                                    .into_iter()
+                                    .map(|(name, pointer, purpose)| VaultEntry {
+                                        name,
+                                        pointer,
+                                        purpose,
+                                    })
+                                    .collect(),
+                            ),
+                            ResolutionWire::Filed => Resolution::Filed,
+                            ResolutionWire::Failed(why) => Resolution::Failed(why),
+                        };
+                        (want, r)
+                    })
+                    .collect(),
+            )),
+        })
+    }
+
+    fn absent() -> Option<Self> {
+        Some(Some(CredentialRead::NotAsked))
     }
 }
 

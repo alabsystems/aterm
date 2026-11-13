@@ -119,9 +119,9 @@ pub struct GlowConfig {
     pub beam: bool,
     /// Horizontal attach point of the live-cursor bridge as a fraction of cell width (`0.5` = centre).
     pub head_dx: f32,
-    /// The rainbow ribbon's shape, which is theme data: `false` is the underline with its
-    /// highlighter, the shape of the one `rainbow` theme; `true` is the tall body, which no
-    /// built-in theme picks.
+    /// The rainbow ribbon's shape, which is theme data: `true` is the tall body, the one `rainbow`
+    /// theme's, its band behind the typed words and its vivid rail under them; `false` is the
+    /// underline with its highlighter, which no built-in theme picks.
     pub ribbon_tall: bool,
     /// The flat body, a shape no built-in theme picks.
     pub ribbon_flat: bool,
@@ -325,9 +325,7 @@ impl GlowConfig {
 
 /// The shipped resolve: what a window with no config resolves on the cold dark ground (the
 /// shipped `rainbow`, the default theme's cursor colour, every knob unset), so a test that
-/// names only the fields it is about takes the rest from here (§15.1 P0.1). One field differs
-/// from that window: `ribbon_tall` is true here, the tall body the engine's own tests judge,
-/// where every style a person can choose resolves the underline.
+/// names only the fields it is about takes the rest from here (§15.1 P0.1).
 impl Default for GlowConfig {
     #[inline]
     fn default() -> Self {

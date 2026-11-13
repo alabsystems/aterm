@@ -54,10 +54,10 @@ impl ReplayIndex {
     pub(super) fn source<V>(
         &mut self,
         records: &BTreeMap<Digest, V>,
-        header_of: impl Fn(&V) -> &Header,
+        header_of: impl Fn(&V) -> Option<&Header>,
         source: &Header,
     ) -> Result<(), Refusal> {
-        if self.admits(records.get(&source.id).map(header_of), source)? {
+        if self.admits(records.get(&source.id).and_then(header_of), source)? {
             self.distinct += 1;
             self.sources.insert(source.id, source.clone());
         }

@@ -345,7 +345,7 @@ pub fn pty_keeper_custody_model() -> Model {
     }
 }
 
-/// The relaunch brake as a writer/reader pair (the shape of `NativeUpdateFailedMarkSuppression`).
+/// The relaunch brake as a writer/reader pair: what the writer records, the reader suppresses.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn keeper_relaunch_brake_model() -> Model {

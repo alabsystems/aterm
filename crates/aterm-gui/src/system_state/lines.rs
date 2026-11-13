@@ -487,15 +487,6 @@ pub(crate) fn card_items(app: &SystemStateApp, rows: &[RowView]) -> Vec<CardItem
                             super::INSTALL_TOOLS_LABEL,
                         )
                 }
-                _ if row.copy_command => CardItem::new(
-                    slug,
-                    Mark::NeedsYou,
-                    aterm_types::macos_setup::GITHUB_TOKEN_REFUSED,
-                )
-                .reason(Some(
-                    aterm_types::macos_setup::GITHUB_TOKEN_COMMAND.to_owned(),
-                ))
-                .button(super::COPY_TOKEN_COMMAND, "Copy Command", "Copy Command"),
                 _ => CardItem::new(
                     slug,
                     Mark::NeedsYou,
@@ -653,7 +644,6 @@ pub(crate) fn line_view(
                 shown.note = None;
                 shown.turn_on_sync = false;
                 shown.install_tools = false;
-                shown.copy_command = false;
             }
             shown
         })
@@ -1147,19 +1137,26 @@ fn things(n: usize) -> String {
 }
 
 /// THE PROGRESS RULE (§4.5, pure): how many managed rows are done, of those aterm manages, once
-/// anything was read. Done means done: a row in the card, a step that failed, waits for aterm's
-/// next try or could not be confirmed is not, nor is one changed since aterm set it, which
-/// setup leaves as it is, so full progress is every line done.
+/// a managed row has an answer beyond unknown. Done means done: a row in the card, a step
+/// that failed, waits for aterm's next try or could not be confirmed is not, nor is one changed
+/// since aterm set it, which setup leaves as it is, so full progress is every line done.
 pub(crate) fn progress(
     app: &SystemStateApp,
     rows: &[RowView],
     card: &[CardItem],
 ) -> (usize, usize) {
     let status = &app.status;
-    if !app.plan_known || status.observed.is_empty() || status.newer() {
+    if !app.plan_known || status.newer() {
         return (0, 0);
     }
     let plan = app.reviewed_plan();
+    if !status.observations_for(Some(&plan.vault_url)).any(|seen| {
+        super::manages(plan.selection, seen.subject)
+            && seen.standing != Standing::Unknown
+            && !status.unconfirmed_observations.contains(&seen.subject)
+    }) {
+        return (0, 0);
+    }
     let steps = Steps::of(status, rows, Some(&plan));
     let total = rows.iter().filter(|row| row.managed).count();
     let done = rows

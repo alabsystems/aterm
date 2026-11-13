@@ -28,10 +28,10 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 const ACCESSIBLE: &str =
     "/user/repos?affiliation=owner&visibility=all&per_page=30&sort=full_name&direction=asc";
 
-/// The step a person takes for the GitHub sign-in or settings a repository needs, as the
-/// engine names it beside their remedy.
-const GITHUB_STEP: &str = "github.sign-in";
-/// Preserved checkout work is separate from the credential's sign-in remedy.
+/// The step a person takes for the GitHub settings a repository needs, as the engine names it
+/// beside their remedy.
+const GITHUB_STEP: &str = "github.settings";
+/// Preserved checkout work is separate from the settings remedy.
 const REPOSITORIES_STEP: &str = "github.repositories";
 
 /// What a local read of the private inventory found ([`automatic_inventory_counts`]).
@@ -123,7 +123,7 @@ pub(crate) fn automatic_inventory_counts_captured(
     } else {
         None
     };
-    if !captured.is_current_now(sys)? {
+    if !captured.is_current(sys)? {
         return Err(
             "repository inputs changed or are still syncing; waiting for a new ready snapshot"
                 .into(),
@@ -581,22 +581,36 @@ impl InitialRepositoryInputs {
     }
 
     /// Whether the selected source and its captured inputs still hold. This observes only
-    /// local files and ready-vault evidence, and grants no lease over later effects.
+    /// local files and ready-vault evidence, and grants no lease over later effects. A vault
+    /// pass holding the vault's state lock is waited for
+    /// ([`aterm_secrets::client::MaterializationSnapshot::is_current`]).
     ///
     /// # Errors
-    /// The current local source or vault state cannot be safely read.
+    /// The current local source or vault state cannot be safely read, or a vault pass held the
+    /// state lock past the wait.
     pub fn is_current(&self, sys: &dyn System) -> Result<bool, String> {
-        self.current_with(
-            sys,
-            aterm_secrets::client::MaterializationSnapshot::is_current,
-        )
-    }
-
-    pub(crate) fn is_current_now(&self, sys: &dyn System) -> Result<bool, String> {
-        self.current_with(
-            sys,
-            aterm_secrets::client::MaterializationSnapshot::is_current_now,
-        )
+        if self.local.is_err() {
+            return Ok(false);
+        }
+        match &self.authority {
+            InputAuthority::Caller => {}
+            InputAuthority::Local(paths) => {
+                if aterm_secrets::client::config(paths)
+                    .map_err(|why| why.to_string())?
+                    .is_some()
+                {
+                    return Ok(false);
+                }
+            }
+            InputAuthority::Vault(paths, snapshot) => {
+                if !snapshot.is_current(paths).map_err(|why| why.to_string())? {
+                    return Ok(false);
+                }
+            }
+        }
+        self.source
+            .as_ref()
+            .map_or(Ok(false), |source| source.is_current(sys, &self.user))
     }
 
     /// A captured local failure is a blocker, not evidence that the vault changed.
@@ -640,42 +654,10 @@ impl InitialRepositoryInputs {
 
     pub(crate) fn validate_selection(&self, sys: &dyn System, ctx: &Ctx) -> Result<(), String> {
         self.validate_default_context(sys, ctx)?;
-        if self.local.is_ok() && !self.is_current_now(sys)? {
+        if self.local.is_ok() && !self.is_current(sys)? {
             return Err("captured repository inputs changed before selection readback".into());
         }
         Ok(())
-    }
-
-    fn current_with(
-        &self,
-        sys: &dyn System,
-        materialization_current: fn(
-            &aterm_secrets::client::MaterializationSnapshot,
-            &aterm_secrets::client::Paths,
-        ) -> aterm_secrets::Result<bool>,
-    ) -> Result<bool, String> {
-        if self.local.is_err() {
-            return Ok(false);
-        }
-        match &self.authority {
-            InputAuthority::Caller => {}
-            InputAuthority::Local(paths) => {
-                if aterm_secrets::client::config(paths)
-                    .map_err(|why| why.to_string())?
-                    .is_some()
-                {
-                    return Ok(false);
-                }
-            }
-            InputAuthority::Vault(paths, snapshot) => {
-                if !materialization_current(snapshot, paths).map_err(|why| why.to_string())? {
-                    return Ok(false);
-                }
-            }
-        }
-        self.source
-            .as_ref()
-            .map_or(Ok(false), |source| source.is_current(sys, &self.user))
     }
 
     fn read(sys: &dyn System, user: &User) -> Result<LocalInputs, Block> {
@@ -1167,9 +1149,10 @@ impl Item for NativeRepositories {
             if selection.needs_credential(sys)? {
                 let current = || {
                     authorized()?;
-                    self.ensure_current(sys)
+                    self.ensure_current(sys)?;
+                    authorized()
                 };
-                let _ = selection.request_credential(sys, &current)?;
+                let _ = selection.request_credential(sys, &current, authorized)?;
                 *self.aside.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some(StoodAside::Waiting(selection.waiting()));
                 return Ok(());
@@ -1186,7 +1169,8 @@ impl Item for NativeRepositories {
             };
             let current = || {
                 authorized()?;
-                self.ensure_current(sys)
+                self.ensure_current(sys)?;
+                authorized()
             };
             current()?;
             if let Lookups::Not(why) = self.lookups(sys, &plan)? {
@@ -1315,6 +1299,7 @@ impl NativeRepositories {
                 return Err("repository setup was disabled in init.toml while cloning".into());
             }
             self.ensure_current(sys)?;
+            authorized()?;
             if recorded != super::develop_checkouts(sys, &self.user)? {
                 return Err(
                     "develop checkout selection changed while repositories were being refreshed"
@@ -1645,10 +1630,12 @@ pub(super) struct Block {
 
 impl Block {
     /// The probe's answer for this block (System State design §3.6): a person's step where only
-    /// their act ends the wait ([`Wait::kind`]), so its row needs them and no pass retries it,
-    /// else a wait that ends by itself. For `aterm init`'s default (`unasked`), a machine the
-    /// vault wrote no token to has no stage to run, which asks nobody anything; `machine` names
-    /// it ([`System::machine`]).
+    /// their act on settings or a destination ends the wait ([`Wait::kind`]), so its row needs
+    /// them and no pass retries it, else a wait that ends by itself. For `aterm init`'s default
+    /// (`unasked`), a machine the vault wrote no token to has no stage to run, which asks nobody
+    /// anything; `machine` names it ([`System::machine`]). A token wait is a blocked operation,
+    /// never a person's: the default vault source files its need through
+    /// [`super::RepositorySelection`]'s protocol.
     fn probe(self, unasked: bool, machine: &str) -> Probe {
         match self.wait {
             Some(Wait::Token) if unasked => Probe::NotApplicable {
@@ -1725,7 +1712,7 @@ impl NativeRepositories {
             .map(|captured| &captured.inputs)
             .or_else(|| self.prepared.get());
         if let Some(inputs) = inputs.filter(|inputs| inputs.local.is_ok())
-            && !inputs.is_current_now(sys)?
+            && !inputs.is_current(sys)?
         {
             return Err(
                 "repository input source changed; waiting for a new coherent version".into(),

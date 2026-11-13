@@ -521,7 +521,7 @@ impl Runs {
 
     /// The W-run sweep.
     fn run_end_sweep(&self, kernel: &impl Kernel) -> Option<Left> {
-        let records = read_records(self.path.parent()?).ok()?;
+        let records = read_records(self.path.parent()?, Some(&self.boot)).ok()?;
         let claims = Claims::of(
             records
                 .iter()
@@ -759,7 +759,7 @@ pub fn end_dead_runs(
     out: &mut dyn FnMut(&str),
     poster: &dyn Poster,
 ) -> usize {
-    let admitted = match read_records(dir) {
+    let admitted = match read_records(dir, Some(this_boot)) {
         Ok(records) => records,
         Err(why) => {
             out(&format!(

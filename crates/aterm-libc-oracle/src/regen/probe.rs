@@ -23,7 +23,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-libc = { version = "=0.2.186", features = ["extra_traits"] }
+libc = { version = "=0.2.191", features = ["extra_traits"] }
 
 [lib]
 path = "src/lib.rs"

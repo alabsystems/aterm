@@ -270,6 +270,16 @@ pub(super) fn scan_file_holders_in(
 ) -> io::Result<HolderScan> {
     let meta = std::fs::metadata(path)?;
     let key = (meta.dev(), meta.ino());
+    scan_file_holders_by_key_in(proc, me, key, skip)
+}
+
+/// The descriptor pass of [`scan_file_holders_in`], with an identity read from an open file.
+pub(super) fn scan_file_holders_by_key_in(
+    proc: &Path,
+    me: u32,
+    key: (u64, u64),
+    skip: &[u32],
+) -> io::Result<HolderScan> {
     let mut scan = HolderScan::default();
     for pid in uid_pids_in(proc, me)? {
         if skip.contains(&pid) {

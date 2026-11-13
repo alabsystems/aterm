@@ -2903,7 +2903,7 @@ impl LiveShell {
             .unwrap_or_else(|error| panic!("{label}: the pty's master: {error}"));
         let stdout = pump(PtyMaster(std::fs::File::from(reader)));
         let (nothing, _) =
-            std::io::pipe().unwrap_or_else(|error| panic!("{label}: a pipe: {error}"));
+            aterm_uds::pipe().unwrap_or_else(|error| panic!("{label}: a pipe: {error}"));
         Self::started(
             label,
             child,

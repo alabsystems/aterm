@@ -3,6 +3,172 @@
 
 //! The ARENA lanes: real-window measurements of the one shipped `aterm`, and
 //! head-to-heads against the pinned ghostty tip.
+//!
+//! # The arena — head-to-head measurement protocol
+//!
+//! The measurement arm of the faster-than-ghostty plan's §2
+//! (`docs/FASTER_THAN_GHOSTTY_PLAN.md`, which `5fb7267b9cc` removed). One protocol, every
+//! dimension, every competitor, one append-only ledger (see Ledger below). The runners are the
+//! arena lanes of `verify perf` (this module and its children); `targo --unverified verify perf
+//! --list` names them and what each needs.
+//!
+//! ## Rule zero — a run is INVALID unless all of these hold
+//!
+//! 1. **Build provenance.** Competitors run official release/nightly artifacts
+//!    wherever they exist (ghostty: the `tip` GitHub release — the exact thing
+//!    mitchellh benchmarks). The June onglass alacritty/kitty numbers came from
+//!    source builds whose commands went unrecorded: never reuse them. Source
+//!    builds record the exact command in the ledger (`zig build
+//!    -Doptimize=ReleaseFast` — Zig defaults to Debug and runs ~2x slow; cargo
+//!    profile + LTO flags for Rust peers). Every binary under test gets a sha256
+//!    in the ledger. `crates/aterm-verify/perf/arena/manifest.toml`
+//!    is the single source of pins.
+//! 2. **Hardware + thermal.** Publishable head-to-heads run on the **M4 Max
+//!    only** (mitchellh's hardware class). Anywhere else is dev-smoke: `cat`,
+//!    `scroll` and `vte` SKIP there unless given `--dev-smoke`, and label every
+//!    number from it `DEV-SMOKE, NON-PUBLISHABLE`; `start` and `compare` run
+//!    anywhere and record the run class (and `compare` each automated rule-zero
+//!    input) beside their numbers. Per trial: check thermal pressure (`pmset -g
+//!    therm`), cool down between competitors, **interleave A/B ordering with
+//!    rotation** (never all-of-A then all-of-B), record thermal state.
+//! 3. **GUI protocol.** Window frontmost + focused + fully visible; same display,
+//!    refresh rate recorded (ProMotion pinned on/off); Do Not Disturb on; App Nap
+//!    verified inactive; no other apps running. (Ghostty stops its display link
+//!    occluded; aterm suppresses effects unfocused — unfairness cuts both ways.)
+//! 4. **Config parity.** All terminals on **shipping defaults**; any deviation is
+//!    a ledger field. aterm publishes both default (effects as shipped) and
+//!    effects-off numbers wherever effects plausibly cost.
+//! 5. **Harness pinning.** Third-party harnesses (vtebench, DOOM-fire-zig,
+//!    typometer) are pinned by commit in the manifest; corpora are pre-generated
+//!    files, never piped from a generator mid-run (ghostty's own
+//!    `src/benchmark/AGENTS.md` discipline: warmups + medians, identical
+//!    dims/flags, never parallel).
+//!
+//! ## The lanes
+//!
+//! Every lane launches the ONE `aterm` (never a crate's dev-only thin binary)
+//! with inherited `ATERM_*` overrides removed, stops it by its own process group
+//! (never by a name a person's own windows could share), and caches what it
+//! pre-generates — corpora, the sha-verified ghostty copy, the pinned vtebench —
+//! under `$TMPDIR/aterm-arena/`, outside the checkout (cargo would claim the
+//! vtebench checkout for this workspace). Control and report sockets live under
+//! `/tmp/at.<pid>.<n>/`, short of the 103-byte socket-path limit whatever
+//! `$TMPDIR` is. A terminal under test runs the in-terminal half, `aterm-verify
+//! --arena-inner`, which answers on a report socket the runner waits on. Ctrl-C,
+//! SIGTERM or SIGHUP retires every terminal the run launched and removes its
+//! scratch directories before the run exits. An arena lane has no floor, so the
+//! closing verdict reports it MEASURED (and where the numbers went), never a
+//! pass.
+//!
+//! | Lane | Dimension | Status |
+//! |---|---|---|
+//! | `start` | ARENA-START: fresh-process real-window open time (GUI entry and Rust `main` → startup-metrics publication inside the first successful-present finalizer) | ready for local before/after runs; publishable claims still require rule zero + a ledger entry |
+//! | `compare` | ARENA-START paired A/B: frozen artifacts, AB/BA rotation folded into order-balanced ABBA rounds, cooldown, raw distributions, per-metric resolution | ready; 20 pairs (10 rounds) and a five-second cooldown by default, the manual rule-zero controls left explicit |
+//! | `cat` | D1: ARENA-CAT (cat 150 MB ascii + unicode, PTY drain) vs ghostty tip | ready — run on the M4 Max |
+//! | `scroll` | ARENA-SCROLL: 100k+-line scrub + jump-to-top, windowed frame pacing (`max_frame_gap_ms`) | ready; only a dev-smoke M5-Max entry exists (2026-07-22). *Needed from the bench machine and the owner:* a rule-zero run plus the owner's manual ghostty screen recording (`docs/measured/arena/ISSUE-arena-scroll-m4max-publishable-run.md`) |
+//! | `vte` | ARENA-VTE: vtebench's default suite, both terminals at one grid (default 120x40), interleaved A/B vs ghostty tip | **not yet run on the M4 Max**. The stock scripts' tty lookup is trimmed for macOS `ps` padding — untrimmed, `cursor_motion` and `light_cells` come out empty and vtebench drops them silently — so the lane refuses a trial that ran fewer than every benchmark, or at another grid, and keeps its file out of the medians. On macOS every payload is 80x24-shaped whatever the grid: vtebench pipes the scripts' stdout and stderr, which are the only places ncurses' `tput` reads the size from (`docs/measured/vte-engine-2026-10-29.md`, which `87da174f249` removed) |
+//! | — | ARENA-FIRE (DOOM-fire-zig), ARENA-LAT (typometer), ARENA-CAST (asciinema corpus) | **no runner**, each for its own reason: ARENA-LAT is a manual GUI tool, ARENA-CAST's corpus is EXTERNAL (its `obtain` field in the manifest), and **ARENA-FIRE's method is not designed yet**: DOOM-fire-zig stops at a "Press return to continue..." prompt, loops until Ctrl-C, and prints its fps only into the frames it draws inside the terminal under test, which ghostty gives no control socket to read |
+//!
+//! The `cat` lane times `/bin/cat` alone, from inside the terminal under test.
+//! The retired runner stamped the end of each drain from a freshly started
+//! python, so the D1 entries before the port (2026-07-19/20) each include one
+//! interpreter start, tens of milliseconds on a ~1 s drain: compare post-port
+//! `cat` MB/s with those entries only in relative terms (each run's aterm
+//! against its own ghostty), never in absolute ones.
+//!
+//! The engine-level, headless, floor-checked half of ARENA-SCROLL is the
+//! `scroll-scrub` floor lane (baseline `crates/aterm-verify/perf/golden/perf-baseline-scroll.json`);
+//! the `scroll` arena lane is the windowed half (frame pacing is observable only
+//! in a real window). The historical PTY-drain and idle-memory sweep was
+//! `docs/measured/onglass/README.md`, which `87da174f249` removed.
+//!
+//! ### ARENA-START
+//!
+//! Build the ONE `aterm` with the release or profiling profile, then:
+//!
+//! ```sh
+//! targo --unverified verify perf start --samples 9 --backend cpu --binary target/profiling/aterm
+//! targo --unverified verify perf compare \
+//!   --baseline /abs/baseline-aterm --candidate /abs/candidate-aterm \
+//!   --pairs 20 --backend gpu --json-out /tmp/aterm-start-ab.json
+//! ```
+//!
+//! `--json-out` writes `aterm-start-v3` (`start`) or `aterm-start-compare-v2`
+//! (`compare`). The `-v1` files in `docs/measured/arena/` came from the retired bash
+//! runners and are shaped differently: v1 repeated each eligibility input as a
+//! top-level flag and carried per-record hashes and the per-sample validity
+//! fields; v2 keeps eligibility only under `automated_rule_zero_inputs` and the
+//! run's RFC 3339 timestamps, harness and artifacts under `provenance`. v3 reads
+//! GPU drill-down schema 2 (`startup_gpu_context_ms`, `startup_gpu_font_join_ms`,
+//! `startup_gpu_assemble_ms`, `startup_gpu_tail_ms`) and drops v2's wgpu legs
+//! (`startup_gpu_instance_ms`, `_adapter_ms`, `_device_ms`, `_context_tail_ms`,
+//! `_pipelines_ms`), its `startup_gpu_pipe_*` keys and
+//! `startup_gpu_cell_pipeline_ms`, which no binary has filled since GW.6.
+//! Compare numbers within one schema.
+//!
+//! Every sample is a fresh process and a real macOS window, in fresh private
+//! `HOME`/XDG directories with session restore and automatic updates off. The
+//! observer waits for the socket without a request, settles 1.5 s, then makes
+//! ONE `metrics --json` read. A sample is refused for `frames < 1`, a zero
+//! `first_present_ms`, a present stamp not safely below the settle, a forced
+//! backend that negotiated otherwise, a grid other than 110x32, a drop ledger
+//! that disagrees with itself, or a partition that does not reconcile (the
+//! eight startup phases with both totals, the eight attach subphases with their
+//! parent, and — when the binary marks them valid — the worker and GPU
+//! drill-downs, all within the 0.06 ms wire-rounding allowance). The binary is
+//! copied to an immutable path and hashed before trial 1, so a concurrent
+//! rebuild cannot mix revisions; installed `.app/Contents/MacOS/*` inputs are
+//! refused.
+//!
+//! Two independent totals: first-present (time-to-CONTENT, from GUI entry and
+//! from Rust `main`) and `rust_main_to_first_visible_ms` (time-to-VISIBLE, the
+//! first window on glass). An early reveal moves the second and no phase of the
+//! first, and may legally sit below it; `compare` compares it beside
+//! first-present on the same round fold, so a reveal-ordering change is never
+//! scored on the wrong axis. An arm that predates the reveal stamp drops that one
+//! comparison; an arm missing the router, phase or attach schema needs
+//! `--allow-legacy-metric` and leaves only the shared totals compared.
+//!
+//! `--warm` is a REACHABILITY switch: a cold launch's home has never held a
+//! previous launch, so state-gated code (the L1 early reveal and its
+//! cell-metrics hit) is absent from the cold lane. Warm primes each trial's
+//! private home with a discarded launch, requires the cell-metrics cache it
+//! leaves, and measures the second launch. Never compare a warm arm with a cold
+//! one; the JSON records which.
+//!
+//! `compare` reports BY ROUND. Pairs 2k-1 and 2k are the quad A B B A, so each
+//! round delta gives both arms mean slot position 2.5 and one repeat and one
+//! switch launch: any offset that depends on slot position cancels inside the
+//! unit. Each metric prints the 95% t interval on the round mean and the
+//! resolution the run earned (this lane's identical-binary controls read -1.36
+//! and +1.54 ms — what a ±2 ms resolution looks like when a bare median is
+//! quoted). Pair deltas stay in the JSON as `paired_candidate_faster_ms`,
+//! flagged `order_contaminated`. The automated rule-zero inputs (exact `Apple M4
+//! Max`, ≥20 pairs, ≥5 s cooldown, every thermal reading the clean triple, not a
+//! negative control) are recorded separately; display, focus, App Nap, DND and
+//! the ledger stay manual, so no run is labelled publishable on automation
+//! alone.
+//!
+//! ## Ledger
+//!
+//! One file per run: `<YYYY-MM-DD>-<dim>.md` from [`TEMPLATE`], in the verify
+//! state directory (`<target>/verify/.ubd/perf.noindex/arena/`, [`crate::perf::ledger_dir`]);
+//! the `cat`, `scroll` and `vte` lanes write the entry and leave the manual
+//! fields for you. Append-only; a superseding run gets a new file, never an
+//! edit. Every entry carries: date, machine, macOS version, display + refresh,
+//! thermal states, competitor versions + sha256s + build provenance, config
+//! deviations, harness commits, raw numbers, and the medians table. No entry,
+//! no claim; an entry is local state, and the number a claim rests on goes in the
+//! lab tracker with the command that produced it (`goals.py measure`).
+//!
+//! ## Standing triggers (plan §6)
+//!
+//! - Every ghostty **stable** release → full arena sweep.
+//! - **Monthly** → ARENA-CAT (`cat`) vs ghostty tip; ARENA-FIRE joins it as the
+//!   cheap pair once its runner exists.
+//! - **mitchellh posts a benchmark chart → D1-style re-measure within a week.**
+//! - Before every aterm release → full sweep.
+//! - A dimension that flips against us is a P0 by definition.
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
@@ -304,7 +470,7 @@ impl Machine {
     }
 }
 
-/// Rule zero §2's hardware (`docs/measured/arena/README.md`): publishable
+/// Rule zero §2's hardware (this module's documentation): publishable
 /// head-to-heads run on the M4 Max only, as `sysctl` names it exactly.
 pub(crate) fn rule_zero_hardware(chip: &str) -> bool {
     chip.trim() == "Apple M4 Max"
@@ -799,7 +965,33 @@ pub(crate) fn report(sock: &Path, line: &str) -> Result<(), String> {
 /// The cooldown between competitors (rule zero §2) — a protocol interval.
 pub(crate) const COOLDOWN: Duration = Duration::from_secs(5);
 
-/// The fields a ledger entry fills into `docs/measured/arena/TEMPLATE.md`.
+/// An arena ledger entry's head, its `{{…}}` fields filled from a [`Ledger`] and the fields
+/// marked TODO left for the person who ran it ([`fill_template`]).
+pub(crate) const TEMPLATE: &str = r"<!-- SPDX-License-Identifier: Apache-2.0 -->
+<!-- Copyright 2026 Andrew Yates -->
+
+# Arena: {{DIM}} — {{DATE}}
+
+Protocol: `crates/aterm-verify/src/perf/arena/mod.rs` rule zero. Append-only — a superseding
+run gets a new file. No field left TODO in an entry a claim rests on.
+
+- **Machine:** {{MACHINE}}
+- **macOS:** {{MACOS}}
+- **Display / refresh:** TODO (ProMotion on/off)
+- **Thermal state per trial:** TODO (`pmset -g therm` before each)
+- **aterm:** {{ATERM}}
+- **Competitors:** {{COMPETITORS}}
+- **Config deviations from shipping defaults:** none / TODO
+- **Harness pins:** see `crates/aterm-verify/perf/arena/manifest.toml` at this commit
+- **Effects:** aterm default (shipped effects on); effects-off delta: TODO if relevant
+
+## Results (medians; raw trials inline)
+
+| workload | aterm | competitor | raw |
+|---|---|---|---|
+";
+
+/// The fields a ledger entry fills into [`TEMPLATE`].
 pub(crate) struct Ledger<'a> {
     pub date: &'a str,
     pub dim: &'a str,
@@ -820,23 +1012,20 @@ pub(crate) fn fill_template(template: &str, l: &Ledger<'_>) -> String {
         .replace("{{COMPETITORS}}", l.competitors)
 }
 
-/// The append-only arena ledger, `docs/measured/arena/`.
+/// The append-only arena ledger, in the verify state directory
+/// ([`crate::perf::ledger_dir`] `arena`).
 pub(crate) struct LedgerBook {
     dir: PathBuf,
-    template: String,
 }
 
 impl LedgerBook {
+    /// The ledger folder, made before a lane runs a trial, so a run whose entry has nowhere to
+    /// go fails before it spends its trials (as the fabric and restore lanes do).
     pub(crate) fn open() -> Result<LedgerBook, Halt> {
-        let dir = workspace_root().join("docs/measured/arena");
-        let path = dir.join("TEMPLATE.md");
-        match crate::read_regular_text(&path) {
-            Ok(template) => Ok(LedgerBook { dir, template }),
-            Err(e) => Err(Halt::skip(
-                format!("no arena ledger template at {} ({e})", path.display()),
-                "run the lane in the development checkout, which carries docs/measured/arena",
-            )),
-        }
+        let dir = crate::perf::ledger_dir("arena");
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not make {}: {e}", dir.display()))?;
+        Ok(LedgerBook { dir })
     }
 
     /// Write a new entry `<date>-<slug>.md` (append-only: a second run on one
@@ -847,8 +1036,10 @@ impl LedgerBook {
         ledger: &Ledger<'_>,
         body: &str,
     ) -> Result<PathBuf, String> {
-        let mut text = fill_template(&self.template, ledger);
+        let mut text = fill_template(TEMPLATE, ledger);
         text.push_str(body);
+        std::fs::create_dir_all(&self.dir)
+            .map_err(|e| format!("could not make {}: {e}", self.dir.display()))?;
         let mut path = self.dir.join(format!("{}-{slug}.md", ledger.date));
         let mut n = 2;
         while path.exists() {
@@ -858,8 +1049,8 @@ impl LedgerBook {
         crate::write_fresh(&path, text)
             .map_err(|e| format!("could not write {}: {e}", path.display()))?;
         eprintln!(
-            "ledger entry written: {} — fill in the display/thermal/config fields before \
-             committing.",
+            "ledger entry written: {} — fill in the display/thermal/config fields before a \
+             claim rests on it.",
             path.display()
         );
         Ok(path)

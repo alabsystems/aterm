@@ -1116,7 +1116,7 @@ fn leave_watcher(parent: i32) -> Result<(), String> {
         .write(true)
         .open("/dev/null")
         .map_err(|e| format!("/dev/null: {e}"))?;
-    let (mut armed, arming) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
+    let (mut armed, arming) = crate::pipe().map_err(|e| format!("a pipe: {e}"))?;
     // SAFETY: `getpid` takes nothing and cannot fail.
     let child = unsafe { libc::getpid() };
     let Some(watched) = crate::process::read_lineage(child).map(|lineage| Watched::of(&lineage))
@@ -1126,6 +1126,9 @@ fn leave_watcher(parent: i32) -> Result<(), String> {
     // SAFETY: `getpgrp` takes nothing and cannot fail. The spawn put this process at the head of
     // its own group (`process_group(0)`, or a session) before it ran, and the exec keeps it.
     let leads = unsafe { libc::getpgrp() } == child;
+    // The watcher keeps both ends, which are kept out of every fork they are not handed to: the
+    // first fork is handed them, and its child, holding them unmarked, forks the watcher.
+    let handing = crate::spawn_lock::handing(&[arming.as_raw_fd(), armed.as_raw_fd()]);
     // SAFETY: `fork` takes nothing. This process has one thread, since its `main` calls `entry`
     // before anything that starts one, so no other thread holds a lock across the fork and the
     // forked branch may read, keep time and sleep as `end_proven` does. That branch never
@@ -1152,6 +1155,7 @@ fn leave_watcher(parent: i32) -> Result<(), String> {
             libc::_exit(i32::from(second < 0));
         }
     }
+    drop(handing);
     let mut status = 0;
     // SAFETY: `first` is this process's own child; `status` is a live local.
     while unsafe { libc::waitpid(first, &mut status, 0) } < 0

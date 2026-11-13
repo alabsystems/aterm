@@ -493,6 +493,64 @@ pub struct Repair {
     /// The common tables whose witnesses differed when this side last asked ([`witness`]): the
     /// regular turn visits these alone while any remain; a table leaves as it is selected.
     differing: BTreeSet<Digest>,
+    /// The tables this side appended to since a round it initiated with this peer last took
+    /// each ([`Self::announce`]), and those an ask an announce called for found differing: at
+    /// most [`MAX_TABLES`]. A round this side initiates takes one ahead of the regular turn, as
+    /// a preferred table, and the regular scan keeps its place ([`Self::table`]); a table
+    /// leaves as any turn selects it. Apart from [`Self::differing`], which the regular turn
+    /// visits and a witness answer replaces.
+    announced: BTreeSet<Digest>,
+    /// The announced table last taken as one: the next is the one after it, so a table
+    /// announced again each round does not keep the other announced tables waiting.
+    announced_after: Option<Digest>,
+    /// How many rounds in a row took an announced table: the [`TABLE_BURST`]th yields the next
+    /// round to the regular turn, so tables announced round after round do not keep the scan
+    /// from the rest.
+    announced_run: usize,
+    /// An announce called for the next round's ask ([`Self::announce`]): what that ask finds
+    /// differing joins [`Self::announced`].
+    announce_asks: bool,
+}
+
+impl Repair {
+    /// This side appended to `tables` (`crate::control::Endpoint::announce`): the rounds it
+    /// initiates with this peer take them ahead of the regular scan's turn, which keeps its
+    /// place. Past [`MAX_TABLES`] of those, or where `unnamed` says an append's table went
+    /// unnamed, the next round asks the peer which tables differ instead ([`witness`]), and
+    /// those are taken the same way.
+    pub(crate) fn announce(&mut self, tables: &BTreeSet<Digest>, unnamed: bool) {
+        let mut ask = unnamed;
+        for table in tables {
+            if self.announced.len() >= MAX_TABLES && !self.announced.contains(table) {
+                ask = true;
+                break;
+            }
+            self.announced.insert(*table);
+        }
+        if ask {
+            self.listed_ms = None;
+            self.announce_asks = true;
+        }
+    }
+    /// Whether this hint still names a table for a round this side initiates to take before
+    /// the ordinary interval: one announced, or one whose witness differed. The schedule does
+    /// not rest an endpoint whose hint does (`crate::runtime`'s `Hints::finish`).
+    pub(crate) fn owes(&self) -> bool {
+        !self.announced.is_empty() || !self.differing.is_empty()
+    }
+    /// The announced table a round takes next: the first after the one last taken, among
+    /// those the peer holds too.
+    fn next_announced(&self, common: &BTreeSet<Digest>) -> Option<Digest> {
+        cycle(&self.announced, self.announced_after)
+            .find(|id| common.contains(*id))
+            .copied()
+    }
+    /// The tables announced and not yet taken, and whether its next round asks for witnesses
+    /// whatever the gap (tests).
+    #[cfg(test)]
+    pub(crate) fn announced(&self) -> (&BTreeSet<Digest>, bool) {
+        (&self.announced, self.listed_ms.is_none())
+    }
 }
 
 /// Volatile work hints learned from authenticated inventory exchanges. These
@@ -2615,6 +2673,10 @@ impl Round<'_> {
         }
         let common: BTreeSet<_> = local.intersection(&remote).copied().collect();
         if side == Side::Initiator {
+            // What an ask an announce called for finds joins the announced tables, which the
+            // regular scan's place does not follow; any other ask's answer is the regular
+            // turn's, as before.
+            let announce_asked = std::mem::take(&mut repair.announce_asks);
             if let Some(salt) = salt
                 && !answered.chunks.is_empty()
                 && let Some(differing) = witness::differing(
@@ -2623,7 +2685,11 @@ impl Round<'_> {
                     &answered,
                 )
             {
-                repair.differing = differing;
+                if announce_asked {
+                    repair.announced.extend(differing);
+                } else {
+                    repair.differing = differing;
+                }
             }
             if salt.is_some() {
                 repair.asked_ms = listed_ms;
@@ -2631,6 +2697,7 @@ impl Round<'_> {
             }
             repair.listed_ms = listed_ms;
             repair.differing.retain(|id| common.contains(id));
+            repair.announced.retain(|id| common.contains(id));
         }
         let force_regular = side == Side::Initiator && std::mem::take(&mut repair.table_yield);
         let follow_up = if side == Side::Initiator {
@@ -2656,17 +2723,27 @@ impl Round<'_> {
             None
         };
         let follow_up = follow_up.filter(|(id, _)| pushed.is_none_or(|first| first == *id));
-        let hinted =
-            if side == Side::Initiator && !force_regular && follow_up.is_none() && pushed.is_none()
-            {
-                self.backfill
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .next(&local, &common)
-            } else {
-                None
-            };
-        let priority = pushed.or(follow_up.map(|(id, _)| id)).or(hinted);
+        let preferring =
+            side == Side::Initiator && !force_regular && follow_up.is_none() && pushed.is_none();
+        // A table this side appended to (`Repair::announce`) goes before a backfill hint, which
+        // is not spent meanwhile, and before the regular turn, whose place it leaves alone.
+        let announced = if preferring {
+            repair.next_announced(&common)
+        } else {
+            None
+        };
+        let hinted = if preferring && announced.is_none() {
+            self.backfill
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .next(&local, &common)
+        } else {
+            None
+        };
+        let priority = pushed
+            .or(follow_up.map(|(id, _)| id))
+            .or(announced)
+            .or(hinted);
         // While tables whose witnesses differed remain, the regular turn visits only those, in the
         // scan's own order (fresh peers still start apart); the scan goes on from the last.
         #[cfg(test)]
@@ -2688,6 +2765,7 @@ impl Round<'_> {
                 });
                 if let Some(id) = chosen {
                     repair.differing.remove(&id);
+                    repair.announced.remove(&id);
                 }
                 self.local(peer, |_| Ok(()))?;
                 control::send_frame(stream, chosen.as_ref().map_or(&[][..], |id| id.as_slice()))?;
@@ -2737,11 +2815,25 @@ impl Round<'_> {
         // restarted scan cannot keep rewinding ours to the first table.
         if side == Side::Initiator && priority.is_none() {
             repair.table = Some(id);
+            repair.announced_run = 0;
         }
         if priority.is_some() {
             // A failed or empty preferred round also yields. A permanently
             // unavailable history must not replace the ordinary table scan.
             repair.table_yield = true;
+        }
+        // An announced table's round yields only as the `TABLE_BURST`th in a row: a few tables
+        // announced together go round after round, and tables announced without end still
+        // leave the regular turn one round in `TABLE_BURST + 1`.
+        let took_announced = announced == Some(id);
+        if took_announced {
+            repair.announced_after = Some(id);
+            repair.announced_run += 1;
+            if repair.announced_run < TABLE_BURST {
+                repair.table_yield = false;
+            } else {
+                repair.announced_run = 0;
+            }
         }
         report.table = Some(id);
         report.scope = self.tables.get(&id).map(|(scope, _)| *scope);
@@ -2754,7 +2846,7 @@ impl Round<'_> {
         let retried = true;
         if retried
             && side == Side::Initiator
-            && priority.is_none()
+            && (priority.is_none() || took_announced)
             && report.table_deferred
             && repair.table_follow_up.is_none()
         {

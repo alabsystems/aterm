@@ -48,8 +48,10 @@ fn alt_arrow_moves_pane_focus_or_reaches_the_program() {
     assert_eq!(drain(top_pipe), b"\x1b[1;3D", "unsplit: the program's key");
 
     let (bottom_pipe, bottom_sink) = {
-        let mut pipe = [0; 2];
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        use std::os::fd::IntoRawFd;
+        let pipe = aterm_uds::pipe()
+            .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+            .expect("pipe");
         assert_eq!(
             unsafe { libc::fcntl(pipe[0], libc::F_SETFL, libc::O_NONBLOCK) },
             0

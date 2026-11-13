@@ -163,6 +163,9 @@ pub fn main_entry(args: Vec<OsString>) -> ExitCode {
     if words.first().is_some_and(|w| w == "table") {
         return crate::att::command::main_entry(&words[1..]);
     }
+    if words.first().is_some_and(|w| w == "fleet") {
+        return crate::fleet::command::main_entry(&words[1..]);
+    }
     if words.first().is_some_and(|w| w == "alab") {
         // The `aterm` executable routes `alab` itself, with the harness's sheet reading; this
         // path serves `check` and `adopt`, and `import` names where it runs.

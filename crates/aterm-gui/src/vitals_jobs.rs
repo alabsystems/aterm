@@ -917,7 +917,7 @@ pub(crate) fn held_on_slow(view: &JobsView, left: Option<&LeftView>) -> bool {
 }
 
 /// Whether `view` names a program of this user that has not started (held by macOS's program
-/// check, translating under Rosetta, on a volume not proven local, or reading stopped or traced),
+/// check, translating under Rosetta, with nothing read to say why, or reading stopped or traced),
 /// or stands in a backed-up episode that has not had its closing reading. Such a view is read
 /// again within 30 s whatever its demand (`vitals_host::held_wait_after`), since a start (a
 /// debugger's resume included) raises no edge.
@@ -1710,6 +1710,7 @@ fn sweep_proc(p: &ProcessReading) -> SweepProc {
         state: state(p.state),
         session_leader: p.session_leader,
         has_tty: p.has_tty,
+        threads: p.threads,
         exec: p.exec,
     }
 }

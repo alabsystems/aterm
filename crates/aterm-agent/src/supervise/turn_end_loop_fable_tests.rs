@@ -9,8 +9,9 @@ use crate::supervise::approvals::{
     model_switch_reason, open_model_switch, open_wall,
 };
 use crate::supervise::policy::turn_end::{
-    AccountAt, FABLE_FALLBACK, LaunchModel, RULE_ACCOUNT, RULE_CONTINUE, RULE_MODEL_FALLBACK,
-    RULE_MODEL_RESTORE, Restart, RestartAnswer, RestartAsk, RestartClaim, decide_turn_end,
+    AccountAt, FABLE_FALLBACK, FableWeek, LaunchModel, RULE_ACCOUNT, RULE_CONTINUE,
+    RULE_MODEL_FALLBACK, RULE_MODEL_RESTORE, Restart, RestartAnswer, RestartAsk, RestartClaim,
+    decide_turn_end,
 };
 use aterm_phase::prompt::fixtures as fx;
 use std::sync::Mutex;
@@ -130,6 +131,9 @@ struct FableHost {
     carry: AtomicBool,
     step: Mutex<Option<&'static str>>,
     carried: AtomicUsize,
+    /// The account's record of Fable's week ([`IdleHost::fable_week`]), and how often it was read.
+    fable_week: Mutex<Option<FableWeek>>,
+    week_reads: AtomicUsize,
 }
 
 impl FableHost {
@@ -189,6 +193,10 @@ impl IdleHost for FableHost {
     fn launch_model(&self) -> LaunchModel {
         self.launch_reads.fetch_add(1, Ordering::SeqCst);
         self.launch.lock().unwrap().clone()
+    }
+    fn fable_week(&self) -> Option<FableWeek> {
+        self.week_reads.fetch_add(1, Ordering::SeqCst);
+        *self.fable_week.lock().unwrap()
     }
     fn restart(&self, why: &Restart, ask: &RestartAsk) -> Option<RestartAnswer> {
         self.asked.lock().unwrap().push(why.clone());
@@ -673,31 +681,44 @@ fn the_return_puts_back_the_launchs_own_model() {
     }
 }
 
-/// A FABLE NOTICE THAT NAMES NO RESET MOVES THE SESSION WITH NO RETURN SCHEDULED: none is guessed.
-/// The ledger's switch says `back_at=-`, and no later loop, however late, takes it back.
+/// A FABLE NOTICE THAT NAMES NO RESET MOVES THE SESSION WITH NO RETURN GUESSED: the move says its
+/// return waits on a `/usage` sample of Fable's week, the ledger's switch says `back_at=-`, and a
+/// later loop, however late, returns nothing on it before a sample, which is due at its first
+/// quiet moment. Where the account's record of Fable's week names a reset still ahead, the move
+/// says so and the ledger's switch carries that reset, which a later loop past it returns at.
+/// NEGATIVE CONTROL: a record whose reset has passed times nothing.
 #[test]
-fn a_fable_limit_with_no_reset_moves_with_no_return_scheduled() {
-    let (dir, ledger) = ledger_at("no-reset");
+fn a_fable_limit_with_no_reset_waits_on_a_sample_or_the_accounts_record_never_a_guess() {
     let screen = fx::screen(fx::WALL_FABLE_NO_RESET_2_1_301);
-    let host = FableHost::launched(LaunchModel::Unnamed, &["relaunched"]);
-    let opts = opts_for(&host);
-    let mut m = Mock::new(vec![screen.clone()]);
-    let mut s = loop_at(&mut m, &ledger, NOW);
-    let p = point_at(&s, screen.clone(), 100);
-    let a = s.turn_end_at_point(&p, None, &opts).expect("a decision");
-    assert!(moves_to_opus(&a), "{a:?}");
-    let mut heard = Heard::default();
-    s.turn_end_execute(&p, a, &opts, &[], &mut heard)
-        .expect("relaunched");
-    drop(s);
+    let moved = |tag: &str, week: Option<FableWeek>| {
+        let (dir, ledger) = ledger_at(tag);
+        let host = FableHost::launched(LaunchModel::Unnamed, &["relaunched"]);
+        *host.fable_week.lock().unwrap() = week;
+        let opts = opts_for(&host);
+        let mut m = Mock::new(vec![screen.clone()]);
+        let mut s = loop_at(&mut m, &ledger, NOW);
+        let p = point_at(&s, screen.clone(), 100);
+        let a = s.turn_end_at_point(&p, None, &opts).expect("a decision");
+        assert!(moves_to_opus(&a), "{tag}: {a:?}");
+        let mut heard = Heard::default();
+        s.turn_end_execute(&p, a, &opts, &[], &mut heard)
+            .expect("relaunched");
+        drop(s);
+        assert!(
+            host.week_reads.load(Ordering::SeqCst) >= 1,
+            "{tag}: the record was read"
+        );
+        (dir, ledger, heard.said)
+    };
+
+    let (dir, ledger, said) = moved("no-reset", None);
     assert!(
-        heard.said.iter().any(|l| l.starts_with("RESTARTED ")
+        said.iter().any(|l| l.starts_with("RESTARTED ")
             && l.ends_with(
-                "relaunch --model claude-opus-5-5 (from fable, no return scheduled: the notice \
-                 names no reset; session-only)"
+                "relaunch --model claude-opus-5-5 (from fable, the notice names no reset: the \
+                 return waits on a /usage sample of Fable's week; session-only)"
             )),
-        "{:#?}",
-        heard.said
+        "{said:#?}"
     );
     assert_eq!(
         typed_rows(&ledger, RULE_MODEL_FALLBACK),
@@ -717,10 +738,53 @@ fn a_fable_limit_with_no_reset_moves_with_no_return_scheduled() {
     let mut s = later_loop(&mut m, &ledger, NOW + 30 * 86_400);
     let p = point_at(&s, ended("Fixed the parser."), 101);
     let a = s.turn_end_at_point(&p, None, &opts).expect("a decision");
+    let due = s.turn_end.model_sample_due(s.fx.mono());
     drop(s);
     let _ = std::fs::remove_dir_all(&dir);
-    assert_eq!(returns(&a), None, "{a:?}");
+    assert_eq!(returns(&a), None, "no reading, no return: {a:?}");
     assert!(host.asked().is_empty(), "{:?}", host.asked());
+    assert!(due, "the sample is due at the later loop's quiet moment");
+
+    let recorded = NOW + 3 * 86_400;
+    let (dir, ledger, said) = moved(
+        "record",
+        Some(FableWeek {
+            pct: Some(100),
+            reset: Some(recorded),
+        }),
+    );
+    assert!(
+        said.iter().any(|l| l.starts_with("RESTARTED ")
+            && l.contains("(from fable, back at ")
+            && l.ends_with(
+                ", the reset the account's record of Fable's week names; session-only)"
+            )),
+        "{said:#?}"
+    );
+    assert_eq!(
+        open_model_switch(&ledger, Some(SID)).map(|o| o.back_at_unix),
+        Some(Some(recorded))
+    );
+    let host = FableHost::launched(LaunchModel::Unnamed, &["relaunched"]);
+    let opts = opts_for(&host);
+    let mut m = Mock::new(vec![ended("Fixed the parser.")]);
+    let mut s = later_loop(&mut m, &ledger, recorded + 60);
+    let p = point_at(&s, ended("Fixed the parser."), 101);
+    let a = s.turn_end_at_point(&p, None, &opts).expect("a decision");
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(returns(&a), Some(None), "past the record's reset: {a:?}");
+
+    let (dir, ledger, _) = moved(
+        "record-passed",
+        Some(FableWeek {
+            pct: Some(100),
+            reset: Some(NOW - 60),
+        }),
+    );
+    let open = open_model_switch(&ledger, Some(SID)).map(|o| o.back_at_unix);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(open, Some(None), "a passed reset times nothing");
 }
 
 /// A MODEL SWITCH IS READ BACK BY A LOOP THAT STARTS AFTER IT, and a switch an older build wrote

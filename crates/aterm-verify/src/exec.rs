@@ -58,6 +58,9 @@ pub struct Cmd {
     pub waits_count: bool,
     /// A test binary whose cases are read as they end ([`CaseWatch`]).
     pub test_cases: Option<CaseWatch>,
+    /// End a child only after this much silence in both captured bytes and complete-tree
+    /// CPU/I/O. Marked admission and lock waits suspend this inactivity window.
+    pub hang_after: Option<Duration>,
     /// The planner's libtest width, independent of its accounting charge in cores.
     planned_test_threads: Option<u32>,
 }
@@ -97,6 +100,7 @@ impl Cmd {
             term_grace: None,
             waits_count: false,
             test_cases: None,
+            hang_after: None,
             planned_test_threads: None,
         }
     }
@@ -256,6 +260,7 @@ struct FinalizedCommandReceipt {
     term_grace: Option<Duration>,
     waits_count: bool,
     test_cases: Option<CaseWatch>,
+    hang_after: Option<Duration>,
     planned_test_threads: Option<u32>,
 }
 
@@ -274,6 +279,7 @@ impl FinalizedCommandReceipt {
             term_grace: command.term_grace,
             waits_count: command.waits_count,
             test_cases: command.test_cases.clone(),
+            hang_after: command.hang_after,
             planned_test_threads: command.planned_test_threads,
         }
     }
@@ -291,6 +297,7 @@ impl FinalizedCommandReceipt {
             && self.term_grace == command.term_grace
             && self.waits_count == command.waits_count
             && self.test_cases == command.test_cases
+            && self.hang_after == command.hang_after
             && self.planned_test_threads == command.planned_test_threads
     }
 }
@@ -369,6 +376,15 @@ impl StackSample {
 /// (`docs/DESIGN-adaptive-build-2026-10-24.md`, CEILING-WAIT), injected through
 /// [`ExecEnv::host`]: [`LIVE_HOST`] reads the OS, a test's stand-in says what it is told.
 pub trait Host: Sync + std::fmt::Debug {
+    /// A complete root-and-descendant CPU/I/O generation for a child's inactivity detector.
+    /// Injected hosts may supply deterministic readings; an unread tree proves no stall.
+    fn process_progress(
+        &self,
+        root: u32,
+        probe: &mut aterm_uds::deadline::ProcessProgressProbe,
+    ) -> Option<u64> {
+        probe.read(root)
+    }
     /// The monotonic clock for work deadlines and start-watch cadence. A fixture may advance
     /// it after its child proves execution; the live host always reads the system clock.
     fn monotonic(&self) -> Instant {
@@ -1468,6 +1484,7 @@ fn run_captured_inner(
                 &label,
                 marks,
                 FinishControls {
+                    stdout_log: None,
                     compiler: None,
                     local_red: hung_red,
                     admission: &mut admission,
@@ -1522,6 +1539,7 @@ fn run_captured_inner(
                 &label,
                 marks,
                 FinishControls {
+                    stdout_log: stdout_log.as_deref(),
                     compiler,
                     local_red: hung_red,
                     admission: &mut admission,
@@ -2658,6 +2676,7 @@ fn discard_sample(sample: &StackSample) {
 }
 
 struct FinishControls<'a, 'lock> {
+    stdout_log: Option<&'a Path>,
     compiler: Option<compiler_progress::Progress>,
     local_red: Option<&'a (dyn Fn() + Sync)>,
     admission: &'a mut SpawnAdmission<'lock>,
@@ -2715,6 +2734,7 @@ fn finish_inner(
 ) -> (Run, Option<String>) {
     let ObservedFinish { controls, cases } = observed;
     let FinishControls {
+        stdout_log,
         mut compiler,
         local_red,
         admission,
@@ -2833,6 +2853,11 @@ fn finish_inner(
         .test_cases
         .as_ref()
         .map(|watch| TestProgress::new(watch.hang_after, begun));
+    let mut child_progress = cmd
+        .hang_after
+        .map(|window| TestProgress::new(window, begun));
+    let mut child_probe = aterm_uds::deadline::ProcessProgressProbe::default();
+    let mut child_probe_due = begun;
     let mut clock = Clock::new(marks, env.host, child.id(), crate::memory::current())
         .watching_tree(cmd.test_cases.is_some())
         .owning(&own);
@@ -3109,6 +3134,54 @@ fn finish_inner(
                 used(spawn_failure(cmd, &format!("{}{note}", v.words)), &clock),
                 read_log(log),
             );
+        } else if let Some(progress) = child_progress.as_mut()
+            && clock.last >= child_probe_due
+            && {
+                child_probe_due = clock.last + READ_USAGE_EVERY;
+                let bytes = [log, stdout_log]
+                    .into_iter()
+                    .flatten()
+                    .try_fold(0_u64, |sum, path| {
+                        std::fs::metadata(path)
+                            .ok()
+                            .map(|meta| sum.saturating_add(meta.len()))
+                    });
+                let work = if clock.waits.is_empty() {
+                    env.host.process_progress(child.id(), &mut child_probe)
+                } else {
+                    None
+                };
+                progress.hung(clock.last, bytes, work)
+            }
+        {
+            let why = format!(
+                "no captured output or complete descendant CPU/I/O progress for {:?}",
+                progress.window
+            );
+            let killed = kill_and_reap(
+                &mut child,
+                #[cfg(unix)]
+                &mut live,
+                cmd.term_grace,
+                #[cfg(unix)]
+                REAP_AFTER_KILL,
+            );
+            return (
+                used(
+                    Run {
+                        case_observations: None,
+                        ok: false,
+                        output: format!("aterm-verify: {why}\n{killed}"),
+                        code: None,
+                        spawn_error: None,
+                        stopped_at: None,
+                        hung: None,
+                        usage: None,
+                    },
+                    &clock,
+                ),
+                read_log(log),
+            );
         } else if let Some(limit) = ceiling
             && clock.over(limit)
         {
@@ -3355,6 +3428,19 @@ fn waited_clause(lock: Duration, core: Duration) -> String {
             secs(lock),
             secs(core)
         ),
+    }
+}
+
+/// Whether this run has no child alive ([`group::idle`]). Where the run does not list its
+/// children it is not known, and the answer is no.
+pub(crate) fn no_child_runs() -> bool {
+    #[cfg(unix)]
+    {
+        group::idle()
+    }
+    #[cfg(not(unix))]
+    {
+        false
     }
 }
 
@@ -3846,7 +3932,7 @@ pub mod group {
         if WATCHDOG.load(Ordering::SeqCst) >= 0 {
             return true;
         }
-        let Ok((mut read, write)) = std::io::pipe() else {
+        let Ok((mut read, write)) = aterm_uds::pipe() else {
             return false;
         };
         let spawned = std::thread::Builder::new()
@@ -3985,6 +4071,13 @@ pub mod group {
     #[cfg(test)]
     pub(crate) fn pending() -> i32 {
         PENDING.load(Ordering::SeqCst)
+    }
+
+    /// Whether no child of this run is listed or between its spawn and its listing: none then
+    /// runs, so none holds a token of the release's pool or will give one back.
+    pub(crate) fn idle() -> bool {
+        SPAWNING.load(Ordering::SeqCst) == 0
+            && LIVE.iter().all(|slot| slot.load(Ordering::SeqCst) == 0)
     }
 
     /// How many stage groups are listed now.

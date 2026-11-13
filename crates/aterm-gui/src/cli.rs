@@ -282,9 +282,9 @@ const HELP_TAIL: &str = concat!(
     "              trail_sound_riff, bell_sound, sparkle_words.profanity.bonk[_detonation].\n",
     "  Text        ligatures, font_features, bidi, ambiguous_width, text_blending\n",
     "              (linear-corrected | linear), font_thicken (macOS), stem_gamma,\n",
-    "              font_hinting (Linux/Windows: full | light | off), font_subpixel\n",
-    "              (Linux CPU: off | rgb | bgr), font_variation [\"wght=450\", ...],\n",
-    "              font_weight, font_weight_dark_nudge, font_family_bold/_italic/\n",
+    "              font_hinting (Linux/Windows: full | light | off),\n",
+    "              font_variation [\"wght=450\", ...], font_weight,\n",
+    "              font_weight_dark_nudge, font_family_bold/_italic/\n",
     "              _bold_italic, font_synthetic_style, fallback_fonts [ordered],\n",
     "              symbol_font, emoji_font, line_height, font_size_scale.\n",
     "  Behaviour   gpu, shell, shell_args, scrollback_lines, columns, lines,\n",
@@ -445,7 +445,7 @@ const STARTER_CONFIG: &str = concat!(
 # motion = \"auto\"                 # auto (Reduce Motion on macOS/Windows) | full | reduced
 # load_adaptive_motion = true      # shed decorative effects under sustained render overload (smooth scroll stays on)
 # cursor_trail_style = \"rainbow\"     # cursor motion trail + light crown (DEFAULT; off on Windows):
-#                                  #   rainbow (the rainbow kitty's line under what you type)
+#                                  #   rainbow (the rainbow kitty's band behind what you type, its line under it)
 #                                  #   | phaser | fire | water | laser | comet | sparkle | lumen | beam
 #                                  #   | classic (comet + jump trail) | classic mono | off
 # cursor_pet = \"cat\"                # the pet beside the cursor, with any trail or none (DEFAULT; off on Windows):
@@ -491,7 +491,6 @@ const STARTER_CONFIG: &str = concat!(
 # font_thicken = false             # macOS: CoreText font smoothing (heavier glyphs)
 # stem_gamma = 1                   # aesthetic stem weight (<1 thicker, >1 thinner)
 # font_hinting = \"full\"           # Linux/Windows grid fitting: full (default) | light | off
-# font_subpixel = \"off\"           # Linux CPU subpixel-RGB text: off (default) | rgb | bgr (opaque frames only)
 # font_variation = [\"wght=450\"]    # variable-font axes (clamped to fvar; default wght=400)
 # font_weight = 450                # wght shorthand; wins over a font_variation wght entry
 # font_weight_dark_nudge = 0       # extra wght on dark themes (applied only when grid-safe)

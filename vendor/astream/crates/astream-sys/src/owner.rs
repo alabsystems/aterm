@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! The cordoned Unix module: hand-declared FFI for the owner-only file rule (no libc
-//! dependency). `geteuid` on every Unix; on Apple the four `<sys/acl.h>` calls that
-//! read a descriptor's extended access list; and on macOS arm64 the five calls that read
+//! dependency). `geteuid` on every Unix; on Apple `fstatx_np`, the four filesec calls and
+//! three `<sys/acl.h>` calls that read a descriptor's extended access list; and on macOS
+//! arm64 `lstatx_np` with the same filesec calls, which read
 //! a path's owner, mode and whether it carries an access list without opening it
 //! (`lstatx_np`, `filesec_init`, `filesec_get_property`, `filesec_query_property`,
 //! `filesec_free`, behind [`crate::owner_private_dir_by_path`]). The `open` flags the
@@ -51,15 +52,19 @@ pub(crate) fn plain_fsync(fd: std::os::fd::BorrowedFd<'_>) -> io::Result<()> {
 
 #[cfg(target_vendor = "apple")]
 unsafe extern "C" {
-    fn acl_get_fd_np(fd: c_int, kind: c_int) -> *mut c_void;
     fn acl_get_entry(acl: *mut c_void, entry_id: c_int, entry: *mut *mut c_void) -> c_int;
     fn acl_get_tag_type(entry: *mut c_void, tag: *mut c_int) -> c_int;
     fn acl_free(object: *mut c_void) -> c_int;
+    // SDK sys/stat.h:422. The plain symbol on every Apple target: x86_64's is the
+    // 32-bit-inode call beside `_fstatx_np$INODE64`, whose smaller `struct stat` the
+    // buffer holds too, and nothing here reads the stat.
+    fn fstatx_np(fd: c_int, sb: *mut c_void, fsec: *mut c_void) -> c_int;
+    // SDK sys/fcntl.h:636, 638, 639 and 640.
+    fn filesec_init() -> *mut c_void;
+    fn filesec_free(fsec: *mut c_void);
+    fn filesec_get_property(fsec: *mut c_void, property: c_int, propptr: *mut c_void) -> c_int;
+    fn filesec_query_property(fsec: *mut c_void, property: c_int, validptr: *mut c_int) -> c_int;
 }
-
-/// `<sys/acl.h>`'s `ACL_TYPE_EXTENDED`: the one ACL type macOS keeps.
-#[cfg(target_vendor = "apple")]
-const ACL_TYPE_EXTENDED: c_int = 0x0000_0100;
 /// `ACL_FIRST_ENTRY` and `ACL_NEXT_ENTRY`, `acl_get_entry`'s cursor.
 #[cfg(target_vendor = "apple")]
 const ACL_FIRST_ENTRY: c_int = 0;
@@ -68,9 +73,8 @@ const ACL_NEXT_ENTRY: c_int = -1;
 /// `acl_tag_t`'s `ACL_EXTENDED_ALLOW`: an entry that grants (the other is a deny).
 #[cfg(target_vendor = "apple")]
 const ACL_EXTENDED_ALLOW: c_int = 1;
-/// `ENOENT`, which `acl_get_fd_np` answers for a file that carries no extended list,
-/// and `lstatx_np` for a path whose lookup found nothing.
-#[cfg(target_vendor = "apple")]
+/// `ENOENT`, which `lstatx_np` answers for a path whose lookup found nothing.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) const ENOENT: i32 = 2;
 
 /// `(O_NONBLOCK, O_NOFOLLOW)` for this target, or `None` where this crate declares
@@ -122,19 +126,141 @@ pub(crate) fn euid() -> u32 {
 }
 
 /// Whether `file`'s extended access list holds an entry that ALLOWS anyone anything.
-/// A file with no list at all (`ENOENT`) holds none; a deny entry is not counted.
+/// A file with no list holds none; a deny entry is not counted.
+///
+/// One `fstatx_np` of the descriptor into a filesec of this function's, decided by return
+/// codes and the filesec's validity bits alone ([`ListRead::allows`]), never by errno.
+/// `acl_get_fd_np`, which this replaced, answers a file with no list NULL with errno
+/// ENOENT, set by `filesec_get_property` before the `free()` in `filesec_free` (Libc
+/// posix1e/acl_file.c:71-90, gen/filesec.c:94-99, 183-186). libmalloc's `free` keeps no
+/// errno, and one that hands a chunk back with `madvise(MADV_FREE_REUSABLE)` leaves the
+/// madvise's: EINVAL where XNU will not reuse the map entry (bsd/kern/kern_mman.c:1492-1495;
+/// osfmk/vm/vm_map.c:16962-17004, 17165-17170: an entry in transition, wired, or copied
+/// on write since a read of this process's memory). So a loaded process could read
+/// "Invalid argument" for a plain private file with no list (aterm's ATERM-KI-1111-30).
 #[cfg(target_vendor = "apple")]
 pub(crate) fn acl_allows(file: &File) -> io::Result<bool> {
     use std::os::fd::AsRawFd as _;
-    // SAFETY: the descriptor is `file`'s, open for the whole call; the list returned
+    // SAFETY: `filesec_init` takes nothing; the filesec it returns (Libc gen/filesec.c:61-70)
     // is owned here and freed once below.
-    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) };
-    if acl.is_null() {
-        let error = io::Error::last_os_error();
-        return match error.raw_os_error() {
-            Some(ENOENT) => Ok(false),
-            _ => Err(error),
+    let fsec = unsafe { filesec_init() };
+    let read = if fsec.is_null() {
+        ListRead::NoFilesec
+    } else {
+        // SAFETY: `fsec` is filesec_init's, non-null, and freed only below; the descriptor is
+        // `file`'s, open for the whole call.
+        let read = unsafe { read_list(file.as_raw_fd(), fsec) };
+        // SAFETY: `fsec` is filesec_init's and freed exactly once, here, on the one path out
+        // after it was made; `read_list` keeps no pointer into it.
+        unsafe { filesec_free(fsec) };
+        read
+    };
+    #[cfg(test)]
+    errno_seam::after_free();
+    read.allows()
+}
+
+/// What [`acl_allows`] read of a descriptor's access list, as plain values: no pointer, and
+/// no errno but the one `filesec_get_property` set itself as it failed, read straight after.
+#[cfg(target_vendor = "apple")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ListRead {
+    /// `filesec_init` could not allocate.
+    NoFilesec,
+    /// `fstatx_np` returned this instead of 0: -1 (the syscall failed; statx1 frees its
+    /// buffer after it, so errno may be `free`'s, and is not read), or the ENOMEM statx1
+    /// returns itself (Libc sys/statx_np.c:159-162).
+    Failed(c_int),
+    /// `fstatx_np` returned 0 with no mode in the filesec: statx1's realloc for a list
+    /// longer than its first buffer failed, and it returns 0 having set nothing
+    /// (statx_np.c:178-187), so no list bit says there is none.
+    Unset,
+    /// The stat was read and the filesec holds no access list.
+    Unlisted,
+    /// The filesec holds a list, which `filesec_get_property` could not copy out: its
+    /// errno (`acl_copy_int_native`'s).
+    Uncopied(Option<i32>),
+    /// The filesec holds a list; whether one of its entries allows.
+    Listed(bool),
+}
+
+#[cfg(target_vendor = "apple")]
+impl ListRead {
+    /// The verdict: `Ok(false)` with no list, the allow walk's answer with one, and `Err`
+    /// for every read that left the list unjudged.
+    pub(crate) fn allows(self) -> io::Result<bool> {
+        let unjudged = |why: String| {
+            Err(io::Error::other(format!(
+                "the access list could not be read: {why}"
+            )))
         };
+        match self {
+            ListRead::Unlisted => Ok(false),
+            ListRead::Listed(allows) => Ok(allows),
+            ListRead::NoFilesec => Err(io::Error::from(io::ErrorKind::OutOfMemory)),
+            ListRead::Failed(rc) => unjudged(format!("fstatx_np returned {rc}")),
+            ListRead::Unset => unjudged("fstatx_np set no mode".to_string()),
+            ListRead::Uncopied(Some(errno)) => Err(io::Error::from_raw_os_error(errno)),
+            ListRead::Uncopied(None) => unjudged("the list could not be copied".to_string()),
+        }
+    }
+}
+
+/// The words of the `struct stat` buffer `fstatx_np` fills in [`read_list`].
+#[cfg(target_vendor = "apple")]
+const LIST_STAT_WORDS: usize = 32;
+
+#[cfg(target_vendor = "apple")]
+const _: () = assert!(
+    LIST_STAT_WORDS * 8 > 144,
+    "the buffer holds the 144 bytes of a 64-bit-inode stat"
+);
+
+/// [`acl_allows`]'s `fstatx_np` and its reads of the filesec, which `acl_allows` makes and
+/// frees.
+///
+/// # Safety
+/// `fsec` is a live filesec from `filesec_init`, not yet freed, and is not freed during
+/// the call; `fd` is open for the call.
+#[cfg(target_vendor = "apple")]
+unsafe fn read_list(fd: c_int, fsec: *mut c_void) -> ListRead {
+    let mut sb = [0u64; LIST_STAT_WORDS];
+    // SAFETY: `sb` is 256 writable, 8-aligned bytes, more than any `struct stat` the call
+    // writes, and nothing here reads it; `fsec` is a live filesec, so the call goes to
+    // statx1 (Libc sys/statx_np.c:141-219), which keeps its list buffer in `fsec` or frees it.
+    let rc = unsafe { fstatx_np(fd, sb.as_mut_ptr().cast::<c_void>(), fsec) };
+    if rc != 0 {
+        return ListRead::Failed(rc);
+    }
+    let mut mode_set: c_int = 0;
+    // SAFETY: `fsec` is live; the query writes one int and allocates nothing
+    // (filesec.c:303-341).
+    let mode_query = unsafe { filesec_query_property(fsec, FILESEC_MODE, &raw mut mode_set) };
+    if mode_query != 0 || mode_set == 0 {
+        return ListRead::Unset;
+    }
+    let mut listed: c_int = 0;
+    // SAFETY: as above; `listed` is the bitmask `fs_valid & FS_VALID_ACL`, so "listed" is
+    // `!= 0` (filesec.c:325-328, 339).
+    let list_query = unsafe { filesec_query_property(fsec, FILESEC_ACL, &raw mut listed) };
+    if list_query != 0 {
+        return ListRead::Unset;
+    }
+    if listed == 0 {
+        return ListRead::Unlisted;
+    }
+    let mut acl: *mut c_void = std::ptr::null_mut();
+    // SAFETY: `fsec` is live and holds a list; FILESEC_ACL writes one `acl_t` through the
+    // pointer, a copy (`acl_copy_int_native`) this function owns and frees below
+    // (filesec.c:148-160).
+    let got = unsafe { filesec_get_property(fsec, FILESEC_ACL, (&raw mut acl).cast::<c_void>()) };
+    if got != 0 || acl.is_null() {
+        let errno = if got != 0 {
+            io::Error::last_os_error().raw_os_error()
+        } else {
+            None
+        };
+        return ListRead::Uncopied(errno);
     }
     let mut allows = false;
     let mut entry: *mut c_void = std::ptr::null_mut();
@@ -150,9 +276,42 @@ pub(crate) fn acl_allows(file: &File) -> io::Result<bool> {
             break;
         }
     }
-    // SAFETY: `acl` came from `acl_get_fd_np` and is freed exactly once.
+    // SAFETY: `acl` came from `filesec_get_property` and is freed exactly once.
     unsafe { acl_free(acl) };
-    Ok(allows)
+    ListRead::Listed(allows)
+}
+
+/// In a test, what libmalloc's `free` may do as `filesec_free` returns: leave errno
+/// EINVAL (a refused `madvise`), on threads that ask for it.
+#[cfg(all(test, target_vendor = "apple"))]
+pub(crate) mod errno_seam {
+    use std::cell::Cell;
+
+    thread_local! {
+        static CLOBBER: Cell<bool> = const { Cell::new(false) };
+    }
+
+    unsafe extern "C" {
+        fn __error() -> *mut std::ffi::c_int;
+    }
+
+    /// EINVAL, which XNU's madvise answers for a map entry it will not reuse.
+    pub(crate) const EINVAL: std::ffi::c_int = 22;
+
+    /// Run `body` with errno set to EINVAL each time Libc's frees return.
+    pub(crate) fn clobbered<R>(body: impl FnOnce() -> R) -> R {
+        CLOBBER.set(true);
+        let out = body();
+        CLOBBER.set(false);
+        out
+    }
+
+    pub(super) fn after_free() {
+        if CLOBBER.get() {
+            // SAFETY: `__error` returns this thread's errno slot, live for the thread.
+            unsafe { *__error() = EINVAL };
+        }
+    }
 }
 
 // The path entry's calls, macOS arm64 only (Libc-1752.120.2, xnu-12377.121.6). On macOS
@@ -165,20 +324,15 @@ pub(crate) fn acl_allows(file: &File) -> io::Result<bool> {
 unsafe extern "C" {
     // SDK sys/stat.h:425.
     fn lstatx_np(path: *const c_char, sb: *mut c_void, fsec: *mut c_void) -> c_int;
-    // SDK sys/fcntl.h:636, 638, 639 and 640.
-    fn filesec_init() -> *mut c_void;
-    fn filesec_free(fsec: *mut c_void);
-    fn filesec_get_property(fsec: *mut c_void, property: c_int, propptr: *mut c_void) -> c_int;
-    fn filesec_query_property(fsec: *mut c_void, property: c_int, validptr: *mut c_int) -> c_int;
 }
 
 /// `filesec_property_t`'s `FILESEC_OWNER`, `FILESEC_MODE` and `FILESEC_ACL` (SDK
 /// sys/fcntl.h:601-612), a C enum whose values all fit an `int`, passed as one.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 const FILESEC_OWNER: c_int = 1;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_vendor = "apple")]
 const FILESEC_MODE: c_int = 4;
-#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[cfg(target_vendor = "apple")]
 const FILESEC_ACL: c_int = 5;
 
 /// The words of the `struct stat` buffer `lstatx_np` fills, which nothing here reads:

@@ -23,6 +23,15 @@ fn profile_pilot_size_ceilings_have_no_timing_admission() {
     assert!(parse(&args("--record wasm --size-only")).is_err());
 }
 
+#[test]
+fn admission_wait_is_explicit_and_leaves_timing_admission_to_each_child() {
+    let cli = parse(&args("admission-wait --json-out /tmp/admission.json")).unwrap();
+    assert_eq!(cli.lanes, [Lane::AdmissionWait]);
+    assert!(!cli.takes_quiet_claim(Lane::AdmissionWait));
+    assert!(!parse(&[]).unwrap().lanes.contains(&Lane::AdmissionWait));
+    assert!(parse(&args("--record admission-wait")).is_err());
+}
+
 fn args(s: &str) -> Vec<String> {
     s.split_whitespace().map(str::to_string).collect()
 }
@@ -335,7 +344,7 @@ fn the_verdict_fails_on_a_failure_and_names_what_was_not_judged() {
     let partial = LaneRun::not_judged("no baseline");
     let skip = LaneRun::skip("no Metal device", "run it on a Mac with a GPU");
     let fail = LaneRun::fail("x < floor");
-    let measured = LaneRun::measured("ledger docs/measured/arena/x.md");
+    let measured = LaneRun::measured("ledger entry target/verify/.ubd/perf.noindex/arena/x.md");
     let (text, code) = verdict(&[("throughput", &pass, 1.0)]);
     assert_eq!(code, crate::exit::PASS);
     assert!(text.contains("GREEN — every lane"), "{text}");

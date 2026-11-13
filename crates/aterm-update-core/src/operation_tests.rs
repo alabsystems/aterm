@@ -30,7 +30,7 @@ fn operation_pipe_cancels_its_owned_helper_and_scope_drop_releases_observer() {
         use std::os::fd::OwnedFd;
         let dir = aterm_tempfile::tempdir().unwrap();
         let witness = dir.path().join("pid");
-        let (read, write) = aterm_uds::kept_out(std::io::pipe).unwrap();
+        let (read, write) = aterm_uds::pipe().unwrap();
         let scope = OperationCancellation::watch(OwnedFd::from(read)).unwrap();
         assert!(operation_active());
         assert!(!operation_cancelled());
@@ -75,12 +75,12 @@ fn operation_pipe_cancels_its_owned_helper_and_scope_drop_releases_observer() {
         assert!(!operation_active());
         assert!(!operation_cancelled());
         // Normal scope retirement must not wait for the client's still-open writer.
-        let (read, held) = aterm_uds::kept_out(std::io::pipe).unwrap();
+        let (read, held) = aterm_uds::pipe().unwrap();
         let scope = OperationCancellation::watch(OwnedFd::from(read)).unwrap();
         drop(scope);
         assert!(!operation_cancelled());
         drop(held);
-        let (read, held) = aterm_uds::kept_out(std::io::pipe).unwrap();
+        let (read, held) = aterm_uds::pipe().unwrap();
         let scope = OperationCancellation::watch(OwnedFd::from(read)).unwrap();
         let witness = dir.path().join("inflight-pid");
         let path = witness.clone();

@@ -107,6 +107,10 @@ impl Grid {
     /// Assert `ExtrasClaimed`: every visible extras-map entry is claimed by its cell's `HAS_EXTRAS`
     /// bit or holds only truecolor fg/bg bytes.
     ///
+    /// The map is keyed by live screen row, so each entry is judged against the cell on that live
+    /// row (`GridStorage::row_at_screen`), wherever the reader has scrolled; read through the
+    /// viewport, a scrolled-back reader's check judged a history row's cell.
+    ///
     /// # Panics
     ///
     /// Panics on a visible entry whose cell lacks HAS_EXTRAS.
@@ -120,7 +124,9 @@ impl Grid {
             assert!(
                 !extra.has_claimable_data()
                     || self
-                        .cell(coord.row, coord.col)
+                        .storage
+                        .row_at_screen(coord.row)
+                        .and_then(|row| row.get(coord.col))
                         .is_some_and(crate::Cell::has_extras),
                 "ExtrasClaimed violated: an extras entry at ({}, {}) whose cell does not \
                  claim it: {extra:?}",

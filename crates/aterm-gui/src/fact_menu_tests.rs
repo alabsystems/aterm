@@ -854,7 +854,7 @@ fn busy_columns_take_the_shaded_ground() {
         cursor: 0x00FF_FFFF,
         selection: 0x0044_4466,
     };
-    let c = crate::tab_menu::menu_colors(theme);
+    let c = crate::autopilot_menu::CardInks::of(theme, None);
     let mut card = vec![MenuRow::Header("Traffic \u{b7} tab 1".into())];
     card.extend(traffic_rows(&traffic(), T0 + 240, Some(0), 30));
     let rect = place(&card, (20, 0), (0..20, 0..80), (80, 21), 0).expect("a card");
@@ -867,12 +867,9 @@ fn busy_columns_take_the_shaded_ground() {
         .expect("the first minute's column");
     let busy = &row[lead + 12];
     assert_eq!(busy.ch, '\u{2588}', "{text:?}");
-    assert_eq!(
-        busy.bg,
-        crate::chrome_band::mix3(c.card_bg, c.band.accent, 0.10)
-    );
-    assert_eq!(busy.fg, c.band.accent);
-    assert_eq!(row[lead].bg, c.card_bg);
+    assert_eq!(busy.bg, crate::chrome_band::mix3(c.ground, c.accent, 0.10));
+    assert_eq!(busy.fg, c.accent);
+    assert_eq!(row[lead].bg, c.ground);
 }
 
 /// THE ACCOUNT CARD SAYS WHY THE WEEK IS MISSING, in its Budget answer: `not read:` and the
@@ -1306,18 +1303,18 @@ fn an_account_rows_aged_store_figure_is_a_lower_bound() {
             NOW,
         )
     };
-    let rows = menu(None, Some("main@example.test"), true);
-    assert!(rows[0].active && !rows[1].active);
-    assert!(rows[0].standing().ends_with("\u{b7} 40% left"));
-    assert!(
-        rows[1].standing().ends_with("\u{b7} \u{2264}80% left"),
-        "a custom-home session identified only by email cannot replace machine-active work's figure"
-    );
-    for (label, email) in [
-        (None, None),
-        (None, Some("unlisted@example.test")),
-        (Some("work"), Some("main@example.test")),
-    ] {
+    // Identified by its email alone, or by a label its email contradicts (a footer still
+    // naming the old row after a /login): the session is the row its email names.
+    for label in [None, Some("work")] {
+        let rows = menu(label, Some("main@example.test"), true);
+        assert!(rows[0].active && !rows[1].active, "{label:?}");
+        assert!(rows[0].standing().ends_with("\u{b7} 40% left"), "{label:?}");
+        assert!(
+            rows[1].standing().ends_with("\u{b7} \u{2264}80% left"),
+            "{label:?}: a session identified by its email cannot replace machine-active work's figure"
+        );
+    }
+    for (label, email) in [(None, None), (None, Some("unlisted@example.test"))] {
         let rows = menu(label, email, true);
         assert!(
             !rows[0].active && rows[1].active,

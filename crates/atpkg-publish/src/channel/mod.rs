@@ -154,6 +154,42 @@ pub fn probe_served(host: &dyn ReleaseHost, slug: &Slug, tag: &str, asset: &str)
     host.probe_public(slug, tag, asset)
 }
 
+/// Anonymous reads a just-written public asset is given before its absence is believed.
+pub const SETTLE_READS: u32 = 30;
+
+/// The pause between two of those reads on a host that pauses at all
+/// ([`ReleaseHost::retry_pause`] non-zero): [`SETTLE_READS`] of them bound the wait at
+/// 150 s. A new release asset was measured taking 30 to 70 s to answer anonymously.
+pub const SETTLE_PAUSE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The answer to `read` for an asset this run has just written, with the anonymous route
+/// given up to [`SETTLE_READS`] reads to stop answering 404. Only an answered absence is
+/// read again: [`Probe::Unknown`] already spent the transport's own retry budget and is
+/// returned at once, and [`Probe::Present`] ends the wait. A read that is still absent after
+/// the bound is returned as absent, never as present.
+pub fn await_written(host: &dyn ReleaseHost, mut read: impl FnMut() -> Probe) -> Probe {
+    let pause = if host.retry_pause().is_zero() {
+        std::time::Duration::ZERO
+    } else {
+        SETTLE_PAUSE
+    };
+    let mut answer = read();
+    for _ in 1..SETTLE_READS {
+        if answer != Probe::Absent {
+            break;
+        }
+        std::thread::sleep(pause);
+        answer = read();
+    }
+    answer
+}
+
+/// [`probe_served`] for an asset this run has just written ([`await_written`]).
+#[must_use]
+pub fn await_served(host: &dyn ReleaseHost, slug: &Slug, tag: &str, asset: &str) -> Probe {
+    await_written(host, || host.probe_public(slug, tag, asset))
+}
+
 /// Parses a future `YYYY-MM-DDTHH:MM:SSZ` freshness horizon after `now_unix` as epoch seconds.
 ///
 /// # Errors

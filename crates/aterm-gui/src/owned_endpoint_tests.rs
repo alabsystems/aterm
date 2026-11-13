@@ -50,7 +50,7 @@ fn verify_real_sigterm_cleanup() {
 
     let scratch = crate::test_scratch::short_dir("the signal stand-in's socket");
     let dir = scratch.path();
-    let (hold_rx, _hold_tx) = std::io::pipe().unwrap();
+    let (hold_rx, _hold_tx) = aterm_uds::pipe().unwrap();
     let mut stand_in = crate::test_alone::StandIn::this_test();
     stand_in.command().env(STAND_IN_DIR, dir.as_os_str());
     stand_in.hand(STAND_IN_HOLD, hold_rx.as_raw_fd());

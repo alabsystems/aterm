@@ -160,7 +160,7 @@ fn a_fixture_replays_from_a_pipe_with_a_bare_replay() {
     let (_, records) = parsed(name, text);
     let stdout = emitted(&records, DOOR_STDOUT);
     let root = scratch("fixture-pipe");
-    let (reader, mut writer) = std::io::pipe().expect("a pipe");
+    let (reader, mut writer) = aterm_uds::pipe().expect("a pipe");
     std::thread::spawn(move || {
         writer.write_all(text.as_bytes()).expect("the tape");
     });

@@ -3,6 +3,7 @@
 
 //! Git queries on a checkout through [`aterm_uds::spawnfd::command`].
 
+use std::ffi::OsString;
 use std::path::Path;
 use std::process::Output;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -78,20 +79,98 @@ impl SourceRepo {
 
 static MAIN_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Remove ambient credentials and all inherited trace selectors before a credential helper
+/// runs: what a network git's environment drops, whichever helper it mounts.
+pub(crate) fn git_environment_removals() -> Vec<String> {
+    git_environment_removals_from(std::env::vars_os().map(|(key, _)| key))
+}
+
+/// Environment overrides also disable Trace2 targets enabled by system/global Git config.
+pub(crate) fn git_tracing_environment() -> Vec<(String, OsString)> {
+    [
+        ("GIT_TRACE", "0"),
+        ("GIT_TRACE2", "0"),
+        ("GIT_TRACE2_EVENT", "0"),
+        ("GIT_TRACE2_PERF", "0"),
+        ("GIT_TRACE_CURL", "0"),
+        ("GIT_TRACE_REDACT", "1"),
+    ]
+    .map(|(name, value)| (name.into(), value.into()))
+    .into()
+}
+
+/// The removals for an environment holding `names`: the fixed ambient-token, verbose and shell
+/// start-up selectors, every `GIT_TRACE*`, `GH_*`, `GITHUB_*` and `AGH_GIT_*` name present, and
+/// `ATPKG_PUBLISH_GIT_TOKEN`, the variable the token host's helper reads its token from. An
+/// `AGH_GIT_*` name is what agh's git runner hands its own credential helper (a grant, the
+/// loose policy, its directories), so agh's helper mounted on a git without the runner routes
+/// from this process's own agh directories, with no grant and agh.toml's strict policy.
+fn git_environment_removals_from(names: impl IntoIterator<Item = OsString>) -> Vec<String> {
+    let mut remove = std::collections::BTreeSet::from([
+        "ATPKG_PUBLISH_GIT_TOKEN".to_owned(),
+        "GITHUB_TOKEN".into(),
+        "GH_TOKEN".into(),
+        "GIT_CURL_VERBOSE".into(),
+        "BASH_ENV".into(),
+        "ENV".into(),
+        "SHELLOPTS".into(),
+        "BASHOPTS".into(),
+    ]);
+    for name in names {
+        if let Some(name) = name.to_str()
+            && (name.starts_with("GIT_TRACE")
+                || name.starts_with("GH_")
+                || name.starts_with("GITHUB_")
+                || name.starts_with("AGH_GIT_"))
+        {
+            remove.insert(name.to_owned());
+        }
+    }
+    remove.into_iter().collect()
+}
+
 /// Admit local source reads and require that its origin names the requested repository.
 /// This checks local configuration only; fetching and authenticating the remote remain
 /// the selected host's responsibility.
+/// A refusal names the origin it found, its userinfo masked ([`without_userinfo`]). Only a
+/// checkout whose remotes (`git remote`) include no `origin` is told it has none; an origin
+/// that is there and cannot be read (its URL not UTF-8, a failing query) keeps the query's own
+/// refusal.
 /// # Errors
-/// Local source admission, a missing origin or an origin for another repository.
+/// Local source admission, a missing or unreadable origin or an origin for another repository.
 pub(crate) fn source_with_origin(repo: &Path, slug: &crate::host::Slug) -> Result<SourceRepo> {
     let source = SourceRepo::open(repo)?;
-    let origin = source.query(&["remote", "get-url", "origin"])?;
-    if !crate::artifact::package::names_repo(origin.trim(), &slug.owner, &slug.repo) {
+    if !source
+        .query(&["remote"])?
+        .lines()
+        .any(|name| name == "origin")
+    {
         return Err(Error::refused(format!(
-            "the source origin does not name {slug}; its main cannot judge this cut"
+            "the source has no origin remote; it must name {slug}"
+        )));
+    }
+    let origin = source.query(&["remote", "get-url", "origin"])?;
+    let origin = origin.trim();
+    if !crate::artifact::package::names_repo(origin, &slug.owner, &slug.repo) {
+        return Err(Error::refused(format!(
+            "the source origin does not name {slug} (it names {}); its main cannot judge this cut",
+            without_userinfo(origin)
         )));
     }
     Ok(source)
+}
+
+/// `url` with the userinfo of a `scheme://userinfo@host/…` URL (a user name, a password, a
+/// token) replaced by `***`, so a message can name a remote without its credential. Any other
+/// form is returned whole: an scp-style `user@host:path` carries no password.
+fn without_userinfo(url: &str) -> String {
+    if let Some((scheme, rest)) = url.split_once("://") {
+        let authority = rest.find('/').map_or(rest, |end| &rest[..end]);
+        if let Some(at) = authority.rfind('@') {
+            return format!("{scheme}://***@{}", &rest[at + 1..]);
+        }
+    }
+    url.to_string()
 }
 
 /// Read a repository's owner-bound main through the selected host, preserving the checkout,
@@ -188,6 +267,37 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+/// Whether a file of `rev` in `dir` that matches `pathspecs` holds `word`, read from the
+/// commit's own objects (`git grep <rev>`): no work tree is needed or touched.
+/// # Errors
+/// A could-not-run when git cannot be started or does not end in time; a refusal when git
+/// fails for any reason but "no match".
+pub fn tree_holds(dir: &Path, rev: &str, word: &str, pathspecs: &[&str]) -> Result<bool> {
+    let mut cmd = aterm_uds::spawnfd::command(aterm_uds::os_path!("git"));
+    cmd.arg("-C")
+        .arg(dir)
+        .args(["grep", "--quiet", "--fixed-strings", "-e", word, rev, "--"])
+        .args(pathspecs)
+        .env("GIT_TERMINAL_PROMPT", "0");
+    let out = output_within(&mut cmd, LOCAL_GIT_BOUND).map_err(|e| match e {
+        CompleteOutputError::Run(RunError::Spawn(e)) => Error::io("spawn git", &e),
+        other => Error::cannot_run(format!("`git -C {} grep {rev}`: {other}", dir.display())),
+    })?;
+    match out.status.code() {
+        Some(0) => Ok(true),
+        // `git grep` exits 1 for "nothing matched", and says nothing.
+        Some(1) if out.stderr.is_empty() => Ok(false),
+        _ => Err(Error::refused(format!(
+            "`git -C {} grep {rev}` failed: {}",
+            dir.display(),
+            String::from_utf8_lossy(&out.stderr)
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("(no message)")
+        ))),
+    }
+}
+
 /// The build number of `rev` in `dir`.
 /// # Errors
 /// When the repository is shallow, git fails, or its output is not recognized.
@@ -280,3 +390,7 @@ pub fn is_pristine(dir: &Path) -> Result<Option<String>> {
         .find(|line| *line != "!! target/")
         .map(str::to_string))
 }
+
+#[cfg(test)]
+#[path = "git_tests.rs"]
+mod tests;

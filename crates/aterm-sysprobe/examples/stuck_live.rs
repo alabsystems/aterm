@@ -65,7 +65,7 @@ fn run(secs: u64, hold: bool) -> std::io::Result<()> {
         return Err(std::io::Error::other(format!("mkfifo failed: {made}")));
     }
     let out = std::fs::File::create(scratch.path().join("busy.out"))?;
-    let (pipe_read, _pipe_write) = std::io::pipe()?;
+    let (pipe_read, _pipe_write) = aterm_uds::pipe()?;
 
     let mut kids = Kids(Vec::new());
     let mut start = |label: &'static str,
@@ -321,6 +321,7 @@ fn sweep_proc(p: &ProcessReading) -> SweepProc {
         session_leader: p.session_leader,
         has_tty: p.has_tty,
         exec: p.exec,
+        threads: p.threads,
     }
 }
 

@@ -2070,6 +2070,10 @@ pub(crate) fn owe_clone(state: &Path, start: &Holds) -> Result<(), String> {
 /// The line [`CLONE_OWED`] carries when the step's last run stopped at a step only a person
 /// can take: the step's mark then ([`crate::init_github::TokenRead::mark`]) follows it.
 const PERSON_MARK: &str = "mark ";
+/// As [`PERSON_MARK`], when GitHub refused the step's token: the same token cannot sign in on
+/// a later pass, so no pass runs the step again until the token or init.toml changes, and the
+/// row waits ([`OwedClone::Waiting`]), never on a person.
+const REFUSED_MARK: &str = "refused ";
 
 /// The fresh control check before a subscriber starts repository work. This checks
 /// current policy and the bounded debt record, never Git or checkout readiness.
@@ -2270,7 +2274,7 @@ impl OwedCloneIntent {
         {
             return Ok(false);
         }
-        inputs.is_current_now(sys)
+        inputs.is_current(sys)
     }
 }
 
@@ -2344,7 +2348,9 @@ pub fn withdraw_repository_credential(
 
 /// Read default repository debt using inputs captured under the caller's ready vault.
 /// All Git work runs after that capture released its lock. `current` must fully
-/// validate the same materialization without waiting, immediately before publication.
+/// validate the same materialization immediately before publication, waiting out a vault
+/// pass that holds its state lock rather than reading that as a change
+/// ([`aterm_secrets::client::MaterializationSnapshot::is_current`]).
 /// This reads only: no clone, source change, or debt-record write is admitted here.
 ///
 /// # Errors
@@ -2385,7 +2391,7 @@ pub fn owed_clone_captured(
         ) {
             return Ok(OwedClone::Waiting(why.into()));
         }
-    } else if !inputs.is_current_now(sys)? {
+    } else if !inputs.is_current(sys)? {
         return Ok(syncing());
     }
     Ok(value)
@@ -2460,7 +2466,7 @@ fn owed_clone_with(
         }
     }
     if let Some(inputs) = inputs.filter(|inputs| inputs.selects_no_repositories()) {
-        return Ok(if inputs.is_current_now(sys)? {
+        return Ok(if inputs.is_current(sys)? {
             OwedClone::Nothing("the private inventory selects no repositories".into())
         } else {
             OwedClone::Waiting(
@@ -2483,6 +2489,13 @@ fn owed_clone_with(
                 crate::items::github::SYSTEM_GIT
             )
         }));
+    }
+    if let Some((why, _)) = record
+        .lines()
+        .zip(record.lines().skip(1))
+        .find(|(_, mark)| mark.strip_prefix(REFUSED_MARK) == Some(read.mark.as_str()))
+    {
+        return Ok(OwedClone::Waiting(why.to_owned()));
     }
     if let Some((how, _)) = record
         .lines()
@@ -2837,14 +2850,33 @@ fn settle_owed_clone(
             row.title,
             row.why.as_deref().unwrap_or(word(row.outcome))
         );
-        if row.outcome == Outcome::Person
+        let refused = matches!(
+            crate::init_observe::Reading::of(row),
+            Some(crate::init_observe::Reading::Waits(
+                crate::init_observe::Wait::TokenRefused
+            ))
+        );
+        if (row.outcome == Outcome::Person || refused)
             && let Some(read) = crate::init_github::token_read(sys, ctx)?
         {
-            let how = format!(
-                "{why}. Only you can fix this; the vault's sync runs the step again once its \
-                 GitHub token or init.toml changes, or run {} once it is fixed",
-                naming(Setting::Repositories)
-            );
+            let (how, mark) = if refused {
+                (
+                    format!(
+                        "{why}; the vault's sync runs the step again once its GitHub token or \
+                         init.toml changes"
+                    ),
+                    REFUSED_MARK,
+                )
+            } else {
+                (
+                    format!(
+                        "{why}. Only you can fix this; the vault's sync runs the step again once \
+                         its GitHub token or init.toml changes, or run {} once it is fixed",
+                        naming(Setting::Repositories)
+                    ),
+                    PERSON_MARK,
+                )
+            };
             // The stamp of the run that owes it stays ([`HELD_MARK`]).
             let start = aterm_uds::private_file::read_private(&dir, CLONE_OWED, 4096)
                 .map(|record| stamped_holds(&String::from_utf8_lossy(&record)))
@@ -2853,7 +2885,7 @@ fn settle_owed_clone(
                 &dir,
                 CLONE_OWED,
                 format!(
-                    "{}\n{PERSON_MARK}{}\n{}\n",
+                    "{}\n{mark}{}\n{}\n",
                     person_line(&how),
                     read.mark,
                     held_stamp(&start)
@@ -2897,8 +2929,16 @@ fn person_line(how: &str) -> String {
 /// (GitHub's sign-in and the clones, design §7, [`owed`]): the vault's join finishes by itself,
 /// and what waits on it runs then, so it is no step of this run's. A row waiting on anything else
 /// keeps its own outcome and words, and a read-only relay keeps the coordinator's scoped reason
-/// rather than claiming vault work.
+/// rather than claiming vault work. A sign-out a coding agent's run reached, or whose tab was
+/// not the one in front, is deferred to the person in words that say so ([`AN_AGENTS_RUN`],
+/// [`TAB_NOT_IN_FRONT`]): no failure of this run.
 fn owe(mut row: ItemReport) -> ItemReport {
+    if let Some(waits) = crate::init_accounts::waits_for_the_person(&row) {
+        row.outcome = Outcome::Deferred;
+        row.why = Some(sign_out_waits(waits).into());
+        row.stood_aside = None;
+        return row;
+    }
     if row.outcome == Outcome::Blocked && owed(&row) {
         row.outcome = Outcome::Deferred;
         if row.class != Some(Class::Relay) {
@@ -3266,6 +3306,30 @@ pub fn converge_workstation_for_test(
     })
 }
 
+/// Why the sign-outs wait in a run a coding agent started: their macOS questions, the app they
+/// bring forward and their clicks would land on the screen of a person who asked for none of
+/// them (owner ruling 2026-11-09). The rest of the run is the agent's to make.
+const AN_AGENTS_RUN: &str = "waits for you: a coding agent started this run, and the sign-outs                              bring macOS questions and Messages or FaceTime onto your screen, so                              they run only when you start them (`aterm init --sign-out` typed                              by you, or System State's Accounts)";
+
+/// Why a sign-out waits when the aterm window would not bring its Accessibility page up: the
+/// run's tab was not the one in front of the person.
+const TAB_NOT_IN_FRONT: &str = "waits for you: this run's tab was not the one in front of you,                                 so nothing was brought up over what you were looking at; run                                 `aterm init --sign-out` from the tab you are looking at";
+
+/// The words a sign-out that waits for the person is deferred with ([`owe`]).
+const fn sign_out_waits(waits: crate::init_accounts::Waits) -> &'static str {
+    match waits {
+        crate::init_accounts::Waits::AgentsRun => AN_AGENTS_RUN,
+        crate::init_accounts::Waits::TabBehind => TAB_NOT_IN_FRONT,
+    }
+}
+
+/// Whether `why` is one of the reasons a sign-out waits for the person ([`sign_out_waits`]).
+fn is_a_sign_out_wait(why: Option<&str>) -> bool {
+    [AN_AGENTS_RUN, TAB_NOT_IN_FRONT]
+        .iter()
+        .any(|words| why == Some(words))
+}
+
 /// Why `aterm init --sign-out` with no terminal is refused while nobody is at this Mac's screen:
 /// the sign-outs are a person stage (design §6.4), so the flag runs only for a person there.
 const SIGN_OUT_NEEDS_A_PERSON: &str = "--sign-out runs with no terminal only while a person is \
@@ -3318,7 +3382,10 @@ fn ways_back_run(sys: &dyn System) -> bool {
 }
 
 /// Setup does not require a controlling terminal when invoked by an agent in the
-/// console owner's graphic session. Agent ancestry is not a permission boundary.
+/// console owner's graphic session. Agent ancestry is not a permission boundary for the work
+/// of setup; what would come up on the person's screen is theirs to start (owner ruling
+/// 2026-11-09), so the sign-outs read the agent themselves and wait
+/// (`crate::init_accounts::waits_for_the_person`), as the Command Line Tools tab does.
 fn init_presence(sys: &dyn System) -> Presence {
     match crate::console::presence(sys) {
         Presence::AgentTab => Presence::AtConsole,
@@ -7280,9 +7347,11 @@ fn left(row: &ItemReport) -> bool {
 }
 
 /// Whether `row` is deferred to a person: the stand-in for the workstation rows a person at
-/// this Mac's console makes ([`AwayFromConsole`]).
+/// this Mac's console makes ([`AwayFromConsole`]), or a sign-out that waits for the person to
+/// start it ([`sign_out_waits`]: an agent's run, a tab not in front).
 fn waits_for_a_person(row: &ItemReport) -> bool {
-    row.outcome == Outcome::Deferred && row.id == AWAY
+    row.outcome == Outcome::Deferred
+        && (row.id == AWAY || (signs_out(&row.id) && is_a_sign_out_wait(row.why.as_deref())))
 }
 
 /// Whether `row` is one of the Permissions phase's grants ([`Permission`]) waiting for the

@@ -1226,10 +1226,10 @@ pub fn recorded_version(build_dir: &Path) -> Option<String> {
     (version_word(version) && lines.next().is_none()).then(|| version.to_string())
 }
 
-/// The sidecars a stage writes beside its build — through
-/// [`crate::install::StageHooks::sidecars`], or a kept unit ([`crate::peers::keep`]) — which gc
-/// sweeps once their build is gone.
-pub(crate) const STAGE_SIDECAR_SUFFIXES: &[&str] = &[
+/// Metadata suffixes an admitted stage keeps beside its build.
+/// The ready record has its own path ([`ready_marker_path`]). Garbage collection removes these
+/// records after their build is gone.
+pub const STAGE_SIDECAR_SUFFIXES: &[&str] = &[
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     crate::engineering_sdk::SUFFIX,
     crate::trust_lock::TREE_ROOT_SUFFIX,

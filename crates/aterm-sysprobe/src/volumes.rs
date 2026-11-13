@@ -23,10 +23,17 @@ pub const MOUNTINFO_CAP: usize = 64 * 1024;
 /// macOS's data volume, where every firmlinked root lives.
 pub const DATA_VOLUME: &str = "/System/Volumes/Data";
 
-/// Linux filesystem types treated as local (`statvfs`-safe).
+/// The file systems the Linux arm calls LOCAL (`statvfs`-safe; an allowlist so
+/// a network or FUSE type is [`Unread::Remote`] and never `statvfs`ed): disk
+/// file systems, the kernel's memory ones (`tmpfs`, `ramfs`, and `devtmpfs`,
+/// which `/dev` is, so `/dev/shm` beneath it is not judged by an unknown type
+/// above it), and read-only images (`squashfs`, which every snap package is,
+/// `erofs`, `iso9660`, `udf`). A VM's host share (`virtiofs`, `9p`) and every
+/// FUSE type stay off it: a user-space server can hang a `stat`.
 pub const LOCAL_FSTYPES: &[&str] = &[
-    "ext2", "ext3", "ext4", "xfs", "btrfs", "zfs", "f2fs", "tmpfs", "overlay", "vfat", "exfat",
-    "ntfs3",
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "bcachefs", "zfs", "f2fs", "nilfs2", "jfs", "reiserfs",
+    "vfat", "exfat", "ntfs3", "hfsplus", "overlay", "tmpfs", "ramfs", "devtmpfs", "squashfs",
+    "erofs", "iso9660", "udf",
 ];
 
 /// One mount, as the table lists it.

@@ -544,6 +544,9 @@ impl Field {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Row {
     pub fields: BTreeMap<String, Field>,
+    /// Canonical claim values, separate from the signed candidates in `fields`.
+    /// An entry with no value withholds an identity whose claim cannot be settled.
+    pub claims: BTreeMap<String, Option<Value>>,
     /// Columns this reader cannot interpret, a newer build's column or word: kept, shown raw
     /// and read-only, never dropped.
     pub raw: BTreeSet<String>,
@@ -552,6 +555,9 @@ pub struct Row {
 impl Row {
     /// A column's shown value.
     pub fn get(&self, column: &str) -> Option<&Value> {
+        if let Some(value) = self.claims.get(column) {
+            return value.as_ref();
+        }
         self.fields.get(column).and_then(Field::value)
     }
 
@@ -652,7 +658,16 @@ pub(crate) fn carried_refs(value: &Value) -> Option<Vec<(Digest, &Value)>> {
     let mut out: Vec<(Digest, &Value)> = Vec::with_capacity(items.len());
     for item in items {
         let item = item.as_object()?;
-        if item.len() != 2 {
+        if item.len() != 2 && item.len() != 3 {
+            return None;
+        }
+        if item
+            .keys()
+            .any(|key| !matches!(key.as_str(), "o" | "v" | "c"))
+            || item
+                .get("c")
+                .is_some_and(|value| !super::claim::valid_context(value))
+        {
             return None;
         }
         let mut operation = [0; 32];
@@ -674,7 +689,9 @@ pub(crate) fn carried_refs(value: &Value) -> Option<Vec<(Digest, &Value)>> {
 /// The candidates a table roll carried into one register (design §3.8): a roll restates a
 /// register of the generation before as one value, `{"k": [{"o": <hex operation>, "v": <its
 /// value>}, …]}`, each item a candidate the register held there, in operation order, with the
-/// operation that wrote it. One writer's records are causally ordered, so a roll cannot write
+/// operation that wrote it. An optional `c` carries owner-attested claim tenure and order;
+/// it is separate from the unchanged typed value. Missing context never proves concurrency.
+/// One writer's records are causally ordered, so a roll cannot write
 /// concurrent candidates; the list is how an open conflict stays open across generations, and
 /// `o` is how the next roll tells a candidate it carried from one it has not seen. `None` for
 /// any value that is not exactly that shape.

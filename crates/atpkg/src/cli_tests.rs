@@ -1687,8 +1687,16 @@ fn temp_layout(label: &str) -> crate::testdir::ScratchLayout {
     crate::testdir::layout(&format!("atpkg-main-{label}-"))
 }
 
+/// A COMMAND NOTHING RUNS IS ANSWERED BY THE PROGRAM THAT SHIPS IT, AND BY WHAT PUTS IT HERE:
+/// where the store's signed manifests say no build of that program serves this target, the
+/// line is that state and the local build that does (a whole sysroot for Trust), never an
+/// install; else a held install's row; else its install. A recorded `unavailable on` row is a
+/// pass's record, not a verdict. NEGATIVE CONTROL (2026-11-11): with `not_runnable_judged`'s
+/// `Unserved` arm dropped back to the recorded row, the unserved trustc line was the install
+/// line.
 #[test]
 fn a_command_nothing_runs_is_answered_by_the_program_that_ships_it() {
+    use crate::serving::Serving;
     let unavailable = crate::state::unavailable("aarch64-unknown-linux-gnu", "");
     assert_eq!(
         not_runnable_words("targo", "trust", None),
@@ -1698,47 +1706,172 @@ fn a_command_nothing_runs_is_answered_by_the_program_that_ships_it() {
         not_runnable_words("targo", "trust", Some(&unavailable)),
         format!("atpkg: targo comes with trust: {unavailable}")
     );
-    assert_eq!(
-        not_runnable_words("ay", "ay", Some(&unavailable)),
-        format!("atpkg: ay: {unavailable}")
-    );
-    assert_eq!(
-        not_runnable_words("ty", "ty", None),
-        not_installed_fix("ty")
-    );
+    assert_eq!(not_runnable_words("ty", "ty", None), install_fix("ty"));
 
     let layout = temp_layout("not-runnable");
     std::fs::create_dir_all(&layout.prefix).unwrap();
     assert_eq!(
         not_runnable_line(&layout, "trustc"),
-        not_runnable_words("trustc", "trust", None)
+        not_runnable_words("trustc", "trust", None),
+        "no index cached: no verdict"
     );
-    let mut programs = std::collections::BTreeMap::new();
-    programs.insert(
-        "trust".to_string(),
+    assert_eq!(not_installed_fix(&layout, "ty"), install_fix("ty"));
+    assert_eq!(
+        not_installed_judged(
+            "trust",
+            &Serving::Unserved(crate::state::unavailable("aarch64-unknown-linux-gnu", ""))
+        ),
+        format!(
+            "atpkg: trust is not installed: {}; {}",
+            crate::state::unavailable("aarch64-unknown-linux-gnu", ""),
+            crate::trust_lock::LOCAL_SYSROOT_REMEDY
+        )
+    );
+    let unserved = Serving::Unserved(unavailable.clone());
+    let trustc = not_runnable_judged(&layout, "trustc", "trust", &unserved);
+    assert_eq!(
+        trustc,
+        format!(
+            "atpkg: trustc comes with trust: {unavailable}; {}",
+            crate::trust_lock::LOCAL_SYSROOT_REMEDY
+        )
+    );
+    assert!(!trustc.contains("pkg install"), "{trustc}");
+    assert_eq!(
+        not_runnable_judged(&layout, "ay", "ay", &unserved),
+        format!(
+            "atpkg: ay: {unavailable}; a local build links in with `aterm pkg link ay \
+             <checkout> <bin>…` (docs/LINUX-LOCAL-TOOLCHAIN.md)"
+        )
+    );
+
+    let row = |state: &str| {
+        let mut programs = std::collections::BTreeMap::new();
+        programs.insert(
+            "trust".to_string(),
+            crate::ProgramStatus {
+                installed_build: None,
+                state: state.to_string(),
+                tree_root: String::new(),
+            },
+        );
+        crate::status::write(
+            &layout,
+            &crate::Status {
+                schema: 1,
+                programs,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    };
+    row(&unavailable);
+    for verdict in [Serving::Unknown, Serving::Served] {
+        assert_eq!(
+            not_runnable_judged(&layout, "trustc", "trust", &verdict),
+            not_runnable_words("trustc", "trust", None),
+            "a recorded row is no verdict ({verdict:?})"
+        );
+    }
+    let held = crate::state::held_failed("stage failed", "now: aterm pkg install trust");
+    row(&held);
+    assert_eq!(
+        not_runnable_judged(&layout, "trustc", "trust", &Serving::Served),
+        format!("atpkg: trustc comes with trust: {held}")
+    );
+    let _ = std::fs::remove_dir_all(&layout.prefix);
+}
+
+/// A PENDING COMMAND NO BUILD SERVES IS NOT COMING, AND SAYS THE LOCAL BUILD: where the store's
+/// signed manifests say no build of its program serves this target, the wait answers that state
+/// and the local build, and requests no install; with no verdict, a recorded `unavailable on` row
+/// is a pass's record, and the program is requested as any other; and the verdict answers ahead
+/// of a failed or held attempt's row, which would promise a retry. NEGATIVE CONTROL (2026-11-12):
+/// with the wait's verdict arm reading the recorded row again, the Unserved verdict with no row
+/// requested an install ("nothing is installing right now"); with the verdict asked after the
+/// held and `error` arms again, an `error:` row answered "aterm pkg update retries it".
+#[test]
+fn a_pending_command_no_build_serves_is_not_coming_and_says_the_local_build() {
+    use crate::serving::Serving;
+    let layout = temp_layout("pending-unserved");
+    std::fs::create_dir_all(&layout.prefix).unwrap();
+    let trust = crate::store::ToolName::new("trust").unwrap();
+    let unavailable = crate::state::unavailable("aarch64-unknown-linux-gnu", "");
+    let wait = |verdict: Serving| {
+        let mut said = Vec::new();
+        pending_not_running_judged(
+            &layout,
+            &trust,
+            crate::progress::Asker::Script,
+            &|| verdict.clone(),
+            &mut |line| said.push(line),
+        );
+        said
+    };
+    let said = wait(Serving::Unserved(unavailable.clone()));
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert!(
+        said[0].contains(&unavailable)
+            && said[0].contains(crate::trust_lock::LOCAL_SYSROOT_REMEDY)
+            && !said[0].contains("pkg install")
+            && !said[0].contains("pkg update"),
+        "{said:?}"
+    );
+    assert!(
+        crate::progress::read_bumps(&layout).is_empty(),
+        "nothing is requested"
+    );
+    record_status(
+        &layout,
+        "trust",
         crate::ProgramStatus {
             installed_build: None,
             state: unavailable.clone(),
             tree_root: String::new(),
         },
+        "an earlier install attempt".into(),
     );
-    crate::status::write(
-        &layout,
-        &crate::Status {
-            schema: 1,
-            programs,
-            ..Default::default()
-        },
-    )
-    .unwrap();
-    assert_eq!(
-        not_runnable_line(&layout, "trustc"),
-        format!("atpkg: trustc comes with trust: {unavailable}")
+    let said = wait(Serving::Unknown);
+    assert!(
+        said.iter().all(|line| !line.contains(&unavailable)),
+        "a recorded row is no verdict: {said:?}"
     );
     assert_eq!(
-        not_runnable_line(&layout, "trust"),
-        format!("atpkg: trust: {unavailable}")
+        crate::progress::read_bumps(&layout).len(),
+        1,
+        "the program is requested"
     );
+    for (row, what) in [
+        ("error: fetch failed".to_string(), "a failed attempt"),
+        (
+            crate::state::held_failed("fetch failed", "aterm pkg install trust"),
+            "a held one",
+        ),
+    ] {
+        record_status(
+            &layout,
+            "trust",
+            crate::ProgramStatus {
+                installed_build: None,
+                state: row.clone(),
+                tree_root: String::new(),
+            },
+            what.into(),
+        );
+        let said = wait(Serving::Unserved(unavailable.clone()));
+        assert!(
+            said.len() == 1
+                && said[0].contains(&unavailable)
+                && !said[0].contains("pkg update")
+                && !said[0].contains("pkg install"),
+            "the verdict answers ahead of {what}'s row {row:?}: {said:?}"
+        );
+        assert_eq!(
+            crate::progress::read_bumps(&layout).len(),
+            1,
+            "{what} requests no retry no build serves"
+        );
+    }
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
@@ -2795,12 +2928,30 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
         "up to date".into(),
     );
     assert_eq!(
-        which_line(&layout, "homebrew", Some(&managed_only)).unwrap(),
-        format!("homebrew → (nothing runs) — {unserved}")
+        which_line(&layout, "homebrew", Some(&managed_only)).unwrap_err(),
+        install_fix("homebrew"),
+        "a recorded row is a pass's record, not a verdict"
+    );
+    assert_eq!(
+        which_line_judged(
+            &layout,
+            "homebrew",
+            Some(&managed_only),
+            crate::reroute::StubEnv::default(),
+            &|program| {
+                assert_eq!(program, "homebrew");
+                crate::serving::Serving::Unserved(unserved.clone())
+            }
+        )
+        .unwrap(),
+        format!(
+            "homebrew → (nothing runs) — {unserved}; {}",
+            crate::serving::local_remedy("homebrew")
+        )
     );
     assert_eq!(
         which_line(&layout, "nothing", Some(&managed_only)).unwrap_err(),
-        not_installed_fix("nothing")
+        install_fix("nothing")
     );
     assert!(which_line(&layout, "alab-claude", Some(&managed_only)).is_err());
     assert!(which_line(&layout, "alab-nothing", Some(&managed_only)).is_err());
@@ -2815,6 +2966,12 @@ fn which_names_the_copy_that_runs_and_shadowing_is_read_per_path() {
     let _ = std::fs::remove_dir_all(&layout.prefix);
 }
 
+/// `which` NAMES A SAME-NAMED UNRELATED BINARY AS SUCH, and what runs in its place: the install
+/// where the program has a build here or nothing says, and where the store's signed manifests
+/// say none serves this target, that state and the local build, shadowed or behind a stub, never
+/// an install that cannot succeed. NEGATIVE CONTROL (2026-11-12): with the shadowed arm reading
+/// the recorded row again in place of `unrunnable_state`, the unserved `trust` line behind its
+/// stub was "not installed yet: the next pass installs it (now: aterm pkg install trust)".
 #[cfg(unix)]
 #[test]
 fn which_names_a_same_named_binary_unrelated_with_no_index_or_behind_a_stub() {
@@ -2852,6 +3009,39 @@ fn which_names_a_same_named_binary_unrelated_with_no_index_or_behind_a_stub() {
     let ahead = path(&[&layout.bin_dir(), &foreign_dir]);
     let line = which_line(&layout, "trust", Some(&ahead)).unwrap();
     assert!(line.contains("(pending stub)"), "{line}");
+
+    let unavailable = crate::state::unavailable("aarch64-unknown-linux-gnu", "");
+    let unserved = |program: &str| {
+        assert_eq!(program, "trust", "only the program nothing runs is asked");
+        crate::serving::Serving::Unserved(unavailable.clone())
+    };
+    let judged = |path_var: &std::ffi::OsStr| {
+        which_line_judged(
+            &layout,
+            "trust",
+            Some(path_var),
+            crate::reroute::StubEnv::default(),
+            &unserved,
+        )
+        .unwrap()
+    };
+    let said = format!("{unavailable}; {}", crate::trust_lock::LOCAL_SYSROOT_REMEDY);
+    for (path_var, what) in [
+        (&behind, "shadowed, a stub behind"),
+        (&ahead, "the stub ahead"),
+    ] {
+        let line = judged(path_var);
+        assert!(line.contains(&said), "{what}: {line}");
+        assert!(!line.contains("pkg install"), "{what}: {line}");
+    }
+    std::fs::remove_file(layout.shim(&crate::store::ToolName::new("trust").unwrap())).unwrap();
+    let line = judged(&path(&[&foreign_dir]));
+    assert!(
+        line.starts_with(&format!("trust → (nothing runs) — {said}"))
+            && line.contains("on PATH is an unrelated binary"),
+        "{line}"
+    );
+    assert!(!line.contains("pkg install"), "{line}");
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&foreign_dir);
 }
@@ -5578,17 +5768,18 @@ fn a_wanted_vendor_program_serves_the_seed_without_the_index() {
     }
 }
 
-/// ONE DEFAULT SET: what `install --default-set`, the update pass after `seed` and doctor's
-/// toolset row complete is every program the index lists (a harness included) and every
-/// vendor row that serves the machine, so a first run installs claude, codex, codex-old, agy
-/// and muse beside the index's programs; `[packages].exclude` narrows both halves alike.
+/// ONE DEFAULT SET: what `install --default-set` and the update pass after `seed` complete is
+/// every program the index lists (a harness included) and every vendor row that serves the
+/// machine, so a first run installs claude, codex, codex-old, agy and muse beside the index's
+/// programs; `[packages].exclude` narrows both halves alike. Doctor's toolset row judges that
+/// set less what the signed manifests serve nowhere here (`serving_tests.rs`).
 #[test]
 fn the_default_set_holds_the_index_programs_and_every_vendor_row_serving_here() {
     let darwin = "aarch64-apple-darwin";
     let none = std::collections::BTreeSet::new();
     let unnarrowed = crate::config::PackagesConfig::default();
     let index = index_of(&[("ay", None), ("trust", None), ("muse-alab", None)]);
-    let set = default_set_here(&index, darwin);
+    let set = default_set_listed(&index, darwin);
     for program in [
         "ay",
         "trust",
@@ -5616,7 +5807,7 @@ fn the_default_set_holds_the_index_programs_and_every_vendor_row_serving_here() 
         exclude: Some(vec!["muse".into(), "ay".into()]),
         ..Default::default()
     };
-    let wanted = wanted_programs(&index, &cfg, darwin);
+    let wanted = wanted_listed(&index, &cfg, darwin);
     assert_eq!(
         set.difference(&wanted).cloned().collect::<Vec<_>>(),
         ["ay", "muse"],
@@ -5670,10 +5861,13 @@ fn the_vendor_lane_completes_the_vendor_half_of_the_default_set() {
         .cloned()
         .collect();
     let index = index_of(&[("ay", None)]);
-    let set_vendors: std::collections::BTreeSet<String> = wanted_programs(&index, &cfg, triple)
-        .into_iter()
-        .filter(|program| crate::vendor_direct::is_vendor(program) && !removed.contains(program))
-        .collect();
+    let set_vendors: std::collections::BTreeSet<String> =
+        wanted_programs(&index, &cfg, &crate::serving::Targets::unread(triple))
+            .into_iter()
+            .filter(|program| {
+                crate::vendor_direct::is_vendor(program) && !removed.contains(program)
+            })
+            .collect();
     assert_eq!(
         served, set_vendors,
         "what it can land is the set's vendor half"
@@ -6569,6 +6763,138 @@ impl crate::flow::Fetcher for CountingFetcher {
     }
 }
 
+/// A registry whose package documents are kept under the cache key the readers of
+/// [`crate::serving::Targets`] read ([`crate::source::package_source_id`]), as the production
+/// fetcher keeps them (the test below holds the two to one key).
+struct ReaderKeyed(crate::DirFetcher);
+
+impl crate::flow::Fetcher for ReaderKeyed {
+    fn index_candidates(&self) -> Result<Vec<crate::Candidate>, String> {
+        crate::flow::Fetcher::index_candidates(&self.0)
+    }
+
+    fn pkg_manifest(
+        &self,
+        repo: &str,
+        program: &str,
+        build: u64,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        crate::flow::Fetcher::pkg_manifest(&self.0, repo, program, build)
+    }
+
+    fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+        crate::flow::Fetcher::download(&self.0, repo, asset, dest)
+    }
+
+    fn source_id(&self) -> String {
+        crate::flow::Fetcher::source_id(&self.0)
+    }
+
+    fn package_source_id(&self, repo: &str, program: &str) -> Option<String> {
+        crate::source::package_source_id(repo, program)
+    }
+}
+
+/// THE PASSES LEARN WHAT SERVES HERE WHETHER OR NOT THEY INSTALL IT: an update pass that may not
+/// complete the set (`[packages] auto_install = false`) and an install of the default set each
+/// keep the pinned manifest of every program not here, under the key the readers read, so the
+/// toolset row's set ([`default_set_here`]) leaves out a program whose pinned build has no row
+/// for this target and keeps one whose build has one; and the fetcher a pass runs keys its
+/// documents as those readers do. NEGATIVE CONTROLS (2026-11-12): with `learn_targets` dropped
+/// from `run_update_pass_in`, the pass's store held no verdict on ny (Unknown); with it dropped
+/// from `install_default_set_inner`, the set's store held none either.
+#[test]
+fn the_passes_learn_what_serves_here_whether_or_not_they_install() {
+    use crate::serving::{Serving, Targets};
+    let elsewhere = if current_triple() == "aarch64-apple-darwin" {
+        "aarch64-unknown-linux-gnu"
+    } else {
+        "aarch64-apple-darwin"
+    };
+    let dir = scratch("learn-targets-registry");
+    write_registry(&dir, "stable");
+    write_pkg_for_triple(&dir, "ny", 7, elsewhere);
+    let fetcher = ReaderKeyed(crate::DirFetcher::new(dir.clone()));
+    let index = {
+        let layout = temp_layout("learn-targets-index");
+        let index = crate::resolve_verified_index(
+            &fetcher,
+            &layout,
+            &test_anchor(),
+            build_floor(&layout),
+            0,
+        )
+        .expect("the signed fixture index verifies");
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+        index
+    };
+    let judged = |layout: &crate::store::Layout, what: &str| {
+        let here = Targets::read(layout, &index, current_triple());
+        assert!(here.unserved("ny").is_some(), "{what}: {here:?}");
+        assert_eq!(here.of("lk"), &Serving::Served, "{what}");
+        let set = default_set_here(&index, &here);
+        assert!(!set.contains("ny") && set.contains("lk"), "{what}: {set:?}");
+    };
+
+    let pass = temp_layout("learn-targets-pass");
+    make_live(&pass, "ay", 18);
+    let installed = crate::active_builds(&pass);
+    let trust = crate::vendor_direct::lane::world::trust();
+    let seams = PassSeams {
+        scope: UpdateScope::Whole,
+        config: None,
+        anchor: |_| test_anchor(),
+        now: || 0,
+        trust: &trust,
+        shell_hooks: no_shell_hooks,
+        rustup_seam: &no_rustup_seam,
+        progress: None,
+        path: Some(std::ffi::OsString::new()),
+        warm_agents: record_warm,
+        translated: || false,
+        flip_policy: || crate::quiet::FlipPolicy::Now,
+        running: &no_processes,
+        vendor_read_grace: VENDOR_READ_GRACE,
+        read_ahead_in: &no_read_ahead_note,
+    };
+    let _ = run_update_pass(
+        &pass,
+        &crate::config::PackagesConfig::default(),
+        &fetcher,
+        &installed,
+        false,
+        &seams,
+    );
+    assert!(
+        !crate::active_builds(&pass).contains_key("lk"),
+        "a pass that may not complete the set installs nothing new"
+    );
+    judged(&pass, "the update pass");
+
+    let set = temp_layout("learn-targets-set");
+    let cfg = crate::config::PackagesConfig {
+        exclude: Some(vec!["ny".into(), "lk".into()]),
+        ..Default::default()
+    };
+    let _ = install_default_set(&set, &fetcher, &test_anchor(), &cfg, 0);
+    assert!(!crate::active_builds(&set).contains_key("lk"), "excluded");
+    judged(&set, "the set's install");
+
+    assert_eq!(
+        crate::flow::Fetcher::package_source_id(
+            &*crate::source::resolve_fetcher(&pass, None),
+            "ny",
+            "ny"
+        ),
+        crate::source::package_source_id("ny", "ny"),
+        "the pass's fetcher keeps documents where the readers look"
+    );
+    for layout in [&pass, &set] {
+        let _ = std::fs::remove_dir_all(&layout.prefix);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn empty_store_retry_records_the_signed_index_it_resolved() {
     let dir = scratch("retry-witness-registry");
@@ -7453,13 +7779,8 @@ fn unserved_triple_members_skip_quietly_with_a_recorded_reason() {
             .all(|p| !p.starts_with("ay:")),
         "an unserved member is a state, never a doctor fault"
     );
-    let lines = pending_state_lines(&layout, "ay");
-    assert!(
-        lines
-            .iter()
-            .any(|l| l.contains(&crate::state::unavailable(current_triple(), ""))),
-        "__pending surfaces the recorded reason, not the launch promise: {lines:?}"
-    );
+    // What a pending `ay` then says is the store's verdict's, never this recorded row's
+    // (`a_pending_command_no_build_serves_is_not_coming_and_says_the_local_build`).
     let _ = std::fs::remove_dir_all(&layout.prefix);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -307,6 +307,23 @@ fn the_serve_command_is_the_no_desk_sandbox_around_the_host() {
     );
 }
 
+/// Off macOS a read makes no host at all: nothing there keeps a signed-out `muse serve`'s
+/// sign-in page off the screen, so no usage read starts one (Muse Code has a macOS build
+/// alone). CONTROL: with `ON_DESK` the same host is made, as a plain child.
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn off_macos_a_read_makes_no_host() {
+    let host = Path::new("/opt/muse/bin/muse");
+    assert!(serve_command(host).is_err(), "no host off macOS");
+    ON_DESK.set(true);
+    let made = serve_command(host);
+    ON_DESK.set(false);
+    assert_eq!(
+        made.expect("CONTROL: a plain child").get_program(),
+        host.as_os_str()
+    );
+}
+
 /// THE FOURTH FINDING: a signed-out `muse serve` can put nothing on the screen, and what it
 /// says of its login is heard. The stand-in host tries to start `/usr/bin/open` (with no
 /// arguments, which opens nothing and prints its usage), writes how that ended, says Muse

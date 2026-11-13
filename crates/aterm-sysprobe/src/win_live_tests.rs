@@ -16,6 +16,8 @@ use std::io::{Read as _, Write as _};
 use std::mem::size_of;
 
 use crate::jobs::RunState;
+use crate::machine_type::{friendly, is_code, is_placeholder};
+use crate::runq::RunQueue;
 use crate::windows::{PerformanceInformation64, SessionClass, session_class};
 use crate::{LinkReading, ProcessReading};
 
@@ -83,6 +85,35 @@ unsafe extern "system" {
     fn GetIfEntry(row: *mut c_void) -> u32;
     fn ConvertInterfaceIndexToLuid(index: u32, luid: *mut u64) -> u32;
     fn ConvertInterfaceLuidToAlias(luid: *const u64, alias: *mut u16, length: usize) -> u32;
+}
+
+/// `HKEY_LOCAL_MACHINE`: `(LONG)0x80000002`, sign-extended to a handle.
+const HKEY_LOCAL_MACHINE: HANDLE = -2_147_483_646;
+/// `KEY_QUERY_VALUE` (`winnt.h`): the one right a value read needs.
+const KEY_QUERY_VALUE: u32 = 0x0001;
+/// `REG_SZ` (`winnt.h`).
+const REG_SZ: u32 = 1;
+/// `REG_EXPAND_SZ` (`winnt.h`).
+const REG_EXPAND_SZ: u32 = 2;
+
+#[link(name = "advapi32.dll", kind = "raw-dylib", modifiers = "+verbatim")]
+unsafe extern "system" {
+    fn RegOpenKeyExW(
+        hKey: HANDLE,
+        lpSubKey: *const u16,
+        ulOptions: u32,
+        samDesired: u32,
+        phkResult: *mut HANDLE,
+    ) -> i32;
+    fn RegQueryValueExW(
+        hKey: HANDLE,
+        lpValueName: *const u16,
+        lpReserved: *mut u32,
+        lpType: *mut u32,
+        lpData: *mut u8,
+        lpcbData: *mut u32,
+    ) -> i32;
+    fn RegCloseKey(hKey: HANDLE) -> i32;
 }
 
 fn performance_info() -> PerformanceInformation64 {
@@ -161,6 +192,72 @@ fn alias_of(index: u32) -> Option<String> {
     }
     let end = buf.iter().position(|u| *u == 0).unwrap_or(buf.len());
     Some(String::from_utf16_lossy(&buf[..end]))
+}
+
+/// The firmware's product fields as the registry's BIOS key holds them, by `RegOpenKeyExW` and
+/// `RegQueryValueExW` (the machine-type reader calls `RegGetValueW`), kept to the reader's
+/// rules: each name with its string, `None` where the key or the value is missing, the value is
+/// no string (`REG_SZ`, or `REG_EXPAND_SZ`, which the reader's read takes too), longer than the
+/// reader's 255 UTF-16 units, or not valid UTF-16.
+fn bios_fields() -> Vec<(&'static str, Option<String>)> {
+    const NAMES: [&str; 4] = [
+        "SystemManufacturer",
+        "SystemProductName",
+        "SystemVersion",
+        "SystemFamily",
+    ];
+    let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let path = wide(r"HARDWARE\DESCRIPTION\System\BIOS");
+    let mut key: HANDLE = 0;
+    // SAFETY: a NUL-terminated key path that outlives the call, a predefined root key, and a
+    // writable handle.
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            path.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &raw mut key,
+        )
+    };
+    if opened != 0 {
+        // No firmware table copied (no SMBIOS): the reader reads no field either.
+        let _ = writeln!(std::io::stderr(), "the BIOS key does not open: {opened}");
+        return NAMES.into_iter().map(|name| (name, None)).collect();
+    }
+    let read = |name: &str| {
+        let value = wide(name);
+        let mut kind = 0u32;
+        let mut buf = [0u16; 256];
+        let mut bytes = u32::try_from(size_of_val(&buf)).expect("a small buffer");
+        // SAFETY: `key` is open; `value` is NUL-terminated and outlives the call; the reserved
+        // pointer is null; `kind` is a writable u32; `buf` is writable for `bytes` bytes, and
+        // `bytes` a writable u32 the call sets to the bytes it wrote.
+        let status = unsafe {
+            RegQueryValueExW(
+                key,
+                value.as_ptr(),
+                std::ptr::null_mut(),
+                &raw mut kind,
+                buf.as_mut_ptr().cast(),
+                &raw mut bytes,
+            )
+        };
+        if status != 0 || !(kind == REG_SZ || kind == REG_EXPAND_SZ) {
+            return None;
+        }
+        let units = &buf[..(bytes as usize / 2).min(buf.len())];
+        let len = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+        // The reader's buffer holds 255 units and the terminator.
+        if len == buf.len() {
+            return None;
+        }
+        String::from_utf16(&units[..len]).ok()
+    };
+    let fields = NAMES.into_iter().map(|name| (name, read(name))).collect();
+    // SAFETY: `key` was opened above and is closed once.
+    unsafe { RegCloseKey(key) };
+    fields
 }
 
 fn own_row() -> ProcessReading {
@@ -953,4 +1050,80 @@ fn the_job_probe_counts_this_process_io() {
     assert!(after.cpu_ns >= before.cpu_ns);
     // NEGATIVE CONTROL: pid 0 (the idle process) is no job, and reads nothing.
     assert!(reader.read(ReadReq { pid: 0, fds: false }).is_none());
+}
+
+/// Live, N2 (SD-03): Windows has no run-queue reader, so the read that counts the machine's
+/// processes and threads answers the run queue `Unsupported`, never a count and never a zero.
+#[test]
+fn n2_windows_live_the_run_queue_reads_unsupported() {
+    let room = crate::task_room(0);
+    // Past libtest's capture, so a passing run's log keeps what this machine answered.
+    let _ = writeln!(std::io::stderr(), "task room {room:?}");
+    assert!(
+        room.threads.is_some_and(|n| n > 0) && room.procs.is_some_and(|n| n > 0),
+        "the same read counted the processes and threads: {room:?}"
+    );
+    assert_eq!(room.run_queue, RunQueue::Unsupported, "{room:?}");
+}
+
+/// Live, N2 (SD-03, M-NAME's VM case): the machine type the registry's BIOS key gives reads a
+/// name or no name, never a code or a placeholder. The fields are read again here by calls the
+/// reader does not make ([`bios_fields`]); what names the machine is the first of the product
+/// name, version and family that can name one, and the reader's name is that field with at
+/// most the vendor's word before it. The identifier is the product name as written, unless it
+/// is a placeholder.
+#[test]
+fn n2_windows_live_the_machine_type_is_a_name_or_none() {
+    let ty = crate::machine_type::read().expect("Windows has a machine-type reader");
+    let fields = bios_fields();
+    let _ = writeln!(
+        std::io::stderr(),
+        "machine type {ty:?}; BIOS key {fields:?}"
+    );
+    let field = |name: &str| {
+        fields
+            .iter()
+            .find(|(n, _)| *n == name)
+            .and_then(|(_, v)| v.as_deref())
+    };
+    let expected = ["SystemProductName", "SystemVersion", "SystemFamily"]
+        .into_iter()
+        .find_map(|name| field(name).and_then(friendly));
+    match (&ty.name, expected) {
+        (Some(name), Some(field)) => {
+            assert!(
+                name == field || name.ends_with(&format!(" {field}")),
+                "{name:?} is the first field that names the machine, {field:?}, with at most \
+                 the vendor word before it"
+            );
+            assert_eq!(name.trim(), name, "trimmed: {name:?}");
+            assert!(
+                !name.chars().any(char::is_control),
+                "no NUL or newline from the registry: {name:?}"
+            );
+            assert!(
+                !is_code(name) && !is_placeholder(name),
+                "not a code or a placeholder: {name:?}"
+            );
+        }
+        (None, None) => {}
+        (name, field) => panic!(
+            "the reader's name {name:?} and the field that names the machine {field:?} disagree"
+        ),
+    }
+    let product = field("SystemProductName").map(str::trim);
+    match ty.model_id.as_deref() {
+        Some(id) => {
+            assert_eq!(
+                Some(id),
+                product,
+                "the identifier is the product name as written"
+            );
+            assert!(!is_placeholder(id), "{id:?}");
+        }
+        None => assert!(
+            product.is_none_or(is_placeholder),
+            "a product name {product:?} that is no placeholder is the identifier"
+        ),
+    }
 }

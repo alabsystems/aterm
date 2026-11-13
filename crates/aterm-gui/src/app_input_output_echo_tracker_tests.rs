@@ -3,6 +3,8 @@
 
 use super::*;
 use aterm_types::keyboard::{Key as TKey, KeyEventType, Modifiers as TMods, NamedKey as TNamed};
+#[cfg(unix)]
+use std::os::fd::IntoRawFd;
 
 #[cfg(unix)]
 fn model_state(
@@ -85,8 +87,9 @@ fn enter(mods: TMods, event_type: KeyEventType) -> InputEvent {
 #[cfg(unix)]
 #[test]
 fn a_receipt_is_never_reported_before_the_dispatch_it_receipts() {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = SinkWriter::new(pipe[1]);
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = OutputEchoTracker::default();
@@ -135,8 +138,9 @@ fn a_receipt_is_never_reported_before_the_dispatch_it_receipts() {
 #[cfg(unix)]
 #[test]
 fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = SinkWriter::new(pipe[1]);
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = OutputEchoTracker::default();
@@ -290,8 +294,9 @@ fn a_ticketed_write_publishes_a_delivery_receipt_the_prelude_reads_once() {
 fn the_delivery_ring_holds_a_frames_worth_of_receipts() {
     use aterm_effects::cursor_glow::InsertWidth;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = SinkWriter::new(pipe[1]);
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = OutputEchoTracker::default();
@@ -369,8 +374,9 @@ fn an_eviction_is_reported_once_on_the_read_that_advances_past_it() {
     use std::io::Read;
     use std::os::fd::FromRawFd;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     aterm_pty::set_nonblocking(pipe[1], true).expect("nonblocking pipe writer");
     aterm_pty::set_nonblocking(pipe[0], true).expect("nonblocking pipe reader");
     let mut filled = 0_usize;
@@ -553,8 +559,9 @@ fn active_write_is_raii_hot_and_a_failed_write_stamps_nothing() {
 #[cfg(unix)]
 #[test]
 fn accepted_order_rejects_an_older_completion_after_enter() {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = SinkWriter::new(pipe[1]);
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = OutputEchoTracker::default();
@@ -667,8 +674,9 @@ fn contended_publication_sampling_is_nonparking_and_conservative() {
 #[cfg(unix)]
 #[test]
 fn accepted_editor_input_discounts_but_enter_opens_the_turn_immediately() {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = SinkWriter::new(pipe[1]);
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = Arc::new(OutputEchoTracker::default());
@@ -753,8 +761,9 @@ fn a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it()
     use std::time::{Duration, Instant};
     /// The frame's render work between reading its clock and sampling.
     const PRELUDE: Duration = Duration::from_millis(20);
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = SinkWriter::new(pipe[1]);
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = OutputEchoTracker::default();
@@ -828,8 +837,9 @@ fn a_turn_boundary_sampled_late_in_its_frame_still_retires_the_paste_before_it()
 /// A pipe whose write end is wedged.
 #[cfg(unix)]
 fn wedged_pipe() -> [i32; 2] {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     aterm_pty::set_nonblocking(pipe[1], true).expect("nonblocking pipe writer");
     aterm_pty::set_nonblocking(pipe[0], true).expect("nonblocking pipe reader");
     fill_pipe(pipe[1]);
@@ -973,8 +983,9 @@ fn a_drained_publish_settles_every_receipt_the_spill_had_held() {
 #[test]
 fn a_contended_spill_probe_never_holds_a_receipt_on_a_drained_sink() {
     use std::sync::atomic::{AtomicBool, Ordering};
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = SinkWriter::new(pipe[1]);
     let term = Mutex::new(Terminal::new(24, 80));
     let tracker = OutputEchoTracker::default();
@@ -1041,8 +1052,9 @@ fn fifo_admission_receipt_is_not_pty_acceptance() {
 #[cfg(unix)]
 #[test]
 fn an_accepted_enter_over_composed_input_counts_one_submission() {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = SinkWriter::new(pipe[1]);
     let term = Mutex::new(Terminal::new(24, 80));
     let modes = crate::mode_mirror_of(&term);

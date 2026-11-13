@@ -29,6 +29,10 @@ const HANG: Duration = Duration::from_secs(60);
 const POLL: Duration = Duration::from_millis(10);
 const MEMORY: u64 = 1024 * 1024 * 1024;
 
+#[cfg(target_os = "macos")]
+#[path = "resource_admission_owner_tests/submitter_death.rs"]
+mod submitter_death;
+
 #[test]
 #[cfg(target_os = "macos")]
 fn queue_io_fault_ends_original_job_as_host_fault() {
@@ -644,26 +648,8 @@ fn queue_owned(
         session: "s-acde".into(),
         attempt,
     };
-    owner.journal.create(&binding).unwrap();
-    let reading = Reading::of_gib(64, 60, 2);
-    let need = Need::new("resource-run: actual private owner fixture")
-        .mem(MEMORY)
-        .margin(reading.memory_margin());
-    let machine = Fixed::new(reading);
-    // Run the real private memory admission AFTER host journal preparation. Do not
-    // admit around a backend-layout refusal or replace its authority with observations.
-    let claim = match Waiter::enter_cohort(&owner.ledger, &machine, need)
-        .unwrap()
-        .poll(&machine)
-    {
-        Polled::Admitted(claim) => claim,
-        other => panic!("private memory was not admitted: {other:?}"),
-    };
-    let reference = claim.cohort_closure_ref().unwrap();
     let (host, client) = CtlStream::pair().unwrap();
     let host: OwnedFd = host.into();
-    let mut events = job::Events::new(host.try_clone().unwrap(), binding.clone()).unwrap();
-    events.emit(Event::Queued).unwrap();
     let pid = std::process::id();
     let birth = process::read_birth(i32::try_from(pid).unwrap()).unwrap().0;
     let null = || -> OwnedFd { File::open("/dev/null").unwrap().into() };
@@ -695,7 +681,35 @@ fn queue_owned(
             events: host,
         },
     };
+    let reference = queue_authenticated(owner, cwd, submission);
+    (binding, reference, client)
+}
+
+fn queue_authenticated(
+    owner: &mut Owner,
+    cwd: &std::path::Path,
+    submission: AuthorizedSubmission,
+) -> CohortClosureRef {
     submission.request.validate().unwrap();
+    let binding = submission.request.binding.clone();
+    owner.journal.create(&binding).unwrap();
+    let reading = Reading::of_gib(64, 60, 2);
+    let need = Need::new("resource-run: actual private owner fixture")
+        .mem(MEMORY)
+        .margin(reading.memory_margin());
+    let machine = Fixed::new(reading);
+    // Keep the real journal/admission/owner path for both in-process controls
+    // and a submission authenticated through the actual native transport.
+    let claim = match Waiter::enter_cohort(&owner.ledger, &machine, need)
+        .unwrap()
+        .poll(&machine)
+    {
+        Polled::Admitted(claim) => claim,
+        other => panic!("private memory was not admitted: {other:?}"),
+    };
+    let reference = claim.cohort_closure_ref().unwrap();
+    let mut events = job::Events::new(submission.fds.events.try_clone().unwrap(), binding).unwrap();
+    events.emit(Event::Queued).unwrap();
     owner.pending.push_back(Pending {
         queued_at: Instant::now(),
         primary: None,
@@ -725,7 +739,7 @@ fn queue_owned(
         preflight: None,
         probe_scope: None,
     });
-    (binding, reference, client)
+    reference
 }
 
 impl Drop for World {
@@ -870,7 +884,7 @@ fn actual_owner_timeout_and_caller_cancel_reap_and_settle_original_resources() {
         let (binding, memory, client) = world.queue_sleep(budget);
         // Keep the real child live until its owner terminates it. A sleeper with its
         // own deadline could exit while successful native inspections are progressing.
-        let (input, continuation) = io::pipe().unwrap();
+        let (input, continuation) = aterm_uds::pipe().unwrap();
         let pending = world.owner.pending.back_mut().unwrap();
         pending.submission.request.argv = vec![b"/bin/cat".to_vec()];
         pending.submission.fds.stdin = input.into();
@@ -1533,6 +1547,7 @@ fn workload_queue_expiry_and_parent_close_keep_paid_preparation_until_join() {
 }
 #[cfg(target_os = "macos")]
 pub(super) fn metadata_native_role() {
+    submitter_death::early_role();
     metadata_native::early_role();
 }
 

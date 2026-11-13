@@ -3,8 +3,8 @@
 
 //! Tier-1 conformance for `ReleaseClaimLanding` (`aterm_models_release::release_claim_landing_model`).
 //!
-//! Drives the real writers (`ledger::reserve`, `ledger::claim`, `changelog::claim_changelogs`)
-//! and reader (`publish::real_cut_version`) against real git and verifies that the model admits
+//! Drives the real writers (`ledger::reserve`, `ledger::claim`, which roll and land the
+//! changelog themselves) and reader (`publish::real_cut_version`) against real git and verifies that the model admits
 //! each projected transition and refuses the negative controls.
 
 #![cfg(unix)]
@@ -482,12 +482,10 @@ impl Harness {
             allow_existing_section: self.state["allow"] == 1,
             max_attempts: ledger::MAX_CLAIM_ATTEMPTS,
             source: &self.source,
+            harness_base: None,
         };
-        let rolls =
-            |source: &str, main: &str| changelog::claim_changelogs(source, main, VERSION, DATE);
-        let result = ledger::reserve(&hooked, &hooked, &plan, &rolls).and_then(|reserved| {
-            ledger::claim(&hooked, &hooked, &self.fix.work, &plan, &reserved, &rolls)
-        });
+        let result = ledger::reserve(&hooked, &hooked, &plan, DATE)
+            .and_then(|reserved| ledger::claim(&hooked, &hooked, &self.fix.work, &plan, &reserved));
         if during.is_some() {
             self.pushes += 1;
         }

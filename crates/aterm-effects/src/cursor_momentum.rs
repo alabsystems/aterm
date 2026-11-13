@@ -3,6 +3,8 @@
 
 //! Typing-momentum glow: the cursor glows with how fast you type and cools when you stop.
 
+use aterm_scene::smoothstep;
+
 pub mod admission;
 pub mod snapshot;
 #[cfg(test)]
@@ -905,12 +907,6 @@ fn emit_light_halo(
         budget,
         |x0, x1| light_halo_share(letters, caret_cell, on_letters, x0, x1),
     );
-}
-
-#[inline]
-const fn smoothstep(x: f32) -> f32 {
-    let x = x.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
 }
 
 /// Colour temperature with momentum: amber → gold → warm white, then white-hot on a dark theme or

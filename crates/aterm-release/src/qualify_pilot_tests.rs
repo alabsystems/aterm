@@ -241,6 +241,42 @@ fn real_tree_children_and_cleanup_share_the_release_layout() {
     );
     assert!(!index.exists());
     assert_eq!(std::fs::read(other_index).unwrap(), b"unrelated index");
+    let old_lint =
+        aterm_verify::plan::lane_dir(&ctx, aterm_verify::plan::Lane::TippyTarget).unwrap();
+    std::fs::create_dir_all(&old_lint).unwrap();
+    std::fs::write(old_lint.join("held-output"), b"prior build").unwrap();
+    for label in ["first", "second"] {
+        let at = temp.join(label);
+        std::fs::create_dir(&at).unwrap();
+        let mut isolated = environment.clone();
+        isolate_side_lanes(&at, &mut isolated).unwrap();
+        let selected = context(&repo, isolated.clone());
+        assert_eq!(selected.target_dir, ctx.target_dir);
+        let mut projected = child();
+        projected.env(aterm_verify::SIDE_LANES_ENV, &old_lint);
+        apply_real_tree_environment(&mut projected, &isolated);
+        assert_eq!(run(projected), layout(&selected), "{label}");
+        assert_eq!(
+            prepare_real_tree(&repo, &options, &isolated).unwrap(),
+            ctx.target_dir
+        );
+        assert_eq!(
+            std::fs::read(old_lint.join("held-output")).unwrap(),
+            b"prior build"
+        );
+        let lint =
+            aterm_verify::plan::lane_dir(&selected, aterm_verify::plan::Lane::TippyTarget).unwrap();
+        std::fs::create_dir(&lint).unwrap();
+        std::fs::write(lint.join("held-output"), b"current build").unwrap();
+        assert!(
+            prepare_real_tree(&repo, &options, &isolated).is_err(),
+            "a cold target cannot be reused"
+        );
+        assert_eq!(
+            std::fs::read(lint.join("held-output")).unwrap(),
+            b"current build"
+        );
+    }
 }
 
 #[cfg(unix)]
@@ -525,6 +561,310 @@ fn a_full_warmup_is_green_before_the_four_red_handoff_takes() {
     ] {
         assert!(parse(words.split_whitespace().map(str::to_owned)).is_err());
     }
+}
+
+#[test]
+fn matched_queued_tree_shares_preserve_the_workload_and_frozen_verifier() {
+    let options = parse(
+        "--verify same --before-verify same --mode matched --tree-work release \
+         --export-work real --plant-red test --build-return early --warmup full \
+         --queued-tree-share matched"
+            .split_whitespace()
+            .map(str::to_owned),
+    )
+    .unwrap();
+    let takes: Vec<_> = options
+        .order()
+        .iter()
+        .map(|take| options.take(take).unwrap())
+        .collect();
+    assert_eq!(
+        takes
+            .iter()
+            .map(|take| take.queued_tree_share)
+            .collect::<Vec<_>>(),
+        [
+            QueuedTreeShare::Retained,
+            QueuedTreeShare::Retained,
+            QueuedTreeShare::Resume,
+            QueuedTreeShare::Resume,
+            QueuedTreeShare::Retained
+        ]
+    );
+    assert!(
+        takes
+            .iter()
+            .all(|take| take.build_return == BuildReturn::Early
+                && take.real_export
+                && take.tree_work == TreeShape::Release
+                && take.verify == options.verify)
+    );
+    assert!(!takes[0].planted_red);
+    assert!(takes[1..].iter().all(|take| take.planted_red));
+    let path = Path::new("frozen-verifier");
+    let frozen = parse(
+        frozen_arguments(&options, path)
+            .into_iter()
+            .skip(1)
+            .map(|argument| argument.into_string().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(frozen.verify.as_path(), path);
+    assert_eq!(frozen.before.as_deref(), Some(path));
+    assert_eq!(frozen.queued_tree_share, QueuedTreeShare::Matched);
+    assert!(frozen.warmup && frozen.planted_red);
+}
+
+#[test]
+fn matched_lending_changes_only_the_cpu_policy_on_one_frozen_verifier() {
+    let options = parse(
+        "--verify same --before-verify same --mode matched --tree-work release \
+         --export-work real --plant-red test --slice-cache cold --tree-cache warm \
+         --build-return early --warmup full --queued-tree-share lend-matched --cores 15"
+            .split_whitespace()
+            .map(str::to_owned),
+    )
+    .unwrap();
+    let takes: Vec<_> = options
+        .order()
+        .iter()
+        .map(|name| options.take(name).unwrap())
+        .collect();
+    assert_eq!(
+        takes
+            .iter()
+            .map(|take| take.queued_tree_share)
+            .collect::<Vec<_>>(),
+        [
+            QueuedTreeShare::Resume,
+            QueuedTreeShare::Resume,
+            QueuedTreeShare::Lend,
+            QueuedTreeShare::Lend,
+            QueuedTreeShare::Resume,
+        ]
+    );
+    assert!(takes.iter().all(|take| take.verify == options.verify
+        && take.cores == Some(15)
+        && take.build_return == BuildReturn::Early
+        && take.real_export
+        && take.tree_work == TreeShape::Release
+        && !take.warm_slices
+        && !take.cold_tree));
+    assert!(!takes[0].planted_red);
+    assert!(takes[1..].iter().all(|take| take.planted_red));
+    let path = Path::new("frozen-verifier");
+    let frozen = parse(
+        frozen_arguments(&options, path)
+            .into_iter()
+            .skip(1)
+            .map(|argument| argument.into_string().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(frozen.verify.as_path(), path);
+    assert_eq!(frozen.before.as_deref(), Some(path));
+    assert_eq!(frozen.queued_tree_share, QueuedTreeShare::LendingMatched);
+    assert_eq!(frozen.cores, Some(15));
+}
+
+#[test]
+fn lending_comparison_balances_historical_current_and_lent_full_gates() {
+    let options = parse(
+        "--verify current --before-verify historical --mode matched --tree-work release \
+         --export-work real --plant-red test --slice-cache cold --tree-cache warm \
+         --build-return early --warmup full --queued-tree-share lend-compare --cores 15"
+            .split_whitespace()
+            .map(str::to_owned),
+    )
+    .unwrap();
+    let order = options.order();
+    assert_eq!(
+        order,
+        [
+            "warmup", "before", "current", "lent", "lent", "current", "before"
+        ]
+    );
+    for (name, policy, verifier) in [
+        ("warmup", QueuedTreeShare::Retained, "historical"),
+        ("before", QueuedTreeShare::Retained, "historical"),
+        ("current", QueuedTreeShare::Resume, "current"),
+        ("lent", QueuedTreeShare::Lend, "current"),
+    ] {
+        let take = options.take(name).unwrap();
+        assert_eq!(take.queued_tree_share, policy);
+        assert_eq!(take.verify, Path::new(verifier));
+        assert_eq!(take.planted_red, name != "warmup");
+        assert_eq!(take.cores, Some(15));
+        assert_eq!(take.tree_work, TreeShape::Release);
+        assert_eq!(take.build_return, BuildReturn::Early);
+        assert!(take.real_export && !take.warm_slices && !take.cold_tree);
+    }
+    for words in [
+        "--verify current --before-verify historical --mode series --queued-tree-share lend-compare",
+        "--verify current --before-verify historical --mode matched --build-return retained --queued-tree-share lend-compare",
+    ] {
+        assert!(parse(words.split_whitespace().map(str::to_owned)).is_err());
+    }
+    let frozen = parse(
+        frozen_arguments(&options, Path::new("frozen-current"))
+            .into_iter()
+            .skip(1)
+            .map(|argument| argument.into_string().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(frozen.queued_tree_share, QueuedTreeShare::LendingCompare);
+    assert_eq!(frozen.verify, Path::new("frozen-current"));
+    assert_eq!(frozen.before.as_deref(), Some(Path::new("historical")));
+}
+
+#[test]
+fn queued_tree_share_controls_cannot_confuse_the_two_verifiers() {
+    for words in [
+        "--verify after --before-verify before --mode matched --queued-tree-share matched",
+        "--verify after --before-verify before --mode matched --queued-tree-share lend-matched",
+        "--verify same --mode shared --queued-tree-share lend-matched",
+        "--verify same --mode shared --queued-tree-share matched",
+        "--verify same --mode shared --queued-tree-share resume --queued-tree-share retained",
+        "--verify same --mode shared --queued-tree-share unknown",
+    ] {
+        assert!(parse(words.split_whitespace().map(str::to_owned)).is_err());
+    }
+    let options = parse(
+        "--verify same --mode shared"
+            .split_whitespace()
+            .map(str::to_owned),
+    )
+    .unwrap();
+    assert_eq!(options.queued_tree_share, QueuedTreeShare::Lend);
+    let retained = parse(
+        "--verify same --mode shared --queued-tree-share retained"
+            .split_whitespace()
+            .map(str::to_owned),
+    )
+    .unwrap();
+    assert_eq!(retained.queued_tree_share, QueuedTreeShare::Retained);
+}
+
+#[test]
+fn three_policies_share_one_workload_and_balanced_order() {
+    let options = parse(
+        "--verify current --before-verify old --mode matched --tree-work release \
+         --export-work real --plant-red test --slice-cache cold --tree-cache warm \
+         --warmup full --queued-tree-share compare --cores 15"
+            .split_whitespace()
+            .map(str::to_owned),
+    )
+    .unwrap();
+    assert_eq!(
+        options.order(),
+        [
+            "warmup", "before", "current", "resumed", "resumed", "current", "before"
+        ]
+    );
+    let takes: Vec<_> = options
+        .order()
+        .iter()
+        .map(|name| options.take(name).unwrap())
+        .collect();
+    assert_eq!(
+        takes
+            .iter()
+            .map(|take| take.verify.as_path())
+            .collect::<Vec<_>>(),
+        [
+            Path::new("old"),
+            Path::new("old"),
+            Path::new("current"),
+            Path::new("current"),
+            Path::new("current"),
+            Path::new("current"),
+            Path::new("old")
+        ]
+    );
+    assert_eq!(
+        takes
+            .iter()
+            .map(|take| take.queued_tree_share)
+            .collect::<Vec<_>>(),
+        [
+            QueuedTreeShare::Retained,
+            QueuedTreeShare::Retained,
+            QueuedTreeShare::Retained,
+            QueuedTreeShare::Resume,
+            QueuedTreeShare::Resume,
+            QueuedTreeShare::Retained,
+            QueuedTreeShare::Retained
+        ]
+    );
+    assert!(takes.iter().all(|take| take.real_export
+        && take.tree_work == TreeShape::Release
+        && !take.warm_slices
+        && !take.cold_tree
+        && take.cores == Some(15)
+        && take.build_return == BuildReturn::Early));
+    assert!(!takes[0].planted_red);
+    assert!(takes[1..].iter().all(|take| take.planted_red));
+    let frozen = parse(
+        frozen_arguments(&options, Path::new("frozen"))
+            .into_iter()
+            .skip(1)
+            .map(|word| word.into_string().unwrap()),
+    )
+    .unwrap();
+    assert_eq!(frozen.before.as_deref(), Some(Path::new("old")));
+    assert_eq!(frozen.verify, Path::new("frozen"));
+    assert_eq!(frozen.cores, Some(15));
+    assert_eq!(frozen.order(), options.order());
+    assert_eq!(options.requested_cores(18).unwrap(), 15);
+    assert!(options.require_grant(15, 15).is_ok());
+    assert!(options.require_grant(15, 14).is_err());
+    assert!(options.requested_cores(14).is_err());
+    for words in [
+        "--verify v --mode chain --cores 0",
+        "--verify v --mode chain --cores -1",
+        "--verify v --mode chain --cores 9 --cores 9",
+        "--verify v --mode chain --queued-tree-share compare",
+        "--verify v --before-verify v --mode matched --queued-tree-share compare --build-return retained",
+    ] {
+        assert!(
+            parse(words.split_whitespace().map(str::to_owned)).is_err(),
+            "{words}"
+        );
+    }
+}
+
+#[test]
+fn successive_cold_side_targets_preserve_prior_outputs_and_native_layout() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let mut env = aterm_verify::EnvSnapshot {
+        cargo_target_dir: Some(scratch.path().join("native.noindex")),
+        ..Default::default()
+    };
+    let native = env.cargo_target_dir.clone();
+    let first = scratch.path().join("first");
+    let second = scratch.path().join("second");
+    std::fs::create_dir(&first).unwrap();
+    std::fs::create_dir(&second).unwrap();
+    isolate_side_lanes(&first, &mut env).unwrap();
+    let old = env.side_lanes_dir.clone().unwrap();
+    std::fs::write(old.join("held-output"), b"preserve").unwrap();
+    isolate_side_lanes(&second, &mut env).unwrap();
+    assert_ne!(env.side_lanes_dir.as_ref(), Some(&old));
+    assert_eq!(std::fs::read(old.join("held-output")).unwrap(), b"preserve");
+    assert_eq!(env.cargo_target_dir, native);
+    assert!(
+        env.side_lanes_dir
+            .as_ref()
+            .unwrap()
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_none()
+    );
+    assert!(
+        isolate_side_lanes(&second, &mut env).is_err(),
+        "never reuse an existing cold target"
+    );
+    assert_eq!(std::fs::read(old.join("held-output")).unwrap(), b"preserve");
 }
 #[test]
 fn cold_native_takes_keep_their_policy_through_the_frozen_cutter() {

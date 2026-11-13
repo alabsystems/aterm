@@ -559,7 +559,11 @@ fn serves_cached(
         && !cached.facts.as_ref().is_some_and(|f| f.roster_unread)
 }
 
-/// Handle `survey [facts|content]` at the requested level, capped to `most`.
+/// Handle `survey [facts|content] [holder=<pid>.<boot>.<start>]` at the requested level, capped
+/// to `most`. A `holder=` word adds one `release_holder` row: this host's kernel judgement of
+/// exactly that identity, made for this request ([`aterm_agent::release_progress::holder_row`]),
+/// never from a cached snapshot, so a peer can tell a dead holder from an unread one where no
+/// progress record survives.
 pub(crate) fn cmd_survey(
     store: &Store,
     rest: &str,
@@ -567,12 +571,41 @@ pub(crate) fn cmd_survey(
     max: usize,
     here: &Here,
 ) -> String {
-    let level = match rest.trim() {
-        "" | "content" => most,
-        "facts" => SurveyLevel::Facts,
-        _ => return "ERR usage: survey [facts|content]\n".to_string(),
+    const USAGE: &str = "ERR usage: survey [facts|content] [holder=<pid>.<boot>.<start>]\n";
+    let (mut level, mut holder) = (None, None);
+    for word in rest.split_ascii_whitespace() {
+        match word {
+            "content" if level.is_none() => level = Some(most),
+            "facts" if level.is_none() => level = Some(SurveyLevel::Facts),
+            _ if holder.is_none() => match aterm_ctl::release_holder::Identity::of_arg(word) {
+                Some(identity) => holder = Some(identity),
+                None => return USAGE.to_string(),
+            },
+            _ => return USAGE.to_string(),
+        }
+    }
+    let level = level.unwrap_or(most);
+    let Some(holder) = holder else {
+        return survey_rows(store, level, max, here);
     };
-    survey_rows(store, level, max, here)
+    let row = aterm_agent::release_progress::holder_row(&holder);
+    // The row's bytes, and one more digit the reply's count may grow by, come off the cap.
+    let reply = survey_rows(store, level, max.saturating_sub(row.len() + 2), here);
+    with_own_line(&reply, &row)
+}
+
+/// `reply` (`OK <n>` and its `n` lines) with `line` counted and appended after them.
+fn with_own_line(reply: &str, line: &str) -> String {
+    let Some((head, rest)) = reply.split_once('\n') else {
+        return reply.to_owned();
+    };
+    let Some(count) = head
+        .strip_prefix("OK ")
+        .and_then(|count| count.parse::<usize>().ok())
+    else {
+        return reply.to_owned();
+    };
+    format!("OK {}\n{rest}{line}\n", count + 1)
 }
 
 /// Render the instance survey at `level` with header `here` and byte cap `max`.

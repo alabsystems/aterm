@@ -2391,11 +2391,13 @@ impl ListenerSocket<'_> {
             Self::Link(listener) => listener.recheck(),
         }
     }
+    /// When the serving loop must recheck with nothing ready: never for a fleet listener, and
+    /// for a link listener only what `lan::Listener::validity_deadline` still owes.
     fn validity_deadline(&self) -> Option<Instant> {
         match self {
             Self::Fleet(_) => None,
             #[cfg(unix)]
-            Self::Link(_) => Some(Instant::now() + ACCEPT_POLL),
+            Self::Link(listener) => listener.validity_deadline(),
         }
     }
     #[cfg(unix)]
@@ -2865,6 +2867,13 @@ fn serve_seated<H, E>(
             break;
         }
         if stop.is_set() {
+            break;
+        }
+        // A change heard while a connection was seated is judged before the next accept, and
+        // an event source that failed withdraws the listener here as it does in the wait.
+        #[cfg(unix)]
+        if let Err(error) = listener.drain_changes() {
+            stopped = Some(format!("listener withdrawn: {error}"));
             break;
         }
         if let Err(error) = listener.recheck() {

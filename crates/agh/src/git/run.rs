@@ -21,6 +21,25 @@ use super::GIT_BUDGET;
 #[cfg(unix)]
 const ANONYMOUS_READ_PROGRESS_WINDOW: Duration = Duration::from_secs(60);
 
+/// The exact object-closure contract of a fetch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FetchScope {
+    /// Ordinary unfiltered native exact fetch, without an additional closure-health claim.
+    NativeExact,
+    /// Commit/tree metadata for the existing blobless main request; invalid for FetchRef.
+    MetadataOnly,
+    /// Full ancestry metadata and the selected checkout's blobs, not historical blob closure.
+    SelectedCheckout {
+        /// Optional read-only object DATA; it supplies no ref or full-source authority.
+        cache: Option<PathBuf>,
+    },
+    /// Complete historical closure, with read-only untrusted cache DATA.
+    FullSource {
+        /// Read-only object DATA, independently checked against the authenticated graph.
+        cache: PathBuf,
+    },
+}
+
 /// What the runner runs. There is no free-form argv.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -92,10 +111,8 @@ pub enum GitOp {
         into: String,
         /// Read without any credential, including for a release-tier owner.
         anonymous: bool,
-        /// Retain full commit/tree ancestry and only the selected tree's blobs.
-        checkout_closure: bool,
-        /// A screened source of already-held immutable blobs, with no ref authority.
-        checkout_cache: Option<PathBuf>,
+        /// One explicit object-closure contract.
+        scope: FetchScope,
     },
     /// Fetch an admitted exact snapshot with one network transfer. Ref batches atomically
     /// publish their private cache refs after every OID matches; object imports publish none.
@@ -306,6 +323,7 @@ impl GitRun {
         reference: &str,
         into: &str,
         anonymous: bool,
+        scope: FetchScope,
     ) -> GitRun {
         GitRun::of(
             slug,
@@ -314,25 +332,9 @@ impl GitRun {
                 reference: reference.to_string(),
                 into: into.to_string(),
                 anonymous,
-                checkout_closure: false,
-                checkout_cache: None,
+                scope,
             },
         )
-    }
-
-    /// Limit an exact immutable fetch to ancestry and the selected checkout.
-    #[must_use]
-    pub fn with_checkout_closure(mut self, cache: Option<&Path>) -> GitRun {
-        if let GitOp::FetchRef {
-            checkout_closure,
-            checkout_cache,
-            ..
-        } = &mut self.op
-        {
-            *checkout_closure = true;
-            *checkout_cache = cache.map(Path::to_path_buf);
-        }
-        self
     }
 
     /// Fetch an entire admitted snapshot without moving caller branches, tags,
@@ -580,6 +582,11 @@ pub(crate) fn project_config_names(listed: &[u8], read_only: bool) -> Vec<u8> {
 }
 
 #[cfg(unix)]
+pub(crate) fn project_commit_config(listed: &[u8]) -> Vec<u8> {
+    unix::project_commit_config(listed)
+}
+
+#[cfg(unix)]
 mod unix {
     //! The runner's steps, on unix.
 
@@ -605,6 +612,8 @@ mod unix {
     use aterm_types::http_retry::{Cause, GitObservation};
 
     mod ancestry;
+    mod commit_config;
+    mod object_view;
 
     /// The route door's fact naming where a profile's token lives (`Fx::fact`).
     const SOURCE: &str = "source";
@@ -620,6 +629,8 @@ mod unix {
     /// clone's and well under the 1 MiB tail the child door keeps of a stream, so a listing
     /// the door cut is always longer than this and refused.
     const SCREEN_MAX: usize = 256 * 1024;
+    /// Completed full-source representation acceptance, not a staging or resource grant.
+    const SOURCE_STORE_ACCEPTANCE_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 
     #[derive(serde::Serialize, serde::Deserialize)]
     enum ConfigClass {
@@ -712,6 +723,10 @@ mod unix {
         let access = if read_only { "read-only" } else { "write" };
         format!("{CONFIG_LIST} {slug} names {access} {scope}").into_bytes()
     }
+
+    fn commit_config_request(slug: &Slug, scope: &str) -> Vec<u8> {
+        format!("{CONFIG_LIST} {slug} immutable-commit-read {scope}").into_bytes()
+    }
     /// The variables a git child gets from the client's environment.
     const PASSED: [&str; 6] = [
         "USER",
@@ -762,12 +777,19 @@ mod unix {
             GitOp::FetchRef {
                 reference,
                 into,
-                checkout_closure,
+                scope,
                 ..
             } => {
-                if *checkout_closure && !crate::path::is_sha(reference) {
+                if matches!(scope, super::FetchScope::MetadataOnly) {
                     return Err(Error::usage(
-                        "checkout closure requires an exact immutable commit",
+                        "metadata-only scope is reserved for blobless main fetches",
+                    ));
+                }
+                if !matches!(scope, super::FetchScope::NativeExact)
+                    && !crate::path::is_sha(reference)
+                {
+                    return Err(Error::usage(
+                        "selected or full source scope requires an exact immutable commit",
                     ));
                 }
                 if !(crate::path::is_sha(reference)
@@ -936,6 +958,8 @@ mod unix {
         /// The private sibling directory a clone or mirror writes before one atomic publish.
         /// It is absent under replay, where no child or destination is changed.
         clone_stage: Option<PathBuf>,
+        /// One complete record-spooled native inventory, never a larger heap capture.
+        stdout_records: Option<PathBuf>,
     }
 
     /// The transport authority attached to one child. A private HTTP trace and the anonymous
@@ -1082,6 +1106,7 @@ mod unix {
             network: ChildNetwork<'_>,
         ) -> Result<ChildOut> {
             let mut spec = ChildSpec::new(&self.git).budget(self.budget);
+            spec.stdout_records = self.stdout_records.clone();
             let (curl_trace, progress_window) = match network {
                 ChildNetwork::Ordinary => (None, self.progress_window),
                 ChildNetwork::AnonymousHttp { trace } => (
@@ -1659,6 +1684,10 @@ mod unix {
         aterm_json::to_vec(&ConfigVerdict::Allowed { keys }).unwrap_or_default()
     }
 
+    pub(super) fn project_commit_config(listed: &[u8]) -> Vec<u8> {
+        commit_config::project(listed)
+    }
+
     fn screen_projected(projected: &[u8], slug: &Slug) -> Result<()> {
         let verdict: ConfigVerdict = aterm_json::from_slice(projected)
             .map_err(|_| Error::local("invalid isolated config-screen verdict"))?;
@@ -1906,14 +1935,15 @@ mod unix {
             )
     }
 
-    /// Refused: git's credential helper, which routes again from agh's directories, would not
-    /// answer as `profile` (`HelperRoute::answers_as`, the rules that pick its profile, with
-    /// `granted` when the run writes a grant naming `profile`), so a git run would end
-    /// Unauthenticated, or speak as another profile than `GitOut.as_` names. That happens when
-    /// the run's call learned a vault token's login and could not record it (the record not
-    /// writable, or another call holding its lock), and when the client's router is not the
-    /// one agh.toml gives the helper (agh.toml changed since the client read it, or a library
-    /// client built its router elsewhere).
+    /// Refused ([`credential::require_answer`]): git's credential helper, which routes again
+    /// from agh's directories, would not answer as `profile` (`HelperRoute::answers_as`, the
+    /// rules that pick its profile, with `granted` when the run writes a grant naming
+    /// `profile`), so a git run would end Unauthenticated, or speak as another profile than
+    /// `GitOut.as_` names. That happens when the run's call learned a vault token's login and
+    /// could not record it (the record not writable, or another call holding its lock past the
+    /// one-minute wait), and when the client's router is not the one agh.toml gives the helper
+    /// (agh.toml changed since the client read it, or a library client built its router
+    /// elsewhere).
     fn helper_answers(
         gh: &Github,
         dirs: &Dirs,
@@ -1922,32 +1952,7 @@ mod unix {
         loose: bool,
         slug: &Slug,
     ) -> Result<()> {
-        let route = credential::route_for(gh.env(), dirs, loose)
-            .map_err(|error| error.with_repo(slug.to_string()))?;
-        if route.answers_as(slug, profile, granted, gh.env()) {
-            return Ok(());
-        }
-        let vault_row = route.adopted && crate::identity::vault::Slot::named(profile).is_some();
-        let (why, next) = if vault_row {
-            (
-                format!(
-                    "{profile}'s login is not in the vault adoption record, which git's credential helper reads"
-                ),
-                route
-                    .next
-                    .unwrap_or_else(|| "run the command again".to_string()),
-            )
-        } else {
-            (
-                format!(
-                    "git's credential helper, which reads agh.toml again, does not answer {slug} as {profile}"
-                ),
-                "agh auth status".to_string(),
-            )
-        };
-        Err(Error::refused(why)
-            .with_next(next)
-            .with_repo(slug.to_string()))
+        credential::require_answer(gh.env(), dirs, slug, profile, granted, loose)
     }
 
     /// The run on unix: steps 1 to 9 of the runner (plan §4.6.13).
@@ -2036,6 +2041,7 @@ mod unix {
                 reads: !push,
                 anonymous_read,
                 clone_stage: None,
+                stdout_records: None,
             };
             if matches!(remote, Remote::Github(_)) && !matches!(run.op, GitOp::CheckLocal { .. }) {
                 children.retain_certificate_default(slug)?;
@@ -2121,6 +2127,7 @@ mod unix {
             reads: !push,
             anonymous_read,
             clone_stage: clone_stage.as_ref().map(|stage| stage.path().to_path_buf()),
+            stdout_records: None,
         };
         if matches!(remote, Remote::Github(_)) && !matches!(run.op, GitOp::CheckLocal { .. }) {
             children.retain_certificate_default(slug)?;
@@ -2194,13 +2201,15 @@ mod unix {
             .as_ref()
             .map_or(&[][..], |source| source.common.as_slice());
         let names = |input: &[u8], scope: &str| -> Result<()> {
-            let listed = children
-                .config(
+            let (query, request) = if matches!(run.op, GitOp::CommitRead { .. }) {
+                (ConfigQuery::CommitRead, commit_config_request(slug, scope))
+            } else {
+                (
                     ConfigQuery::Names { read_only },
-                    input,
-                    &config_names_request(slug, read_only, scope),
+                    config_names_request(slug, read_only, scope),
                 )
-                .map_err(unsent)?;
+            };
+            let listed = children.config(query, input, &request).map_err(unsent)?;
             if listed.code != Some(0) {
                 return Err(Error::refused("source configuration cannot be parsed")
                     .with_repo(slug.to_string()));
@@ -2354,15 +2363,47 @@ mod unix {
     /// tips do not stand for complete history, so its scratch starts cold. `common` is what
     /// [`source_view`] admitted: an absolute path begins with '/', never with the '"' or '#'
     /// git's alternates parser reads specially, and holds no line break.
-    fn lend_objects(scratch: Option<&Path>, common: &str, shallow: bool) -> Result<()> {
-        let Some(scratch) = scratch.filter(|_| !shallow) else {
+    fn lend_objects(
+        children: &Children<'_>,
+        run: &GitRun,
+        scratch: Option<&Path>,
+        common: &str,
+        shallow: bool,
+    ) -> Result<()> {
+        if shallow {
             return Ok(());
-        };
-        std::fs::write(
-            scratch.join("objects/info/alternates"),
-            format!("{common}/objects\n"),
-        )
-        .map_err(|e| Error::local(format!("private object view: {e}")))
+        }
+        object_view::lend(scratch, common, || {
+            let key = [
+                crate::fx::canon::git_request(run),
+                format!("\nstep object-directories {common}").into_bytes(),
+            ]
+            .concat();
+            let out = children
+                .git(
+                    &[
+                        os("--git-dir"),
+                        os(common),
+                        os("-c"),
+                        os("core.quotePath=true"),
+                        os("count-objects"),
+                        os("-v"),
+                    ],
+                    None,
+                    &key,
+                )
+                .map_err(unsent)?;
+            if out.code != Some(0) {
+                return Err(failed(
+                    &run.op,
+                    &out,
+                    children.gh.redactor(),
+                    &run.slug,
+                    false,
+                ));
+            }
+            Ok(out)
+        })
     }
 
     /// Ordinary refs in a non-shallow repository can still name metadata-only
@@ -2413,7 +2454,7 @@ mod unix {
             );
         }
         if checked.stdout.is_empty() && !checked.stdout_may_be_truncated() {
-            lend_objects(scratch, common, false)?;
+            lend_objects(children, run, scratch, common, false)?;
         }
         Ok(())
     }
@@ -2468,19 +2509,22 @@ mod unix {
         Ok(())
     }
 
-    fn hold_object_intake_directories(
-        object_directory: &Path,
-        pack_directory: &Path,
-    ) -> Result<Vec<(PathBuf, std::fs::File)>> {
+    fn hold_physical_directories(paths: &[&Path]) -> Result<Vec<(PathBuf, std::fs::File)>> {
+        use std::os::unix::fs::OpenOptionsExt as _;
         let mut pinned = Vec::new();
-        for path in [object_directory, pack_directory] {
+        for &path in paths {
             let before = std::fs::symlink_metadata(path)
                 .map_err(|error| Error::local(format!("object intake directory: {error}")))?;
             if !before.is_dir() {
                 return Err(Error::refused("object intake directory must be physical"));
             }
-            let file = std::fs::File::open(path)
-                .map_err(|error| Error::local(format!("hold object intake directory: {error}")))?;
+            let file = aterm_uds::kept_out(|| {
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                    .open(path)
+            })
+            .map_err(|error| Error::local(format!("hold object intake directory: {error}")))?;
             let held = file
                 .metadata()
                 .map_err(|error| Error::local(format!("object intake identity: {error}")))?;
@@ -2568,7 +2612,7 @@ mod unix {
         let object_directory = Path::new(common).join("objects");
         let pack_directory = object_directory.join("pack");
         let pinned = if scratch.is_some() {
-            hold_object_intake_directories(&object_directory, &pack_directory)?
+            hold_physical_directories(&[&object_directory, &pack_directory])?
         } else {
             Vec::new()
         };
@@ -2789,6 +2833,428 @@ mod unix {
         )
     }
 
+    /// Cache ownership is DATA only. Retain its physical namespace while native Git
+    /// independently packs requested blobs into our private store.
+    fn source_copy_check(children: &Children<'_>, deadline: std::time::Duration) -> Result<()> {
+        if children
+            .gh
+            .fx()
+            .git_stop()
+            .is_some_and(|stop| stop.load(std::sync::atomic::Ordering::Acquire))
+        {
+            return Err(Error::new(
+                Kind::Interrupted,
+                "source DATA copy interrupted",
+            ));
+        }
+        if children.gh.fx().mono()? >= deadline {
+            return Err(Error::local(
+                "source DATA copy exceeded its operation bound",
+            ));
+        }
+        Ok(())
+    }
+
+    fn source_cache_stamp(
+        root: &Path,
+        children: &Children<'_>,
+        deadline: std::time::Duration,
+    ) -> Result<Vec<(PathBuf, Vec<u64>)>> {
+        let mut pending = vec![root.to_path_buf()];
+        let mut result = Vec::new();
+        while let Some(path) = pending.pop() {
+            source_copy_check(children, deadline)?;
+            if result.len() + pending.len() >= 100_000 {
+                return Err(Error::refused(
+                    "source cache namespace exceeds its entry bound",
+                ));
+            }
+            let meta = std::fs::symlink_metadata(&path)
+                .map_err(|error| Error::local(format!("source cache metadata: {error}")))?;
+            if !meta.is_dir() && !meta.is_file() {
+                return Err(Error::refused(
+                    "source cache must contain physical directories and regular files",
+                ));
+            }
+            result.push((
+                path.clone(),
+                vec![
+                    meta.dev(),
+                    meta.ino(),
+                    u64::from(meta.mode()),
+                    u64::from(meta.uid()),
+                    meta.nlink(),
+                    meta.len(),
+                    meta.mtime() as u64,
+                    meta.mtime_nsec() as u64,
+                    meta.ctime() as u64,
+                    meta.ctime_nsec() as u64,
+                ],
+            ));
+            if meta.is_dir() {
+                for entry in std::fs::read_dir(path)
+                    .map_err(|error| Error::local(format!("source cache directory: {error}")))?
+                {
+                    source_copy_check(children, deadline)?;
+                    if result.len() + pending.len() >= 100_000 {
+                        return Err(Error::refused(
+                            "source cache namespace exceeds its entry bound",
+                        ));
+                    }
+                    pending.push(
+                        entry
+                            .map_err(|error| Error::local(error.to_string()))?
+                            .path(),
+                    );
+                }
+            }
+        }
+        result.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        Ok(result)
+    }
+
+    // A complete-source receiver must not exempt links from its final fsck or
+    // redirect object lookup. Caller-owned state is refused, never repaired.
+    fn full_source_receiver(common: &Path, shallow: bool, children: &Children<'_>) -> Result<()> {
+        if shallow {
+            return Err(Error::refused(
+                "complete source receiver must not be shallow",
+            ));
+        }
+        for suffix in [
+            "objects/info/alternates",
+            "objects/info/http-alternates",
+            "info/grafts",
+            "refs/replace",
+        ] {
+            match std::fs::symlink_metadata(common.join(suffix)) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Error::local(error.to_string())),
+                Ok(_) => {
+                    return Err(Error::refused(
+                        "complete source receiver has an external or rewritten object route",
+                    ));
+                }
+            }
+        }
+        // A replacement can be packed with no loose refs/replace directory.
+        let replacements = children
+            .git(
+                &[
+                    os("--git-dir"),
+                    common.as_os_str().to_owned(),
+                    os("for-each-ref"),
+                    os("--count=1"),
+                    os("--format=%(refname)"),
+                    os("refs/replace/"),
+                ],
+                None,
+                b"full source receiver replacement refs",
+            )
+            .map_err(unsent)?;
+        if replacements.code != Some(0)
+            || !replacements.stdout.is_empty()
+            || !replacements.stderr.is_empty()
+        {
+            return Err(Error::refused(
+                "complete source receiver has replacement refs or unavailable ref evidence",
+            ));
+        }
+        for suffix in ["objects", "objects/pack"] {
+            if !std::fs::symlink_metadata(common.join(suffix))
+                .map_err(|e| Error::local(e.to_string()))?
+                .is_dir()
+            {
+                return Err(Error::refused("source pack directory must be physical"));
+            }
+        }
+        let deadline = children
+            .gh
+            .fx()
+            .mono()?
+            .checked_add(children.budget)
+            .ok_or_else(|| Error::refused("source operation deadline overflow"))?;
+        for (count, entry) in std::fs::read_dir(common.join("objects/pack"))
+            .map_err(|e| Error::local(e.to_string()))?
+            .enumerate()
+        {
+            source_copy_check(children, deadline)?;
+            if count >= 100_000 {
+                return Err(Error::refused(
+                    "source receiver pack namespace exceeds its entry bound",
+                ));
+            }
+            if entry
+                .map_err(|e| Error::local(e.to_string()))?
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "promisor")
+            {
+                return Err(Error::refused(
+                    "complete source receiver must not contain promisor markers",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Keep the mutable Git stores themselves open. A cache may contain loose
+    /// objects without a pack directory; absent ref/reflog namespaces create no
+    /// additional store to alias. Existing paths must be physical directories.
+    fn hold_source_store(
+        common: &Path,
+        receiver_ref: Option<&str>,
+    ) -> Result<Vec<(PathBuf, std::fs::File)>> {
+        let mut paths = vec![common.to_path_buf(), common.join("objects")];
+        for suffix in ["objects/pack", "refs", "logs"] {
+            let path = common.join(suffix);
+            match std::fs::symlink_metadata(&path) {
+                Ok(_) => paths.push(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if suffix == "objects/pack" && receiver_ref.is_some() {
+                        return Err(Error::refused("source receiver pack directory is missing"));
+                    }
+                }
+                Err(error) => return Err(Error::local(format!("source store metadata: {error}"))),
+            }
+        }
+        if let Some(into) = receiver_ref {
+            for relative in [into.to_owned(), format!("logs/{into}")] {
+                let mut path = common.to_path_buf();
+                let parts: Vec<_> = relative.split('/').collect();
+                for part in &parts[..parts.len() - 1] {
+                    path.push(part);
+                    match std::fs::symlink_metadata(&path) {
+                        Ok(_) => paths.push(path.clone()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                        Err(error) => {
+                            return Err(Error::local(format!("source ref store: {error}")));
+                        }
+                    }
+                }
+            }
+        }
+        paths.sort_unstable();
+        paths.dedup();
+        hold_physical_directories(&paths.iter().map(PathBuf::as_path).collect::<Vec<_>>())
+    }
+
+    /// Names alone cannot distinguish linked worktrees, bind aliases or shared
+    /// object/ref stores. Held file descriptions keep each physical identity
+    /// alive while comparing the read-only input against every mutable output.
+    fn source_stores_disjoint(
+        receiver: &[(PathBuf, std::fs::File)],
+        cache: &[(PathBuf, std::fs::File)],
+    ) -> Result<()> {
+        check_object_intake_directories(receiver)?;
+        check_object_intake_directories(cache)?;
+        // Walk actual held-directory parents, not pathname prefixes. A nested
+        // output can mutate the cache even when none of its store roots equal
+        // a cache root. Check both directions, retaining the original pins.
+        for (inputs, outputs) in [(cache, receiver), (receiver, cache)] {
+            let mut identities = std::collections::BTreeSet::new();
+            for (_, file) in inputs {
+                let meta = file
+                    .metadata()
+                    .map_err(|error| Error::local(error.to_string()))?;
+                identities.insert((meta.dev(), meta.ino()));
+            }
+            for (_, file) in outputs {
+                let mut current = aterm_uds::kept_out(|| file.try_clone()).map_err(|error| {
+                    Error::local(format!("hold source store ancestry: {error}"))
+                })?;
+                let mut reached_root = false;
+                let mut visited = std::collections::BTreeSet::new();
+                for _ in 0..256 {
+                    let meta = current
+                        .metadata()
+                        .map_err(|error| Error::local(error.to_string()))?;
+                    let identity = (meta.dev(), meta.ino());
+                    if identities.contains(&identity) {
+                        return Err(Error::refused("read-only source cache aliases or contains the receiver's mutable store")
+                            .with_sub(Sub::GuardFailed { what: "source cache aliases receiver".into() }));
+                    }
+                    if !visited.insert(identity) {
+                        return Err(Error::refused("source store ancestry contains a cycle"));
+                    }
+                    let parent: std::fs::File = aterm_uds::kept_out(|| {
+                        aterm_dirfd::openat(
+                            &current,
+                            "..",
+                            aterm_dirfd::OFlags::RDONLY
+                                | aterm_dirfd::OFlags::DIRECTORY
+                                | aterm_dirfd::OFlags::NOFOLLOW
+                                | aterm_dirfd::OFlags::CLOEXEC,
+                            aterm_dirfd::Mode::empty(),
+                        )
+                        .map_err(std::io::Error::from)
+                    })
+                    .map_err(|error| Error::local(format!("source store parent: {error}")))?
+                    .into();
+                    let parent_meta = parent
+                        .metadata()
+                        .map_err(|error| Error::local(error.to_string()))?;
+                    if (parent_meta.dev(), parent_meta.ino()) == identity {
+                        reached_root = true;
+                        break;
+                    }
+                    current = parent;
+                }
+                if !reached_root {
+                    return Err(Error::refused(
+                        "source store ancestry exceeds the physical traversal bound",
+                    ));
+                }
+            }
+        }
+        check_object_intake_directories(receiver)?;
+        check_object_intake_directories(cache)?;
+        Ok(())
+    }
+
+    /// Consume only fixed-size records from one proven-complete owned native
+    /// stream. No whole-history vector/set, path names or partial tail is accepted.
+    fn source_object_batches(
+        path: &Path,
+        children: &Children<'_>,
+        deadline: std::time::Duration,
+        mut consume: impl FnMut(usize, &[String]) -> Result<()>,
+    ) -> Result<()> {
+        use std::io::BufRead as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)
+            .map_err(|error| Error::local(format!("complete source inventory: {error}")))?;
+        let before = file.metadata().map_err(|e| Error::local(e.to_string()))?;
+        if !before.is_file()
+            || before.nlink() != 1
+            || before.len() > crate::fx::child::MAX_RECORD_SPOOL_BYTES as u64
+        {
+            return Err(Error::refused(
+                "complete source inventory has unsupported type or size",
+            ));
+        }
+        let identity = |m: &std::fs::Metadata| {
+            (
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )
+        };
+        if identity(&before)
+            != identity(&std::fs::symlink_metadata(path).map_err(|e| Error::local(e.to_string()))?)
+        {
+            return Err(Error::refused("complete source inventory route changed"));
+        }
+        let mut reader = std::io::BufReader::new(file);
+        let mut batch = Vec::with_capacity(16_384);
+        let mut index = 0;
+        loop {
+            source_copy_check(children, deadline)?;
+            let mut record = Vec::with_capacity(43);
+            let n = reader
+                .by_ref()
+                .take(43)
+                .read_until(b'\n', &mut record)
+                .map_err(|e| Error::local(e.to_string()))?;
+            if n == 0 {
+                break;
+            }
+            if record.last() != Some(&b'\n') {
+                return Err(Error::protocol("incomplete source inventory record"));
+            }
+            record.pop();
+            let missing = record.first() == Some(&b'?');
+            let oid = if missing { &record[1..] } else { &record[..] };
+            let oid = std::str::from_utf8(oid)
+                .ok()
+                .filter(|oid| crate::path::is_sha(oid))
+                .ok_or_else(|| Error::protocol("malformed source inventory record"))?;
+            batch.push(oid.to_owned());
+            if batch.len() == 16_384 {
+                consume(index, &batch)?;
+                batch.clear();
+                index += 1;
+            }
+        }
+        if !batch.is_empty() {
+            consume(index, &batch)?;
+        }
+        let after = reader
+            .get_ref()
+            .metadata()
+            .map_err(|e| Error::local(e.to_string()))?;
+        if identity(&before) != identity(&after)
+            || identity(&before)
+                != identity(
+                    &std::fs::symlink_metadata(path).map_err(|e| Error::local(e.to_string()))?,
+                )
+        {
+            return Err(Error::refused(
+                "complete source inventory changed during consumption",
+            ));
+        }
+        Ok(())
+    }
+
+    fn source_missing_objects(
+        children: &Children<'_>,
+        scratch: Option<&Path>,
+        key: &[u8],
+        batch: &[String],
+        input: &[u8],
+    ) -> Result<String> {
+        let key = [key, b"\ninspect cached object types"].concat();
+        let result = children.git_input(
+            &[
+                os("cat-file"),
+                os("--batch-check=%(objectname) %(objecttype)"),
+            ],
+            scratch,
+            &key,
+            input,
+        )?;
+        if result.code != Some(0) || result.stdout_may_be_truncated() || !result.stderr.is_empty() {
+            return Err(Error::protocol(
+                "could not inspect the complete source object cache batch",
+            ));
+        }
+        let text = std::str::from_utf8(&result.stdout)
+            .map_err(|_| Error::protocol("invalid source object cache object response"))?;
+        if !text.ends_with('\n') {
+            return Err(Error::protocol("incomplete source object cache response"));
+        }
+        let mut rows = text.lines();
+        let mut missing = String::new();
+        for oid in batch {
+            match rows.next().and_then(|row| row.split_once(' ')) {
+                Some((observed, kind))
+                    if observed == oid && matches!(kind, "blob" | "commit" | "tree") => {}
+                Some((observed, "missing")) if observed == oid => {
+                    missing.push_str(oid);
+                    missing.push('\n');
+                }
+                _ => {
+                    return Err(Error::protocol(
+                        "source object cache object identity or type differs",
+                    ));
+                }
+            }
+        }
+        if rows.next().is_some() {
+            return Err(Error::protocol(
+                "unexpected source object cache object response",
+            ));
+        }
+        Ok(missing)
+    }
+
     fn checkout_blob_ids(
         commit: &str,
         mut list: impl FnMut(&str, bool) -> Result<ChildOut>,
@@ -2939,16 +3405,40 @@ mod unix {
 
     /// Keep promisor configuration private. Import complete commit/tree ancestry and,
     /// for checkout closure, only the immutable selected tree's blob bodies.
+    /// Metadata-only requests retain their explicit commit/tree contract. A source
+    /// cache request instead hydrates and validates the COMPLETE reachable closure.
     fn fetch_tree_scope(
         children: &Children<'_>,
         run: &GitRun,
         remote: &Remote,
         dir: &Path,
         into: &str,
-        checkout: Option<(&str, Option<&Path>)>,
+        scope: &super::FetchScope,
+        reference: Option<&str>,
     ) -> Result<ChildOut> {
+        let source_cache = match scope {
+            super::FetchScope::FullSource { cache } => Some((
+                reference
+                    .ok_or_else(|| Error::usage("full source scope needs an exact reference"))?,
+                cache.as_path(),
+            )),
+            _ => None,
+        };
+        let checkout = match scope {
+            super::FetchScope::SelectedCheckout { cache } => Some((
+                reference.ok_or_else(|| Error::usage("checkout scope needs an exact reference"))?,
+                cache.as_deref(),
+            )),
+            _ => None,
+        };
+        if matches!(scope, super::FetchScope::NativeExact) {
+            return Err(Error::usage(
+                "native exact fetch does not use a filtered tree scope",
+            ));
+        }
         let mut children = children.clone();
         children.env.push((os("GIT_NO_LAZY_FETCH"), os("1")));
+        children.env.push((os("GIT_NO_REPLACE_OBJECTS"), os("1")));
         let dir = screened(&children, run, dir)?;
         let canonical = crate::fx::canon::git_request(run);
         let scratch = children.scratch_git.as_deref();
@@ -2969,7 +3459,10 @@ mod unix {
             Ok(out)
         };
         let view = step("common-dir", source_view_args(&dir), None)?;
-        let (common, _) = source_view(&view.stdout)?;
+        let (common, shallow) = source_view(&view.stdout)?;
+        if source_cache.is_some() {
+            full_source_receiver(Path::new(common), shallow, &children)?;
+        }
         cache_parents(Path::new(common), into)?;
         let mut init = vec![os("init"), os("--quiet"), os("--bare")];
         if let Some(path) = scratch {
@@ -2988,7 +3481,7 @@ mod unix {
                 os(remote.url()),
                 os(format!(
                     "+{}:refs/agh/source",
-                    checkout.map_or("refs/heads/main", |(commit, _)| commit)
+                    reference.unwrap_or("refs/heads/main")
                 )),
             ],
             scratch,
@@ -3007,15 +3500,15 @@ mod unix {
             .and_then(|s| s.strip_suffix('\n'))
             .filter(|s| crate::path::is_sha(s))
             .ok_or_else(|| Error::protocol("invalid metadata commit"))?;
-        if checkout.is_some_and(|(expected, _)| expected != oid) {
-            return Err(Error::protocol(
-                "checkout closure returned a different commit",
-            ));
+        if reference.is_some_and(|expected| expected != oid) {
+            return Err(Error::protocol("scoped fetch returned a different commit"));
         }
         let object_directory = Path::new(common).join("objects");
         let pack_directory = object_directory.join("pack");
-        let pinned = if checkout.is_some() {
-            hold_object_intake_directories(&object_directory, &pack_directory)?
+        let pinned = if source_cache.is_some() {
+            hold_source_store(Path::new(common), Some(into))?
+        } else if checkout.is_some() {
+            hold_physical_directories(&[&object_directory, &pack_directory])?
         } else {
             Vec::new()
         };
@@ -3036,6 +3529,357 @@ mod unix {
             .as_ref()
             .map_or(pack_directory.as_path(), aterm_tempfile::TempDir::path)
             .join("pack");
+        if let Some((_, cache)) = source_cache {
+            let copy_deadline = children
+                .gh
+                .fx()
+                .mono()?
+                .checked_add(children.budget)
+                .ok_or_else(|| Error::refused("source operation deadline overflow"))?;
+            // Metadata came from the authenticated remote into an EMPTY private
+            // repository. Cache refs never decide which commit the remote owns.
+            let cache = screened(&children, run, cache)?;
+            let cache_view = step("source-cache", source_view_args(&cache), None)?;
+            let (cache_common, shallow) = source_view(&cache_view.stdout)?;
+            if shallow {
+                return Err(Error::refused("source object cache must not be shallow"));
+            }
+            let cache_common = Path::new(cache_common);
+            let cache_store = hold_source_store(cache_common, None)?;
+            source_stores_disjoint(&pinned, &cache_store)?;
+            for suffix in [
+                "objects/info/alternates",
+                "objects/info/http-alternates",
+                "info/grafts",
+                "refs/replace",
+            ] {
+                match std::fs::symlink_metadata(cache_common.join(suffix)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(Error::local(error.to_string())),
+                    Ok(_) => {
+                        return Err(Error::refused(
+                            "source object cache has an external or rewritten object route",
+                        ));
+                    }
+                }
+            }
+            let stamp = source_cache_stamp(cache_common, &children, copy_deadline)?;
+            let private = scratch
+                .ok_or_else(|| Error::local("source cache fetch needs owned private storage"))?;
+            let inventory_path = private
+                .parent()
+                .ok_or_else(|| Error::local("source inventory has no owner"))?
+                .join("source-history");
+            let mut inventory_reader = children.clone();
+            inventory_reader.stdout_records = Some(inventory_path.clone());
+            let key = [canonical.as_slice(), b"\nstep full source history records"].concat();
+            let inventory = inventory_reader
+                .git(
+                    &[
+                        os("rev-list"),
+                        os("--objects"),
+                        os("--missing=print"),
+                        os("--no-object-names"),
+                        os(oid),
+                    ],
+                    scratch,
+                    &key,
+                )
+                .map_err(unsent)?;
+            if inventory.code != Some(0) {
+                return Err(failed(
+                    &run.op,
+                    &inventory,
+                    children.gh.redactor(),
+                    &run.slug,
+                    false,
+                ));
+            }
+            // This per-operation coverage selects a transfer shape, not integrity or
+            // resource authority. Inspect every native graph row even after a miss.
+            let mut cache_covers_inventory = true;
+            source_object_batches(&inventory_path, &children, copy_deadline, |index, batch| {
+                let mut input = batch.join("\n");
+                input.push('\n');
+                let key = [
+                    canonical.as_slice(),
+                    format!("\nsource coverage {index}").as_bytes(),
+                ]
+                .concat();
+                let missing = source_missing_objects(
+                    &children,
+                    Some(cache_common),
+                    &key,
+                    batch,
+                    input.as_bytes(),
+                )?;
+                if !missing.is_empty() {
+                    cache_covers_inventory = false;
+                }
+                Ok(())
+            })?;
+            let mut body_worker = None;
+            if cache_covers_inventory {
+                // Retain commit/path context and ignore the existing metadata haves.
+                // Failure is fatal: a failed complete transfer never enters mixed mode.
+                let key = [canonical.as_slice(), b"\ncomplete cache transfer"].concat();
+                let copied = children
+                    .git(
+                        &[
+                            os("-c"),
+                            os("protocol.file.allow=always"),
+                            os("-c"),
+                            os("fetch.fsckObjects=true"),
+                            os("-c"),
+                            os("transfer.fsckObjects=true"),
+                            os("fetch"),
+                            os("--quiet"),
+                            os("--refetch"),
+                            os("--no-filter"),
+                            os("--no-tags"),
+                            os("--no-write-fetch-head"),
+                            os("--recurse-submodules=no"),
+                            cache_common.as_os_str().to_owned(),
+                            os(oid),
+                        ],
+                        scratch,
+                        &key,
+                    )
+                    .map_err(unsent)?;
+                if copied.code != Some(0) {
+                    return Err(failed(
+                        &run.op,
+                        &copied,
+                        children.gh.redactor(),
+                        &run.slug,
+                        false,
+                    ));
+                }
+            } else {
+                // Keep filtered metadata out of the body worker's have set.
+                // An incomplete cache supplies no fetch haves or raw blob wants;
+                // the authenticated exact root supplies full history.
+                let body = private.with_file_name("full-source-body.git");
+                step(
+                    "source-body-init",
+                    vec![
+                        os("init"),
+                        os("--quiet"),
+                        os("--bare"),
+                        os("--template="),
+                        body.as_os_str().to_owned(),
+                    ],
+                    None,
+                )?;
+                // This incomplete-cache plan requests the authenticated root
+                // once, never raw blob wants or a protocol-version retry. The
+                // cold worker advertises no borrowed/filtered commits and has
+                // neither a shallow boundary nor a body filter.
+                let key = [canonical.as_slice(), b"\nfull source exact root"].concat();
+                let fetched = children
+                    .remote_read(
+                        run,
+                        &[
+                            os("-c"),
+                            os("fetch.negotiationAlgorithm=noop"),
+                            os("-c"),
+                            os("fetch.fsckObjects=true"),
+                            os("-c"),
+                            os("transfer.fsckObjects=true"),
+                            os("fetch"),
+                            os("--quiet"),
+                            os("--no-filter"),
+                            os("--no-tags"),
+                            os("--no-write-fetch-head"),
+                            os("--recurse-submodules=no"),
+                            os(remote.url()),
+                            os(format!("+{oid}:refs/agh/source")),
+                        ],
+                        Some(&body),
+                        &key,
+                        None,
+                    )
+                    .map_err(unsent)?;
+                if fetched.code != Some(0) {
+                    return Err(failed(
+                        &run.op,
+                        &fetched,
+                        children.gh.redactor(),
+                        &run.slug,
+                        false,
+                    ));
+                }
+                let observed = step(
+                    "source-body-oid",
+                    vec![
+                        os("rev-parse"),
+                        os("--verify"),
+                        os("refs/agh/source^{commit}"),
+                    ],
+                    Some(&body),
+                )?;
+                if observed.stdout_may_be_truncated()
+                    || observed.stdout != format!("{oid}\n").as_bytes()
+                {
+                    return Err(Error::protocol(
+                        "full source body fetch returned a different commit",
+                    ));
+                }
+                body_worker = Some(body);
+            }
+            let hydrated = body_worker.as_deref().unwrap_or(private);
+            let after_stamp = source_cache_stamp(cache_common, &children, copy_deadline)?;
+            if after_stamp != stamp {
+                let changed = stamp
+                    .iter()
+                    .zip(&after_stamp)
+                    .find(|(before, after)| before != after);
+                let detail = changed.map_or_else(
+                    || "entry count changed".to_owned(),
+                    |((path, before), (after_path, after))| {
+                        let field =
+                            before
+                                .iter()
+                                .zip(after)
+                                .position(|(a, b)| a != b)
+                                .map(|index| {
+                                    [
+                                        "device", "inode", "mode", "owner", "links", "length",
+                                        "mtime", "mtime_ns", "ctime", "ctime_ns",
+                                    ][index]
+                                });
+                        format!(
+                            "entry {} -> {}, metadata field {field:?}",
+                            path.strip_prefix(cache_common).unwrap_or(path).display(),
+                            after_path
+                                .strip_prefix(cache_common)
+                                .unwrap_or(after_path)
+                                .display()
+                        )
+                    },
+                );
+                return Err(Error::refused(format!(
+                    "source object cache changed while independently copied: {detail}"
+                )));
+            }
+            let private_shape = step("full-source-shape", source_view_args(hydrated), None)?;
+            let (_, private_shallow) = source_view(&private_shape.stdout)?;
+            if private_shallow {
+                return Err(
+                    Error::refused("complete source private worker must not be shallow").with_sub(
+                        Sub::GuardFailed {
+                            what: "full source private worker is shallow".into(),
+                        },
+                    ),
+                );
+            }
+            // These markers belong ONLY to the selected owned private fetch
+            // worker. Removing them makes full fsck judge every historical link;
+            // input-cache markers are never changed.
+            for entry in std::fs::read_dir(hydrated.join("objects/pack"))
+                .map_err(|e| Error::local(e.to_string()))?
+            {
+                let path = entry.map_err(|e| Error::local(e.to_string()))?.path();
+                if path.extension().is_some_and(|ext| ext == "promisor") {
+                    if !std::fs::symlink_metadata(&path)
+                        .map_err(|e| Error::local(e.to_string()))?
+                        .is_file()
+                    {
+                        return Err(Error::refused(
+                            "private promisor marker is not a regular file",
+                        ));
+                    }
+                    std::fs::remove_file(path).map_err(|e| Error::local(e.to_string()))?;
+                }
+            }
+            let stored = source_cache_stamp(&hydrated.join("objects"), &children, copy_deadline)?;
+            let bytes = stored
+                .iter()
+                .try_fold(0u64, |total, (_, fields)| total.checked_add(fields[5]))
+                .ok_or_else(|| Error::refused("complete source store size overflow"))?;
+            // Post-fetch/pack acceptance bound, not a staging-write quota. Native
+            // writers retain their existing resource, cancellation and deadline owner.
+            if bytes > SOURCE_STORE_ACCEPTANCE_BYTES {
+                let packs = stored.iter().filter(|(path, fields)| {
+                    path.extension().is_some_and(|ext| ext == "pack")
+                        && fields[2] & u64::from(libc::S_IFMT) == u64::from(libc::S_IFREG)
+                });
+                let mut pack_count = 0u64;
+                let mut pack_bytes = 0u64;
+                for (_, fields) in packs {
+                    pack_count += 1;
+                    pack_bytes = pack_bytes
+                        .checked_add(fields[5])
+                        .ok_or_else(|| Error::refused("complete source pack size overflow"))?;
+                }
+                return Err(Error::refused(format!(
+                    "complete source store exceeds its physical data bound: observed_store_bytes={bytes} pack_count={pack_count} pack_bytes={pack_bytes} acceptance_bytes={}",
+                    SOURCE_STORE_ACCEPTANCE_BYTES,
+                )));
+            }
+            step(
+                "full-source-integrity",
+                vec![
+                    os("fsck"),
+                    os("--full"),
+                    os("--strict"),
+                    os("--no-reflogs"),
+                    os("--no-dangling"),
+                    os(oid),
+                ],
+                Some(hydrated),
+            )?;
+            // Bind the shared importer to the SAME complete, validated owned
+            // worker. The earlier filtered metadata repository is not a source
+            // when independent root-body acquisition was necessary.
+            let mut hydrated_children = children.clone();
+            hydrated_children.scratch_git = Some(hydrated.to_path_buf());
+            cache_parents(Path::new(common), into)?;
+            source_stores_disjoint(&pinned, &cache_store)?;
+            import_fetched_objects(&hydrated_children, run, common, &[oid])?;
+            source_stores_disjoint(&pinned, &cache_store)?;
+            step(
+                "destination-integrity",
+                vec![
+                    os("-C"),
+                    dir.as_os_str().to_owned(),
+                    os("fsck"),
+                    os("--full"),
+                    os("--strict"),
+                    os("--no-reflogs"),
+                    os("--no-dangling"),
+                    os(oid),
+                ],
+                None,
+            )?;
+            check_current()?;
+            if screened(&children, run, &dir)? != dir {
+                return Err(Error::refused("complete source receiver path changed"));
+            }
+            let final_view = step("destination-shape", source_view_args(&dir), None)?;
+            let (final_common, final_shallow) = source_view(&final_view.stdout)?;
+            if final_common != common {
+                return Err(Error::refused("complete source receiver route changed"));
+            }
+            full_source_receiver(Path::new(final_common), final_shallow, &children)?;
+            cache_parents(Path::new(common), into)?;
+            source_stores_disjoint(&pinned, &cache_store)?;
+            let updated = step(
+                "update",
+                vec![
+                    os("-C"),
+                    dir.into_os_string(),
+                    os("update-ref"),
+                    os("--no-deref"),
+                    os("--create-reflog"),
+                    os(into),
+                    os(oid),
+                ],
+                None,
+            )?;
+            source_stores_disjoint(&pinned, &cache_store)?;
+            return Ok(updated);
+        }
         let key = [canonical.as_slice(), b"\nstep metadata-pack"].concat();
         let packed = children
             .git_input(
@@ -3096,7 +3940,7 @@ mod unix {
                         "checkout cache must have complete commit ancestry",
                     ));
                 }
-                lend_objects(scratch, common, false)?;
+                lend_objects(&children, run, scratch, common, false)?;
             }
             // Without a lent cache every blob is missing: the metadata fetch took none.
             let presence = match cache {
@@ -3120,6 +3964,14 @@ mod unix {
                 step("checkout-tree", args, scratch)
             })?;
             let blobs: Vec<_> = blobs.into_iter().collect();
+            // A provider may permit the exact commit but refuse arbitrary blob
+            // wants beneath it. Keep the current checkout's complete bodies in
+            // a second, cold repository, never in the promisor metadata view.
+            // Its shallow boundary and config remain private to this request.
+            let body_scratch = scratch
+                .unwrap_or(Path::new("scratch.git"))
+                .with_file_name("checkout-body.git");
+            let mut body_ready = false;
             for (index, batch) in blobs.chunks(16_384).enumerate() {
                 let mut input = batch.join("\n");
                 input.push('\n');
@@ -3144,10 +3996,21 @@ mod unix {
                     )?,
                     None => input.clone(),
                 };
-                if !missing.is_empty() {
-                    // The scratch has complete metadata, not complete blob history.
-                    // Explicit missing-object wants must not negotiate its filtered
-                    // commits as complete haves (Git's partial-clone fetch contract).
+                if !missing.is_empty() && !body_ready {
+                    step(
+                        "checkout-body-init",
+                        vec![
+                            os("init"),
+                            os("--quiet"),
+                            os("--bare"),
+                            os("--template="),
+                            body_scratch.as_os_str().to_owned(),
+                        ],
+                        None,
+                    )?;
+                    // Request an authenticated commit root once, with no borrowed
+                    // refs, alternates, or filtered-history negotiation. Only its
+                    // selected blob IDs are packed into the receiving repository.
                     let fetched = children
                         .remote_read(
                             run,
@@ -3159,12 +4022,13 @@ mod unix {
                                 os("--no-tags"),
                                 os("--no-write-fetch-head"),
                                 os("--recurse-submodules=no"),
-                                os("--stdin"),
+                                os("--depth=1"),
                                 os(remote.url()),
+                                os(format!("+{oid}:refs/agh/checkout-body")),
                             ],
-                            scratch,
+                            Some(&body_scratch),
                             &fetch_key,
-                            Some(missing.as_bytes()),
+                            None,
                         )
                         .map_err(unsent)?;
                     if fetched.code != Some(0) {
@@ -3176,6 +4040,23 @@ mod unix {
                             false,
                         ));
                     }
+                    let body_oid = step(
+                        "checkout-body-oid",
+                        vec![
+                            os("rev-parse"),
+                            os("--verify"),
+                            os("refs/agh/checkout-body^{commit}"),
+                        ],
+                        Some(&body_scratch),
+                    )?;
+                    if body_oid.stdout_may_be_truncated()
+                        || body_oid.stdout != format!("{oid}\n").as_bytes()
+                    {
+                        return Err(Error::protocol(
+                            "checkout body fetch returned a different commit",
+                        ));
+                    }
+                    body_ready = true;
                 }
                 let packed = children
                     .git_input(
@@ -3187,7 +4068,11 @@ mod unix {
                             os("--threads=1"),
                             prefix.as_os_str().to_owned(),
                         ],
-                        scratch,
+                        if body_ready {
+                            Some(body_scratch.as_path())
+                        } else {
+                            scratch
+                        },
                         &pack_key,
                         input.as_bytes(),
                     )
@@ -3862,10 +4747,7 @@ mod unix {
                 .and_then(|s| s.strip_suffix('\n'))
                 .filter(|s| !s.contains(['\n', '\r']) && Path::new(s).is_absolute())
                 .ok_or_else(|| Error::refused("source common directory has unsupported framing"))?;
-            if let Some(path) = &alternate {
-                std::fs::write(path, format!("{common}/objects\n"))
-                    .map_err(|e| Error::local(format!("private object view: {e}")))?;
-            }
+            lend_objects(children, run, scratch, common, false)?;
             if let Some(main) = found.get("refs/heads/main") {
                 let available = step(
                     "main-present",
@@ -4592,7 +5474,15 @@ mod unix {
                 blobless,
             } => {
                 let out = if *blobless {
-                    fetch_tree_scope(children, run, remote, dir, into, None)?
+                    fetch_tree_scope(
+                        children,
+                        run,
+                        remote,
+                        dir,
+                        into,
+                        &super::FetchScope::MetadataOnly,
+                        None,
+                    )?
                 } else {
                     fetch_exact(children, run, remote, dir, "refs/heads/main", into)?
                 };
@@ -4607,21 +5497,16 @@ mod unix {
                 dir,
                 reference,
                 into,
-                checkout_closure,
-                checkout_cache,
+                scope,
                 ..
             } => {
-                let out = if *checkout_closure {
-                    fetch_tree_scope(
-                        children,
-                        run,
-                        remote,
-                        dir,
-                        into,
-                        Some((reference, checkout_cache.as_deref())),
-                    )?
-                } else {
-                    fetch_exact(children, run, remote, dir, reference, into)?
+                let out = match scope {
+                    super::FetchScope::NativeExact => {
+                        fetch_exact(children, run, remote, dir, reference, into)?
+                    }
+                    _ => {
+                        fetch_tree_scope(children, run, remote, dir, into, scope, Some(reference))?
+                    }
                 };
                 return Ok(GitOut {
                     stdout: kept(&out.stdout, redactor),

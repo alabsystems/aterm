@@ -166,3 +166,32 @@ fn the_boot_clock_reads_in_nanoseconds_through_this_machines_timebase() {
         "{read} ns outside [{inner}, {outer}]"
     );
 }
+
+/// THIS PROCESS'S AGE IS READ ON THE BOOT CLOCK: a wall clock set a century ahead does not age
+/// it, so the launch watch's exit bound, counted from the birth, holds through a clock step. A
+/// translated process reads no boot clock and has only the wall clock (NOT RUN there).
+/// NEGATIVE CONTROL: `process_age_at` passing no boot-clock reading (the wall-clock age this
+/// replaced) fails "a wall-clock step does not age the process".
+#[cfg(target_os = "macos")]
+#[test]
+fn this_processs_age_is_read_on_the_boot_clock_through_a_wall_step() {
+    if aterm_uds::process::translation() == aterm_uds::process::Translation::Translated {
+        println!(
+            "NOT RUN under Rosetta: metrics::startup::startup_prepare_tests::\
+             this_processs_age_is_read_on_the_boot_clock_through_a_wall_step: a translated \
+             process reads no boot clock"
+        );
+        return;
+    }
+    let century = Duration::from_secs(100 * 365 * 24 * 3_600);
+    let stepped = std::time::SystemTime::now() + century;
+    let age = super::process_age_at(stepped).expect("our own start record, before now");
+    assert!(
+        age < century,
+        "a wall-clock step does not age the process: {age:?}"
+    );
+    assert!(
+        super::process_age().is_some(),
+        "the unstepped reading is there too"
+    );
+}

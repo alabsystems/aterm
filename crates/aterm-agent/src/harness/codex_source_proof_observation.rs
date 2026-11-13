@@ -46,15 +46,22 @@ impl Registry {
         &self,
         caller: &slot::Caller,
     ) -> Result<SourceProofObservation, Error> {
-        let process = Process::observe(caller.pid).ok_or(Error::Stale)?;
+        let stale = |phase| {
+            eprintln!("Source qualification native: census stale phase={phase}");
+            Error::Stale
+        };
+        let process = Process::observe(caller.pid).ok_or_else(|| stale("process"))?;
         if process.birth != caller.birth {
-            return Err(Error::Stale);
+            return Err(stale("birth"));
         }
         let (keys, issued, state_version, uses, mut result) = {
             let state = lock(&self.state)?;
-            let actor = state.actors.get(&actor_key(caller)).ok_or(Error::Stale)?;
+            let actor = state
+                .actors
+                .get(&actor_key(caller))
+                .ok_or_else(|| stale("actor"))?;
             if actor.process != process {
-                return Err(Error::Stale);
+                return Err(stale("actor-process"));
             }
             let keys = state
                 .members
@@ -93,12 +100,14 @@ impl Registry {
                 keys,
                 actor.issued.keys().cloned().collect::<Vec<_>>(),
                 state.version,
-                reservation::ProofUses::capture(&state, caller)?,
+                reservation::ProofUses::capture(&state, caller).inspect_err(|error| {
+                    eprintln!("Source qualification native: census phase=uses error={error:?}");
+                })?,
                 result,
             )
         };
         if !uses.observed() {
-            return Err(Error::Stale);
+            return Err(stale("use-scope"));
         }
         for (key, _) in &keys {
             let member = key.rsplit(':').next().ok_or(Error::Stale)?;
@@ -122,10 +131,13 @@ impl Registry {
             }
         }
         if Process::observe(caller.pid).as_ref() != Some(&process) {
-            return Err(Error::Stale);
+            return Err(stale("process-recheck"));
         }
         let state = lock(&self.state)?;
-        let actor = state.actors.get(&actor_key(caller)).ok_or(Error::Stale)?;
+        let actor = state
+            .actors
+            .get(&actor_key(caller))
+            .ok_or_else(|| stale("actor-recheck"))?;
         if state.version != state_version
             || actor.highwater != result.member_highwater
             || actor.epoch != result.member_epoch
@@ -168,7 +180,7 @@ impl Registry {
                                 snapshot.role,
                             )
                         })
-                        .ok_or(Error::Stale)?,
+                        .ok_or_else(|| stale("ready-sequence"))?,
                     member: key.rsplit(':').next().ok_or(Error::Stale)?.to_owned(),
                     connection: snapshot.connection.id,
                     registration: snapshot.registration.clone(),

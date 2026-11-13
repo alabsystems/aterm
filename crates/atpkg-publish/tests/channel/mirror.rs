@@ -628,9 +628,44 @@ fn a_create_the_download_host_never_serves_fails_the_run() {
     rig.route(Arc::new(Dark::new(host, Probe::Absent)));
     let e = err(&rig, &q, false);
     assert!(
-        e.contains("after the upload — the public repo is private"),
+        e.contains("after the upload, read 30 times — the public repo is private"),
         "{e}"
     );
+}
+
+#[test]
+fn a_just_written_asset_the_download_route_lags_on_is_read_again_until_it_answers() {
+    let (rig, q) = setup("mirror-lag", index());
+    rig.host
+        .lag_public(&public(), "atpkg-ay-8256", "pkg-ay-8256.toml", 12);
+    let (report, _) = ok(&rig, &q, false);
+    assert_eq!(report.created, ["atpkg-ay-8256"]);
+    let probes = rig
+        .host
+        .calls()
+        .iter()
+        .filter(|c| *c == "probe alabsystems/ay atpkg-ay-8256 pkg-ay-8256.toml")
+        .count();
+    assert_eq!(probes, 13, "twelve 404s, then the answer");
+}
+
+#[test]
+fn a_lag_past_the_bound_still_fails_the_run_after_exactly_the_bound() {
+    let (rig, q) = setup("mirror-lag-bound", index());
+    rig.host
+        .lag_public(&public(), "atpkg-ay-8256", "pkg-ay-8256.toml", 1_000);
+    let e = err(&rig, &q, false);
+    assert!(
+        e.contains("answers Absent after the upload, read 30 times"),
+        "{e}"
+    );
+    let probes = rig
+        .host
+        .calls()
+        .iter()
+        .filter(|c| *c == "probe alabsystems/ay atpkg-ay-8256 pkg-ay-8256.toml")
+        .count();
+    assert_eq!(probes, 30);
 }
 
 #[test]
@@ -829,8 +864,13 @@ fn a_quad_missing_its_roster_moves_no_pack() {
         "{flag_err}"
     );
 
-    std::fs::write(&rig.ctx.tokens.channel, "  \n").expect("whitespace token");
-    let blank_err = mirror::run(&rig.ctx, &[dir.display().to_string()])
+    // The `gh` arm's token check, said outright; under agh the channel writer is asked
+    // instead (`publishing_asks_the_channel_writer_under_agh`).
+    let gh = rig.ctx.clone().with_host_choice(HostChoice::Gh);
+    std::fs::create_dir_all(gh.tokens.channel.parent().expect("secrets dir"))
+        .expect("mkdir secrets");
+    std::fs::write(&gh.tokens.channel, "  \n").expect("whitespace token");
+    let blank_err = mirror::run(&gh, &[dir.display().to_string()])
         .expect_err("whitespace-only channel token refused before mirroring");
     assert!(
         blank_err
@@ -850,8 +890,6 @@ fn a_quad_missing_its_roster_moves_no_pack() {
 #[test]
 fn publishing_asks_the_channel_writer_under_agh() {
     let (mut rig, _) = setup("mirror-writer", index());
-    std::fs::remove_file(&rig.ctx.tokens.channel).expect("rm token");
-    rig.ctx = rig.ctx.clone().with_host_choice(HostChoice::Agh);
     let dir = rig.path("quad").display().to_string();
     rig.host.fail_next(FakeOp::Preflight, FakeFail::Refuse);
     let e = mirror::run(&rig.ctx, std::slice::from_ref(&dir)).expect_err("no channel writer");

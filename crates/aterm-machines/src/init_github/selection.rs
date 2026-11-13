@@ -319,6 +319,21 @@ impl RepositorySelection {
     /// # Errors
     /// The captured selection no longer holds or the current source cannot be read.
     pub fn ensure_current(&self, sys: &dyn System) -> Result<(), String> {
+        self.ensure_intent(sys)?;
+        if !self
+            .snapshot
+            .is_current(&self.paths)
+            .map_err(|why| why.to_string())?
+        {
+            return Err("repository selection changed, stopped or is still syncing".into());
+        }
+        // The state reader can wait for a vault writer. That writer's end does not
+        // preserve the caller's Stop, account or repository choice across the wait.
+        self.ensure_intent(sys)
+    }
+
+    /// Read the caller's local intent without waiting for the vault's state lock.
+    fn ensure_intent(&self, sys: &dyn System) -> Result<(), String> {
         if sys.stopped().is_some()
             || sys.euid() != self.user.uid
             || sys.identity()?.user != self.user
@@ -326,10 +341,6 @@ impl RepositorySelection {
                 asked(profile(sys, &self.user)?.and_then(|p| p.github), &self.user)?,
                 Asked::Default
             )
-            || !self
-                .snapshot
-                .is_current_now(&self.paths)
-                .map_err(|why| why.to_string())?
         {
             return Err("repository selection changed, stopped or is still syncing".into());
         }
@@ -359,12 +370,15 @@ impl RepositorySelection {
 
     /// Record one durable, deduplicated want after releasing every materialization lock.
     /// The existing need policy and credential protocol retain all release authority.
+    /// `current` may wait for vault currency; `admitted` is the caller's local,
+    /// nonwaiting control check, also read under the need ledger lock.
     /// # Errors
     /// Current intent was withdrawn, or the existing need ledger cannot be updated.
     pub fn request_credential(
         &self,
         sys: &dyn System,
         current: &(dyn Fn() -> Result<(), String> + Sync),
+        admitted: &(dyn Fn() -> Result<(), String> + Sync),
     ) -> Result<bool, String> {
         current()?;
         if !self.needs_credential(sys)? {
@@ -372,6 +386,7 @@ impl RepositorySelection {
         }
         current()?;
         self.ensure_current(sys)?;
+        current()?;
         let want = need::Want::Gh(need::GhProfile::Dev);
         let purpose = need::Purpose::AghDev;
         let previous = need::peek(&self.paths)
@@ -387,14 +402,17 @@ impl RepositorySelection {
                     )
             })
             .and_then(|previous| previous.seq);
-        let raised = match delivered {
-            Some(seq) => need::raise_refused(&self.paths, want, purpose, seq),
-            None => need::raise(&self.paths, want, purpose),
-        }
+        // The caller's guard may also wait for a vault pass. Finish all such
+        // waits before the last local intent read that admits this request.
+        self.ensure_intent(sys)?;
+        let raised = need::raise_with_admission(&self.paths, want, purpose, delivered, || {
+            self.ensure_intent(sys).map_err(aterm_secrets::Error::new)?;
+            admitted().map_err(aterm_secrets::Error::new)
+        })
         .map_err(|why| why.to_string())?;
         current()?;
         self.ensure_current(sys)?;
-        if raised.state.ended() || raised.state == need::State::AwaitingPerson {
+        if raised.state.ended() {
             return Err(format!("{}; {}", self.waiting(), raised.line));
         }
         Ok(true)
@@ -482,7 +500,7 @@ impl RepositorySelection {
         )
         .map_err(|why| why.to_string())?;
         current()?;
-        if raised.state.ended() || raised.state == need::State::AwaitingPerson {
+        if raised.state.ended() {
             return Err(raised.line);
         }
         Ok(())

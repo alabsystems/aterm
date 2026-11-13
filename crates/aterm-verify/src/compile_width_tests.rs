@@ -703,6 +703,109 @@ fn a_unit_claim_this_mac_can_never_hold_runs_alone_instead_of_being_refused() {
     );
 }
 
+/// A measured unit that fits this Mac's memory but never what is available on it: 25 GiB and
+/// the driver's 2 GiB beside it on a 32 GiB Mac with 18 GiB available and no claim held. The
+/// ledger never admits a need with a margin alone, so the unit's wait had no end (three hours,
+/// 2026-11-12). It now asks to run alone once a look says no claim holds what it is short of.
+#[test]
+fn a_unit_short_only_of_memory_no_claim_holds_runs_alone() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(32, 18, 12));
+    let unit = || {
+        aterm_capacity::Need::new("verify TestCompile unit compiler unit run aterm-gui test")
+            .mem(25 << 30)
+            .covers()
+            .margin(DRIVER_CLAIM)
+    };
+    assert_eq!(
+        aterm_capacity::never(&unit(), &aterm_capacity::Machine::read(&machine, None)),
+        None,
+        "the machine can hold it, so it is not refused"
+    );
+    assert!(
+        aterm_capacity::admit::try_admit_with(
+            &aterm_capacity::Ledger::at(dir.path().join("control")),
+            &machine,
+            unit(),
+        )
+        .unwrap()
+        .is_none(),
+        "NEGATIVE CONTROL: as asked, with its margin, the ledger makes it wait"
+    );
+    let claim = admit_unit(
+        &aterm_capacity::Ledger::at(dir.path().join("unit")),
+        &machine,
+        unit(),
+    )
+    .expect("admitted");
+    assert!(
+        claim.alone().is_some(),
+        "it holds the machine's memory alone"
+    );
+    let memory = |reserved: u64| aterm_capacity::Short::Memory {
+        need: 25 << 30,
+        margin: DRIVER_CLAIM,
+        available: 18 << 30,
+        reserved,
+        passes: None,
+        stuck_ahead: 0,
+        stuck: false,
+    };
+    let short = |shorts: Vec<aterm_capacity::Short>| aterm_capacity::Shortfall {
+        shorts,
+        holders: Vec::new(),
+    };
+    assert!(unclaimed_memory(&short(vec![memory(0)])));
+    assert!(
+        !unclaimed_memory(&short(vec![memory(4 << 30)])),
+        "memory a claim ahead reserves comes back at that claim's end: the unit waits"
+    );
+    assert!(
+        !unclaimed_memory(&short(vec![memory(0), aterm_capacity::Short::Cores])),
+        "a wait for anything else is not a wait for unclaimed memory"
+    );
+    assert!(!unclaimed_memory(&short(Vec::new())));
+
+    // A unit its own look names STUCK waits for memory no claim's end brings, though claims
+    // hold memory beside it (ones that went first past it) or wait ahead (a stuck release
+    // budget): it asks to run alone. NEGATIVE CONTROL: the same holders with a wait some end
+    // brings, and the rule before, which asked for no holder at all, keep it waiting.
+    let beside = aterm_capacity::Holder {
+        pid: 4242,
+        what: "test build".to_owned(),
+        checkout: String::new(),
+        held: true,
+        age: std::time::Duration::from_secs(60),
+        mem: 0,
+        claimed: 3 << 30,
+        alone: false,
+        disk: 0,
+        quiet: false,
+        order: (0, 4242, 0),
+        stalled: None,
+        credit: Vec::new(),
+        overrun: None,
+    };
+    let stuck = |reserved: u64, stuck: bool| aterm_capacity::Shortfall {
+        shorts: vec![aterm_capacity::Short::Memory {
+            need: 34 << 30,
+            margin: DRIVER_CLAIM,
+            available: 35 << 30,
+            reserved,
+            passes: None,
+            stuck_ahead: 42 << 30,
+            stuck,
+        }],
+        holders: vec![beside.clone()],
+    };
+    assert!(unclaimed_memory(&stuck(0, true)));
+    assert!(unclaimed_memory(&stuck(4 << 30, true)));
+    assert!(
+        !unclaimed_memory(&stuck(0, false)),
+        "a holder whose end may bring what it lacks: the unit waits"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn only_a_recorded_test_unit_enables_driver_only_admission_and_the_wrapper() {

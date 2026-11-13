@@ -271,6 +271,62 @@ fn an_access_list_that_allows_others_is_refused() {
     );
 }
 
+/// On Apple a file's verdict never rests on errno once Libc's frees have run
+/// (ATERM-KI-1111-30): with errno left EINVAL as each `filesec_free` returns, as
+/// libmalloc's `free` leaves it when XNU refuses the `madvise` that hands a chunk back, a
+/// 0600 file and a 0700 directory with no list, and a file carrying only a deny entry,
+/// still pass, and an allow entry is still `Acl`. Negative control: the earlier read,
+/// `acl_get_fd_np` and then errno (ENOENT for no list, anything else an error), with the
+/// same EINVAL left after it, fails the first judgement with "Invalid argument (os error
+/// 22)", the refusal agh met on a loaded Mac for a worktree's `.git` and its `vault.toml`.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn a_file_with_no_list_passes_whatever_libcs_frees_leave_in_errno() {
+    use crate::owner::errno_seam;
+    let scratch = Scratch::new("errno");
+    let path = scratch.file("k", 0o600);
+    errno_seam::clobbered(|| {
+        assert!(judge(&path).is_ok(), "no list, EINVAL left in errno");
+        let opened = open_nonblocking(&scratch.0, Links::Refuse).unwrap();
+        assert!(owner_private_dir(&opened).unwrap().is_ok());
+    });
+    let acl = |args: &[&str]| {
+        let ran = std::process::Command::new("/bin/chmod")
+            .args(args)
+            .arg(&path)
+            .status()
+            .expect("run chmod");
+        assert!(ran.success(), "chmod {args:?}");
+    };
+    acl(&["+a", "everyone deny write"]);
+    errno_seam::clobbered(|| assert!(judge(&path).is_ok(), "a deny entry passes"));
+    acl(&["+a", "everyone allow read"]);
+    errno_seam::clobbered(|| assert_eq!(judge(&path).unwrap_err(), NotPrivate::Acl));
+}
+
+/// Every reading of the list maps to its verdict by itself, errno no part of it: no list
+/// is `Ok(false)`, a list the allow walk's answer, and every unread state an error, the
+/// realloc failure statx1 returns 0 for (no mode set) included, which a decision on the
+/// list bit alone would read as no list.
+#[cfg(target_vendor = "apple")]
+#[test]
+fn each_list_reading_has_one_verdict() {
+    use crate::owner::ListRead;
+    assert!(!ListRead::Unlisted.allows().unwrap());
+    assert!(ListRead::Listed(true).allows().unwrap());
+    assert!(!ListRead::Listed(false).allows().unwrap());
+    for unread in [
+        ListRead::NoFilesec,
+        ListRead::Failed(-1),
+        ListRead::Failed(12),
+        ListRead::Unset,
+        ListRead::Uncopied(None),
+        ListRead::Uncopied(Some(12)),
+    ] {
+        assert!(unread.allows().is_err(), "{unread:?}");
+    }
+}
+
 /// On macOS the access list is judged BEFORE the mode: a 0755 directory and a 0644 file,
 /// each open by its mode bits as well, that carry an `everyone allow read` entry are `Acl`,
 /// never `Mode`. A caller that narrows the mode it is told of (aterm-uds's

@@ -15,7 +15,57 @@ fn missing_original_store_capability_refuses_without_submitting_root_descriptors
     refusing_preflight(true, true);
 }
 
+#[test]
+fn owner_refusal_keeps_its_authority_error_before_any_execution_attachment() {
+    refusing_reply(
+        Some("ERR resource-admission-v3 refused local-owner-only\n"),
+        false,
+        io::ErrorKind::PermissionDenied,
+        "local-owner-only",
+    );
+}
+
+#[test]
+fn malformed_capabilities_and_connection_loss_are_not_capacity_waits() {
+    for (reply, reason) in [
+        (
+            "OK resource-admission-v3 capabilities\nnot-json\n",
+            "invalid host capability response",
+        ),
+        (
+            "OK resource-admission-v3 capabilities\n{\"version\":2,\"ready\":false}\n",
+            "invalid host capability response",
+        ),
+        ("ERR unknown verb\n", "ERR unknown verb"),
+    ] {
+        refusing_reply(Some(reply), false, io::ErrorKind::InvalidData, reason);
+    }
+    refusing_reply(
+        None,
+        false,
+        io::ErrorKind::UnexpectedEof,
+        "without responding",
+    );
+}
+
 fn refusing_preflight(ready: bool, expectation: bool) {
+    let reply = format!(
+        "OK resource-admission-v3 capabilities\n{{\"version\":3,\"ready\":{ready},\"accounting\":\"owning-wait-accounting-v1\"}}\n"
+    );
+    refusing_reply(
+        Some(&reply),
+        expectation,
+        if ready && expectation {
+            io::ErrorKind::Unsupported
+        } else {
+            io::ErrorKind::WouldBlock
+        },
+        "retained host",
+    );
+}
+
+fn refusing_reply(reply: Option<&str>, expectation: bool, kind: io::ErrorKind, reason: &str) {
+    let reply = reply.map(str::to_owned);
     let directory = crate::test_scratch_dir("resource-unready");
     let path = directory.path().join("socket");
     let listener = aterm_uds::CtlListener::bind(&path).unwrap();
@@ -37,13 +87,12 @@ fn refusing_preflight(ready: bool, expectation: bool) {
             reader.read_line(&mut request).unwrap();
         }
         assert_eq!(request, "resource-admission-v3 capabilities\n");
-        writeln!(
-            stream,
-            "OK resource-admission-v3 capabilities\n{{\"version\":3,\"ready\":{ready},\"accounting\":\"owning-wait-accounting-v1\"}}"
-        )
-        .unwrap();
+        if let Some(reply) = reply {
+            stream.write_all(reply.as_bytes()).unwrap();
+        }
+        listener
     });
-    let (mut read, write) = std::io::pipe().unwrap();
+    let (mut read, write) = aterm_uds::pipe().unwrap();
     let args = super::super::Args {
         sock: None,
         session: "@self".into(),
@@ -64,10 +113,9 @@ fn refusing_preflight(ready: bool, expectation: bool) {
         path: path.to_string_lossy().into_owned(),
         origin: crate::TargetOrigin::Pinned,
     };
-    assert_eq!(
-        run(&wire, "s-a", &args).unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
+    let error = run(&wire, "s-a", &args).unwrap_err();
+    assert_eq!(error.kind(), kind);
+    assert!(error.to_string().contains(reason), "{error}");
     drop(write);
     let mut status = String::new();
     read.read_to_string(&mut status).unwrap();
@@ -75,7 +123,18 @@ fn refusing_preflight(ready: bool, expectation: bool) {
     assert_eq!(value["event"].as_str(), Some("refused"));
     assert_eq!(value["version"].as_u64(), Some(3));
     assert!(!status.contains("transport_unknown"));
-    server.join().unwrap();
+    assert!(value["reason"].as_str().unwrap().contains(reason));
+    let listener = server.join().unwrap();
+    assert_eq!(
+        aterm_uds::accept(
+            &listener,
+            aterm_uds::AcceptWait::Ready,
+            aterm_uds::AcceptedMode::Nonblocking,
+        )
+        .unwrap_err()
+        .kind(),
+        io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]

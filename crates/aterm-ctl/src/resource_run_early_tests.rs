@@ -42,6 +42,17 @@ fn child() {
     let source = original.as_raw_fd();
     let original_id = original.metadata().unwrap().ino();
     let foreign = File::open(foreign_root.path()).unwrap();
+    let native = std::env::var(ROLE).as_deref() == Ok("native");
+    let option = if native {
+        "--expect-native-job-original-store-fd"
+    } else {
+        "--expect-original-store-fd"
+    };
+    let entry = if native {
+        "--resource-native-job-v1"
+    } else {
+        "--resource-workload-v1"
+    };
     let arguments = [
         "resource-run",
         "--accounted",
@@ -53,11 +64,11 @@ fn child() {
         "1000",
         "--job",
         "workload",
-        "--expect-original-store-fd",
+        option,
         &source.to_string(),
         "--",
         "targo",
-        "--resource-workload-v1",
+        entry,
     ]
     .map(OsString::from)
     .to_vec();
@@ -66,10 +77,7 @@ fn child() {
     // SAFETY: the same original source is still owned and held here.
     let for_changed_arguments = unsafe { capture_original_root_store(&arguments) }.unwrap();
     let mut changed = arguments[1..].to_vec();
-    let option = changed
-        .iter()
-        .position(|word| word == "--expect-original-store-fd")
-        .unwrap();
+    let option = changed.iter().position(|word| word == option).unwrap();
     changed.drain(option..option + 2);
     assert!(parse_with_original_store(changed, for_changed_arguments).is_err());
     // Simulate startup code replacing the raw inherited number before parse.
@@ -97,4 +105,17 @@ fn child() {
     assert!(replacement.metadata().unwrap().is_dir());
     assert!(parse_with_original_store(arguments[1..].to_vec(), None).is_err());
     println!("original-startup-store-captured");
+}
+
+#[test]
+fn native_job_original_store_survives_number_reuse_and_rejects_late_adoption() {
+    let mut command = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", EXACT, "--nocapture"])
+        .env(ROLE, "native");
+    let output =
+        aterm_uds::deadline::output_within(&mut command, std::time::Duration::from_secs(60))
+            .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("original-startup-store-captured"));
 }

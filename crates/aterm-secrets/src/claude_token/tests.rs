@@ -488,3 +488,161 @@ fn after_remove_a_later_admit_opens_neither_name() {
         lab.macs.server.stop();
     }
 }
+
+/// Whether the Mac at `paths` reads no entry of the account at all.
+fn absent(paths: &Paths) -> bool {
+    matches!(
+        crate::claude_token::read(paths, &key(), std::time::Duration::from_secs(60)).unwrap(),
+        Lookup::Absent
+    )
+}
+
+/// How a Mac back on the LAN gets what it signed off it to a vault server.
+#[derive(Clone, Copy, Debug)]
+enum Rejoin {
+    /// One records pass ([`sync_records`]), which a subscriber's pass and every `sync` of a vault
+    /// at a server's address run before their vault pass: the server says it lacks this Mac's
+    /// frontier, and the pass posts it.
+    RecordsPass,
+    /// [`post_records_to_servers`]: the post the harness retries once a minute for a row that
+    /// reads `signed here` (`accounts_token_view::note_posted`). The vault pass is no third route:
+    /// it posts only where it signed something in that pass, and a write already signed leaves
+    /// it nothing to sign.
+    Post,
+}
+
+/// Off the LAN and back (`docs/DESIGN-claude-sign-in-sitting-2026-11-12.md` §5, slice S6), with
+/// `rejoin` carrying the token to the server that returned. Three seated Macs: m7 and m40,
+/// members with no admin key, and m22.
+///
+/// With no vault server answering, m7's token write is signed into its own log (`SignedHere`),
+/// and m7 reads the token and serves it at once, as the Mac that minted it; m22 and m40, whose
+/// syncs reach no server, read no entry of the account. NEGATIVE CONTROL: with the server back
+/// on its address and store, and before m7's `rejoin`, both sync and still read none, so it is
+/// m7's pass that delivers the token and nothing else of the lab. After `rejoin` and a sync, both
+/// read the same token, signed by m7 and unverified, so neither serves it; after m7's verifying
+/// write, which the server takes, and a sync, both serve it.
+///
+/// With m7's `rejoin` step left out, m40's read after its sync fails.
+fn off_the_lan_and_back(rejoin: Rejoin) {
+    let Lab { macs, m40 } = Lab::new();
+    let TwoMacs {
+        root,
+        server,
+        m22,
+        m7,
+        ..
+    } = macs;
+    // m40 first: it reads before m22, the admin, has synced.
+    let others = [&m40, &m22];
+    assert!(
+        matches!(can_administer(&m7), Ok(false)) && !matches!(can_administer(&m40), Ok(true)),
+        "CONTROL: neither m7 nor m40 opens an admin locker"
+    );
+    let now = aterm_time::unix_secs().unwrap();
+    let addr = server.addr;
+    server.stop();
+
+    let written = crate::claude_token::write(
+        &m7,
+        &key(),
+        &SecretBytes::from(TOKEN),
+        &meta(a_year()),
+        refuse(),
+    )
+    .unwrap();
+    assert_eq!(
+        written,
+        MemberWritten::SignedHere,
+        "{rejoin:?}: no server took it"
+    );
+    assert!(
+        !crate::claude_token::waiting_here(&m7, &key()).unwrap(),
+        "{rejoin:?}: it is signed, not waiting"
+    );
+    assert!(returns_token(&m7), "{rejoin:?}: m7 reads its token at once");
+    let minted = standing_of(&m7);
+    assert!(minted.minted_here, "{rejoin:?}");
+    assert!(
+        matches!(
+            minted.state(now),
+            State::Unverified {
+                served_here: true,
+                ..
+            }
+        ),
+        "{rejoin:?}: {:?}",
+        minted.state(now)
+    );
+    assert!(minted.in_use(now), "{rejoin:?}: in use where it was minted");
+    for other in others {
+        assert!(
+            sync(other, None).is_err(),
+            "{rejoin:?}: CONTROL: no server answers"
+        );
+        assert!(absent(other), "{rejoin:?}: absent on every other Mac");
+    }
+
+    let server = crate::client::log_entries_tests::server_again(root.path(), addr);
+    for other in others {
+        sync(other, None).expect("the server answers again");
+        assert!(
+            absent(other),
+            "{rejoin:?}: NEGATIVE CONTROL: the server is back and m7 has not passed"
+        );
+    }
+    match rejoin {
+        Rejoin::RecordsPass => {
+            sync_records(&m7, None).expect("m7's records pass");
+        }
+        Rejoin::Post => {
+            let took = post_records_to_servers(&m7).expect("m7 posts its records");
+            assert_eq!(took, 1, "the one server takes them");
+        }
+    }
+    for other in others {
+        sync(other, None).expect("syncs");
+        assert!(returns_token(other), "{rejoin:?}: the same token");
+        let standing = standing_of(other);
+        assert_eq!(standing.check, Check::Readable, "{rejoin:?}");
+        assert_eq!(standing.signer.as_deref(), Some("m7"), "{rejoin:?}");
+        assert!(!standing.minted_here, "{rejoin:?}");
+        assert!(
+            !standing.in_use(now),
+            "{rejoin:?}: unverified, it is served only where it was minted"
+        );
+    }
+
+    let evidence = Verified {
+        on: "m7".into(),
+        at: now,
+        by: "windows".into(),
+        seven_day_resets_at: Some(now + 86_400),
+        five_hour_resets_at: None,
+    };
+    assert_eq!(
+        crate::claude_token::verify(&m7, &key(), evidence, refuse()).unwrap(),
+        MemberWritten::Posted,
+        "{rejoin:?}: the server takes the verifying write"
+    );
+    for other in others {
+        sync(other, None).expect("syncs");
+        let standing = standing_of(other);
+        assert_eq!(standing.state(now), State::Active, "{rejoin:?}");
+        assert!(standing.in_use(now), "{rejoin:?}: in use on the other Mac");
+        assert!(returns_token(other), "{rejoin:?}: the same token");
+    }
+    assert!(standing_of(&m7).in_use(now), "{rejoin:?}: and still on m7");
+    server.stop();
+}
+
+/// A token minted while no vault server answers is `SignedHere`, in use on the Mac that minted it
+/// and absent on every other; once the server answers again, one records pass of the minting
+/// Mac's, or the post a `signed here` row's reader retries, then the verifying write, put it in
+/// use on the others ([`off_the_lan_and_back`], which holds the negative control).
+#[test]
+fn a_token_minted_with_no_server_is_in_use_here_and_on_another_mac_after_rejoin() {
+    for rejoin in [Rejoin::RecordsPass, Rejoin::Post] {
+        off_the_lan_and_back(rejoin);
+    }
+}

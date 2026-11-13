@@ -10,23 +10,22 @@ use aterm_window::keyboard::{
 };
 
 fn app_observing_pty() -> (App, i32) {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::IntoRawFd;
     use std::sync::Arc;
 
     use aterm_session::sink::SinkWriter;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-    let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+    let (reader, writer) = aterm_uds::pipe().expect("pipe");
+    let reader = reader.into_raw_fd();
+    let flags = unsafe { libc::fcntl(reader, libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(
-        unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        unsafe { libc::fcntl(reader, libc::F_SETFL, flags | libc::O_NONBLOCK) },
         0
     );
-    let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
     (
-        App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer))),
-        pipe[0],
+        App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer.into()))),
+        reader,
     )
 }
 

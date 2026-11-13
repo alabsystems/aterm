@@ -4,6 +4,158 @@
 use super::*;
 use crate::table::tests::frontier::built_wide_lab;
 
+/// Own-process CPU for real durable ingests into a populated store. Fixture construction,
+/// sealing and prefix ingestion precede the counters; endpoint sampling remains in the result.
+/// `ATERM_INGEST_MEASUREMENT=scalar|batch` chooses the measured path in the same binary;
+/// scalar is the default. Pair processes rather than mixing their warmup or fixture work.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "manual paired durable-ingest CPU measurement; no latency budget"]
+fn populated_store_ingest_cpu_measurement() {
+    use aterm_bench::measurement_clock::counters;
+
+    const WRITERS: usize = 4;
+    const PREFIX: usize = 2048;
+    const INGESTS: usize = 32;
+    let mode = std::env::var("ATERM_INGEST_MEASUREMENT").unwrap_or_else(|_| "scalar".into());
+    assert!(matches!(mode.as_str(), "scalar" | "batch"));
+    for round in 0..5 {
+        let lab = crate::table::tests::Lab::new(&[Role::Writer; WRITERS]);
+        let bootstraps: Vec<_> = (0..WRITERS).map(|writer| lab.bootstrap(writer)).collect();
+        let sessions: Vec<_> = bootstraps
+            .iter()
+            .map(|bootstrap| Session::open(bootstrap).unwrap())
+            .collect();
+        let session = &sessions[0];
+        let directory = lab._home.path().join("populated-ingest");
+        let mut store = Store::create(session, &directory).unwrap();
+        let mut previous = [None; WRITERS];
+        let wires: Vec<_> = (0..PREFIX + INGESTS)
+            .map(|row| {
+                let writer = row % WRITERS;
+                let wire = sessions[writer]
+                    .seal(
+                        store.scope(),
+                        Causal {
+                            sequence: u64::try_from(row / WRITERS + 1).unwrap(),
+                            previous: previous[writer],
+                            parents: previous[writer].as_slice(),
+                        },
+                        b"populated-store ingest measurement",
+                    )
+                    .unwrap();
+                previous[writer] = Some(aterm_digest::Sha256::digest(&wire));
+                wire
+            })
+            .collect();
+        for wire in &wires[..PREFIX] {
+            store.ingest(session, wire).unwrap();
+        }
+        let incoming: Vec<_> = wires[PREFIX..].iter().map(Vec::as_slice).collect();
+        let probe = counters().expect("kernel own-process counters");
+        let before = counters().expect("kernel own-process counters");
+        if mode == "batch" {
+            store
+                .ingest_batch(session, std::hint::black_box(&incoming))
+                .unwrap();
+        } else {
+            for wire in &incoming {
+                store.ingest(session, std::hint::black_box(wire)).unwrap();
+            }
+        }
+        let after = counters().expect("kernel own-process counters");
+        let elapsed = after.since(before);
+        assert!(elapsed.cpu_ns >= 0.0);
+        let used = store.retained_use(session, session.actor()).unwrap();
+        assert_eq!(used.records, PREFIX + INGESTS);
+        assert_eq!(used.bytes, wires.iter().map(Vec::len).sum::<usize>());
+        for signer in &sessions {
+            assert_eq!(
+                store.retained_by(session, signer.actor()).unwrap(),
+                (PREFIX + INGESTS) / WRITERS
+            );
+        }
+        println!(
+            "{}",
+            aterm_json::json!({
+                "measurement": "populated_store_ingest",
+                "ingest_mode": mode,
+                "clock": "proc_pid_rusage_self",
+                "prefix_records": PREFIX,
+                "ingested_records": INGESTS,
+                "writers": WRITERS,
+                "round": round,
+                "warmup": round == 0,
+                "before_cpu_ns": before.cpu_ns,
+                "after_cpu_ns": after.cpu_ns,
+                "probe_cpu_ns": before.since(probe).cpu_ns,
+                "cpu_ns": elapsed.cpu_ns,
+                "instructions": elapsed.instructions,
+                "cycles": elapsed.cycles,
+            })
+        );
+    }
+}
+
+/// Admission refuses before append, and an uncertain append never publishes an in-memory
+/// header or spends a writer's retained quota. A poisoned handle needs a fresh writing open.
+#[test]
+fn ingest_refusals_preserve_the_journal_index_and_writer_usage() {
+    let lab = crate::table::tests::Lab::new(&[Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::open(&bootstrap).unwrap();
+    let directory = lab._home.path().join("ingest-refusals");
+    let mut store = Store::create(&session, &directory).unwrap();
+    let scope = store.scope();
+    let wire = session
+        .seal(
+            scope,
+            Causal {
+                sequence: 1,
+                previous: None,
+                parents: &[],
+            },
+            b"one retained operation",
+        )
+        .unwrap();
+    let log = directory.join("table.astream");
+    let before = std::fs::read(&log).unwrap();
+    let witness = store.witness.bytes();
+    store.index = OnceLock::from(Index::new(0));
+    assert!(store.ingest(&session, &wire).is_err());
+    assert!(!store.poisoned, "admission refusal never starts an append");
+    assert_eq!(std::fs::read(&log).unwrap(), before);
+    assert_eq!(store.witness.bytes(), witness);
+    assert!(store.index().unwrap().inventory().next().is_none());
+    assert!(store.records.is_empty());
+    assert!(store.writers.is_empty());
+    assert_eq!(store.operation_bytes, 0);
+
+    store.index = OnceLock::from(Index::new(INDEX_CAPACITY));
+    APPEND_FAILS.with(|fails| fails.set(true));
+    let failed = store.ingest(&session, &wire);
+    APPEND_FAILS.with(|fails| fails.set(false));
+    assert!(failed.is_err());
+    assert!(store.poisoned, "an uncertain append poisons this handle");
+    assert_eq!(std::fs::read(&log).unwrap(), before);
+    assert_eq!(store.witness.bytes(), witness);
+    assert!(store.index().unwrap().inventory().next().is_none());
+    assert!(store.records.is_empty());
+    assert!(store.writers.is_empty());
+    assert_eq!(store.operation_bytes, 0);
+    assert!(store.ingest(&session, &wire).is_err());
+    drop(store);
+
+    let mut reopened = Store::open(&session, &directory, scope).unwrap();
+    let receipt = reopened.ingest(&session, &wire).unwrap();
+    assert_eq!(reopened.ingest(&session, &wire).unwrap(), receipt);
+    let used = reopened.retained_use(&session, session.actor()).unwrap();
+    assert_eq!(used.records, 1);
+    assert_eq!(used.writer_records, 1);
+    assert_eq!(used.bytes, wire.len());
+    assert_eq!(used.writer_bytes, wire.len());
+}
+
 /// A retained application payload needs no second cryptographic opening merely to find that it
 /// is not a removal cutoff. A real cutoff still opens, under the ordinary fresh key admission.
 #[test]
@@ -121,17 +273,17 @@ fn payload_facts_require_the_current_key_and_exact_ciphertext() {
     let before = crate::crypto::test_cipher_constructions();
     let decoded = sources
         .with_store_replay(scope, 2, |batch| {
-            let (_, decoded) = batch.replay_metadata(&wire, envelope)?;
-            let (_, ordinary) = batch.replay_metadata(
+            let decoded = batch.replay_metadata(&wire, &envelope)?;
+            let ordinary = batch.replay_metadata(
                 &application,
-                crate::table::Envelope::parse_identified(scope, &application)?,
+                &crate::table::Envelope::parse_identified(scope, &application)?,
             )?;
             assert!(ordinary.is_none());
             assert!(
                 batch
                     .replay_metadata(
                         &application,
-                        crate::table::Envelope::parse_identified(scope, &wire)?
+                        &crate::table::Envelope::parse_identified(scope, &wire)?
                     )
                     .is_err(),
                 "another ciphertext cannot borrow the ordinary payload's fact"
@@ -141,7 +293,7 @@ fn payload_facts_require_the_current_key_and_exact_ciphertext() {
                     batch
                         .replay_metadata(
                             &invalid,
-                            crate::table::Envelope::parse_identified(scope, &invalid)?
+                            &crate::table::Envelope::parse_identified(scope, &invalid)?
                         )
                         .is_err(),
                     "a correctly signed but unauthenticated payload never becomes a fact"

@@ -73,23 +73,18 @@ fn the_default_glow_config_is_the_shipped_resolve() {
         }
         app
     };
-    // The engine's default config still names the tall ribbon body, which no style a person
-    // can choose lays: the shipped rainbow is the underline. Every other field is the default.
-    let shipped = GlowConfig {
-        ribbon_tall: false,
-        ..GlowConfig::default()
-    };
+    // The engine's default config is the shipped rainbow's: its tall band behind the words.
     let app = drawn();
     assert_eq!(
         app.glow_config(),
-        shipped,
-        "a window with no config resolves the engine's defaults, on the underline"
+        GlowConfig::default(),
+        "a window with no config resolves the engine's defaults"
     );
     let mut tinted = drawn();
     tinted.config.cursor_trail_color = Some("#d03a8c".to_string());
     assert_ne!(
         tinted.glow_config(),
-        shipped,
+        GlowConfig::default(),
         "control: a set trail colour resolves away from the default"
     );
 }
@@ -160,7 +155,7 @@ fn classic_receives_the_shipped_knobs() {
 }
 
 #[test]
-fn the_one_rainbow_theme_is_the_underline() {
+fn the_one_rainbow_theme_draws_its_band() {
     for style in [
         "rainbow",
         " RAINBOW ",
@@ -169,8 +164,8 @@ fn the_one_rainbow_theme_is_the_underline() {
         let cfg = glow(style, true);
         assert_eq!(cfg.style, GlowStyle::RainbowKitty, "{style:?}");
         assert!(
-            !cfg.ribbon_tall && !cfg.ribbon_flat,
-            "{style:?} draws the line under what you type"
+            cfg.ribbon_tall && !cfg.ribbon_flat,
+            "{style:?} draws its band behind what you type, its line under it"
         );
     }
 }
@@ -184,7 +179,7 @@ fn immutable_catalog_caches_the_complete_trail_presentation() {
     let catalog = config.resolve_trail_style_cache();
     let cached = catalog.presentation_for(config.cursor_trail_style_raw(), "cat");
     assert_eq!(cached.style.style, Some(GlowStyle::RainbowKitty));
-    assert!(!cached.ribbon_tall);
+    assert!(cached.ribbon_tall && !cached.ribbon_flat);
     assert_eq!(
         cached.pet_species,
         Some(aterm_effects::kitty_pet::PetSpecies::Cat)

@@ -1048,7 +1048,7 @@ impl CursorGlow {
                                 (s.x - hx) * inv_cw,
                                 (s.y - hy) * inv_ch,
                             );
-                            1.0 - smoothstep01(
+                            1.0 - smoothstep(
                                 (d - CursorGlow::LASER_AURA_FULL_CELLS)
                                     * (1.0
                                         / (CursorGlow::LASER_AURA_REACH_CELLS
@@ -1235,7 +1235,7 @@ impl CursorGlow {
         if held == f32::INFINITY {
             return 0.0;
         }
-        smoothstep01((held - Self::DENSE_SEAT_HOLD_S) / Self::DENSE_SEAT_RISE_S)
+        smoothstep((held - Self::DENSE_SEAT_HOLD_S) / Self::DENSE_SEAT_RISE_S)
     }
 
     /// Whether the air past the caret at (`row`, `col`) that a dense row
@@ -2217,7 +2217,9 @@ impl CursorGlow {
         }
         let phase = (self.flame_phase * 1024.0) as u32;
         let lean_q = (-(ch * 0.30 * t) * 4.0).clamp(-127.0, 127.0) as i8;
-        let (fx_l, fx_r) = (geom.fx_left(), geom.fx_right());
+        // The effects box inside the overlay pixel space ([`OVERLAY_PX_MAX`]): a patch's
+        // pixels then narrow to `u16` exactly.
+        let (fx_l, fx_r) = (geom.fx_left(), geom.fx_right().min(OVERLAY_PX_MAX));
         let chi = geom.ch as i32;
         let cwi = geom.cw as i32;
         let head = i32::from(geom.head);
@@ -2641,7 +2643,7 @@ impl CursorGlow {
                                 hr
                             }
                         };
-                        (d, kept_rise * hr * smoothstep01((1.0 - d) * 2.0))
+                        (d, kept_rise * hr * smoothstep((1.0 - d) * 2.0))
                     } else {
                         let peak = if tg.kept {
                             kept_rise * CursorGlow::FIRE_DARK_GAP_RISE * tg.size
@@ -2758,7 +2760,7 @@ impl CursorGlow {
                     };
                     if h < air_cap {
                         let d = (c as f32 - u).max(u - (c + 1) as f32).max(0.0);
-                        cap = cap.min(h + (air_cap - h) * smoothstep01(d * INV_EASE));
+                        cap = cap.min(h + (air_cap - h) * smoothstep(d * INV_EASE));
                     }
                     c += 1;
                 }
@@ -2819,7 +2821,7 @@ impl CursorGlow {
                         self.air_floor_lift(ch, tongues, u)
                     };
                     let base_y = base_y - (ch * curl * (1.0 - side) + lift) as i32;
-                    let scallop = if air { smoothstep01(side * 2.0) } else { 1.0 };
+                    let scallop = if air { smoothstep(side * 2.0) } else { 1.0 };
                     // Rise ceiling: the grid top relaxed by the head band. A
                     // crest kept in its row stands to the row's top, where
                     // the ceiling fades it: cut at the envelope, every crest
@@ -2831,7 +2833,10 @@ impl CursorGlow {
                     } else {
                         (base_y - rise_px as i32 - 2).max(oy - head)
                     };
-                    if top_y >= base_y {
+                    // A flame whose root lies past the overlay pixel space is dropped: a
+                    // patch stores its root as `u16`, and a clamped root would re-shape
+                    // the field.
+                    if top_y >= base_y || base_y > OVERLAY_PX_MAX {
                         k += 1;
                         continue;
                     }
@@ -2949,16 +2954,16 @@ impl CursorGlow {
                                 } else {
                                     under_memo[level]
                                 };
-                                over + (under - over) * smoothstep01((mid - low_top) * inv_cap_ease)
+                                over + (under - over) * smoothstep((mid - low_top) * inv_cap_ease)
                             } else {
                                 over
                             };
                             return low
-                                * smoothstep01((base_y as f32 - mid) * inv_row_foot)
-                                * smoothstep01((mid - row_top as f32) * inv_row_fade);
+                                * smoothstep((base_y as f32 - mid) * inv_row_foot)
+                                * smoothstep((mid - row_top as f32) * inv_row_fade);
                         }
                         let foot_in = if air {
-                            smoothstep01((base_y as f32 - mid) * inv_foot)
+                            smoothstep((base_y as f32 - mid) * inv_foot)
                         } else {
                             1.0
                         };
@@ -2990,7 +2995,7 @@ impl CursorGlow {
                             if over_above {
                                 k = k.min((mid - top) * inv_shoulder);
                             }
-                            (cov_cap + (air_cap - cov_cap) * smoothstep01(k)) * foot_in
+                            (cov_cap + (air_cap - cov_cap) * smoothstep(k)) * foot_in
                         }
                     };
                     let x0_u = x0 as u16;
@@ -3526,7 +3531,7 @@ impl CursorGlow {
             if hard {
                 (y >= low_top) as u8 as f32
             } else {
-                smoothstep01((y - low_top) * (1.0 / CursorGlow::FIRE_DARK_CAP_EASE_PX))
+                smoothstep((y - low_top) * (1.0 / CursorGlow::FIRE_DARK_CAP_EASE_PX))
             }
         }
         #[inline]
@@ -3626,7 +3631,7 @@ impl CursorGlow {
             }
             let cov = cov.min(255.0);
             let thin =
-                CursorGlow::FIRE_DARK_CORE_AMBER * smoothstep01((yellow_cov - cov) * (1.0 / 38.0));
+                CursorGlow::FIRE_DARK_CORE_AMBER * smoothstep((yellow_cov - cov) * (1.0 / 38.0));
             #[cfg(test)]
             let thin = if this.fire_core_uncooled { 0.0 } else { thin };
             (cov as u32, flame_core_ramp(best.1.max(thin)))
@@ -3814,8 +3819,8 @@ impl CursorGlow {
                     if rise >= 1.0 || ym >= floor {
                         continue;
                     }
-                    let root_in = smoothstep01((floor - ym) * inv_root_px);
-                    let hue_in = smoothstep01((floor - ym) * inv_root_hue_px);
+                    let root_in = smoothstep((floor - ym) * inv_root_px);
+                    let hue_in = smoothstep((floor - ym) * inv_root_hue_px);
                     let rise = rise.max(0.0);
                     let xc = xc + lean * rise * rise;
                     let k = (rise * 5.0).clamp(0.0, 1.0);
@@ -4219,7 +4224,7 @@ impl CursorGlow {
                     if hw < 0.3 {
                         continue;
                     }
-                    let root_in = smoothstep01(dy * inv_root_ease) * fade;
+                    let root_in = smoothstep(dy * inv_root_ease) * fade;
                     if root_in <= 0.0 {
                         continue;
                     }
@@ -4507,12 +4512,12 @@ impl CursorGlow {
             let transfer = if s.typing {
                 0.0
             } else {
-                smoothstep01((u - drip_start) * (1.0 / 0.28))
+                smoothstep((u - drip_start) * (1.0 / 0.28))
             };
             let surface_cov = (base_cov * (1.0 - 0.88 * transfer)) as u8;
             let drip_on = !s.typing && seed.is_multiple_of(3);
             let drip_cov = if drip_on && drip_t > 0.0 {
-                let arrive = smoothstep01(drip_t * (1.0 / 0.16));
+                let arrive = smoothstep(drip_t * (1.0 / 0.16));
                 (base_cov * 0.54 * arrive * (1.0 - 0.20 * drip_t)) as u8
             } else {
                 0

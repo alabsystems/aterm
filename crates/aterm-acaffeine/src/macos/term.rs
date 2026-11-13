@@ -39,7 +39,7 @@ pub(super) fn watch(quit: fn(libc::pid_t)) -> Option<Watching> {
     if read != 0 || current.sa_sigaction != libc::SIG_DFL {
         return None;
     }
-    let (mut reader, writer) = aterm_uds::kept_out(io::pipe).ok()?;
+    let (mut reader, writer) = aterm_uds::pipe().ok()?;
     // SAFETY: `fcntl` reads and sets the status flags of the pipe's live write end.
     let nonblocking = unsafe {
         let flags = libc::fcntl(writer.as_raw_fd(), libc::F_GETFL);

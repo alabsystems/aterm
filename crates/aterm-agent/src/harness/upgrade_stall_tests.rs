@@ -1446,6 +1446,7 @@ fn decide(s: &S, holds: Holds, history: bool) -> Option<Decided> {
                 }
                 upgrade::Gate::Wait(held) => {
                     let r = Report {
+                        rung: None,
                         pid: AGENT_PID,
                         tab: TAB.to_string(),
                         session: SESSION.to_string(),

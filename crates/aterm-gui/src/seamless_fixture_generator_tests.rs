@@ -469,6 +469,7 @@ fn fx_record(local_id: u64, title: &str) -> SessionRecord {
         status_seen: None,
         autopilot_end: None,
         wakes: None,
+        agent_act: None,
     }
 }
 
@@ -1303,6 +1304,7 @@ fn fx_text_at(t: &Terminal, abs: u64) -> Option<String> {
 }
 
 fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
+    use std::os::fd::IntoRawFd as _;
     let scratch = scratch_root.join(desk.name);
     let _ = std::fs::remove_dir_all(&scratch);
     std::fs::create_dir_all(&scratch).unwrap();
@@ -1932,8 +1934,10 @@ fn fx_write(desk: &FxDesk, scratch_root: &std::path::Path) {
     );
     std::fs::write(out.join("parent.toml"), parent).unwrap();
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     // SAFETY: `getppid` is a side-effect-free libc getter.
     let parent_pid = unsafe { libc::getppid() };
     aterm_log::env::set(ENV_MANIFEST, &manifest_path);
@@ -3699,9 +3703,20 @@ fn fx_agent(
     run: Option<crate::restore::RunRestore>,
     word: &str,
 ) -> crate::restore::AgentRestore {
+    let (host, namespace) = if pid % 2 == 0 {
+        ("darwin", "")
+    } else {
+        ("linux", r#", "namespace":"1234""#)
+    };
     crate::restore::AgentRestore {
         pid,
         claude_auth: None,
+        lifetime: Some(
+            aterm_json::from_str(&format!(
+                r#"{{"host":"{host}:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","boot":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","pid":{pid},"birth":456{namespace}}}"#
+            ))
+            .expect("the fixture agent's captured lifetime"),
+        ),
         start: "Mon Oct 19 09:14:02 2026".to_string(),
         program: format!("/home/dev/.local/bin/{program}"),
         argv: vec![program.to_string()],
@@ -3843,6 +3858,11 @@ fn fx_carried_state_desk() -> FxDesk {
     }
     .row();
     record.wakes = Some(crate::occupancy_wakes::fixture_row(release_ms + 3_300_000));
+    record.agent_act = Some(crate::agent_act::fixture_row(
+        48_200,
+        u64::try_from(release_ms + 2_700_000).unwrap() * 1_000,
+        3,
+    ));
     {
         let mut timeline = sessions[0].timeline.lock().unwrap();
         timeline
@@ -3898,6 +3918,11 @@ fn fx_carried_state_desk() -> FxDesk {
         crate::occupancy_wakes::carried_wakes(record.wakes.as_deref().unwrap()),
         Some(2)
     );
+    assert!(crate::agent_act::adopt_carried(
+        "fixture-read",
+        record.agent_act.as_deref().unwrap()
+    ));
+    crate::agent_act::forget_kept_for_test("fixture-read");
     assert!(
         crate::task_record::TaskRecord::from_carry_row(
             record.task.as_deref().unwrap(),
@@ -4040,6 +4065,7 @@ fn fx_carried_state_desk() -> FxDesk {
         leaf.agent = Some(Box::new(AgentRestore {
             claude_auth: None,
             pid: 48_213,
+            lifetime: None,
             start: "Mon Oct 19 09:14:02 2026".to_string(),
             program: "/home/dev/.local/bin/codex-alab".to_string(),
             argv: vec!["codex-alab".to_string()],
@@ -4534,6 +4560,12 @@ fn fx_engine_state_desk() -> FxDesk {
     let mut restored = Terminal::from_checkpoint(&fx_two_drawers(5).checkpoint());
     restored.fx_process(b"\r\n\x1b[2mresuming\x1b[0m\r\n");
     shells.push(("claude", restored, cwd));
+
+    // Line sizes and DECSCA protection on the alternate screen and on the saved primary.
+    let mut banner = fx_shell(ROWS, COLS, 12, cwd, 1);
+    banner.fx_process(b"./banner\r\n\x1b#6RELEASE NOTES\r\n\x1b[1\"qread only\x1b[0\"q\r\n");
+    banner.fx_process(b"\x1b[?1049h\x1b[H\x1b#3TOP\r\n\x1b#4TOP\r\n\x1b[1\"qfield:\x1b[0\"q ");
+    shells.push(("banner", banner, cwd));
 
     let mut sessions = Vec::new();
     let mut tabs = Vec::new();

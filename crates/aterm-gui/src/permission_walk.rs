@@ -9,8 +9,12 @@
 //! macOS asks after it is gone. Debugger access is no page of the walk's: setup's one early
 //! elevation turns developer mode on (`aterm_machines::root_steps`).
 //!
-//! * It starts by itself in a process the owner started or an update's successor ([`starts`],
-//!   [`WalkLane::note_successor`]), with no typing ([`START_KEYS_QUIET`]), the Mac Setup tab not
+//! * It starts by itself only in a process the owner started ([`starts`]; owner ruling
+//!   2026-11-09: a walk that starts itself after an update is not the person's, so an update's
+//!   successor starts none and what the Mac lacks stays on System State's Permissions rows and
+//!   in the walk record for the next launch of theirs), with no typing ([`START_KEYS_QUIET`]), an
+//!   aterm window holding keyboard focus ([`StartFacts::in_front`]: System Settings comes up over
+//!   what the person is looking at, so only while that is aterm), the Mac Setup tab not
 //!   the next macOS ask (`App::mac_setup_tab_comes_next`), no install of Apple's tools running
 //!   that may still ask or that a quit would cut off (this launch's tab,
 //!   `App::access_gesture_up`; an adopted one or an installer,
@@ -205,20 +209,24 @@ impl Subject {
 /// What [`starts`] judges, read at the moment it is asked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct StartFacts {
-    /// The process may start the first walk by itself (`App::walk_may_start_by_itself`): the
-    /// owner started it, or it is an update's successor ([`WalkLane::note_successor`]). Whether
+    /// The process may start a walk by itself (`App::walk_may_start_by_itself`): the owner
+    /// started it; an update's successor starts none (owner ruling 2026-11-09). Whether
     /// aterm brought up the Full Disk Access or Developer Tools page for this bundle on this Mac
     /// before (either page's opening of this TCC identity) is read only once these facts say
     /// start (`App::fresh_mac`).
     pub(crate) cold: bool,
     /// A key was typed within [`START_KEYS_QUIET`].
     pub(crate) typing: bool,
+    /// An aterm window holds keyboard focus (`App::any_os_window_focused`): System Settings, and
+    /// macOS's Automation question, come up over what the person is looking at, so only while
+    /// that is aterm.
+    pub(crate) in_front: bool,
 }
 
 /// Whether the walk starts by itself now. Pure.
 #[must_use]
 pub(crate) const fn starts(facts: StartFacts) -> bool {
-    facts.cold && !facts.typing
+    facts.cold && !facts.typing && facts.in_front
 }
 
 /// Whether `word`, an opening `atpkg::devtools::PageMarkers::opened_as` found for `key`'s TCC
@@ -1115,8 +1123,6 @@ pub(crate) struct WalkLane {
     /// access record ([`App::accessibility_handed`]): a line the record never loses, so it is
     /// not read again under that revision.
     ax_handed: Option<u64>,
-    /// This process is an update's successor ([`Self::note_successor`]).
-    successor: bool,
 }
 
 /// The walk record's line for this `.app` on this Mac ([`WALK_RECORD`]), as this process knows
@@ -1159,18 +1165,7 @@ impl WalkLane {
             automation_ask: None,
             ax_declined: None,
             ax_handed: None,
-            successor: false,
         }
-    }
-
-    /// This process is an update's successor (a launch into a staged update, a seamless
-    /// hand-over, a relaunch of the running aterm), not one the owner started: it starts a walk
-    /// by itself as a cold launch does ([`StartFacts::cold`]): the first walk on a Mac that never
-    /// had one ([`App::fresh_mac`]), and, as every process does, the walk on from the pages an
-    /// earlier walk left in the walk record ([`WALK_RECORD`]). Its settle and the Full Disk
-    /// Access page's Later stay a successor's (`devtools_helper::Lane::note_cold_start`).
-    pub(crate) const fn note_successor(&mut self) {
-        self.successor = true;
     }
 
     pub(crate) const fn reach(&self) -> WalkReach {
@@ -1650,7 +1645,8 @@ impl App {
     /// for the answer), with no sign-out row needed: the sign-outs come last in the setup run,
     /// and asking then would be late and alone. Under the walk's own start rules
     /// ([`Self::look_for_walk_start`]): an admitted revision, a process that may start a walk by
-    /// itself, no typing, none of the window's gestures or aterm's macOS dialogs up, the Mac
+    /// itself, no typing, an aterm window holding keyboard focus ([`StartFacts::in_front`]),
+    /// none of the window's gestures or aterm's macOS dialogs up, the Mac
     /// Setup tab not next, no install of the tools running outside this launch's tab
     /// (`App::developer_tools_install_elsewhere`), and System Settings asking nothing; and only
     /// with a person at the Mac, its screen in use (`App::screen_away`) and touched within
@@ -1687,6 +1683,7 @@ impl App {
             typing: self
                 .last_keystroke_at
                 .is_some_and(|at| now.saturating_duration_since(at) < START_KEYS_QUIET),
+            in_front: self.any_os_window_focused(),
         };
         if !signs_out
             || !starts(facts)
@@ -1742,7 +1739,9 @@ impl App {
     ///    process handed it.
     ///
     /// A walk the setup run has not admitted (no approved revision, a `[privacy]` switch off)
-    /// never starts by itself, nor one while another of the window's gestures or a macOS dialog
+    /// never starts by itself, nor one while no aterm window holds keyboard focus
+    /// ([`StartFacts::in_front`]: its pages wait for the person to be looking at aterm), nor one
+    /// while another of the window's gestures or a macOS dialog
     /// of aterm's is up, nor one while the Mac Setup tab comes next
     /// ([`Self::mac_setup_tab_comes_next`]) or an install of Apple's tools runs that may still ask
     /// or that a quit would cut off (this launch's tab is a gesture up while it may ask; an
@@ -1771,6 +1770,7 @@ impl App {
             typing: self
                 .last_keystroke_at
                 .is_some_and(|at| now.saturating_duration_since(at) < START_KEYS_QUIET),
+            in_front: self.any_os_window_focused(),
         };
         if !starts(facts)
             || self.access_gesture_up(now)
@@ -1917,12 +1917,13 @@ impl App {
         }
     }
 
-    /// Whether this process may start the first walk by itself ([`StartFacts::cold`]): the owner
-    /// started it (`devtools_helper::Lane::cold_start`), or it is an update's successor
-    /// ([`WalkLane::note_successor`]). Every windowed process is one or the other; a test's lane
-    /// that notes neither starts none by itself.
+    /// Whether this process may start a walk by itself ([`StartFacts::cold`]): the owner started
+    /// it (`devtools_helper::Lane::cold_start`). An update's successor (a launch into a staged
+    /// update, a seamless hand-over, a relaunch of the running aterm) starts none by itself
+    /// (owner ruling 2026-11-09): the pages the walk record keeps wait for the next process the
+    /// owner starts, or for a press on a Permissions row.
     fn walk_may_start_by_itself(&self) -> bool {
-        self.devtools_helper.cold_start() || self.permission_walk.successor
+        self.devtools_helper.cold_start()
     }
 
     /// Start a walk over `named` first, then every other subject missing, started `by`

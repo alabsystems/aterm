@@ -266,8 +266,8 @@ pub const USAGE: &str = "\
                   reveal-tab-control  the same with the GUI's plain-publication negative control on in the
                                    instance (each Editor publishes as though nothing were concealed): FAILED
                                    unless the tree's no-value check fails and every check off the tree holds
-                Prints a markdown table; --record FILE appends it (--record alone: docs/measured/
-                mac-nux-<date>.md in this checkout). Exit 0 every row measured, 1 a row
+                Prints a markdown table; --record FILE appends it (--record alone: the lab's state
+                folder, mac-nux/mac-nux-<date>.md). Exit 0 every row measured, 1 a row
                 failed (a hang detector fired, a guest step failed), 3 NOT RUN (a row the guest could not
                 run, no tart)
 ";
@@ -748,10 +748,11 @@ pub fn vanilla_image(image: &str) -> Option<String> {
     Some(format!("{stem}-vanilla:{tag}"))
 }
 
-/// The dated record `--record` alone appends to.
+/// The dated record `--record` alone appends to, in the lab's state folder beside the runs and
+/// frames (`mac-nux/`).
 fn dated_record() -> PathBuf {
-    paths().repo.join(format!(
-        "docs/measured/mac-nux-{}.md",
+    paths().state.join("mac-nux").join(format!(
+        "mac-nux-{}.md",
         crate::util::ymd(crate::util::now_secs())
     ))
 }

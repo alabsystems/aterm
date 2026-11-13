@@ -8,10 +8,13 @@ use std::sync::{Arc, Mutex};
 
 use atpkg_publish::api::{Baseline, Delta, IndexRequest};
 use atpkg_publish::channel::Log;
-use atpkg_publish::channel::index::{Outcome, parse_delta, publish_with};
+use atpkg_publish::channel::index::{
+    Outcome, PreparedPublication, PublicationObserver, parse_delta, publish_with,
+    publish_with_observer, quad_digests,
+};
 use atpkg_publish::ctx::HostChoice;
 use atpkg_publish::error::{Error, Result};
-use atpkg_publish::host::fake::{FakeFail, FakeHost, FakeOp};
+use atpkg_publish::host::fake::{FakeFail, FakeHost, FakeOp, FakeRelease};
 use atpkg_publish::host::{HostError, Probe, Release, ReleaseHost, Replace, Slug};
 use atpkg_publish::quad::{QUAD_FILES, index_tag};
 use atpkg_publish::testkit::FAR_FUTURE;
@@ -200,6 +203,65 @@ fn writes(host: &FakeHost) -> Vec<String> {
 }
 
 #[test]
+fn failed_durable_retention_prevents_both_pack_mirroring_and_index_publication() {
+    struct RefuseRetention(bool);
+    impl PublicationObserver for RefuseRetention {
+        fn before_publish(&mut self, prepared: &PreparedPublication<'_>) -> Result<()> {
+            self.0 = true;
+            assert_eq!(prepared.base().index_build, 21);
+            assert_eq!(prepared.plan().index_build, 22);
+            assert!(prepared.request().upload);
+            assert!(prepared.predecessor().is_some());
+            assert_eq!(quad_digests(prepared.candidate())?.len(), 4);
+            Err(Error::cannot_run("durable retention did not finish"))
+        }
+    }
+    let rig = live("idx-retain-refusal");
+    rig.lay_pack("alabsystems", "ay", 6, &[MAC, MAC_X86, LINUX]);
+    let delta = parse_delta(&["--pin".into(), "ay=6".into()]).unwrap();
+    let req = request(&rig, "out", true, delta);
+    let mut retention = RefuseRetention(false);
+    let result = publish_with_observer(&rig.ctx, &req, &mut Rig::log(), &mut retention);
+    assert!(matches!(result, Err(Error::CannotRun(_))));
+    assert!(retention.0, "the native gates reached durable retention");
+    assert!(writes(&rig.host).is_empty(), "{:?}", writes(&rig.host));
+}
+
+#[test]
+fn changed_signed_files_during_retention_cannot_cross_the_publication_boundary() {
+    struct ChangeFiles {
+        predecessor: bool,
+        called: bool,
+    }
+    impl PublicationObserver for ChangeFiles {
+        fn before_publish(&mut self, prepared: &PreparedPublication<'_>) -> Result<()> {
+            self.called = true;
+            let quad = if self.predecessor {
+                prepared.predecessor().unwrap()
+            } else {
+                prepared.candidate()
+            };
+            std::fs::write(quad.file(QUAD_FILES[0]), b"changed retained candidate").unwrap();
+            Ok(())
+        }
+    }
+    for predecessor in [false, true] {
+        let rig = live("idx-retain-changed");
+        let req = request(&rig, "out", true, Delta::default());
+        let mut retention = ChangeFiles {
+            predecessor,
+            called: false,
+        };
+        let result = publish_with_observer(&rig.ctx, &req, &mut Rig::log(), &mut retention);
+        assert!(retention.called);
+        assert!(
+            matches!(result, Err(Error::Refused(message)) if message.contains("changed during publication retention"))
+        );
+        assert!(writes(&rig.host).is_empty(), "{:?}", writes(&rig.host));
+    }
+}
+
+#[test]
 fn a_dry_run_over_a_quad_on_disk_makes_no_host_call_and_signs_the_next_number() {
     let rig = Rig::new("idx-dry");
     let base = rig.path("base");
@@ -241,8 +303,10 @@ fn rig_with_head(rig: &Rig) -> &Rig {
 
 #[test]
 fn upload_needs_the_channel_token_before_anything_is_signed() {
-    let rig = live("idx-token");
-    std::fs::remove_file(&rig.ctx.tokens.channel).expect("rm token");
+    // The `gh` arm's token check, said outright: the rig holds no token file, and under agh
+    // the channel writer is asked instead (`upload_asks_the_channel_writer_under_agh`).
+    let mut rig = live("idx-token");
+    rig.ctx = rig.ctx.clone().with_host_choice(HostChoice::Gh);
     let (e, _) = refused(&rig, &request(&rig, "out", true, Delta::default()));
     assert!(
         e.to_string().contains("needs the public owner's token"),
@@ -254,9 +318,7 @@ fn upload_needs_the_channel_token_before_anything_is_signed() {
 
 #[test]
 fn upload_asks_the_channel_writer_under_agh() {
-    let mut rig = live("idx-writer");
-    std::fs::remove_file(&rig.ctx.tokens.channel).expect("rm token");
-    rig.ctx = rig.ctx.clone().with_host_choice(HostChoice::Agh);
+    let rig = live("idx-writer");
     rig.host.fail_next(FakeOp::Preflight, FakeFail::Refuse);
     let (e, _) = refused(&rig, &request(&rig, "out", true, Delta::default()));
     assert!(matches!(e, Error::Refused(_)), "{e}");
@@ -375,6 +437,32 @@ fn a_false_negative_head_does_not_override_the_public_signed_quad() {
             .uploaded
     );
     assert!(log.contains("all four anonymous public files match"));
+}
+
+#[test]
+fn a_new_index_the_download_route_lags_on_is_read_again_and_confirmed() {
+    let rig = live("idx-lagging-public-file");
+    rig.host
+        .lag_public(&rig.index_slug(), &index_tag(22), "index.toml", 6);
+    let (result, log) = publish(&rig, &request(&rig, "out", true, Delta::default()));
+    assert!(
+        result
+            .unwrap_or_else(|e| panic!("{e}\n{}", log.text()))
+            .published
+            .uploaded
+    );
+    assert!(log.contains("all four anonymous public files match"));
+    let reads = rig
+        .host
+        .calls()
+        .iter()
+        .filter(|c| *c == "fetch alabsystems/aterm atpkg-index-22 index.toml")
+        .count();
+    assert_eq!(reads, 7, "six 404s, then the bytes");
+    assert!(
+        rig.index_release(23).is_none(),
+        "one index, no retry publish"
+    );
 }
 
 #[test]
@@ -511,6 +599,85 @@ fn another_publishers_index_is_refused_and_never_clobbered() {
     });
     let (e, _) = refused(&rig, &rerun(&rig, "again"));
     assert!(e.to_string().contains("(index.toml.sig)"), "{e}");
+}
+
+#[test]
+fn an_owned_empty_create_recovers_the_same_index_without_a_second_create() {
+    let rig = live("idx-owned-empty");
+    rig.host
+        .fail_next(FakeOp::Create, FakeFail::KilledBeforeUpload);
+    let (first, _) = publish(&rig, &request(&rig, "first", true, Delta::default()));
+    assert!(first.is_err());
+    let pending = rig.index_release(22).unwrap();
+    assert!(pending.draft);
+    assert!(pending.assets.is_empty());
+    let before = rig
+        .host
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("create "))
+        .count();
+    let (second, log) = publish(&rig, &rerun(&rig, "retry"));
+    second.unwrap_or_else(|error| panic!("{error}\n{}", log.text()));
+    assert_eq!(
+        rig.host
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with("create "))
+            .count(),
+        before
+    );
+    let completed = rig.index_release(22).unwrap();
+    assert!(!completed.draft);
+    assert_eq!(completed.assets.len(), 4);
+    assert!(rig.index_release(23).is_none());
+}
+
+#[test]
+fn an_owned_empty_create_cannot_be_retargeted_to_a_different_signed_candidate() {
+    let rig = live("idx-owned-empty-retarget");
+    rig.host
+        .fail_next(FakeOp::Create, FakeFail::KilledBeforeUpload);
+    assert!(
+        publish(&rig, &request(&rig, "first", true, Delta::default()))
+            .0
+            .is_err()
+    );
+    rig.lay_pack("alabsystems", "ay", 6, &[MAC, MAC_X86, LINUX]);
+    let mut changed = rerun(&rig, "changed");
+    changed.delta = parse_delta(&["--pin".into(), "ay=6".into()]).unwrap();
+    let before = writes(&rig.host).len();
+    let (error, _) = refused(&rig, &changed);
+    assert!(error.to_string().contains("without an index.toml"));
+    assert_eq!(writes(&rig.host).len(), before);
+    assert!(rig.index_release(22).unwrap().assets.is_empty());
+}
+
+#[test]
+fn an_unowned_draft_without_an_index_is_never_adopted() {
+    let rig = live("idx-unowned-empty-draft");
+    publish(&rig, &request(&rig, "candidate", false, Delta::default()))
+        .0
+        .unwrap();
+    rig.host.put(
+        &rig.index_slug(),
+        &index_tag(22),
+        FakeRelease {
+            draft: true,
+            prerelease: true,
+            ..Default::default()
+        },
+    );
+    lay(
+        &rig,
+        "aterm-machines.toml",
+        own_file(&rig.path("candidate"), "aterm-machines.toml"),
+    );
+    let before = writes(&rig.host).len();
+    let (error, _) = refused(&rig, &rerun(&rig, "retry"));
+    assert!(error.to_string().contains("without an index.toml"));
+    assert_eq!(writes(&rig.host).len(), before);
+    assert!(rig.index_release(22).unwrap().draft);
 }
 
 #[test]

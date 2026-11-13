@@ -198,12 +198,16 @@ pub fn stage_local(options: &LocalStageOptions) -> Result<String, String> {
     ) {
         return Err(why);
     }
-    if crate::manifest::artifact_quarantined_for_gate(
+    if let Some(hold) = crate::hold::held(
         &live,
         manifest.build_number,
         &manifest.sha256,
-    )? {
-        return Err("candidate is quarantined by the installed updater".into());
+        crate::install::unix_now_secs(),
+    ) {
+        return Err(format!(
+            "candidate is held by the installed updater: {}",
+            crate::hold::refusal(&hold)
+        ));
     }
     let copied = scratch.path().join(&artifact.name);
     let (mut input, _) = regular(&options.assets.join(&artifact.name))?;

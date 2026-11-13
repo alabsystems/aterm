@@ -265,7 +265,7 @@ fn a_route_socket_polled_in_error_is_read_not_given_up() {
         "a socket whose read fails"
     );
     let (routes, _kernel, _witness) = stand_in_routes();
-    let (hear, ring) = std::io::pipe().expect("a bell");
+    let (hear, ring) = aterm_uds::pipe().expect("a bell");
     drop(ring);
     let bell_gone = |fds: &mut [libc::pollfd; 2], _millis| {
         fds[1].revents = libc::POLLHUP;

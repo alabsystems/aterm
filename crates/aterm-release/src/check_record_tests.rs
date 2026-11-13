@@ -75,6 +75,104 @@ fn later_cuts_offer_ancestor_lint_facts_without_reviving_newer_tombstones() {
     );
 }
 
+/// A tree with no test verdict is offered the binaries its ancestors' runs passed, whatever
+/// hop or cut they belonged to, each under the run that executed it: the verifier recomputes
+/// every offered key, so the offer decides nothing.
+/// NEGATIVE CONTROLS: the nearest ancestor's FAIL of a binary is not passed over for an older
+/// pass of it; a record made only of candidates, which no run keyed on its tree, offers
+/// nothing; and a row the current tree already holds is not offered again.
+#[test]
+fn a_tree_is_offered_the_test_binaries_its_ancestors_passed() {
+    let f = Fixture::new();
+    let repository = f._dir.path().join("repository");
+    std::fs::create_dir_all(&repository).unwrap();
+    let git = crate::ledger::GitCli::new(&repository);
+    let call = |args: &[&str]| {
+        let output = git.git(args).unwrap();
+        assert!(output.success(), "{}", output.stderr_utf8());
+        output.stdout_utf8().trim().to_owned()
+    };
+    call(&["init", "--quiet", "-b", "main"]);
+    call(&["config", "user.name", "Qualification fixture"]);
+    call(&["config", "user.email", "fixture@example.invalid"]);
+    let commit = |text: &str| {
+        std::fs::write(repository.join("source"), text).unwrap();
+        call(&["add", "source"]);
+        call(&["commit", "--quiet", "-m", text]);
+        call(&["rev-parse", "HEAD^{tree}"])
+    };
+    let records = root(&git).unwrap();
+    let old = commit("an earlier cut");
+    let newer = commit("a hop whose run failed one binary");
+    let unkeyed = commit("a hop no run keyed");
+    let tree = commit("the head");
+    let head = call(&["rev-parse", "HEAD"]);
+    let seed = |tree: &str, run: &str, outcome: &str, binaries: Vec<Binary>| {
+        let mut facts = f.facts("prior-seal", "unused");
+        facts.tree = tree;
+        facts.run = run;
+        let mut row = record(&facts, (0, &u(9)), "test", outcome, None);
+        row.binaries = binaries;
+        let at = path(&records, tree, "prior-seal", "test", None);
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        write(&at, &row).unwrap();
+    };
+    seed(
+        &old,
+        "run-old",
+        OK,
+        vec![
+            bin("-p stable --lib", 1, OK),
+            bin("-p changed --lib", 2, OK),
+            bin("-p held --lib", 3, OK),
+        ],
+    );
+    seed(
+        &newer,
+        "run-newer",
+        FAIL,
+        vec![
+            bin("-p changed --lib", 4, FAIL),
+            bin("-p fresh --lib", 5, OK),
+        ],
+    );
+    seed(
+        &unkeyed,
+        &format!("{CANDIDATE_RUN_PREFIX}abcdef0"),
+        NOT_RUN,
+        vec![bin("-p unkeyed --lib", 6, OK)],
+    );
+    assert_eq!(
+        ancestor_test_candidates(&git, &records, &head, &tree).unwrap(),
+        [
+            ran_in("run-newer", bin("-p fresh --lib", 5, OK)),
+            ran_in("run-old", bin("-p held --lib", 3, OK)),
+            ran_in("run-old", bin("-p stable --lib", 1, OK)),
+        ]
+    );
+    assert!(
+        !has_records(&records, &tree).unwrap(),
+        "offering facts writes no current verdict"
+    );
+
+    let mut facts = f.facts("s1", "unused");
+    facts.tree = &tree;
+    let mut current = record(&facts, (3, &u(9)), "test", NOT_RUN, None);
+    current.binaries = vec![bin("-p held --lib", 7, NOT_RUN)];
+    let at = path(&records, &tree, "s1", "test", None);
+    std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+    write(&at, &current).unwrap();
+    let judged = checks(&git, &head, None, || Ok("s1".into())).unwrap();
+    assert_eq!(
+        judged.run(Half::Tree).passed_binaries,
+        [
+            ran_in("run-newer", bin("-p fresh --lib", 5, OK)),
+            ran_in("run-old", bin("-p stable --lib", 1, OK)),
+        ],
+        "the head's own NOT RUN row of `held` wins over its ancestor's pass"
+    );
+}
+
 /// A record as large as a whole-tree check's (over the old 1 MiB cap) is written and read
 /// back; one over the bound its reader holds is never written.
 ///
@@ -126,6 +224,16 @@ fn bin(spec: &str, sha: u8, outcome: &str) -> Binary {
         input_reason: None,
         json: Some(false),
         execution_s: f64::from(sha),
+        key_parts: BTreeMap::new(),
+        origin_run: None,
+    }
+}
+
+/// `row` as the record of the run that executed it keeps it.
+fn ran_in(run: &str, row: Binary) -> Binary {
+    Binary {
+        origin_run: Some(run.into()),
+        ..row
     }
 }
 
@@ -299,6 +407,11 @@ fn input_records_resume_only_missing_and_never_reroll_red() {
     )
     .unwrap();
     assert!(input_missing(&f.root, TREE, facts.seal).unwrap().is_empty());
+    // R13: a run that reuses these records names the run that judged them, and no run where
+    // another seal or tree has none.
+    assert_eq!(input_judged_by(&f.root, TREE, facts.seal), [RUN]);
+    assert!(input_judged_by(&f.root, TREE, "changed-cone-seal").is_empty());
+    assert!(input_judged_by(&f.root, "changed-tree", facts.seal).is_empty());
     assert_eq!(
         input_missing(&f.root, TREE, "changed-cone-seal").unwrap(),
         asked
@@ -801,6 +914,45 @@ fn a_tree_passes_only_on_its_own_records_under_its_seal() {
     );
 }
 
+/// A row keeps the release run that executed it: a run stamps what it ran, and a row its
+/// verifier carried keeps the run the event names. The passing answer then says what its
+/// records hold that no run of the tree executed.
+/// NEGATIVE CONTROL: the same run with every binary executed in it says PASSED and no more.
+#[test]
+fn a_passing_answer_names_what_was_carried_and_from_which_run() {
+    let f = Fixture::new();
+    let mut run = all_ok();
+    run.binaries = vec![bin("-p a --lib", 1, OK), bin("-p b --lib", 2, OK)];
+    f.write("s1", &u(1), 0, &run);
+    let own = f.judge("s1", Some(&u(1)));
+    assert!(own.complete(), "{}", own.line());
+    assert!(own.line().ends_with("under this seal"), "{}", own.line());
+    let Read::Record(kept) = read(&path(&f.root, TREE, "s1", "test", None)).unwrap() else {
+        panic!("the run kept no test record");
+    };
+    assert!(
+        kept.binaries
+            .iter()
+            .all(|row| row.origin_run.as_deref() == Some(RUN)),
+        "{:?}",
+        kept.binaries
+    );
+
+    let g = Fixture::new();
+    run.binaries[0].origin_run = Some("20261104T080000-7".into());
+    g.write("s1", &u(1), 0, &run);
+    let carried = g.judge("s1", Some(&u(1)));
+    assert!(carried.complete(), "{}", carried.line());
+    assert!(
+        carried.line().ends_with(
+            "under this seal; carried on equal content, not run on this tree: 1 of 2 binaries \
+             of test from 20261104T080000-7"
+        ),
+        "{}",
+        carried.line()
+    );
+}
+
 /// A tree half judges no executable, so it keeps no record of a bundle check its events
 /// name: measure's record always names the bytes it judged, and the tree's records stand
 /// without one. Negative control: the same events with the executable keep measure under it.
@@ -908,7 +1060,7 @@ fn a_fail_refuses_its_tree_and_a_resume_runs_only_what_is_missing() {
     assert_eq!(resume.checks, tree_missing);
     assert_eq!(
         resume.passed_binaries,
-        [bin("-p a --lib", 1, OK)],
+        [ran_in(RUN, bin("-p a --lib", 1, OK))],
         "a binary whose digest is not known runs again"
     );
     assert!(resume.strict_subset() && !resume.reads_the_bundle());
@@ -1080,7 +1232,7 @@ fn a_fail_that_cannot_be_written_still_refuses_its_tree() {
     assert!(judged.failed.is_empty(), "{}", judged.line());
     assert_eq!(
         judged.run(Half::Tree).passed_binaries,
-        [bin("-p a --lib", 1, OK)]
+        [ran_in(RUN, bin("-p a --lib", 1, OK))]
     );
 
     let f = Fixture::new();

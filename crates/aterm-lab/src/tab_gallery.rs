@@ -76,7 +76,7 @@ const QUICK: [&str; 6] = [
 ];
 const ALL: [&str; 20] = [
     "Default",
-    "Aterm Night",
+    "aterm Night",
     "Hearth",
     "Dracula",
     "Nord",
@@ -85,7 +85,7 @@ const ALL: [&str; 20] = [
     "Gruvbox Dark",
     "Solarized Dark",
     "One Dark",
-    "Aterm Day",
+    "aterm Day",
     "Linen",
     "Default Light",
     "Solarized Light",
@@ -117,8 +117,38 @@ pub struct Chip {
 }
 
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    line.split_whitespace()
-        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+    let mut value = None;
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (at, ch) in line
+        .char_indices()
+        .chain(std::iter::once((line.len(), ' ')))
+    {
+        if escaped {
+            escaped = false;
+        } else if quoted && ch == '\\' {
+            escaped = true;
+        } else if ch == '"' {
+            quoted = !quoted;
+        } else if ch.is_whitespace() && !quoted {
+            if let Some((name, found)) = line[start..at].split_once('=')
+                && name == key
+            {
+                if value.is_some() {
+                    return None;
+                }
+                value = Some(found);
+            }
+            start = at + ch.len_utf8();
+        }
+    }
+    (!quoted && !escaped).then_some(value).flatten()
+}
+
+fn theme_is_drawn(line: &str, theme: &str) -> bool {
+    let label = aterm_types::scheme::builtin_theme(theme).map_or(theme, |theme| theme.name);
+    field(line, "miss") == Some("-") && field(line, "label") == Some(format!("{label:?}").as_str())
 }
 
 const fn px_box(x: i64, y: i64, w: i64, h: i64) -> PxBox {
@@ -391,7 +421,7 @@ impl Run {
         let status = inst.ctl(&["theme", "status"]);
         ok(&status, "theme status")?;
         let line = status.first();
-        if field(&line, "miss") != Some("-") || !line.contains(&format!("label={theme:?}")) {
+        if !theme_is_drawn(&line, theme) {
             return Err(format!("{theme} is not what is drawn: {line}"));
         }
         self.line(&format!(
@@ -417,7 +447,7 @@ impl Run {
             &inst.ctl(&["open", "app", "system-state"]),
             "open system-state",
         )?;
-        ok(&inst.ctl(&["tab", "close", "0"]), "close the terminal")?;
+        ok(&inst.ctl(&["tab", "close", "1"]), "close the terminal")?;
         ok(&inst.ctl(&["resize", "px", &w, &h]), "resize")?;
         let (strip, chips) = self.shot(inst, &format!("{stem}.lone"))?;
         if !matches!(
@@ -462,7 +492,7 @@ impl Run {
             "open markdown",
         )?;
         for index in 0..WIDE_APPS.len() {
-            let n = index.to_string();
+            let n = (index + 1).to_string();
             ok(&inst.ctl(&["tab", &n]), "tab")?;
             let (strip, chips) = self.shot(inst, &format!("{stem}.tab{index}"))?;
             if let Err(why) = wide_layout_holds(&chips) {
@@ -472,7 +502,7 @@ impl Run {
             if chips.get(index).is_some_and(|c| c.selected) {
                 tiles.push(Tile {
                     frame: strip,
-                    caption: format!("{theme}: tab {index} selected"),
+                    caption: format!("{theme}: tab {n} selected"),
                     verdicts: Vec::new(),
                 });
             } else {

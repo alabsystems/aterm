@@ -998,7 +998,7 @@ const TEMPLATE: &[&str] = &[
     "#                       machine's own: files that belong together fill together",
     "#",
     "# A name is a file name (written to ~/.secrets/<name>) or a home path such as",
-    "# ~/.aterm/release-credentials.toml (written there). Every file is written 0600.",
+    "# ~/.aterm/release-ring/release-credentials.toml (written there). Every file is written 0600.",
 ];
 
 /// Split a text into lines: LF ends, a trailing CR dropped, a final LF optional.

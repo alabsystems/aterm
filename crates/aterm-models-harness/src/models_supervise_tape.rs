@@ -5,7 +5,18 @@
 
 use aterm_spec::derive::Model;
 
-/// One tape and its one reading (`aterm-agent/src/supervise/tape/frame.rs`'s `TapeWriter` and `recover.rs`'s `recover`).
+/// One tape and its one reading (`aterm-agent/src/supervise/tape/frame.rs`'s `TapeWriter` and `recover.rs`'s `recover` and `salvage`).
+///
+/// `TearNested` is a crash inside a frame stored raw whose items hold a whole astream frame of
+/// their own, cut past that nested frame's last byte. astream's scan reads bytes, not intent
+/// (`astream_wire::steps`, "A body that holds a frame of its own"): that cut looks like a rotted
+/// length with a whole frame after it, so `Recover` refuses it (`NestedRefused`), and a salvage
+/// keeps every whole frame before the torn one (`NestedKept`). By the same rule `Rot` is damage at
+/// rest with a whole astream frame after it: a later frame of the tape, or one nested in the
+/// damaged frame's stored bytes, so damage to a last frame that nests one, outside the nested
+/// frame, is `Rot` (refused), and `RotLast` is damage to a last frame with no whole frame after
+/// it. `kept` is what a salvage keeps of a tape no byte of which rotted at rest and whose frames
+/// stand in place; of a damaged one the model leaves it undecided, at 0.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervise_tape_recovery_model() -> Model {
@@ -24,6 +35,8 @@ pub fn supervise_tape_recovery_model() -> Model {
             var recovered = 0;
             var refused = 0;
             var said_torn = 0;
+            var nested = 0;
+            var kept = 0;
 
             action Write when (crashed == 0 && written <= MaxFrames - 1) {
                 written = written + 1;
@@ -32,19 +45,24 @@ pub fn supervise_tape_recovery_model() -> Model {
                 torn = 1;
                 crashed = 1;
             }
+            action TearNested when (crashed == 0 && written > 0) {
+                torn = 1;
+                nested = 1;
+                crashed = 1;
+            }
             action Crash when (crashed == 0) {
                 crashed = 1;
             }
-            action Rot when (crashed == 1 && done == 0 && flipped == 0 && written > 1) {
+            action Rot when (crashed == 1 && done == 0 && flipped == 0 && nested == 0 && written > 1) {
                 rot = 1;
                 flipped = 1;
             }
-            action RotLast when (crashed == 1 && done == 0 && flipped == 0 && written > 0) {
+            action RotLast when (crashed == 1 && done == 0 && flipped == 0 && nested == 0 && written > 0) {
                 written = written - 1;
                 torn = 1;
                 flipped = 1;
             }
-            action RotMagic when (crashed == 1 && done == 0 && flipped == 0 && written > 0) {
+            action RotMagic when (crashed == 1 && done == 0 && flipped == 0 && nested == 0 && written > 0) {
                 magic_rot = 1;
                 flipped = 1;
             }
@@ -62,6 +80,10 @@ pub fn supervise_tape_recovery_model() -> Model {
                     0
                 } else if misplaced == 1 {
                     1
+                } else if nested == 1 && Buggy == 7 {
+                    0
+                } else if nested == 1 {
+                    1
                 } else if rot == 1 && (Buggy == 1 || Buggy == 3) {
                     0
                 } else {
@@ -74,6 +96,10 @@ pub fn supervise_tape_recovery_model() -> Model {
                 } else if misplaced == 1 && Buggy == 6 {
                     written
                 } else if misplaced == 1 {
+                    0
+                } else if nested == 1 && Buggy == 7 {
+                    written
+                } else if nested == 1 {
                     0
                 } else if rot == 1 && Buggy == 1 {
                     written
@@ -92,6 +118,10 @@ pub fn supervise_tape_recovery_model() -> Model {
                     0
                 } else if misplaced == 1 {
                     0
+                } else if nested == 1 && Buggy == 7 {
+                    torn
+                } else if nested == 1 {
+                    0
                 } else if Buggy == 4 {
                     0
                 } else if rot == 1 && (Buggy == 1 || Buggy == 3) {
@@ -101,6 +131,13 @@ pub fn supervise_tape_recovery_model() -> Model {
                 } else {
                     torn
                 };
+                kept = if nested == 1 && Buggy == 8 {
+                    0
+                } else if rot == 1 || magic_rot == 1 || misplaced == 1 {
+                    0
+                } else {
+                    written
+                };
             }
 
             invariant RecoveredIsPrefix: recovered <= written;
@@ -108,6 +145,8 @@ pub fn supervise_tape_recovery_model() -> Model {
             invariant RotRefused: done == 0 || (rot == 0 && magic_rot == 0) || refused == 1;
             invariant MisplacedRefused: done == 0 || misplaced == 0 || refused == 1;
             invariant TornSaid: done == 0 || refused == 1 || said_torn == torn;
+            invariant NestedRefused: done == 0 || nested == 0 || refused == 1;
+            invariant NestedKept: done == 0 || nested == 0 || kept == written;
         }
     }
 }

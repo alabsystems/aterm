@@ -530,3 +530,83 @@ fn a_relative_program_is_refused_under_simulation_as_it_is_live() {
 fn scripting_children_on_a_live_fx_panics() {
     let _ = Fx::live().with_children(Vec::new());
 }
+
+#[cfg(unix)]
+#[test]
+fn source_inventory_spools_more_than_tail_capacity_with_bounded_records() {
+    use std::io::{BufRead as _, Write as _};
+    let root = aterm_tempfile::Builder::new()
+        .prefix("agh-inventory-")
+        .tempdir()
+        .unwrap();
+    let input = root.path().join("input");
+    let row = format!("{}\n", "1".repeat(40));
+    let mut file = std::fs::File::create(&input).unwrap();
+    for _ in 0..66_023 {
+        file.write_all(row.as_bytes()).unwrap();
+    }
+    drop(file);
+    let cat = aterm_uds::deadline::stand_in(Path::new("/bin/cat"));
+    for progress in [false, true] {
+        let destination = root.path().join(if progress { "progress" } else { "wall" });
+        let mut spec = ChildSpec::new(&cat)
+            .arg(input.as_os_str())
+            .budget(Duration::from_secs(60));
+        if progress {
+            spec = spec.progressing(Duration::from_secs(60), "complete source inventory");
+        }
+        spec.stdout_records = Some(destination.clone());
+        let out = run(&spec).unwrap();
+        assert_eq!(out.code, Some(0));
+        assert!(
+            out.stdout.is_empty(),
+            "the complete inventory is never a heap/tail answer"
+        );
+        assert_eq!(std::fs::metadata(&destination).unwrap().len(), 66_023 * 41);
+        let mut lines = 0;
+        for line in std::io::BufReader::new(std::fs::File::open(destination).unwrap()).lines() {
+            assert_eq!(line.unwrap(), "1".repeat(40));
+            lines += 1;
+        }
+        assert_eq!(lines, 66_023);
+    }
+    for bytes in [
+        b"unterminated".as_slice(),
+        b"this record has more than forty two bytes and must be rejected\n".as_slice(),
+    ] {
+        std::fs::write(&input, bytes).unwrap();
+        let destination = root.path().join("refused");
+        let mut spec = ChildSpec::new(&cat).arg(input.as_os_str());
+        spec.stdout_records = Some(destination.clone());
+        assert!(
+            run(&spec).is_err(),
+            "partial/oversized native records cannot become complete DATA"
+        );
+        std::fs::remove_file(destination).unwrap();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn source_inventory_stop_retires_the_actual_writer_before_returning() {
+    let root = aterm_tempfile::Builder::new()
+        .prefix("agh-inventory-stop-")
+        .tempdir()
+        .unwrap();
+    let marker = root.path().join("started");
+    let sh = aterm_uds::deadline::stand_in(Path::new("/bin/sh"));
+    let mut spec = ChildSpec::new(&sh).arg("-c")
+        .arg("printf '1111111111111111111111111111111111111111\\n'; printf '%s' $$ > \"$1\"; /bin/sleep 60")
+        .arg("sh").arg(marker.as_os_str()).budget(Duration::from_secs(60));
+    spec.stdout_records = Some(root.path().join("records"));
+    let error = super::run_unless(&spec, &mut || marker.exists()).unwrap_err();
+    assert_eq!(
+        (error.kind, error.side_effect),
+        (Kind::Interrupted, SideEffect::Unknown)
+    );
+    let pid: i32 = std::fs::read_to_string(marker).unwrap().parse().unwrap();
+    assert_eq!(
+        aterm_uds::process::process_presence(pid),
+        aterm_uds::process::ProcessPresence::Absent
+    );
+}

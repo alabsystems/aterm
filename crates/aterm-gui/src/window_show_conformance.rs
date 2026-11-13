@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::io::Read as _;
-use std::os::fd::FromRawFd as _;
 
 use aterm_models_update::native_update_window_show_model;
 use aterm_spec::derive::Model;
@@ -28,21 +27,8 @@ struct Rig {
     fs: bool,
     fsfront: bool,
     done: bool,
-    proof_read: Option<std::fs::File>,
-    _commit_write: Option<std::fs::File>,
-}
-
-fn pipe() -> (std::fs::File, std::fs::File) {
-    let mut fds = [0i32; 2];
-    // SAFETY: pipe(2) into a valid two-slot out-array.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-    // SAFETY: two fresh descriptors, owned by exactly one `File` each.
-    unsafe {
-        (
-            std::fs::File::from_raw_fd(fds[0]),
-            std::fs::File::from_raw_fd(fds[1]),
-        )
-    }
+    proof_read: Option<std::io::PipeReader>,
+    _commit_write: Option<std::io::PipeWriter>,
 }
 
 impl Rig {
@@ -74,8 +60,8 @@ impl Rig {
     }
 
     fn owe_the_proof(&mut self) {
-        let (proof_read, proof_write) = pipe();
-        let (commit_read, commit_write) = pipe();
+        let (proof_read, proof_write) = aterm_uds::pipe().expect("a proof pipe");
+        let (commit_read, commit_write) = aterm_uds::pipe().expect("a commit pipe");
         self.app.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
             proof_write.into(),
             "window-show-conformance",

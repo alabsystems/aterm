@@ -1869,7 +1869,9 @@ pub fn supervisor_land_liveness() -> Liveness {
     }
 }
 
-/// Formal model for the supervisor stall-remedy escalation ladder (`supervise/stall.rs`).
+/// Formal model for the supervisor stall-remedy escalation ladder (`supervise/stall.rs`). An
+/// unconfirmed agent's (`observed`) stall is withheld its restart and warned of once
+/// (`Withhold`), never restarted (`NeverAnObservedAgent`, H6).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_stall_remedy_model() -> Model {
@@ -1888,6 +1890,8 @@ pub fn supervisor_stall_remedy_model() -> Model {
             var beside = 0;
             var rest = 0;
             var withheld = 0;
+            var observed = 0;
+            var blind = 0;
 
             action Freeze when (stalled == 0) {
                 stalled = 1;
@@ -1922,8 +1926,21 @@ pub fn supervisor_stall_remedy_model() -> Model {
             action RestFlips when (termed == 0) {
                 rest = if rest == 1 { 0 } else { 1 };
             }
+            action ObservedFlips when (termed == 0) {
+                observed = if observed == 1 { 0 } else { 1 };
+            }
             action Term when (stalled == 1 && aged == 1 && off == 0 && host == 1
-                && hand == 0 && termed == 0) {
+                && hand == 0 && termed == 0 && observed == 0) {
+                terms = terms + 1;
+                termed = 1;
+            }
+            action Withhold when (stalled == 1 && aged == 1 && off == 0 && host == 1
+                && hand == 0 && termed == 0 && observed == 1) {
+                termed = 1;
+            }
+            action TermObserved when (Buggy == 1 && stalled == 1 && aged == 1 && off == 0
+                && host == 1 && hand == 0 && termed == 0 && observed == 1) {
+                blind = 1;
                 terms = terms + 1;
                 termed = 1;
             }
@@ -1948,6 +1965,7 @@ pub fn supervisor_stall_remedy_model() -> Model {
             invariant OneTermAnEpisode: terms <= 1;
             invariant NeverAKill: killed == 0;
             invariant TheStallAloneDecides: withheld == 0;
+            invariant NeverAnObservedAgent: blind == 0;
         }
     }
 }
@@ -2180,20 +2198,25 @@ pub fn upgrade_settle_turn_end_model() -> Model {
 
 /// Formal model for the turn ends a quiet round's settle holds (`wait:settling` under the quiet
 /// flow): each for at most `Looks` looks counted since the last turn (other bounded waits at the
-/// point included), and at most `Points` of them a round, so a session whose settle cannot run out
-/// loses a bounded time to it, and every look the round can still hold is held. A settle look is
-/// two actions: `HostDecides` sets `owns`, the host's decision for the look, from the host's own
+/// point included), and at most `Points` of them at each increasing rung of a round, so a session
+/// whose settle cannot run out loses a bounded time to it, and every look the round can still
+/// hold is held. A settle look is two actions: `HostDecides` sets `owns`, the host's decision for
+/// the look, from the host's own
 /// counts, and `HostCounts` books that decision, so every law reads `owns`, the variable the
 /// conformance test binds to the worker. `at` counts this point's looks and `kept` the turn ends
-/// the round held, as they are; `count` and `points` are the host's counts of the same, which only
-/// a mutant lets drift. `held` says the round held this point, `here` counts the point's held looks,
+/// the current rung held, as they are; `count` and `points` are the host's counts of the same,
+/// which only a mutant lets drift. `held` says the round held this point, `here` counts its held looks,
 /// and `dropped` records a look the round could hold (within its point's `Looks`, and the point
 /// held or fewer than `Points` held) that the decision let go. So the laws bound `owns` from above
 /// (`here`, `kept`) and from below (`dropped`). Mutants: `Buggy = 1` drops the round's bound,
 /// `Buggy = 2` keeps the point's count across a turn (the round-wide count that once let a quiet
 /// round hold no turn end after one disturbed point), `Buggy = 3` drops the point's bound,
 /// `Buggy = 4` books a held turn end at each of its held looks rather than once, and `Buggy = 5`
-/// forgets that the point is held, so the round's last turn end loses its second look. `Steps`
+/// forgets that the point is held, so the round's last turn end loses its second look. A higher
+/// rung renews the points, counting a currently held point and keeping its spent looks. Repeated,
+/// lower and unread rungs renew nothing. `Buggy = 6` keeps spent points at a higher rung,
+/// `Buggy = 7` renews them on an unchanged or unknown rung, `Buggy = 8` renews the current point's
+/// looks, and `Buggy = 9` forgets to count the held point at the new rung. `Steps`
 /// bounds the walk's other actions and decisions, and covers every conformance walk
 /// (`the_quiet_settle_conforms_to_its_turn_end_model`), a settle look counted once.
 #[must_use]
@@ -2204,7 +2227,9 @@ pub fn upgrade_quiet_settle_turn_end_model() -> Model {
             const Buggy = 0;
             const Looks = 2;
             const Points = 3;
+            const Rungs = 2;
             const Steps = 12;
+            var rung = 0;
             var at = 0;
             var count = 0;
             var kept = 0;
@@ -2243,8 +2268,28 @@ pub fn upgrade_quiet_settle_turn_end_model() -> Model {
                 held = 0;
                 here = 0;
             }
+            action RungRises when (deciding == 0 && steps <= Steps - 1 && rung <= Rungs - 1) {
+                steps = steps + 1;
+                rung = rung + 1;
+                kept = held;
+                points = if Buggy == 6 { points } else { if Buggy == 9 { 0 } else { held } };
+                count = if Buggy == 8 { 0 } else { count };
+            }
+            action RungRepeats when (deciding == 0 && steps <= Steps - 1) {
+                steps = steps + 1;
+                points = if Buggy == 7 { held } else { points };
+            }
+            action RungFalls when (deciding == 0 && steps <= Steps - 1 && rung > 0) {
+                steps = steps + 1;
+                points = if Buggy == 7 { held } else { points };
+            }
+            action RungUnread when (deciding == 0 && steps <= Steps - 1) {
+                steps = steps + 1;
+                points = if Buggy == 7 { held } else { points };
+            }
             action RoundStarts when (deciding == 0 && steps <= Steps - 1) {
                 steps = steps + 1;
+                rung = 0;
                 at = 0;
                 count = 0;
                 kept = 0;
@@ -2255,7 +2300,7 @@ pub fn upgrade_quiet_settle_turn_end_model() -> Model {
             }
 
             invariant NeverHoldATurnEndPastItsLooks: here <= Looks;
-            invariant NeverHoldMoreTurnEndsThanARoundsPoints: kept <= Points;
+            invariant NeverHoldMoreTurnEndsThanARungsPoints: kept <= Points;
             invariant NeverLetGoOfALookTheRoundCanHold: dropped == 0;
         }
     }
@@ -3857,8 +3902,18 @@ pub fn supervisor_credits_hold_liveness() -> Liveness {
 /// Formal model for the one model move the harness makes (owner, 2026-11-11: "no, keep the same
 /// account and switch from fable to opus."): a Claude Code session at Fable's own usage limit is
 /// relaunched on Opus, asked for until the host can make it, its continuation first at a named
-/// reset, and its return only at a named reset that was ahead when the move was made. `launch` is
-/// what the session's launch names: none (1), Fable (2), or another model (3), which is never moved.
+/// reset, and its return only on evidence: at a named reset that was ahead when the move was made
+/// (`back` 1), or, where the notice named none, as a `/usage` sample of Fable's week reads it: at
+/// the reset a spent row names (`SampleSpent`), or on a row with room left (`SampleRoom`). A row
+/// with room left may be wrong (the bucket may still stand): the returns made on room left since
+/// one last held the longest rung (`roomed`, 3 standing for three or more) are paced, the next
+/// due at once only once the rung of that count has passed since the last (`paced`, the rung's
+/// pass `RungPasses`; `back` 2 due now, 3 due at the rung), and `RoomHolds` (a return that held
+/// the longest rung) starts the count over. `NoPingPong` bounds the relaunches between two passes
+/// of a rung and between two turns Fable served (`Works`): five at most, a move, one return on
+/// room left and the move after it, a return at the reset a spent row names and the move after
+/// it. `launch` is what the session's launch names: none (1), Fable (2), or another model (3),
+/// which is never moved.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn supervisor_model_switch_model() -> Model {
@@ -3883,6 +3938,8 @@ pub fn supervisor_model_switch_model() -> Model {
             var badret = 0;
             var launch = 0;
             var foreign = 0;
+            var roomed = 0;
+            var paced = 0;
 
             action LaunchUnnamed when (launch == 0) {
                 launch = 1;
@@ -3927,6 +3984,9 @@ pub fn supervisor_model_switch_model() -> Model {
             action BucketLifts when (bucket == 1 && named == 1 && ResetAt <= clock) {
                 bucket = 0;
             }
+            action BucketLiftsUnnamed when (bucket == 1 && named == 0) {
+                bucket = 0;
+            }
 
             action Continue when (bucket == 1 && on == 0 && named == 1 && ResetAt <= clock && probed == 0) {
                 probed = 1;
@@ -3939,17 +3999,37 @@ pub fn supervisor_model_switch_model() -> Model {
                 on = if jobs == 0 { 1 } else { on };
                 probed = if jobs == 0 { 1 } else { probed };
                 back = if jobs == 0 { if named == 1 && clock <= ResetAt - 1 { 1 } else { 0 } } else { back };
-                flips = if jobs == 0 { if flips <= 3 { flips + 1 } else { flips } } else { flips };
+                flips = if jobs == 0 { if flips <= 5 { flips + 1 } else { flips } } else { flips };
             }
-            action Return when (on == 1 && back == 1 && ResetAt <= clock && jobs == 0) {
+            action SampleRoom when (on == 1 && back == 0 && named == 0 && jobs == 0) {
+                back = if roomed == 0 || paced == 1 { 2 } else { 3 };
+            }
+            action RungPasses when (on == 1 && named == 0 && 1 <= roomed && paced == 0) {
+                paced = 1;
+                back = if back == 3 { 2 } else { back };
+                flips = 0;
+            }
+            action RoomHolds when (on == 0 && bucket == 0 && 1 <= roomed) {
+                roomed = 0;
+                paced = 0;
+            }
+            action SampleSpent when (
+                on == 1 && back == 0 && bucket == 1 && named == 0 && jobs == 0 && clock <= ResetAt - 1
+            ) {
+                named = 1;
+                back = 1;
+            }
+            action Return when (on == 1 && jobs == 0 && ((back == 1 && ResetAt <= clock) || back == 2)) {
+                roomed = if back == 2 { if roomed <= 2 { roomed + 1 } else { roomed } } else { roomed };
+                paced = if back == 2 { 0 } else { paced };
                 on = 0;
                 back = 0;
-                flips = if flips <= 3 { flips + 1 } else { flips };
+                flips = if flips <= 5 { flips + 1 } else { flips };
             }
 
             action GuessedReturn when (Buggy == 1 && on == 1 && bucket == 1 && back == 0 && Guess <= clock) {
                 on = 0;
-                flips = if flips <= 3 { flips + 1 } else { flips };
+                flips = if flips <= 5 { flips + 1 } else { flips };
                 badret = 1;
             }
             action GivesUp when (Buggy == 1 && on == 0 && bucket == 1 && GiveUpAfter <= tries) {
@@ -3962,9 +4042,16 @@ pub fn supervisor_model_switch_model() -> Model {
                 on = 1;
                 foreign = 1;
             }
+            // `Buggy = 2`: a row with room left returned on at once though the rung since the last
+            // such return has not passed: a misread row ping-pongs.
+            action SampleUnpaced when (
+                Buggy == 2 && on == 1 && back == 0 && named == 0 && jobs == 0 && 1 <= roomed && paced == 0
+            ) {
+                back = 2;
+            }
 
             invariant NoReturnWithoutAReset: badret == 0;
-            invariant NoPingPong: flips <= 3;
+            invariant NoPingPong: flips <= 5;
             invariant PointsGoOn: held == 0;
             invariant AsksNeverStop: gaveup == 0;
             invariant NeverMovesAnotherLaunch: foreign == 0;
@@ -4059,115 +4146,98 @@ pub fn supervisor_box_ask_model() -> Model {
     }
 }
 
-/// Formal model for holding an approval-box episode within the vendor auto-deny margin.
+/// Formal model for answering a Claude Code permission box nobody has touched once the person's
+/// keys settle, and holding one a person or another driver touched for the person's whole grace.
+///
+/// `typed` is a person's gesture younger than the settle, or input the worker has not read;
+/// `grace` the person's grace running; `touched` the box's episode touched (a key moved its focus,
+/// or another driver's hand was on the session), `hand` a person or driver deciding it. A key into
+/// the composer or a queued message (`Types`) is no touch. `Buggy` names each defect, its negative
+/// control: 1 presses over a touch, 2 holds an untouched box for the grace, 3 answers with no
+/// settle, 4 loses a touch at a redraw.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
-pub fn supervisor_box_hold_model() -> Model {
+pub fn supervisor_box_settle_model() -> Model {
     aterm_spec::ty_model! {
-        SupervisorBoxHold {
+        SupervisorBoxSettle {
             const Buggy = 0;
-            const Outlast = 0;
-            const Touched = 0;
-            const Lost = 0;
-            const Window = 8;
-            const Margin = 1;
             var up = 0;
-            var left = 0;
-            var known = 0;
             var policy = 0;
             var grace = 0;
+            var typed = 0;
             var driver = 0;
-            var counted = 0;
-            var driven = 0;
-            var blind = 0;
-            var latched = 0;
-            var lost = 0;
+            var touched = 0;
+            var hand = 0;
             var over = 0;
+            var stalled = 0;
+            var raced = 0;
 
             action BoxUp when (up == 0) {
                 up = 1;
-                left = Window;
-                known = 1;
                 policy = 1;
-                driven = driver;
-                latched = driver;
-            }
-            action BoxUpUnknown when (up == 0) {
-                up = 1;
-                left = Window;
-                known = 0;
-                policy = 1;
-                driven = driver;
-                latched = driver;
+                touched = driver;
+                hand = driver;
             }
             action BoxUpEscalated when (up == 0) {
                 up = 1;
-                left = Window;
-                known = 1;
                 policy = 0;
-                driven = driver;
-                latched = driver;
+                touched = driver;
+                hand = driver;
             }
-            action Types when (up == 0 && grace == 0) {
+            action Types when (typed == 0) {
+                typed = 1;
                 grace = 1;
             }
-            action Gesture when (up == 1 && counted == 0) {
-                counted = 1;
-                latched = 1;
-                grace = 1;
+            action Settles when (typed == 1) {
+                typed = 0;
             }
-            action DriverOn when (up <= 1 && driver == 0) {
+            action Touches when (up == 1 && touched == 0) {
+                touched = 1;
+                hand = 1;
+                grace = 1;
+                typed = 1;
+            }
+            action DriverOn when (driver == 0) {
                 driver = 1;
-                driven = if up == 1 { 1 } else { driven };
-                latched = if up == 1 { 1 } else { latched };
+                grace = 1;
+                touched = if up == 1 { 1 } else { touched };
+                hand = if up == 1 { 1 } else { hand };
             }
             action DriverOff when (driver == 1) {
                 driver = 0;
             }
-            action GraceEnds when (grace == 1) {
+            action GraceEnds when (grace == 1 && typed == 0 && driver == 0) {
                 grace = 0;
             }
-            action Blind when (up == 1 && blind == 0) {
-                blind = 1;
-                latched = 1;
+            action Redraw when (up == 1 && touched == 1) {
+                touched = if Buggy == 4 { 0 } else { touched };
             }
-            action Redraw when (up == 1 && latched == 1) {
-                latched = if Lost == 1 || Buggy == 1 { 0 } else { latched };
-            }
-            action Answered when (up == 1 && (counted == 1 || driven == 1)) {
+            action Answered when (up == 1 && hand == 1) {
                 up = 2;
             }
-            action Tick when (
-                up == 1 && left > 0 &&
-                (policy == 0 ||
-                    ((grace == 1 || driver == 1) &&
-                        (known == 0 || left > Margin || latched == 1 || Outlast == 1 ||
-                            Buggy == 1)))
+            action Wait when (
+                up == 1 &&
+                (policy == 0 || driver == 1 || typed == 1 || (touched == 1 && grace == 1) ||
+                    (Buggy == 2 && grace == 1))
             ) {
-                left = left - 1;
-            }
-            action Press when (
-                up == 1 && policy == 1 &&
-                ((grace == 0 && driver == 0) ||
-                    (known == 1 && left <= Margin && latched == 0 && Outlast == 0 &&
-                        Buggy == 0) ||
-                    ((Touched == 1 || Buggy == 1) && known == 1 && left <= Margin))
-            ) {
-                up = 2;
-                over = if (grace == 1 || driver == 1) && (counted == 1 || driven == 1) {
+                stalled = if policy == 1 && driver == 0 && typed == 0 && touched == 0 {
                     1
                 } else {
-                    over
+                    stalled
                 };
             }
-            action Deny when (up == 1 && left == 0) {
+            action Press when (
+                up == 1 && policy == 1 && driver == 0 && (typed == 0 || Buggy == 3) &&
+                (touched == 0 || grace == 0 || Buggy == 1)
+            ) {
                 up = 2;
-                lost = if policy == 1 && known == 1 && counted == 0 && driven == 0 &&
-                    blind == 0 { 1 } else { lost };
+                over = if hand == 1 && grace == 1 { 1 } else { over };
+                raced = if typed == 1 { 1 } else { raced };
             }
 
-            invariant TheVendorNeverDeniesAnUntouchedEpisode: lost == 0;
-            invariant ATouchedEpisodeIsHeldAsEver: over == 0;
+            invariant ATouchedBoxIsHeldAsEver: over == 0;
+            invariant AnUntouchedBoxIsNotHeldByAPerson: stalled == 0;
+            invariant NoAnswerRacesAKeystroke: raced == 0;
         }
     }
 }

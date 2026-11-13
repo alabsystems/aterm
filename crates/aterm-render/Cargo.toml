@@ -66,6 +66,7 @@ aterm-bidi = { workspace = true }
 # Shaping config (ligature mode, font features, ambiguous width) and the `dev_seam!`
 # macro. Plain data types, no default features.
 aterm-types = { workspace = true }
+aterm-scene = { workspace = true }
 # The unified message engine (docs/DESIGN-unified-messages-2026-09-21.md):
 # src/band.rs turns its resolved band rows into renderer input, the one composition
 # the native window and the web module share.

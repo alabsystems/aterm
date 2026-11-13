@@ -524,10 +524,7 @@ fn established_repair_storage_cannot_reinitialize_after_directory_loss() {
     lab.journal(0).ingest(lab.genesis.bytes()).unwrap();
     let path = lab.path(0);
     std::fs::rename(&path, lab.root.path().join("preserved-control")).unwrap();
-    let disk = Disk {
-        dir: &path,
-        trust: lab.trust,
-    };
+    let disk = Disk::new(&path, lab.trust);
     assert!(disk.inventory().is_err());
     assert!(disk.batch(&[lab.genesis.id()]).is_err());
     assert!(disk.retain(&[lab.genesis.bytes().to_vec()]).is_err());
@@ -1043,9 +1040,12 @@ fn offer(wires: &[Vec<u8>]) -> Script {
 #[test]
 fn failed_append_is_deferred_and_a_later_exact_retry_is_acknowledged() {
     let lab = Lab::new();
+    // The writer below is held past any wait: a store that waits none defers the record as an
+    // exchange's store does once its wait runs out, without waiting it out.
     let store = Disk {
         dir: &lab.path(0),
         trust: lab.trust,
+        writer_wait: Duration::ZERO,
     };
     let wire = lab.genesis.bytes().to_vec();
     let locked = lab.journal(0);
@@ -1070,9 +1070,12 @@ fn reads_and_known_records_need_no_writer_and_new_records_still_do() {
     let lab = Lab::new();
     let path = lab.path(0);
     lab.journal(0).ingest(lab.genesis.bytes()).unwrap();
+    // The writer below is held past any wait: a store that waits none decides what an
+    // exchange's store decides once its wait runs out, without waiting it out.
     let store = Disk {
         dir: &path,
         trust: lab.trust,
+        writer_wait: Duration::ZERO,
     };
     let known = lab.genesis.bytes().to_vec();
     let fresh = lab.update(lab.genesis.id(), b"next", &[]);
@@ -1103,12 +1106,23 @@ fn reads_and_known_records_need_no_writer_and_new_records_still_do() {
         let _failing = aterm_durable::seam::FailingDirs::with(aterm_durable::seam::EIO);
         assert!(store.retain(std::slice::from_ref(&known)).is_err());
     }
+    // The store's own wait bounds the open: with none, the held writer is met and never
+    // waited on.
+    let waited = std::rc::Rc::new(std::cell::Cell::new(0));
+    let observed = waited.clone();
+    let deferred = aterm_uds::file_lock::with_lock_wait_observer(
+        move |_| observed.set(observed.get() + 1),
+        || store.retain(&[known.clone(), fresh.bytes().to_vec()]),
+    );
     assert_eq!(
-        store
-            .retain(&[known.clone(), fresh.bytes().to_vec()])
-            .unwrap(),
+        deferred.unwrap(),
         [true, false],
         "a new record needs the writer; while it is busy, the peer offers it again"
+    );
+    assert_eq!(
+        waited.get(),
+        0,
+        "the open waited past the store's writer wait"
     );
     drop(held);
     assert_eq!(
@@ -1142,10 +1156,7 @@ fn network_reads_and_writes_never_own_the_journal_lock() {
     }
     let lab = Lab::new();
     let path = lab.path(0);
-    let store = Disk {
-        dir: &path,
-        trust: lab.trust,
-    };
+    let store = Disk::new(&path, lab.trust);
     let mut stream = Unlocked {
         script: offer(&[lab.genesis.bytes().to_vec()]),
         dir: &path,
@@ -1175,14 +1186,7 @@ fn missing_channel_proof_and_invalid_signatures_do_not_touch_storage() {
     *corrupt.last_mut().unwrap() ^= 1;
     let mut stream = offer(&[corrupt]);
     assert_eq!(
-        receive_batch(
-            &mut stream,
-            &Disk {
-                dir: &path,
-                trust: lab.trust
-            }
-        )
-        .unwrap(),
+        receive_batch(&mut stream, &Disk::new(&path, lab.trust)).unwrap(),
         (0, 1)
     );
     assert!(
@@ -1317,10 +1321,8 @@ fn control_admission_model_conforms_and_rejects_copied_witness_bypass() {
 fn one_bad_record_does_not_block_other_signed_records_in_the_batch() {
     let lab = Lab::new();
     drop(lab.journal(0));
-    let store = Disk {
-        dir: &lab.path(0),
-        trust: lab.trust,
-    };
+    let path = lab.path(0);
+    let store = Disk::new(&path, lab.trust);
     let mut bad = lab.genesis.bytes().to_vec();
     *bad.last_mut().unwrap() ^= 1;
     let node = lab.update(lab.genesis.id(), b"independent-valid-arrival", &[]);
@@ -1373,10 +1375,8 @@ fn hostile_framing_is_bounded_and_receipts_require_exact_identity() {
         assert!(receive_inventory(&mut Cursor::new(bytes)).is_err());
     }
     let lab = Lab::new();
-    let store = Disk {
-        dir: &lab.path(0),
-        trust: lab.trust,
-    };
+    let path = lab.path(0);
+    let store = Disk::new(&path, lab.trust);
     let wire = lab.genesis.bytes().to_vec();
     let mut duplicate = offer(&[wire.clone(), wire.clone()]);
     assert!(receive_batch(&mut duplicate, &store).is_err());

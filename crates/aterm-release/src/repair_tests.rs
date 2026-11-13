@@ -69,6 +69,7 @@ fn failure(commit: &str) -> Failure {
         prover: "/c/store/trust/bin".into(),
         trustc: "41d799797a1b2c3d4e5f60718293a4b5c6d7e8f9".into(),
         at: 1_791_600_000,
+        opening: None,
     }
 }
 
@@ -430,4 +431,191 @@ fn the_record_keeps_the_newest_sixty_four_workers() {
             .map(|w| (w.hash.as_str(), w.sid.as_str())),
         Some((input_hash(&red).as_str(), "s-5555555555555555eeee"))
     );
+}
+
+/// THE REPORT'S LAST VERDICT LINE IS WHAT THE PUMP READS. `FIX` names one full commit, `NO-FIX`
+/// a reason; a report with neither says nothing, and prose that mentions a fix is no verdict.
+#[test]
+fn a_reports_last_verdict_line_names_the_fix_or_the_reason() {
+    let rows: [(&str, Option<Result<&str, &str>>); 9] = [
+        (&format!("Landed it.\nFIX {HOP}\n"), Some(Ok(HOP))),
+        (
+            &format!("FIX {OTHER}\nthen redone\n`FIX {HOP}`."),
+            Some(Ok(HOP)),
+        ),
+        (&format!("- **FIX: {HOP}**"), Some(Ok(HOP))),
+        (&format!("FIX {}", HOP.to_ascii_uppercase()), Some(Ok(HOP))),
+        (
+            "NO-FIX the notary service is down",
+            Some(Err("the notary service is down")),
+        ),
+        ("NO-FIX", Some(Err("no reason given"))),
+        ("FIX 1111111", None),
+        ("The FIX is on main: see the log", None),
+        ("", None),
+    ];
+    for (report, expected) in rows {
+        let expected = expected.map(|v| v.map(str::to_string).map_err(str::to_string));
+        assert_eq!(verdict(report), expected, "{report:?}");
+    }
+}
+
+/// A WORKER IS WORKING UNTIL ITS TASK ENDS, and an ended worker with no verdict line fixed
+/// nothing. What cannot be read is unread: never a fix and never an end.
+#[test]
+fn a_workers_report_is_read_from_its_task_state_then_its_verdict() {
+    use crate::pump::Report;
+    let unread = || -> Result<String, String> { panic!("a working task's result is not read") };
+    assert_eq!(
+        report_from(Ok("OK state=working rev=3 from=s-1".into()), unread),
+        Report::Working
+    );
+    assert_eq!(
+        report_from(Ok("OK state=done rev=9".into()), || Ok(format!(
+            "done\nFIX {HOP}"
+        ))),
+        Report::Fix(HOP.into())
+    );
+    assert_eq!(
+        report_from(Ok("OK state=exited rev=9".into()), || Ok(
+            "NO-FIX a credential".into()
+        )),
+        Report::NoFix("a credential".into())
+    );
+    assert!(matches!(
+        report_from(Ok("OK state=stalled rev=2".into()), || Ok("ran out".into())),
+        Report::NoFix(why) if why.contains("stalled")
+    ));
+    assert_eq!(
+        report_from(Err("no aterm answered".into()), unread),
+        Report::Unread("no aterm answered".into())
+    );
+    assert!(matches!(
+        report_from(Ok("OK rev=1".into()), unread),
+        Report::Unread(why) if why.contains("names no state")
+    ));
+    assert_eq!(
+        report_from(Ok("OK state=done".into()), || Err(
+            "result unavailable".into()
+        )),
+        Report::Unread("result unavailable".into())
+    );
+
+    // A worker that failed, lost its task or lost its session has ended: it holds no red line
+    // as a worker still on it, and it is not unread for good.
+    // NEGATIVE CONTROL: read as Working (or Unread), the pump waits on it without end.
+    assert_eq!(
+        report_from(Ok("OK state=failed rev=4".into()), || Ok(format!(
+            "it broke\nFIX {HOP}"
+        ))),
+        Report::Fix(HOP.into()),
+        "a failed task that still named its fix"
+    );
+    assert!(matches!(
+        report_from(Ok("OK state=failed rev=4".into()), || Ok("it broke".into())),
+        Report::NoFix(why) if why.contains("failed")
+    ));
+    assert_eq!(
+        report_from(Ok("OK state=- rev=0".into()), unread),
+        Report::NoFix("its session runs no task".into())
+    );
+    let gone = "aterm ctl @s-1 task exited exit status: 1: aterm-ctl: ERR no such session";
+    assert!(matches!(
+        report_from(Err(gone.into()), unread),
+        Report::NoFix(why) if why.contains("its session is gone")
+    ));
+    assert!(matches!(
+        report_from(Ok("OK state=done".into()), || Err(gone.into())),
+        Report::NoFix(why) if why.contains("its session is gone")
+    ));
+    // A state this does not know is still working: only a named end is one.
+    assert_eq!(
+        report_from(Ok("OK state=paused".into()), unread),
+        Report::Working
+    );
+}
+
+/// ONE RED OF `--open-next` IS ONE FAILURE AT EVERY TIP. Each try judges whatever commit main's
+/// tip then is, so its hash is of the version it opens after alone: a second red at another tip
+/// names the worker already on it and opens none. A cut's red of the same version and commit
+/// is another failure, and its worker is of a cut where the opening's is not.
+/// NEGATIVE CONTROL: hashed as a cut's inputs, each tip is a new hash and a new worker.
+#[test]
+fn a_red_opening_has_one_worker_at_every_tip() {
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let record = scratch.path().join("aterm-release").join(RECORD_FILE);
+    let clone = scratch.path().join("clone");
+    let opening = |tip: &str| Failure {
+        opening: Some("0.5.0".into()),
+        ..failure(tip)
+    };
+    assert_eq!(input_hash(&opening(R)), opening_hash("0.5.0"));
+    assert_eq!(input_hash(&opening(R)), input_hash(&opening(HOP)));
+    assert_ne!(opening_hash("0.5.0"), opening_hash("0.6.0"));
+    assert_ne!(input_hash(&opening(R)), input_hash(&failure(R)));
+
+    let mut first = Spawns::opening("s-0123456789abcdef0123");
+    assert!(matches!(
+        open(&record, &clone, &opening(R), &mut first),
+        Opened::Spawned { .. }
+    ));
+    let mut again = Spawns::opening("s-ffffffffffffffffffff");
+    assert_eq!(
+        open(&record, &clone, &opening(HOP), &mut again),
+        Opened::Already {
+            hash: opening_hash("0.5.0"),
+            sid: "s-0123456789abcdef0123".into()
+        }
+    );
+    assert!(again.spawned.is_empty(), "no second worker");
+
+    // The line of the version it opened then goes red at that same commit: a cut's failure.
+    let mut cut = Spawns::opening("s-11111111111111111111");
+    assert!(matches!(
+        open(&record, &clone, &failure(R), &mut cut),
+        Opened::Spawned { .. }
+    ));
+    let kept = Record::load(&record).unwrap();
+    assert_eq!(
+        kept.workers.iter().map(Worker::of_cut).collect::<Vec<_>>(),
+        [false, true]
+    );
+}
+
+/// A PUMP'S CUT OPENS ITS WORKER WITHOUT A SESSION. Outside a session a person's cut prints the
+/// command; the pump's reaches the newest local aterm with no `@self`, in a tab it does not
+/// raise.
+/// NEGATIVE CONTROL: with `@self` the spawn outside a session names no session and fails, so
+/// an unattended red would open no worker.
+#[test]
+fn a_cut_outside_a_session_spawns_through_the_local_aterm_only_for_the_pump() {
+    for (in_session, pump, expected) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, false),
+        (false, true, true),
+    ] {
+        assert_eq!(
+            unattended(in_session, pump),
+            expected,
+            "{in_session} {pump}"
+        );
+    }
+    assert!(spawner(false, true).in_session(), "the pump's cut spawns");
+    let words = unattended_args(Path::new("/c/clone"));
+    assert_eq!(
+        words,
+        ["spawn", "raise=f", "agent=claude", "cwd=/c/clone", "-"]
+    );
+    assert!(!words.iter().any(|word| word.starts_with('@')));
+    assert_eq!(spawn_args(Path::new("/c/clone"))[0], "@self");
+}
+
+/// The task tells the worker the line the pump reads.
+#[test]
+fn the_task_asks_for_the_verdict_line() {
+    let failure = failure(R);
+    let task = task(Path::new("/c/clone"), &failure, &input_hash(&failure));
+    assert!(task.contains("`FIX <its 40 hex digits>`"), "{task}");
+    assert!(task.contains("`NO-FIX <what it is>`"), "{task}");
 }

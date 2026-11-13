@@ -530,7 +530,8 @@ fn schema_rows_are_published_once_and_never_below_a_visible_version() {
     let lab = Lab::new(&[Role::Writer]);
     let registry = Registry::at(lab.paths[0].clone());
     registry.open().unwrap();
-    let newer = json!({"r": 2, "x": {"format": "att/1", "version": 2}});
+    let future_version = registry::MACHINE.version + 1;
+    let newer = json!({"r": future_version, "x": {"format": "att/1", "version": future_version}});
     let mut earlier_source = registry::SOURCE.schema_row();
     let object = earlier_source.as_object_mut().unwrap();
     object.insert("r".into(), json!(2));
@@ -596,7 +597,7 @@ fn schema_rows_are_published_once_and_never_below_a_visible_version() {
     assert_eq!(
         view.schema("machine"),
         SchemaState::One {
-            version: 2,
+            version: future_version,
             row: newer
         }
     );

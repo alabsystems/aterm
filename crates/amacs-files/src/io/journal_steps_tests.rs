@@ -4,7 +4,7 @@
 use super::*;
 use crate::io::{
     JournalDocumentKey, JournalEdit, decode_journal, encode_journal, encode_journal_v1,
-    recover_journal_for,
+    recover_journal_for, recover_journal_image_for,
 };
 
 const KEY: JournalDocumentKey = JournalDocumentKey(0x5eed);
@@ -228,4 +228,50 @@ fn a_republished_format_1_image_names_its_bytes_and_compacts_at_its_first_append
         ("disk draft!", Seq(5))
     );
     assert_eq!(recovered.base_content, ContentFingerprint::of(b"disk"));
+}
+
+/// Text whose bytes hold a whole empty astream frame (`¥` is C2 A5, so `¥q`, U+0001 and nine
+/// NULs give magic A5 71, version 1, flags 0, length 0 and CRC 0).
+const NESTED_FRAME: &str = "\u{a5}q\u{1}\0\0\0\0\0\0\0\0\0";
+
+/// A crash cuts an append past a whole frame nested in its record's text. astream reads that
+/// cut as a fault, not a torn tail (`astream_wire::steps`, "A body that holds a frame of its
+/// own"), so the image is no crash's to drop; yet every record before the torn one is whole.
+/// A read keeps them and names the fault beside them, and the boundary it reports ends before
+/// the cut bytes, so a host keeps the image aside.
+#[test]
+fn a_cut_past_a_frame_nested_in_a_records_text_keeps_the_whole_records_before_it() {
+    let text = format!("{NESTED_FRAME} and after");
+    let (image, tails) = typed("disk", &[" one", &text]);
+    let before = usize::try_from(tails[1].byte_len()).unwrap();
+    // Past `¥`'s lead byte C2: the record's own frame starts A5 71 01 too.
+    let nested = before
+        + 1
+        + image[before..]
+            .windows(4)
+            .position(|bytes| bytes == [0xc2, 0xa5, b'q', 1])
+            .expect("the record's frame holds the nested one");
+    let cut = &image[..nested + HEADER_SIZE];
+    assert!(cut.len() < image.len(), "the cut is inside the record");
+    assert!(
+        matches!(
+            scan_steps_from(&cut[MAGIC.len()..], 0).end,
+            StepEnd::Fault { .. }
+        ),
+        "astream reads this cut as a fault"
+    );
+    let read = decode_image(cut).unwrap();
+    assert!(read.fault.is_some(), "the fault is named");
+    assert_eq!(read.records.len(), 2);
+    assert_eq!(read.tail, tails[1], "the whole records end before the cut");
+    let (recovered, tail, fault) = recover_journal_image_for(KEY, cut).unwrap();
+    assert_eq!(recovered.text, "disk one");
+    assert_eq!(tail, Some(tails[1]));
+    assert!(fault.is_some());
+    assert!(
+        matches!(recover_journal_for(KEY, cut), Err(JournalError::Fault(_))),
+        "a read that keeps no boundary still refuses it"
+    );
+    assert!(matches!(journal_tail(cut), Err(JournalError::Fault(_))));
+    assert!(matches!(decode_journal(cut), Err(JournalError::Fault(_))));
 }

@@ -58,7 +58,9 @@ pub(crate) fn trace_splice(
     chrome_written(app, wid, name, shape, &before)
 }
 
-/// The box of the frame cells whose pixels differ from `before`'s, in window pixels.
+/// The box of the frame cells whose pixels differ from `before`'s, in window pixels: what the
+/// splice wrote in cells. A layer of the chrome's own (a footer card's frame, whose shadow
+/// falls outside the card's cells) is left out of both frames.
 pub(crate) fn chrome_written(
     app: &mut App,
     wid: WindowId,
@@ -75,7 +77,15 @@ pub(crate) fn chrome_written(
     let (cw, ch) = app.win_cell_size(wid);
     let (pad, grid_top) = (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid));
     let r = renderer(app, wid);
-    let (was, now) = (r.render_input(before), r.render_input(&after));
+    let cells_of = |input: &RenderInput| {
+        let mut input = input.clone();
+        input.fx_layers.clear();
+        input
+    };
+    let (was, now) = (
+        r.render_input(&cells_of(before)),
+        r.render_input(&cells_of(&after)),
+    );
     let painted = |row: usize, col: usize| {
         (grid_top + row * ch..grid_top + (row + 1) * ch).any(|y| {
             (pad + col * cw..pad + (col + 1) * cw).any(|x| {
@@ -162,13 +172,16 @@ fn diff_in(a: &aterm_render::Frame, b: &aterm_render::Frame, px: PxRect) -> usiz
 }
 
 /// THE LAW: over the window's composed frame, [`light`] in every slot leaves each chrome box
-/// byte-identical to the frame without it, while it draws around them.
+/// byte-identical to the frame without it, while it draws around them. The frame's own layers
+/// are a chrome's (a footer card's frame, standing on the card's occluder) and stay under the
+/// light in every render.
 pub(crate) fn assert_chrome_cuts_the_light(app: &mut App, wid: WindowId, boxes: &[ChromeBox]) {
     let input: RenderInput = app.windows[&wid].input_scratch.clone();
     assert!(
-        input.fx_layers.is_empty(),
-        "the fixture frame carries no light of its own"
+        input.fx_layers.iter().all(|layer| layer.chrome.is_some()),
+        "the fixture frame carries no light of its own, only a chrome's own layers"
     );
+    let own = input.fx_layers.clone();
     let cuts = input.fx_occluders.clone();
     assert!(
         cuts.len() >= boxes.len(),
@@ -177,7 +190,7 @@ pub(crate) fn assert_chrome_cuts_the_light(app: &mut App, wid: WindowId, boxes: 
     let r = renderer(app, wid);
     let mut render = |layers: &[FxLayer], occluders: &[PxRect]| {
         let mut frame = input.clone();
-        frame.fx_layers = layers.to_vec();
+        frame.fx_layers = own.iter().chain(layers).cloned().collect();
         frame.fx_occluders = occluders.to_vec();
         r.render_input(&frame)
     };

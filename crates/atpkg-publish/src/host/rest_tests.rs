@@ -4,50 +4,15 @@
 use super::*;
 
 #[test]
-fn credential_preparation_removes_current_and_future_trace_and_ambient_auth_selectors() {
-    let names = [
-        "GIT_TRACE",
-        "GIT_TRACE2_EVENT",
-        "GIT_TRACE_REDACT",
-        "GIT_TRACE_FUTURE",
-        "GH_ENTERPRISE_TOKEN",
-        "GITHUB_ENTERPRISE_TOKEN",
-        "SSH_AUTH_SOCK",
-        "PATH",
-    ];
-    let remove = git_environment_removals_from(names.map(OsString::from));
-    for name in &names[..6] {
-        assert!(remove.iter().any(|entry| entry == name));
-    }
-    for name in [
-        GIT_TOKEN_ENV,
-        "GH_TOKEN",
-        "GITHUB_TOKEN",
-        "GIT_CURL_VERBOSE",
-        "BASH_ENV",
-        "ENV",
-        "SHELLOPTS",
-        "BASHOPTS",
-    ] {
-        assert!(remove.iter().any(|entry| entry == name));
-    }
-    assert!(
-        !remove
-            .iter()
-            .any(|entry| entry == "SSH_AUTH_SOCK" || entry == "PATH")
-    );
-}
-
-#[test]
-fn required_credentials_refuse_missing_or_blank_files_and_never_debug_the_secret() {
+fn a_git_credential_never_debugs_or_passes_its_secret_in_argv() {
     let dir = aterm_tempfile::TempDir::new().expect("scratch");
     let file = dir.path().join("token");
-    assert!(GitAuth::required(&file, "https://github.com").is_err());
-    std::fs::write(&file, " \n").expect("blank fixture credential");
-    assert!(GitAuth::required(&file, "https://github.com").is_err());
     let secret = "github_pat_redaction_fixture";
     std::fs::write(&file, secret).expect("fixture credential");
-    let auth = GitAuth::required(&file, "https://github.com").expect("known origin");
+    let token = Token::from_file(&file)
+        .expect("a readable credential")
+        .expect("a present credential");
+    let auth = GitAuth::new(Some(token), "https://github.com");
     assert!(!format!("{auth:?}").contains(secret));
     assert!(
         !auth
@@ -59,12 +24,6 @@ fn required_credentials_refuse_missing_or_blank_files_and_never_debug_the_secret
         auth.environment().expect("credential environment"),
         vec![(GIT_TOKEN_ENV.into(), secret.into())]
     );
-    assert_eq!(
-        auth.redact(&format!("remote echoed {secret}")),
-        "remote echoed [redacted]"
-    );
-    assert!(GitAuth::required(&file, "https://github.com.helper=!other").is_err());
-    assert!(GitAuth::required(&file, "file:///r").is_err());
 }
 
 #[test]

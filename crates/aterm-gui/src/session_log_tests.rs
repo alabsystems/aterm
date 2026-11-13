@@ -618,6 +618,7 @@ fn fact(blk: u64, start: u64, end: BlockEnd, detail: Option<&str>) -> BlockFact 
         end,
         detail: detail.map(str::to_string),
         detail_final: true,
+        shape: crate::session_status::LineShape::ONE,
     }
 }
 
@@ -2214,6 +2215,7 @@ fn a_command_line_never_reaches_the_log() {
                 ),
             ),
             detail_final: true,
+            shape: crate::session_status::LineShape::ONE,
         }],
         ..BlockRead::default()
     };
@@ -2712,6 +2714,7 @@ fn a_command_from_before_this_process_measures_its_duration_on_the_wall() {
             end,
             detail: Some("claude".into()),
             detail_final: true,
+            shape: crate::session_status::LineShape::ONE,
         }],
         ..BlockRead::default()
     };

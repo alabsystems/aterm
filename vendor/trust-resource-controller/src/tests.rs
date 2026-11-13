@@ -230,12 +230,18 @@ fn closed_peer_is_safe_with_default_sigpipe() {
         assert!(channel.send(b"closed", Instant::now() + Duration::from_secs(1)).is_err());
         return;
     }
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "tests::closed_peer_is_safe_with_default_sigpipe"])
         .env(CHILD, "1")
-        .status()
+        .output()
         .unwrap();
-    assert!(status.success(), "default SIGPIPE killed controller fixture: {status}");
+    assert!(
+        output.status.success(),
+        "default SIGPIPE killed controller fixture: {:?}\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 #[test]

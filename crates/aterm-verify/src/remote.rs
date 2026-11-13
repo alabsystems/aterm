@@ -3,8 +3,9 @@
 
 //! The verifier's remote boundary: GitHub goes through agh, local repositories through git.
 //! Pinned reads import an exact observed OID; ordinary main refreshes reuse the checkout's
-//! objects. Writes carry the expected ref and stop on an unknown outcome. Neither a failed
-//! agh command nor an unrecognised URL falls back to git.
+//! objects. Writes carry the expected ref and stop on an unknown outcome; one agh says sent
+//! nothing may be made again. Neither a failed agh command nor an unrecognised URL falls back
+//! to git.
 
 use aterm_json::{Value, json};
 use aterm_uds::spawnfd::Command;
@@ -181,27 +182,29 @@ pub(crate) enum Pushed {
         intent: agh::IntentId,
         why: String,
     },
+    /// agh could not run the write, says that it sent nothing, and settled its own intent (a
+    /// network, server or rate failure before the send): the same write may be made again.
+    Unsent(String),
 }
 
-/// Read the machine diagnostic, never its human `why` or suggested command. Unknown outcomes
-/// without this exact pre-send refusal remain fatal, including older agh diagnostics.
-fn blocking_intent(out: &Output, repo: &str) -> Option<agh::IntentId> {
-    if out.status.code() != Some(13) {
-        return None;
-    }
+/// agh's one machine diagnostic of a failed command: the fields a caller decides by.
+#[derive(serde::Deserialize)]
+struct Refusal {
+    v: u8,
+    exit: u8,
+    kind: String,
+    sub: Option<String>,
+    side_effect: String,
+    repo: Option<String>,
+    intent: Option<String>,
+}
+
+/// Read the machine diagnostic, never its human `why` or suggested command: `None` unless
+/// stderr holds exactly one, for this exit.
+fn refusal(out: &Output) -> Option<Refusal> {
     #[derive(serde::Deserialize)]
     struct Diagnostic {
         error: Refusal,
-    }
-    #[derive(serde::Deserialize)]
-    struct Refusal {
-        v: u8,
-        exit: u8,
-        kind: String,
-        sub: String,
-        side_effect: String,
-        repo: String,
-        intent: String,
     }
     let mut records = out
         .stderr
@@ -209,22 +212,41 @@ fn blocking_intent(out: &Output, repo: &str) -> Option<agh::IntentId> {
         .map(<[u8]>::trim_ascii)
         .filter(|line| line.starts_with(b"{") || line.starts_with(b"["))
         .map(aterm_json::from_slice::<Diagnostic>);
-    let diagnostic = records.next()?.ok()?;
+    let error = records.next()?.ok()?.error;
     if records.next().is_some() {
         return None;
     }
-    let error = diagnostic.error;
-    if error.v == 1
-        && error.exit == 13
+    (error.v == 1 && out.status.code() == Some(i32::from(error.exit))).then_some(error)
+}
+
+/// The foreign intent whose open entry refused this write before it sent anything. Unknown
+/// outcomes without this exact pre-send refusal remain fatal, including older agh diagnostics.
+fn blocking_intent(out: &Output, repo: &str) -> Option<agh::IntentId> {
+    let error = refusal(out)?;
+    if error.exit == 13
         && error.kind == "outcome_unknown"
-        && error.sub == "intent_open"
+        && error.sub.as_deref() == Some("intent_open")
         && error.side_effect == "none"
-        && error.repo == repo
+        && error.repo.as_deref() == Some(repo)
     {
-        agh::IntentId::parse(&error.intent)
+        agh::IntentId::parse(error.intent.as_deref()?)
     } else {
         None
     }
+}
+
+/// Whether agh's diagnostic says the write could not run and sent nothing: one of its kinds a
+/// later attempt may cure (could not run, a rate limit, a server failure), with no side effect,
+/// for this repository where it names one. agh settles such a write's intent itself, so the
+/// journal holds nothing open for it. Any other failure keeps its own meaning.
+fn unsent(out: &Output, repo: &str) -> bool {
+    refusal(out).is_some_and(|error| {
+        matches!(
+            (error.exit, error.kind.as_str()),
+            (3, "could_not_run") | (11, "rate_limited") | (12, "server")
+        ) && error.side_effect == "none"
+            && error.repo.as_deref().is_none_or(|named| named == repo)
+    })
 }
 
 impl<'a> Remote<'a> {
@@ -500,8 +522,12 @@ impl<'a> Remote<'a> {
         success(Tool::Git, (self.run)(Tool::Git, &args)?).map(drop)
     }
 
-    /// Publish exact local objects, expected ref included. An unknown outcome stops the caller;
-    /// only a typed refusal which sent nothing permits observation of the blocking intent.
+    /// Publish exact local objects, expected ref included, as one write. agh's write makes
+    /// every check its dry run makes (routing, the source graph, the expected ref) before it
+    /// sends, so no rehearsal comes first: each one would repeat agh's strict re-verification of
+    /// the pushed history while the expected ref is free to move. An unknown outcome stops the
+    /// caller; only a typed refusal which sent nothing permits observation of the blocking
+    /// intent ([`Pushed::Blocked`]) or the same write again ([`Pushed::Unsent`]).
     pub(crate) fn push(
         &self,
         reference: &str,
@@ -540,26 +566,24 @@ impl<'a> Remote<'a> {
                     "--input".into(),
                     input.into_os_string(),
                 ]);
-                let mut dry = args.clone();
-                dry.push("--dry-run".into());
-                for args in [&dry, &args] {
-                    let out = (self.run)(Tool::Agh, args)?;
-                    if !out.status.success() {
-                        let why = why(Tool::Agh, &out);
-                        return if out.status.code() == Some(9) {
-                            Ok(Pushed::Rejected(why))
-                        } else if let Some(intent) = blocking_intent(&out, slug) {
-                            Ok(Pushed::Blocked { intent, why })
-                        } else if out.status.code() == Some(13) {
-                            Err(format!(
-                                "{why}; outcome unknown: reconcile agh's intent before another write"
-                            ))
-                        } else {
-                            Err(why)
-                        };
-                    }
+                let out = (self.run)(Tool::Agh, &args)?;
+                if out.status.success() {
+                    return Ok(Pushed::Done);
                 }
-                Ok(Pushed::Done)
+                let why = why(Tool::Agh, &out);
+                if out.status.code() == Some(9) {
+                    Ok(Pushed::Rejected(why))
+                } else if let Some(intent) = blocking_intent(&out, slug) {
+                    Ok(Pushed::Blocked { intent, why })
+                } else if unsent(&out, slug) {
+                    Ok(Pushed::Unsent(why))
+                } else if out.status.code() == Some(13) {
+                    Err(format!(
+                        "{why}; outcome unknown: reconcile agh's intent before another write"
+                    ))
+                } else {
+                    Err(why)
+                }
             }
         }
     }

@@ -93,6 +93,8 @@ pub(crate) fn prepare<'a>(
             profile.dir()
         )));
     }
+    let built = std::fs::canonicalize(&built)
+        .map_err(|why| Halt::Fail(format!("cannot resolve the aterm cargo built: {why}")))?;
     let identity = bench_profile::identity(&built)
         .map_err(|why| Halt::Fail(format!("the aterm cargo just built cannot be read: {why}")))?;
     Ok((
@@ -119,11 +121,11 @@ pub(crate) enum Entry {
 
 /// Build `build_args`'s bench without executing it, then execute Cargo's exact artifact with the
 /// words of `knobs` (the variable and its words) and the separate OS-native output path in its
-/// named variable (`output`), admitted as `entry` says: a timed run first obtains fresh
+/// named variable (`output`), selecting `built` as its app. A timed `entry` first obtains fresh
 /// measurement-entry evidence. Echo stderr lines beginning with `progress`, and return stdout.
 ///
 /// # Errors
-/// A bench that does not start, or exits unsuccessfully (`what` names it, with both tails); a
+/// A bench that does not start, or exits unsuccessfully (with both tails); a
 /// timed run whose admission is refused or lapsed.
 pub(crate) fn run_bench(
     targo: &Targo<'_>,
@@ -131,7 +133,7 @@ pub(crate) fn run_bench(
     knobs: (&str, &str),
     output: (&str, &Path),
     progress: &str,
-    what: &str,
+    built: &Built,
     entry: Entry,
 ) -> Result<String, Halt> {
     let (env, words) = knobs;
@@ -146,7 +148,8 @@ pub(crate) fn run_bench(
         .ok_or_else(|| Halt::Fail("measurement build names no bench target".into()))?;
     let executable = built_executable(&messages, name, "bench")?;
     eprintln!(
-        "  $ {env}=\"{words}\" {}={:?} {} --bench",
+        "  $ ATERM_TEST_EXECUTABLE={:?} {env}=\"{words}\" {}={:?} {} --bench",
+        built.path,
         output.0,
         output.1,
         executable.display()
@@ -158,7 +161,7 @@ pub(crate) fn run_bench(
         Entry::Timed => Some(super::measurement_entry().map_err(Halt::Timing)?),
         Entry::Counted => None,
     };
-    set_bench_environment(&mut command, env, words, output);
+    set_bench_environment(&mut command, env, words, output, &built.path);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -226,7 +229,7 @@ pub(crate) fn run_bench(
     if !status.success() {
         let out_tail: Vec<&str> = stdout.lines().rev().take(TAIL).collect();
         return Err(Halt::Fail(format!(
-            "{what} exited {:?}\n--- stderr (tail) ---\n{}\n--- stdout (tail) ---\n{}",
+            "{name} exited {:?}\n--- stderr (tail) ---\n{}\n--- stdout (tail) ---\n{}",
             status.code(),
             tail.join("\n"),
             out_tail.into_iter().rev().collect::<Vec<_>>().join("\n")
@@ -375,8 +378,17 @@ fn built_binary(messages: &str, name: &str) -> Result<PathBuf, String> {
     built_executable(messages, name, "bin")
 }
 
-fn set_bench_environment(command: &mut Command, env: &str, words: &str, output: (&str, &Path)) {
-    command.env(env, words).env(output.0, output.1);
+fn set_bench_environment(
+    command: &mut Command,
+    env: &str,
+    words: &str,
+    output: (&str, &Path),
+    built: &Path,
+) {
+    command
+        .env(env, words)
+        .env(output.0, output.1)
+        .env("ATERM_TEST_EXECUTABLE", built);
 }
 
 /// Cargo's exact executable artifact, matched by both target name and target kind.
@@ -538,7 +550,7 @@ pub(crate) fn cpus() -> String {
 pub(crate) struct Provenance<'a> {
     /// The entry's title, before its date (`Fabric: pingpong`).
     pub heading: &'a str,
-    /// The README that keeps the ledger's protocol.
+    /// The file whose documentation keeps the ledger's protocol: the lane's own module.
     pub protocol: &'a str,
     pub date: &'a str,
     pub machine: &'a str,

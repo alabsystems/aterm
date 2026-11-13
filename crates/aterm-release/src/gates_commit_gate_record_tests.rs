@@ -34,6 +34,25 @@ fn fixture_and_policy_records_bind_every_input() {
     ] {
         assert!(changed.adopt(&git).is_err(), "{changed:?}");
     }
+    // R13: the record names the run that judged, which is no input of the judgment: the same
+    // four inputs agree whoever wrote them, and a record written before runs were named
+    // agrees and names none.
+    assert_eq!(expected.recorded(&git).unwrap(), None);
+    CommitGateRecord::new("source", "0.183.0", "seal".into(), "tags".into())
+        .judged_by("20261112T171324-27178")
+        .save(&git)
+        .unwrap();
+    expected.adopt(&git).unwrap();
+    assert_eq!(
+        expected.recorded(&git).unwrap().as_deref(),
+        Some("20261112T171324-27178")
+    );
+    assert!(
+        CommitGateRecord::new("source", "0.183.0", "seal".into(), "other".into())
+            .recorded(&git)
+            .is_err(),
+        "a named run carries nothing across another tag set"
+    );
     std::fs::write(CommitGateRecord::path(&git).unwrap(), "garbled").unwrap();
     assert!(expected.adopt(&git).is_err(), "garbled is not passed");
 }

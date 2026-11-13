@@ -107,17 +107,6 @@ fn too_large(len: &str, form: &str) -> String {
     format!("ERR spawn {form}: the task is {len} bytes (max {TASK_MAX})\n")
 }
 
-/// The reply to a spawn line whose `agent=` names a retired agent
-/// ([`aterm_phase::RETIRED_AGENTS`], Gemini CLI): refused with the agent that
-/// replaces it named, never read as another worker.
-pub(crate) fn retired_worker(agent: Option<&str>) -> Option<String> {
-    let agent = agent?;
-    aterm_phase::RETIRED_AGENTS
-        .iter()
-        .any(|retired| agent.eq_ignore_ascii_case(retired))
-        .then(|| format!("ERR spawn agent={agent}: {}\n", aterm_phase::RETIRED_AGENT))
-}
-
 /// The worker word a spawn line's `agent=` names.
 pub(crate) fn worker_word(agent: Option<&str>) -> &'static str {
     aterm_agent::harness::worker::WORKERS
@@ -1322,8 +1311,7 @@ fn install_with(
     };
     #[cfg(unix)]
     let run = {
-        let (reader, writer) =
-            aterm_uds::kept_out(std::io::pipe).map_err(|e| format!("cancellation pipe: {e}"))?;
+        let (reader, writer) = aterm_uds::pipe().map_err(|e| format!("cancellation pipe: {e}"))?;
         let mut argv = install_argv(program, Some(layout));
         argv.push(atpkg::cli::CANCEL_STDIN_FLAG.into());
         crate::run_atpkg_pass_owned(

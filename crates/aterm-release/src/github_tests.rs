@@ -232,7 +232,6 @@ fn concurrent_upload_fixture_walls() {
             kind: crate::publish::CutKind::DryRun,
             lease: None,
             fence: None,
-            notes_section: "0.181.0".into(),
             journal: None,
             adopted: false,
         };
@@ -392,7 +391,10 @@ fn a_write_without_the_token_is_refused_before_curl_starts() {
     };
     assert!(refused.to_string().contains("without a token"), "{refused}");
     let gate = crate::gates::github_identity_gate(false).unwrap_err();
-    assert!(gate.to_string().contains("no release token"), "{gate}");
+    assert!(
+        gate.to_string().contains("aterm secrets need gh:release"),
+        "{gate}"
+    );
     assert!(w.recorder.spawned().is_empty(), "nothing was started");
     assert!(w.fake.seen().is_empty(), "nothing was sent");
     assert!(crate::publish::release_listing(SLUG).unwrap().is_empty());

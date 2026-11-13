@@ -148,17 +148,25 @@ pub enum Selection {
     /// The cone narrowed to the seeds and what each reaches ([`Reach`]).
     Narrowed {
         /// What the change itself touched: members whose own files changed, the packages a lock or
-        /// root manifest row names, and vendored packages whose files changed.
+        /// root manifest row names, and vendored packages whose files changed; and the members
+        /// walked as namers, which observe a changed path of another member through code a
+        /// dependent links ([`crate::own_tests::Observed::Linked`]: their library, binaries,
+        /// build script, a file such code embeds, an unplaced file or a comment a macro may read
+        /// spells it): of a seed judged alone because walking them adds fewer members than its
+        /// own dependents would, or of a path no member owns.
         seeds: Vec<String>,
-        /// By `-p` spec, the members among `seeds`, those a seed reaches, and those [`TESTED_BY`] a
-        /// changed file.
+        /// By `-p` spec, the members among `seeds`, those a seed reaches, those [`TESTED_BY`] a
+        /// changed file, and the other members that observe a changed path of another member:
+        /// whose tests or doc comments alone spell it ([`crate::own_tests::Observed::Tests`]),
+        /// or whose linked code does where the seed that owns it is judged whole.
         crates: Vec<String>,
         /// Whether any selected crate declares a library target ([`Members::any_has_lib`]).
         any_lib: bool,
         /// The members, by name, whose test, bench and example targets the cone's lint compiles:
-        /// those whose own files changed and those [`TESTED_BY`] a changed file. A root manifest
-        /// row, a lock row other than a touched member's own entry, or a fork moves code under any
-        /// member's tests, so any of those makes this the whole cone.
+        /// those whose own files changed, those that observe a changed path of another member,
+        /// and those [`TESTED_BY`] a changed file. A root manifest row, a lock row other than a
+        /// touched member's own entry, or a fork moves code under any member's tests, so any of
+        /// those makes this the whole cone.
         all_targets: Vec<String>,
         /// The members, by name, the cone's lint leaves out: those it holds only by a dev edge
         /// ([`Reach::dev_only`]) and not in `all_targets`. Their libraries and binaries link
@@ -170,8 +178,13 @@ pub enum Selection {
         direct_dependents: Vec<String>,
         /// The members among `seeds`, by name, whose every changed file is confined to the member
         /// itself ([`crate::own_tests`]: its test code, comments no macro reads, a manifest whose
-        /// values are the same): no build of a dependent reads the change, so the cone holds
-        /// none of theirs and judges them alone, with all of their own rows.
+        /// values are the same), whose reads of another package's changed file sit only in its
+        /// tests, benches and examples, that are no walked namer, whose changed paths no namer's
+        /// linked code spells, or whose namers' dependents add fewer members than their own would,
+        /// and, where their own linked code observes a changed path of another member, whose
+        /// paths no member observes and none of which is a reader, so main judged them alone too
+        /// ([`select`]): no build of a dependent reads the change, so the cone holds none of
+        /// theirs and judges them alone, with all of their own rows.
         alone: Vec<String>,
     },
 }
@@ -439,26 +452,59 @@ pub fn owning_member<'a>(
     members: &'a Members,
 ) -> Option<&'a str> {
     let dir = owning_dir(path, manifests)?;
-    if path.strip_prefix(dir) == Some("/SPECS.md") {
+    if spec_table(path, dir) {
         return None;
     }
     members.at(dir)
 }
 
-/// Select the workspace crates that the change cone must build and test. `confined` says whether a
-/// member's changed files (the second argument) are all confined to the member itself
-/// ([`crate::own_tests::confined`]); such a member is judged alone ([`Selection::Narrowed`]'s
-/// `alone`).
+/// Whether `path` is the spec table at the root of the package in `dir`, which no member owns
+/// ([`owning_member`]).
+fn spec_table(path: &str, dir: &str) -> bool {
+    path.strip_prefix(dir) == Some("/SPECS.md")
+}
+
+/// Select the workspace crates that the change cone must build and test. `readers` are the paths
+/// of `paths` that read another package's changed path ([`with_shared_inputs`]). `confined` says
+/// whether a member's owned paths (the second argument: its changed files and its readers) are
+/// all confined to the member itself ([`crate::own_tests::confined`]). `observe` says, by member
+/// name and then by changed path, how each member that spells a changed member path of another
+/// observes it ([`crate::own_tests::observes`]).
+///
+/// The bar is to judge the change at least as well as main did, where a namer only kept the seed
+/// it spelled whole and ran nothing of its own. A member whose tests or doc comments alone observe
+/// a path joins with all of its targets and walks nothing; so does one whose linked code observes
+/// it ([`crate::own_tests::Observed::Linked`]) where the seed that owns the path is judged whole
+/// (not confined, replanned or forked), whose dependents the cone already walks: the namer's own
+/// rows are more than main ran. For a confined seed whose changed paths linked namers spell, two
+/// selections meet the bar: the seed whole, as main's veto made it, with each namer's own rows;
+/// or the seed alone with each namer walked, its dependents in the cone, which keeps every observer
+/// a run-time read can reach. `dependents` is asked of the seed and of each of its namers, and the
+/// seed goes alone only where its namers' dependents add strictly fewer members than its own; a
+/// tie keeps main's shape. A linked observer of a path no member owns (one a reader in a nested
+/// package no member is reads) is walked. A seed whose own linked code observes another changed
+/// path is judged whole, and `confined` is not asked of it, where main judged it whole: another
+/// member observes one of its paths in any class (main's veto ran on any spelling, a plain
+/// comment's among them), or one of them is a reader. Its dependents, which main ran, may read
+/// that other path through its code. A confined seed with no linked namer, or that went alone, is
+/// judged alone unless it is itself a walked namer ([`Selection::Narrowed`]'s `alone`).
 #[must_use]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each graph, plan and judgment reader is an injected seam the tests answer"
+)]
 pub fn select(
     paths: &[String],
+    readers: &BTreeSet<String>,
     manifests: &Manifests,
     members: &Members,
     path_packages: &dyn Fn() -> Option<Vec<(String, String)>>,
     dependents: &dyn Fn(&str) -> Option<Reach>,
     replan: &dyn Fn(&str) -> Replan,
     confined: &dyn Fn(&str, &[&str]) -> bool,
+    observe: &dyn Fn() -> BTreeMap<String, BTreeMap<String, crate::own_tests::Observed>>,
 ) -> Selection {
+    use crate::own_tests::Observed;
     if members.is_empty() {
         return Selection::Widened("`targo tree` returned no workspace members".to_string());
     }
@@ -488,13 +534,28 @@ pub fn select(
                 .to_string(),
         );
     };
-    let mut cone: BTreeSet<String> = seeds.clone();
-    cone.extend(replanned.iter().filter(|p| names.contains(*p)).cloned());
-    let own = seeds.clone();
     let forked = forks_touched(paths, &packages);
+    let observed: BTreeMap<String, BTreeMap<String, Observed>> = observe()
+        .into_iter()
+        .filter(|(namer, _)| names.contains(namer))
+        .collect();
+    // Main kept a seed whole where another member spelled one of its paths, in any class, or one
+    // of them reads another package's changed path. A seed whose own linked code observes another
+    // changed path stays whole there: its dependents, which main ran, may read that path through
+    // it.
+    let linking: BTreeSet<&str> = observed
+        .iter()
+        .filter(|(_, by_path)| by_path.values().any(|how| *how == Observed::Linked))
+        .map(|(namer, _)| namer.as_str())
+        .collect();
+    let spelled: BTreeSet<&str> = observed
+        .values()
+        .flat_map(BTreeMap::keys)
+        .map(String::as_str)
+        .collect();
     // A member a lock or root manifest row also names, or a fork it is, builds differently for
     // every dependent whatever its files say.
-    let alone: BTreeSet<String> = own
+    let judged: BTreeSet<String> = seeds
         .iter()
         .filter(|seed| !replanned.contains(*seed) && !forked.contains(*seed))
         .filter(|seed| {
@@ -503,33 +564,94 @@ pub fn select(
                 .filter(|p| owning_member(p, manifests, members) == Some(seed.as_str()))
                 .map(String::as_str)
                 .collect();
-            confined(seed, &owned)
+            let vetoed = linking.contains(seed.as_str())
+                && owned
+                    .iter()
+                    .any(|p| spelled.contains(p) || readers.contains(*p));
+            !vetoed && confined(seed, &owned)
         })
         .cloned()
         .collect();
+    // A spelling is read where its code runs, whichever way the seed whose path it spells is
+    // judged: each observer joins, and how depends on that seed.
+    let mut watching: BTreeSet<String> = BTreeSet::new();
+    let mut walked: BTreeSet<String> = BTreeSet::new();
+    let mut namers: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for (namer, by_path) in &observed {
+        for (path, observed) in by_path {
+            match observed {
+                Observed::Nothing => {}
+                Observed::Tests => {
+                    watching.insert(namer.clone());
+                }
+                Observed::Linked => match owning_member(path, manifests, members) {
+                    Some(seed) if judged.contains(seed) => {
+                        namers
+                            .entry(seed.to_string())
+                            .or_default()
+                            .insert(namer.clone());
+                    }
+                    Some(_) => {
+                        watching.insert(namer.clone());
+                    }
+                    None => {
+                        walked.insert(namer.clone());
+                    }
+                },
+            }
+        }
+    }
+    let mut asked: BTreeMap<String, Reach> = BTreeMap::new();
+    // Each confined seed with linked namers goes alone, its namers walked, only where that adds
+    // fewer members than judging it whole with its namers' own rows.
+    let mut whole: BTreeSet<String> = BTreeSet::new();
+    for (seed, by) in &namers {
+        let joined: BTreeSet<&String> = by.iter().chain(std::iter::once(seed)).collect();
+        let adds = |found: &Reach| -> BTreeSet<String> {
+            found
+                .links
+                .iter()
+                .chain(&found.dev_only)
+                .filter(|n| names.contains(*n) && !joined.contains(n))
+                .cloned()
+                .collect()
+        };
+        let as_whole = match reach_of(seed, dependents, &names, &mut asked) {
+            Ok(found) => adds(&found).len(),
+            Err(why) => return Selection::Widened(why),
+        };
+        let mut as_alone: BTreeSet<String> = BTreeSet::new();
+        for namer in by {
+            match reach_of(namer, dependents, &names, &mut asked) {
+                Ok(found) => as_alone.extend(adds(&found)),
+                Err(why) => return Selection::Widened(why),
+            }
+        }
+        if as_alone.len() < as_whole {
+            walked.extend(by.iter().cloned());
+        } else {
+            whole.insert(seed.clone());
+            watching.extend(by.iter().cloned());
+        }
+    }
+    let alone: BTreeSet<String> = judged
+        .into_iter()
+        .filter(|seed| !whole.contains(seed) && !walked.contains(seed))
+        .collect();
     let mut seeds = seeds;
+    seeds.extend(walked.iter().cloned());
+    let own = seeds.clone();
+    let mut cone: BTreeSet<String> = seeds.clone();
+    cone.extend(replanned.iter().filter(|p| names.contains(*p)).cloned());
     seeds.extend(replanned);
     seeds.extend(forked);
     let mut dev_only: BTreeSet<String> = BTreeSet::new();
     let mut direct_dependents: BTreeSet<String> = BTreeSet::new();
     for seed in seeds.iter().filter(|seed| !alone.contains(*seed)) {
-        let Some(found) = dependents(seed.as_str()) else {
-            return Selection::Widened(format!(
-                "`targo tree --invert {seed}` failed or could not be read, so its dependents are \
-                 unknown"
-            ));
+        let found = match reach_of(seed, dependents, &names, &mut asked) {
+            Ok(found) => found,
+            Err(why) => return Selection::Widened(why),
         };
-        if !found
-            .links
-            .iter()
-            .chain(&found.dev_only)
-            .any(|n| names.contains(n))
-        {
-            return Selection::Widened(format!(
-                "`targo tree --invert {seed}` reaches no member: this host's graph does not hold \
-                 it, so what depends on it on another target is unknown"
-            ));
-        }
         cone.extend(found.links.into_iter().filter(|n| names.contains(n)));
         dev_only.extend(found.dev_only.into_iter().filter(|n| names.contains(n)));
         direct_dependents.extend(found.direct.into_iter().filter(|n| names.contains(n)));
@@ -541,6 +663,7 @@ pub fn select(
         .flat_map(|p| tested_by(p))
         .map(str::to_string)
         .filter(|n| names.contains(n))
+        .chain(watching)
         .collect();
     cone.extend(tested.iter().cloned());
     let (all_targets, unlinted) = if root_row || !seeds.is_subset(&own) {
@@ -564,6 +687,39 @@ pub fn select(
         direct_dependents: direct_dependents.into_iter().collect(),
         alone: alone.into_iter().collect(),
     }
+}
+
+/// What `dependents` says `seed` reaches ([`select`]), asked once per seed and kept in `asked`;
+/// or why the selection widens: the graph read fails, or this host's graph does not hold the
+/// seed, so what depends on it on another target is unknown.
+fn reach_of(
+    seed: &str,
+    dependents: &dyn Fn(&str) -> Option<Reach>,
+    names: &BTreeSet<String>,
+    asked: &mut BTreeMap<String, Reach>,
+) -> Result<Reach, String> {
+    if let Some(found) = asked.get(seed) {
+        return Ok(found.clone());
+    }
+    let Some(found) = dependents(seed) else {
+        return Err(format!(
+            "`targo tree --invert {seed}` failed or could not be read, so its dependents are \
+             unknown"
+        ));
+    };
+    if !found
+        .links
+        .iter()
+        .chain(&found.dev_only)
+        .any(|n| names.contains(n))
+    {
+        return Err(format!(
+            "`targo tree --invert {seed}` reaches no member: this host's graph does not hold \
+             it, so what depends on it on another target is unknown"
+        ));
+    }
+    asked.insert(seed.to_string(), found.clone());
+    Ok(found)
 }
 
 /// Workspace members whose own files changed in `paths`.
@@ -734,6 +890,7 @@ pub fn resolve_paths(
         paths,
         readers,
         named,
+        adopted,
     } = match with_shared_inputs(root, &listed, paths, &members) {
         Ok(shared) => shared,
         Err(why) => return Selection::Widened(why),
@@ -745,24 +902,81 @@ pub fn resolve_paths(
         base,
         listed: &listed,
     });
+    // `observes` reads only the files as they are now, so it needs no one tree they changed from.
+    let now = crate::own_tests::Checkout {
+        root,
+        path_env,
+        base: from.unwrap_or(merge_base),
+        listed: &listed,
+    };
     select(
         &paths,
+        &readers,
         &manifests,
         &members,
         &|| read_path_packages(root, tools, path_env, &members),
         &|c| invert(root, &tools.targo, path_env, members.spec(c), &members),
         &|p| replan_of(root, path_env, merge_base, p, &members),
-        // What another member reads, or a file that reads another's, is the cone's to follow.
+        // A member is alone where its own changed files and its readers are confined to it.
         &|member, owned| {
-            owned
+            let (Some(checkout), Some(dir)) = (checkout.as_ref(), members.dir(member)) else {
+                return false;
+            };
+            let own: Vec<&str> = owned
                 .iter()
-                .all(|p| changed.contains(*p) && !readers.contains(*p) && !named.contains(*p))
-                && match (&checkout, members.dir(member)) {
-                    (Some(checkout), Some(dir)) => {
-                        crate::own_tests::confined(checkout, dir, owned).is_ok()
-                    }
-                    _ => false,
-                }
+                .copied()
+                .filter(|path| changed.contains(*path))
+                .collect();
+            let reads: Vec<&str> = owned
+                .iter()
+                .copied()
+                .filter(|path| readers.contains(*path))
+                .collect();
+            let elsewhere: Vec<&str> = changed
+                .iter()
+                .map(String::as_str)
+                .filter(|path| !owned.contains(path))
+                .collect();
+            crate::own_tests::confined(
+                checkout,
+                dir,
+                crate::own_tests::Touched {
+                    changed: &own,
+                    readers: &reads,
+                    elsewhere: &elsewhere,
+                },
+            )
+            .is_ok()
+        },
+        // Each member that spells a changed path of another observes each such path as the most
+        // of every place it does, and a member whose nested package holds a reader observes what
+        // that reader reads of another member's or of no member's as linked code does (the most
+        // there is, whatever its spelling there gave).
+        &|| {
+            let mut observed: BTreeMap<String, BTreeMap<String, crate::own_tests::Observed>> =
+                named
+                    .iter()
+                    .map(|(namer, spellings)| {
+                        let by_path = match members.dir(namer) {
+                            Some(dir) => crate::own_tests::observes(&now, dir, spellings),
+                            None => spellings
+                                .iter()
+                                .map(|spelling| {
+                                    (spelling.path.clone(), crate::own_tests::Observed::Linked)
+                                })
+                                .collect(),
+                        };
+                        (namer.clone(), by_path)
+                    })
+                    .collect();
+            for (member, reads) in &adopted {
+                observed.entry(member.clone()).or_default().extend(
+                    reads
+                        .iter()
+                        .map(|path| (path.clone(), crate::own_tests::Observed::Linked)),
+                );
+            }
+            observed
         },
     )
 }
@@ -827,20 +1041,61 @@ fn replan_of(
     }
 }
 
-/// A change with what other members read of it ([`with_shared_inputs`]).
+/// A change with what other members read or spell of it ([`with_shared_inputs`]).
 struct Shared {
-    /// The changed paths and every member source that reads one of them from outside its member.
+    /// The changed paths and every source that reads one of them from outside its package.
     paths: Vec<String>,
-    /// Every member source that reads one of `paths` from outside its member by a `../` literal
-    /// ([`shares_changed_input`]), whether it changed itself or not.
+    /// Every source that reads one of `paths` from outside its package by a `../` literal
+    /// ([`changed_inputs`]); compiles, embeds or names as missing one through a file outside
+    /// its package that a `#[path]` or `include!` literal of it mounts ([`Target::module`],
+    /// [`crate::own_tests::closure`]), or mounts such a file this reader cannot settle where that
+    /// file is in the path's package or in none; or reads a source of another package that spells
+    /// a changed member path: whether it changed itself or not, so a changed source may be one.
     readers: BTreeSet<String>,
-    /// The changed paths whose repo-relative path a source of another member spells.
-    named: BTreeSet<String>,
+    /// By member name, each source under the member's folder (in its package or in a nested one
+    /// no member is) that spells a changed path of another member by its repo-relative path,
+    /// once per path it spells, with that path and every offset it does.
+    named: BTreeMap<String, Vec<crate::own_tests::Spelling>>,
+    /// By member name, what the readers of `readers` in a nested package under the member's
+    /// folder that no member is read, other than the member's own: each of `paths` such a reader
+    /// reads whose package is not the member's, and each changed path of another member that a
+    /// source it reads spells. The member's tests may build and run that package, and no
+    /// declaration of the member places the reader, so the member observes each as linked code
+    /// does; what the reader reads of the member's own is the member's own change, judged by its
+    /// own placement, and its tests, which may run the reader, are among its own rows. A member
+    /// whose readers read nothing else has no entry.
+    adopted: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// `paths` and every member source, of the checkout's `listed` files, that reads one of them from
-/// outside its member by a `../` literal ([`shares_changed_input`]), with those readers and the
-/// paths another member's source names by their repo-relative path.
+/// A `.rs` source with a `../` literal, or of a member whose folder holds a package no member is
+/// ([`with_shared_inputs`]).
+struct Reading {
+    /// Its repo-relative path.
+    path: String,
+    /// The paths its literals may name ([`literal_targets`]).
+    targets: Vec<Target>,
+    /// The repo-relative folder of the package it is in (its nearest manifest), or `None` outside
+    /// every package, where each path it names is another's.
+    package: Option<String>,
+    /// The member whose folder holds its package where no member is that package.
+    adopter: Option<String>,
+}
+
+/// `paths` and every source, of the checkout's `listed` files, that reads one of them from
+/// outside its package: by a `../` literal ([`changed_inputs`]), or through a file outside
+/// it that a `#[path]` or `include!` literal of it names ([`Target::module`]: an embed or a
+/// run-time literal reads only the file it names) and whose declarations and includes, followed
+/// as rustc follows them in a test build ([`crate::own_tests::closure`]), compile or embed one or
+/// name one that is not there, or where this reader cannot settle them, may (any path under that
+/// file's package, or anywhere when it is in none); and in turn every source that reads one of
+/// those.
+/// A source that spells a changed member path is read through too: a source that reads it reads
+/// its spelling. With the readers, it returns where each member spells another's changed path.
+/// A package is the nearest manifest's ([`owning_member`]), so a folder under a member that holds
+/// a manifest of its own is not that member's; but a spelling there is the nearest enclosing
+/// member's, whose build or tests may build and run that nested package, and so is what a reader
+/// there reads of another member's or of no member's ([`Shared::adopted`]); and a source of that
+/// member may name a file there by a literal with no `../` (`literal_targets`' `every`).
 fn with_shared_inputs(
     root: &Path,
     listed: &[String],
@@ -848,70 +1103,245 @@ fn with_shared_inputs(
     members: &Members,
 ) -> Result<Shared, String> {
     let mut readers = BTreeSet::new();
-    let mut named = BTreeSet::new();
+    let mut named: BTreeMap<String, Vec<crate::own_tests::Spelling>> = BTreeMap::new();
+    let mut adopted: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     if paths.is_empty() {
         return Ok(Shared {
             paths,
             readers,
             named,
+            adopted,
         });
     }
-    let owner = |path: &str| {
-        members
-            .0
-            .iter()
-            .find(|m| {
-                path.strip_prefix(&m.dir)
-                    .is_some_and(|p| p.starts_with('/'))
-            })
-            .map(|m| m.dir.as_str())
+    let manifests: Manifests = listed
+        .iter()
+        .filter_map(|path| path.strip_suffix("/Cargo.toml"))
+        .map(str::to_string)
+        .chain(members.0.iter().map(|m| m.dir.clone()))
+        .collect();
+    let package = |path: &str| -> Option<String> {
+        if manifests.holds(path) {
+            Some(path.to_string())
+        } else {
+            owning_dir(path, &manifests).map(str::to_string)
+        }
     };
-    // Each path's owner once, and one trie walk per source for every path its text spells: a
+    let member_at = |dir: &str| members.0.iter().find(|m| m.dir == dir);
+    // The member whose folder holds `path`, the nearest: a nested package no member is, and its
+    // files, are the enclosing member's to build or run.
+    let member_above = |path: &str| {
+        let mut dir = parent_dir(path);
+        while !dir.is_empty() {
+            if let Some(member) = member_at(dir) {
+                return Some(member);
+            }
+            dir = parent_dir(dir);
+        }
+        None
+    };
+    // The members whose folder holds a package no member is, which their tests may build and run:
+    // a source of one may name a file there by a literal with no `../`.
+    let hosts: BTreeSet<&str> = listed
+        .iter()
+        .filter_map(|path| {
+            let dir = path.strip_suffix("/Cargo.toml")?;
+            member_at(dir)
+                .is_none()
+                .then(|| member_above(path))
+                .flatten()
+        })
+        .map(|member| member.name.as_str())
+        .collect();
+    let relative = |path: &Path| -> Option<String> {
+        path.strip_prefix(root)
+            .ok()
+            .and_then(Path::to_str)
+            .map(str::to_string)
+    };
+    // Each path's member once, and one trie walk per source for every path its text spells: a
     // pair-by-pair `text.contains` over thousands of paths and sources ran for hours on an
-    // archive merge's input (27,657 paths against 9,009 sources).
-    let owners: Vec<_> = paths.iter().map(|p| owner(p)).collect();
+    // archive merge's input (27,657 paths against 9,009 sources). A member's spec table is no
+    // member's ([`owning_member`]), so a spelling of it makes no one a namer.
+    let owners: Vec<Option<String>> = paths
+        .iter()
+        .map(|path| package(path).filter(|dir| member_at(dir).is_some() && !spec_table(path, dir)))
+        .collect();
     let spelled = PathTrie::new(paths.iter().map(String::as_str));
+    let listed_files: BTreeSet<&str> = listed.iter().map(String::as_str).collect();
+    // Each source that spells a changed member path, with the paths it spells.
+    let mut spelling: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut sources = Vec::new();
     for source in listed {
         if !source.ends_with(".rs") {
             continue;
         }
-        let Some(member) = members.0.iter().find(|m| {
-            source
-                .strip_prefix(&m.dir)
-                .is_some_and(|p| p.starts_with('/'))
-        }) else {
-            continue;
-        };
         let file = root.join(source);
         let text = match crate::read_regular_text(&file) {
             Ok(text) => text,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(format!("cannot read shared input {}: {e}", file.display())),
         };
-        for index in spelled.contained(&text) {
-            if owners[index] != Some(member.dir.as_str()) {
-                named.insert(paths[index].clone());
+        let home = package(source);
+        let namer = member_above(source);
+        for (index, at) in spelled.found(&text) {
+            let Some(owner) = &owners[index] else {
+                continue;
+            };
+            spelling
+                .entry(source.clone())
+                .or_default()
+                .insert(paths[index].clone());
+            if let Some(namer) = namer.filter(|namer| &namer.dir != owner) {
+                named
+                    .entry(namer.name.clone())
+                    .or_default()
+                    .push(crate::own_tests::Spelling {
+                        file: source.clone(),
+                        path: paths[index].clone(),
+                        at,
+                    });
             }
         }
-        if text.contains("../") {
-            sources.push((source.clone(), file, text, root.join(&member.dir)));
+        let host = namer.is_some_and(|namer| hosts.contains(namer.name.as_str()));
+        if host || text.contains("../") {
+            let base = root.join(home.as_deref().unwrap_or_else(|| parent_dir(source)));
+            let adopter = namer
+                .filter(|_| home.as_deref().is_some_and(|dir| member_at(dir).is_none()))
+                .map(|member| member.name.clone());
+            sources.push(Reading {
+                path: source.clone(),
+                targets: literal_targets(&file, &text, &base, host),
+                package: home,
+                adopter,
+            });
         }
     }
+    // What each foreign file a literal names compiles or embeds, with the package that compiles
+    // it (its `CARGO_MANIFEST_DIR`): `None` where this reader cannot settle it.
+    let mut closures: BTreeMap<(String, String), Option<BTreeSet<String>>> = BTreeMap::new();
+    let text = |path: &str| {
+        listed_files
+            .contains(path)
+            .then(|| crate::read_regular_text(root.join(path)).ok())
+            .flatten()
+    };
     let mut present: BTreeSet<String> = paths.iter().cloned().collect();
-    loop {
-        let changed: BTreeSet<_> = paths.iter().map(|p| root.join(p)).collect();
-        let before = paths.len();
-        for (source, file, text, member) in &sources {
-            if !readers.contains(source) && shares_changed_input(file, text, member, &changed) {
-                readers.insert(source.clone());
-                if present.insert(source.clone()) {
-                    paths.push(source.clone());
+    // The paths of `read` that `source` reads from outside its package, at most `limit` of them:
+    // through a literal ([`changed_inputs`]), or through what a foreign module file it mounts
+    // compiles, embeds or names as missing, or, where that is unsettled, any path under that
+    // file's package, or any at all in none.
+    let mut reads_of = |source: &Reading,
+                        read: &BTreeSet<String>,
+                        changed: &BTreeSet<std::path::PathBuf>,
+                        limit: usize| {
+        let own = source.package.as_deref();
+        let inside = |target: &Path| {
+            own.is_some() && relative(target).and_then(|rel| package(&rel)).as_deref() == own
+        };
+        let mut hits: BTreeSet<String> = changed_inputs(&source.targets, &inside, changed)
+            .take(limit)
+            .filter_map(|path| relative(path))
+            .collect();
+        for target in &source.targets {
+            if hits.len() >= limit {
+                break;
+            }
+            let Some(file) = relative(&target.path) else {
+                continue;
+            };
+            if target.folder
+                || !target.module
+                || !file.ends_with(".rs")
+                || inside(&target.path)
+                || !listed_files.contains(file.as_str())
+            {
+                continue;
+            }
+            let compiler = own.unwrap_or_default().to_string();
+            let closure = closures
+                .entry((file.clone(), compiler.clone()))
+                .or_insert_with(|| {
+                    crate::own_tests::closure(&text, &file, &compiler, true).map(|closure| {
+                        closure
+                            .compiled
+                            .into_keys()
+                            .chain(closure.embedded)
+                            .chain(closure.missing)
+                            .collect()
+                    })
+                });
+            let under = match closure {
+                Some(files) => {
+                    hits.extend(
+                        files
+                            .iter()
+                            .filter(|file| read.contains(*file))
+                            .take(limit)
+                            .cloned(),
+                    );
+                    continue;
                 }
+                None => package(&file).map(|dir| format!("{dir}/")),
+            };
+            hits.extend(
+                read.iter()
+                    .filter(|path| under.as_ref().is_none_or(|dir| path.starts_with(dir)))
+                    .take(limit)
+                    .cloned(),
+            );
+        }
+        hits
+    };
+    let read_now = |paths: &[String]| -> BTreeSet<String> {
+        paths.iter().chain(spelling.keys()).cloned().collect()
+    };
+    loop {
+        let read = read_now(&paths);
+        let changed: BTreeSet<_> = read.iter().map(|p| root.join(p)).collect();
+        let before = paths.len();
+        for source in &sources {
+            if readers.contains(&source.path) || reads_of(source, &read, &changed, 1).is_empty() {
+                continue;
+            }
+            readers.insert(source.path.clone());
+            if present.insert(source.path.clone()) {
+                paths.push(source.path.clone());
             }
         }
         if paths.len() == before {
             break;
+        }
+    }
+    // What an adopted reader reads of another member's, or of no member's, its member observes:
+    // each changed path or reader it reads, and each changed member path a source it reads spells.
+    // What it reads of its member's own is that member's own change, judged by the member's own
+    // placement: the member's tests, which may run the reader, are among its own rows.
+    let read = read_now(&paths);
+    let changed: BTreeSet<_> = read.iter().map(|p| root.join(p)).collect();
+    for source in sources
+        .iter()
+        .filter(|source| readers.contains(&source.path))
+    {
+        let Some((member, dir)) = source
+            .adopter
+            .as_ref()
+            .and_then(|member| Some((member, members.dir(member)?)))
+        else {
+            continue;
+        };
+        let observed: Vec<String> = reads_of(source, &read, &changed, usize::MAX)
+            .iter()
+            .flat_map(|path| {
+                present
+                    .get(path)
+                    .into_iter()
+                    .chain(spelling.get(path).into_iter().flatten())
+            })
+            .filter(|path| package(path).as_deref() != Some(dir) || spec_table(path, dir))
+            .cloned()
+            .collect();
+        if !observed.is_empty() {
+            adopted.entry(member.clone()).or_default().extend(observed);
         }
     }
     paths.sort();
@@ -920,11 +1350,13 @@ fn with_shared_inputs(
         paths,
         readers,
         named,
+        adopted,
     })
 }
 
 /// A byte trie of paths. One walk from each position of a text finds every path the text
-/// contains: exactly the paths for which `text.contains(path)` holds, by the same byte match.
+/// contains: exactly the non-empty paths for which `text.contains(path)` holds, by the same byte
+/// match.
 struct PathTrie {
     nodes: Vec<TrieNode>,
 }
@@ -958,10 +1390,12 @@ impl PathTrie {
         Self { nodes }
     }
 
-    /// The indices of the paths `text` contains, each once, in index order.
-    fn contained(&self, text: &str) -> BTreeSet<usize> {
+    /// The indices of the paths `text` contains, each with every byte offset it starts at, in
+    /// order: each such offset `s` has `text[s..]` starting with the path. An empty path starts
+    /// nowhere and is not listed.
+    fn found(&self, text: &str) -> BTreeMap<usize, Vec<usize>> {
         let bytes = text.as_bytes();
-        let mut found: BTreeSet<usize> = self.nodes[0].ends.iter().copied().collect();
+        let mut found: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for start in 0..bytes.len() {
             let mut at = 0;
             for byte in &bytes[start..] {
@@ -970,7 +1404,9 @@ impl PathTrie {
                     break;
                 };
                 at = node.next[next].1;
-                found.extend(self.nodes[at].ends.iter().copied());
+                for &index in &self.nodes[at].ends {
+                    found.entry(index).or_default().push(start);
+                }
             }
         }
         found
@@ -988,61 +1424,203 @@ fn continued_path(literal: &str) -> Option<&str> {
     after_argument.unwrap_or(literal).strip_prefix('/')
 }
 
-/// Whether `text`, a source of the member at `member`, names something outside that member that
-/// changed through a quoted `../` literal. A literal that continues a directory
-/// ([`continued_path`]) starts at the member: each such literal here that names a real file
-/// continues the manifest directory, and any other matches nothing while no such path exists. Any
-/// other literal may start at the source's folder (`include_str!`) or the member (`Path::join`, a build
-/// script). The literal names one file unless it ends in `/`, which names a folder: a change
-/// under `steps` selects no reader of `"/../a/steps"`, and one of `"/../a/steps/"` does.
-pub(crate) fn shares_changed_input(
+/// A path a quoted `../` literal of a source may name ([`literal_targets`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Target {
+    /// The path, joined and its `.` and `..` folded lexically.
+    pub(crate) path: std::path::PathBuf,
+    /// The literal names a folder: it ends in `/`, is a `#[path]` value that names an existing
+    /// directory (an inline module's, whose `mod x;` children load from it), or is a build
+    /// script's `rerun-if-changed` value that names no existing file (Cargo watches a folder's
+    /// every file, as [`crate::own_tests`]' build inputs read it); and it has a segment other than
+    /// `""`, `.` and `..`, and its folder does not hold the source's package.
+    pub(crate) folder: bool,
+    /// The literal may hand rustc what it names as a module file, whose own declarations and
+    /// includes it follows ([`crate::own_tests::closure`]): a `#[path]` value, an `include!`
+    /// argument, or one this reader cannot tell from those ([`Fed`]). An `include_str!` or
+    /// `include_bytes!` argument and a run-time literal read only the file they name.
+    pub(crate) module: bool,
+}
+
+/// What a source's literals feed, by value, as the census reader reads it ([`literal_targets`]).
+struct Fed {
+    /// The values a `#[path]` or an `include!` takes: rustc compiles what they name.
+    modules: BTreeSet<String>,
+    /// The values of the plain string literals and of each `include_str!` and `include_bytes!`
+    /// argument: what they name is read as bytes, if at all.
+    files: BTreeSet<String>,
+}
+
+impl Fed {
+    /// What `text`'s literals feed, or `None` where any literal may be a module's path: the text
+    /// does not lex, a declaration's path cannot be settled (a `cfg_attr` that may set one, one a
+    /// macro declares), or an `include!` takes an argument this reader cannot read.
+    fn of(text: &str) -> Option<Self> {
+        use aterm_census::items::{IncludeArg, IncludeKind, MountPath, Source};
+        let source = Source::read(text.to_string())?;
+        let mut fed = Self {
+            modules: BTreeSet::new(),
+            files: source
+                .strings()
+                .filter_map(|(value, _)| value.map(str::to_string))
+                .collect(),
+        };
+        for mount in source.mounts() {
+            match &mount.path {
+                MountPath::Default => {}
+                MountPath::Literal(path) => {
+                    fed.modules.insert(path.clone());
+                }
+                MountPath::Unsettled => return None,
+            }
+        }
+        for include in source.includes() {
+            let value = match &include.arg {
+                IncludeArg::Relative(path) | IncludeArg::ManifestDir(path) => path.clone(),
+                IncludeArg::OutDir => continue,
+                IncludeArg::Unknown if include.kind == IncludeKind::Tokens => return None,
+                IncludeArg::Unknown => continue,
+            };
+            if include.kind == IncludeKind::Tokens {
+                fed.modules.insert(value);
+            } else {
+                fed.files.insert(value);
+            }
+        }
+        Some(fed)
+    }
+
+    /// Whether the literal whose text is `quoted` may name a module file: it is a `#[path]` or
+    /// `include!` value, or the value of no plain literal and no embed this reader read (one in a
+    /// comment, or a piece of a `concat!`).
+    fn module(fed: Option<&Self>, quoted: &str) -> bool {
+        fed.is_none_or(|fed| fed.modules.contains(quoted) || !fed.files.contains(quoted))
+    }
+}
+
+/// Every path a quoted `../` literal of `text`, the source at `source` in the package at
+/// `package`, may name. A literal that continues a directory ([`continued_path`]) starts at the
+/// package: each such literal here that names a real file continues the manifest directory, and
+/// any other matches nothing while no such path exists. Any other literal may start at the
+/// source's folder (`include_str!`, a top `#[path]`) or the package (`Path::join`, a build
+/// script); and a `#[path]` inside inline modules starts at a folder below the source's, which
+/// only takes up leading `..` segments, so it may also start at the source's folder with any
+/// number of them dropped. A build script's `cargo:rerun-if-changed=` value starts at the
+/// package. Any other literal names one file unless it ends in `/`, which names a folder: a change
+/// under `steps` is named by no `"/../a/steps"`, and by `"/../a/steps/"`. A `rerun-if-changed`
+/// value names a folder unless it names an existing file, and a `#[path]` value (one after
+/// `path =`) that names an existing directory names a folder ([`Target::folder`]). With `every`,
+/// each other literal on one line names what it may too: a source of a member whose folder holds
+/// a package no member is may name a file there with no `../` (`#[path = "gen/src/g.rs"]`).
+pub(crate) fn literal_targets(
     source: &Path,
     text: &str,
-    member: &Path,
-    changed: &BTreeSet<std::path::PathBuf>,
-) -> bool {
+    package: &Path,
+    every: bool,
+) -> Vec<Target> {
     let Some(parent) = source.parent() else {
-        return false;
+        return Vec::new();
     };
-    text.split('"').any(|literal| {
-        if !literal.contains("../") {
-            return false;
-        }
-        let (path, start) = match continued_path(literal) {
-            Some(path) => (path, member),
-            None => (literal, parent),
-        };
-        let folder = path.ends_with('/')
-            && path
-                .split('/')
-                .any(|segment| !segment.is_empty() && segment != "." && segment != "..");
-        [start, member].into_iter().any(|base| {
-            let mut target = std::path::PathBuf::new();
-            for component in base.join(path).components() {
-                match component {
-                    std::path::Component::ParentDir => {
-                        target.pop();
-                    }
-                    std::path::Component::CurDir => {}
-                    component => target.push(component.as_os_str()),
+    let fold = |base: &Path, path: &str| {
+        let mut target = std::path::PathBuf::new();
+        for component in base.join(path).components() {
+            match component {
+                std::path::Component::ParentDir => {
+                    target.pop();
                 }
+                std::path::Component::CurDir => {}
+                component => target.push(component.as_os_str()),
             }
-            let folder = folder && !member.starts_with(&target);
-            // A changed path at or above `target` is one of its ancestors. One under it sorts
-            // first at or after it, since paths order by components and a folder's
-            // descendants follow it before any path that is not one.
-            !target.starts_with(member)
-                && (target.ancestors().any(|a| changed.contains(a))
-                    || (folder
-                        && changed
-                            .range::<Path, _>((
-                                std::ops::Bound::Included(target.as_path()),
-                                std::ops::Bound::Unbounded,
-                            ))
-                            .next()
-                            .is_some_and(|p| p.starts_with(&target))))
+        }
+        target
+    };
+    let mut targets = Vec::new();
+    let fed = Fed::of(text);
+    let segments: Vec<&str> = text.split('"').collect();
+    for (index, &quoted) in segments.iter().enumerate() {
+        if !quoted.contains("../") && !(every && !quoted.is_empty() && !quoted.contains('\n')) {
+            continue;
+        }
+        let rerun = ["cargo:rerun-if-changed=", "cargo::rerun-if-changed="]
+            .into_iter()
+            .find_map(|prefix| quoted.strip_prefix(prefix));
+        let literal = rerun.unwrap_or(quoted);
+        let attribute = index
+            .checked_sub(1)
+            .is_some_and(|before| path_value(segments[before]));
+        let module = attribute || Fed::module(fed.as_ref(), quoted);
+        let folder = |path: &str, target: &Path| {
+            (path.ends_with('/')
+                || (rerun.is_some() && !target.is_file())
+                || (attribute && target.is_dir()))
+                && path
+                    .split('/')
+                    .any(|segment| !segment.is_empty() && segment != "." && segment != "..")
+        };
+        let mut starts: Vec<(&Path, &str)> = match continued_path(literal) {
+            Some(path) => vec![(package, path)],
+            None => {
+                let mut starts = vec![(parent, literal), (package, literal)];
+                let mut rest = literal;
+                while let Some(shorter) = rest.strip_prefix("../") {
+                    rest = shorter;
+                    starts.push((parent, rest));
+                }
+                starts
+            }
+        };
+        starts.dedup();
+        for (base, path) in starts {
+            let target = fold(base, path);
+            let folder = folder(path, &target) && !package.starts_with(&target);
+            targets.push(Target {
+                path: target,
+                folder,
+                module,
+            });
+        }
+    }
+    targets
+}
+
+/// Whether the code before a literal, `before`, ends in `path =` (and a raw string's `r`): the
+/// literal is a `#[path]` value, outer, inner or under `cfg_attr`, or a binding named `path`.
+fn path_value(before: &str) -> bool {
+    // A raw string's `r` and hashes sit before its quote.
+    let before = before.trim_end_matches('#');
+    let before = before.strip_suffix('r').unwrap_or(before);
+    before
+        .trim_end()
+        .strip_suffix('=')
+        .map(str::trim_end)
+        .and_then(|before| before.strip_suffix("path"))
+        .is_some_and(|before| !before.ends_with(|c: char| c.is_alphanumeric() || c == '_'))
+}
+
+/// Each path of `changed` that one of `targets` ([`literal_targets`]) that is not `inside` the
+/// source's package names: a changed path at or above it, or, for a folder, one under it. A path
+/// may come more than once.
+fn changed_inputs<'a>(
+    targets: &'a [Target],
+    inside: &'a dyn Fn(&Path) -> bool,
+    changed: &'a BTreeSet<std::path::PathBuf>,
+) -> impl Iterator<Item = &'a std::path::PathBuf> {
+    targets
+        .iter()
+        .filter(move |target| !inside(&target.path))
+        .flat_map(move |Target { path, folder, .. }| {
+            // A changed path at or above `path` is one of its ancestors. One under it sorts at or
+            // after it, since paths order by components and a folder's descendants follow it
+            // before any path that is not one.
+            let above = path.ancestors().filter_map(move |a| changed.get(a));
+            let under = changed
+                .range::<Path, _>((
+                    std::ops::Bound::Included(path.as_path()),
+                    std::ops::Bound::Unbounded,
+                ))
+                .take_while(move |p| *folder && p.starts_with(path));
+            above.chain(under)
         })
-    })
 }
 
 pub(crate) const GIT_REDIRECTS: [&str; 8] = [
@@ -1081,7 +1659,10 @@ pub fn changed_since(root: &Path, path_env: &OsStr, base: &str) -> Result<Vec<St
 }
 
 /// The merge-base of HEAD and `base`, and every path changed since it ([`flag_hidden_edits`]).
-fn changed_paths(
+///
+/// # Errors
+/// As [`changed_since`].
+pub(crate) fn changed_paths(
     root: &Path,
     path_env: &OsStr,
     base: &str,

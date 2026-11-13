@@ -407,6 +407,35 @@ fn every_child_builds_in_the_callers_target_dir_and_gets_the_threads_asked_for()
     assert!(has(&threaded, "RUST_TEST_THREADS", &asked));
 }
 
+#[test]
+fn isolated_side_targets_preserve_native_layout_and_do_not_reach_test_children() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let root = physical(scratch.path());
+    let native = root.join("native.noindex");
+    let ctx = Ctx::new(
+        root.clone(),
+        Scope::workspace(),
+        EnvSnapshot {
+            cargo_target_dir: Some(native.clone()),
+            side_lanes_dir: Some(PathBuf::from("isolated.noindex")),
+            ..EnvSnapshot::default()
+        },
+        PathBuf::from("/tmp"),
+    );
+    assert_eq!(plan::lane_dir(&ctx, plan::Lane::MainTarget), Some(native));
+    assert_eq!(
+        plan::lane_dir(&ctx, plan::Lane::TippyTarget),
+        Some(root.join("isolated.noindex/tippy.noindex"))
+    );
+    assert!(ctx.exec_env().remove_env.contains(&SIDE_LANES_ENV));
+    assert!(
+        !ctx.exec_env()
+            .add_env
+            .iter()
+            .any(|(name, _)| name == SIDE_LANES_ENV)
+    );
+}
+
 /// A run's children get the temp directory's quiet folder as `TMPDIR` on macOS. The loud
 /// directory is a private scratch one, not `/tmp`, whose shared quiet folder another program
 /// or user may have made in a form this one refuses (verify passes `std::env::temp_dir()`).
@@ -2332,4 +2361,31 @@ fn a_locked_checkout_runs_the_locked_build_and_says_a_shim_that_does_not() {
         preflight(&with(&[("RUSTC", &other)]), &checkout).is_ok(),
         "no lock: RUSTC is the caller's"
     );
+}
+
+#[test]
+fn pinned_engine_snapshot_values_are_reader_inputs_not_test_child_environment() {
+    let snapshot = EnvSnapshot {
+        publication_engine_git_dir: Some(OsString::new()),
+        publication_engine_commit: Some(OsString::from("invalid")),
+        ..EnvSnapshot::default()
+    };
+    assert_eq!(
+        snapshot.engine_var(engine::GIT_DIR_ENV),
+        Some(OsString::new())
+    );
+    assert_eq!(
+        snapshot.engine_var(engine::COMMIT_ENV),
+        Some(OsString::from("invalid"))
+    );
+    let ctx = Ctx::new(
+        PathBuf::from("/repo"),
+        Scope::workspace(),
+        snapshot,
+        PathBuf::from("/tmp"),
+    );
+    for name in [engine::GIT_DIR_ENV, engine::COMMIT_ENV] {
+        assert!(ctx.exec_env().remove_env.contains(&name));
+        assert!(ctx.exec_env().add_env.iter().all(|(key, _)| key != name));
+    }
 }

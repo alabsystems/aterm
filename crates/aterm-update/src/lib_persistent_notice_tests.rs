@@ -85,18 +85,18 @@ fn an_overdue_pending_build_is_announced_once() {
     assert!(stranded.persistent_class().is_none());
     assert!(
         announcer
-            .tick_overdue(&stranded, "2026-09-25T00:00:00Z", 1790019739, false)
+            .tick_overdue(&stranded, None, "2026-09-25T00:00:00Z", 1790019739, false)
             .is_none(),
         "auto_apply = false is not a failure"
     );
     assert!(
         announcer
-            .tick_overdue(&stranded, "2026-09-22T01:10:00Z", 1790019739, true)
+            .tick_overdue(&stranded, None, "2026-09-22T01:10:00Z", 1790019739, true)
             .is_none(),
         "fifty-nine minutes is not overdue"
     );
     let (title, _) = announcer
-        .tick_overdue(&stranded, "2026-09-22T01:11:00Z", 1790019739, true)
+        .tick_overdue(&stranded, None, "2026-09-22T01:11:00Z", 1790019739, true)
         .expect("past the hour the stranded machine is announced");
     assert_eq!(
         title,
@@ -105,13 +105,13 @@ fn an_overdue_pending_build_is_announced_once() {
     );
     assert!(
         announcer
-            .tick_overdue(&stranded, "2026-09-22T09:00:00Z", 1790019739, true)
+            .tick_overdue(&stranded, None, "2026-09-22T09:00:00Z", 1790019739, true)
             .is_none(),
         "once per build: the row stands, the notice does not repeat"
     );
     assert!(
         announcer
-            .tick_overdue(&stranded, "2026-09-23T00:00:00Z", 1790120495, true)
+            .tick_overdue(&stranded, None, "2026-09-23T00:00:00Z", 1790120495, true)
             .is_none()
     );
     let unattempted = Health {
@@ -121,7 +121,7 @@ fn an_overdue_pending_build_is_announced_once() {
     };
     assert!(
         announcer
-            .tick_overdue(&unattempted, "2026-09-23T02:00:00Z", 1790120495, true)
+            .tick_overdue(&unattempted, None, "2026-09-23T02:00:00Z", 1790120495, true)
             .is_some()
     );
 }
@@ -136,23 +136,18 @@ fn a_withdrawn_build_is_never_announced_as_waiting() {
         h.pending_since = "2026-09-22T01:00:00Z".to_string();
         std::fs::write(s.health(), aterm_toml::to_string(&h).unwrap()).unwrap();
     };
-    for withdrawal in ["none", "quarantine", "yank", "revocation"] {
+    for withdrawal in ["none", "yank", "revocation"] {
         let s = super::paths::Staging::scratch("pending-withdrawn");
         super::note_pending_update(&s, 10, Some(11), None);
         backdate(&s);
         match withdrawal {
-            "quarantine" => super::manifest::quarantine_artifact(
-                &s,
-                11,
-                &"ab".repeat(32),
-                aterm_durable::Flush::Durable,
-            ),
             "yank" => super::manifest::Floor::bump_and_write(&s.floor(), 12, 0, 0),
             "revocation" => super::github::retire_revoked_stage(&s, 11),
             _ => {}
         }
         let h = super::note_pending_update(&s, 10, None, None);
-        let said = super::HealthAnnouncer::new(started.clone()).tick_overdue(&h, later, 10, true);
+        let said =
+            super::HealthAnnouncer::new(started.clone()).tick_overdue(&h, None, later, 10, true);
         if withdrawal == "none" {
             assert!(said.is_some(), "a stranded machine must still be told");
         } else {
@@ -164,6 +159,28 @@ fn a_withdrawn_build_is_never_announced_as_waiting() {
         }
         let _ = std::fs::remove_dir_all(&s.root);
     }
+}
+
+/// A hold withdraws nothing: the held build still waits on this machine, its clock keeps
+/// running, and the overdue notice says the hold and when it lapses.
+#[test]
+fn a_held_build_keeps_its_pending_clock_and_its_notice_names_the_hold() {
+    use super::health::Health;
+    let s = super::paths::Staging::scratch("pending-held");
+    super::note_pending_update(&s, 10, Some(11), None);
+    let mut h = Health::read(&s.health());
+    h.pending_since = "2026-09-22T01:00:00Z".to_string();
+    std::fs::write(s.health(), aterm_toml::to_string(&h).unwrap()).unwrap();
+    let hold = super::hold::stage_failed(&s, 11, "0.11.0", &"ab".repeat(32), "did not start", 1)
+        .expect("held");
+    s.retire_published();
+    let h = super::note_pending_update(&s, 10, None, None);
+    assert_eq!(h.pending_build, 11, "the hold keeps the clock");
+    let (_, body) = super::HealthAnnouncer::new("2026-09-22T00:00:00Z".to_string())
+        .tick_overdue(&h, Some(&hold), "2026-09-22T05:00:00Z", 10, true)
+        .expect("a held build that waits past the hour is told");
+    assert!(body.contains("held until"), "{body}");
+    assert!(body.contains("did not start"), "{body}");
 }
 
 #[test]
@@ -184,7 +201,8 @@ fn a_yanked_installed_bundle_is_never_announced_as_waiting() {
             super::manifest::Floor::bump_and_write(&s.floor(), 12, 0, 0);
         }
         let h = super::note_pending_update(&s, 10, None, Some(11));
-        let said = super::HealthAnnouncer::new(started.clone()).tick_overdue(&h, later, 10, true);
+        let said =
+            super::HealthAnnouncer::new(started.clone()).tick_overdue(&h, None, later, 10, true);
         if yanked {
             assert_eq!(h.pending_build, 0, "a yanked build is never pending");
             assert!(said.is_none(), "build 11 is yanked, not waiting: {said:?}");
@@ -196,7 +214,7 @@ fn a_yanked_installed_bundle_is_never_announced_as_waiting() {
         assert_eq!(h.pending_build, 12, "yanked: {yanked}");
         assert!(
             super::HealthAnnouncer::new(started.clone())
-                .tick_overdue(&h, &super::install::now_rfc3339(), 10, true)
+                .tick_overdue(&h, None, &super::install::now_rfc3339(), 10, true)
                 .is_none(),
             "the successor's clock starts now"
         );
@@ -446,4 +464,64 @@ fn a_taken_up_download_warning_is_not_said_again_for_its_sibling_class() {
         .tick_for_process(&process, &stage, "2026-09-29T10:02:01Z", 7)
         .expect("announced");
     assert_eq!(title, super::health_failing_title("stage"));
+}
+
+/// A WAITING BUILD'S CLOCK STARTS AT ITS FIRST ASK: the node service's check keeps no pending clock
+/// (it has no health hook) and a frozen window's check runs no more, so the node job's ask starts it,
+/// and a later ask reads the same clock. A clock that follows a newer build is read, not restarted.
+/// A held build still waits, so its clock starts too: a hold lapses, it withdraws nothing.
+/// NEGATIVE CONTROL: a build below the operator floor has no clock, and none is started for it.
+#[test]
+fn a_waiting_builds_clock_starts_at_its_first_ask() {
+    use super::health::Health;
+    let s = super::paths::Staging::scratch("pending-waited");
+    assert_eq!(
+        Health::read(&s.health()).pending_build,
+        0,
+        "no check kept a clock"
+    );
+    let first = super::pending_update_waited_at(&s, 10, 11).expect("the ask starts the clock");
+    assert!(first < std::time::Duration::from_secs(60));
+    let mut h = Health::read(&s.health());
+    assert_eq!(h.pending_build, 11);
+    h.pending_since = "2026-09-22T01:00:00Z".to_string();
+    std::fs::write(s.health(), aterm_toml::to_string(&h).unwrap()).unwrap();
+    let later = super::pending_update_waited_at(&s, 10, 11).expect("the same clock");
+    assert!(later > std::time::Duration::from_secs(3600), "{later:?}");
+    assert!(
+        super::pending_update_waited_at(&s, 9, 10).is_some(),
+        "a newer build's clock answers for an older one"
+    );
+    assert_eq!(
+        Health::read(&s.health()).pending_since,
+        "2026-09-22T01:00:00Z"
+    );
+
+    let held = super::paths::Staging::scratch("pending-waited-held");
+    let now = crate::unix_now();
+    super::hold::stage_failed(
+        &held,
+        11,
+        "0.11.0",
+        &"ab".repeat(32),
+        "it would not verify",
+        now,
+    )
+    .expect("the build is held");
+    assert!(
+        super::pending_update_waited_at(&held, 10, 11).is_some(),
+        "a held build still waits, and its clock runs"
+    );
+    assert_eq!(Health::read(&held.health()).pending_build, 11);
+
+    let below = super::paths::Staging::scratch("pending-waited-below-floor");
+    super::manifest::Floor::observe_and_write(
+        &below.floor(),
+        &super::manifest::FloorObservation {
+            min_build: 12,
+            ..super::manifest::FloorObservation::default()
+        },
+    );
+    assert_eq!(super::pending_update_waited_at(&below, 10, 11), None);
+    assert_eq!(Health::read(&below.health()).pending_build, 0);
 }

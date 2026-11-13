@@ -293,6 +293,26 @@ impl Seen {
         seen
     }
 
+    /// What a window holding exactly `events` says at `now`, each event logged by the Mac whose
+    /// Commons uuid (32 hex) it is paired with and folded by the code [`Self::of`] folds an `ev`
+    /// batch with: the journal of the fleet tables' fixture (`crate::fleet::fixture`), which
+    /// holds no Commons to read one from.
+    pub(crate) fn of_events(events: &[(String, Event)], now: u64) -> Self {
+        let mut seen = Self::empty(now);
+        for (n, (uuid, event)) in events.iter().enumerate() {
+            seen.fold_event(uuid, event);
+            seen.events.push(Logged {
+                uuid: uuid.clone(),
+                n: u64::try_from(n).unwrap_or(u64::MAX),
+                event: *event,
+                heard: false,
+            });
+        }
+        seen.drop_withdrawn();
+        seen.sort_events();
+        seen
+    }
+
     /// Add the batches of this Mac's heard archive from `since` on (§7: the log reaches past the
     /// ring's window, labelled "heard by this Mac"): every event no window batch already holds.
     pub(crate) fn hear(&mut self, batches: &[super::heard::Batch]) {

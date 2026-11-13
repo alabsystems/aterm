@@ -58,33 +58,14 @@ pub enum Reject {
     SignerMismatch,
 }
 
-/// Prove that a profile and its key file share one currently authorized release identity.
-/// `floor_seq` is the caller's retained roster floor; a freshly enrolled member may use zero.
-/// No physical hostname is involved: a shared ring identifies its signer, while enrollment
-/// independently decides which members may receive it.
+/// Prove that a profile and its key file share one currently authorized release identity,
+/// under the release master `anchors`. `floor_seq` is the caller's retained roster floor; a
+/// freshly enrolled member may use zero. No physical hostname is involved: a shared ring
+/// identifies its signer, while enrollment independently decides which members may receive it.
 ///
 /// # Errors
 /// A malformed or mismatched key/profile, an untrusted or stale roster, or a signer the roster
 /// does not authorize returns [`Reject`] without including secret values in the error.
-pub fn authorize(
-    profile: &[u8],
-    private_key: &[u8],
-    roster: Vec<u8>,
-    roster_signature: &[u8],
-    floor_seq: u64,
-    now_unix: i64,
-) -> Result<Attribution, Reject> {
-    authorize_with(
-        profile,
-        private_key,
-        roster,
-        roster_signature,
-        aterm_update_core::pins::PAPER_MASTER_PUBKEYS,
-        floor_seq,
-        now_unix,
-    )
-}
-
 pub(crate) fn authorize_with(
     profile: &[u8],
     private_key: &[u8],

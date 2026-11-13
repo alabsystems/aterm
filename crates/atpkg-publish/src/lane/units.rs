@@ -26,6 +26,35 @@ pub const SYSTEMD_PATH: &str = "aterm-auto-atpkg.path";
 /// The Apple lane's 6-hour start interval in seconds.
 pub const START_INTERVAL_SECS: u64 = 21_600;
 
+/// The tip lane's launchd label.
+pub const TIP_LABEL: &str = "systems.alab.aterm-auto-tip";
+
+/// The Apple ready dispatcher's launchd label.
+pub const TIP_READY_LABEL: &str = "systems.alab.aterm-auto-tip-ready";
+
+/// Every launchd job a lane install arms. One lane snapshot is live per machine, so arming one
+/// lane's jobs retires the others'.
+pub const APPLE_LABELS: &[&str] = &[LAUNCHD_LABEL, TIP_LABEL, TIP_READY_LABEL];
+
+/// The tip lane's start interval in seconds: a pass freezes whatever main is then, so a short
+/// interval bounds how stale a qualified build can be. launchd never starts a second pass while
+/// one runs.
+pub const TIP_INTERVAL_SECS: u64 = 900;
+
+/// The ready dispatcher's fallback start interval in seconds: its event is a change of the
+/// ready directory, and this retries a record a pass could not publish.
+pub const TIP_READY_INTERVAL_SECS: u64 = 3600;
+
+/// launchd's own capture of the job `label`, under the lanes' state root.
+#[must_use]
+pub fn launchd_log(state_dir: &Path, label: &str) -> PathBuf {
+    state_dir.join(match label {
+        TIP_LABEL => "tip.launchd.log",
+        TIP_READY_LABEL => "tip-ready.launchd.log",
+        _ => "alab.launchd.log",
+    })
+}
+
 /// What a unit is rendered from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct UnitSpec {
@@ -45,7 +74,8 @@ pub struct UnitSpec {
     pub shim_bin: PathBuf,
     /// Which hosts the unit's runs build (`--host`, §16.1): `gh` until WP15.
     pub host: HostChoice,
-    /// Consume staging notifications instead of building missing programs.
+    /// Consume staging notifications instead of building missing programs (Linux); also arm
+    /// the ready dispatcher beside the tip lane (tip).
     pub staged_only: bool,
 }
 
@@ -60,12 +90,31 @@ impl UnitSpec {
             .flatten();
         std::iter::once(self.binary.display().to_string())
             .chain(host)
-            .chain(self.run_words())
+            .chain(self.run_words(self.staged_only && self.kind != LaneKind::Tip))
             .collect()
     }
 
-    /// `lane run <kind> --sha256 … --log …`.
-    fn run_words(&self) -> Vec<String> {
+    /// The command the tip lane's ready dispatcher runs: [`Self::argv`]'s, as the queued
+    /// staged-only pass, with its own log.
+    #[must_use]
+    pub fn ready_argv(&self) -> Vec<String> {
+        let host = (self.host != HostChoice::Gh)
+            .then(|| ["--host".to_string(), self.host.as_str().to_string()])
+            .into_iter()
+            .flatten();
+        std::iter::once(self.binary.display().to_string())
+            .chain(host)
+            .chain(self.run_words(true))
+            .collect()
+    }
+
+    /// `lane run <kind> --sha256 … --log …`, and for a `queued` pass the staged-only words.
+    fn run_words(&self, queued: bool) -> Vec<String> {
+        let log = if queued && self.kind == LaneKind::Tip {
+            self.state_dir.join("tip-ready.log")
+        } else {
+            super::state::LaneState::of(self.kind, &self.state_dir).log
+        };
         let mut words = vec![
             "lane".into(),
             "run".into(),
@@ -73,12 +122,9 @@ impl UnitSpec {
             "--sha256".into(),
             self.sha256.clone(),
             "--log".into(),
-            super::state::LaneState::of(self.kind, &self.state_dir)
-                .log
-                .display()
-                .to_string(),
+            log.display().to_string(),
         ];
-        if self.staged_only {
+        if queued {
             words.extend(["--staged-only".into(), "--queued".into(), "--json".into()]);
         }
         words
@@ -118,6 +164,13 @@ pub struct Unit {
 pub fn render(spec: &UnitSpec) -> Vec<Unit> {
     match spec.kind {
         LaneKind::Alab => vec![launchd(spec)],
+        LaneKind::Tip => {
+            let mut units = vec![launchd_tip(spec)];
+            if spec.staged_only {
+                units.push(launchd_tip_ready(spec));
+            }
+            units
+        }
         LaneKind::Linux => {
             let mut units = vec![systemd_service(spec), systemd_timer()];
             if spec.staged_only {
@@ -190,20 +243,30 @@ impl Plist {
     }
 }
 
-/// Render the Apple lane's launchd user agent.
-#[must_use]
-pub fn launchd(spec: &UnitSpec) -> Unit {
+/// One launchd user agent of a lane snapshot.
+struct Agent<'a> {
+    label: &'a str,
+    argv: Vec<String>,
+    /// The verb that renders it, for the plist's own comment.
+    rendered_by: &'a str,
+    interval: u64,
+    /// A directory whose change starts the job.
+    watch: Option<PathBuf>,
+    /// Run as a launchd `Background` process, which macOS throttles (CPU and I/O). Not for a
+    /// job whose steps are judged against time bounds another repository committed.
+    background: bool,
+}
+
+fn agent(spec: &UnitSpec, agent: &Agent<'_>) -> Unit {
     let s = |v: &str| Plist::Str(v.to_string());
-    let launchd_log = spec
-        .state_dir
-        .join("alab.launchd.log")
+    let launchd_log = launchd_log(&spec.state_dir, agent.label)
         .display()
         .to_string();
-    let dict = Plist::Dict(vec![
-        ("Label".into(), s(LAUNCHD_LABEL)),
+    let mut entries = vec![
+        ("Label".into(), s(agent.label)),
         (
             "ProgramArguments".into(),
-            Plist::Array(spec.argv().iter().map(|a| s(a)).collect()),
+            Plist::Array(agent.argv.iter().map(|a| s(a)).collect()),
         ),
         (
             "WorkingDirectory".into(),
@@ -234,26 +297,92 @@ pub fn launchd(spec: &UnitSpec) -> Unit {
                 ),
             ]),
         ),
-        ("StartInterval".into(), Plist::Int(START_INTERVAL_SECS)),
+        ("StartInterval".into(), Plist::Int(agent.interval)),
+    ];
+    if let Some(watch) = &agent.watch {
+        entries.push((
+            "WatchPaths".into(),
+            Plist::Array(vec![s(&watch.display().to_string())]),
+        ));
+    }
+    entries.extend([
         ("RunAtLoad".into(), Plist::Bool(true)),
         ("Nice".into(), Plist::Int(10)),
-        ("ProcessType".into(), s("Background")),
+    ]);
+    if agent.background {
+        entries.push(("ProcessType".into(), s("Background")));
+    }
+    entries.extend([
         ("StandardOutPath".into(), s(&launchd_log)),
         ("StandardErrorPath".into(), s(&launchd_log)),
     ]);
-    let mut text = String::from(
+    let mut text = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
          \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-         <!-- Rendered by `atpkg-publish lane install alab`: re-run it to change this agent. -->\n\
+         <!-- Rendered by `atpkg-publish {}`: re-run it to change this agent. -->\n\
          <plist version=\"1.0\">\n",
+        agent.rendered_by
     );
-    dict.write(0, &mut text);
+    Plist::Dict(entries).write(0, &mut text);
     text.push_str("</plist>\n");
     Unit {
-        name: format!("{LAUNCHD_LABEL}.plist"),
+        name: format!("{}.plist", agent.label),
         text,
     }
+}
+
+/// Render the Apple lane's launchd user agent.
+#[must_use]
+pub fn launchd(spec: &UnitSpec) -> Unit {
+    agent(
+        spec,
+        &Agent {
+            label: LAUNCHD_LABEL,
+            argv: spec.argv(),
+            rendered_by: "lane install alab",
+            interval: START_INTERVAL_SECS,
+            watch: None,
+            background: true,
+        },
+    )
+}
+
+/// Render the tip lane's launchd user agent: a pass every [`TIP_INTERVAL_SECS`]. It is not a
+/// `Background` process: a pass's steps are held to the time bounds each product repository
+/// committed, and macOS's throttling of that class would turn a sound build into an overrun.
+#[must_use]
+pub fn launchd_tip(spec: &UnitSpec) -> Unit {
+    agent(
+        spec,
+        &Agent {
+            label: TIP_LABEL,
+            argv: spec.argv(),
+            rendered_by: "lane install tip",
+            interval: TIP_INTERVAL_SECS,
+            watch: None,
+            background: false,
+        },
+    )
+}
+
+/// Render the Apple ready dispatcher's launchd user agent: started when the ready directory
+/// changes (a record enqueued or retired), and every [`TIP_READY_INTERVAL_SECS`] besides. Each
+/// start is the queued staged-only pass, which is idle on an empty queue and still checks its
+/// installed hash, the fresh signed head and every record.
+#[must_use]
+pub fn launchd_tip_ready(spec: &UnitSpec) -> Unit {
+    agent(
+        spec,
+        &Agent {
+            label: TIP_READY_LABEL,
+            argv: spec.ready_argv(),
+            rendered_by: "lane install tip --staged-only",
+            interval: TIP_READY_INTERVAL_SECS,
+            watch: Some(super::state::LaneState::of(LaneKind::Tip, &spec.state_dir).ready_dir()),
+            background: true,
+        },
+    )
 }
 
 fn exec_word(s: &str) -> String {

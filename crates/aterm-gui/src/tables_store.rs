@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! The Tables page's one reach into the registry: a read of every shown collection as the grid
-//! lays it out (`aterm_db::typed::grid::export`, addresses and secrets masked), with each cell's
-//! candidates and each operation's author, and a write of the staged cells through
+//! lays it out (`aterm_db::typed::grid::export`, addresses and secrets masked), at the head or as
+//! of a past operation (`Handle::view_at`) with what changed since (`Handle::diff`), with each
+//! cell's candidates and each operation's author, and a write of the staged cells through
 //! [`aterm_db::att::Handle::save`], the same save `aterm db table apply` makes. Nothing here
 //! runs on the main thread: [`crate::native_tables`]'s worker calls it.
 
@@ -17,7 +18,8 @@ use aterm_db::typed::{Collection, Ty, Writer};
 
 #[cfg(unix)]
 use crate::native_tables::{
-    Author, AuthorKind, Group, Sheet, SheetColumn, SheetRow, Shown, Written, WrittenCell,
+    AsOf, Author, AuthorKind, Group, Sheet, SheetColumn, SheetRow, Shown, Since, Written,
+    WrittenCell,
 };
 use crate::native_tables::{Snapshot, Staged, Wrote};
 
@@ -76,39 +78,203 @@ fn shown_value(ty: &Ty, value: Option<&aterm_json::Value>) -> String {
     }
 }
 
-/// Read every shown collection of this Mac's registry.
+/// One seat of this Mac's membership log: the Commons actor it is keyed by, the machine its
+/// binding names, and its label (`m73`).
+#[cfg(unix)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Seat {
+    pub(crate) actor: [u8; 48],
+    pub(crate) machine: [u8; 16],
+    pub(crate) label: String,
+}
+
+/// Every seat this Mac's membership log holds, removed ones included: a removed Mac's signed rows
+/// are still its own. None where the vault holds no log here.
+#[cfg(unix)]
+fn seats(paths: &Paths) -> Vec<Seat> {
+    let Ok(read) = aterm_secrets::client::load_acknowledged_and_ahead(paths) else {
+        return Vec::new();
+    };
+    let Some(log) = read.acknowledged.log() else {
+        return Vec::new();
+    };
+    aterm_secrets::client::seats_ever(log)
+        .into_iter()
+        .map(|(actor, machine, label)| Seat {
+            actor,
+            machine,
+            label,
+        })
+        .collect()
+}
+
+/// Each writer's label, from what aterm already holds: an operation's actor names a seat, the
+/// seat a Commons machine, and the machine a label. Nothing here makes a name up: a writer none
+/// of these name has no label.
+#[cfg(unix)]
+#[derive(Debug, Default)]
+pub(crate) struct Writers {
+    by_actor: BTreeMap<[u8; 48], String>,
+    by_machine: BTreeMap<[u8; 16], String>,
+}
+
+#[cfg(unix)]
+impl Writers {
+    /// The labels `machines` (the registry's machine rows), `facts` (each Mac's own statement,
+    /// keyed by its Commons machine) and `seats` (this Mac's membership log) give.
+    ///
+    /// A machine's label is, first, the registry's: the unconflicted `label` of the machine row
+    /// its facts row binds (`merged_into` where it states one). Then the label its facts row
+    /// states, then its seat's. A facts row's `predecessor` is the same Mac before writer
+    /// succession, so that machine's operations take the successor's label.
+    pub(crate) fn new(
+        machines: &aterm_db::typed::cell::Projection,
+        facts: &aterm_db::typed::owned::OwnedRead,
+        seats: &[Seat],
+    ) -> Self {
+        let text = |value: &aterm_json::Value, column: &str| {
+            value
+                .get(column)
+                .and_then(aterm_json::Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+        };
+        let registry = |mac: &str| {
+            let row = machines.rows.get(mac)?;
+            if row.raw.contains("label") || row.fields.get("label")?.conflicted() {
+                return None;
+            }
+            row.get("label")
+                .and_then(aterm_json::Value::as_str)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+        };
+        let mut by_machine: BTreeMap<[u8; 16], String> = BTreeMap::new();
+        for row in facts.rows.values() {
+            let mac = text(&row.value, "merged_into").or_else(|| text(&row.value, "mac"));
+            if let Some(label) = mac
+                .as_deref()
+                .and_then(registry)
+                .or_else(|| text(&row.value, "label"))
+            {
+                by_machine.insert(row.machine, label);
+            }
+        }
+        let mut by_actor = BTreeMap::new();
+        for seat in seats {
+            by_actor.insert(seat.actor, seat.label.clone());
+            by_machine
+                .entry(seat.machine)
+                .or_insert_with(|| seat.label.clone());
+        }
+        // Each pass carries a label one predecessor back; a chain is no longer than the rows.
+        for _ in 0..facts.rows.len() {
+            let mut carried = false;
+            for row in facts.rows.values() {
+                let Some(before) = text(&row.value, "predecessor")
+                    .and_then(|p| aterm_db::typed::keys::parse_uuid32(&p))
+                else {
+                    continue;
+                };
+                if by_machine.contains_key(&before) {
+                    continue;
+                }
+                if let Some(label) = by_machine.get(&row.machine).cloned() {
+                    by_machine.insert(before, label);
+                    carried = true;
+                }
+            }
+            if !carried {
+                break;
+            }
+        }
+        Self {
+            by_actor,
+            by_machine,
+        }
+    }
+
+    /// The label of the Mac that signed as `actor` from Commons machine `machine`, where any is
+    /// known.
+    pub(crate) fn label(&self, actor: &[u8; 48], machine: Option<&[u8; 16]>) -> Option<String> {
+        machine
+            .and_then(|m| self.by_machine.get(m))
+            .or_else(|| self.by_actor.get(actor))
+            .cloned()
+    }
+}
+
+/// What names a writer no label names: the start of its Commons machine id, else of its actor.
+#[cfg(unix)]
+pub(crate) fn short_id(actor: &[u8; 48], machine: Option<&[u8; 16]>) -> String {
+    match machine {
+        Some(machine) => aterm_codec::hex::encode_lower(&machine[..4]),
+        None => aterm_codec::hex::encode_lower(&actor[..4]),
+    }
+}
+
+/// The column that names a row of `collection` among the shown `columns`: the first that is
+/// unique by itself (a machine's or a mailbox's `label`, an address's `addr`), else its `label`,
+/// else its first column.
+#[cfg(unix)]
+fn key_column(collection: &Collection, columns: &[SheetColumn]) -> String {
+    let shown = |name: &str| {
+        columns
+            .iter()
+            .any(|c| c.name == name && c.group == Group::Stored)
+    };
+    collection
+        .unique
+        .iter()
+        .filter_map(|names| match names {
+            [name] => Some(*name),
+            _ => None,
+        })
+        .chain(["label"])
+        .find(|name| shown(name))
+        .map(str::to_owned)
+        .or_else(|| columns.first().map(|c| c.name.clone()))
+        .unwrap_or_default()
+}
+
+/// Read every shown collection of this Mac's registry, as of the operation `at` names (the head
+/// where `None`), and, as of a past one, what changed in each since.
 ///
 /// # Errors
 /// The registry cannot be read here: no Commons, or not subscribed, or its store answered busy
-/// past the read's deadline.
+/// past the read's deadline; or this Mac holds no operation `at`.
 #[cfg(unix)]
-pub(crate) fn read(paths: &Paths) -> Result<Snapshot, String> {
-    use aterm_db::att::{Handle, REGISTRY};
+pub(crate) fn read(paths: &Paths, at: Option<[u8; 32]>) -> Result<Snapshot, String> {
+    use aterm_db::att::{Handle, Point, REGISTRY};
     let handle = Handle::at(paths.clone(), &REGISTRY);
     let compiled = handle.compiled();
-    let view = handle.view().map_err(|e| e.to_string())?;
+    let view = handle
+        .view_at(at.map_or(Point::Head, Point::At))
+        .map_err(|e| e.to_string())?;
     let history = handle.history().map_err(|e| e.to_string())?;
-    let labels: BTreeMap<String, String> = view
-        .owned
-        .get("machine-facts")
-        .map(|facts| {
-            facts
-                .rows
-                .iter()
-                .filter_map(|(uuid, row)| {
-                    Some((uuid.clone(), row.value.get("label")?.as_str()?.to_owned()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let since = match at {
+        Some(at) => {
+            handle
+                .diff(at, Point::Head)
+                .map_err(|e| e.to_string())?
+                .cells
+        }
+        None => Vec::new(),
+    };
+    let empty = aterm_db::typed::owned::OwnedRead::default();
+    // A writer is named as the registry names its Mac now, in a past table too: history runs
+    // past the point, and a Mac labelled since is still that Mac.
+    let head = match at {
+        Some(_) => Some(handle.view().map_err(|e| e.to_string())?),
+        None => None,
+    };
+    let names = head.as_ref().unwrap_or(&view);
+    let writers = Writers::new(
+        &names.project(&aterm_db::alab::registry::MACHINE),
+        names.owned.get("machine-facts").unwrap_or(&empty),
+        &seats(paths),
+    );
     let author = |entry: &aterm_db::att::Entry| -> Author {
-        let machine = entry.machine.as_ref().map(|m| {
-            let uuid = aterm_db::typed::keys::uuid32(m);
-            labels
-                .get(&uuid)
-                .cloned()
-                .unwrap_or_else(|| uuid.chars().take(8).collect())
-        });
         let mut kind = AuthorKind::Person;
         for change in &entry.changes {
             if let Some(cell) = change
@@ -125,7 +291,8 @@ pub(crate) fn read(paths: &Paths) -> Result<Snapshot, String> {
         }
         Author {
             kind,
-            machine,
+            label: writers.label(&entry.actor, entry.machine.as_ref()),
+            id: short_id(&entry.actor, entry.machine.as_ref()),
             at_ms: entry.authored_ms,
             hlc: (entry.hlc.ms, entry.hlc.counter),
         }
@@ -143,7 +310,8 @@ pub(crate) fn read(paths: &Paths) -> Result<Snapshot, String> {
     for (name, title, singular) in SHOWN {
         let (collection, projection) = &projections[name];
         let collection: &'static Collection = collection;
-        let export = grid::export(compiled.table, collection, &view.cells, &[], false)
+        let export = view
+            .export_grid(compiled.table, collection, &[], false, None)
             .map_err(|e| e.to_string())?;
         let base = export.base;
         let mut columns: Vec<SheetColumn> = base
@@ -340,25 +508,92 @@ pub(crate) fn read(paths: &Paths) -> Result<Snapshot, String> {
             }
             if !changed.is_empty() {
                 written.push(Written {
+                    operation: entry.operation,
                     by: author(entry),
                     cells: changed,
                 });
             }
         }
+        let key = key_column(collection, &columns);
         sheets.push(Sheet {
             name,
             title,
             singular,
+            key,
             columns,
             rows,
             written,
+            since: since_then(collection, &since, &by_operation),
             base,
         });
     }
     Ok(Snapshot {
         sheets,
+        at: at.map(|operation| AsOf {
+            operation,
+            by: by_operation.get(&operation).cloned(),
+        }),
         read_ms: aterm_time::unix_millis().unwrap_or(0),
     })
+}
+
+/// What changed in `collection` since the point a past read is at, by row and column: what the
+/// cell holds now as the pane shows it (a set by the members put in or taken out), and who wrote
+/// that. A secret says only whether it holds one.
+#[cfg(unix)]
+fn since_then(
+    collection: &'static Collection,
+    cells: &[aterm_db::att::CellDiff],
+    by_operation: &BTreeMap<[u8; 32], Author>,
+) -> BTreeMap<(String, String), Since> {
+    let mut found: BTreeMap<(String, String), Since> = BTreeMap::new();
+    for cell in cells.iter().filter(|c| c.collection == collection.name) {
+        let Ok(key) = aterm_db::typed::cell::CellKey::parse(&cell.key) else {
+            continue;
+        };
+        let Some(schema) = collection.column(key.col) else {
+            continue;
+        };
+        let now = match key.elem {
+            Some(member) => match cell.delta {
+                aterm_db::att::Delta::Retired => format!("\u{2212} {member}"),
+                _ => format!("+ {member}"),
+            },
+            None => {
+                let mut values: Vec<String> = cell
+                    .after
+                    .iter()
+                    .filter_map(|c| aterm_db::typed::cell::CellValue::decode(&c.value).ok())
+                    .map(|c| shown_value(&schema.ty, Some(&c.x)))
+                    .filter(|text| !text.is_empty())
+                    .collect();
+                values.sort();
+                values.dedup();
+                values.join(" / ")
+            }
+        };
+        let entry = found
+            .entry((key.pk.to_owned(), key.col.to_owned()))
+            .or_insert_with(|| Since {
+                now: String::new(),
+                by: Vec::new(),
+                members: key.elem.is_some(),
+            });
+        if entry.now.is_empty() {
+            entry.now = now;
+        } else {
+            entry.now = format!("{}, {now}", entry.now);
+        }
+        for maker in &cell.by {
+            if let Some(author) = by_operation.get(&maker.operation)
+                && !entry.by.contains(author)
+            {
+                entry.by.push(author.clone());
+            }
+        }
+        entry.by.sort_by_key(|author| author.hlc);
+    }
+    found
 }
 
 #[cfg(unix)]
@@ -423,9 +658,16 @@ pub(crate) fn write(paths: &Paths, staged: Vec<Staged>) -> Result<Wrote, String>
                         .get(problem.column)
                         .map(|h| h.trim_start_matches(grid::READ_ONLY).to_owned())
                         .unwrap_or_default();
+                    // The page shows the rule at the cell it names, so a rule's own
+                    // `<collection>.<column>: ` is not said again.
+                    let placed = format!("{}.{column}: ", base.collection);
+                    let rule = problem
+                        .rule
+                        .strip_prefix(&placed)
+                        .map_or(problem.rule.clone(), str::to_owned);
                     wrote
                         .refused
-                        .push((base.collection.clone(), pk, column, problem.rule));
+                        .push((base.collection.clone(), pk, column, rule));
                 }
             }
         }
@@ -461,7 +703,7 @@ pub(crate) fn live() -> Result<Paths, String> {
 }
 
 #[cfg(not(unix))]
-pub(crate) fn read(_: &Paths) -> Result<Snapshot, String> {
+pub(crate) fn read(_: &Paths, _: Option<[u8; 32]>) -> Result<Snapshot, String> {
     Err("the registry is kept on macOS and Linux".into())
 }
 

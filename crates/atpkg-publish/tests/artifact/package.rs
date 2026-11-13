@@ -14,7 +14,7 @@ use atpkg_publish::artifact::package::{
 use atpkg_publish::channel::Log;
 use atpkg_publish::channel::index::{parse_delta, publish_with};
 use atpkg_publish::channel::mirror::{self, MirrorOptions};
-use atpkg_publish::ctx::Ctx;
+use atpkg_publish::ctx::{Ctx, HostChoice};
 use atpkg_publish::error::Error;
 use atpkg_publish::host::Slug;
 use atpkg_publish::host::fake::FakeHost;
@@ -96,6 +96,344 @@ fn a_regular_release_binds_explicit_atpkg_ownership_to_committed_version_and_bas
     );
 }
 
+#[test]
+fn a_campaign_retains_exact_signed_inputs_before_publication_and_reopens_without_the_working_output()
+ {
+    use atpkg_publish::channel::index::{
+        PreparedPublication, PublicationObserver, publish_with_observer,
+    };
+    use atpkg_publish::package_campaign::{Campaign, Intent, Observation, Retention};
+
+    struct StopAfterRetention<'a>(Retention<'a>);
+    impl PublicationObserver for StopAfterRetention<'_> {
+        fn before_publish(&mut self, prepared: &PreparedPublication<'_>) -> Result<(), Error> {
+            self.0.before_publish(prepared)?;
+            Err(Error::cannot_run(
+                "fixture lost the caller after durable retention",
+            ))
+        }
+    }
+
+    let w = world("pkg-campaign-signed-inputs");
+    let root = regular_campaign_package(&w);
+    let pkg =
+        package::read_package(&root, "codex", atpkg_publish::triple::AARCH64_APPLE_DARWIN).unwrap();
+    let frozen = Intent::from_package(&w.ctx, "codex", ALAB, &pkg).unwrap();
+    let journal = w.root.join("campaign");
+    let mut campaign = Campaign::open(&journal, &frozen).unwrap();
+    let mut package_request = w.request(&root, ALAB);
+    package_request.toolchain = None;
+    let inputs = atpkg_publish::project_toolchain::Inputs {
+        prefix: w.ctx.pkg_prefix.clone(),
+        repo: w.source.clone(),
+        path: "/usr/bin:/bin".into(),
+        cargo_home: w.root.join("fixture cargo home"),
+        overrides: vec![],
+    };
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let packed = campaign
+        .qualify_package(&w.ctx, &package_request, &w.tools, &inputs, &signed_root)
+        .unwrap();
+    let repeated = campaign
+        .qualify_package(&w.ctx, &package_request, &w.tools, &inputs, &signed_root)
+        .unwrap();
+    assert_eq!(files_of(&packed), files_of(&repeated));
+    assert!(packed.asset.starts_with(&journal));
+    let archive = read(&packed.asset);
+    std::fs::write(&packed.asset, b"changed retained archive").unwrap();
+    let error = campaign
+        .qualify_package(&w.ctx, &package_request, &w.tools, &inputs, &signed_root)
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("retained package bytes differ"),
+        "{error}"
+    );
+    assert_eq!(read(&packed.asset), b"changed retained archive");
+    // Repair only the test fixture so the rest can exercise index recovery.
+    std::fs::write(&packed.asset, archive).unwrap();
+    assert!(
+        campaign
+            .observations()
+            .any(|event| matches!(event, Observation::Qualified { .. }))
+    );
+    let staged = campaign
+        .stage_package(&w.ctx, &package_request, &w.tools, &inputs, &signed_root)
+        .unwrap();
+    assert!(staged.uploaded);
+    assert!(
+        campaign
+            .observations()
+            .any(|event| matches!(event, Observation::Staged { .. }))
+    );
+    let staged_changes = w.host.changes();
+    let request = IndexRequest {
+        baseline: Baseline::ChannelHead,
+        delta: parse_delta(&["--pin".into(), format!("codex={ALAB}")]).unwrap(),
+        out: w.root.join("index-working-output"),
+        upload: true,
+        pack_dir: None,
+    };
+    let mut observer = StopAfterRetention(campaign.retention(&w.ctx));
+    let result = publish_with_observer(&w.ctx, &request, &mut Log::capture("test"), &mut observer);
+    assert!(
+        matches!(&result, Err(Error::CannotRun(message)) if message.contains("lost the caller")),
+        "{result:?}"
+    );
+    let retained = observer
+        .0
+        .into_retained()
+        .expect("native retention finished before the simulated failure");
+    assert_eq!(retained.candidate().index.index_build, 72);
+    assert_eq!(retained.predecessor().index.index_build, 71);
+    let original = atpkg_publish::channel::index::quad_digests(retained.candidate()).unwrap();
+    drop(campaign);
+    std::fs::remove_dir_all(&request.out).unwrap();
+    let mut reopened = Campaign::open(&journal, &frozen).unwrap();
+    let resumed = reopened.retained_index(&w.ctx).unwrap().unwrap();
+    assert_eq!(
+        atpkg_publish::channel::index::quad_digests(resumed.candidate()).unwrap(),
+        original
+    );
+    let mut unrelated = request.clone();
+    unrelated.out = w.root.join("unrelated-index-change");
+    unrelated.delta.min_build = Some(2);
+    let mut separate = Campaign::open(&w.root.join("unrelated-campaign"), &frozen).unwrap();
+    let mut retention = separate.retention(&w.ctx);
+    let result = publish_with_observer(
+        &w.ctx,
+        &unrelated,
+        &mut Log::capture("test"),
+        &mut retention,
+    );
+    assert!(
+        matches!(result, Err(Error::Refused(message)) if message.contains("more than the frozen package pin"))
+    );
+    drop(retention);
+    assert!(separate.retained_index(&w.ctx).unwrap().is_none());
+    assert!(
+        !reopened
+            .observations()
+            .any(|event| matches!(event, Observation::IndexPublished { .. }))
+    );
+    assert_eq!(w.host.changes(), staged_changes);
+    let published = reopened
+        .publish_package(
+            &w.ctx,
+            &package_request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            &mut Log::capture("resume"),
+        )
+        .unwrap();
+    assert_eq!(published.published.index_build, 72);
+    assert_eq!(
+        atpkg_publish::channel::index::quad_digests(resumed.candidate()).unwrap(),
+        original
+    );
+    let creates = w
+        .host
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("create "))
+        .count();
+    let repeated = reopened
+        .publish_package(
+            &w.ctx,
+            &package_request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            &mut Log::capture("repeat"),
+        )
+        .unwrap();
+    assert_eq!(repeated.published.index_build, 72);
+    assert_eq!(
+        w.host
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with("create "))
+            .count(),
+        creates
+    );
+    assert!(
+        reopened
+            .observations()
+            .any(|event| matches!(event, Observation::IndexPublished { build: 72, .. }))
+    );
+    let newer = IndexRequest {
+        baseline: Baseline::ChannelHead,
+        delta: Default::default(),
+        out: w.root.join("newer-index"),
+        upload: true,
+        pack_dir: None,
+    };
+    assert_eq!(
+        publish_with(&w.ctx, &newer, &mut Log::capture("newer"))
+            .unwrap()
+            .published
+            .index_build,
+        73
+    );
+    let before = w.host.calls();
+    let error = reopened
+        .resume_index(&w.ctx, &mut Log::capture("superseded"))
+        .unwrap_err();
+    assert!(error.to_string().contains("refusing to repin"), "{error}");
+    let writes = |calls: &[String]| {
+        calls
+            .iter()
+            .filter(|call| {
+                call.starts_with("create")
+                    || call.starts_with("upload")
+                    || call.starts_with("publish-draft")
+            })
+            .count()
+    };
+    assert_eq!(writes(&w.host.calls()), writes(&before));
+    std::fs::write(resumed.candidate().file(QUAD_FILES[0]), b"truncated").unwrap();
+    assert!(reopened.retained_index(&w.ctx).is_err());
+}
+
+#[test]
+fn a_package_campaign_publishes_from_native_qualification_and_repeats_the_same_index() {
+    use atpkg_publish::package_campaign::{Campaign, Intent, Observation};
+    let w = world("pkg-campaign-complete-publication");
+    let root = regular_campaign_package(&w);
+    let pkg =
+        package::read_package(&root, "codex", atpkg_publish::triple::AARCH64_APPLE_DARWIN).unwrap();
+    let intent = Intent::from_package(&w.ctx, "codex", ALAB, &pkg).unwrap();
+    let state = w.root.join("campaign");
+    let mut request = w.request(&root, ALAB);
+    request.toolchain = None;
+    let inputs = atpkg_publish::project_toolchain::Inputs {
+        prefix: w.ctx.pkg_prefix.clone(),
+        repo: w.source.clone(),
+        path: "/usr/bin:/bin".into(),
+        cargo_home: w.root.join("fixture cargo home"),
+        overrides: vec![],
+    };
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let mut campaign = Campaign::open(&state, &intent).unwrap();
+    let published = campaign
+        .publish_package(
+            &w.ctx,
+            &request,
+            &w.tools,
+            &inputs,
+            &signed_root,
+            &mut Log::capture("publish"),
+        )
+        .unwrap();
+    assert_eq!(published.published.index_build, 72);
+    assert!(
+        campaign
+            .observations()
+            .any(|event| matches!(event, Observation::Staged { .. }))
+    );
+    drop(campaign);
+    let creates = w
+        .host
+        .calls()
+        .iter()
+        .filter(|call| call.starts_with("create "))
+        .count();
+    let mut reopened = Campaign::open(&state, &intent).unwrap();
+    assert_eq!(
+        reopened
+            .publish_package(
+                &w.ctx,
+                &request,
+                &w.tools,
+                &inputs,
+                &signed_root,
+                &mut Log::capture("repeat"),
+            )
+            .unwrap()
+            .published
+            .index_build,
+        72
+    );
+    assert_eq!(
+        w.host
+            .calls()
+            .iter()
+            .filter(|call| call.starts_with("create "))
+            .count(),
+        creates
+    );
+}
+
+#[test]
+fn the_package_campaign_cli_refuses_overrides_and_non_agh_hosts_before_creating_state() {
+    let w = world("pkg-campaign-cli-admission");
+    // The `gh` arm's refusal, said outright: the world is built for agh.
+    let gh = w.ctx.clone().with_host_choice(HostChoice::Gh);
+    let state = w.root.join("never-created");
+    let args = vec![
+        "unread-package".into(),
+        "--build".into(),
+        ALAB.to_string(),
+        "--source-repo".into(),
+        w.source.to_string_lossy().into_owned(),
+        "--state".into(),
+        state.to_string_lossy().into_owned(),
+    ];
+    let error = atpkg_publish::package_campaign::run(&gh, &args).unwrap_err();
+    assert!(error.to_string().contains("requires --host agh"), "{error}");
+    for flag in ["--key", "--toolchain", "--out", "--upload"] {
+        let mut invalid = args.clone();
+        invalid.push(flag.into());
+        assert!(matches!(
+            atpkg_publish::package_campaign::run(&gh, &invalid),
+            Err(Error::Usage(_))
+        ));
+    }
+    assert!(!state.exists());
+    assert_eq!(w.host.changes(), 0);
+}
+
+fn regular_campaign_package(w: &World) -> PathBuf {
+    // This campaign exercises a codex-only channel. The broader world also
+    // names ay without laying its packs, which intentionally cannot publish.
+    w.keys.publish_quad(
+        &w.host,
+        &w.ctx.index_slug(),
+        71,
+        &w.keys
+            .index_toml(71, &[("codex", "aterm")], &[("codex", LIVE_CODEX)]),
+    );
+    put(&w.source.join("VERSION"), b"0.5.0\n");
+    put(
+        &w.source.join("alab/versions.toml"),
+        b"[[release]]\nversion = '0.5.0'\nbaseline = '0.167.1'\n",
+    );
+    git(&w.source, &["add", "."]);
+    git(&w.source, &["commit", "-q", "-m", "regular release"]);
+    git(&w.source, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    let lay = Lay {
+        version: "0.5.0".into(),
+        source: git(&w.source, &["rev-parse", "HEAD"]),
+        baseline: Some("0.167.1".into()),
+        ..w.lay()
+    };
+    let root = w.package("regular", &lay);
+    let record = root.join("alab-build.json");
+    let mut value: aterm_json::Value = aterm_json::from_slice(&read(&record)).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("updater".into(), "atpkg".into());
+    std::fs::write(&record, aterm_json::to_vec(&value).unwrap()).unwrap();
+    root
+}
+
 struct World {
     _tmp: aterm_tempfile::TempDir,
     root: PathBuf,
@@ -120,7 +458,9 @@ fn world(label: &str) -> World {
         &Slug::new("alabsystems", "codex-alab"),
         &root.join("remotes/alabsystems/codex-alab.git"),
     );
-    let ctx = keys.ctx(&home, host.clone());
+    let ctx = keys
+        .ctx(&home, host.clone())
+        .with_host_choice(HostChoice::Agh);
     keys.publish_quad(
         &host,
         &ctx.index_slug(),
@@ -131,7 +471,7 @@ fn world(label: &str) -> World {
             &[("ay", 5), ("codex", LIVE_CODEX)],
         ),
     );
-    trust_repo(&home.join("trust"), DORMANT_LEDGER);
+    trust_repo(&home.join("trust"), DORMANT_LEDGER, &ctx, &host);
     let payload = ctx.pkg_prefix.join("store/trust/1");
     let bin = fixture_toolchain(&payload);
     std::fs::rename(
@@ -995,4 +1335,71 @@ fn the_index_pins_an_alab_build_only_over_a_pack_that_verifies() {
         "only the pack's source check read codex-alab: {:?}",
         w2.host.calls()
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_campaign_binds_source_modes_separately_from_the_signed_payload() {
+    use atpkg_publish::package_campaign::{Campaign, Intent};
+    use std::os::unix::fs::PermissionsExt as _;
+    let w = world("pkg-campaign-source-modes");
+    let root = regular_campaign_package(&w);
+    let binary = root.join("bin/codex");
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let before = atpkg::tree::tree_roots_for_pack(&root).unwrap();
+    assert_ne!(before.source, before.payload);
+    let frozen = Intent::from_package(
+        &w.ctx,
+        "codex",
+        ALAB,
+        &package::read_package(&root, "codex", atpkg_publish::triple::AARCH64_APPLE_DARWIN)
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        std::fs::metadata(&binary).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+    let mut campaign = Campaign::open(&w.root.join("campaign"), &frozen).unwrap();
+    let mut request = w.request(&root, ALAB);
+    request.toolchain = None;
+    let inputs = atpkg_publish::project_toolchain::Inputs {
+        prefix: w.ctx.pkg_prefix.clone(),
+        repo: w.source.clone(),
+        path: "/usr/bin:/bin".into(),
+        cargo_home: w.root.join("fixture cargo home"),
+        overrides: vec![],
+    };
+    let signed_root = |build| {
+        assert_eq!(build, 1);
+        atpkg::tree::tree_root(w.bin.parent().unwrap()).map_err(|error| error.to_string())
+    };
+    let host_changes = w.host.changes();
+    let packed = campaign
+        .qualify_package(&w.ctx, &request, &w.tools, &inputs, &signed_root)
+        .unwrap();
+    let authority = atpkg_publish::artifact::sign::authority(&w.ctx).unwrap();
+    let manifest = authority
+        .verify_pkg(&read(&packed.manifest), &read(&packed.signature))
+        .unwrap();
+    assert!(
+        manifest
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.tree_root == before.payload)
+    );
+    assert_eq!(
+        std::fs::metadata(&binary).unwrap().permissions().mode() & 0o7777,
+        0o700
+    );
+    std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let after = atpkg::tree::tree_roots_for_pack(&root).unwrap();
+    assert_eq!(before.payload, after.payload);
+    assert_ne!(before.source, after.source);
+    assert!(
+        campaign
+            .qualify_package(&w.ctx, &request, &w.tools, &inputs, &signed_root)
+            .is_err()
+    );
+    assert_eq!(w.host.changes(), host_changes);
 }

@@ -162,14 +162,18 @@ pub struct StageSpec {
 
 /// The side lanes' build directories ([`SIDE_LANES`]), each `*.noindex`, live under
 /// the managed build cache when the shim selects it, so removing a worktree does not
-/// discard its expensive compiler artifacts. Caller-selected layouts keep them in
+/// discard its expensive compiler artifacts. An explicit [`crate::SIDE_LANES_ENV`] selects
+/// a separate root while preserving the native layout. Other caller-selected layouts keep them in
 /// `<target>/verify/.ubd`. Both use a folder whose file events fseventsd drops (`aterm_tempfile::QUIET`):
 /// one checkout's lint lane gave it 4,983 file events in a 10-minute census, and a lane under
 /// `.ubd` gives it none.
 #[must_use]
 pub fn lanes_dir(ctx: &Ctx) -> PathBuf {
-    ctx.cached_lanes_dir
-        .clone()
+    ctx.env
+        .side_lanes_dir
+        .as_ref()
+        .map(|dir| crate::physical(&ctx.root.join(dir)))
+        .or_else(|| ctx.cached_lanes_dir.clone())
         .unwrap_or_else(|| ctx.state_dir().join(aterm_tempfile::QUIET))
 }
 

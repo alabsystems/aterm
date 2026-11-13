@@ -575,27 +575,11 @@ mod grant_watch {
                 return None;
             }
             let sentinel = {
-                use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
-                aterm_uds::kept_out(|| {
-                    let mut ends = [0 as libc::c_int; 2];
-                    // SAFETY: `ends` is two writable descriptor slots, which `pipe` fills on success.
-                    if unsafe { libc::pipe(ends.as_mut_ptr()) } != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    // SAFETY: both ends were just opened by this call; the write end is closed at once,
-                    // the read end kept for the process's life and made close-on-exec.
-                    let sentinel = unsafe {
-                        libc::close(ends[1]);
-                        let sentinel = OwnedFd::from_raw_fd(ends[0]);
-                        if libc::fcntl(sentinel.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) != 0 {
-                            return Err(std::io::Error::last_os_error());
-                        }
-                        sentinel
-                    };
-                    Ok(sentinel)
-                })
-                .ok()?
-                .into_raw_fd()
+                use std::os::fd::IntoRawFd as _;
+                // The write end is closed at once, the read end kept for the process's life.
+                let (sentinel, write) = aterm_uds::pipe().ok()?;
+                drop(write);
+                sentinel.into_raw_fd()
             };
             let dog: &'static Dog = Box::leak(Box::new(Dog {
                 watched: Mutex::new(Watched {
@@ -1020,28 +1004,19 @@ fn open_exec_status_fifo() -> io::Result<(libc::c_int, libc::c_int)> {
 }
 
 fn open_exec_status_channel() -> io::Result<(libc::c_int, libc::c_int, ExecStatusCarrier)> {
+    use std::os::fd::IntoRawFd as _;
     #[cfg(target_os = "linux")]
-    let atomic: io::Result<(libc::c_int, libc::c_int, ExecStatusCarrier)> = {
-        let mut fds = [0 as libc::c_int; 2];
-        // SAFETY: `fds` is a valid 2-int buffer filled by `pipe2` with `O_CLOEXEC`.
-        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } == 0 {
-            let (rd, wr) = (fds[0], fds[1]);
-            if fd_is_cloexec(rd) && fd_is_cloexec(wr) {
-                Ok((rd, wr, ExecStatusCarrier::Pipe2))
+    let atomic: io::Result<(libc::c_int, libc::c_int, ExecStatusCarrier)> = aterm_uds::pipe()
+        .and_then(|(rd, wr)| {
+            use std::os::fd::AsRawFd as _;
+            if fd_is_cloexec(rd.as_raw_fd()) && fd_is_cloexec(wr.as_raw_fd()) {
+                Ok((rd.into_raw_fd(), wr.into_raw_fd(), ExecStatusCarrier::Pipe2))
             } else {
-                // SAFETY: closing the pair we just created; nothing else exists.
-                unsafe {
-                    libc::close(rd);
-                    libc::close(wr);
-                }
                 Err(io::Error::other(
                     "pipe2(O_CLOEXEC) produced a descriptor without FD_CLOEXEC",
                 ))
             }
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    };
+        });
     #[cfg(target_os = "macos")]
     let atomic: io::Result<(libc::c_int, libc::c_int, ExecStatusCarrier)> =
         open_exec_status_fifo().map(|(rd, wr)| (rd, wr, ExecStatusCarrier::Fifo));
@@ -1054,28 +1029,15 @@ fn open_exec_status_channel() -> io::Result<(libc::c_int, libc::c_int, ExecStatu
     let (rd, wr, carrier) = match atomic {
         Ok(chan) => chan,
         Err(why) => {
-            let mut fds = [0 as libc::c_int; 2];
-            // SAFETY: `fds` is a valid 2-element buffer that `pipe` fills.
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let (rd, wr) = (fds[0], fds[1]);
-            // SAFETY: both fds are valid; `F_SETFD` only sets a flag word.
-            let flagged = unsafe {
-                libc::fcntl(rd, libc::F_SETFD, libc::FD_CLOEXEC) != -1
-                    && libc::fcntl(wr, libc::F_SETFD, libc::FD_CLOEXEC) != -1
-            };
-            if !flagged {
-                let err = io::Error::last_os_error();
-                // SAFETY: closing the pair we just created.
-                unsafe {
-                    libc::close(rd);
-                    libc::close(wr);
-                }
-                return Err(err);
-            }
+            // Close-on-exec and kept out of children: the spawn that uses it hands its child the
+            // write end (`aterm_uds::spawn_lock::handing`).
+            let (rd, wr) = aterm_uds::pipe()?;
             note_racy_exec_status_carrier(&why);
-            (rd, wr, ExecStatusCarrier::RacyPipe)
+            (
+                rd.into_raw_fd(),
+                wr.into_raw_fd(),
+                ExecStatusCarrier::RacyPipe,
+            )
         }
     };
 
@@ -1510,7 +1472,9 @@ fn spawn_session_leader_on_fresh_pty(
                 Ok(())
             });
         }
-        let spawning = aterm_uds::spawn_lock::spawning();
+        // The exec status's write end, which `pre_exec` writes, is unmarked for this spawn alone
+        // where it is a kept-out pipe (the fallback carrier).
+        let spawning = aterm_uds::spawn_lock::handing(&[status_wr]);
         let spawned = cmd.spawn();
         drop(spawning);
         drop(cmd);
@@ -2117,8 +2081,10 @@ pub fn spawn_shell_with_pid_cell_px(
         let strikes = pty_race::child_strikes(master);
         let inherit_strip = aterm_uds::spawnfd::InheritStrip::prepare();
         // A passed descriptor kept out of children (`aterm_uds::kept_out`) is unmarked for this
-        // fork alone, so the child has the copy it puts at its number.
-        let spawning = aterm_uds::spawn_lock::handing(handed.as_slice());
+        // fork alone, so the child has the copy it puts at its number; so is the exec status's
+        // write end where it is a kept-out pipe (the fallback carrier), which the child writes.
+        let kept: Vec<libc::c_int> = handed.iter().copied().chain([status_wr]).collect();
+        let spawning = aterm_uds::spawn_lock::handing(&kept);
         // SAFETY: `fork` takes no arguments and returns child pid, 0, or -1.
         let pid = unsafe { libc::fork() };
         if pid != 0 {
@@ -3495,48 +3461,15 @@ pub fn read(master: i32, buf: &mut [u8]) -> isize {
 
 /// Creates a non-blocking, close-on-exec `(read_end, write_end)` wake pipe.
 ///
-/// Off Linux, where no `pipe2` sets the flags at creation, the pipe is made and flagged inside
-/// [`aterm_uds::kept_out`]. On Apple that holds every spawn off between the pipe's creation and
-/// its last flag, so no child copies an end before it is close-on-exec, and keeps each end out of
-/// children (`FD_CLOFORK`, where the kernel keeps that mark).
+/// Made by [`aterm_uds::pipe`], so each end is kept out of children (`FD_CLOFORK`, where the
+/// kernel keeps that mark) and no child copies an end before it is close-on-exec; each end is
+/// then made non-blocking.
 pub fn make_wake_pipe() -> Option<(i32, i32)> {
-    #[cfg(target_os = "linux")]
-    {
-        let mut fds = [0i32; 2];
-        // SAFETY: `fds` is a valid 2-int out-array for `pipe2`.
-        (unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == 0)
-            .then_some((fds[0], fds[1]))
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
-        let (rd, wr) = aterm_uds::kept_out(|| {
-            let mut fds = [0i32; 2];
-            // SAFETY: `fds` is a valid 2-int out-array for pipe(2).
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: pipe(2) just opened both ends and nothing else owns them, so each is
-            // closed when its owner drops, a failed flag included.
-            let ends = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
-            for end in [&ends.0, &ends.1] {
-                let fd = end.as_raw_fd();
-                // SAFETY: `fd` is an end this call owns; these fcntls only read and set flags.
-                let configured = unsafe {
-                    let flags = libc::fcntl(fd, libc::F_GETFL);
-                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) != -1
-                        && flags >= 0
-                        && libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) != -1
-                };
-                if !configured {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-            Ok(ends)
-        })
-        .ok()?;
-        Some((rd.into_raw_fd(), wr.into_raw_fd()))
-    }
+    use std::os::fd::{AsRawFd as _, IntoRawFd as _};
+    let (rd, wr) = aterm_uds::pipe().ok()?;
+    set_nonblocking(rd.as_raw_fd(), true).ok()?;
+    set_nonblocking(wr.as_raw_fd(), true).ok()?;
+    Some((rd.into_raw_fd(), wr.into_raw_fd()))
 }
 
 /// Outcome of [`read_or_wake`].

@@ -73,7 +73,7 @@ fn off_windows_every_stream_gets_the_text_as_it_is() {
 #[test]
 fn a_pipe_this_process_made_names_this_process_as_its_creator() {
     use std::os::windows::io::AsRawHandle as _;
-    let (_reader, writer) = std::io::pipe().expect("pipe");
+    let (_reader, writer) = aterm_uds::pipe().expect("pipe");
     let creator = super::windows::creator_image(writer.as_raw_handle() as isize)
         .expect("the creator of a pipe this process made");
     let me = std::env::current_exe().expect("current exe");

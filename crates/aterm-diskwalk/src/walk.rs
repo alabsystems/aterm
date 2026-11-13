@@ -101,7 +101,8 @@ pub enum Step {
 /// The hard-link figures of a walk with [`Policy::links_out`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LinkTotals {
-    /// Each inode's allocation counted once, at its first link seen.
+    /// Each inode's allocation counted once, at its first link seen, the directories' own
+    /// included: `du`'s figure for the root.
     pub alloc_first_seen: u64,
     /// The allocation of inodes with a link outside the root.
     pub shared_out: u64,
@@ -145,6 +146,11 @@ pub struct Walk {
     policy: Policy,
     #[cfg(any(unix, windows))]
     links: Option<HashMap<(u64, u64), Link>>,
+    /// The directories' own allocation, the root's included: a directory has no hard links, so
+    /// deleting the tree frees all of it (ext4 gives each at least a block, and a directory of
+    /// 20,000 names 480 KiB; APFS reports none).
+    #[cfg(any(unix, windows))]
+    dirs_alloc: u64,
     link_totals: Option<LinkTotals>,
     walked: u64,
     calls: u64,
@@ -344,7 +350,7 @@ impl Walk {
         if let Some(map) = self.links.take() {
             let floor = self.tree.root().subtree.released_floor;
             let mut t = LinkTotals {
-                alloc_first_seen: floor,
+                alloc_first_seen: floor.saturating_add(self.dirs_alloc),
                 ..LinkTotals::default()
             };
             for l in map.values() {
@@ -1059,6 +1065,7 @@ pub(crate) mod imp {
             root_dev: dev,
             policy: policy.clone(),
             links: policy.links_out.then(HashMap::new),
+            dirs_alloc: alloc,
             link_totals: None,
             walked: 0,
             calls: 0,
@@ -1070,6 +1077,7 @@ pub(crate) mod imp {
     struct Sink<'a> {
         tree: &'a mut Tree,
         links: Option<&'a mut HashMap<(u64, u64), Link>>,
+        dirs_alloc: &'a mut u64,
         policy: &'a Policy,
         walked: &'a mut u64,
         root_dev: u64,
@@ -1171,6 +1179,7 @@ pub(crate) mod imp {
                     .deny
                     .denies(&self.path.join(OsStr::from_bytes(e.name)))
             };
+            *self.dirs_alloc = self.dirs_alloc.saturating_add(e.alloc);
             let r = self.tree.rec_mut(child);
             r.direct_entries = e.dir_entries.unwrap_or(0);
             r.own.alloc_fair = e.alloc;
@@ -1202,6 +1211,7 @@ pub(crate) mod imp {
                 stack,
                 tree,
                 links,
+                dirs_alloc,
                 policy,
                 walked,
                 root_dev,
@@ -1223,6 +1233,7 @@ pub(crate) mod imp {
                 let mut sink = Sink {
                     tree,
                     links: links.as_mut(),
+                    dirs_alloc,
                     policy,
                     walked,
                     root_dev: *root_dev,

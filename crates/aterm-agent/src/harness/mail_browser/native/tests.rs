@@ -8,8 +8,8 @@ fn a_required_mailbox_command_waits_for_its_native_pipe_reply() {
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsFd as _;
     for (age, parent_expired) in [(31, false), (61, false), (0, true), (0, false)] {
-        let (mut commands, command_write) = std::io::pipe().unwrap();
-        let (event_read, mut replies) = std::io::pipe().unwrap();
+        let (mut commands, command_write) = aterm_uds::pipe().unwrap();
+        let (event_read, mut replies) = aterm_uds::pipe().unwrap();
         let peer = std::thread::spawn(move || {
             let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
             let mut seen = Vec::new();

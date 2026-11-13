@@ -26,7 +26,7 @@ pub struct Need {
 
 impl Need {
     /// The need `key` with its texts, raised at `at_secs`. `Need` is `#[non_exhaustive]`, so a
-    /// caller outside agh builds one here or through the two below.
+    /// caller outside agh builds one here or through `config_invalid`.
     #[must_use]
     pub fn new(key: &str, what: &str, why: &str, then: &str, at_secs: u64) -> Need {
         Need {
@@ -36,19 +36,6 @@ impl Need {
             then: then.to_string(),
             at_secs,
         }
-    }
-
-    /// `agh.config.missing`, with its texts.
-    #[must_use]
-    pub fn config_missing(at_secs: u64) -> Need {
-        Need::new(
-            "agh.config.missing",
-            "agh.toml is missing on this builder",
-            "the lanes route their GitHub identities through it, and a missing file is never \
-             read as no identities",
-            CONFIG_PROVISION,
-            at_secs,
-        )
     }
 
     /// `agh.config.invalid`, its `why` the first fault as `{rule} {what}`.
@@ -63,13 +50,6 @@ impl Need {
         )
     }
 }
-
-/// The step that provisions a missing agh.toml the lanes can use, from a builder's token
-/// files: `agh.config.missing`'s `then`, and the step `atpkg-publish hosts check` names. A
-/// profile named `dev` or `release` starts a file that routes alone.
-pub const CONFIG_PROVISION: &str = "agh auth add dev|release --file PATH --tier TIER --owner \
-                                    OWNER --write for each lane writer, then agh policy grant \
-                                    atpkg-publish REPO (docs/RUNBOOK-atpkg-republish.md)";
 
 /// The longest file `list` reads: 8 KiB.
 pub const NEED_MAX: usize = 8 << 10;

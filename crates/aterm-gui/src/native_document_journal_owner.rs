@@ -3,9 +3,11 @@
 
 //! Who holds a draft journal, and the two ways a journal nobody holds leaves `drafts/`: its last holder's release, and the launch sweep (`docs/NATIVE_TAB_APPS_DESIGN.md` §5.11).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 
 use super::{
     ContentFingerprint, JournalDocumentKey, JournalImageGeneration, JournalLockPatience,
@@ -41,13 +43,256 @@ const MARK_CAPACITY: usize = 17 + MAX_OWNERS * 17;
 #[derive(Debug)]
 pub(crate) struct JournalOwner {
     id: JournalOwnerId,
-    _lease: crate::native_document_host::HeldAdvisoryLock,
+    sender: mpsc::Sender<Message>,
+    #[cfg(test)]
+    finished: Arc<std::sync::Mutex<mpsc::Receiver<()>>>,
 }
 
 impl JournalOwner {
     pub(crate) const fn id(&self) -> JournalOwnerId {
         self.id
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static ENQUEUED: std::cell::RefCell<Option<mpsc::Sender<()>>> = const { std::cell::RefCell::new(None) };
+}
+
+// Only this worker owns files and the lease. Messages from UI contain memory only.
+type Job = Box<dyn FnOnce(&mut Custody) + Send>;
+enum Message {
+    Run(Job),
+    Release(u64),
+}
+
+pub(super) struct Custody {
+    next: u64,
+    images: BTreeMap<u64, HeldImage>,
+}
+
+struct HeldImage {
+    path: PathBuf,
+    pin: Option<Candidate>,
+    live: Arc<AtomicBool>,
+}
+
+impl Custody {
+    /// Called within acquisition's journal lock, before the result can be delivered.
+    pub(super) fn register(
+        &mut self,
+        owner: &Arc<JournalOwner>,
+        path: &Path,
+        key: JournalDocumentKey,
+    ) -> Result<Registration, String> {
+        let id = self.next;
+        self.next = id
+            .checked_add(1)
+            .ok_or("journal registration IDs exhausted")?;
+        let pin = Candidate::open(path.to_path_buf(), key);
+        let live = Arc::new(AtomicBool::new(true));
+        self.images.insert(
+            id,
+            HeldImage {
+                path: path.to_path_buf(),
+                pin,
+                live: live.clone(),
+            },
+        );
+        Ok(Registration(Arc::new(Release {
+            id,
+            live,
+            owner: owner.clone(),
+        })))
+    }
+
+    /// An explicit privacy purge revokes every local writer of these names. IDs are
+    /// never reused, so stale plans and receipt drops cannot touch a later open.
+    pub(super) fn revoke(&mut self, paths: &[PathBuf]) {
+        self.images.retain(|_, held| {
+            if paths.contains(&held.path) {
+                held.live.store(false, Ordering::Release);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    fn release(&mut self, id: u64, owner: JournalOwnerId) {
+        let Some(HeldImage { path, pin, live }) = self.images.remove(&id) else {
+            return;
+        };
+        live.store(false, Ordering::Release);
+        // A registration for this name also protects an identical republish on a new inode.
+        // Never remove the process-wide mark while another local open can still write it.
+        if self.images.values().any(|held| {
+            held.path == path
+                || pin
+                    .as_ref()
+                    .zip(held.pin.as_ref())
+                    .is_some_and(|(leaving, held)| leaving.stamp.same_file(&held.stamp))
+        }) {
+            return;
+        }
+        let Some(pin) = pin else { return };
+        let (Some(owners), Some((image, clean))) = (owners_dir_of(&path), pin.read_image()) else {
+            return;
+        };
+        pin.settle(&owners, image, clean, Some(owner));
+    }
+}
+
+/// Clones share one release authority. The last drop only sends a nonblocking message;
+/// file pins, locks and the owner's final lease are destroyed by the worker.
+#[derive(Clone, Debug)]
+pub(crate) struct Registration(Arc<Release>);
+
+#[derive(Debug)]
+struct Release {
+    id: u64,
+    live: Arc<AtomicBool>,
+    owner: Arc<JournalOwner>,
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        let _ = self.owner.sender.send(Message::Release(self.id));
+    }
+}
+
+impl Registration {
+    /// Adoption only reads this memory flag; it never waits for the worker.
+    pub(super) fn live(&self) -> bool {
+        self.0.live.load(Ordering::Acquire)
+    }
+
+    pub(super) fn run<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut Custody, u64) -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let id = self.0.id;
+        self.0
+            .owner
+            .run(move |custody| custody.images.contains_key(&id).then(|| work(custody, id)))?
+            .ok_or_else(|| "journal registration was revoked".to_string())
+    }
+}
+
+/// Mutation, acknowledgement and replacement of the registration's physical pin are
+/// one journal-lock transaction. No path is reopened later to infer release authority.
+pub(super) fn operate<T>(
+    path: &Path,
+    key: JournalDocumentKey,
+    patience: JournalLockPatience,
+    custody: Option<(&mut Custody, u64)>,
+    work: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    with_journal_lock(path, patience, || {
+        let result = work();
+        if let Some((custody, id)) = custody {
+            let pin = result
+                .as_ref()
+                .ok()
+                .and_then(|_| Candidate::open(path.to_path_buf(), key));
+            if let Some(held) = custody.images.get_mut(&id) {
+                held.pin = pin;
+            }
+        }
+        result
+    })
+}
+
+impl JournalOwner {
+    pub(super) fn run<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(&mut Custody) -> T + Send + 'static,
+    ) -> Result<T, String> {
+        let (sender, receiver) = mpsc::channel();
+        #[cfg(all(test, unix))]
+        let copies = super::FORKED_LOCK_COPIES.with(|copies| copies.borrow().clone());
+        self.sender
+            .send(Message::Run(Box::new(move |custody| {
+                #[cfg(all(test, unix))]
+                let previous = super::FORKED_LOCK_COPIES.with(|slot| slot.replace(copies));
+                let result = work(custody);
+                #[cfg(all(test, unix))]
+                super::FORKED_LOCK_COPIES.with(|slot| *slot.borrow_mut() = previous);
+                let _ = sender.send(result);
+            })))
+            .map_err(|_| "journal custody worker unavailable")?;
+        #[cfg(test)]
+        ENQUEUED.with(|slot| {
+            if let Some(queued) = slot.borrow_mut().take() {
+                queued.send(()).expect("queued work observed");
+            }
+        });
+        #[cfg(test)]
+        let result = match receiver.recv_timeout(std::time::Duration::from_secs(60)) {
+            Ok(value) => Ok(value),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(mpsc::RecvError),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                panic!("journal custody worker did not reply within the hang detector")
+            }
+        };
+        #[cfg(not(test))]
+        let result = receiver.recv();
+        result.map_err(|_| "journal custody worker stopped".to_string())
+    }
+}
+
+fn start_worker(
+    id: JournalOwnerId,
+    lease: crate::native_document_host::HeldAdvisoryLock,
+) -> Result<JournalOwner, String> {
+    let (sender, receiver) = mpsc::channel();
+    #[cfg(test)]
+    let (done, finished) = mpsc::channel();
+    crate::qos::spawn_lane_thread(
+        "aterm-journal-custody",
+        crate::qos::Role::Background,
+        move || {
+            let mut custody = Custody {
+                next: 1,
+                images: BTreeMap::new(),
+            };
+            let mut failed = false;
+            // Retain panic payloads too: their destructors are arbitrary code. Nothing
+            // uncertain may unwind this lease while logical owner handles still live.
+            let mut failures = Vec::new();
+            while let Ok(message) = receiver.recv() {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    match message {
+                        Message::Run(job) if !failed => job(&mut custody),
+                        Message::Release(registration) if !failed => {
+                            custody.release(registration, id)
+                        }
+                        // Dropping a rejected job disconnects its reply, so its caller
+                        // returns an error. Failure is never authority to settle an image.
+                        _ => {}
+                    }
+                }));
+                if let Err(payload) = result {
+                    failed = true;
+                    failures.push(payload);
+                }
+            }
+            // Every logical owner/registration sender is gone. All final filesystem
+            // destruction, including uncertain pins and the lease, stays on this worker.
+            drop(custody);
+            drop(lease);
+            drop(failures);
+            #[cfg(test)]
+            let _ = done.send(());
+        },
+    )
+    .map_err(|error| format!("journal custody worker: {error}"))?;
+    Ok(JournalOwner {
+        id,
+        sender,
+        #[cfg(test)]
+        finished: Arc::new(std::sync::Mutex::new(finished)),
+    })
 }
 
 /// Take a fresh owner identity under `root`: a lease file created exclusively, locked, and proved still linked at its name — a sweep that probed it between the create and the lock (and so took it for a dead owner's) unlinks it, and then another id is tried.
@@ -74,7 +319,7 @@ pub(crate) fn establish(root: &Path) -> Result<JournalOwner, String> {
             }
         };
         if names_file(&path, held.file()) {
-            return Ok(JournalOwner { id, _lease: held });
+            return start_worker(id, held);
         }
     }
     Err("could not take a journal owner lease".to_string())
@@ -300,6 +545,7 @@ pub(super) fn adopt(path: &Path, image: ContentFingerprint, owner: Option<Journa
 }
 
 /// A keyed journal a release or a sweep may take, as one look found it: its open file, which pins it, and the stamp that look read.
+#[derive(Debug)]
 pub(super) struct Candidate {
     path: PathBuf,
     key: JournalDocumentKey,
@@ -322,16 +568,22 @@ impl Candidate {
     /// The fingerprint of its bytes, and whether they decode to a journal that
     /// holds no draft.
     fn read_image(&self) -> Option<(ContentFingerprint, bool)> {
-        use std::io::Read as _;
+        use std::io::{Read as _, Seek as _, SeekFrom};
 
+        (&self.image).seek(SeekFrom::Start(0)).ok()?;
         let mut bytes =
             Vec::with_capacity(usize::try_from(self.stamp.len().saturating_add(1)).unwrap_or(0));
         (&self.image)
             .take(MAX_JOURNAL_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .ok()?;
-        let clean = recover_journal_image_for(self.key, &bytes).is_ok_and(|(read, tail)| {
-            holds_no_draft(&read) && tail.is_none_or(|tail| tail.byte_len() == bytes.len() as u64)
+        if bytes.len() > MAX_JOURNAL_BYTES {
+            return None;
+        }
+        let clean = recover_journal_image_for(self.key, &bytes).is_ok_and(|(read, tail, fault)| {
+            fault.is_none()
+                && holds_no_draft(&read)
+                && tail.is_none_or(|tail| tail.byte_len() == bytes.len() as u64)
         });
         Some((ContentFingerprint::of(&bytes), clean))
     }
@@ -376,35 +628,6 @@ impl Candidate {
             Ok(false)
         })
         .unwrap_or(false)
-    }
-}
-
-/// This process let go of the document whose journal is at `path` (`DocumentJournalStore::forget`): open that image as it is now, on the event loop (one open and one stat), for [`settle_releases`].
-pub(super) fn released(path: PathBuf, key: JournalDocumentKey) -> Option<Candidate> {
-    Candidate::open(path, key)
-}
-
-/// Settle every journal `owner` let go of ([`Candidate::settle`], leaving its owner set): on a background thread, which reads each image once; inline in tests.
-pub(super) fn settle_releases(owner: JournalOwnerId, released: Vec<Candidate>) {
-    let settle = move || {
-        for candidate in released {
-            let (Some(owners), Some((image, clean))) =
-                (owners_dir_of(&candidate.path), candidate.read_image())
-            else {
-                continue;
-            };
-            candidate.settle(&owners, image, clean, Some(owner));
-        }
-    };
-    #[cfg(test)]
-    settle();
-    #[cfg(not(test))]
-    if let Err(error) = crate::qos::spawn_lane_thread(
-        "aterm-journal-release",
-        crate::qos::Role::Background,
-        settle,
-    ) {
-        aterm_log::warn!("released draft journals kept until the next launch: {error}");
     }
 }
 
@@ -645,17 +868,23 @@ mod sys {
     }
 
     pub(super) fn stamp(file: &File) -> std::io::Result<Stamp> {
+        #[cfg(test)]
+        super::check_fs_thread();
         file.metadata().map(|metadata| Stamp::of(&metadata))
     }
 
     /// The stamp of what `path` names, never following a link.
     pub(super) fn stamp_at(path: &Path) -> std::io::Result<Stamp> {
+        #[cfg(test)]
+        super::check_fs_thread();
         std::fs::symlink_metadata(path).map(|metadata| Stamp::of(&metadata))
     }
 
     /// Open an existing regular file without following a link or waiting on a
     /// FIFO.
     pub(super) fn open_regular(path: &Path) -> std::io::Result<File> {
+        #[cfg(test)]
+        super::check_fs_thread();
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK)
@@ -711,7 +940,11 @@ mod sys {
             Ok(len) => Ok(Some(len)),
             Err(_) => {
                 let error = std::io::Error::last_os_error();
-                if error.raw_os_error() == Some(libc::ENOATTR) {
+                #[cfg(target_os = "macos")]
+                let missing = libc::ENOATTR;
+                #[cfg(not(target_os = "macos"))]
+                let missing = libc::ENODATA;
+                if error.raw_os_error() == Some(missing) {
                     Ok(None)
                 } else {
                     Err(error)
@@ -822,6 +1055,8 @@ mod sys {
     }
 
     pub(super) fn stamp(file: &File) -> std::io::Result<Stamp> {
+        #[cfg(test)]
+        super::check_fs_thread();
         let mut information = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
         // SAFETY: `file` owns a live handle and the out pointer addresses writable storage for exactly one BY_HANDLE_FILE_INFORMATION.
         let ok = unsafe {
@@ -847,6 +1082,8 @@ mod sys {
 
     /// The stamp of what `path` names, never following a reparse point.
     pub(super) fn stamp_at(path: &Path) -> std::io::Result<Stamp> {
+        #[cfg(test)]
+        super::check_fs_thread();
         let file = OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
@@ -861,6 +1098,8 @@ mod sys {
 
     /// Open an existing regular file without following a reparse point.
     pub(super) fn open_regular(path: &Path) -> std::io::Result<File> {
+        #[cfg(test)]
+        super::check_fs_thread();
         let file = OpenOptions::new()
             .read(true)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -933,3 +1172,15 @@ mod sys {
 #[cfg(test)]
 #[path = "native_document_journal_owner_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+thread_local! { static FORBID_FS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(super) fn check_fs_thread() {
+    FORBID_FS.with(|forbidden| {
+        assert!(
+            !forbidden.get(),
+            "journal filesystem work on retirement/adoption caller"
+        )
+    });
+}

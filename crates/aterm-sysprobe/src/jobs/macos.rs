@@ -572,6 +572,118 @@ fn kqueue_kind(pid: c_int, fd: i32, lanes: Lanes) -> FdKind {
     FdKind::EventQueue { sleeping, knotes }
 }
 
+pub(super) fn event_queues(pid: u32, lanes: Lanes) -> Option<Vec<FdReading>> {
+    let pid = c_int::try_from(pid).ok().filter(|pid| *pid > 0)?;
+    if !lanes.kqueue_detail.is_on() {
+        return None;
+    }
+    let before = bsd_info(pid)?;
+    if before.pbi_flags & darwin::PROC_FLAG_INEXIT != 0 {
+        return None;
+    }
+    // Unlike ordinary sampling, unrelated files, pipes and sockets spend no detail slots.
+    // The shared listing cap still bounds enumeration and a cut cannot prove queue absence.
+    let listed = strict_fd_list(pid)?;
+    let candidates: Vec<_> = listed
+        .iter()
+        .map(|fd| {
+            (
+                fd.proc_fd,
+                fd.proc_fdtype == libc::PROX_FDTYPE_KQUEUE as u32,
+            )
+        })
+        .collect();
+    let queues =
+        super::event_queues::read_complete(&candidates, false, |fd| strict_kqueue(pid, fd))?;
+    let after = bsd_info(pid)?;
+    (after.pbi_flags & darwin::PROC_FLAG_INEXIT == 0
+        && (before.pbi_start_tvsec, before.pbi_start_tvusec)
+            == (after.pbi_start_tvsec, after.pbi_start_tvusec))
+        .then_some(queues)
+}
+
+/// The strict observation path never treats libproc's zero-on-failure as an empty scope.
+/// Its positive BSD reads in `event_queues` establish the process even for a genuine empty list.
+fn strict_fd_list(pid: c_int) -> Option<Vec<libc::proc_fdinfo>> {
+    let slots = MAX_FDS + 1;
+    let mut listed = vec![
+        libc::proc_fdinfo {
+            proc_fd: 0,
+            proc_fdtype: 0
+        };
+        slots
+    ];
+    let bytes = c_int::try_from(slots.checked_mul(FDINFO_SIZE)?).ok()?;
+    // SAFETY: `listed` has `bytes` writable bytes. This thread's errno is cleared immediately
+    // before libproc's zero-or-failed call and captured immediately afterward.
+    let (got, error) = unsafe {
+        *libc::__error() = 0;
+        let got = libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDLISTFDS,
+            0,
+            listed.as_mut_ptr().cast(),
+            bytes,
+        );
+        (got, *libc::__error())
+    };
+    let count = super::event_queues::complete_bytes(got, error, FDINFO_SIZE, slots, MAX_FDS)?;
+    listed.truncate(count);
+    Some(listed)
+}
+
+fn strict_kqueue(pid: c_int, fd: i32) -> Option<FdReading> {
+    let mut info = [0u8; darwin::KQUEUE_SIZE];
+    let bytes = c_int::try_from(info.len()).ok()?;
+    // SAFETY: `info` is exactly the fixed record's writable size; errno is this thread's,
+    // cleared and captured around the call so a zero refusal cannot look like an empty queue.
+    let (got, error) = unsafe {
+        *libc::__error() = 0;
+        let got = libc::proc_pidfdinfo(
+            pid,
+            fd,
+            darwin::PROC_PIDFDKQUEUEINFO,
+            info.as_mut_ptr().cast(),
+            bytes,
+        );
+        (got, *libc::__error())
+    };
+    let sleeping = super::event_queues::exact_record(got, error, info.len())
+        .then(|| darwin::kqueue_state(&info))
+        .flatten()
+        .map(|state| state & darwin::PROC_KQUEUE_SLEEP != 0);
+    super::event_queues::known_queue(fd, sleeping, || strict_knotes(pid, fd))
+}
+
+fn strict_knotes(pid: c_int, fd: i32) -> Option<Vec<Knote>> {
+    let mut buf = vec![0u8; darwin::KNOTE_SIZE * MAX_KNOTES];
+    let bytes = c_int::try_from(buf.len()).ok()?;
+    // SAFETY: `buf` has `bytes` writable bytes. EXTINFO returns a count of notes (possibly
+    // exceeding our slots); errno distinguishes a genuine zero count from libproc's refusal.
+    let (got, error) = unsafe {
+        *libc::__error() = 0;
+        let got = libc::proc_pidfdinfo(
+            pid,
+            fd,
+            darwin::PROC_PIDFDKQUEUE_EXTINFO,
+            buf.as_mut_ptr().cast(),
+            bytes,
+        );
+        (got, *libc::__error())
+    };
+    let count = super::event_queues::complete_notes(got, error)?;
+    let decoded = darwin::knotes(&buf, count);
+    (decoded.len() == count).then(|| {
+        decoded
+            .into_iter()
+            .map(|(ident, filter)| Knote {
+                ident,
+                filter: KnoteFilter::from_darwin(filter),
+            })
+            .collect()
+    })
+}
+
 fn knotes_of(pid: c_int, fd: i32) -> Option<Vec<Knote>> {
     let mut buf = vec![0u8; darwin::KNOTE_SIZE * MAX_KNOTES];
     let size = c_int::try_from(buf.len()).ok()?;
@@ -781,7 +893,8 @@ fn close_all(fds: &[c_int]) {
 fn own_pipe() -> Option<[c_int; 2]> {
     let mut fds = [0 as c_int; 2];
     // SAFETY: `fds` is two writable descriptors' room.
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+    let made = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if made != 0 {
         return None;
     }
     for fd in fds {

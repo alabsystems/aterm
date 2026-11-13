@@ -339,6 +339,35 @@ pub fn kept_out<T, E>(create: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
     create()
 }
 
+/// Make a pipe kept out of every child it is not handed to: the one pipe constructor (clippy
+/// refuses `libc::pipe`, `libc::pipe2` and `std::io::pipe`). Both ends are made close-on-exec and
+/// marked [`keep_out_of_children`] under [`kept_out`], so no `fork` or `posix_spawn` of another
+/// thread copies one meanwhile. A bare end does reach such a child: a forked one holds it until
+/// its exec, a spawned one for life when the end is not close-on-exec at the spawn (`libc::pipe`
+/// never is; Apple's std pipe is flagged only after `pipe(2)` returns). There it outlives its
+/// owner's drop: a read waiting for EOF answers nothing, a write waiting for `EPIPE` is accepted,
+/// a child parked on the pipe is never released. An end handed to a child through
+/// [`spawnfd`] still reaches it; a raw `fork` or spawn that hands its child an end takes
+/// [`spawn_lock::handing`] around the call. Where the kernel keeps no `FD_CLOFORK` (off Apple,
+/// and an Apple kernel that ignores it) a forked child still holds both ends until its exec.
+///
+/// # Errors
+/// `pipe(2)`'s errno, or the mark's `fcntl(2)` errno (both ends are then closed).
+#[cfg(unix)]
+pub fn pipe() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
+    kept_out(std::io::pipe)
+}
+
+/// Elsewhere: `std::io::pipe`, as a handle reaches a child only when it is made inheritable, and
+/// std's pipe handles are not.
+///
+/// # Errors
+/// `std::io::pipe`'s error (`Unsupported` where the platform has no pipe).
+#[cfg(not(unix))]
+pub fn pipe() -> std::io::Result<(std::io::PipeReader, std::io::PipeWriter)> {
+    std::io::pipe()
+}
+
 /// The process-wide lock between a spawn and a descriptor's creation: every spawn and fork
 /// holds [`spawn_lock::spawning`] across its descriptor table's copy, and [`kept_out`] creates
 /// and marks with none in flight.
@@ -667,3 +696,7 @@ mod windows_control_dir_tests;
 #[cfg(all(test, not(windows)))]
 #[path = "lib_control_dir_tests.rs"]
 mod control_dir_tests;
+
+#[cfg(all(test, unix))]
+#[path = "lib_pipe_tests.rs"]
+mod pipe_tests;

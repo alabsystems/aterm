@@ -422,9 +422,13 @@ fn the_overview_wears_its_corners_shadow_and_ring_in_points() {
     let s = closing_scene();
     let one = overview_tray(&s, &at(1.0), Theme::default()).prims;
     let two = overview_tray(&s, &at(2.0), Theme::default()).prims;
-    let DrawPrim::Stroke { radius, .. } = one[2] else {
-        panic!("the card's border: {:?}", one[2]);
+    // The card's border is its first stroke, over its shadow and ground.
+    let Some(DrawPrim::Stroke { radius, .. }) =
+        one.iter().find(|p| matches!(p, DrawPrim::Stroke { .. }))
+    else {
+        panic!("the card's border");
     };
+    let radius = *radius;
     assert_eq!(radius, 14.0, "the 1x radius is at its cap");
     assert!(
         one.iter()

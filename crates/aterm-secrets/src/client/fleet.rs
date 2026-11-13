@@ -41,8 +41,9 @@ impl std::fmt::Debug for AlabFleet {
 ///
 /// # Errors
 /// Local state, the signed cache or its recipient or admin lockers cannot be
-/// read safely, or the apply has not finished (a pass applying now, or the last
-/// one leaving an entry failed or pending), so the code is read once it has.
+/// read safely, or the apply has not finished (a pass that held the state lock
+/// through the whole wait for it, or the last one leaving an entry failed or
+/// pending), so the code is read once it has.
 pub fn alab_fleet(paths: &Paths) -> crate::Result<Option<AlabFleet>> {
     let expected =
         config(paths)?.ok_or_else(|| Error::new("no vault configured; run aterm secrets join"))?;
@@ -68,22 +69,27 @@ pub fn test_alab_fleet(paths: &Paths) -> crate::Result<Option<AlabFleet>> {
 ///
 /// # Errors
 /// Local state, the signed cache or its recipient or admin lockers cannot be
-/// read safely, or the apply has not finished (a pass applying now, or the last
-/// one leaving an entry failed or pending), so the code is read once it has.
+/// read safely, or the apply has not finished (a pass that held the state lock
+/// through the whole wait for it, or the last one leaving an entry failed or
+/// pending), so the code is read once it has.
 pub fn alab_fleet_code(paths: &Paths) -> crate::Result<Option<SecretBytes>> {
     Ok(alab_fleet(paths)?.map(|fleet| fleet.code))
 }
 
 /// [`alab_fleet`]'s read of `expected`'s applied copy, any vault's: an apply
-/// that has not finished is an error naming it, never read as no code.
+/// that has not finished is an error naming it, never read as no code. A vault pass
+/// holding the state lock is waited for ([`StateLock::observe_judging`]).
 pub(super) fn reserved_fleet(paths: &Paths, expected: &Config) -> crate::Result<Option<AlabFleet>> {
-    let lock = match StateLock::observe_narrowed(paths)? {
+    let observation = match StateLock::observe_narrowed(paths)? {
+        StateObservation::Busy => StateLock::observe_judging(paths)?,
+        observation => observation,
+    };
+    let lock = match observation {
         StateObservation::Held(lock) => lock,
         StateObservation::Absent => return Ok(None),
         StateObservation::Busy => {
-            return Err(Error::new(
-                "a vault pass is applying on this machine now: the default fleet code is read once \
-                 it ends",
+            return Err(writer_outlasted_wait(
+                "the default fleet code is read once it ends",
             ));
         }
     };

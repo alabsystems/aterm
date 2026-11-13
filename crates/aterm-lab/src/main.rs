@@ -260,8 +260,12 @@ mod local_signins_heal;
 mod look_away;
 #[cfg(target_os = "macos")]
 mod mac;
+#[cfg(all(target_os = "macos", debug_assertions))]
+mod mac_codex_source_proof;
 #[cfg(target_os = "macos")]
 mod mac_commons_startup;
+#[cfg(target_os = "macos")]
+mod mac_component;
 #[cfg(target_os = "macos")]
 mod mac_nux;
 #[cfg(target_os = "macos")]
@@ -655,8 +659,10 @@ usage: targo --unverified lab <command> [tag] [args]
             [--min-quiet SECS] [--settle LO..HI] [--no-pet] [--toml LINE]... [--seed N] --out DIR
             | first-key summarize PRESSES.TSV...
                                  a window's first key after each quiet, arm against arm, press by press (a window's
-                                 rest and each arm's config lines): per-press rows, each press's replies whole, and
-                                 nearest-rank, bootstrap and exact-test summaries (ATERM-KI-1027-4)
+                                 rest and each arm's config lines; a press's quiet is the longer of --min-quiet and its
+                                 arm's rest plus 1 s): per-press rows with aterm's cold and rest-wake key counts, each
+                                 press's replies whole, and nearest-rank, cold-share, bootstrap and exact-test summaries
+                                 against each arm's base, the first arm of its kind in the rows (ATERM-KI-1027-4)
   halfdraw scan <cast> --program claude|agy|muse [--show N] [--event I]
                                  replay a cast one PTY read per batch to report DEC 2026 brackets and unguarded busy gaps
   idle-points scan <tape|dir>... --program claude|agy|muse|auto [--show N]
@@ -793,7 +799,7 @@ usage: targo --unverified lab <command> [tag] [args]
                                  (--keep-dumps: its scratch dumps too)
 
 Outside any lab (no jail, no stub):
-  instance [--window] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons|harness-layouts]
+  instance [--window [--functional-memory-mib N]] [--band app|agent] [--aterm PATH] [--columns N] [--lines N] [--font-px N] [--scale N] [--scene band-icons|harness-layouts]
            [--env NAME=VALUE]... [--toml LINE]... [--toml-after LINE]... [--harness-key LINE]... [--home DIR] [--harness]
            [--reroute-prefix DIR] [--pre VERB]... [--image PNG] [--post VERB]... [--pages cold] [--network-away-in-ms N] [--keep | --world DIR] [-- PROGRAM ARGS]
                                  run a private aterm in a scratch HOME/XDG world, print its socket and build and hold it until
@@ -801,6 +807,9 @@ Outside any lab (no jail, no stub):
                                  launchd job, in a coalition of its own as aterm.app is, a window under its keeper there, and agent
                                  as this command's child, in its coalition; --image PNG: capture one settled frame, run
                                  --post, and end; --pages cold: run a copy whose pages are evicted, to measure cold page-ins;
+                                 windows default to strict timing admission; --functional-memory-mib N reserves a positive
+                                 MiB budget for functional work, with headroom and the same window lane and --admit wait policy;
+                                 functional admission provides no timing qualification or accepted latency result
                                  --pre and --post run in order; a failed control ends the run with an error
                                  and later controls are not run (a failed --pre captures no image);
                                  --reroute-prefix DIR: DIR, new, is the HOME, its atpkg prefix holding a clone of the
@@ -875,10 +884,10 @@ Outside any lab (no jail, no stub):
                                  with a planted control); (c) the real Claude Code on the wrapper's descriptor: its
                                  SessionStart hook, MCP server and statusLine command find no token (control: the
                                  wrapper's spare socket, which they find); exit 1 on FAIL, 3 when a lane could not run
-  fleet-sim [--n N] [--runs R] [--keep] [--record]
+  fleet-sim [--n N] [--runs R] [--keep]
                                  run N (default 30, 4-64) private headless aterms on loopback fleet ports and verify
-                                 `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (--record:
-                                 a passing run's record goes to docs/measured/)
+                                 `aterm ctl survey --fleet` across R runs (default 3) under `ulimit -n 256` (each run's
+                                 record goes to $LAB_STATE/results/)
   tables-page [--out DIR] [ATERM]
                                  the Tables page on a private instance with a scratch registry: frames of
                                  its read, a conflict, staged edits and their write (debug lab image)
@@ -887,24 +896,25 @@ Outside any lab (no jail, no stub):
   swarm rotate [--aterm PATH] [--keep]
                                  run a private headless aterm with two enrolled Claude Code logins, wall the first through
                                  the usage-tap seam (`harness tap`), verify `rotations[]` grows, and serve a turn on the second
-  swarm mailbox-signin [--live] [--email EMAIL] [--label LABEL] [--mailbox PATH] [--record] [--aterm PATH] [--keep]
+  swarm mailbox-signin [--live] [--email EMAIL] [--label LABEL] [--mailbox PATH] [--aterm PATH] [--keep]
                                  verify an unenrolled Claude row records `no-route` while mailbox config is withheld, then
                                  signs in through `ai-mailbox.toml`, ends enrolled, and serves a proven turn (--live: run
-                                 against a real Claude account and ~/.secrets/ai-mailbox.toml; --record: write docs/measured/)
-  swarm partition [--one-url] [--writers both|a] [--minter-away] [--hold SECS] [--aterm PATH] [--keep] [--record] [--label WORD]
+                                 against a real Claude account and ~/.secrets/ai-mailbox.toml; a pass's record goes to
+                                 $LAB_STATE/results/)
+  swarm partition [--one-url] [--writers both|a] [--minter-away] [--hold SECS] [--aterm PATH] [--keep] [--label WORD]
                                  split seven private headless aterms and a vault-only Mac on loopback into two islands
                                  (the ATERM_DEBUG_PARTITION cut), publish and admit on each side, heal, and report what
                                  the vault and the fleet did, with timings and what was lost; every fleet Mac surveys,
                                  drives every other and is read for whom its heartbeat reached (--one-url: F8's negative
-                                 control; --minter-away: a1's instance stops before the heal; --record: write
-                                 docs/measured/, its name carrying --label's WORD)
+                                 control; --minter-away: a1's instance stops before the heal; each run's record goes to
+                                 $LAB_STATE/results/, its name carrying --label's WORD)
   swarm e2e [--aterm PATH] [--keep]
                                  one-mesh E2's membership checks no other lane stages: a drive by a Mac's roster
                                  label and a fleet survey while a writer holds the vault's state lock (N1, N2), and
                                  founders an admin approved by code (seatless, S1), one seated by its own proof under
                                  its own label and one by a person's Allow, then a rotation that carries both and drops
                                  the third, which nothing seated
-  mesh churn [--n N] [--seed S] [--minutes M] [--whole-wraps] [--negative-control NAME] [--aterm PATH] [--keep] [--record] [--label WORD]
+  mesh churn [--n N] [--seed S] [--minutes M] [--whole-wraps] [--negative-control NAME] [--aterm PATH] [--keep] [--label WORD]
                                  found a membership log on N private Macs (default 30) on loopback, each its own vault
                                  server and subscriber on the run's genesis; let each in by Allow and the phrase, stop
                                  two for M minutes, remove two at once, restart two, split two islands (a remover killed
@@ -912,8 +922,8 @@ Outside any lab (no jail, no stub):
                                  frontier, newest key, Wrap bound, removed seats and the per-seat view, every time a
                                  measurement (--whole-wraps: island A takes every Wrap of the remover's [everyone] epoch,
                                  so the newcomer's gap heals at once; --negative-control old-gap-rule|unsettled-ok, or
-                                 frontier-blind with --whole-wraps: a run that holds only when its check fails;
-                                 --record: write docs/measured/, its name carrying --label's WORD)
+                                 frontier-blind with --whole-wraps: a run that holds only when its check fails; each
+                                 run's record goes to $LAB_STATE/results/, its name carrying --label's WORD)
   disk-lane [--aterm PATH] [--keep]
                                  mount an 8 GiB sparse APFS image and verify disk-pressure tier eviction and reserve order (~1 min)
   disk-ask [tag] [--keep] [--scenario clear|partial|unanswered|exhausted|worker]
@@ -1148,7 +1158,7 @@ Outside any lab (no jail, no stub):
 
 Windowed Instances coordinate one original lab run at a time through the account's window lane.
 Ordinary windows request measured Timing admission; unknown CPU observation, expired patience or
-`--admit now` cannot qualify them. The explicit functional allocation-monitor window reserves memory
+`--admit now` cannot qualify them. Explicit functional windows (instance --functional-memory-mib N and the allocation monitor) reserve memory
 without a quiet-CPU requirement or timing claim and also refuses `--admit now`. Other resource-only
 lanes retain their own --admit policy. Admission says once a minute what it is waiting for.
 

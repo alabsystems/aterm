@@ -253,7 +253,7 @@ fn numeric_gnu_maps_original_pipe_and_flags_without_tokens_or_cpu_credit() {
     use std::io::{Read as _, Write as _};
     let root = aterm_tempfile::tempdir().unwrap();
     let (pool, debt, _retired) = pool(root.path());
-    let (read, write) = aterm_uds::kept_out(io::pipe).unwrap();
+    let (read, write) = aterm_uds::pipe().unwrap();
     let mut supplied = rights();
     supplied.gnu = vec![read.into(), write.into()];
     let mut prepared = Prepared::try_new(

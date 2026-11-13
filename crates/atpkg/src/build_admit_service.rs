@@ -33,7 +33,7 @@ pub use epochs::{EpochAccepted, EpochId, EpochRefused};
 
 #[path = "build_admit_preparation_inputs.rs"]
 mod preparation_inputs;
-pub use preparation_inputs::PreparationInputs;
+pub use crate::private_input::PreparationInputs;
 
 /// Resource custody is installed, including if dispatch or publication later failed.
 /// Keep the attempt for recovery; publication success is not a start or drain receipt.

@@ -69,6 +69,10 @@ mod native {
         }
         if let Some(world) = world {
             match role.as_str() {
+                "exec-status-control" => {
+                    aterm_uds::spawnfd::exec_status_observation_control(&world);
+                    return;
+                }
                 "probe" => {
                     line(&world, "probe", "executed retained image");
                     return;

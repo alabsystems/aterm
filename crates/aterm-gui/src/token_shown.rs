@@ -20,7 +20,9 @@
 
 use std::sync::Arc;
 
+#[cfg(test)]
 use aterm_agent::harness::account_card::LoginHalf;
+use aterm_agent::harness::account_card::LoginHere;
 use aterm_agent::harness::token_state::TokenState;
 
 /// The least time between two reads of the token view.
@@ -80,7 +82,7 @@ pub(crate) struct TokenFact {
     /// A token made here is not in the vault yet: its write waits, or no server took it.
     pub(crate) not_yet: bool,
     /// The account's stored login on this Mac, the offer pair's other half.
-    pub(crate) login: LoginHalf,
+    pub(crate) login: LoginHere,
     /// A session on this Mac is logged into the account.
     pub(crate) logged_in: bool,
     /// The vault column as a person reads it (`in vault`, `not yet in vault (waiting: …)`).
@@ -111,7 +113,7 @@ impl TokenFact {
             made_on: None,
             verified_at: None,
             not_yet: false,
-            login: LoginHalf::Ok,
+            login: LoginHere::Half(LoginHalf::Ok),
             logged_in: false,
             vault_words: None,
             peers: Vec::new(),

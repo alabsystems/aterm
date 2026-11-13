@@ -205,15 +205,25 @@ pub const FLAT_PAPER_CORE_SHARE: f32 = 0.85;
 /// read as the pet's ribbon without the rail, a near twin at 1x (looks9 Q6).
 pub const FLAT_PAPER_GAIN: f32 = 0.62;
 
-/// The rail's ink luminance floor.
+/// The rail's ink luminance floor on a dark page, where a deeper blue or violet would sink
+/// into the page.
 pub const RAIL_LUMA_FLOOR: f32 = 0.20;
+
+/// The rail's ink luminance floor on a light page ([`paper_rail_ink`]). The dark page's floor
+/// ([`RAIL_LUMA_FLOOR`]) lifted blue and violet toward white there: the line under the typed
+/// words paled to periwinkle and lavender over that stretch (pure blue's ink #6767FF, its palest
+/// entry #6967FF at RGB chroma 152, where the walk's other inks read 201 or more), on a page where
+/// a deeper line only reads more. Here they keep their colour down to this luminance (the palest
+/// entry #4E4BFF, chroma 180), over the floor a film reads a vivid line at (0.12,
+/// `aterm_lab::trail_film::LINE_LUMA`).
+pub const PAPER_RAIL_LUMA_FLOOR: f32 = 0.14;
 
 /// The rail's luminance ceiling.
 pub const RAIL_LUMA_CEIL: f32 = 0.54;
 
 const _: () = assert!(
-    RAIL_LUMA_FLOOR < RAIL_LUMA_CEIL,
-    "the rail's floor must sit under its ceiling"
+    RAIL_LUMA_FLOOR < RAIL_LUMA_CEIL && PAPER_RAIL_LUMA_FLOOR < RAIL_LUMA_FLOOR,
+    "the rail's floors must sit under its ceiling, the paper's under the dark page's"
 );
 
 /// The rail's coverage as a share of the body's at the same slab.
@@ -1170,6 +1180,14 @@ pub struct Segment {
     /// frame, where the body is main's (`spine`, `up`, `dn`), which the plan keeps on a glass
     /// frame too ([`Ribbon::band`]).
     pub glass_up: f32,
+    /// The share of its light the line under the body lays here ([`Ribbon::emit`]): what the
+    /// body's height takes and its opacity does not, so the line leaves with the body, never at
+    /// whole light until the body is gone. On a frame the bed draws by its glass, what
+    /// [`Self::glass_up`] folds in besides the glass's shape (its exits, the flow's last breath,
+    /// its oldest end's ease and the frame's intensity; not the flow's settle, which lowers the
+    /// band); on every other frame, where `cov` carries the envelope, the flow's last breath
+    /// alone.
+    pub line_keep: f32,
     /// On a glass frame, the walk the boundary opens its right cell at less the walk it closes
     /// its left cell at (`t`): a hard step (§2.2 Seams, [`GLASS_HARD_STEP_T`]) the glass lays as
     /// two vertices at one x. `0` at every other boundary and on every other frame.
@@ -2104,10 +2122,25 @@ pub const fn hot_edge_ink(rgb: u32) -> u32 {
     }
 }
 
-/// The vivid rail's ink.
+/// The vivid rail's ink on a dark page.
 #[inline]
 #[must_use]
 pub const fn rail_ink(rgb: u32) -> u32 {
+    rail_ink_over(rgb, RAIL_LUMA_FLOOR)
+}
+
+/// The vivid rail's ink on a light page: [`rail_ink`] over [`PAPER_RAIL_LUMA_FLOOR`].
+#[inline]
+#[must_use]
+pub const fn paper_rail_ink(rgb: u32) -> u32 {
+    rail_ink_over(rgb, PAPER_RAIL_LUMA_FLOOR)
+}
+
+/// The rail's ink over the luminance `floor`: `rgb` at full channel, lifted toward white to the
+/// floor under it and lowered to [`RAIL_LUMA_CEIL`] over it.
+#[inline]
+#[must_use]
+const fn rail_ink_over(rgb: u32, floor: f32) -> u32 {
     let table = crate::color_math::relative_luminance_table();
     let rgb = spectrum_with_min_saturation(rgb, BED_SAT_FLOOR);
     let r = (rgb >> 16) & 0xff;
@@ -2116,12 +2149,12 @@ pub const fn rail_ink(rgb: u32) -> u32 {
     let mx = if r > g { r } else { g };
     let mx = if mx > b { mx } else { b };
     if mx == 0 {
-        return onto_luma_with(table, rgb, RAIL_LUMA_FLOOR);
+        return onto_luma_with(table, rgb, floor);
     }
     let full = scale_rgb(rgb, 255.0 / mx as f32);
     let y = crate::color_math::relative_luminance_with(table, full);
-    if y < RAIL_LUMA_FLOOR {
-        onto_luma_with(table, full, RAIL_LUMA_FLOOR)
+    if y < floor {
+        onto_luma_with(table, full, floor)
     } else if y > RAIL_LUMA_CEIL {
         onto_luma_with(table, full, RAIL_LUMA_CEIL)
     } else {
@@ -2209,6 +2242,21 @@ const fn rail_ink_lut() -> &'static [u32; BED_INK_LUT_LEN] {
     &RAIL_INK_LUT
 }
 
+static PAPER_RAIL_INK_LUT: [u32; BED_INK_LUT_LEN] = {
+    let mut table = [0u32; BED_INK_LUT_LEN];
+    let mut i = 0;
+    while i < BED_INK_LUT_LEN {
+        table[i] = paper_rail_ink(walk_arc_at(i));
+        i += 1;
+    }
+    table
+};
+
+#[inline]
+const fn paper_rail_ink_lut() -> &'static [u32; BED_INK_LUT_LEN] {
+    &PAPER_RAIL_INK_LUT
+}
+
 static DARK_BED_MAX_LUT: [u32; BED_INK_LUT_LEN] = {
     let mut table = [0u32; BED_INK_LUT_LEN];
     let mut i = 0;
@@ -2279,7 +2327,8 @@ pub struct BedInkLut {
     glass: Option<GlassBed>,
 }
 
-/// A light page's glass129 as the bed draws it (§15.2 1.5), light only.
+/// A light page's glass129 as the bed draws it (§15.2 1.5), light only, and the lip129 its rail
+/// is laid in.
 #[derive(Clone, Copy, Debug)]
 struct GlassBed {
     /// The theme fg and page it was filled for.
@@ -2288,6 +2337,13 @@ struct GlassBed {
     lut: [u32; BED_INK_LUT_LEN],
     /// What of each glass the page shows.
     seen: [f32; BED_INK_LUT_LEN],
+    /// The palette's lip129: the DEEP tone under its glass (`docs/design/PRISM-GLASS.md` §1),
+    /// the rail's ink on a glass frame ([`BedInkLut::rail_at`]).
+    lip: [u32; BED_INK_LUT_LEN],
+    /// The lip's pairs `(k, k + 1)` its sampler takes the nearer entry across instead of
+    /// lerping ([`BedInkLut::sample_snapped`]): the gold|green fold (`Palette::fold_at`), and
+    /// the cyan waypoint where the palette snaps there (`Palette::cyan_snap`).
+    lip_snaps: [Option<u8>; 2],
 }
 
 #[cfg(test)]
@@ -2312,7 +2368,7 @@ thread_local! {
 fn glass_table<'p>(
     cfg: &Config,
     palettes: &'p mut PaletteCache,
-) -> Option<&'p [u32; BED_INK_LUT_LEN]> {
+) -> Option<&'p super::prism_glass::Palette> {
     #[cfg(test)]
     let flat = cfg.ribbon_flat && !FLAT_GLASS.with(std::cell::Cell::get);
     #[cfg(not(test))]
@@ -2323,7 +2379,6 @@ fn glass_table<'p>(
     palettes
         .frame(cfg.theme_fg, cfg.theme_bg)
         .filter(|p| p.headroom())
-        .map(|p| &p.glass)
 }
 
 impl Default for BedInkLut {
@@ -2414,15 +2469,17 @@ impl BedInkLut {
         self.key = Some(key);
     }
 
-    /// Sync the glass to the frame: under `glass_lit`, the glass129 it draws by ([`glass_table`]),
-    /// filled when the glass lights or the page changes; `None` on every other frame. Main's
-    /// table ([`Self::sync`]) is synced beside it.
+    /// Sync the glass to the frame: under `glass_lit`, the glass129 it draws by and the lip129
+    /// its rail is laid in, the palette's ([`glass_table`]), filled when the glass lights or the
+    /// page changes; `None` on every other frame. Main's table ([`Self::sync`]) is synced beside
+    /// it.
     #[inline]
-    fn sync_glass(&mut self, cfg: &Config, glass: Option<&[u32; BED_INK_LUT_LEN]>) {
-        let Some(table) = glass else {
+    fn sync_glass(&mut self, cfg: &Config, palette: Option<&super::prism_glass::Palette>) {
+        let Some(palette) = palette else {
             self.glass = None;
             return;
         };
+        let table = &palette.glass;
         let pair = (cfg.theme_fg, cfg.theme_bg);
         if self.glass.as_ref().is_some_and(|g| g.pair == pair) {
             return;
@@ -2439,6 +2496,15 @@ impl BedInkLut {
             pair,
             lut: *table,
             seen,
+            lip: palette.lip,
+            lip_snaps: [
+                Some(palette.fold_at),
+                if palette.cyan_snap {
+                    Some(super::prism_glass::CYAN_AT as u8)
+                } else {
+                    None
+                },
+            ],
         });
     }
 
@@ -2514,14 +2580,57 @@ impl BedInkLut {
         Self::sample(hot_edge_ink_lut(), t)
     }
 
-    /// The vivid rail's ink at walk position `t`.
+    /// The vivid rail's ink at walk position `t`: under the glass the lip's
+    /// (`docs/design/PRISM-GLASS.md` §1, DEEP tone: at least .10 OKLab L under the glass at the
+    /// same walk, so the line reads on the glass it lies over), on every other light frame the
+    /// paper's ([`paper_rail_ink`]) and on a dark one main's ([`rail_ink`]).
     #[inline]
     #[must_use]
     pub const fn rail_at(&self, t: f32) -> u32 {
-        if self.key.is_none() {
+        let Some((_, _, dark, _)) = self.key else {
             return 0;
+        };
+        match &self.glass {
+            Some(g) => Self::sample_snapped(&g.lip, g.lip_snaps, t),
+            None if dark => Self::sample(rail_ink_lut(), t),
+            None => Self::sample(paper_rail_ink_lut(), t),
         }
-        Self::sample(rail_ink_lut(), t)
+    }
+
+    /// Where the rail's ink from walk position `a` to `b` steps at a snap of the lip
+    /// ([`Self::sample_snapped`]): the share of the way from `a` to `b` the step lies at, and the
+    /// entries on `a`'s side of it and on `b`'s. A run lays the rail by its vertices, lerping
+    /// between them, and vertices a few entries apart on either side of the gold|green fold lerp
+    /// through the olive the snap is there to keep out, so the rail is laid as two vertices at the
+    /// step. `None` on a frame the glass does not draw, and where no snap lies between them.
+    #[inline]
+    #[must_use]
+    pub const fn rail_step(&self, a: f32, b: f32) -> Option<(f32, u32, u32)> {
+        if self.key.is_none() {
+            return None;
+        }
+        let Some(g) = &self.glass else {
+            return None;
+        };
+        let n = (BED_INK_LUT_LEN - 1) as f32;
+        let (xa, xb) = (clamp01(tri(a)) * n, clamp01(tri(b)) * n);
+        let mut k = 0;
+        while k < g.lip_snaps.len() {
+            if let Some(at) = g.lip_snaps[k] {
+                let i = at as usize;
+                let edge = i as f32 + 0.5;
+                if i + 1 < BED_INK_LUT_LEN && (xa < edge) != (xb < edge) {
+                    let u = (edge - xa) / (xb - xa);
+                    return Some(if xa < edge {
+                        (u, g.lip[i], g.lip[i + 1])
+                    } else {
+                        (u, g.lip[i + 1], g.lip[i])
+                    });
+                }
+            }
+            k += 1;
+        }
+        None
     }
 
     /// The colour floor at walk position `t`.
@@ -2565,6 +2674,37 @@ impl BedInkLut {
             BED_INK_LUT_LEN - 1
         };
         seen[i].max(seen[j])
+    }
+
+    /// [`Self::sample`], save that across each pair `(k, k + 1)` of `snaps` it takes the nearer
+    /// entry instead of lerping (`docs/design/PRISM-GLASS.md` §1, the FOLD SNAP): the lip's gold
+    /// and green at the fold lerp through olive.
+    #[inline]
+    #[must_use]
+    const fn sample_snapped(table: &[u32; BED_INK_LUT_LEN], snaps: [Option<u8>; 2], t: f32) -> u32 {
+        let x = clamp01(tri(t)) * (BED_INK_LUT_LEN - 1) as f32;
+        let idx = x as usize;
+        let i = if idx < BED_INK_LUT_LEN - 1 {
+            idx
+        } else {
+            BED_INK_LUT_LEN - 1
+        };
+        let j = if i + 1 < BED_INK_LUT_LEN - 1 {
+            i + 1
+        } else {
+            BED_INK_LUT_LEN - 1
+        };
+        let f = x - i as f32;
+        let mut k = 0;
+        while k < snaps.len() {
+            if let Some(at) = snaps[k]
+                && at as usize == i
+            {
+                return if f < 0.5 { table[i] } else { table[j] };
+            }
+            k += 1;
+        }
+        lerp_rgb(table[i], table[j], f)
     }
 
     /// The colour `table` lays at walk position `t`: the bed's sampler, which Prism Glass's scan
@@ -3059,8 +3199,8 @@ pub fn take_glass_exits() -> usize {
     GLASS_EXITS.with(|n| n.replace(0))
 }
 
-/// A boundary's planned shape: `(spine, up, dn, t, cov, glass_up)` ([`Segment`]).
-type Sample = (f32, f32, f32, f32, f32, f32);
+/// A boundary's planned shape: `(spine, up, dn, t, cov, glass_up, line_keep)` ([`Segment`]).
+type Sample = (f32, f32, f32, f32, f32, f32, f32);
 
 #[derive(Clone, Copy, Debug)]
 struct Run {
@@ -3158,6 +3298,7 @@ struct LaidSegment {
     t: f32,
     cov: f32,
     glass_up: f32,
+    line_keep: f32,
     glass_jump: f32,
 }
 
@@ -3197,6 +3338,7 @@ const fn laid_segment(s: &Segment) -> LaidSegment {
         t: s.t,
         cov: s.cov as f32,
         glass_up: s.glass_up,
+        line_keep: s.line_keep,
         glass_jump: s.glass_jump,
     }
 }
@@ -3252,7 +3394,7 @@ fn for_each_feathered(
                     } else {
                         here.t + here.glass_jump
                     };
-                    let (dx, d_spine, d_up, d_dn, dt, d_cov, d_glass) = (
+                    let (dx, d_spine, d_up, d_dn, dt, d_cov, d_glass, d_keep) = (
                         here.x - p.x,
                         here.spine - p.spine,
                         here.up - p.up,
@@ -3260,6 +3402,7 @@ fn for_each_feathered(
                         here_t - p.t,
                         here.cov - p.cov,
                         here.glass_up - p.glass_up,
+                        here.line_keep - p.line_keep,
                     );
                     let mut k = 1;
                     while k < n {
@@ -3274,6 +3417,7 @@ fn for_each_feathered(
                                 t: p.t + dt * u,
                                 cov: p.cov + d_cov * u,
                                 glass_up: p.glass_up + d_glass * u,
+                                line_keep: p.line_keep + d_keep * u,
                                 glass_jump: 0.0,
                             },
                         );
@@ -3373,6 +3517,25 @@ pub struct Ribbon {
     /// (looks8 K9's negative control).
     #[cfg(test)]
     pub(crate) row_rail_off: bool,
+    /// Test-only: no rail is laid, so a frame's last laid vertices ([`Self::verts`]) are its
+    /// body's: the glass's own, which its rail laid after it would leave behind.
+    #[cfg(test)]
+    pub(crate) rail_off: bool,
+    /// Test-only: the line lays its whole light whatever the body keeps of its height, and under
+    /// the glass none once no glass of its run stands [`GLASS_MIN_PX`]: it went out in one frame
+    /// at the end of every glass exit and of the fold flow, as it did ([`Segment::line_keep`]'s
+    /// negative control).
+    #[cfg(test)]
+    pub(crate) line_whole: bool,
+    /// Test-only: the line under the glass lerps between its vertices across the lip's snaps,
+    /// through the olive between its gold and green, as it did ([`BedInkLut::rail_step`]'s
+    /// negative control).
+    #[cfg(test)]
+    pub(crate) rail_lerps_the_fold: bool,
+    /// Test-only: a glass frame lays each run's rail after its own glass, before the next run's,
+    /// as main's frames lay theirs (the glass-first order's negative control).
+    #[cfg(test)]
+    pub(crate) glass_rails_by_run: bool,
     /// Test-only: the in-row rail parts round every foot, as it did
     /// (looks9 Q9's negative control, [`ROW_RAIL_DIP_GAP_PX`]).
     #[cfg(test)]
@@ -3687,6 +3850,14 @@ impl Ribbon {
             rail_gap_rounded: false,
             #[cfg(test)]
             row_rail_off: false,
+            #[cfg(test)]
+            rail_off: false,
+            #[cfg(test)]
+            line_whole: false,
+            #[cfg(test)]
+            rail_lerps_the_fold: false,
+            #[cfg(test)]
+            glass_rails_by_run: false,
             #[cfg(test)]
             held_rail_off: false,
             thin_caret: false,
@@ -7966,6 +8137,8 @@ impl Ribbon {
         }
     }
 
+    /// `cell`'s shape at `sp` of its run's span: `(spine, up, dn, cov, glass_up, line_keep)`
+    /// ([`Segment`]).
     #[inline]
     fn sample_with(
         &self,
@@ -7974,7 +8147,7 @@ impl Ribbon {
         coh: Option<&Cohort>,
         sp: f32,
         rs: &RunSample,
-    ) -> (f32, f32, f32, f32, f32) {
+    ) -> (f32, f32, f32, f32, f32, f32) {
         let chf = rs.chf;
         let prof = rs.prof;
         let disp = rs.disp;
@@ -8119,9 +8292,23 @@ impl Ribbon {
             let env = self.glass_env(ctx, cell, coh);
             let glass = Self::glass_up_at(ctx, rs, sp) * env.height;
             let cov = Self::glass_cov(ctx.cfg, cell, env);
-            return (spine, up, dn, cov, glass);
+            return (
+                spine,
+                up,
+                dn,
+                cov,
+                glass,
+                env.height * clamp01(ctx.cfg.intensity) * rs.breath_scale,
+            );
         }
-        (spine, up, dn, self.cov_of(ctx, cell, coh), 0.0)
+        (
+            spine,
+            up,
+            dn,
+            self.cov_of(ctx, cell, coh),
+            0.0,
+            rs.breath_scale,
+        )
     }
 
     /// The glass's reach above its row's bottom at a boundary `sp` of the run's span from its
@@ -8754,6 +8941,7 @@ impl Ribbon {
                 mid_f32(sa.2, sb.2),
                 mid_f32(a.t, b.t),
                 mid_f32(sa.4, sb.4),
+                mid_f32(sa.5, sb.5),
             );
             // On glass (§2.2 Seams) an in-run walk jump is a hard step: the boundary closes
             // its left cell at that cell's walk and opens its right one at its own.
@@ -8773,7 +8961,14 @@ impl Ribbon {
                 // A cohort seam keeps its neighbour's shape, and on glass opens at its own
                 // walk: a hard step.
                 let t = if glass { shape.3 } else { seam.t };
-                shape = (seam.spine, seam.up, seam.dn, t, seam.glass_up);
+                shape = (
+                    seam.spine,
+                    seam.up,
+                    seam.dn,
+                    t,
+                    seam.glass_up,
+                    seam.line_keep,
+                );
             }
             if right.is_none()
                 && let Some(nb) = right_nb.as_ref()
@@ -8795,7 +8990,7 @@ impl Ribbon {
                 None
             };
             let cov = floored.unwrap_or(natural);
-            let here = (shape.0, shape.1, shape.2, shape.3, cov, shape.4);
+            let here = (shape.0, shape.1, shape.2, shape.3, cov, shape.4, shape.5);
             if let Some((uniform, probe)) = attack
                 && boundary == u32::from(caret_cell)
             {
@@ -8831,6 +9026,7 @@ impl Ribbon {
                         t: lerp_f32(p.3, here.3, f),
                         cov: cov.clamp(0.0, 255.0) as u8,
                         glass_up: lerp_f32(p.5, here.5, f) * tail_at(xf),
+                        line_keep: lerp_f32(p.6, here.6, f) * tail_at(xf),
                         glass_jump: 0.0,
                     });
                     j += 1;
@@ -8846,19 +9042,28 @@ impl Ribbon {
                 t: here.3,
                 cov: here.4.clamp(0.0, 255.0) as u8,
                 glass_up: here.5 * tail_here,
+                line_keep: here.6 * tail_here,
                 glass_jump: jump,
             });
             // The boundary's right side: its walk past a hard step.
             let open = if jump == 0.0 {
                 here
             } else {
-                (here.0, here.1, here.2, here.3 + jump, here.4, here.5)
+                (
+                    here.0,
+                    here.1,
+                    here.2,
+                    here.3 + jump,
+                    here.4,
+                    here.5,
+                    here.6,
+                )
             };
             let continues =
                 right.is_some() || (boundary == u32::from(col1) + 1 && right_nb.is_some());
             let onward = if floored.is_some() && continues {
                 doubled = Some((boundary - u32::from(col0)) as usize);
-                let seam = (open.0, open.1, open.2, open.3, natural, open.5);
+                let seam = (open.0, open.1, open.2, open.3, natural, open.5, open.6);
                 self.plan.push(Segment {
                     x: rx,
                     spine: seam.0,
@@ -8867,6 +9072,7 @@ impl Ribbon {
                     t: seam.3,
                     cov: seam.4.clamp(0.0, 255.0) as u8,
                     glass_up: seam.5 * tail_here,
+                    line_keep: seam.6 * tail_here,
                     glass_jump: 0.0,
                 });
                 seam
@@ -8898,6 +9104,7 @@ impl Ribbon {
                     t: p.3,
                     cov: cov.clamp(0.0, 255.0) as u8,
                     glass_up: p.5 * tail_at(xf),
+                    line_keep: p.6 * tail_at(xf),
                     glass_jump: 0.0,
                 });
                 j += 1;
@@ -8951,8 +9158,9 @@ impl Ribbon {
         }
         let ink_from = (frame.under.len(), frame.under_ramps.mark());
         // Under glass (§15.2 1.7) the body is the glass's: [`GLASS_BODY`] laid on its row's
-        // bottom through the glass's wedge walk, under a whole ceiling, with no rail (the
-        // declared interim until the lip) and none of the paper spellings' treatments.
+        // bottom through the glass's wedge walk, under a whole ceiling, with none of the paper
+        // spellings' treatments, and the comet's rail laid over it in the lip's DEEP ink
+        // ([`BedInkLut::rail_at`]): the rainbow behind the typed words and the line under them.
         let glass = self.ink.glass_lit();
         // The frame's plan draws by the glass, so it is the glass arm's even where no run
         // reaches [`GLASS_MIN_PX`] and nothing is laid: main's paper would lay its body there.
@@ -8966,7 +9174,19 @@ impl Ribbon {
         #[cfg(not(test))]
         let alike = false;
         let flat_dim = Self::flat_dim(ctx.cfg);
-        let rail = (Self::rail_lit(ctx.cfg) || flat_dim) && !alike && !glass;
+        #[cfg(test)]
+        let rail_off = self.rail_off;
+        #[cfg(not(test))]
+        let rail_off = false;
+        let rail = (Self::rail_lit(ctx.cfg) || flat_dim) && !alike && !rail_off;
+        #[cfg(test)]
+        let line_whole = self.line_whole;
+        #[cfg(not(test))]
+        let line_whole = false;
+        #[cfg(test)]
+        let rail_lerps_the_fold = self.rail_lerps_the_fold;
+        #[cfg(not(test))]
+        let rail_lerps_the_fold = false;
         let chf = ctx.geom.ch as f32;
         let ceiling = if glass {
             GLASS_ALPHA
@@ -9093,6 +9313,8 @@ impl Ribbon {
                 * chf
                 < RIBBON_QUAD_BUDGET as f32 * RUN_END_ROOM_SHARE
         };
+        // Where the glass a frame laid ends in the under stream: its rails follow it.
+        let mut glass_to = None;
         {
             let mut paint = |out: &mut RampSink<'_>, run: &Run, layer: Lay| -> bool {
                 let rail_layer = !matches!(layer, Lay::Body);
@@ -9145,10 +9367,12 @@ impl Ribbon {
                 if dark {
                     return true;
                 }
-                // A glass run nowhere [`GLASS_MIN_PX`] tall draws nothing: the glass is whole
-                // or absent.
+                // A glass run nowhere [`GLASS_MIN_PX`] tall draws no glass: the glass is whole
+                // or absent. Its line lays the share of its height the glass keeps
+                // ([`Segment::line_keep`]), so it has faded with the glass by then and fades on
+                // to none.
                 if glass
-                    && !rail_layer
+                    && (!rail_layer || line_whole)
                     && !plan[run.lo..run.hi]
                         .iter()
                         .any(|s| s.glass_up >= GLASS_MIN_PX)
@@ -9222,7 +9446,15 @@ impl Ribbon {
                 };
                 if rail_layer {
                     let gap = if in_row { gap } else { None };
-                    let rail_scale = RAIL_GAIN * (1.0 - hold);
+                    // The rail is the leading's line ([`InkRole::Leading`]): on paper it lays the
+                    // body's share of the body's ceiling at the leading's own, so the line under
+                    // the tall body's over-text wash is the line under the underline's body.
+                    let rail_cap = if glass || ctx.cfg.dark_theme {
+                        1.0
+                    } else {
+                        InkRole::Leading.alpha_cap() / cov_cap(ctx.cfg)
+                    };
+                    let rail_scale = RAIL_GAIN * (1.0 - hold) * rail_cap;
                     let flat_dim_scale = FLAT_DIM_RAIL_GAIN * (1.0 - hold);
                     let rail_core = if flat_dim {
                         FLAT_DIM_RAIL_CORE
@@ -9253,10 +9485,8 @@ impl Ribbon {
                                 (row_bottom_i, dip_bottom),
                             ) == Some(false)
                     };
+                    let mut prev_t = None;
                     for_each_feathered(&plan[run.lo..run.hi], fine_feather, end_fine, |i, seg| {
-                        if i == head_rel {
-                            head_rev = verts.len();
-                        }
                         // The vivid rail lies a hairline below the row's bottom.
                         let top = if in_row {
                             row_bottom - row_rail
@@ -9284,8 +9514,11 @@ impl Ribbon {
                         } else {
                             (seg.spine + seg.dn - top).max(dn_floor).min(rail_reach_max)
                         };
-                        let feather_cov = seg.cov * head_feather_of.at(seg.x);
-                        verts.push(RibbonVertex {
+                        // The line lays the share of its height the body keeps
+                        // ([`Segment::line_keep`]): the body's coverage is its opacity alone.
+                        let keep = if line_whole { 1.0 } else { seg.line_keep };
+                        let feather_cov = seg.cov * head_feather_of.at(seg.x) * keep;
+                        let v = RibbonVertex {
                             x: seg.x,
                             spine: top,
                             up: 0.0,
@@ -9303,7 +9536,46 @@ impl Ribbon {
                             } * foot,
                             lift: 0.0,
                             lift_span: 0.0,
-                        });
+                        };
+                        // A glass hard step (§2.2 Seams) is two vertices at its x, its right side's
+                        // walk first, as the glass lays it.
+                        let right = if seg.glass_jump == 0.0 {
+                            None
+                        } else {
+                            Some(RibbonVertex {
+                                color: ink.rail_at(seg.t + seg.glass_jump),
+                                ..v
+                            })
+                        };
+                        // Where the lip's ink steps between this vertex and the last
+                        // ([`BedInkLut::rail_step`]), two vertices at the step, one in each
+                        // side's entry, laid as the run is: nothing lerps across it.
+                        let near_t = seg.t + seg.glass_jump;
+                        if let (Some(pt), Some(&p)) = (prev_t, verts.last())
+                            && !rail_lerps_the_fold
+                            && let Some((u, from, to)) = ink.rail_step(pt, near_t)
+                        {
+                            let mix = |a: f32, b: f32| a + (b - a) * u;
+                            let at = |color: u32| RibbonVertex {
+                                x: mix(p.x, v.x),
+                                spine: mix(p.spine, v.spine),
+                                dn: mix(p.dn, v.dn),
+                                core_dn: mix(p.core_dn, v.core_dn),
+                                cov: mix(p.cov, v.cov),
+                                color,
+                                ..v
+                            };
+                            verts.push(at(from));
+                            verts.push(at(to));
+                        }
+                        if i == head_rel {
+                            head_rev = verts.len();
+                        }
+                        if let Some(right) = right {
+                            verts.push(right);
+                        }
+                        verts.push(v);
+                        prev_t = Some(seg.t);
                     });
                     if inked || gap.is_some() {
                         let ring = crate::cursor_glow::LETTER_GUARD_RING as f32;
@@ -9526,7 +9798,37 @@ impl Ribbon {
             let mut prior_rail_drawn = false;
             let mut sink = frame.under_sink();
             let under = &mut sink;
-            let mut i = 0;
+            // Under glass every run's glass is laid first and every run's rail after it. The
+            // glass is opaque: a rail laid before a later run's glass would lie under it, as the
+            // line under a wrapped row's words would under the next row's glass. And the span the
+            // yield owns ([`Self::glass_span`]) is then the glass's alone, the rails the guard's.
+            #[cfg(test)]
+            let glass_first = glass && !self.glass_rails_by_run;
+            #[cfg(not(test))]
+            let glass_first = glass;
+            let mut i = if glass_first {
+                let mut whole = true;
+                let mut gi = 0;
+                while gi < runs.len() {
+                    if !paint(under, &runs[gi], Lay::Body) {
+                        whole = false;
+                        break;
+                    }
+                    gi += 1;
+                }
+                glass_to = Some(under.mark());
+                let mut ri = 0;
+                while whole && ri < runs.len() {
+                    let run = &runs[ri];
+                    if !(paint(under, run, Lay::Rail) && paint(under, run, Lay::RowRail)) {
+                        break;
+                    }
+                    ri += 1;
+                }
+                runs.len()
+            } else {
+                0
+            };
             while i < runs.len() {
                 let run = &runs[i];
                 if !paint(under, run, Lay::Body) {
@@ -9598,8 +9900,10 @@ impl Ribbon {
             }
         }
         let at = (frame.under.len(), frame.under_ramps.mark());
-        if glass && at != ink_from {
-            self.glass_span = Some((ink_from, at));
+        if let Some(to) = glass_to
+            && to != ink_from
+        {
+            self.glass_span = Some((ink_from, to));
         }
         rail_spans.retain(|&(_, to, _)| rail_within(to, at));
         self.rail_spans = rail_spans;

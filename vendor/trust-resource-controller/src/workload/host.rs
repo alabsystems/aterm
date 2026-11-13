@@ -11,9 +11,11 @@ use super::{WorkloadInvocation, path};
 pub mod bank;
 pub mod census;
 pub mod contained;
+pub mod coordinator;
 pub mod output;
 pub mod phase;
 pub mod produced;
+pub mod publication;
 pub mod worker;
 use crate::wire::{Encoder, header, invalid};
 use crate::{ContextQuery, ContextReply, GnuTransport, MetadataPrepared, Request, Role};
@@ -30,6 +32,10 @@ pub const CPU_SET_FDS_ENV: &str = "ATERM_WORKLOAD_CPU_FDS_V1";
 /// Read-only discovery locator only. Original live context/SCM authenticates
 /// every resource; a store directory or environment value grants none.
 pub const HOST_STORE_FD_ENV: &str = "ATERM_WORKLOAD_HOST_STORE_FD_V1";
+pub const CONTROL_FDS_ENV: &str = "ATERM_WORKLOAD_HOST_CONTROL_FDS_V1";
+pub const CONTROL_ORIGINALS: usize = 9;
+pub const CONTROL_TARGETS: [i32; CONTROL_ORIGINALS] = [10, 11, 12, 13, 14, 15, 16, 17, 18];
+pub const CONTROL_ADVERTISEMENT: &str = "10,11,12,13,14,15,16,17,18";
 pub const CPU_SET_MARKER: u8 = 0x57;
 pub const MEMBER_ORIGINAL_PURPOSE: &str = "native-workload-member-original-v1";
 pub const READY_CAPABILITIES_JSON: &str = r#"{"version":3,"purpose":"sealed-workload-v1","query_purpose":"sealed-workload-query-v1","query_role":6,"cpu_mode":"cooperative-shared","cpu_custody":"original-all-domain-descriptions-v1","crash_exclusion":"original-recoverable-domain-v1","context_sdk":"inherited-sdk-keeper-v1","output_custody":"original-output-root-v1","member_purpose":"sealed-workload-member-v1","member_role":7,"output_registration":"original-live-unit-output-v1","produced_preparation":"mixed-original-output-sdk-v1","output_lock_custody":"original-layout-ofd-close-only-v1","compiler_proxy":"original-store-fd-v1"}"#;
@@ -40,6 +46,8 @@ pub enum MemberKind {
     BuildScript,
     Inventory,
     Sample,
+    /// Distinct produced Targo coordinator; never a libtest/build-script alias.
+    Coordinator,
 }
 
 /// A bound terminal from the same owning wait, after native scope retirement
@@ -64,6 +72,7 @@ impl Completion {
             MemberKind::BuildScript => 1,
             MemberKind::Inventory => 2,
             MemberKind::Sample => 3,
+            MemberKind::Coordinator => 4,
         });
         e.frame_bytes(&self.completed.encode()?)?;
         e.frame_bytes(&self.observation.encode()?)?;
@@ -80,6 +89,7 @@ impl Completion {
             1 => MemberKind::BuildScript,
             2 => MemberKind::Inventory,
             3 => MemberKind::Sample,
+            4 => MemberKind::Coordinator,
             _ => return Err(invalid()),
         };
         let value = Self {
@@ -174,16 +184,23 @@ impl MemberOriginalRequest {
         if d.number()? != 2 {
             return Err(invalid());
         }
-        let value =
-            Self { query: ContextQuery::decode(&d.frame_bytes()?)?, member_attempt: d.array()? };
+        let value = Self {
+            query: ContextQuery::decode(&d.frame_bytes()?)?,
+            member_attempt: d.array()?,
+        };
         d.done()?;
         value.encode()?;
         Ok(value)
     }
     pub fn hello(&self) -> io::Result<Vec<u8>> {
         self.encode()?;
-        let attempt: String =
-            self.query.binding.root_attempt.iter().map(|byte| format!("{byte:02x}")).collect();
+        let attempt: String = self
+            .query
+            .binding
+            .root_attempt
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         Ok(format!("{{\"version\":3,\"role\":\"{MEMBER_ORIGINAL_PURPOSE}\",\"session\":\"{}\",\"attempt\":\"{attempt}\"}}",self.query.binding.session).into_bytes())
     }
 }
@@ -194,9 +211,13 @@ pub struct MemberOriginalReply {
 }
 impl MemberOriginalReply {
     pub fn encode(&self) -> io::Result<Vec<u8>> {
-        if !matches!(self.context.context.subject, crate::Subject::RegisteredMember { .. })
-            || !matches!(self.context.context.cpu, crate::Cpu::CooperativeShared { .. })
-            || self.context.context.sdk.is_none()
+        if !matches!(
+            self.context.context.subject,
+            crate::Subject::RegisteredMember { .. }
+        ) || !matches!(
+            self.context.context.cpu,
+            crate::Cpu::CooperativeShared { .. }
+        ) || self.context.context.sdk.is_none()
             || self.cpu.inherited_fd < 6
             || self.cpu.inherited_fd > i32::MAX as u32
             || self.cpu.slot >= MAX_CPU_SET as u32
@@ -223,7 +244,10 @@ impl MemberOriginalReply {
             cpu: PrimaryCpu {
                 inherited_fd: d.narrow()?,
                 slot: d.narrow()?,
-                backing: crate::FileIdentity { device: d.number()?, inode: d.number()? },
+                backing: crate::FileIdentity {
+                    device: d.number()?,
+                    inode: d.number()?,
+                },
             },
         };
         d.done()?;
@@ -241,8 +265,10 @@ impl ReadyReply {
         e.number(1);
         e.frame_bytes(&self.context.encode()?)?;
         e.0.extend(self.invocation_sha256);
-        if !matches!(self.context.context.cpu, crate::Cpu::CooperativeShared { .. })
-            || self.context.context.sdk.is_none()
+        if !matches!(
+            self.context.context.cpu,
+            crate::Cpu::CooperativeShared { .. }
+        ) || self.context.context.sdk.is_none()
         {
             return Err(invalid());
         }
@@ -286,11 +312,19 @@ impl ReadyReply {
             set.push(PrimaryCpu {
                 inherited_fd: d.narrow()?,
                 slot: d.narrow()?,
-                backing: crate::FileIdentity { device: d.number()?, inode: d.number()? },
+                backing: crate::FileIdentity {
+                    device: d.number()?,
+                    inode: d.number()?,
+                },
             });
         }
         let primary = set.remove(0);
-        let value = Self { context, invocation_sha256, primary, supplementary: set };
+        let value = Self {
+            context,
+            invocation_sha256,
+            primary,
+            supplementary: set,
+        };
         d.done()?;
         value.encode()?;
         Ok(value)
@@ -318,13 +352,17 @@ pub(crate) fn validate_query_member(member: &Request) -> io::Result<()> {
         || !matches!(member.delegations.gnu, GnuTransport::None)
         || !member.delegations.fences.is_empty()
         || member.command.environment.len() != 6
-        || member.command.environment.iter().any(|(name, value)| match name.as_slice() {
-            b"LANG" | b"LC_ALL" => value != b"C",
-            b"CARGO" | b"CARGO_HOME" => !path(value),
-            b"RUSTC" => value != &member.command.program,
-            b"CARGO_CACHE_RUSTC_INFO" => value != b"0",
-            _ => true,
-        })
+        || member
+            .command
+            .environment
+            .iter()
+            .any(|(name, value)| match name.as_slice() {
+                b"LANG" | b"LC_ALL" => value != b"C",
+                b"CARGO" | b"CARGO_HOME" => !path(value),
+                b"RUSTC" => value != &member.command.program,
+                b"CARGO_CACHE_RUSTC_INFO" => value != b"0",
+                _ => true,
+            })
     {
         return Err(invalid());
     }

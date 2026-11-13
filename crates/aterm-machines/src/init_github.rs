@@ -51,7 +51,7 @@ pub fn git_installed(sys: &dyn System) -> bool {
     repos::git_installed(sys)
 }
 
-/// A test double's git before 2.44 answering [`git_ready_for_inventory`]'s capability question:
+/// A test double's git before 2.45 answering [`git_ready_for_inventory`]'s capability question:
 /// it refuses `--no-lazy-fetch`, and its read shows whether it `obeys` `GIT_NO_LAZY_FETCH`
 /// ([`crate::checkout::lazy_fetch::before_the_option`]).
 #[cfg(any(test, debug_assertions))]
@@ -60,7 +60,7 @@ pub use crate::checkout::lazy_fetch::before_the_option as git_before_no_lazy_fet
 /// Whether the selected private inventory's Git requirements are met. Unlike the
 /// metadata-only [`git_installed`], this may ask the selected executable whether
 /// it supports safe local object reads when required dependencies need them
-/// ([`crate::checkout::NoLazyFetch::of`]: `--no-lazy-fetch`, or `GIT_NO_LAZY_FETCH` it was
+/// ([`crate::checkout::lazy_fetch::of`]: `--no-lazy-fetch`, or `GIT_NO_LAZY_FETCH` it was
 /// seen to obey, in a scratch folder of its own).
 /// Call outside the materialization lock, with source admission checked again
 /// before using the result. This reading grants no package or credential authority.
@@ -93,7 +93,7 @@ pub fn git_ready_for_inventory(sys: &dyn System, ctx: &Ctx) -> Result<bool, Stri
     {
         return Ok(true);
     }
-    crate::checkout::NoLazyFetch::of(sys, user).map(|off| off.is_some())
+    crate::checkout::lazy_fetch::of(sys, user).map(|off| off.is_some())
 }
 
 /// Whether repository setup uses the private vault inventory rather than an explicit profile.

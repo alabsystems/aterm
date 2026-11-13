@@ -7,6 +7,31 @@ use std::path::PathBuf;
 
 use aterm_update_core::ensure_private_dir;
 
+/// Files earlier updaters kept a verdict in, which the [record](Staging::record) replaced: the
+/// crash-loop quarantine ledger, the failed-candidate memo and the window-start failure record
+/// (now the record's `start_failure`), with their locks. Nothing reads
+/// them, nothing is imported from them (a held build is simply tried again), and
+/// [`Staging::retire`] deletes them.
+pub const RETIRED: [&str; 6] = [
+    "quarantine.toml",
+    "quarantine.toml.lock",
+    "failed.toml",
+    "failed.toml.lock",
+    "window-start-failure.toml",
+    "window-start-failure.toml.lock",
+];
+
+/// Delete the [`RETIRED`] files under `root`, best effort, and nothing else.
+pub fn retire_in(root: &std::path::Path) {
+    for name in RETIRED {
+        match std::fs::remove_file(root.join(name)) {
+            Ok(()) => aterm_log::info!("aterm-update: retired the old update verdict file {name}"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => aterm_log::warn!("aterm-update: could not retire {name}: {error}"),
+        }
+    }
+}
+
 /// Layout of the staging area, all under `…/aterm/Updates/`.
 #[derive(Clone, Debug)]
 pub struct Staging {
@@ -58,14 +83,16 @@ impl Staging {
         self.root.join("health.toml")
     }
 
-    /// The last-failed-candidate memo (`failed.toml`).
-    pub fn failed(&self) -> PathBuf {
-        self.root.join("failed.toml")
+    /// This copy's one update record (`record.json`, [`aterm_update_core::update_record`]): the
+    /// trial under way, the one hold and how the last one ended. It is the lab row's local copy,
+    /// and no other file here holds a verdict.
+    pub fn record(&self) -> PathBuf {
+        self.root.join(crate::RECORD)
     }
 
-    /// The crash-loop quarantine ledger (`quarantine.toml`).
-    pub fn quarantine(&self) -> PathBuf {
-        self.root.join("quarantine.toml")
+    /// Delete the [`RETIRED`] files, best effort. They are never read.
+    pub fn retire(&self) {
+        retire_in(&self.root);
     }
 
     /// The trialed build's `(build_number, dmg_sha256)` (`trial.toml`).

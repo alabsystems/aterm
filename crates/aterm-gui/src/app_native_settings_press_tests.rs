@@ -778,3 +778,75 @@ mod macos_notice_ask {
         assert_eq!(take_asks(), 0, "another row's press does not ask again");
     }
 }
+
+/// A browser comes up over whatever the person is looking at, so only their own press opens
+/// one (owner ruling 2026-11-09). The view cannot tell a click from a control client's `act`,
+/// so the host decides by the marks of the gesture it is dispatching.
+mod link_opens {
+    use super::*;
+
+    const SITE: &str = "about/open-site";
+
+    type By = fn(&mut App, &str);
+
+    /// Every way a press of `action` comes with no person known to stand behind it.
+    const UNVOUCHED: [(&str, By); 4] = [
+        ("`aterm ctl act`", |app, action| {
+            let (_, view) = app.active_native_view(WindowId(0)).unwrap();
+            app.act_app(crate::app_control::ActRequest {
+                view,
+                ui_key: action.to_string(),
+                action: action.to_string(),
+                value: None,
+            })
+            .unwrap();
+        }),
+        ("a control client's input", |app, action| {
+            app.with_controller_mark(true, |app| press(app, action, None));
+        }),
+        ("the accessibility tree", |app, action| {
+            app.with_assistive_source(|app| press(app, action, None));
+        }),
+        ("another process's input", |app, action| {
+            app.with_origin_mark(aterm_window::event::InputOrigin::Relayed, |app| {
+                press(app, action, None);
+            });
+        }),
+    ];
+
+    fn about() -> App {
+        let mut app = settings_app("", SettingsRoute::About);
+        if let Some(window) = app.windows.get_mut(&WindowId(0)) {
+            window.cols = 140;
+            window.rows = 100;
+        }
+        app
+    }
+
+    /// AN AGENT'S PRESS OPENS NO BROWSER: the About page's site button pressed through `act`, a
+    /// control client's key, the accessibility tree or another process's input opens nothing
+    /// and says why. NEGATIVE CONTROL: the person's own press of the same button opens the
+    /// site once.
+    #[test]
+    fn only_a_persons_own_press_opens_the_site() {
+        let _ = crate::platform::take_opened_urls();
+        for (who, by) in UNVOUCHED {
+            let mut app = about();
+            by(&mut app, SITE);
+            assert_eq!(
+                crate::platform::take_opened_urls(),
+                Vec::<String>::new(),
+                "{who} opened a browser"
+            );
+            assert!(
+                app.gesture_unvouched().is_none(),
+                "{who}: the mark is spent"
+            );
+        }
+        let mut app = about();
+        press(&mut app, SITE, None);
+        let opened = crate::platform::take_opened_urls();
+        assert_eq!(opened.len(), 1, "control: a person's press: {opened:?}");
+        assert!(opened[0].starts_with("https://"), "{opened:?}");
+    }
+}

@@ -750,6 +750,22 @@ impl GlassGrid {
         self.geom.cell
     }
 
+    /// The window pixel at the centre of frame cell `(row, col)` under this grid:
+    /// [`Self::cell_at`]'s inverse.
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "window pixel coordinates; the f64 mantissa covers every representable window size"
+    )]
+    pub(crate) fn cell_centre(&self, row: usize, col: usize) -> (f64, f64) {
+        let (cw, ch) = self.geom.cell;
+        let x = self.geom.pad + col * cw + cw / 2;
+        let y = self.geom.pad_top + self.geom.head + row * ch + ch / 2;
+        (
+            self.origin.0 as f64 + x as f64,
+            self.origin.1 as f64 + y as f64,
+        )
+    }
+
     /// Window pixel `(x, y)` as a frame cell `(row, col)` under this grid.
     pub(crate) fn cell_at(&self, x: f64, y: f64) -> Option<(usize, usize)> {
         frame_cell_of(self.geom, self.origin, self.dims.1, x, y)
@@ -988,8 +1004,10 @@ impl App {
     }
 
     /// The window pixel at the centre of the open card's row for `item` — the palette's filtered
-    /// row, as `menu` counts `selected=`, or the Overview's item, as `controls overview` counts
-    /// it — where a person's pointer selects that row, or why there is none.
+    /// row, as `menu` counts `selected=`, the Overview's item, as `controls overview` counts
+    /// it, or a footer card's row, as `controls fact-menu` counts `index=`
+    /// ([`Self::fact_card_item_px`]) — where a person's pointer selects that row, or why there
+    /// is none.
     pub(crate) fn overlay_card_item_px(
         &self,
         wid: WindowId,
@@ -997,7 +1015,10 @@ impl App {
     ) -> Result<(f64, f64), String> {
         let window = self.windows.get(&wid).ok_or("no window")?;
         if window.palette().is_none() && window.overview().is_none() {
-            return Err("no palette or Overview is open".into());
+            if self.autopilot_menu.as_ref().is_some_and(|m| m.wid == wid) {
+                return self.fact_card_item_px(wid, item);
+            }
+            return Err("no palette, Overview or footer card is open".into());
         }
         let transform = self
             .overlay_coordinate_transform(wid)
@@ -3506,22 +3527,32 @@ impl App {
                 self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
                 return Resolved(None);
             }
+            // The hand over a top line's mark where a press opens the site, as over a card
+            // line's mark below; the arrow over the blank between two chips.
             crate::claude_lights::OverChips::Gap => {
-                self.set_hover_cursor(wid, CursorIcon::Default, false, false);
+                let opens = self
+                    .claude_glass_at(wid, px, py)
+                    .is_some_and(|(session, at)| {
+                        matches!(at, crate::claude_lights::GlassAt::Mark)
+                            && self.mark_press_opens(wid, session)
+                    });
+                if opens {
+                    self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
+                } else {
+                    self.set_hover_cursor(wid, CursorIcon::Default, false, false);
+                }
                 return Resolved(None);
             }
             crate::claude_lights::OverChips::No => {}
         }
-        if let Some((session, url)) = self.claude_glass_hit_at(wid, px, py) {
-            let mods = self.windows.get(&wid).map(|ws| ws.mods).unwrap_or_default();
-            let held = link_modifier_held(mods);
+        if let Some((session, _)) = self.claude_glass_hit_at(wid, px, py) {
             let tracking = self
                 .pool
                 .get(session)
                 .is_some_and(|owner| owner.ctx.modes.mouse_tracking_enabled());
             // The hand where a press opens the link (`press_claude_glass_hit`): with the link
             // modifier, or with no modifier in the focused pane.
-            if url.is_some() && (held || (mods.is_empty() && self.session_is_front(wid, session))) {
+            if self.mark_press_opens(wid, session) {
                 self.set_hover_cursor(wid, CursorIcon::Pointer, true, false);
             } else if tracking {
                 self.set_hover_cursor(wid, CursorIcon::Default, false, false);
@@ -4969,7 +5000,7 @@ impl App {
             return None;
         }
         if let Some((_, url)) = self.claude_glass_hit_at(wid, px, py) {
-            return url.map(|url| (url.to_owned(), false));
+            return Some((url.to_owned(), false));
         }
         if !self.pointer_is_inside_focused_pane_with(wid, focused_rect)
             || self.glass_swallows_at(wid, px, py)

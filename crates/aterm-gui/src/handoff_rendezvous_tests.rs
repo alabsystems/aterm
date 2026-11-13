@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
-use std::os::fd::{AsFd as _, FromRawFd as _};
+use std::os::fd::AsFd as _;
 
 const TEST_NONCE: &str = "0123456789abcdef0123456789abcdef";
 
@@ -445,8 +445,8 @@ fn a_grant_is_not_sent_when_the_dialers_token_is_not_the_one_checked() {
     let sessions = 100;
     let rendezvous = bind_for_test();
     let (reads, writes) = pipes_for_test(sessions);
-    let (ready_rd, ready_wr) = pipe_for_test();
-    let (commit_rd, commit_wr) = pipe_for_test();
+    let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+    let (commit_rd, commit_wr) = aterm_uds::pipe().expect("pipe");
     let dialer = dial_and_count(
         rendezvous.path().to_path_buf(),
         rendezvous.claim().to_string(),
@@ -617,8 +617,8 @@ fn a_grant_is_not_sent_once_the_dialers_image_changed() {
             );
         }
         let (reads, writes) = pipes_for_test(1);
-        let (ready_rd, ready_wr) = pipe_for_test();
-        let (commit_rd, commit_wr) = pipe_for_test();
+        let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+        let (commit_rd, commit_wr) = aterm_uds::pipe().expect("pipe");
         let granted = peer.transfer(
             TEST_NONCE,
             &[(11, 4242, writes[0].as_fd())],
@@ -667,8 +667,8 @@ fn a_grant_whose_connection_closes_at_once_is_still_claimed() {
     for _ in 0..20 {
         let rendezvous = bind_for_test();
         let (master, slave) = open_pty();
-        let (ready_rd, ready_wr) = pipe_for_test();
-        let (commit_rd, commit_wr) = pipe_for_test();
+        let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+        let (commit_rd, commit_wr) = aterm_uds::pipe().expect("pipe");
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
         let dialer = std::thread::spawn(move || {
@@ -756,8 +756,8 @@ fn a_successor_process_claims_from_the_real_outgoing_listener() {
     let rendezvous = bind_for_test();
     let (master, slave) = open_pty();
     let term = pty_device_term(master).expect("a master answers fstat");
-    let (ready_rd, ready_wr) = pipe_for_test();
-    let (commit_rd, commit_wr) = pipe_for_test();
+    let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+    let (commit_rd, commit_wr) = aterm_uds::pipe().expect("pipe");
     let spec = format!(
         "{}\n{}\n{}\n{term}",
         rendezvous.path().display(),
@@ -818,9 +818,9 @@ fn a_successor_process_claims_from_the_real_outgoing_listener() {
 #[test]
 fn a_transfer_failure_says_whether_the_descriptors_left() {
     let rendezvous = bind_for_test();
-    let (ready_rd, ready_wr) = pipe_for_test();
-    let (commit_rd, commit_wr) = pipe_for_test();
-    let (fake_master_rd, _fake_master_wr) = pipe_for_test();
+    let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+    let (commit_rd, commit_wr) = aterm_uds::pipe().expect("pipe");
+    let (fake_master_rd, _fake_master_wr) = aterm_uds::pipe().expect("pipe");
     let claim = rendezvous.claim().to_string();
     let path = rendezvous.path().to_path_buf();
 
@@ -968,8 +968,8 @@ fn hung_up_on(dialer: std::os::fd::RawFd) -> bool {
 fn a_wrong_dialer_does_not_end_the_attempt_and_the_successor_still_claims() {
     let rendezvous = bind_for_test();
     let (master, slave) = open_pty();
-    let (ready_rd, ready_wr) = pipe_for_test();
-    let (commit_rd, commit_wr) = pipe_for_test();
+    let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+    let (commit_rd, commit_wr) = aterm_uds::pipe().expect("pipe");
     let path = rendezvous.path().to_path_buf();
     let claim = rendezvous.claim().to_string();
 
@@ -1202,8 +1202,8 @@ fn a_held_claim_is_granted_after_the_hold_under_the_grant_budget() {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let rendezvous = bind_for_test();
     let (master, slave) = open_pty();
-    let (ready_rd, ready_wr) = pipe_for_test();
-    let (commit_rd, commit_wr) = pipe_for_test();
+    let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+    let (commit_rd, commit_wr) = aterm_uds::pipe().expect("pipe");
     let claim = rendezvous.claim().to_string();
     let path = rendezvous.path().to_path_buf();
     let dial = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
@@ -1466,16 +1466,8 @@ fn open_pty() -> (i32, i32) {
     aterm_pty::open_pty_pair().expect("open_pty_pair")
 }
 
-fn pipe_for_test() -> (OwnedFd, OwnedFd) {
-    let mut raw = [0i32; 2];
-    // SAFETY: `pipe` initializes two file descriptors in `raw`.
-    assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0, "pipe");
-    // SAFETY: `raw` holds two freshly created pipe descriptors owned exclusively here.
-    unsafe { (OwnedFd::from_raw_fd(raw[0]), OwnedFd::from_raw_fd(raw[1])) }
-}
-
-fn pipes_for_test(count: usize) -> (Vec<OwnedFd>, Vec<OwnedFd>) {
-    (0..count).map(|_| pipe_for_test()).unzip()
+fn pipes_for_test(count: usize) -> (Vec<std::io::PipeReader>, Vec<std::io::PipeWriter>) {
+    (0..count).map(|_| aterm_uds::pipe().expect("pipe")).unzip()
 }
 
 fn inode(fd: i32) -> (libc::dev_t, libc::ino_t) {
@@ -1487,7 +1479,7 @@ fn inode(fd: i32) -> (libc::dev_t, libc::ino_t) {
     (info.st_dev, info.st_ino)
 }
 
-fn assert_every_write_end_closed(reads: &[OwnedFd], what: &str) {
+fn assert_every_write_end_closed(reads: &[std::io::PipeReader], what: &str) {
     for read in reads {
         // SAFETY: `F_SETFL` on a valid descriptor owned by this test.
         unsafe {
@@ -1626,8 +1618,8 @@ fn a_grant_past_its_deadline_says_the_successor_dialed_and_sends_nothing() {
     for (sessions, chunks) in [(3_usize, false), (100, true)] {
         let rendezvous = bind_for_test();
         let (_reads, writes) = pipes_for_test(sessions);
-        let (_ready_rd, ready_wr) = pipe_for_test();
-        let (commit_rd, _commit_wr) = pipe_for_test();
+        let (_ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+        let (commit_rd, _commit_wr) = aterm_uds::pipe().expect("pipe");
         let claim = rendezvous.claim().to_string();
         let path = rendezvous.path().to_path_buf();
         let dialer = std::thread::spawn(move || {
@@ -1681,8 +1673,8 @@ fn a_grant_past_its_deadline_says_the_successor_dialed_and_sends_nothing() {
 fn a_grant_of_100_sessions_crosses_in_chunks() {
     let rendezvous = bind_for_test();
     let (reads, writes) = pipes_for_test(100);
-    let (ready_rd, ready_wr) = pipe_for_test();
-    let (commit_rd, commit_wr) = pipe_for_test();
+    let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+    let (commit_rd, commit_wr) = aterm_uds::pipe().expect("pipe");
     let claim = rendezvous.claim().to_string();
     let path = rendezvous.path().to_path_buf();
     let dialer = std::thread::spawn(move || {
@@ -1758,8 +1750,8 @@ fn an_atrz1c_claim_never_receives_a_chunked_grant() {
 
     let rendezvous = bind_for_test();
     let (reads, writes) = pipes_for_test(100);
-    let (ready_rd, ready_wr) = pipe_for_test();
-    let (commit_rd, commit_wr) = pipe_for_test();
+    let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+    let (commit_rd, commit_wr) = aterm_uds::pipe().expect("pipe");
     let claim = rendezvous.claim().to_string();
     let path = rendezvous.path().to_path_buf();
     let dialer = std::thread::spawn(move || {
@@ -1814,8 +1806,8 @@ fn an_atrz1c_claim_never_receives_a_chunked_grant() {
 
     let rendezvous = bind_for_test();
     let (master, slave) = open_pty();
-    let (ready_rd, ready_wr) = pipe_for_test();
-    let (commit_rd, commit_wr) = pipe_for_test();
+    let (ready_rd, ready_wr) = aterm_uds::pipe().expect("pipe");
+    let (commit_rd, commit_wr) = aterm_uds::pipe().expect("pipe");
     let dialer = CtlStream::connect(rendezvous.path()).expect("connect");
     (&dialer)
         .write_all(&claim_frame_with(rendezvous.claim(), true))
@@ -2296,4 +2288,63 @@ fn rendezvous_grant_conformance() {
         .is_some(),
         "a successor that refuses the lone list it declared must disagree with the model"
     );
+}
+
+/// The launched lane's claim report reaches only a parent that offered to read reports, and is
+/// the first frame such a parent reads: the one that starts its silence clock between the grant
+/// and intake. A parent that offered nothing (an older outgoing build) reads only its proof.
+///
+/// NEGATIVE CONTROL: drop the offer check from `ClaimedHandoff::report_claim` and the unoffered
+/// parent reads a frame it cannot parse as its proof.
+#[test]
+fn the_claim_report_reaches_only_a_parent_that_offered_to_read_reports() {
+    use std::os::fd::AsRawFd as _;
+    for offered in [true, false] {
+        let (read, ready) = aterm_uds::pipe().expect("pipe");
+        let (_commit_read, commit) = aterm_uds::pipe().expect("pipe");
+        let claimed = ClaimedHandoff {
+            fds_wire: String::new(),
+            masters: Vec::new(),
+            ready: ready.into(),
+            commit: commit.into(),
+            parked_for: None,
+        };
+        let mut env = crate::handoff_env::HandoffEnv::default();
+        if offered {
+            env.set(
+                crate::seamless::ENV_READY_CAPS,
+                crate::seamless::READY_CAPS_PROGRESS.to_string(),
+            );
+        }
+        assert_eq!(claimed.report_claim(&env), offered, "offered {offered}");
+        assert!(
+            env.present(crate::seamless::ENV_READY_CAPS) == offered,
+            "the claim reads the offer and leaves it for intake to take"
+        );
+        drop(claimed);
+        let mut frames = Vec::new();
+        loop {
+            let mut wire = [0u8; crate::seamless::READY_WIRE_LEN];
+            // SAFETY: a bounded read into a fixed local buffer; every write end is closed, so
+            // this ends at EOF.
+            let n = unsafe { libc::read(read.as_raw_fd(), wire.as_mut_ptr().cast(), wire.len()) };
+            if n != isize::try_from(wire.len()).unwrap_or(-1) {
+                assert_eq!(n, 0, "whole frames, then EOF");
+                break;
+            }
+            frames.push(wire);
+        }
+        let labels = frames
+            .iter()
+            .map(|wire| {
+                crate::handoff_progress::Report::from_wire(wire)
+                    .map(|report| report.label().to_string())
+            })
+            .collect::<Vec<_>>();
+        if offered {
+            assert_eq!(labels, vec![Some("claimed".to_string())]);
+        } else {
+            assert!(labels.is_empty(), "nothing but the proof: {labels:?}");
+        }
+    }
 }

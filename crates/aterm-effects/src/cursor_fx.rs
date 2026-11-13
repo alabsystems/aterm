@@ -778,8 +778,9 @@ pub struct GlowSpelling {
     pub style: Option<GlowStyle>,
     /// The additive beam ([`crate::cursor_glow::style_has_beam_of`]).
     pub beam: bool,
-    /// The full-height ribbon body: `false` for the `rainbow` theme, whose shape is the
-    /// underline, and unread by every other style.
+    /// The full-height ribbon body, the `rainbow` theme's: its band lies behind the typed
+    /// words with the vivid rail under them. `false` is the underline body, which no built-in
+    /// theme picks; every other style leaves it unread.
     pub ribbon_tall: bool,
     /// The flat ribbon body, which no built-in theme picks.
     pub ribbon_flat: bool,
@@ -804,7 +805,7 @@ impl GlowSpelling {
                 Some(style)
             },
             beam: crate::cursor_glow::style_has_beam_of(style, token),
-            ribbon_tall: !matches!(style, GlowStyle::RainbowKitty),
+            ribbon_tall: true,
             ribbon_flat: false,
             classic_mono: GlowStyle::style_names_classic_mono(raw),
         }

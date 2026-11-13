@@ -31,16 +31,31 @@ fn field(line: &str, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// THE QUOTA CAPABILITY IS THE OWNER'S, AND NAMES ITS FIVE-HOUR BOUND: with the native policy's
+/// quota rotation on, the owner's reply carries `codex_rotation=1` and, beside it,
+/// `codex_rotation_five_hour=` with the bound a five-hour handoff is judged by
+/// (`accounts::RESET_SOON_S`) as a plain count of seconds. With it off, or for an edge token,
+/// the reply carries neither word.
 #[test]
 fn quota_capability_requires_host_support_and_is_owner_only() {
+    const WORDS: [&str; 2] = ["codex_rotation", "codex_rotation_five_hour"];
     let mut value = facts(SupervisorConfig::default());
-    assert_eq!(field(&reply(&value, None, true), "codex_rotation"), None);
+    for word in WORDS {
+        assert_eq!(field(&reply(&value, None, true), word), None, "{word}");
+    }
     value.codex_rotation = true;
+    let line = reply(&value, None, true);
+    assert_eq!(field(&line, "codex_rotation").as_deref(), Some("1"));
+    let bound = field(&line, "codex_rotation_five_hour").expect("the five-hour bound");
     assert_eq!(
-        field(&reply(&value, None, true), "codex_rotation").as_deref(),
-        Some("1")
+        bound,
+        aterm_agent::harness::accounts::RESET_SOON_S.to_string()
     );
-    assert_eq!(field(&reply(&value, None, false), "codex_rotation"), None);
+    // What its reader takes for a count: digits alone, so no sign.
+    assert!(bound.bytes().all(|b| b.is_ascii_digit()), "{bound}");
+    for word in WORDS {
+        assert_eq!(field(&reply(&value, None, false), word), None, "{word}");
+    }
 }
 
 #[test]

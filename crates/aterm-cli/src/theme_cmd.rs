@@ -55,7 +55,7 @@ aterm theme check <file> [--strict] [--signature] [--format text|json]
 
   --strict         Warnings fail the check (exit 1); notes never do.
   --signature      Also measure the stricter bar aterm's signature themes
-                   (Aterm Night and Day, Hearth, Linen) clear: text 7:1; each
+                   (aterm Night and Day, Hearth, Linen) clear: text 7:1; each
                    accent (ANSI 1-6, brights 9-14) 4.5:1; a tier's accents 25
                    deg apart in OkLCh hue; each bright 0.05 OkLab from its
                    normal; color8 in [3, 4.5); color0 1.15:1; color7 and

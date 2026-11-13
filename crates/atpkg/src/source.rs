@@ -64,7 +64,10 @@ pub(crate) fn dir_registry(spec: Option<&std::ffi::OsStr>) -> Option<std::path::
         .map(std::path::PathBuf::from)
 }
 
-pub(crate) fn resolve_fetcher(
+/// The configured package transport for `layout`, with an optional publication hint.
+/// Callers still admit signatures, freshness and installed payloads through the package flow.
+#[must_use]
+pub fn resolve_fetcher(
     layout: &crate::store::Layout,
     published: Option<u64>,
 ) -> Box<dyn crate::flow::Fetcher> {
@@ -72,6 +75,20 @@ pub(crate) fn resolve_fetcher(
         return Box::new(crate::DirFetcher::new(dir));
     }
     Box::new(github_fetcher(layout, published))
+}
+
+/// The cache source [`resolve_fetcher`]'s fetcher names `program`'s package documents by
+/// ([`crate::flow::Fetcher::package_source_id`]), without building one: what a reader of the
+/// signed-artifact cache keys its read on.
+pub(crate) fn package_source_id(repo: &str, program: &str) -> Option<String> {
+    use crate::flow::Fetcher as _;
+    if let Some(dir) = dir_registry(registry_seam().as_deref()) {
+        return crate::DirFetcher::new(dir).package_source_id(repo, program);
+    }
+    let cfg = crate::config::cached();
+    crate::GithubFetcher::new(crate::resolve_account(cfg.account()).owner)
+        .with_overrides(crate::repo_overrides(cfg))
+        .package_source_id(repo, program)
 }
 
 pub(crate) fn effective_anchor(layout: &crate::store::Layout) -> crate::Anchor {

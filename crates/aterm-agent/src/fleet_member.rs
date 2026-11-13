@@ -8824,7 +8824,11 @@ fn survey_all_facts_in(
 ) -> Result<aterm_ctl::FleetRead, aterm_ctl::FleetRefused> {
     survey_fleet_read_in(
         places,
-        &aterm_ctl::FleetAsk { host: None, within },
+        &aterm_ctl::FleetAsk {
+            host: None,
+            within,
+            holder: None,
+        },
         "survey facts",
     )
 }
@@ -9399,7 +9403,11 @@ fn survey_fleet_in(
     places: &Places,
     ask: &aterm_ctl::FleetAsk<'_>,
 ) -> Result<aterm_ctl::FleetRead, aterm_ctl::FleetRefused> {
-    survey_fleet_read_in(places, ask, "survey")
+    let query = ask.holder.map_or_else(
+        || "survey".to_owned(),
+        |holder| format!("survey {}", holder.arg()),
+    );
+    survey_fleet_read_in(places, ask, &query)
 }
 
 fn survey_fleet_read_in(
@@ -9522,7 +9530,13 @@ fn survey_fleet_read_in(
         if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
             return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
         }
-        let read = member::survey_one_by(&target_of(&peer), keys, (&secret, me.as_ref()), deadline);
+        let read = member::survey_one_by(
+            &target_of(&peer),
+            keys,
+            (&secret, me.as_ref()),
+            deadline,
+            query,
+        );
         if !traffic.current() || !local_fleet_matches(places, &secret, me.as_ref()) {
             return Err(FLEET_IDENTITY_CHANGED.to_owned().into());
         }

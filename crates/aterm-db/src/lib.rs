@@ -34,6 +34,8 @@ pub mod crypto;
 pub mod database;
 mod documents;
 #[cfg(unix)]
+pub mod fleet;
+#[cfg(unix)]
 pub mod fleet_db;
 #[cfg(unix)]
 mod generation;
@@ -46,6 +48,7 @@ pub mod machines;
 pub mod network;
 #[cfg(unix)]
 pub mod network_state;
+pub mod publish;
 #[cfg(unix)]
 pub mod replica;
 #[cfg(unix)]

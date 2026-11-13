@@ -20,6 +20,7 @@ use atpkg_publish::artifact::bundle::pack_bundle_with;
 use atpkg_publish::artifact::relocate::Report;
 use atpkg_publish::artifact::tarwrite::{Compressor, RawFrames};
 use atpkg_publish::artifact::tools::{HostTools, Ran, Run, RunError, Tools};
+use atpkg_publish::ctx::HostChoice;
 use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::testkit::Keys;
 
@@ -201,8 +202,11 @@ fn a_cc_built_sysroot_ships_one_compiler_under_one_signature() {
 
     let home = root.join("home");
     let keys = Keys::mint("m3", &[]);
-    let ctx = keys.ctx(&home, Arc::new(FakeHost::new()));
-    trust_repo(&home.join("trust"), DORMANT_LEDGER);
+    let fake = Arc::new(FakeHost::new());
+    let ctx = keys
+        .ctx(&home, fake.clone())
+        .with_host_choice(HostChoice::Agh);
+    trust_repo(&home.join("trust"), DORMANT_LEDGER, &ctx, &fake);
     let checkout = root.join("trust-mc");
     fixture_checkout(&checkout, &[("README", b"trust-mc\n")]);
     let out_dir: PathBuf = root.join("out");

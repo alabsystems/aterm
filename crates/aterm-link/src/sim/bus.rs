@@ -115,10 +115,13 @@
 //! [`Stop::Clean`] and [`Stop::Crash`] lose and move nothing (P5, P6).
 //! [`Stop::PowerLoss`] on a weak tier keeps a prefix of at least the durable
 //! head (P2, P3) drawn from [`State::allowed_cuts`], and a loss moves the
-//! generation with lineage `(g + 1, kept)` (P4, P7). [`law_check`] holds every
-//! restart to the law, and admits too what astream settles for a log that kept
-//! no record: ANOTHER LOG, a fresh id that continues nothing
-//! ([`Restart::another_log`]), which the model never mints. `conform_broker`'s
+//! generation with lineage `(g + 1, kept)` (P4, P7). Every open of a log that
+//! holds no record settles ANOTHER LOG, as astream's `logid::settle` does
+//! whatever the stop or its `.id` sidecar says: a fresh id at generation 0
+//! with no lineage, continuing nothing ([`Restart::another_log`],
+//! [`State::mint`]); so does the open after [`Broker::retire_log`], the
+//! `aterm link broker --retire-log` that sets a log aside. [`law_check`] holds
+//! every restart to the law, another log included. `conform_broker`'s
 //! refinement arm holds the real store's recoveries at each power loss, from
 //! the images astream's simulated device could be left in (every one while an
 //! epoch's subsets fit 64 images, a seeded sample of 64 past that), to
@@ -126,6 +129,18 @@
 //! P1 (the model always opens), P8 (no byte rots), batch boundaries, and a
 //! move after a crash on a log off the boot volume or opened in a boot it
 //! cannot name (astream takes either crash for a power loss).
+//!
+//! ## A poisoned log
+//!
+//! [`Broker::fail_next_full_flush`] fails the log's next full flush, as astream's
+//! `BrokerLog::full_flush_failed` meets one: an escalated publish's or group commit's on a weak
+//! tier, the Ordered horizon's while one is owed, or a `Settle`'s on any tier ([`State::full_flush`]).
+//! The run is recorded lossy, a weak tier latches to Strict (`Hello` says
+//! `LatchedAfterFlushFailure`), and the log is POISONED: the op whose flush failed is refused
+//! "outcome unknown", its record written and held out of sight ([`State::visible_head`]), and
+//! every write after it is refused `log poisoned` until a reopen, which moves the generation
+//! whatever the stop (P4L) and shows the held record. A Strict batch's own flush failure is a
+//! rolled-back batch, never a poison, and stays astream's `poisoned_log` test.
 //!
 //! ## Held acks, rolled-back batches and determinism
 //!
@@ -160,8 +175,22 @@ use super::{lock, Process, Rng};
 use crate::fx::BusCloser;
 use crate::transport::Conn;
 
-/// The simulated log's id: a `Hello` names it with the generation ([`State::identity`]).
+/// The simulated log's first id: a `Hello` names it with the generation ([`State::identity`]).
+/// Each ANOTHER LOG the model settles takes it with its mint count in the last eight bytes
+/// ([`State::mint`]).
 pub(crate) const LOG_ID: [u8; 16] = [0x5a; 16];
+
+/// The words astream answers the op whose full flush failed with (`settle_full_flush`): not
+/// under `LOG_POISONED_PREFIX`, which only the writes after it are refused under.
+const OUTCOME_UNKNOWN: &str = "durability flush failed: injected; the outcome is unknown, and the \
+                               log refuses every write until it is reopened: resend then";
+
+/// A POISONED LOG ([`State::poison`]): where the record whose escalated flush failed was held
+/// out of sight (`None`: a `Settle`'s or the horizon's failure, which holds nothing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Poison {
+    pub(crate) held_from: Option<u64>,
+}
 
 /// The tier the simulated broker serves.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -582,6 +611,22 @@ pub(crate) struct State {
     pub(crate) no_horizon: bool,
     /// NEGATIVE CONTROLS of the arm itself ([`law_check`]'s).
     pub(crate) mutant: ArmMutant,
+    /// ANOTHER LOGs settled so far ([`State::mint`]): the next one's id.
+    pub(crate) mints: u64,
+    /// THE POISON a failed full flush set, until the next stop ([`State::full_flush`]).
+    pub(crate) poison: Option<Poison>,
+    /// The weak tier latched to Strict by that failure: `Hello` serves Strict.
+    pub(crate) latched: bool,
+    /// The next full flush fails ([`Broker::fail_next_full_flush`]), until one is made or the
+    /// broker stops.
+    pub(crate) fail_full_flush: bool,
+    /// The run is recorded lossy: the next open moves the identity whatever the stop.
+    pub(crate) lossy: bool,
+    /// The full flush the op being served made just failed: its answer is "outcome unknown".
+    flush_failed: bool,
+    /// Full flushes that failed and poisoned the log, and writes refused while it was.
+    pub(crate) poisons: u64,
+    pub(crate) poisoned_refusals: u64,
     /// A SIBLING RACING AN ATTACH ([`Race`]), in the worlds that have one.
     pub(crate) race: Option<Race>,
     /// THE DOOR'S JOURNAL ([`Event`]), in a world that keeps one.
@@ -793,6 +838,19 @@ pub(crate) enum ArmMutant {
     /// A broker that says it gap-fences lets a publish land behind one of its producer's
     /// refused on that connection.
     NoGapFence,
+    /// An open of a log that holds no record keeps its id (and a weak power loss to 0 moves it
+    /// `(g + 1, 0)`): no ANOTHER LOG is ever settled ([`State::mint`]).
+    NeverMints,
+    /// Another log is minted a fresh id but keeps the generation and lineage it had.
+    MintKeepsGeneration,
+    /// A failed full flush is consumed but succeeds: nothing is poisoned ([`State::full_flush`]).
+    NeverPoisons,
+    /// The reopen of a run whose full flush failed keeps its identity, as a clean one does.
+    PoisonKeepsGeneration,
+    /// A poisoned weak tier still serves the tier it was asked for: no latch to Strict.
+    PoisonWithoutLatch,
+    /// A write after the poison lands as on a healthy log.
+    PoisonedWritesLand,
     /// A broker that gap-fences fences every connection, asked or not (astream `8a15cdb`..
     /// `ea8bab7`): a refusal on a connection that never asked holds back what it sends after.
     FenceUnasked,
@@ -899,6 +957,11 @@ pub(crate) enum Event {
     Refuse(u32),
     /// The model was told a producer's principal ([`Broker::name_producer`]).
     Name(u64, String),
+    /// The log's next full flush fails ([`Broker::fail_next_full_flush`]).
+    FailFullFlush,
+    /// The stopped log was set aside, as `aterm link broker --retire-log` does
+    /// ([`Broker::retire_log`]).
+    RetireLog,
 }
 
 /// The simulated broker every connection of a world reaches.
@@ -918,11 +981,20 @@ pub(crate) struct Restart {
     pub(crate) generation_before: u64,
     pub(crate) generation_after: u64,
     pub(crate) lineage_after: Vec<(u64, u64)>,
-    /// The open settled ANOTHER LOG: a fresh log id, as astream mints for a log that kept no
-    /// record, so no offset a reader kept continues (`LogIdentity::continues` answers none)
-    /// and no lineage is owed. The model's own stops never mint one: it moves the generation
-    /// with a step to the records kept, which continues nothing either at a cut to 0.
+    /// The open settled ANOTHER LOG: a fresh log id at generation 0 with no lineage, as astream
+    /// mints at every open of a log that holds no record ([`State::mint`]), whatever the stop,
+    /// and after a retire ([`Restart::retired`]): no offset a reader kept continues
+    /// (`LogIdentity::continues` answers none) and no lineage is owed.
     pub(crate) another_log: bool,
+    /// The run before the stop was recorded lossy (a failed full flush, [`State::poison`]): the
+    /// reopen moves the identity whatever the stop (P4L).
+    pub(crate) lossy: bool,
+    /// The log was set aside while down ([`Broker::retire_log`]): what it held is not lost but
+    /// moved away, and the next open starts another log.
+    pub(crate) retired: bool,
+    /// Where the poison held a record out of sight ([`Poison::held_from`]): never acked, so a
+    /// power loss may cut it whatever it escalated (P3e).
+    pub(crate) held_from: Option<u64>,
 }
 
 impl Broker {
@@ -969,6 +1041,14 @@ impl Broker {
                 eager_tails: false,
                 no_horizon: false,
                 mutant: ArmMutant::None,
+                mints: 0,
+                poison: None,
+                latched: false,
+                fail_full_flush: false,
+                lossy: false,
+                flush_failed: false,
+                poisons: 0,
+                poisoned_refusals: 0,
                 race: None,
                 journal: None,
                 revive: None,
@@ -1039,7 +1119,8 @@ impl Broker {
     /// the head. Nothing on a broker that is down or set no rules. Whether anything landed.
     pub(crate) fn tick(&self, now_ms: u64) -> bool {
         let mut s = lock(&self.state);
-        if !s.up || !s.ret.active {
+        // A poisoned log refuses every mutation, the tick's included (`check_poisoned`).
+        if !s.up || !s.ret.active || s.poison.is_some() {
             return false;
         }
         s.note_event(|| Event::Tick(now_ms));
@@ -1138,6 +1219,9 @@ impl Broker {
     pub(crate) fn last_row(&self, subject: &str) -> Option<(u64, Vec<u8>)> {
         let s = lock(&self.state);
         let (off, _) = *s.index.get(subject)?;
+        if off >= s.visible_head() {
+            return None;
+        }
         let rec = s.log.get(usize::try_from(off).ok()?)?;
         Some((off, rec.body.clone()))
     }
@@ -1156,9 +1240,23 @@ impl Broker {
         subject: &str,
         body: &[u8],
     ) -> Option<(u64, bool)> {
+        self.publish_told(producer, seq, subject, body).ok()
+    }
+
+    /// [`Broker::publish_as`], telling a refusal whose outcome is unknown apart: `Err(true)`
+    /// where the publish's full flush failed and poisoned the log ([`OUTCOME_UNKNOWN`]), its
+    /// record appended and held out of sight, so a reopen may keep it; `Err(false)` for a
+    /// publish that landed nothing.
+    pub(crate) fn publish_told(
+        &self,
+        producer: u64,
+        seq: u64,
+        subject: &str,
+        body: &[u8],
+    ) -> Result<(u64, bool), bool> {
         let mut s = lock(&self.state);
         if !s.up {
-            return None;
+            return Err(false);
         }
         s.note_event(|| Event::Publish {
             producer,
@@ -1166,7 +1264,9 @@ impl Broker {
             subject: subject.to_string(),
             body: body.to_vec(),
         });
-        s.publish(producer, seq, subject, body).ok()
+        s.publish(producer, seq, subject, body).map_err(
+            |refusal| matches!(&*refusal, Response::Error { msg, .. } if msg == OUTCOME_UNKNOWN),
+        )
     }
 
     /// HOLD ACKS from now on, `rng` deciding which ([`State::answer`]).
@@ -1249,11 +1349,104 @@ impl Broker {
     /// [`State::no_horizon`]).
     pub(crate) fn horizon(&self) {
         let mut s = lock(&self.state);
-        if s.up && s.tier == Tier::Ordered && !s.no_horizon {
-            s.flushed_in_full();
-            let line = format!("horizon durable={}", s.durable);
+        // astream's horizon issues a full flush only when one is owed (`full_flush_owed`), and
+        // none on a poisoned log.
+        if s.up
+            && s.tier == Tier::Ordered
+            && !s.no_horizon
+            && s.poison.is_none()
+            && s.durable < s.log.len() as u64
+        {
+            let flushed = s.full_flush(None);
+            let line = format!(
+                "horizon durable={}{}",
+                s.durable,
+                if flushed { "" } else { " FAILED: poisoned" }
+            );
             s.notes.push(line);
         }
+    }
+
+    /// THE LOG'S NEXT FULL FLUSH FAILS ([`State::full_flush`]), as `InjectedFaults::sync` fails
+    /// it on a real broker: on a broker that is up and not already poisoned.
+    pub(crate) fn fail_next_full_flush(&self) {
+        let mut s = lock(&self.state);
+        if s.up && s.poison.is_none() && !s.fail_full_flush {
+            s.note_event(|| Event::FailFullFlush);
+            s.fail_full_flush = true;
+            s.notes
+                .push("broker: the next full flush fails".to_string());
+        }
+    }
+
+    /// Whether the log is poisoned ([`State::poison`]).
+    pub(crate) fn poisoned(&self) -> bool {
+        lock(&self.state).poison.is_some()
+    }
+
+    /// Whether the next full flush is to fail ([`State::fail_full_flush`]).
+    pub(crate) fn flush_fault_owed(&self) -> bool {
+        lock(&self.state).fail_full_flush
+    }
+
+    /// THE STOPPED LOG SET ASIDE, as `aterm link broker --retire-log` does (`at_rest::retire`): the
+    /// log, its sidecars and its key moved away, so the next open starts an empty log, ANOTHER
+    /// LOG ([`State::mint`]). What is not the log's is kept: the producers' names, the oracle,
+    /// the device, the table and the rules every open sets, the rate limit, the journal. On a
+    /// broker that is up, nothing: astream refuses to retire a log that opens.
+    pub(crate) fn retire_log(&self) -> Option<Restart> {
+        let mut s = lock(&self.state);
+        if s.up {
+            return None;
+        }
+        s.note_event(|| Event::RetireLog);
+        let before = std::mem::take(&mut s.log);
+        let durable_before = s.durable;
+        let generation_before = s.generation;
+        s.durable = 0;
+        s.wills.clear();
+        s.retired.clear();
+        s.strays.clear();
+        if let Some(race) = s.race.as_mut() {
+            race.collision = None;
+        }
+        if let Some(revive) = s.revive.as_mut() {
+            revive.landed = None;
+        }
+        // The held store went with the log: its rules, its records and what the oracle read of
+        // them; what the next open is to set and the run's counts stay.
+        let ret = std::mem::take(&mut s.ret);
+        s.ret = Retained {
+            unretained_next: ret.unretained_next,
+            rules_next: ret.rules_next,
+            ticks: ret.ticks,
+            cuts: ret.cuts,
+            refusals: ret.refusals,
+            epoch: ret.epoch + 1,
+            ..Retained::default()
+        };
+        s.settle_owed = false;
+        s.rebuild();
+        s.mint();
+        let line = format!(
+            "broker log retired: {} records set aside, another log",
+            before.len()
+        );
+        s.notes.push(line);
+        Some(Restart {
+            stop: Stop::Clean,
+            tier: s.tier,
+            before,
+            durable_before,
+            kept: 0,
+            generation_before,
+            generation_after: s.generation,
+            lineage_after: s.lineage.clone(),
+            another_log: true,
+            lossy: false,
+            retired: true,
+            held_from: None,
+        })
     }
 
     /// Whether a subscription's next read has something to answer: a frame owed, or its end.
@@ -1325,13 +1518,29 @@ impl Broker {
         {
             kept = rng.below(s.log.len() as u64 + 1);
         }
-        let moves = stop == Stop::PowerLoss && s.tier != Tier::Strict;
-        let moves = moves && !(s.mutant == ArmMutant::LoseWithoutMove);
+        // A run whose full flush failed is recorded lossy, so the open moves whatever the stop
+        // (astream's `Prior::unclean` reads the sidecar's `Lossy`); its poison, its latch and an
+        // armed fault end with the run.
+        let lossy = s.lossy;
+        let held_from = s.poison.and_then(|p| p.held_from);
+        s.poison = None;
+        s.latched = false;
+        s.lossy = false;
+        s.fail_full_flush = false;
+        let unclean = (stop == Stop::PowerLoss && s.tier != Tier::Strict)
+            || (lossy && s.mutant != ArmMutant::PoisonKeepsGeneration);
+        let moves = unclean && s.mutant != ArmMutant::LoseWithoutMove;
         s.log.truncate(usize::try_from(kept).unwrap_or(usize::MAX));
         // The offsets a loss took name other records from here.
         s.ret.unretained.retain(|&off| off < kept);
         s.rebuild();
-        if moves {
+        // ANOTHER LOG: astream settles every open of a log that holds no record as a fresh id
+        // (`logid::settle`'s first arm), whatever the stop or the sidecar; the empty log a
+        // Reboot keeps, a Clean or Crash of a log that never held one, and a loss that kept none.
+        let another = kept == 0 && s.mutant != ArmMutant::NeverMints;
+        if another {
+            s.mint();
+        } else if moves {
             s.generation += 1;
             let common = if s.mutant == ArmMutant::LineageAtHead {
                 before.len() as u64
@@ -1351,9 +1560,11 @@ impl Broker {
         }
         let line = format!(
             "broker stop {stop:?} tier={tier:?} head={} durable={durable_before} kept={kept} \
-             gen={}",
+             gen={}{}{}",
             before.len(),
-            s.generation
+            s.generation,
+            if another { " another-log" } else { "" },
+            if lossy { " lossy" } else { "" }
         );
         s.notes.push(line);
         Restart {
@@ -1365,7 +1576,10 @@ impl Broker {
             generation_before,
             generation_after: s.generation,
             lineage_after: s.lineage.clone(),
-            another_log: false,
+            another_log: another,
+            lossy,
+            retired: false,
+            held_from,
         }
     }
 
@@ -1456,8 +1670,10 @@ impl Broker {
     /// Every visible record, for the oracle.
     pub(crate) fn records(&self) -> Vec<Visible> {
         let s = lock(&self.state);
+        let visible = usize::try_from(s.visible_head()).unwrap_or(usize::MAX);
         s.log
             .iter()
+            .take(visible)
             .enumerate()
             .filter(|(_, r)| !r.hidden())
             .map(|(i, r)| (i as u64, r.subject.clone(), r.body.clone(), r.key))
@@ -1470,6 +1686,9 @@ impl Broker {
     /// whether it lies below the oldest of `prefix>` (where a plain read of it is refused).
     pub(crate) fn at(&self, off: u64, prefix: &str) -> Option<At> {
         let s = lock(&self.state);
+        if off >= s.visible_head() {
+            return None;
+        }
         let rec = s.log.get(usize::try_from(off).ok()?)?;
         if rec.hidden() || !rec.subject.starts_with(prefix) {
             return None;
@@ -1489,6 +1708,7 @@ impl Broker {
         let s = lock(&self.state);
         usize::try_from(off)
             .ok()
+            .filter(|_| off < s.visible_head())
             .and_then(|i| s.log.get(i))
             .is_some_and(|rec| {
                 !rec.hidden() && (off >= s.ret.base || s.ret.held.contains_key(&off))
@@ -1509,9 +1729,11 @@ impl Broker {
     /// the ones the broker carries below its base; and the head.
     pub(crate) fn offsets_of(&self, prefix: &str) -> (Vec<u64>, Vec<u64>, u64) {
         let s = lock(&self.state);
+        let visible = usize::try_from(s.visible_head()).unwrap_or(usize::MAX);
         let all: Vec<u64> = s
             .log
             .iter()
+            .take(visible)
             .enumerate()
             .filter(|(_, r)| !r.hidden() && r.subject.starts_with(prefix))
             .map(|(i, _)| i as u64)
@@ -1523,7 +1745,7 @@ impl Broker {
             .filter(|(_, h)| h.rec.subject.starts_with(prefix))
             .map(|(&off, _)| off)
             .collect();
-        (all, held, s.log.len() as u64)
+        (all, held, s.visible_head())
     }
 }
 
@@ -1547,6 +1769,85 @@ impl State {
             }
             _ => vec![head],
         }
+    }
+
+    /// ANOTHER LOG (astream's `minted_settled`): a fresh id, the mint count in its last eight
+    /// bytes, at generation 0 with no lineage.
+    pub(crate) fn mint(&mut self) {
+        self.mints += 1;
+        if self.mutant == ArmMutant::NeverMints {
+            return;
+        }
+        let mut id = LOG_ID;
+        id[8..].copy_from_slice(&self.mints.to_be_bytes());
+        self.id = id;
+        if self.mutant != ArmMutant::MintKeepsGeneration {
+            self.generation = 0;
+            self.lineage.clear();
+        }
+    }
+
+    /// THE VISIBLE HEAD: the log's head, or where a poison holds its record out of sight
+    /// ([`Poison::held_from`]). A real broker's own head counts the held record, as the
+    /// model's log does; every read stops here.
+    pub(crate) fn visible_head(&self) -> u64 {
+        self.poison
+            .and_then(|p| p.held_from)
+            .unwrap_or(self.log.len() as u64)
+    }
+
+    /// A FULL FLUSH of the log ([`State::flushed_in_full`]) that fails when one is armed
+    /// ([`State::fail_full_flush`], cleared whatever comes of it): the run is recorded lossy, a
+    /// weak tier latches to Strict and the log is poisoned, the record at `held_from` (an
+    /// escalation's own) held out of sight; nothing is flushed and the device is not drained
+    /// (astream's `flush_failed_lossy`). Whether it flushed.
+    fn full_flush(&mut self, held_from: Option<u64>) -> bool {
+        if !std::mem::take(&mut self.fail_full_flush) || self.mutant == ArmMutant::NeverPoisons {
+            self.flushed_in_full();
+            return true;
+        }
+        self.poison_now(held_from);
+        false
+    }
+
+    /// The poison of a full flush that failed ([`State::full_flush`]).
+    fn poison_now(&mut self, held_from: Option<u64>) {
+        self.poisons += 1;
+        self.lossy = true;
+        self.latched = self.tier != Tier::Strict && self.mutant != ArmMutant::PoisonWithoutLatch;
+        self.poison = Some(Poison { held_from });
+        self.flush_failed = true;
+        self.notes.push(format!(
+            "full flush FAILED: poisoned, held from {held_from:?}{}",
+            if self.latched { ", latched Strict" } else { "" }
+        ));
+    }
+
+    /// The refusal a write meets on a poisoned log (astream's `check_poisoned`, answered with
+    /// `store::poisoned_refusal`), or none.
+    fn poisoned_refusal(&mut self) -> Option<Box<Response>> {
+        let poisoned = self.poison.is_some() && self.mutant != ArmMutant::PoisonedWritesLand;
+        self.poisoned_refusals += u64::from(poisoned);
+        poisoned.then(|| {
+            refused(
+                astream_broker::proto::ERR_REFUSED,
+                format!(
+                    "{} (a flush failed (injected) with records no full flush covers); reopen \
+                     it to recover",
+                    astream_broker::proto::LOG_POISONED_PREFIX
+                ),
+            )
+        })
+    }
+
+    /// The answer of the op whose full flush just failed, once ([`State::flush_failed`]).
+    fn outcome_unknown(&mut self) -> Option<Box<Response>> {
+        std::mem::take(&mut self.flush_failed).then(|| {
+            refused(
+                astream_broker::proto::ERR_REFUSED,
+                OUTCOME_UNKNOWN.to_string(),
+            )
+        })
     }
 
     fn rebuild(&mut self) {
@@ -1726,7 +2027,7 @@ impl State {
 
     /// [`Broker::cut_to`] on the state its lock holds.
     fn cut_to(&mut self, at: u64) -> bool {
-        if !self.up || !self.ret.active {
+        if !self.up || !self.ret.active || self.poison.is_some() {
             return false;
         }
         let head = self.log.len() as u64;
@@ -1845,7 +2146,7 @@ impl State {
     /// so its cursor is the head; without, a world explores the tail that has yet to read
     /// them when the cut lands, and is told their gap instead.
     fn catch_up_tails(&mut self) {
-        let head = self.log.len() as u64;
+        let head = self.visible_head();
         let tails: Vec<(u64, u64, Filter)> = self
             .conns
             .iter()
@@ -2061,8 +2362,14 @@ impl State {
         let escalated = rec.escalated;
         self.log.push(rec);
         match self.tier {
+            // A Strict batch's own flush failure is rolled back, never a poison (astream's
+            // `poisoned_log`): no fault reaches it here.
             Tier::Strict => self.flushed_in_full(),
-            Tier::Ordered | Tier::Relaxed if escalated => self.flushed_in_full(),
+            // Its flush failed: written and indexed (its subject charged), and held out of
+            // sight ([`State::visible_head`]).
+            Tier::Ordered | Tier::Relaxed if escalated => {
+                self.full_flush(Some(off));
+            }
             _ => {}
         }
         off
@@ -2271,6 +2578,9 @@ impl State {
         body: &[u8],
         bounded: bool,
     ) -> Result<(u64, bool), Box<Response>> {
+        if let Some(refusal) = self.poisoned_refusal() {
+            return Err(refusal);
+        }
         if subject == astream_broker::RETIRE_SUBJECT
             && (seq == 0 || self.mutant != ArmMutant::RetireOnlyAtZero)
         {
@@ -2343,6 +2653,9 @@ impl State {
             escalated,
             principal,
         });
+        if let Some(unknown) = self.outcome_unknown() {
+            return Err(unknown);
+        }
         Ok((off, false))
     }
 
@@ -2393,6 +2706,9 @@ impl State {
         use astream_broker::proto::{
             ERR_BAD_SUBJECT, ERR_RECORD_REFUSED, ERR_RETIRE_REFUSED, RETIRE_LOG_PREFIX,
         };
+        if let Some(refusal) = self.poisoned_refusal() {
+            return Err(refusal);
+        }
         if astream_broker::store::is_hidden_subject(target)
             || target.starts_with("/a/")
             || target == "/a"
@@ -2610,8 +2926,10 @@ impl State {
             }
         }
         let start = usize::try_from(from.max(base)).ok()?;
+        let visible = usize::try_from(self.visible_head()).unwrap_or(usize::MAX);
         self.log
             .iter()
+            .take(visible)
             .enumerate()
             .skip(start)
             .find(|(_, r)| !r.hidden() && filter.matches_str(&r.subject))
@@ -2621,7 +2939,7 @@ impl State {
     fn mark(&self, next: u64, resume: String) -> Response {
         Response::Mark {
             next,
-            head: self.log.len() as u64,
+            head: self.visible_head(),
             resume,
             durable: Some(self.durable),
             oldest: None,
@@ -2640,8 +2958,12 @@ impl State {
             ext: NonceExt {
                 durability: Some(ServedInfo {
                     requested: tier,
-                    served: tier,
-                    reason: ServedReason::None,
+                    served: if self.latched { WireTier::Strict } else { tier },
+                    reason: if self.latched {
+                        ServedReason::LatchedAfterFlushFailure
+                    } else {
+                        ServedReason::None
+                    },
                     horizon_ms: (self.tier == Tier::Ordered && !self.no_horizon).then(|| {
                         u32::try_from(crate::durability::ORDERED_HORIZON.as_millis())
                             .unwrap_or(u32::MAX - 1)
@@ -2731,7 +3053,7 @@ impl State {
     }
 
     fn handle(&mut self, conn: u64, req: Request) -> Vec<Response> {
-        let head = self.log.len() as u64;
+        let head = self.visible_head();
         if let Some(msg) = oversized_name(&req).filter(|_| self.mutant != ArmMutant::NoNameBound) {
             return vec![Response::Error {
                 code: astream_broker::proto::ERR_RECORD_REFUSED,
@@ -2791,6 +3113,16 @@ impl State {
                 if limited.is_some() {
                     self.rate_limited += 1;
                     self.rate_limited_total += 1;
+                }
+                // A POISONED LOG's refusal is the writer's first answer, ahead of the fence it
+                // latches (astream's `refused_poisoned` before `StickyFenceTable::check`).
+                if limited.is_none() && self.poison.is_some() {
+                    if let Some(refusal) = self.poisoned_refusal() {
+                        if fenced {
+                            self.fence_on(conn, producer_id, producer_seq, false);
+                        }
+                        return vec![*refusal];
+                    }
                 }
                 if let Some(fence) = self
                     .fence_of(conn, producer_id, producer_seq)
@@ -2892,6 +3224,17 @@ impl State {
             // it, is drained as the answer goes ([`State::answer`]), so a held answer is the
             // writer still flushing, the latest it may.
             Request::Settle => {
+                if let Some(refusal) = self.poisoned_refusal() {
+                    return vec![*refusal];
+                }
+                // Its full flush failed: poisoned on any tier, Strict included, nothing held.
+                if std::mem::take(&mut self.fail_full_flush)
+                    && self.mutant != ArmMutant::NeverPoisons
+                {
+                    self.poison_now(None);
+                    let unknown = self.outcome_unknown().expect("the flush just failed");
+                    return vec![*unknown];
+                }
                 self.settles += 1;
                 self.durable = head;
                 self.settle_owed = true;
@@ -2924,6 +3267,9 @@ impl State {
                 body,
             } => self.register(conn, producer_id, producer_seq, subject, body),
             Request::Commit { group, upto } => {
+                if let Some(refusal) = self.poisoned_refusal() {
+                    return vec![*refusal];
+                }
                 // A batch rolled back refuses the group commit in it too.
                 if self.refuse_next > 0 {
                     self.refuse_next -= 1;
@@ -2948,6 +3294,9 @@ impl State {
                     escalated,
                     principal: None,
                 });
+                if let Some(unknown) = self.outcome_unknown() {
+                    return vec![*unknown];
+                }
                 let e = self.groups.entry(group.clone()).or_insert(upto);
                 *e = astream_broker::proto::group_commit_monotone(*e, upto);
                 self.notes
@@ -2971,13 +3320,18 @@ impl State {
                 } as usize;
                 let mut out = Vec::new();
                 let mut resume = String::new();
+                // A row a poison holds out of sight is not read ([`State::visible_head`]).
+                let visible = self.visible_head();
+                let filt = &filt;
                 let after_row = |after: &str| {
                     self.index
                         .range::<str, _>((
                             std::ops::Bound::Excluded(after),
                             std::ops::Bound::Unbounded,
                         ))
-                        .filter(|(subject, _)| filt.matches_str(subject))
+                        .filter(move |(subject, (off, _))| {
+                            filt.matches_str(subject) && *off < visible
+                        })
                 };
                 if max > 0 {
                     for (subject, (off, _)) in after_row(after.as_str()) {
@@ -3108,7 +3462,7 @@ impl State {
     /// retained one, then the retained suffix to the head; `max` records of `filter` at most.
     /// The page, and the offset after the last record it scanned.
     fn fetch_from(&self, from: u64, filt: &Filter, max: u32) -> (Vec<(u64, String, Vec<u8>)>, u64) {
-        let head = self.log.len() as u64;
+        let head = self.visible_head();
         let max = max as usize;
         let mut out = Vec::new();
         let mut budget = if self.mutant == ArmMutant::FetchUnbounded {
@@ -3160,6 +3514,9 @@ impl State {
         body: Vec<u8>,
     ) -> Vec<Response> {
         use astream_broker::proto::{ERR_RECORD_REFUSED, ERR_REFUSED, ERR_SUBJECT_BOUND};
+        if let Some(refusal) = self.poisoned_refusal() {
+            return vec![*refusal];
+        }
         if let Some(refusal) =
             subject_error(&subject).filter(|_| self.mutant != ArmMutant::WillTakesAnySubject)
         {
@@ -3258,7 +3615,7 @@ impl State {
         let c = self.conns.get(&conn)?;
         let (cursor, filter) = c.sub.clone()?;
         let mut told = c.told?;
-        if (self.log.len() as u64) <= cursor {
+        if self.visible_head() <= cursor {
             return None;
         }
         let gap = self.gap_notice(&filter, cursor, &mut told);
@@ -3616,9 +3973,34 @@ pub(crate) fn law_check(r: &Restart, oracle: &Escalation) -> Vec<String> {
     }
     let lost_acked = r.kept < head;
     let moved = r.another_log || r.generation_after != r.generation_before;
+    // Another log continues nothing a reader kept, so no lineage is owed; it is astream's
+    // answer to an open that finds no record, since a reader that forgets its offsets would
+    // take each kept record again (P7); and its id is fresh, at generation 0 with no lineage.
+    if r.another_log {
+        if r.kept > 0 {
+            bad.push(format!(
+                "P7: another log, {} records kept a reader would take again",
+                r.kept
+            ));
+        }
+        if r.generation_after != 0 || !r.lineage_after.is_empty() {
+            bad.push(format!(
+                "P7: another log names generation {} and lineage {:?}",
+                r.generation_after, r.lineage_after
+            ));
+        }
+    }
+    // A run whose full flush failed may have lost what that flush was to cover, so its reopen
+    // moves whatever the stop (astream's `Lossy` sidecar).
+    if r.lossy && !moved {
+        bad.push(format!(
+            "P4L: the reopen after a failed full flush kept the identity (a {:?})",
+            r.stop
+        ));
+    }
     match r.stop {
         Stop::Clean | Stop::Crash => {
-            if lost_acked {
+            if lost_acked && !r.retired {
                 bad.push(format!(
                     "{}: a {:?} lost acked records {}..{head}",
                     if r.stop == Stop::Clean { "P5" } else { "P6" },
@@ -3626,11 +4008,11 @@ pub(crate) fn law_check(r: &Restart, oracle: &Escalation) -> Vec<String> {
                     r.kept
                 ));
             }
-            if moved {
+            if moved && !r.lossy && !r.retired && !(r.another_log && head == 0) {
                 bad.push(format!("P5/P6: a {:?} moved the identity", r.stop));
             }
         }
-        Stop::PowerLoss => {
+        Stop::PowerLoss if !r.retired => {
             if r.tier == Tier::Strict && lost_acked {
                 bad.push("P3: a Strict power loss lost acked records".to_string());
             }
@@ -3640,10 +4022,14 @@ pub(crate) fn law_check(r: &Restart, oracle: &Escalation) -> Vec<String> {
                     r.kept, r.durable_before
                 ));
             }
+            // The record a poison held was never acked: astream's torn-tail cut of it is its
+            // law (`flush_failed_lossy`), escalated or not.
+            let held = usize::try_from(r.held_from.unwrap_or(u64::MAX)).unwrap_or(usize::MAX);
             for (i, rec) in r
                 .before
                 .iter()
                 .enumerate()
+                .take(held)
                 .skip(usize::try_from(r.kept).unwrap_or(0))
             {
                 if oracle.escalates(&rec.subject, &rec.kind, rec.principal.as_deref()) {
@@ -3653,36 +4039,28 @@ pub(crate) fn law_check(r: &Restart, oracle: &Escalation) -> Vec<String> {
             if lost_acked && !moved {
                 bad.push("P4: acked records lost and the identity did not move".to_string());
             }
-            // Another log continues nothing a reader kept, so no lineage is owed (P7); and it
-            // is astream's answer to a log that kept no record, since a reader that forgets its
-            // offsets would take each kept record again.
-            if r.another_log && r.kept > 0 {
-                bad.push(format!(
-                    "P7: another log, {} records kept a reader would take again",
-                    r.kept
-                ));
-            }
-            if moved && !r.another_log {
-                match r.lineage_after.last() {
-                    Some(&(g, common)) if g == r.generation_after => {
-                        if common > r.kept {
-                            bad.push(format!(
-                                "P7: lineage says generation {g} continues to {common}, past \
-                                 the {} records kept",
-                                r.kept
-                            ));
-                        }
-                    }
-                    _ => bad.push("P7: a move with no lineage step".to_string()),
-                }
-                let newest = r.lineage_after.last().map_or(0, |s| s.1);
-                if r.lineage_after.iter().any(|&(_, common)| common > newest) {
+        }
+        Stop::PowerLoss => {}
+    }
+    if moved && !r.another_log {
+        match r.lineage_after.last() {
+            Some(&(g, common)) if g == r.generation_after => {
+                if common > r.kept {
                     bad.push(format!(
-                        "P7: an older step continues past the newest's common {newest}: {:?}",
-                        r.lineage_after
+                        "P7: lineage says generation {g} continues to {common}, past the {} \
+                         records kept",
+                        r.kept
                     ));
                 }
             }
+            _ => bad.push("P7: a move with no lineage step".to_string()),
+        }
+        let newest = r.lineage_after.last().map_or(0, |s| s.1);
+        if r.lineage_after.iter().any(|&(_, common)| common > newest) {
+            bad.push(format!(
+                "P7: an older step continues past the newest's common {newest}: {:?}",
+                r.lineage_after
+            ));
         }
     }
     bad

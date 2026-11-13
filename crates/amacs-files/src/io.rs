@@ -12,6 +12,7 @@ use amacs::store::{DocumentId, DocumentSnapshot};
 use aterm_buffer::Seq;
 
 mod journal_steps;
+pub use astream_wire::steps::StepFault;
 pub use journal_steps::{
     FRAME_HEAD as JOURNAL_FRAME_HEAD, JournalTail, frame_record, journal_tail,
 };
@@ -831,7 +832,8 @@ pub enum JournalError {
     NumericOverflow,
     /// A format-2 image whose step records astream's scan finds damaged inside, out of their
     /// place, or of a layout this build does not read: not what a crash leaves, so the image
-    /// is refused and kept, never cut ([`journal_steps`]).
+    /// is kept, never cut ([`journal_steps`]). [`recover_journal_image_for`] names it beside
+    /// the whole records before it; every other read refuses the image.
     Fault(astream_wire::steps::StepFault),
     /// A format-2 image with no header frame first, or a second one.
     NoHeader,
@@ -955,7 +957,7 @@ pub fn decode_journal(bytes: &[u8]) -> Result<Vec<JournalRecord>, JournalError> 
         return Err(JournalError::Empty);
     }
     if bytes.starts_with(&journal_steps::MAGIC) {
-        return journal_steps::decode_image(bytes).map(|image| image.records);
+        return journal_steps::decode_whole_image(bytes).map(|image| image.records);
     }
     decode_journal_v1(bytes)
 }
@@ -1014,28 +1016,49 @@ pub(crate) fn recover_journal(
     })
 }
 
-/// Validate and replay using the restart-stable canonical-document key.
+/// Validate and replay using the restart-stable canonical-document key. It keeps no boundary,
+/// so it refuses an image with a fault ([`JournalError::Fault`]).
+///
+/// # Errors
+/// [`decode_journal`]'s, and a replay's.
 pub fn recover_journal_for(
     key: JournalDocumentKey,
     bytes: &[u8],
 ) -> Result<StoredJournalRecovery, JournalError> {
-    recover_journal_image_for(key, bytes).map(|(recovered, _)| recovered)
+    match recover_journal_image_for(key, bytes)? {
+        (_, _, Some(fault)) => Err(JournalError::Fault(fault)),
+        (recovered, _, None) => Ok(recovered),
+    }
 }
 
 /// Recover an image and retain its format-2 boundary, so a host can preserve any
-/// uninterpreted tail before replacing the file. Format 1 has no partial recovery.
+/// uninterpreted tail before replacing the file. A format-2 image with a fault recovers the
+/// whole records before it, and the fault comes back beside them, with a boundary short of
+/// the image: a host opens that draft and keeps the image aside. Format 1 has no partial
+/// recovery.
 ///
 /// # Errors
-/// [`recover_journal_for`]'s.
+/// [`recover_journal_for`]'s, but for a fault after the header.
 pub fn recover_journal_image_for(
     key: JournalDocumentKey,
     bytes: &[u8],
-) -> Result<(StoredJournalRecovery, Option<JournalTail>), JournalError> {
+) -> Result<
+    (
+        StoredJournalRecovery,
+        Option<JournalTail>,
+        Option<StepFault>,
+    ),
+    JournalError,
+> {
     if bytes.starts_with(&journal_steps::MAGIC) {
         let image = journal_steps::decode_image(bytes)?;
-        Ok((replay_journal(key, &image.records)?, Some(image.tail)))
+        Ok((
+            replay_journal(key, &image.records)?,
+            Some(image.tail),
+            image.fault,
+        ))
     } else {
-        Ok((replay_journal(key, &decode_journal(bytes)?)?, None))
+        Ok((replay_journal(key, &decode_journal(bytes)?)?, None, None))
     }
 }
 

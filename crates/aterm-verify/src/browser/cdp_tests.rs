@@ -49,8 +49,8 @@ fn console_lines_name_their_kind_and_join_their_arguments() {
 
 #[test]
 fn a_call_waits_for_its_own_answer_and_keeps_the_events_between() {
-    let (to_read, to_write) = std::io::pipe().expect("pipe");
-    let (from_read, mut from_write) = std::io::pipe().expect("pipe");
+    let (to_read, to_write) = aterm_uds::pipe().expect("pipe");
+    let (from_read, mut from_write) = aterm_uds::pipe().expect("pipe");
     let browser = std::thread::spawn(move || {
         let mut r = to_read;
         let mut pending = Vec::new();
@@ -90,8 +90,8 @@ fn a_call_waits_for_its_own_answer_and_keeps_the_events_between() {
 
 #[test]
 fn a_console_marker_ends_the_wait_and_the_lines_before_it_stay() {
-    let (_to_read, to_write) = std::io::pipe().expect("pipe");
-    let (from_read, mut from_write) = std::io::pipe().expect("pipe");
+    let (_to_read, to_write) = aterm_uds::pipe().expect("pipe");
+    let (from_read, mut from_write) = aterm_uds::pipe().expect("pipe");
     let line = |session: &str, text: &str| {
         format!(
             "{{\"method\":\"Runtime.consoleAPICalled\",\"sessionId\":\"{session}\",\"params\":\
@@ -119,8 +119,8 @@ fn a_console_marker_ends_the_wait_and_the_lines_before_it_stay() {
 
 #[test]
 fn a_crash_read_during_an_earlier_call_ends_the_console_wait_at_once() {
-    let (to_read, to_write) = std::io::pipe().expect("pipe");
-    let (from_read, mut from_write) = std::io::pipe().expect("pipe");
+    let (to_read, to_write) = aterm_uds::pipe().expect("pipe");
+    let (from_read, mut from_write) = aterm_uds::pipe().expect("pipe");
     let crashed = |session: &str| {
         format!(
             "{{\"method\":\"Inspector.targetCrashed\",\"sessionId\":\"{session}\",\"params\":{{}}}}\0"

@@ -26,7 +26,7 @@ default-members = [
     "crates/aterm-gui", "crates/aterm-gui-consent", "crates/aterm-gui-documents",
     "crates/aterm-gui-fabric", "crates/aterm-gui-tabs", "crates/aterm-gui-timing",
     "crates/aterm-hash", "crates/aterm-heap-count", "crates/aterm-http", "crates/aterm-journal", "crates/aterm-jpeg", "crates/aterm-json",
-    "crates/aterm-keeper", "crates/aterm-lan", "crates/aterm-lexicon", "crates/aterm-libc",
+    "crates/aterm-keeper", "crates/aterm-lan", "crates/aterm-land", "crates/aterm-lexicon", "crates/aterm-libc",
     "crates/aterm-link", "crates/aterm-log", "crates/aterm-machines", "crates/aterm-lz4",
     "crates/aterm-macos-ui", "crates/aterm-macro-support", "crates/aterm-mail", "crates/aterm-mail-bigint", "crates/aterm-mesh", "crates/aterm-mesh-core", "crates/aterm-mesh-core-islands", "crates/aterm-mesh-core-islands-no-lost-edit", "crates/aterm-mesh-core-islands-p1", "crates/aterm-messages", "crates/aterm-metrics", "crates/aterm-net", "crates/aterm-netplace", "crates/aterm-objc",
     "crates/aterm-models-agh", "crates/aterm-models-aos", "crates/aterm-models-atpkg", "crates/aterm-models-capacity", "crates/aterm-models-core", "crates/aterm-models-effects",
@@ -85,7 +85,7 @@ update_channel = "alabsystems/aterm"
 # record (crates/aterm-stamp); nothing depends on that package. Every library's own version is a
 # constant `0.0.0`, so a bump is an input of no library unit (census `identity-read`).
 [workspace.package]
-version = "0.199.0"
+version = "0.200.0"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/alabsystems/aterm"
@@ -126,6 +126,7 @@ amacs-term = { path = "crates/amacs-term" }
 # Accessibility tree model and Linux AT-SPI publisher over aterm-dbus.
 aterm-a11y = { path = "crates/aterm-a11y" }
 aterm-agent = { path = "crates/aterm-agent" }
+aterm-land = { path = "crates/aterm-land" }
 # The one agent name table (`agent_of`), apart from aterm-phase's screen reader.
 aterm-agent-names = { path = "crates/aterm-agent-names" }
 aterm-alloc = { path = "crates/aterm-alloc" }
@@ -615,8 +616,8 @@ opt-level = 2
 tracing = { path = "crates/aterm-tracing" }
 cfg-if = { path = "crates/aterm-cfg-if" }
 
-# First-party `libc` 0.2.186 declarations (`crates/aterm-libc`), checked against
-# registry `=0.2.186` by `libc-oracle/` (its own workspace without this patch
+# First-party `libc` 0.2.191 declarations (`crates/aterm-libc`), checked against
+# registry `=0.2.191` by `libc-oracle/` (its own workspace without this patch
 # table). Must cover the full `--all-targets` graph across all six target cells;
 # symbols still resolve to the system C library at link time.
 libc = { path = "crates/aterm-libc" }

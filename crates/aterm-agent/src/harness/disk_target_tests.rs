@@ -629,11 +629,17 @@ struct Parked {
 impl Parked {
     fn fork() -> Parked {
         use std::os::fd::AsRawFd as _;
-        let (go_r, go_w) = std::io::pipe().expect("pipe");
+        let (go_r, go_w) = aterm_uds::pipe().expect("pipe");
         let (go_fd, go_w_fd) = (go_r.as_raw_fd(), go_w.as_raw_fd());
+        // The go pipe's read end is the child's: unmarked for this fork alone.
+        let handing = aterm_uds::spawn_lock::handing(&[go_fd]);
         // SAFETY: the child calls only async-signal-safe functions (`close`, `read`, `_exit`,
         // and errno) on descriptors opened before `fork`, then exits without unwinding.
         let pid = unsafe { libc::fork() };
+        if pid != 0 {
+            // The child's copy of the hold is never released: it `_exit`s.
+            drop(handing);
+        }
         assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
         if pid == 0 {
             let interrupted =

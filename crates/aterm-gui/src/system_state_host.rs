@@ -20,6 +20,10 @@ use crate::{App, Wake};
 /// Provisioning callbacks installed by the shipped binary.
 #[derive(Clone, Copy)]
 pub struct InitialSetupHandlers {
+    /// Read only saved display values and their plan before restoring a System State view.
+    /// Called during launch construction, before the event loop; terminal-only launches do
+    /// not call it. It must not probe this Mac, the network, or admit setup work.
+    pub launch_history: fn() -> Option<SetupDisplayHistory>,
     /// Durably admit `plan` (with its vault-typed flag and optional join
     /// password) as the next run; the receipt says whose choice it is and
     /// whether it shapes the plan. A choice takes effect at once (design §3.3):
@@ -99,6 +103,7 @@ pub struct InitialSetupHandlers {
 impl InitialSetupHandlers {
     pub(crate) fn inert_for_test() -> Self {
         Self {
+            launch_history: || None,
             apply: |_, _, _, _| false,
             check: |_, _| CheckStarted::default(),
             restore: || false,
@@ -430,6 +435,26 @@ pub struct SetupReadings {
     pub running: Vec<Setting>,
 }
 
+/// Saved values for a page's first presentation, with no current evidence or
+/// permission to run anything. The reader validates their account and vault source.
+#[derive(Clone, Debug)]
+pub struct SetupDisplayHistory {
+    pub plan: Plan,
+    pub last_known: Vec<aterm_types::macos_setup::Observation>,
+    pub vault_source: Option<String>,
+}
+
+impl SetupDisplayHistory {
+    fn status(self) -> SetupStatus {
+        SetupStatus {
+            plan: Some(self.plan),
+            last_known: self.last_known,
+            observed_vault_url: self.vault_source,
+            ..SetupStatus::default()
+        }
+    }
+}
+
 impl SetupReadings {
     fn overlay(self, status: &mut SetupStatus) {
         status.observed = self.observed;
@@ -678,7 +703,25 @@ type StatusPoll = (fn() -> SetupStatus, u64);
 impl Host {
     /// The window's own host: the join's asking start kept in this login's state folder.
     pub(crate) fn for_launch(headless: bool) -> Self {
+        Self::for_launch_with_history(headless, || {
+            let handlers = HANDLERS.lock().ok().and_then(|handlers| *handlers)?;
+            (handlers.launch_history)()
+        })
+    }
+
+    /// Read once before the GUI loop, so both an immediate manual open and a restored page
+    /// start with saved display values. The injected reader keeps tests off account I/O.
+    pub(crate) fn for_launch_with_history(
+        headless: bool,
+        read: impl FnOnce() -> Option<SetupDisplayHistory>,
+    ) -> Self {
+        let latest_status = if !headless {
+            read().map(SetupDisplayHistory::status).unwrap_or_default()
+        } else {
+            SetupStatus::default()
+        };
         Self {
+            latest_status,
             asking_record: if headless || cfg!(test) {
                 None
             } else {

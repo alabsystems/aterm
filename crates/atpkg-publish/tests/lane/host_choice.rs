@@ -22,19 +22,27 @@ use atpkg_publish::lane::install::InstallFlags;
 use atpkg_publish::testkit::NOW;
 use atpkg_publish::triple::Os;
 
-use super::fixture::Fx;
+use super::fixture::{
+    DORMANT_LEDGER, Fx, MINTED_LEDGER, dev_config, git, public_repos, release_config,
+    trust_checkout, trust_ledger, unit_dirs,
+};
 use super::install::{Box_, install, machine};
 use crate::shared::{toml_path, write_config};
 
 /// The runbook every provisioning text names.
 const RUNBOOK: &str = "docs/RUNBOOK-atpkg-republish.md";
 
-/// The owners every judging test uses, in the dev build and the public build alike.
+/// The staging owner every judging test uses, which `dev_config` writes.
+const STAGING: &str = "fixture-dev";
+
+/// The owners every judging test uses, in the dev build and the public build alike, and a
+/// trust checkout whose origin names the staging owner's `trust` repository.
 fn fixture_accounts(ctx: &mut Ctx) {
     ctx.accounts = Accounts {
-        staging: "fixture-dev".into(),
+        staging: STAGING.into(),
         public: "alabsystems".into(),
     };
+    trust_checkout(ctx);
 }
 
 /// A lane unit's environment under `ctx`'s home: `XDG_CONFIG_HOME` is `~/.config`, as
@@ -47,12 +55,6 @@ fn unit_env(ctx: &Ctx) -> (PathBuf, PathBuf) {
             .expect("the state root's parent")
             .to_path_buf(),
     )
-}
-
-/// The agh directories that environment resolves to.
-fn unit_dirs(ctx: &Ctx) -> Dirs {
-    let (config, state) = unit_env(ctx);
-    Dirs::resolve(&ctx.home, Some(&config), Some(&state)).expect("agh's directories")
 }
 
 /// `from_home_hosts` over `fx`'s home and its unit environment.
@@ -78,47 +80,6 @@ fn write_token(dir: &Path, name: &str, token: &str) {
     .expect("the token file");
 }
 
-/// The dev profile writing `fixture-dev`, its token file in `tokens`.
-fn dev_config(tokens: &Path) -> String {
-    format!(
-        "[profiles.dev]\ntoken_file = \"{}/dev.token\"\ntier = \"dev\"\n\
-         login = \"fixture-dev-bot\"\n\n\
-         [[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = [\"dev\"]\nwrite = \"dev\"\n",
-        toml_path(tokens)
-    )
-}
-
-/// The dev profile and a release profile writing `alabsystems`, with atpkg-publish's
-/// `[[writers]]` row over `repos`.
-fn release_config(tokens: &Path, repos: &[String]) -> String {
-    let list = repos
-        .iter()
-        .map(|r| format!("\"{r}\""))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "{}\n[profiles.release]\ntoken_file = \"{}/release.token\"\ntier = \"release\"\n\
-         login = \"fixture-release-bot\"\n\n\
-         [[owners]]\nname = \"alabsystems\"\ntier = \"release\"\nread = [\"dev\", \
-         \"anonymous\"]\nwrite = \"release\"\n\n\
-         [[writers]]\ncaller = \"atpkg-publish\"\nrepos = [{list}]\n",
-        dev_config(tokens),
-        toml_path(tokens)
-    )
-}
-
-/// `alabsystems/aterm` and `alabsystems/{repo}` for every repository `program_repos()` gives.
-fn public_repos() -> Vec<String> {
-    let mut repos = vec!["alabsystems/aterm".to_string()];
-    for repo in hosts_check::program_repos() {
-        let slug = format!("alabsystems/{repo}");
-        if !repos.contains(&slug) {
-            repos.push(slug);
-        }
-    }
-    repos
-}
-
 fn named<'a>(checks: &'a [HostCheck], name: &str) -> &'a HostCheck {
     checks
         .iter()
@@ -135,7 +96,8 @@ fn all_hold(checks: &[HostCheck]) {
             "staging_writer",
             "public_writer",
             "grants",
-            "drafts"
+            "drafts",
+            "trust_origin"
         ]
     );
 }
@@ -218,8 +180,13 @@ fn missing_config_builds_without_manufacturing_writers_or_needs() {
         let fx = Fx::new("host-missing");
         let dirs = unit_dirs(&fx.ctx);
         assert_eq!(built(&fx, choice).unwrap().host_choice(), choice);
-        let checks =
-            hosts_check::check(&fx.ctx, &dirs, choice, false, &hosts_check::program_repos());
+        let checks = hosts_check::check(
+            &fx.ctx,
+            &dirs,
+            choice,
+            false,
+            &hosts_check::alab_program_repos(),
+        );
         assert!(named(&checks, "config").ok);
         assert!(!named(&checks, "staging_writer").ok);
         assert!(needs::list(&dirs).expect("the needs").is_empty());
@@ -228,7 +195,7 @@ fn missing_config_builds_without_manufacturing_writers_or_needs() {
 
 /// Explicit profiles still route when their file also opts into vault adoption.
 #[test]
-fn a_vault_join_keeps_its_explicit_profile_and_clears_obsolete_config_needs() {
+fn a_vault_join_keeps_its_explicit_profile_and_clears_the_config_need() {
     let mut fx = Fx::new("host-vault");
     fixture_accounts(&mut fx.ctx);
     let dirs = unit_dirs(&fx.ctx);
@@ -250,11 +217,11 @@ fn a_vault_join_keeps_its_explicit_profile_and_clears_obsolete_config_needs() {
         &dirs,
         HostChoice::AghStaging,
         false,
-        &hosts_check::program_repos(),
+        &hosts_check::alab_program_repos(),
     );
     all_hold(&checks);
 
-    needs::raise(&dirs, &Need::config_missing(0)).expect("the missing need");
+    needs::raise(&dirs, &Need::config_invalid("L1 bogus", 0)).expect("the invalid need");
     assert!(built(&fx, HostChoice::Agh).is_ok());
     assert!(needs::list(&dirs).unwrap().is_empty());
 }
@@ -263,7 +230,6 @@ fn a_vault_join_keeps_its_explicit_profile_and_clears_obsolete_config_needs() {
 fn an_invalid_agh_toml_is_named_and_raises_its_need() {
     let fx = Fx::new("host-invalid");
     let dirs = unit_dirs(&fx.ctx);
-    needs::raise(&dirs, &Need::config_missing(0)).expect("the missing need");
     write_config(&dirs, "bogus = true\n");
     let e = built(&fx, HostChoice::Agh)
         .err()
@@ -279,14 +245,13 @@ fn an_invalid_agh_toml_is_named_and_raises_its_need() {
 }
 
 #[test]
-fn a_valid_agh_toml_builds_and_clears_the_needs() {
+fn a_valid_agh_toml_builds_and_clears_the_need() {
     let fx = Fx::new("host-valid");
     let dirs = unit_dirs(&fx.ctx);
-    needs::raise(&dirs, &Need::config_missing(0)).expect("the missing need");
     needs::raise(&dirs, &Need::config_invalid("L1 bogus", 0)).expect("the invalid need");
     let tokens = tokens(&fx);
     write_token(&tokens, "dev", &agh_fake::token("dev"));
-    write_config(&dirs, &dev_config(&tokens));
+    write_config(&dirs, &dev_config(&tokens, STAGING));
     let ctx = built(&fx, HostChoice::Agh).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(ctx.host_choice(), HostChoice::Agh);
     assert!(needs::list(&dirs).expect("the needs").is_empty());
@@ -298,7 +263,7 @@ fn install_records_the_host_in_the_unit_and_installed_from() {
     fixture_accounts(&mut b.fx.ctx);
     let tokens = tokens(&b.fx);
     write_token(&tokens, "dev", &agh_fake::token("dev"));
-    write_config(&unit_dirs(&b.fx.ctx), &dev_config(&tokens));
+    write_config(&unit_dirs(&b.fx.ctx), &dev_config(&tokens, STAGING));
 
     let (r, tx) = install(
         &b,
@@ -331,9 +296,8 @@ fn install_records_the_host_in_the_unit_and_installed_from() {
     assert!(from.ends_with("host agh-staging\n"), "{from}");
 
     // The rollback: a reinstall with no --host arms M1's eight words again, and clears the
-    // config needs an agh unit raised under the unit's directories, which no longer hold.
+    // config need an agh unit raised under the unit's directories, which no longer hold.
     let dirs = unit_dirs(&b.fx.ctx);
-    needs::raise(&dirs, &Need::config_missing(0)).expect("the missing need");
     needs::raise(&dirs, &Need::config_invalid("L1 bogus", 0)).expect("the invalid need");
     let (r, _) = install(&b, LaneKind::Alab, InstallFlags::default());
     let again = r.expect("reinstalled");
@@ -411,6 +375,7 @@ fn a_mistyped_verb_after_a_global_host_raises_nothing() {
 #[test]
 fn an_install_whose_hosts_check_fails_arms_nothing() {
     let b = machine("host-install-refused", Os::Linux);
+    std::fs::remove_file(unit_dirs(&b.fx.ctx).config.join("agh.toml")).expect("no agh.toml");
     let (r, _) = install(
         &b,
         LaneKind::Linux,
@@ -442,7 +407,7 @@ fn hosts_check_reports_each_check() {
     fixture_accounts(&mut fx.ctx);
     let ctx = &fx.ctx;
     let dirs = unit_dirs(ctx);
-    let repos = hosts_check::program_repos();
+    let repos = hosts_check::alab_program_repos();
     let check = |choice, keyless| hosts_check::check(ctx, &dirs, choice, keyless, &repos);
 
     // 1. No agh.toml.
@@ -458,7 +423,7 @@ fn hosts_check_reports_each_check() {
     // 2. The dev profile alone, under agh-staging.
     let tokens = tokens(&fx);
     write_token(&tokens, "dev", &agh_fake::token("dev"));
-    write_config(&dirs, &dev_config(&tokens));
+    write_config(&dirs, &dev_config(&tokens, STAGING));
     let checks = check(HostChoice::AghStaging, false);
     all_hold(&checks);
     assert_eq!(
@@ -486,7 +451,7 @@ fn hosts_check_reports_each_check() {
     );
 
     // 4. A release profile writing alabsystems, its token file absent, and every grant.
-    write_config(&dirs, &release_config(&tokens, &public_repos()));
+    write_config(&dirs, &release_config(&tokens, STAGING, &public_repos()));
     let checks = check(HostChoice::Agh, false);
     let public = named(&checks, "public_writer");
     assert!(!public.ok, "{public:?}");
@@ -505,7 +470,7 @@ fn hosts_check_reports_each_check() {
         .into_iter()
         .filter(|r| r != "alabsystems/trust")
         .collect();
-    write_config(&dirs, &release_config(&tokens, &narrowed));
+    write_config(&dirs, &release_config(&tokens, STAGING, &narrowed));
     let checks = check(HostChoice::Agh, false);
     let grants = named(&checks, "grants");
     assert!(!grants.ok, "{grants:?}");
@@ -515,7 +480,7 @@ fn hosts_check_reports_each_check() {
     );
 
     // 7. A fine-grained dev token nobody vouched for drafts.
-    write_config(&dirs, &release_config(&tokens, &public_repos()));
+    write_config(&dirs, &release_config(&tokens, STAGING, &public_repos()));
     write_token(&tokens, "dev", &agh_fake::fine_grained_token("dev"));
     let checks = check(HostChoice::Agh, false);
     let drafts = named(&checks, "drafts");
@@ -527,7 +492,7 @@ fn hosts_check_reports_each_check() {
 
     // 8. The dev profile alone, under agh, for a keyless lane.
     write_token(&tokens, "dev", &agh_fake::token("dev"));
-    write_config(&dirs, &dev_config(&tokens));
+    write_config(&dirs, &dev_config(&tokens, STAGING));
     let checks = check(HostChoice::Agh, true);
     all_hold(&checks);
     assert_eq!(
@@ -584,7 +549,7 @@ fn the_forwarding_verb_answers_git_as_the_credential_helper() {
     let token = agh_fake::token("dev");
     fake.add_token(&token, "fixture-dev-bot");
     write_token(&tokens, "dev", &token);
-    write_config(&dirs, &dev_config(&tokens));
+    write_config(&dirs, &dev_config(&tokens, STAGING));
     fake.add_repo(
         "fixture-dev/app",
         RepoSpec::private().push("fixture-dev-bot"),
@@ -661,7 +626,7 @@ fn a_keyless_install_under_agh_needs_no_public_writer() {
     fixture_accounts(&mut b.fx.ctx);
     let tokens = tokens(&b.fx);
     write_token(&tokens, "dev", &agh_fake::token("dev"));
-    write_config(&unit_dirs(&b.fx.ctx), &dev_config(&tokens));
+    write_config(&unit_dirs(&b.fx.ctx), &dev_config(&tokens, STAGING));
     std::fs::remove_file(&b.fx.ctx.identity.key).expect("rm key");
     b.fx.publish_head(1, &[("git", 7)]);
 
@@ -706,6 +671,78 @@ fn a_keyless_install_under_agh_needs_no_public_writer() {
     }
 }
 
+#[test]
+fn the_tip_lanes_check_asks_no_grant_on_a_program_repository_it_cannot_know_is_open() {
+    let mut fx = Fx::new("hosts-check-tip");
+    fixture_accounts(&mut fx.ctx);
+    let ctx = &fx.ctx;
+    let dirs = unit_dirs(ctx);
+    let tokens = tokens(&fx);
+    write_token(&tokens, "dev", &agh_fake::token("dev"));
+    write_token(&tokens, "release", &agh_fake::token("release"));
+    // The release writer is granted the index repository and one program's, and no other.
+    write_config(
+        &dirs,
+        &release_config(
+            &tokens,
+            STAGING,
+            &[
+                "alabsystems/aterm".to_string(),
+                "alabsystems/ay".to_string(),
+            ],
+        ),
+    );
+    // The alab lane's check names every ungranted repository it tracks as missing, the closed
+    // tiers among them, with a remedy that would grant them.
+    let whole = hosts_check::check(
+        ctx,
+        &dirs,
+        HostChoice::Agh,
+        false,
+        &hosts_check::alab_program_repos(),
+    );
+    let grants = named(&whole, "grants");
+    assert!(
+        !grants.ok && grants.detail.contains("alabsystems/claude-code-alab"),
+        "{grants:?}"
+    );
+    // The tip lane's check holds: the index repository's grant is the one it needs to
+    // publish at all.
+    let tip = hosts_check::check_tip(ctx, &dirs, HostChoice::Agh);
+    assert!(tip.iter().all(|c| c.ok), "{tip:?}");
+    let note = named(&tip, "program_grants");
+    assert!(note.ok, "{note:?}");
+    // It names what has no grant without asking for one: which repositories are open is the
+    // lifecycle registry's to say, and the granted one is not listed.
+    assert!(
+        note.detail.contains("alabsystems/nn")
+            && !note.detail.contains("alabsystems/ay,")
+            && !note.detail.contains("alabsystems/ay."),
+        "{note:?}"
+    );
+    assert!(
+        note.detail
+            .contains("only when the lifecycle registry holds it active")
+            && !note.detail.contains("agh policy grant"),
+        "{note:?}"
+    );
+    // A program the queue never carries (a coherence-group member, a program built from
+    // another product's repository) is not the tip lane's to write at all.
+    let repos = hosts_check::tip_program_repos();
+    assert!(repos.iter().any(|r| r == "ay") && !repos.iter().any(|r| r == "trust"));
+    // Without the index repository's grant nothing can publish: that still refuses.
+    write_config(
+        &dirs,
+        &release_config(&tokens, STAGING, &["alabsystems/ay".to_string()]),
+    );
+    let tip = hosts_check::check_tip(ctx, &dirs, HostChoice::Agh);
+    let grants = named(&tip, "grants");
+    assert!(
+        !grants.ok && grants.detail.starts_with("missing: alabsystems/aterm;"),
+        "{grants:?}"
+    );
+}
+
 /// Every file and identity here is owned fixture data; no live token or policy is read.
 fn linux_selection_box(label: &str, grants: &[&str]) -> Box_ {
     let mut b = machine(label, Os::Linux);
@@ -717,6 +754,7 @@ fn linux_selection_box(label: &str, grants: &[&str]) -> Box_ {
         &unit_dirs(&b.fx.ctx),
         &release_config(
             &tokens,
+            STAGING,
             &grants.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
         ),
     );
@@ -773,6 +811,7 @@ fn linux_preflight_requires_the_selected_repo_and_keeps_the_index_grant() {
         &dirs,
         &release_config(
             &tokens,
+            STAGING,
             &[
                 "alabsystems/aterm".into(),
                 "alabsystems/selected-git-assets".into(),
@@ -785,7 +824,11 @@ fn linux_preflight_requires_the_selected_repo_and_keeps_the_index_grant() {
     );
     write_config(
         &dirs,
-        &release_config(&tokens, &["alabsystems/selected-git-assets".into()]),
+        &release_config(
+            &tokens,
+            STAGING,
+            &["alabsystems/selected-git-assets".into()],
+        ),
     );
     let checks = hosts_check::check_linux(&b.fx.ctx, &dirs, HostChoice::Agh, false)
         .expect("index grant refusal");
@@ -879,4 +922,259 @@ fn one_owner_for_both_accounts_is_judged_by_role() {
             "{choice:?}"
         );
     }
+}
+
+/// The alab lane's check asks a grant on exactly the repositories that lane preflights: the
+/// index and each lane-tracked program's. A repository only package or bottle rows name enters
+/// the channel through an explicit pin, never through this lane, so it is never asked for.
+/// NEGATIVE CONTROL: `alab_program_repos` over the unfiltered table names `codex-alab` too.
+#[test]
+fn the_alab_check_names_no_package_or_bottle_repository() {
+    use atpkg_publish::programs::PROGRAMS;
+    let mut tracked: Vec<&str> = Vec::new();
+    for def in PROGRAMS.iter().filter(|d| d.lane_tracked()) {
+        if !tracked.contains(&def.repo) {
+            tracked.push(def.repo);
+        }
+    }
+    let untracked: Vec<&str> = PROGRAMS
+        .iter()
+        .map(|d| d.repo)
+        .filter(|repo| !tracked.contains(repo))
+        .collect();
+    assert!(
+        !untracked.is_empty(),
+        "no repository is named only by a package or bottle row, so this proves nothing"
+    );
+    let repos = hosts_check::alab_program_repos();
+    assert_eq!(
+        repos, tracked,
+        "the lane-tracked repositories, in table order"
+    );
+
+    let mut fx = Fx::new("hosts-check-alab-repos");
+    fixture_accounts(&mut fx.ctx);
+    let dirs = unit_dirs(&fx.ctx);
+    let tokens = tokens(&fx);
+    write_token(&tokens, "dev", &agh_fake::token("dev"));
+    write_token(&tokens, "release", &agh_fake::token("release"));
+    write_config(
+        &dirs,
+        &release_config(&tokens, STAGING, &["alabsystems/aterm".to_string()]),
+    );
+    let checks = hosts_check::check(&fx.ctx, &dirs, HostChoice::Agh, false, &repos);
+    let grants = named(&checks, "grants");
+    assert!(!grants.ok, "{grants:?}");
+    let missing: Vec<&str> = grants
+        .detail
+        .strip_prefix("missing: ")
+        .and_then(|rest| rest.split_once("; "))
+        .map(|(list, _)| list.split(", ").collect())
+        .unwrap_or_else(|| panic!("no missing list in {grants:?}"));
+    let wanted: Vec<String> = tracked
+        .iter()
+        .filter(|repo| **repo != "aterm")
+        .map(|repo| format!("alabsystems/{repo}"))
+        .collect();
+    assert_eq!(missing, wanted, "{grants:?}");
+}
+
+/// A trust checkout whose origin names another repository fails `trust_origin`, and no other
+/// row, exactly where that origin decides the lineage switch: its origin/main carries a dormant
+/// seed ledger, so the switch reads the trust repository's main through that origin. Where the
+/// checkout alone settles the switch (no checkout, no origin/main, a minted ledger there), the
+/// row holds and names the origin that would not serve. The row names the origin it found, its
+/// credential masked, and the repository it wants, whatever the lane; it is judged without an
+/// agh.toml. NEGATIVE CONTROLS: without the row, `named` finds no `trust_origin` check; a row
+/// that fails on every mismatched origin fails the settled halves.
+#[test]
+fn a_mismatched_trust_origin_fails_trust_origin_where_it_decides_the_switch() {
+    let mut fx = Fx::new("hosts-check-trust-origin");
+    fixture_accounts(&mut fx.ctx);
+    let ctx = &fx.ctx;
+    let dirs = unit_dirs(ctx);
+    let tokens = tokens(&fx);
+    write_token(&tokens, "dev", &agh_fake::token("dev"));
+    write_config(&dirs, &dev_config(&tokens, STAGING));
+    let check = |ctx: &Ctx| {
+        hosts_check::check(
+            ctx,
+            &dirs,
+            HostChoice::AghStaging,
+            false,
+            &hosts_check::alab_program_repos(),
+        )
+    };
+    let failed = |checks: &[HostCheck]| -> Vec<&'static str> {
+        checks.iter().filter(|c| !c.ok).map(|c| c.name).collect()
+    };
+    let held = check(ctx);
+    all_hold(&held);
+    assert_eq!(
+        named(&held, "trust_origin").detail,
+        "$HOME/trust's origin names fixture-dev/trust"
+    );
+
+    git(
+        &ctx.trust_repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://someone:hunter2@github.com/someone/trust.git",
+        ],
+    );
+    let names_it = |row: &str| {
+        assert!(
+            row.contains("does not name fixture-dev/trust")
+                && row.contains("(it names https://***@github.com/someone/trust.git)")
+                && !row.contains("hunter2"),
+            "{row}"
+        );
+    };
+    // Settled by the checkout alone: no origin/main reads unknown, a minted ledger there live.
+    let checks = check(ctx);
+    all_hold(&checks);
+    let row = &named(&checks, "trust_origin").detail;
+    names_it(row);
+    assert!(
+        row.contains("decides nothing")
+            && row.contains("reads the lineage switch unknown")
+            && row.contains("has no origin/main"),
+        "{row}"
+    );
+    let mut absent = ctx.clone();
+    absent.trust_repo = ctx.home.join("no-trust");
+    let checks = check(&absent);
+    all_hold(&checks);
+    let row = &named(&checks, "trust_origin").detail;
+    assert!(
+        row.contains("reads the lineage switch unknown")
+            && row.contains("there is no trust checkout at ~/no-trust"),
+        "{row}"
+    );
+    trust_ledger(ctx, MINTED_LEDGER);
+    let checks = check(ctx);
+    all_hold(&checks);
+    let row = &named(&checks, "trust_origin").detail;
+    names_it(row);
+    assert!(
+        row.contains("reads the lineage switch live: its origin/main carries a minted re-pin"),
+        "{row}"
+    );
+
+    // Deferred to the trust repository's main: the origin decides, and the row fails.
+    trust_ledger(ctx, DORMANT_LEDGER);
+    let checks = check(ctx);
+    assert_eq!(failed(&checks), ["trust_origin"], "{checks:?}");
+    let row = &named(&checks, "trust_origin").detail;
+    names_it(row);
+    assert!(row.contains("carries a dormant ledger"), "{row}");
+    let tip = hosts_check::check_tip(ctx, &dirs, HostChoice::AghStaging);
+    assert_eq!(failed(&tip), ["trust_origin"], "{tip:?}");
+
+    write_config(&dirs, "bogus = true\n");
+    let checks = check(ctx);
+    assert!(!named(&checks, "config").ok, "{checks:?}");
+    assert_eq!(named(&checks, "trust_origin").detail, *row);
+    write_config(&dirs, &dev_config(&tokens, STAGING));
+
+    // Removing the remote drops its tracking refs too; the dormant origin/main is laid again.
+    git(&ctx.trust_repo, &["remote", "remove", "origin"]);
+    git(
+        &ctx.trust_repo,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    );
+    let checks = check(ctx);
+    assert_eq!(failed(&checks), ["trust_origin"], "{checks:?}");
+    let row = &named(&checks, "trust_origin").detail;
+    assert!(
+        row.contains("has no origin remote; it must name fixture-dev/trust"),
+        "{row}"
+    );
+
+    // The Linux check reads the head past a failed trust origin: the grant its pin selects
+    // is still judged.
+    let b = linux_selection_box("linux-trust-origin", &["alabsystems/aterm"]);
+    let text =
+        b.fx.keys
+            .index_toml(1, &[("git", "selected-git-assets")], &[("git", 7)]);
+    b.fx.publish_index_text(1, &text);
+    git(
+        &b.fx.ctx.trust_repo,
+        &["remote", "set-url", "origin", "/elsewhere/trust"],
+    );
+    trust_ledger(&b.fx.ctx, DORMANT_LEDGER);
+    let checks = hosts_check::check_linux(&b.fx.ctx, &unit_dirs(&b.fx.ctx), HostChoice::Agh, false)
+        .expect("signed head");
+    assert_eq!(failed(&checks), ["grants", "trust_origin"], "{checks:?}");
+    assert!(
+        named(&checks, "grants")
+            .detail
+            .contains("alabsystems/selected-git-assets"),
+        "{checks:?}"
+    );
+}
+
+/// A Linux check whose signed head cannot be read after only `trust_origin` failed refuses
+/// with the head's own error, and that error names the failed row too: neither fault hides the
+/// other, in `hosts check --lane linux` or in `lane install --lane linux`. With the origin
+/// right, the same unreadable head names no trust row. NEGATIVE CONTROL: the head's error
+/// returned alone, as before, fails the first half.
+#[test]
+fn an_unreadable_head_still_names_a_failed_trust_origin() {
+    let b = linux_selection_box("linux-trust-origin-head", &["alabsystems/aterm"]);
+    let public = b.fx.ctx.accounts.public.clone();
+    b.fx.host.set_unreachable(&public, true);
+    let refused = |b: &Box_| {
+        hosts_check::check_linux(&b.fx.ctx, &unit_dirs(&b.fx.ctx), HostChoice::Agh, false)
+            .expect_err("the head cannot be read")
+    };
+    let control = refused(&b);
+    assert_eq!(control.exit_code(), 3, "{control}");
+    let head = control.to_string();
+    assert!(!head.contains("trust_origin"), "{head}");
+
+    git(
+        &b.fx.ctx.trust_repo,
+        &["remote", "set-url", "origin", "/elsewhere/trust"],
+    );
+    trust_ledger(&b.fx.ctx, DORMANT_LEDGER);
+    let both = refused(&b);
+    assert_eq!(both.exit_code(), 3, "the head's kind is kept: {both}");
+    let text = both.to_string();
+    assert!(
+        text.starts_with(&head)
+            && text.contains("; trust_origin failed too: $HOME/trust cannot serve as")
+            && text.contains("does not name fixture-dev/trust (it names /elsewhere/trust)"),
+        "{text}"
+    );
+}
+
+/// The install fixture's own routing (`install::machine`) is ready for every lane: `hosts check
+/// --host agh` holds for alab, tip and Linux over it as it stands, so an install that runs the
+/// check finds nothing to provision and the head's pins select no ungranted repository.
+#[test]
+fn the_install_fixture_holds_every_lane_s_hosts_check() {
+    let b = machine("host-fixture-ready", Os::Linux);
+    let ctx = &b.fx.ctx;
+    let dirs = unit_dirs(ctx);
+    all_hold(&hosts_check::check(
+        ctx,
+        &dirs,
+        HostChoice::Agh,
+        false,
+        &hosts_check::alab_program_repos(),
+    ));
+    let tip = hosts_check::check_tip(ctx, &dirs, HostChoice::Agh);
+    assert!(tip.iter().all(|c| c.ok), "{tip:?}");
+    assert!(
+        named(&tip, "program_grants")
+            .detail
+            .contains("may write every program repository the tip lane can queue"),
+        "{tip:?}"
+    );
+    all_hold(
+        &hosts_check::check_linux(ctx, &dirs, HostChoice::Agh, false).expect("the signed head"),
+    );
 }

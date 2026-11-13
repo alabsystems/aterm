@@ -140,8 +140,11 @@ pub(in crate::harness) fn source_for_preload(
     caller: &Caller,
     operation: &str,
     proof: &super::super::codex_source_registry::PreloadReadNamespace,
-) -> Result<SourceProgress, SlotError> {
-    proof.current().map_err(|_| SlotError::Unavailable)?;
+) -> Result<SourceProgress, crate::harness::codex_source_registry::Error> {
+    use crate::harness::codex_source_registry::Error;
+    // A contended occurrence check is retryable on this same owned command.
+    // Do not relabel it as lost transport and discard its live connection.
+    proof.current()?;
     let source = proof.source();
     let result = source_inner_using_namespace(
         env,
@@ -149,8 +152,9 @@ pub(in crate::harness) fn source_for_preload(
         operation,
         Some(source),
         Some(SourceReadNamespace::CapturedPreload(proof)),
-    )?;
-    proof.current().map_err(|_| SlotError::Unavailable)?;
-    check_source(&result, source)?;
+    )
+    .map_err(|_| Error::Unavailable)?;
+    proof.current()?;
+    check_source(&result, source).map_err(|_| Error::Unavailable)?;
     Ok(result)
 }

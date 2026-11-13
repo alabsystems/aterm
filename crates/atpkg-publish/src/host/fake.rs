@@ -27,6 +27,7 @@ struct State {
     repos: BTreeMap<Slug, BTreeMap<String, FakeRelease>>,
     clone_sources: BTreeMap<Slug, PathBuf>,
     fail_once: Vec<(Slug, String, String)>,
+    lagging: BTreeMap<(Slug, String, String), u32>,
     unreachable_owners: BTreeSet<String>,
     private: BTreeSet<Slug>,
     not_visible: BTreeSet<Slug>,
@@ -57,6 +58,8 @@ pub enum FakeOp {
 /// What an armed write does instead of succeeding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FakeFail {
+    /// A create killed before its first asset upload; its owned draft is empty.
+    KilledBeforeUpload,
     /// A create killed after its draft holds every file: the draft stays, unpublished.
     KilledCreate,
     /// The write lands whole, and its answer is lost.
@@ -73,7 +76,10 @@ const fn armable(op: FakeOp, fail: FakeFail) -> bool {
         (op, fail),
         (
             FakeOp::Create,
-            FakeFail::KilledCreate | FakeFail::LostResponse | FakeFail::Refuse
+            FakeFail::KilledBeforeUpload
+                | FakeFail::KilledCreate
+                | FakeFail::LostResponse
+                | FakeFail::Refuse
         ) | (
             FakeOp::Upload,
             FakeFail::Partial | FakeFail::LostResponse | FakeFail::Refuse
@@ -178,6 +184,14 @@ impl FakeHost {
         self.state()
             .fail_once
             .push((slug.clone(), tag.to_string(), asset.to_string()));
+    }
+
+    /// The next `reads` anonymous reads of this one asset answer 404 although it is
+    /// published: the download route's lag behind a just-written release asset.
+    pub fn lag_public(&self, slug: &Slug, tag: &str, asset: &str, reads: u32) {
+        self.state()
+            .lagging
+            .insert((slug.clone(), tag.to_string(), asset.to_string()), reads);
     }
 
     /// Every authenticated call on `owner`'s repos answers unreachable (or stops).
@@ -498,15 +512,25 @@ impl FakeHost {
     }
 
     fn public(&self, slug: &Slug, tag: &str, asset: &str) -> Option<Vec<u8>> {
-        let s = self.state();
+        let mut s = self.state();
         if s.private.contains(slug) || s.not_visible.contains(slug) {
             return None;
         }
-        s.repos
+        let bytes = s
+            .repos
             .get(slug)
             .and_then(|tags| tags.get(tag))
             .filter(|r| !r.draft)
-            .and_then(|r| r.assets.get(asset).cloned())
+            .and_then(|r| r.assets.get(asset).cloned())?;
+        if let Some(reads) = s
+            .lagging
+            .get_mut(&(slug.clone(), tag.to_string(), asset.to_string()))
+            .filter(|reads| **reads > 0)
+        {
+            *reads -= 1;
+            return None;
+        }
+        Some(bytes)
     }
 
     /// `fetch_public`'s answer. A final failure never removes caller-owned bytes at `dest`.
@@ -578,6 +602,10 @@ impl FakeHost {
             }
         }
         match self.armed(FakeOp::Create) {
+            Some(FakeFail::KilledBeforeUpload) => {
+                self.lay_own(slug, tag, notes, true, BTreeMap::new());
+                return Err(HostError::Unreachable("killed before upload".into()));
+            }
             Some(FakeFail::KilledCreate) => {
                 self.lay_own(slug, tag, notes, true, incoming.into_iter().collect());
                 return Err(HostError::Unreachable("killed".into()));
@@ -648,6 +676,28 @@ impl ReleaseHost for FakeHost {
             published_at: r.published_at.clone(),
             assets: r.assets.keys().cloned().collect(),
         })
+    }
+
+    fn complete_created(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        _title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> Result<bool, HostError> {
+        self.reachable(slug)?;
+        let owned = {
+            let state = self.state();
+            let key = (slug.clone(), tag.to_string());
+            state.own.contains(&key) && state.notes.get(&key).map(String::as_str) == Some(notes)
+        };
+        if !owned {
+            return Ok(false);
+        }
+        self.log(format!("create-recovery {slug} {tag}"));
+        self.complete_own(slug, tag, Self::read_files(files)?, true)?;
+        Ok(true)
     }
 
     fn download(

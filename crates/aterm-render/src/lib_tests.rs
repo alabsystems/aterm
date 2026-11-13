@@ -3933,7 +3933,6 @@ fn retiring_a_styled_slot_drops_the_pointer_keyed_caches() {
         std::sync::Arc::ptr_eq(&banked, &hit),
         "the bank must be memoizing for this test to be a test"
     );
-    r.subpx_glyphs.insert(key, None);
 
     assert!(r.retire_unparsable_styled(0), "a present slot must retire");
 
@@ -3945,10 +3944,6 @@ fn retiring_a_styled_slot_drops_the_pointer_keyed_caches() {
         !std::sync::Arc::ptr_eq(&banked, &rebuilt),
         "the retire freed the slot's bytes but left ADDRESS-keyed instances behind — \
          a later allocation at that address would resurrect them"
-    );
-    assert!(
-        r.subpx_glyphs.is_empty(),
-        "the subpixel overlay is keyed like `glyphs`, cleared with it"
     );
 }
 

@@ -1191,10 +1191,9 @@ configured mailbox routes and encrypted grants, never command-line passwords.
   aterm secrets ls --describe                   names, purposes and registered file pointers
   aterm secrets ls --json                       the same metadata as JSON, without values
 
-  Start credential and deployment questions with this registry and `secrets status`.
-  Use its registered paths: entries may land outside ~/.secrets. Status reports
-  release-signing readiness; file presence alone is not a readiness check. For a GitHub
-  token, `agh whoami --verify` is: it asks GitHub whose each token is (`aterm help agh`).
+  Use its registered paths: entries may land outside ~/.secrets. One this Mac lacks is
+  `aterm secrets need <want>`, never a person's. `agh whoami --verify` asks GitHub whose
+  each token is (`aterm help agh`).
 
 DETAILS
 
@@ -1426,7 +1425,7 @@ SETUP AT EACH MAC (`aterm machines help enroll` is the checklist)
 VERBS
   set up      init, scan, enroll, unenroll, rename
   look        ls, tabs, monitor, status, outstanding, storage plan
-  change      plan, apply, attach, run, github login|revoke, rekey
+  change      plan, apply, attach, run, github revoke, rekey
   people      person, screen
   on a host   here plan|apply <baseline.toml> (apply under sudo); here apply --plain
               (Apple's Command Line Tools from the built-in baseline, reading no file)
@@ -1491,11 +1490,17 @@ WHAT IT IS
     `aterm ctl signal`, that came again within 10 minutes, or whose owner could not be
     read is recorded in Messages, the asker named; the record asks nothing.
   * Human grace: after a person types, clicks or scrolls, it holds off for
-    `human_grace_s` (`status human_ms=`), but a permission box nobody has touched
-    since it appeared, and a choice dialog that grants and spends nothing (a
-    question, a plan or goal dialog, a model switch), only 15 s past the person's
-    last input, and an untouched box Claude Code will deny on a timer (`⚠ … deny
-    this request in M:SS`) only until 15 s before the deny. While a hold stands (`hold=1`) or an external supervisor holds the lease
+    `human_grace_s` (`status human_ms=`), but a Claude Code permission box nobody has
+    touched (no key moved its focus, no other driver held the tab) is answered once
+    the person's last input is 2.5 s old and the worker has read all of it, whatever
+    they typed into the composer or queued as it came up; each key of the answer is
+    fenced on the person's count and the screen, so a key of theirs after the
+    decision stops it. A box someone touched keeps the whole grace. A choice dialog
+    that grants and spends nothing (a question, a plan or goal dialog, a model
+    switch), and another program's untouched box, wait only 15 s past the person's
+    last input, and an untouched one Claude Code will deny on a timer (`⚠ … deny
+    this request in M:SS`) only until 15 s before the deny. While a hold stands
+    (`hold=1`) or an external supervisor holds the lease
     (`supervisor=external`), the window only watches. A worker frozen past
     `stall_term_after_s` (`input=stalled`) is restarted, or warned about once under
     `stall_term = false`.
@@ -1517,7 +1522,9 @@ AUTOPILOT — how far the harness carries a session's work
     keep going (`continue-background@v1`, asked again after 2, 4, 8 … and at most 60
     minutes while the agent answers it in seconds); a run of replies with no work gets
     a paced recovery, not a stop (Stopped typing, below). Each time a reply
-    says the work is done, it asks the agent for another kind of work, in turn: the
+    says the work is done in a few lines starting `Nothing left:` (the primer asks
+    for that form; a legacy `ATERM-TASK-DONE` line or a bare `DONE` counts too, and
+    words alone do not), it asks the agent for another kind of work, in turn: the
     widest check on the merged tree, a hostile review of the landed diff, what its
     reports called out of scope, a measurement against the main it started from, the
     next open issue or TODO, and landing what the session made (leaving what it did
@@ -1566,6 +1573,10 @@ AUTOPILOT — how far the harness carries a session's work
   Under every mode nothing is typed while a person types (`human_grace_s`), another
   driver holds the tab, or the composer holds a draft or input is unsent; a dialog or
   question box is answered by its own rule, and a usage limit or a hold waits as before.
+  An upgrade line of aterm's own that the window stopped before its Enter (a notice, the
+  `Upgrade waiting` line) is no draft of yours: aterm backspaces its words out of Claude
+  Code's prompt, at once or once the tab has been left alone a minute, and presses
+  nothing while the prompt holds a key of yours.
 
   Stopped typing: when the agent answers aterm's acts with the same reply twice and
   no work, or six replies in a row with no work, aterm stops typing into its tab under
@@ -1678,8 +1689,9 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
                                   Code's `accounts.toml`, and `accounts-codex.toml`,
                                   `accounts-grok.toml`, `accounts-kimi.toml`, whose
                                   pools pick a row when aterm starts a session and
-                                  move no running one but a codex-alab at its weekly
-                                  limit)
+                                  move no running one but a codex-alab: at its weekly
+                                  limit, or when it is asked to with
+                                  `aterm ctl @<sid> restart account=<label>`)
   limit_reset [false]             take an eligible limit reset on the usage-limit dialog
   limit_reset_kinds [[]]          which reset kinds `limit_reset` may spend
   usage_tap [true]                pass aterm's status-line tap on Claude Code relaunches;
@@ -1711,9 +1723,10 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   upgrade_ask [false]             true: ask the agent before restarting for an upgrade;
                                   false: restart quietly at a genuinely idle point
   human_grace_s [120]             seconds to keep hands off after a person's input (a
-                                  permission box nobody touched since it appeared, or a
-                                  choice dialog that grants and spends nothing: 15 s at
-                                  most; to 15 s before an untouched box's auto-deny)
+                                  Claude Code permission box nobody touched: 2.5 s; a
+                                  choice dialog that grants and spends nothing, or
+                                  another program's untouched box: 15 s at most, to
+                                  15 s before an untouched dialog's auto-deny)
   occupancy ["observe"]           wait measurement: `"observe"`, `"off"` or `"prompt"`
                                   (`"prompt"` alone types its lines: one fenced line
                                   at a drawn break, after every guard)
@@ -1745,8 +1758,7 @@ THE [harness] TABLE (aterm.toml; every key optional, the default in brackets)
   off that CLI's account rotation (the account a worker launches on, and Claude Code's
   moves in the window) and its automatic sign-ins, which `[harness] enabled = false`
   turns off for every CLI. Its panes wear only the switch, as under the master
-  switch off. A `[harness.gemini]` table, the retired Gemini CLI's,
-  switches nothing: its note says agy replaces it.
+  switch off.
 
 THE VERBS (`aterm harness --help`; `aterm harness <verb> --help` for one)
   usage      this session's tokens per model, subagents folded in (Codex at list price,
@@ -1811,9 +1823,9 @@ THE FOOTER
   `✓ landed`, `⤓ quiet`, `○` off, or `✋ you` while you hold it), the session's facts
   and status lights. `[claude_footer]`'s switches, each true by default, turn on its
   extras: `usage` (the `Σ` working time and tokens), `acts` (what the harness just did,
-  beside the chip), `card` (the decorated launch card, its line linking alab.systems,
-  and the banners over Claude Code's update notice and startup announcement) and
-  `agents` (the agents panel's colours). Clicking the chip moves Autopilot to its next
+  beside the chip), `card` (the decorated launch card and its line, `enhanced by ALab
+  <cli> harness`, whose `ALab` links alab.systems; every row under the line stays the
+  CLI's own, its news and its links included) and `agents` (the agents panel's colours). Clicking the chip moves Autopilot to its next
   mode (Cruise, Land, Off, round again), its name shown after the glyph for a moment
   (`⤓ land`); the chip is that three-way toggle and no more, so a right-click
   (control-click on a Mac) on it opens nothing. A timed Cruise that then lands, and
@@ -1863,8 +1875,9 @@ THE FOOTER
   so a column wears one hue on all three (Autopilot's palette: Cruise the rainbow, Land
   the sunset, Off the moonbow; neutral inks with no harness). This includes Claude Code,
   agy, Muse Code and Kimi Code. Line B, the rule above the composer, ends with the
-  harness label `alab v<ver> (v<cli>)`, or `alab v<ver>` where the CLI's build does not
-  fit or is not known.
+  harness label `ALab v<ver> (v<cli>)`, `ALab v<ver>` where the CLI's build does not
+  fit or is not known, or `ALab` alone in a narrower pane; a click on it opens
+  alab.systems.
   Line D, the rule below it, sets its facts at one size, as terminal text: `◆` the model
   and effort at the far left, then `⧗ until <when>` only while the account is out at a
   usage limit (that slot carries a wall and nothing else), the account unit, `⌂` the
@@ -2237,10 +2250,14 @@ WHEN TO REACH FOR IT
   backend; trust routes its obligations to them itself.
 
 GOTCHAS
-  * INSTALL: a prebuilt, self-contained sysroot ships: `aterm pkg install trust`, or the
-    whole toolset with `aterm pkg install --default-set` (Settings ▸ Packages ▸ Install
-    ALab Tools Now). `aterm trustc` / `aterm targo` run the store's copy, never $PATH's;
-    an aterm shell has them on PATH. atpkg installs prebuilt builds only.
+  * INSTALL: a prebuilt, self-contained sysroot ships where the index publishes one for
+    the machine's target: `aterm pkg install trust`, or the whole toolset with
+    `aterm pkg install --default-set` (Settings ▸ Packages ▸ Install ALab Tools Now).
+    Where none is published (`aterm help rust` says so), a locally built sysroot links in
+    with `aterm pkg link trust <sysroot> bin/trustc bin/targo …`; verify and an explicit lane
+    (`cargo --unverified …`, `cargo trust …`) also take TRUST_STAGE2_BIN naming its bin
+    (docs/LINUX-LOCAL-TOOLCHAIN.md). `aterm trustc` / `aterm targo` run the store's copy,
+    never $PATH's; an aterm shell has them on PATH. atpkg installs prebuilt builds only.
   * An empty or zero-obligation report is not a proof: gate with `--require proved`.
   * Type Trust's names: `targo`, `trustc`, `tippy`, `trustfmt`, `trustdoc`. rustup's
     `trust` toolchain (~/.rustup/toolchains/trust) also answers to `cargo`, `rustc` and
@@ -3281,7 +3298,6 @@ AGENTS
   toolset removed by `aterm pkg uninstall --all`) keeps it off, nothing is installed,
   the launch says so and the line runs any copy of the shell's own (if none starts,
   its `stalled why=startup` says why).
-  `agent=gemini`, the retired Gemini CLI, is refused by name: agy replaces it.
 
 ANY OTHER PROGRAM
   aterm ctl @self spawn program=<path|word> [arg=<word>]... - < task
@@ -3721,7 +3737,11 @@ DEBUGGER ACCESS (a password dialog, not privacy)
 
 SLOW FIRST RUNS (macOS's first-run check, not a wall)
   A newly built binary that pauses for seconds before it starts is being scanned by
-  `syspolicyd` / XProtect, one binary at a time.
+  `syspolicyd` / XProtect, one binary at a time. aterm calls a program held at that check
+  only on per-process evidence of its check, which no reader of macOS gives yet: on a
+  real Mac one the check holds reads `finding kind=not-started …
+  program_check=unconfirmed` in `aterm ctl @self sys jobs` once 20 s past its launch, so
+  there the held counts below read 0 and nothing below is named held or stranded.
   1. Check `aterm doctor --read-only`'s `devtools:` row (or `devtools` in `aterm ctl
      privacy`, whose `program_check=` counts this user's programs waiting at the check
      now; `aterm ctl @self status`'s `program_check=` counts this tab's and the oldest).
@@ -3740,11 +3760,15 @@ SLOW FIRST RUNS (macOS's first-run check, not a wall)
      launchd started another, so `status` reads `syspolicyd=ok`, and its
      `syspolicyd_pid=` and `syspolicyd_up_ms=` name the new one and how long it has
      run) most likely sent its check to a `syspolicyd` that is no longer running.
-     `targo --unverified verify` ends its own such stage child COULD NOT RUN once the
-     new one has run 10 min (the bound on a first exec) with no queue. Run the check
-     again on the same tree: no restart is needed, and a build that rewrites that
-     binary first could land on a check the new one took from its queue and has not
-     finished.
+     `status`'s `program_check_stranded=` and `privacy` count each held one aterm read
+     unrun before the new one started, and `sys jobs` names it
+     (`kind=program-check-stranded`), only once the new one has run 10 min awake (the
+     bound on a first exec) with room in its pool and no newer program held; they end
+     none. `targo --unverified verify` ends its own such stage child COULD NOT RUN once
+     the new one has run 10 min with no queue. New programs start: stop what started it
+     and run it again (verify on the same tree). No restart is needed, and a build that
+     rewrites that binary first could land on a check the new one took from its queue
+     and has not finished.
 
 GOTCHAS
   * `probe=pending` or a folder's `unknown` means unmeasured, not `denied`.
@@ -3958,6 +3982,7 @@ const NAME_PAGE: &str = r#"name — this machine's name: its NAME (`m8`, or `unn
   aterm name [--json]
   aterm name set <mN> [--nick <word>] [--dry-run] [--json]
   aterm name nick <word> | --random  [--dry-run] [--json]
+  aterm name sync [--json]
 
   Unix only for now: elsewhere it exits 2, keeping no name.
 
@@ -3992,9 +4017,12 @@ CHANGING THE NAME
   `unnumbered` means no ID has been assigned. A number another known machine holds is refused, and so
   is one its vault gives another Mac, with what holds it. `--dry-run` reports the
   proposed name without changing it. A real change also updates the naming policy and
-  checked fleet name. On macOS, one system-password prompt covers ComputerName,
-  LocalHostName and HostName; Details shows the exact authorized operation. A failed
-  later step reports publication pending; repeat the command to resume.
+  checked fleet name. On macOS it uses the existing setup authorization to update
+  ComputerName, LocalHostName and HostName; the command never opens a password prompt.
+  Missing authorization or a failed step leaves publication pending. `aterm name sync`
+  retries the three OS names from the freshly read saved identity, without choosing a
+  number or nickname or changing policy or the fleet name. To authorize naming, open
+  Rename This Mac… from the Name menu and choose Authorize Naming.
 
 THE NICKNAME
   `aterm name nick Heron` sets the nickname (one argument: quote `"Blue Heron"`), and

@@ -279,6 +279,16 @@ fn rows() -> Vec<(&'static Collection, Vec<Seed>)> {
     rows
 }
 
+/// Whether every build compiles a seed row keyed `pk` in `collection` (a provider, CLI or plan
+/// row): a row the registry holds by construction, which a seed pass writes wherever it is
+/// absent, so an owner write may name it before any pass has run here
+/// ([`crate::att::Compiled::seeded`]).
+pub fn compiled(collection: &str, pk: &str) -> bool {
+    rows()
+        .iter()
+        .any(|(c, seeds)| c.name == collection && seeds.iter().any(|seed| seed.pk == pk))
+}
+
 /// Whether a projected cell already holds something: a value, a conflict, or for a set element
 /// any candidate at all. A seed never writes over it.
 fn held(projection: &Projection, seed: &Seed) -> bool {

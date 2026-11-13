@@ -570,3 +570,102 @@ fn a_star_that_paints_nothing_answers_the_budget_as_the_piece_loop_did() {
         "no star that paints nothing was laid below the cap ({below}) or at it ({at_or_past})"
     );
 }
+
+/// 4096 columns of 20 px and 2,100 rows of 40 px: an effects box of 81,920 by 84,000 px, past
+/// the `u16` pixel space an overlay quad stores, on both axes.
+const fn wide_geom() -> Geom {
+    Geom {
+        cw: 20,
+        ch: 40,
+        rows: 2100,
+        cols: 4096,
+        origin_x: 0,
+        origin_y: 0,
+        win_w: u16::MAX,
+        win_h: u16::MAX,
+        head: 0,
+    }
+}
+
+/// What the rect `(x, y, w, h)` lays on [`wide_geom`] through the grid-px pusher or the
+/// window-px one, each quad as `(x, y, w, h)`.
+fn laid_on_wide(grid: bool, (x, y, w, h): (i32, i32, i32, i32)) -> Vec<(u16, u16, u16, u16)> {
+    let mut out = Vec::new();
+    if grid {
+        push_grid_quad(&mut out, wide_geom(), x, y, w, h, 0x00FF_FFFF, 0);
+    } else {
+        push_fx_rect(&mut out, wide_geom(), x, y, w, h, 0x00FF_FFFF);
+    }
+    out.iter().map(|q| (q.x, q.y, q.w, q.h)).collect()
+}
+
+/// Light on a grid whose pixel extent passes 65,535 is cut at the space's edge and dropped
+/// past it. Narrowed with a bare `as u16` it was laid at `x mod 65,536`, the far side of the
+/// frame (the rect at x 81,760 at x 16,224), and a debug build panicked on the assertion that
+/// stood in for the clip.
+#[test]
+fn light_past_the_u16_pixel_space_is_clipped_never_wrapped() {
+    let none: [(u16, u16, u16, u16); 0] = [];
+    for grid in [false, true] {
+        assert_eq!(
+            laid_on_wide(grid, (64_000, 80, 100, 60)),
+            [(64_000, 80, 100, 40), (64_000, 120, 100, 20)],
+            "inside the space: laid whole, a quad per row band"
+        );
+        assert_eq!(
+            laid_on_wide(grid, (65_500, 80, 100, 40)),
+            [(65_500, 80, 35, 40)],
+            "across the right edge: cut at 65,535"
+        );
+        assert_eq!(
+            laid_on_wide(grid, (81_760, 80, 100, 40)),
+            none,
+            "past the right edge: nothing"
+        );
+        assert_eq!(
+            laid_on_wide(grid, (100, 65_500, 10, 100)),
+            [(100, 65_500, 10, 20), (100, 65_520, 10, 15)],
+            "across the bottom edge: cut at 65,535"
+        );
+        assert_eq!(
+            laid_on_wide(grid, (100, 70_000, 10, 100)),
+            none,
+            "past the bottom edge: nothing"
+        );
+    }
+}
+
+/// A halo is stored with its true centre, so one whose centre lies past the space is dropped
+/// (cast, the centre wrapped and the band left in the box was laid round the wrong point); one
+/// inside it is cut at the edge and keeps its centre.
+#[test]
+fn a_halo_centred_past_the_u16_pixel_space_is_dropped() {
+    let lay = |cx: f32| {
+        let mut out = Vec::new();
+        crate::cursor_glow::push_halo_rows(
+            &mut out,
+            wide_geom(),
+            (cx, 100.0),
+            (30.0, 30.0),
+            0x00FF_FFFF,
+            aterm_render::HaloMode::Add,
+        );
+        out
+    };
+    let near = lay(65_520.0);
+    assert_eq!(near.len(), 3, "three row bands, y 70 to 130");
+    for h in &near {
+        assert_eq!((h.cx, h.x, h.w), (65_520, 65_490, 45), "cut at 65,535");
+    }
+    assert!(lay(65_550.0).is_empty(), "its centre is past the space");
+    assert!(lay(81_760.0).is_empty(), "all of it is past the space");
+}
+
+/// The beam rasterizers' clip ends at the space's edge; a grid inside the space keeps its box.
+#[test]
+fn the_beam_clip_ends_at_the_u16_pixel_space() {
+    let wide = wide_geom().beam_clip();
+    assert_eq!((wide.x1, wide.y1), (65_535, 65_535));
+    let small = geom().beam_clip();
+    assert_eq!((small.x1, small.y1), (320, 96));
+}

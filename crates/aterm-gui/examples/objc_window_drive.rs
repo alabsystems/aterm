@@ -2660,9 +2660,9 @@ mod macos {
     }
 
     fn child_diagnostic(stdout: &str, stderr: &str) -> String {
-        stderr
+        stdout
             .lines()
-            .chain(stdout.lines())
+            .chain(stderr.lines())
             .rev()
             .find(|line| !line.trim().is_empty())
             .unwrap_or("no child diagnostic")

@@ -19,6 +19,8 @@ use crate::schema::{Book, MAX_JSON, Record, hex, refused};
 
 mod image_pin;
 pub use image_pin::PinnedProgram;
+mod control;
+pub use control::{HostControlTransfer, ORIGINAL_CONTROL_DESCRIPTORS};
 
 #[derive(Debug)]
 struct Backing {
@@ -62,6 +64,7 @@ pub struct Host {
     image: Arc<Image>,
     socket_parent: Arc<File>,
     stream: UnixStream,
+    control_anchor: Option<Arc<UnixStream>>,
 }
 
 /// An immutable helper selected through an actual native ancestor connection.
@@ -73,6 +76,9 @@ pub struct PinnedHelper {
     identity: Identity,
     image: Arc<Image>,
     socket_parent: Arc<File>,
+    // Imported control originals retain their SAME native socket too. Ordinary
+    // discovered pins have only the existing eight-backing profile.
+    control_anchor: Option<Arc<UnixStream>>,
 }
 
 fn same_file(actual: &File, original: &File) -> io::Result<bool> {
@@ -140,16 +146,15 @@ impl Store {
             (&backing.path.join("images"), &backing.images),
             (&backing.path.join("instances"), &backing.instances),
         ] {
-            if !same_file(&private::directory(path)?, held)? {
-                return Err(refused("provenance directory replaced"));
-            }
+            private::named_directory(path, held)?;
         }
-        let (version, file) = private::read_private(&backing.root, OsStr::new("version.json"), 64)?;
-        if version != b"{\"version\":1}" || !same_file(&file, &backing.version)? {
+        private::named_file(&backing.path.join("version.json"), &backing.version)?;
+        let version = private::read_original(&backing.version, 64)?;
+        if version != b"{\"version\":1}" {
             return Err(refused("provenance version changed"));
         }
-        let lock = private::open_private(&backing.root, OsStr::new("lock"))?;
-        if !same_file(&lock, &backing.lock)? || lock.metadata()?.len() != 0 {
+        private::named_file(&backing.path.join("lock"), &backing.lock)?;
+        if backing.lock.metadata()?.len() != 0 {
             return Err(refused("provenance lock changed"));
         }
         Ok(())
@@ -252,6 +257,7 @@ impl Instance {
             image: Arc::new(image),
             socket_parent: Arc::new(socket_parent),
             stream,
+            control_anchor: None,
         };
         host.instance.check_socket(&host.socket_parent)?;
         let own = process::read_identity(std::process::id())?;
@@ -262,13 +268,13 @@ impl Instance {
         Ok(Some(host))
     }
     fn check_socket(&self, original_parent: &File) -> io::Result<()> {
-        let parent = private::directory(
+        private::named_directory(
             self.socket.parent().ok_or_else(|| refused("socket parent missing"))?,
+            original_parent,
         )?;
         let meta = fs::symlink_metadata(&self.socket)?;
         // SAFETY: geteuid reads only the current effective account identity.
-        if !same_file(&parent, original_parent)?
-            || !meta.file_type().is_socket()
+        if !meta.file_type().is_socket()
             || meta.uid() != unsafe { libc::geteuid() }
             || meta.nlink() != 1
             || meta.mode() & 0o7077 != 0
@@ -304,6 +310,7 @@ impl Host {
             identity: self.identity,
             image: self.image,
             socket_parent: self.socket_parent,
+            control_anchor: self.control_anchor,
         })
     }
     pub fn pid(&self) -> u32 {
@@ -331,6 +338,7 @@ impl Host {
             &self.socket_parent,
             deadline,
         )?;
+        check_control_anchor(self.control_anchor.as_deref(), &self.instance, self.identity)?;
         process::check_peer(&self.stream, self.identity)?;
         let own = process::read_identity(std::process::id())?;
         if !process::stable_ancestor(self.identity, own, deadline)? {
@@ -361,6 +369,19 @@ fn validate_native_host(
         return Err(refused("custodian is not actual ancestor"));
     }
     expired(deadline)
+}
+fn check_control_anchor(
+    anchor: Option<&UnixStream>,
+    instance: &Instance,
+    native: Identity,
+) -> io::Result<()> {
+    if let Some(anchor) = anchor {
+        process::check_peer(anchor, native)?;
+        if anchor.peer_addr()?.as_pathname() != Some(instance.socket_path()) {
+            return Err(refused("retained original control anchor endpoint changed"));
+        }
+    }
+    Ok(())
 }
 impl PinnedHelper {
     /// Duplicate the SAME retained read-only store directory for this helper's
@@ -409,7 +430,9 @@ impl PinnedHelper {
             &self.image,
             &self.socket_parent,
             deadline,
-        )
+        )?;
+        check_control_anchor(self.control_anchor.as_deref(), &self.instance, self.identity)?;
+        expired(deadline)
     }
     /// Reconnect as the actual native caller using the ORIGINAL verified image
     /// handles. This never rehashes or reselects a different book row. Retain
@@ -426,6 +449,7 @@ impl PinnedHelper {
             image: Arc::clone(&self.image),
             socket_parent: Arc::clone(&self.socket_parent),
             stream,
+            control_anchor: self.control_anchor.clone(),
         };
         host.revalidate(deadline)?;
         Ok(host)

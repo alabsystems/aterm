@@ -179,15 +179,15 @@ fn showcase_keep_with_no_theme_writes_the_plain_name() {
         let (published, _) = apply_real_config_patch(&mut service, &patches[0].0);
         (published.config.theme.clone(), feedback)
     };
-    for id in ["Aterm Day", "Nord"] {
+    for id in ["aterm Day", "Nord"] {
         assert_eq!(
             keep("", id),
             (Some(id.to_string()), Some(format!("Keeping {id}\u{2026}")))
         );
     }
     assert_eq!(
-        keep("theme = \"dark:Nord,light:Default Light\"\n", "Aterm Day").0,
-        Some("dark:Aterm Day,light:Default Light".to_string())
+        keep("theme = \"dark:Nord,light:Default Light\"\n", "aterm Day").0,
+        Some("dark:aterm Day,light:Default Light".to_string())
     );
 
     let mut lab = super::modified::Lab::new("");
@@ -197,16 +197,16 @@ fn showcase_keep_with_no_theme_writes_the_plain_name() {
         .showcase
         .cards
         .iter()
-        .find(|card| card.id == "Aterm Day")
-        .expect("Aterm Day has a card")
+        .find(|card| card.id == "aterm Day")
+        .expect("aterm Day has a card")
         .slug
         .clone();
     let _ = lab.invoke(&format!("settings/showcase/card/{slug}"), None);
     lab.commit("settings/showcase/keep", None);
-    assert_eq!(lab.text(), "theme = \"Aterm Day\"\n");
+    assert_eq!(lab.text(), "theme = \"aterm Day\"\n");
     let feedback = lab.state().feedback.clone().unwrap_or_default();
     assert!(
-        feedback.starts_with("Color theme set to Aterm Day"),
+        feedback.starts_with("Color theme set to aterm Day"),
         "the status names the one theme: {feedback}"
     );
 }

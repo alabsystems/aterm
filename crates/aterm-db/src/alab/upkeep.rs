@@ -33,7 +33,8 @@ fn journal_spool() -> Option<Spool> {
 }
 
 /// The journal's flusher on its own thread: a pass every [`JOURNAL_EVERY`], [`RETRY`] after one
-/// that failed or kept its record local.
+/// that failed or kept its record local, and at once after an update record's
+/// [`super::journal::upd::nudge`].
 struct Journal {
     spool: Spool,
     next: Instant,
@@ -51,6 +52,9 @@ impl Journal {
                     Some(Flushed::Idle | Flushed::Wrote { .. }) => JOURNAL_EVERY,
                     Some(Flushed::Kept(_)) | None => RETRY,
                 };
+        }
+        if self.running.is_none() && super::journal::upd::nudged() {
+            self.next = now;
         }
         if self.running.is_some() || now < self.next {
             return;
@@ -71,6 +75,7 @@ impl Journal {
                     &spool,
                     &|| presence_live(&paths),
                     &super::journal::place::holdings,
+                    &super::journal::upd::record,
                     off,
                     now,
                 )

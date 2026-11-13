@@ -2535,6 +2535,7 @@ fn dead_agent() -> restore::AgentRestore {
         claude_auth: None,
         word: String::new(),
         pid: 4242,
+        lifetime: None,
         start: "Sat Sep 27 01:02:03 2026".into(),
         program: "/opt/claude/bin/claude".into(),
         argv: vec!["/opt/claude/bin/claude".into()],
@@ -2592,6 +2593,7 @@ fn owed_relaunch(tab: &str) -> aterm_agent::harness::relaunch::Snapshot {
         profile: None,
         tab: tab.to_string(),
         pid: 4242,
+        lifetime: None,
         start: "Sat Sep 27 01:02:03 2026".into(),
         shell: 4343,
         program: std::path::PathBuf::from("/opt/claude/bin/claude"),
@@ -4814,6 +4816,7 @@ fn handed_off_shell(local_id: u64) -> crate::spawn::Adopted {
         task: None,
         autopilot_end: None,
         wakes: None,
+        agent_act: None,
     }
 }
 
@@ -5160,6 +5163,7 @@ impl Successor {
             claude_auth: None,
             word: String::new(),
             pid: 4242,
+            lifetime: None,
             start: "Sat Sep 27 01:02:03 2026".into(),
             program: "/opt/claude/bin/claude".into(),
             argv: vec!["/opt/claude/bin/claude".into()],
@@ -5946,20 +5950,13 @@ fn a_window_past_the_tab_cap_spills_into_another_window_of_the_handoff_layout() 
 }
 
 #[cfg(unix)]
-fn owe_a_proof(app: &mut App, label: &str) -> std::os::fd::OwnedFd {
-    use std::os::fd::FromRawFd as _;
-    let mut fds = [0i32; 2];
-    // SAFETY: pipe(2) into a valid two-slot out-array.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-    // SAFETY: two fresh descriptors, one owner each from here.
-    let (read, write) = unsafe {
-        (
-            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
-            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
-        )
-    };
+fn owe_a_proof(app: &mut App, label: &str) -> std::io::PipeReader {
+    let (read, write) = aterm_uds::pipe().expect("pipe");
     app.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
-        write, label, [0; 32], [0; 32],
+        write.into(),
+        label,
+        [0; 32],
+        [0; 32],
     ));
     read
 }

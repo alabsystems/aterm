@@ -68,17 +68,27 @@ fn end(
     code: Option<i32>,
     (end_ms, read_ms): (u64, u64),
 ) {
+    end_read(tl, hand, order, &finished(1, code, 5, end_ms, "x"), read_ms);
+}
+
+/// Command `r1`'s block's end as `read` holds it, read at `read_ms` in `order`.
+fn end_read(
+    tl: &Mutex<SessionTimeline>,
+    hand: &Hand,
+    order: Order,
+    read: &BlockRead,
+    read_ms: u64,
+) {
     hand.set(read_ms);
-    let read = finished(1, code, 5, end_ms, "x");
     let mut g = tl.lock().unwrap();
     match order {
         Order::DFirst => {
-            let _ = g.sweep_slog(&read, false, 100, 100);
+            let _ = g.sweep_slog(read, false, 100, 100);
         }
         Order::FrontFirst => {
             assert!(g.note_foreground_group(100));
             let now = g.slog().now();
-            g.slog_mut().shell_blocks(&read, None, now);
+            g.slog_mut().shell_blocks(read, None, now);
         }
     }
 }
@@ -496,6 +506,185 @@ fn a_stop_or_a_resume_asks_no_end() {
             "{sig}: {got:?}"
         );
     }
+}
+
+/// 1l. A JOB THE SHELL STOPPED HAS NOT ENDED (review RV2, E2-R1): Ctrl-Z stops `vim` (group 400)
+/// and the shell writes its block's D with 128 plus the stop's signal (146, Darwin's `SIGTSTP`;
+/// 148, Linux's), read in both orders. Its run closes `unknown`, never `gone`, and its command's end
+/// amends nothing; the command closes `unknown`, keeping `code=`, and nothing raises a need. Then
+/// `fg` gives group 400 the front again: a run of `vim` opens under the `fg` command and, once
+/// `vim` quits, takes that command's `ok`. NEGATIVE CONTROL (run): a stop read as an end
+/// (`stopped_status` false) reads the run `gone` and the command `fail`, raising `failure`.
+#[test]
+fn a_stopped_job_has_not_ended_and_its_fg_resumes_it() {
+    for code in [146, 148] {
+        for order in ORDERS {
+            let case = format!("{code} {order:?}");
+            let (tl, hand) = in_front("vim", 400);
+            end(&tl, &hand, order, Some(code), (900, 1_000));
+            let got = lines_of(&tl);
+            assert!(
+                find(&got, &[" close r2 prog out=unknown "]).is_some()
+                    && find(&got, &[" amend r2 "]).is_none(),
+                "{case}: {got:?}"
+            );
+            assert!(
+                find(
+                    &got,
+                    &[" close r1 cmd out=unknown ", &format!(" code={code} ")]
+                )
+                .is_some(),
+                "{case}: {got:?}"
+            );
+            assert!(
+                !any_raises(&tl) && failures(&tl).is_empty(),
+                "{case}: {got:?}"
+            );
+            blocks(&tl, &hand, 1_200, &running(2, 1_100, "fg"));
+            {
+                let mut g = tl.lock().unwrap();
+                hand.set(1_300);
+                assert!(g.note_foreground_group(400));
+                assert!(g.set_program(400, Some("vim".into())));
+            }
+            blocks(&tl, &hand, 1_400, &running(2, 1_100, "fg"));
+            blocks(&tl, &hand, 2_000, &finished(2, Some(0), 1_100, 1_900, "fg"));
+            let got = lines_of(&tl);
+            let resumed = find(&got, &[" open r4 prog par=r3 ", " prog=vim "]);
+            let ended = find(&got, &[" close r4 prog out=ok "]);
+            assert!(
+                resumed.is_some() && resumed < ended && ended.is_some(),
+                "{case}: {got:?}"
+            );
+            assert!(
+                find(&got, &[" close r3 cmd out=ok "]).is_some(),
+                "{case}: {got:?}"
+            );
+        }
+    }
+}
+
+/// 1m. A RUN TAKES ITS LINE'S STATUS ONLY WHERE ITS GROUP RAN THE ELEMENT THAT STATUS DESCRIBES
+/// (review RV2, E2-R2), read in both orders: the shell reports one status for a line, its last
+/// top-level element's. Under `claude; echo done` (two elements, the detail `echo` read from the
+/// last) and `claude || true` (two, the detail `claude` read from the first), a SIGKILLed agent's
+/// line ends 0, and its run keeps `unknown` (`close … out=unknown src=status conf=strong`, as before
+/// E2), with no amend; under `cd proj && claude` (two, the detail `claude` read from the last) the
+/// agent ran the element its status describes and takes it, `ok`, as `make` does under `cd proj &&
+/// make install`. A run is known by its program's name, so the name must be the last element's
+/// alone (review RV2 lander): under `vim notes; ll` (`ll` an alias no file names) the detail is the
+/// stand-in `vim`, the first program the line's jobs ran, not the last element's own
+/// (`detail_final` false), and under `make; make install` an earlier element ran the same program
+/// (the shape shared), so vim's and make's runs keep `unknown`. Each shape is the one the detail's
+/// own parser reads off the line ([`crate::session_status::line_shape`]). NEGATIVE CONTROLS (run,
+/// one build): every run taking its line's status (`StatusOf::describes` true) reads the first two
+/// rows `ok`; a stand-in detail read as the last element's fails the `vim` row, and the shape's
+/// `shared` unread fails the `make; make install` row.
+#[test]
+fn a_run_takes_its_lines_status_only_where_its_group_ran_the_element_it_describes() {
+    use crate::session_status::LineShape;
+    let shape = |read, shared| LineShape {
+        elements: 2,
+        read,
+        shared,
+    };
+    let mut bad = Vec::new();
+    for (line, front, detail, own, shape, out) in [
+        (
+            "claude; echo done",
+            "claude",
+            "echo",
+            true,
+            shape(2, false),
+            "unknown",
+        ),
+        (
+            "claude || true",
+            "claude",
+            "claude",
+            true,
+            shape(1, false),
+            "unknown",
+        ),
+        (
+            "cd proj && claude",
+            "claude",
+            "claude",
+            true,
+            shape(2, false),
+            "ok",
+        ),
+        (
+            "cd proj && make install",
+            "make",
+            "make install",
+            true,
+            shape(2, false),
+            "ok",
+        ),
+        (
+            "vim notes; ll",
+            "vim",
+            "vim",
+            false,
+            shape(2, false),
+            "unknown",
+        ),
+        (
+            "make; make install",
+            "make",
+            "make install",
+            true,
+            shape(2, true),
+            "unknown",
+        ),
+    ] {
+        let kind = if front == "claude" { "agent" } else { "prog" };
+        for order in ORDERS {
+            let case = format!("{line} {order:?}");
+            let (tl, hand) = in_front(front, 300);
+            let mut read = finished(1, Some(0), 5, 900, detail);
+            read.facts[0].shape = shape;
+            read.facts[0].detail_final = own;
+            end_read(&tl, &hand, order, &read, 1_000);
+            let got = lines_of(&tl);
+            let cmd = find(&got, &[" close r1 cmd out=ok ", " code=0 "]);
+            let amend = find(&got, &[" amend r2 "]);
+            let held = match (order, out) {
+                (Order::DFirst, _) => {
+                    let run = find(&got, &[&format!(" close r2 {kind} out={out} ")]);
+                    run.is_some() && run < cmd && amend.is_none()
+                }
+                (Order::FrontFirst, "unknown") => {
+                    let run = find(
+                        &got,
+                        &[
+                            &format!(" close r2 {kind} out=unknown "),
+                            " src=status conf=strong ",
+                        ],
+                    );
+                    run.is_some() && amend.is_none() && cmd.is_some()
+                }
+                (Order::FrontFirst, _) => {
+                    let ok = find(
+                        &got,
+                        &[&format!(" amend r2 {kind} out=ok src=shell conf=strong ")],
+                    );
+                    ok.is_some() && ok < cmd
+                }
+            };
+            if !held || !failures(&tl).is_empty() {
+                bad.push(format!("{case}: want {out}: {got:?}"));
+            }
+        }
+        let parsed = crate::session_status::line_shape(line);
+        if parsed != shape {
+            bad.push(format!(
+                "{line:?}: the parser reads {parsed:?}, not {shape:?}"
+            ));
+        }
+    }
+    assert!(bad.is_empty(), "{bad:#?}");
 }
 
 /// 1i. A COMMAND THE SWEEP HAD YET TO SEE: the asked group led the terminal at the ask, so while

@@ -79,12 +79,22 @@ fn hosted(max_s: u64) -> SuperviseOpts {
 }
 
 fn ended(said: &str) -> Vec<String> {
-    let mut r = rows(&[
-        &format!("⏺ {said}"),
-        "",
-        "✻ Worked for 12m 2s · done 4:24 PM",
-        "",
+    let mut lines: Vec<String> = said
+        .lines()
+        .enumerate()
+        .map(|(i, l)| match (i, l.is_empty()) {
+            (0, _) => format!("⏺ {l}"),
+            (_, true) => String::new(),
+            _ => format!("  {l}"),
+        })
+        .collect();
+    lines.extend([
+        String::new(),
+        "✻ Worked for 12m 2s · done 4:24 PM".to_string(),
+        String::new(),
     ]);
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let mut r = rows(&refs);
     r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
     r
 }
@@ -199,9 +209,11 @@ fn a_done_report_is_checked_and_a_done_reply_is_checked_again() {
     compacted.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
     let mut m = Mock::new(vec![
         busy_screen(),
-        ended("Fixed the parser; all done."),
+        ended("Fixed the parser; all done.\n\nATERM-TASK-DONE"),
         busy_screen(),
-        ended("The task is complete. The parser fix is committed and all tests passed."),
+        ended(
+            "The task is complete. The parser fix is committed and all tests passed.\n\nATERM-TASK-DONE",
+        ),
         busy_screen(),
         compacted,
     ]);
@@ -253,7 +265,7 @@ fn a_done_report_is_checked_and_a_done_reply_is_checked_again() {
 
 #[test]
 fn a_check_answered_faster_than_any_read_is_judged_at_its_answer() {
-    const IDLE: &str = "Both branches have landed and no lander is running.";
+    const IDLE: &str = "Both branches have landed and no lander is running.\n\nATERM-TASK-DONE";
     let screen = |more: &[&str]| {
         let mut r = rows(&[
             "❯ land the two branches",
@@ -369,7 +381,7 @@ impl IdleHost for TypedRecordHost {
 
 #[test]
 fn the_record_tells_a_check_answered_faster_than_any_read() {
-    const IDLE: &str = "Both branches have landed and no lander is running.";
+    const IDLE: &str = "Both branches have landed and no lander is running.\n\nATERM-TASK-DONE";
     let screen = |more: &[&str]| {
         let mut r = rows(&[
             "❯ land the two branches",
@@ -5964,8 +5976,10 @@ fn a_held_box_is_answered_once_the_persons_grace_has_passed() {
         },
         ..auto(budget)
     };
+    // A box nobody touched is held only until the person's keys settle (`PERSON_SETTLE`): their
+    // last key 2 s before the first look leaves half a second of it.
     let mut m = fenced(vec![bash_box(&["⏺ Cleaning."], "rm -rf build")]);
-    m.human_ms_reads = VecDeque::from([Some(500)]);
+    m.human_ms_reads = VecDeque::from([Some(2_000)]);
     m.stall_sleep = Some(Duration::from_millis(300));
     m.vanish_after = Some(4);
     let (lines, _) = watch_lines(&mut m, &opts(10));
@@ -14108,7 +14122,9 @@ fn a_claim_over_uncommitted_work_gets_the_repo_suffix_through_the_loop() {
         r.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
         r
     };
-    let claim = report(&["Built, tested and landed the parser. All done; nothing left to do."]);
+    let claim = report(&[
+        "Built, tested and landed the parser. All done; nothing left to do.\n\nATERM-TASK-DONE",
+    ]);
     let dirty = RepoWork {
         repo: "/Users//a/Developer/parser".to_string(),
         changed: 1,
@@ -14357,6 +14373,8 @@ impl IdleHost for ReadingHost {
 fn claim_over_work() -> (Vec<Vec<String>>, RepoWork) {
     let mut claim = rows(&[
         "⏺ Built, tested and landed the parser. All done; nothing left to do.",
+        "",
+        "  ATERM-TASK-DONE",
         "",
         "✻ Worked for 12m 2s · done 4:24 PM",
         "",
@@ -15540,6 +15558,9 @@ struct AccountHost {
     relaunch_owed: std::sync::atomic::AtomicBool,
     relaunch_owed_asked: std::sync::atomic::AtomicUsize,
     upgrade_due: std::sync::atomic::AtomicBool,
+    /// [`IdleHost::upgrade_wall_due`]: the upgrade's last look found its move held by the loop's
+    /// wall guard alone, as a test sets it.
+    upgrade_wall_due: std::sync::atomic::AtomicBool,
     limit_until: std::sync::Mutex<Option<u64>>,
     /// The host wants every idle point and break offered ([`IdleHost::wants`]), and keeps each
     /// offered, in order, with where: `idle` ([`IdleHost::at_idle_on`]) or `break`
@@ -15846,6 +15867,9 @@ impl IdleHost for AccountHost {
     }
     fn upgrade_due(&self) -> bool {
         self.upgrade_due.load(Ordering::SeqCst)
+    }
+    fn upgrade_wall_due(&self) -> bool {
+        self.upgrade_wall_due.load(Ordering::SeqCst)
     }
     fn limit_until(&self) -> Option<u64> {
         *self.limit_until.lock().unwrap()
@@ -22216,7 +22240,8 @@ fn an_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
     use aterm_phase::prompt::fixtures as fx;
     const RESET: i64 = TEST_NOW + 6 * 3600 + 40 * 60;
     let now = RESET + 20 * 60;
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let opts = SuperviseOpts {
         policy: owners_policy(),
         ..auto(30)
@@ -22489,7 +22514,8 @@ fn a_done_check_at_an_ordinary_turn_end_is_no_limits_try_whatever_was_seeded() {
     };
     use crate::supervise::policy::turn_end::{LimitTry, decide_turn_end};
     let now = TEST_NOW + 6 * 3600;
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let opts = SuperviseOpts {
         policy: owners_policy(),
         ..auto(30)
@@ -22618,7 +22644,8 @@ fn a_land_act_in_a_limits_place_is_the_try_a_successor_backs_off_from() {
     use aterm_phase::prompt::fixtures as fx;
     const RESET: i64 = TEST_NOW + 6 * 3600 + 40 * 60;
     let now = RESET + 20 * 60;
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let force = "Shall I force-push the rewritten history over main?";
     let opts = |mode: Autopilot| SuperviseOpts {
         policy: SupervisorConfig {
@@ -24153,7 +24180,8 @@ fn a_limits_try_at_a_bucket_is_the_try_a_successor_backs_off_from() {
         policy: owners_policy(),
         ..auto(30)
     };
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let armed = fx::screen(fx::WALL_SONNET_BUCKET_AUTO_CONTINUE_ARMED_2_1_300);
     let wall = aterm_phase::read(Some("claude"), &armed, Some(2))
         .wall
@@ -24980,6 +25008,230 @@ fn a_claimed_probe_types_usage_samples_the_settled_panel_and_closes_it() {
         "{with_host:#?}"
     );
     assert_eq!(with_host, run(None, "probe-no-host"));
+}
+
+/// THE LEDGER AN EARLIER LOOP LEFT AT `ledger`: its move onto Opus, from Fable, at a notice that
+/// named no reset (`back_at_unix` `None`) or one that did, and a turn asked on it since.
+fn seed_awaiting_switch(ledger: &Path, back_at_unix: Option<i64>) {
+    use crate::supervise::approvals::{Outcome, Row, model_switch_reason};
+    use crate::supervise::policy::turn_end::{FABLE_FALLBACK, RULE_CONTINUE, RULE_MODEL_FALLBACK};
+    let now = PROBE_NOW * 1000;
+    let reason = model_switch_reason(Some("fable"), None, back_at_unix, PROBE_NOW - 31 * 60);
+    let command = format!("relaunch --model {FABLE_FALLBACK}");
+    let rows = [
+        Row {
+            rule_id: RULE_MODEL_FALLBACK,
+            outcome: Outcome::Typed,
+            command: &command,
+            reason: &reason,
+            box_seq: 90,
+        }
+        .to_json(now - 30 * 60_000, None),
+        Row {
+            rule_id: RULE_CONTINUE,
+            outcome: Outcome::Typed,
+            command: "keep going",
+            reason: "the turn-end policy",
+            box_seq: 91,
+        }
+        .to_json(now - 29 * 60_000, None),
+    ];
+    std::fs::write(ledger, rows.join("\n") + "\n").expect("the ledger");
+}
+
+/// [`panel_fx::USAGE_SETTLED`] with its `Current week (Fable)` row at its limit, its reset kept
+/// (Oct 8 at 9am, Pacific: `PROBE_NOW + 560_400`).
+fn usage_fable_spent() -> String {
+    let room = format!("{}0% used", " ".repeat(54));
+    assert_eq!(
+        panel_fx::USAGE_SETTLED.matches(&room).count(),
+        1,
+        "the Fable row"
+    );
+    panel_fx::USAGE_SETTLED.replace(&room, &format!("{}100% used", " ".repeat(52)))
+}
+
+/// A SWITCH ONTO OPUS THAT NO READING HAS TIMED IS SAMPLED BY THE PROBE'S OWN `/usage` AT A QUIET
+/// TURN END, with no account advising a probe and none claimed: a `Current week (Fable)` row with
+/// room left makes the return due at once, and the same point asks it (`restart:model-back`); the
+/// sample and what it scheduled are a journal record. A row at its limit times the return at the
+/// reset it names, and nothing returns now. NEGATIVE CONTROL: a switch the notice timed is never
+/// sampled (no `/usage` is typed).
+#[test]
+fn a_switch_no_reading_timed_is_sampled_by_usage_and_its_fable_row_times_the_return() {
+    let run = |tag: &str, frame: &str, back_at_unix: Option<i64>| {
+        let (dir, ledger) = ledger_at(tag);
+        seed_awaiting_switch(&ledger, back_at_unix);
+        let host = ProbeHost::scripted(&[None], &[]);
+        let mut m = probe_world(&[frame], &host);
+        let (lines, journal) = probe_run(
+            &format!("te-{tag}"),
+            &mut m,
+            &host,
+            &ledger,
+            probe_policy(120),
+            |_| {},
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        (m.writes(), lines, journal, host.said(""))
+    };
+
+    let (writes, lines, journal, said) = run("fable-room", panel_fx::USAGE_SETTLED, None);
+    assert_eq!(writes[..3], ["text:/usage", "enter", "esc"], "{writes:?}");
+    assert!(
+        !said
+            .iter()
+            .any(|w| w.starts_with("probe:") || w.starts_with("probed:")),
+        "no claim taken and no read told: {said:?}"
+    );
+    assert!(
+        said.iter().any(|w| w == "restart:model-back"),
+        "the return asked at the point the sample made it due: {said:?}"
+    );
+    assert!(
+        journal.iter().any(|l| l.starts_with("NOTE seq=")
+            && l.contains(" rule=model-restore@v1 /usage Current week (Fable) 0% used, resets ")
+            && l.ends_with(
+                "; room left: the return to the launch's model is due at the next quiet moment"
+            )),
+        "{journal:#?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.starts_with("PROBED seq=")),
+        "the sample is the probe's own read: {lines:#?}"
+    );
+
+    let spent = usage_fable_spent();
+    let (writes, _, journal, said) = run("fable-spent", &spent, None);
+    assert_eq!(writes[..3], ["text:/usage", "enter", "esc"], "{writes:?}");
+    assert!(!said.iter().any(|w| w == "restart:model-back"), "{said:?}");
+    let note = journal
+        .iter()
+        .find(|l| l.contains(" rule=model-restore@v1 /usage "))
+        .unwrap_or_else(|| panic!("the sample's record: {journal:#?}"));
+    assert!(
+        note.contains("Current week (Fable) 100% used, resets ")
+            && note.contains("; at its limit: the return is due at its reset, "),
+        "{note}"
+    );
+
+    let (writes, _, journal, said) = run(
+        "fable-timed",
+        panel_fx::USAGE_SETTLED,
+        Some(PROBE_NOW + 3600),
+    );
+    assert!(!writes.iter().any(|w| w == "text:/usage"), "{writes:?}");
+    assert!(!said.iter().any(|w| w == "restart:model-back"), "{said:?}");
+    assert!(
+        !journal.iter().any(|l| l.contains("rule=model-restore@v1")),
+        "{journal:#?}"
+    );
+}
+
+/// A SAMPLE WHOSE `/usage` WAS ENTERED BUT WHOSE PANEL WAS NEVER READ IS STILL A SAMPLE: it is told
+/// the switch as one that read no `Current week (Fable)` row, journaled with the rung the next
+/// waits for, and the next turn end, inside that rung, types no second `/usage`. NEGATIVE
+/// CONTROL: the switch never told of it would sample at every turn end.
+#[test]
+fn a_sample_whose_panel_was_never_read_waits_its_rung_before_the_next() {
+    let (dir, ledger) = ledger_at("fable-unread");
+    seed_awaiting_switch(&ledger, None);
+    let host = ProbeHost::scripted(&[None], &[]);
+    let mut m = probe_mock(
+        vec![busy_screen(), ended(PROBE_SAID)],
+        &[panel_fx::USAGE_REFRESHING],
+        &host,
+    );
+    world(&mut m).then.push_back(vec![
+        busy_screen(),
+        ended("Stage 4 done; the suite is green."),
+    ]);
+    world(&mut m)
+        .then
+        .push_back(vec![busy_screen(), ended(STOP)]);
+    let (lines, journal) = probe_run(
+        "te-fable-unread",
+        &mut m,
+        &host,
+        &ledger,
+        probe_policy(120),
+        |s| {
+            let ms = Duration::from_millis;
+            s.set_probe_waits(ms(60), ms(200), ms(10), ms(100));
+        },
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let writes = m.writes();
+    assert_eq!(writes[..3], ["text:/usage", "enter", "esc"], "{lines:#?}");
+    assert_eq!(
+        writes.iter().filter(|w| *w == "text:/usage").count(),
+        1,
+        "one sample inside its rung: {writes:?}"
+    );
+    let notes: Vec<_> = journal
+        .iter()
+        .filter(|l| l.contains(" rule=model-restore@v1 /usage "))
+        .collect();
+    assert_eq!(notes.len(), 1, "{journal:#?}");
+    assert!(
+        notes[0].contains(
+            "/usage no Current week (Fable) row read; no return named: sampled again at "
+        ),
+        "{}",
+        notes[0]
+    );
+    assert!(
+        !host.said("").iter().any(|w| w == "restart:model-back"),
+        "nothing read, nothing returns"
+    );
+}
+
+/// UNDER CLAUDE CODE'S INLINE RENDERER NO SAMPLE IS TAKEN, BY DECISION: the probe's `/usage` runs
+/// only on the alternate screen (`docs/SPEC-claude-accounts-probe-2026-10-01.md` P9; the inline
+/// probe is P24's, not built), as the inline panel leaves its rows in the conversation's
+/// transcript. A switch no reading timed then waits on the account's record of Fable's week
+/// alone: the loop says once why the sample was not run (`gate=not-fullscreen`), types nothing
+/// and returns nothing. CONTROL: the same switch under the fullscreen renderer is sampled.
+#[test]
+fn a_switch_under_the_inline_renderer_is_not_sampled_and_says_why() {
+    let run = |tag: &str, alt: bool| {
+        let (dir, ledger) = ledger_at(tag);
+        seed_awaiting_switch(&ledger, None);
+        let host = ProbeHost::scripted(&[None], &[]);
+        let mut m = probe_world(&[panel_fx::USAGE_SETTLED], &host);
+        m.alt_screen = Some(alt);
+        let (lines, journal) = probe_run(
+            &format!("te-{tag}"),
+            &mut m,
+            &host,
+            &ledger,
+            probe_policy(120),
+            |_| {},
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        (m.writes(), lines, journal, host.said(""))
+    };
+    let (writes, lines, journal, said) = run("fable-inline", false);
+    assert!(!writes.iter().any(|w| w == "text:/usage"), "{writes:?}");
+    assert!(!said.iter().any(|w| w == "restart:model-back"), "{said:?}");
+    assert!(
+        lines.iter().any(|l| l.starts_with("SKIPPED ")
+            && l.ends_with(" rule=usage-probe@v1 gate=not-fullscreen")),
+        "{lines:#?}"
+    );
+    assert!(
+        !journal
+            .iter()
+            .any(|l| l.contains(" rule=model-restore@v1 /usage ")),
+        "{journal:#?}"
+    );
+    let (writes, _, _, said) = run("fable-fullscreen", true);
+    assert_eq!(
+        writes[..3],
+        ["text:/usage", "enter", "esc"],
+        "CONTROL: {writes:?}"
+    );
+    assert!(said.iter().any(|w| w == "restart:model-back"), "{said:?}");
 }
 
 #[test]
@@ -27146,7 +27398,7 @@ fn a_defense_taller_than_the_screen_is_read_whole_before_it_lands() {
     let tall = |need: bool| -> (Vec<String>, Vec<String>, String) {
         let mut said = vec!["Merged the parser, the lexer and their suites.".to_string()];
         if need {
-            said.push("NEEDS YOU: the signing credential".to_string());
+            said.push("NEEDS YOU: the signing permission".to_string());
         }
         said.extend((0..45).map(|i| format!("- merged item {i} into the remote main branch")));
         said.push(String::new());
@@ -27176,7 +27428,7 @@ fn a_defense_taller_than_the_screen_is_read_whole_before_it_lands() {
         let transcript = transcript_of(&landing_rows(&text));
         let host = TaskHost::reading(&root.join(format!("{tag}.jsonl")), &[&transcript]);
         let answer = if need {
-            check_answer("claude", "NEEDS YOU: the signing credential")
+            check_answer("claude", "NEEDS YOU: the signing permission")
         } else {
             check_answer("claude", CHECK_LANDED)
         };
@@ -27244,7 +27496,7 @@ fn tall_on(
 fn tall_said(need: bool) -> Vec<String> {
     let mut said = vec!["Merged the parser, the lexer and their suites.".to_string()];
     if need {
-        said.push("NEEDS YOU: the signing credential".to_string());
+        said.push("NEEDS YOU: the signing permission".to_string());
     }
     said.extend((0..55).map(|i| format!("- merged item {i} into the remote main branch")));
     said.push(String::new());
@@ -27305,14 +27557,14 @@ fn tall_landing(
 }
 
 /// The need's answer to the check: Land rests on it.
-const NEED_ONLY: &str = "NEEDS YOU: the signing credential";
+const NEED_ONLY: &str = "NEEDS YOU: the signing permission";
 
 /// Whether the loop rested on the need, quietly (`waits only on you`).
 fn rested(lines: &[String]) -> bool {
     lines.iter().any(|l| {
         l.starts_with("WAITING ")
             && l.contains(crate::supervise::policy::land_check::WAITS_ON_YOU)
-            && l.contains("the signing credential")
+            && l.contains("the signing permission")
     })
 }
 
@@ -27482,7 +27734,7 @@ fn a_tall_land_report_on_every_harness_is_read_whole_before_it_lands() {
             needs
                 .first()
                 .is_some_and(|c| c.starts_with("set attention owner=needs ")
-                    && c.contains("the signing credential")),
+                    && c.contains("the signing permission")),
             "{program}: the need raised: {needs:#?}\n{lines:#?}"
         );
         let answer = check_answer(program, CHECK_LANDED);
@@ -27509,7 +27761,7 @@ fn a_need_said_earlier_in_a_turn_above_the_screen_is_read_before_it_lands() {
             "⏺ Merged the lexer and its suites.".to_string(),
         ];
         if need {
-            drawn.push("  NEEDS YOU: the signing credential".to_string());
+            drawn.push("  NEEDS YOU: the signing permission".to_string());
         }
         for call in 0..calls {
             drawn.extend([
@@ -27557,7 +27809,7 @@ fn a_need_said_earlier_in_a_turn_above_the_screen_is_read_before_it_lands() {
         needs
             .first()
             .is_some_and(|c| c.starts_with("set attention owner=needs ")
-                && c.contains("the signing credential")),
+                && c.contains("the signing permission")),
         "the need raised: {needs:#?}\n{lines:#?}"
     );
     let (lines, needs, checks) = tall_landing(
@@ -27599,7 +27851,7 @@ fn a_need_said_before_a_tool_call_on_every_harness_is_read_before_it_lands() {
     let before = |need: bool, head: &str| -> Vec<String> {
         if need {
             vec![
-                format!("{head}NEEDS YOU: the signing credential"),
+                format!("{head}NEEDS YOU: the signing permission"),
                 "  I will push the branch now.".to_string(),
             ]
         } else {
@@ -27730,7 +27982,7 @@ fn a_need_said_before_a_tool_call_on_every_harness_is_read_before_it_lands() {
                 needs
                     .first()
                     .is_some_and(|c| c.starts_with("set attention owner=needs ")
-                        && c.contains("the signing credential")),
+                        && c.contains("the signing permission")),
                 "{program} {at}: the need raised: {needs:#?}\n{lines:#?}"
             );
             let answer = check_answer(program, CHECK_LANDED);
@@ -29524,12 +29776,19 @@ fn a_workers_done_check_goes_without_the_back_off() {
     let root = crate::supervise::ScratchDir::new("task", "backoff");
     let text = transcript_of(&[
         task_row("user", "u-task", "", "Fix the parser."),
-        task_row("assistant", "a-1", "msg_1", "Fixed the parser; all done."),
+        task_row(
+            "assistant",
+            "a-1",
+            "msg_1",
+            "Fixed the parser; all done.\n\nATERM-TASK-DONE",
+        ),
     ]);
     let run = |task: Option<(u64, String)>| {
         let host = TaskHost::reading(&root.join("t.jsonl"), &[&text]);
         let journal = root.join(format!("journal-{}.jsonl", task.is_some()));
-        let mut m = Mock::new(vec![ended("Fixed the parser; all done.")]);
+        let mut m = Mock::new(vec![ended(
+            "Fixed the parser; all done.\n\nATERM-TASK-DONE",
+        )]);
         m.exit_when = Some(|m| m.turns > 0 || m.stalls >= 3);
         m.vanish_after = Some(3);
         m.task = task;
@@ -31297,7 +31556,7 @@ fn a_need_said_early_in_a_tall_turn_that_claims_no_done_is_raised() {
             "❯ Fix the parser and land it.".to_string(),
             String::new(),
             "⏺ Merged the lexer and its suites.".to_string(),
-            "  NEEDS YOU: the signing credential".to_string(),
+            "  NEEDS YOU: the signing permission".to_string(),
         ];
         for call in 0..calls {
             drawn.extend([
@@ -31320,7 +31579,7 @@ fn a_need_said_early_in_a_tall_turn_that_claims_no_done_is_raised() {
         let mut drawn: Vec<String> = vec![
             "❯ Fix the parser.".to_string(),
             String::new(),
-            "⏺ NEEDS YOU: the signing credential".to_string(),
+            "⏺ NEEDS YOU: the signing permission".to_string(),
         ];
         for i in 0..lines {
             drawn.push(format!("  - merged branch {i:02} and ran its suite"));
@@ -31339,7 +31598,7 @@ fn a_need_said_early_in_a_tall_turn_that_claims_no_done_is_raised() {
             .position(|r| r.starts_with("◆ Hi!"))
             .expect("the reply");
         let mut drawn = end[..at].to_vec();
-        drawn.push("◆ NEEDS YOU: the signing credential".to_string());
+        drawn.push("◆ NEEDS YOU: the signing permission".to_string());
         drawn.push("  I will push the branch now.".to_string());
         drawn.push(String::new());
         for call in 0..(if tall { 60 } else { 1 }) {
@@ -31387,7 +31646,7 @@ fn a_need_said_early_in_a_tall_turn_that_claims_no_done_is_raised() {
         });
         let _ = std::fs::remove_dir_all(&dir);
         let raised = m.needs_calls.iter().any(|c| {
-            c.starts_with("set attention owner=needs ") && c.contains("the signing credential")
+            c.starts_with("set attention owner=needs ") && c.contains("the signing permission")
         });
         let before: Vec<&String> = lines
             .iter()
@@ -33888,6 +34147,8 @@ fn an_act_typed_spends_the_hosts_repository_and_left_reads() {
     let mut said = rows(&[
         "⏺ Built, tested and landed the parser. All done; nothing left to do.",
         "",
+        "  ATERM-TASK-DONE",
+        "",
     ]);
     said.extend(composer("  ⏵⏵ bypass permissions on (shift+tab to cycle)"));
     let mut m = Mock::new(vec![said; 6]);
@@ -33925,7 +34186,7 @@ fn an_act_typed_spends_the_hosts_repository_and_left_reads() {
 /// point, whose peek reads Down again, and leave no break of the turn they open held on it. The
 /// control: a restart the host waits on leaves the point standing, still held on its read.
 /// NEGATIVE CONTROLS (run): with the restart arm's `self.reach_seen = None` removed, "the restart
-/// spent the point's Down" fails; with `confirm_dialog`'s removed, "the key spent the point's
+/// spent the point's Down" fails; with `confirm_dialog`'s removed, "the nod spent the point's
 /// Down" fails; with the read cleared by every reread (`turn_end_reread`) instead, "a restart
 /// waited on leaves the point's Down standing" fails.
 #[test]
@@ -33999,7 +34260,7 @@ fn a_restart_made_or_a_dialog_key_pressed_at_a_down_point_leaves_no_reach_hold()
             .any(|l| l.starts_with("TYPED ") && l.contains(" rule=login-done@v1 enter at ")),
         "{said:#?}"
     );
-    assert!(!held, "the key spent the point's Down: {said:#?}");
+    assert!(!held, "the nod spent the point's Down: {said:#?}");
     let (held, said) = after(ended, restart, Some("wait"));
     assert!(
         !said.iter().any(|l| l.starts_with("RESTARTED ")),
@@ -34176,4 +34437,197 @@ pub(super) fn observe_stop_phrase() -> &'static [&'static str] {
     m.vanish_after = Some(2);
     let _ = watch_lines(&mut m, &hosted(30));
     &[]
+}
+
+/// A LOGIN WALL THE UPGRADE'S BOUND OUTLASTED IS PASSED FOR ITS STEP ALONE: where the host says its
+/// upgrade waits only on the loop's wall guard ([`IdleHost::upgrade_wall_due`]), the point at
+/// Claude Code's login wall is offered, marked walled ([`IdlePoint::walled`]). NEGATIVE CONTROLS:
+/// with the door shut the wall withholds the point, and a wall that is no login wall (an API
+/// error) is withheld whatever the door says. A usage limit's episode still open changes
+/// neither: the login wall's point is offered with the door open and withheld with it shut.
+#[test]
+fn a_login_wall_past_the_upgrades_bound_is_offered_to_the_upgrade_alone() {
+    use aterm_phase::prompt::fixtures::{API_ERROR_529, LOGIN_EXPIRED, screen};
+    let offered = |door: bool, rows: Vec<String>| {
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        host.asks_points.store(true, Ordering::SeqCst);
+        host.upgrade_wall_due.store(door, Ordering::SeqCst);
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![rows.clone()]);
+        let mut s = session(&mut m, Some("@s-walled".to_string()));
+        let mut point = account_point_of(rows.clone(), Phase::Idle);
+        point.screen.cursor_row = rows
+            .iter()
+            .rposition(|r| r.starts_with('❯'))
+            .expect("caret");
+        let stepped = s
+            .host_steps_here(&point, &opts, &mut false, &mut Alone)
+            .expect("the host's step");
+        let points: Vec<bool> = host
+            .points
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, p)| p.walled)
+            .collect();
+        (stepped, points, s.withheld)
+    };
+    let (stepped, points, withheld) = offered(true, screen(LOGIN_EXPIRED));
+    assert!(stepped, "offered: {withheld:?}");
+    assert_eq!(points, [true], "marked walled");
+    let (stepped, points, withheld) = offered(false, screen(LOGIN_EXPIRED));
+    assert!(!stepped && points.is_empty(), "{points:?}");
+    assert_eq!(withheld, Some(Guard::Wall));
+    let (stepped, points, withheld) = offered(true, screen(API_ERROR_529));
+    assert!(!stepped && points.is_empty(), "{points:?} {withheld:?}");
+    // A limit's episode still open does not hold the login wall's point from the upgrade.
+    let in_episode = |door: bool| {
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        host.asks_points.store(true, Ordering::SeqCst);
+        host.upgrade_wall_due.store(door, Ordering::SeqCst);
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![limited_screen()]);
+        let (mut s, wall) = account_session(&mut m);
+        let mut deadline = Instant::now() + Duration::from_secs(3600);
+        s.limit_after(&wall, &mut deadline, true, &mut Alone)
+            .expect("the episode opens");
+        assert!(s.limit.is_some(), "the episode is open");
+        let rows = screen(LOGIN_EXPIRED);
+        let mut point = account_point_of(rows.clone(), Phase::Idle);
+        point.screen.cursor_row = rows
+            .iter()
+            .rposition(|r| r.starts_with('❯'))
+            .expect("caret");
+        let stepped = s
+            .host_steps_here(&point, &opts, &mut false, &mut Alone)
+            .expect("the host's step");
+        let points: Vec<bool> = host
+            .points
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, p)| p.walled)
+            .collect();
+        (stepped, points, s.withheld)
+    };
+    let (stepped, points, withheld) = in_episode(true);
+    assert!(stepped, "offered in the episode: {withheld:?}");
+    assert_eq!(points, [true], "marked walled");
+    let (stepped, points, withheld) = in_episode(false);
+    assert!(!stepped && points.is_empty(), "{points:?}");
+    assert_eq!(withheld, Some(Guard::Wall));
+}
+
+/// A USAGE LIMIT THE UPGRADE'S BOUND OUTLASTED IS PASSED FOR ITS STEP ALONE: where the host says
+/// its upgrade waits only on the loop's guard at a wall ([`IdleHost::upgrade_wall_due`]), the
+/// point at Claude Code's limit notice (with the limit's episode open or not, no reset passed) and
+/// one where only the transcript shows the limit are each offered, marked walled
+/// ([`IdlePoint::walled`]). NEGATIVE CONTROLS: with the door shut each withholds the point, a
+/// limit past its reset is the carry's own point, offered unwalled, and an open episode at another
+/// wall (an API error) is that wall's, withheld whatever the door says.
+#[test]
+fn a_usage_limit_past_the_upgrades_bound_is_offered_to_the_upgrade_alone() {
+    let walled = |host: &AccountHost| -> Vec<bool> {
+        host.points
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, p)| p.walled)
+            .collect()
+    };
+    let at_notice = |door: bool, episode: bool, limit_until: Option<u64>| {
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        host.asks_points.store(true, Ordering::SeqCst);
+        host.upgrade_wall_due.store(door, Ordering::SeqCst);
+        *host.limit_until.lock().unwrap() = limit_until;
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![limited_screen()]);
+        let (mut s, wall) = account_session(&mut m);
+        if episode {
+            let mut deadline = Instant::now() + Duration::from_secs(3600);
+            s.limit_after(&wall, &mut deadline, true, &mut Alone)
+                .expect("the episode opens");
+            assert!(s.limit.is_some(), "the episode is open");
+        }
+        let stepped = s
+            .host_steps_here(&wall, &opts, &mut false, &mut Alone)
+            .expect("the host's step");
+        (stepped, walled(&host), s.withheld)
+    };
+    for episode in [false, true] {
+        let (stepped, points, withheld) = at_notice(true, episode, None);
+        assert!(stepped, "episode={episode}: offered: {withheld:?}");
+        assert_eq!(points, [true], "episode={episode}: marked walled");
+        let (stepped, points, withheld) = at_notice(false, episode, None);
+        assert!(
+            !stepped && points.is_empty() && withheld.is_some(),
+            "episode={episode}: {points:?} {withheld:?}"
+        );
+    }
+    let now = u64::try_from(ACCOUNT_NOW).expect("now");
+    let past = now - crate::harness::upgrade_drive::LIMIT_GRACE_S - 60;
+    let (stepped, points, withheld) = at_notice(true, false, Some(past));
+    assert!(stepped, "{withheld:?}");
+    assert_eq!(points, [false], "a limit past its reset is the carry's");
+
+    let at_other_wall = {
+        use aterm_phase::prompt::fixtures::{API_ERROR_529, screen};
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        host.asks_points.store(true, Ordering::SeqCst);
+        host.upgrade_wall_due.store(true, Ordering::SeqCst);
+        let opts = account_opts(&host);
+        let mut m = Mock::new(vec![limited_screen()]);
+        let (mut s, wall) = account_session(&mut m);
+        let mut deadline = Instant::now() + Duration::from_secs(3600);
+        s.limit_after(&wall, &mut deadline, true, &mut Alone)
+            .expect("the episode opens");
+        assert!(s.limit.is_some(), "the episode is open");
+        let rows = screen(API_ERROR_529);
+        let mut point = account_point_of(rows.clone(), Phase::Idle);
+        point.screen.cursor_row = rows
+            .iter()
+            .rposition(|r| r.starts_with('❯'))
+            .expect("caret");
+        let stepped = s
+            .host_steps_here(&point, &opts, &mut false, &mut Alone)
+            .expect("the host's step");
+        (stepped, walled(&host), s.withheld)
+    };
+    let (stepped, points, withheld) = at_other_wall;
+    assert!(!stepped && points.is_empty(), "{points:?} {withheld:?}");
+    assert_eq!(withheld, Some(Guard::Wall), "the API error's wall holds");
+
+    let standing = |door: bool| {
+        let host = AccountHost::scripted(&[None], &["adopted"]);
+        host.asks_points.store(true, Ordering::SeqCst);
+        host.upgrade_wall_due.store(door, Ordering::SeqCst);
+        *host.standing.lock().unwrap() = Some(crate::harness::upgrade::StandingLimit {
+            text: "API Error: Rate limit reached for requests".to_string(),
+            until: None,
+            window: None,
+            at: Some(now - 7_200),
+            row: Some("row-429".to_string()),
+        });
+        let opts = account_opts(&host);
+        let rows = idle_screen();
+        let mut m = Mock::new(vec![rows.clone()]);
+        let mut s = session(&mut m, Some("@s-standing".to_string()));
+        s.set_clock(ACCOUNT_NOW, PDT);
+        s.set_zone_lookup(test_zones);
+        let mut point = account_point_of(rows.clone(), Phase::Idle);
+        point.screen.cursor_row = rows
+            .iter()
+            .rposition(|r| r.starts_with('❯'))
+            .expect("caret");
+        let stepped = s
+            .host_steps_here(&point, &opts, &mut false, &mut Alone)
+            .expect("the host's step");
+        (stepped, walled(&host), s.withheld)
+    };
+    let (stepped, points, withheld) = standing(true);
+    assert!(stepped, "the transcript's limit: {withheld:?}");
+    assert_eq!(points, [true], "marked walled");
+    let (stepped, points, withheld) = standing(false);
+    assert!(!stepped && points.is_empty(), "{points:?}");
+    assert_eq!(withheld, Some(Guard::LimitEpisode));
 }

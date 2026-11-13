@@ -9,7 +9,7 @@ use super::super::tests::{SEALER, Stand};
 use super::*;
 use crate::{
     alab::{
-        import::{Input, Plan, Step, Terms, Vendors, plan},
+        import::{Input, Plan, Step, Terms, Vendors, plan_cells as plan},
         registry::{ADDRESS, MACHINE as MACHINE_TABLE, MAILBOX, PHONE, SOURCE},
     },
     typed::{
@@ -33,7 +33,7 @@ fn planned(sheets: &[Sheet], cells: &Cells) -> Plan {
             vendors: &Stand,
             sealer: &SEALER,
             now_ms: NOW,
-            births: true,
+            births: crate::alab::import::Births::Named,
             unread: &[],
         },
         cells,
@@ -3435,7 +3435,7 @@ fn what_a_row_says_beyond_its_cells_is_reported() {
                 vendors: &AnyMember,
                 sealer: &SEALER,
                 now_ms: NOW,
-                births: true,
+                births: crate::alab::import::Births::Named,
                 unread: &[],
             },
             &Cells::new(),

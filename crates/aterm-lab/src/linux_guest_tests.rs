@@ -206,7 +206,16 @@ fn the_x86_64_environment_is_a_cross_environment() {
         "aarch64 runs its tests in parallel"
     );
     assert!(native.contains(&("RUSTUP_TOOLCHAIN".into(), RUST.into())));
+    assert!(native.contains(&(
+        "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS".into(),
+        "-Clink-arg=-fuse-ld=lld".into()
+    )));
+    assert!(packages_for(false).iter().any(|package| package == "lld"));
     let cross = cargo_env(Arch::X86_64, "/t", true);
+    assert!(
+        cross.iter().all(|(key, _)| !key.ends_with("RUSTFLAGS")),
+        "the native linker selection never steers the cross cell"
+    );
     assert!(cross.contains(&(
         "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER".into(),
         "x86_64-linux-gnu-gcc".into()

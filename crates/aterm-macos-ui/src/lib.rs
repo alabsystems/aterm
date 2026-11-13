@@ -3,7 +3,7 @@
 
 //! Native UI framework bindings, kept outside the foundational Objective-C runtime.
 //!
-//! AppKit, Carbon, ServiceManagement and AudioQueue bindings acquire their
+//! AppKit, Carbon, ServiceManagement, WebKit and AudioQueue bindings acquire their
 //! frameworks only when a caller first needs their classes or exports.
 //! `status_button` is a menu-bar item's click split, pop-up and template face, and
 //! `darwin_notify` the observer of a state file's change notification.
@@ -22,3 +22,4 @@ pub mod darwin_notify;
 pub mod restoration;
 pub mod service_management;
 pub mod status_button;
+pub mod webkit;

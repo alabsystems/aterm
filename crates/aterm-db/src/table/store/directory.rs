@@ -22,7 +22,11 @@ fn name(claim_name: &str) -> String {
 /// Retire the supplemental witness before its claim, so a completed retirement
 /// never leaves a detached witness that can be mistaken for lost custody.
 pub(crate) fn remove_claim_files(dir: &Path, claim_name: &str) -> Result<()> {
-    for file in [name(claim_name), claim_name.to_owned()] {
+    for file in [
+        super::group::name(claim_name),
+        name(claim_name),
+        claim_name.to_owned(),
+    ] {
         match std::fs::remove_file(dir.join(file)) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -68,39 +72,85 @@ fn legacy_of(identity: Identity) -> [u8; 16] {
     bytes
 }
 
+/// Why a claim does not hold the data folder found at its table's path ([`judged`]). Three are
+/// relocations: the folder is not found as the claim or its volume witness recorded it
+/// ([`Self::Inode`], [`Self::Volume`], [`Self::Device`]). A malformed claim ([`Self::Length`])
+/// or a malformed or foreign witness ([`Self::Witness`]) is damaged custody, not a moved folder.
+#[derive(Clone, Copy)]
+enum Lost {
+    /// The claim is not a claim's length.
+    Length,
+    /// The folder has another inode than the claim recorded. This is given before the claim's
+    /// volume witness is read, and says nothing of it.
+    Inode,
+    /// The claim's volume witness is malformed or was written for another claim.
+    Witness,
+    /// The folder is on another persistent volume than the claim's own witness names, or on one
+    /// that cannot be read.
+    Volume,
+    /// The folder has another device number than the claim recorded, and no volume witness says
+    /// which volume it was on.
+    Device,
+}
+
+impl Lost {
+    fn error(self) -> Error {
+        Error::new(match self {
+            Self::Length => "table directory claim has an invalid length",
+            Self::Inode => "table directory has another inode; recovery required",
+            Self::Witness => "table volume witness has another custody anchor",
+            Self::Volume => {
+                "table directory has another or unavailable persistent volume; recovery required"
+            }
+            Self::Device => {
+                "table device number changed without a persistent volume witness; recovery required"
+            }
+        })
+    }
+}
+
 pub(super) fn check_observed(
     identity: &Identity,
     witness: Option<&[u8]>,
     claim: &[u8],
 ) -> Result<()> {
+    judged(identity, witness, claim).map_err(Lost::error)
+}
+
+/// Whether `witness` is a volume witness written for `claim`, which is a claim's length: it has
+/// a witness's length and magic, and the claim's anchor. Which volume it names is not judged.
+fn witnesses(witness: &[u8], claim: &[u8]) -> bool {
+    witness.len() == LEN && &witness[..5] == MAGIC && witness[5..37] == anchor(claim)
+}
+
+/// Whether `claim` holds the data folder found as `identity`, with the claim's volume witness
+/// `witness` where it has one, and why not. The first of its verdicts that applies is given:
+/// another inode is named before the witness is read.
+fn judged(
+    identity: &Identity,
+    witness: Option<&[u8]>,
+    claim: &[u8],
+) -> std::result::Result<(), Lost> {
     if claim.len() != CLAIM_LEN {
-        return Err(Error::new("table directory claim has an invalid length"));
+        return Err(Lost::Length);
     }
     let stored = &claim[ANCHOR_LEN..WITNESS_AT];
     if stored[8..] != identity.ino.to_le_bytes() {
-        return Err(Error::new(
-            "table directory has another inode; recovery required",
-        ));
+        return Err(Lost::Inode);
     }
     if let Some(witness) = witness {
-        if witness.len() != LEN || &witness[..5] != MAGIC || witness[5..37] != anchor(claim) {
-            return Err(Error::new(
-                "table volume witness has another custody anchor",
-            ));
+        if !witnesses(witness, claim) {
+            return Err(Lost::Witness);
         }
         if identity
             .volume
             .as_ref()
             .is_none_or(|volume| witness[37..] != *volume)
         {
-            return Err(Error::new(
-                "table directory has another or unavailable persistent volume; recovery required",
-            ));
+            return Err(Lost::Volume);
         }
     } else if stored[..8] != identity.dev.to_le_bytes() {
-        return Err(Error::new(
-            "table device number changed without a persistent volume witness; recovery required",
-        ));
+        return Err(Lost::Device);
     }
     Ok(())
 }
@@ -131,12 +181,93 @@ fn checked<'d>(
     if claim.len() != CLAIM_LEN {
         return Err(Error::new("table directory claim has an invalid length"));
     }
+    let (identity, claims, witness) = observed(dir, claim_dir, claim_name)?;
+    check_observed(&identity, witness.as_deref(), claim)?;
+    Ok(claims)
+}
+
+/// What a judgment of a claim's hold on its data folder reads: the identity of the folder at
+/// `dir`, one verdict on `claim_dir`, and the claim's volume witness there, none where it has
+/// none.
+fn observed<'d>(
+    dir: &Path,
+    claim_dir: &'d Path,
+    claim_name: &str,
+) -> Result<(Identity, private_file::JudgedDir<'d>, Option<Vec<u8>>)> {
     let identity = read(dir)?;
     let claims = private_file::JudgedDir::judge(claim_dir)
         .map_err(|_| Error::new("table volume witness is unreadable"))?;
     let witness = witness_read(claims.read(&name(claim_name), LEN))?;
-    check_observed(&identity, witness.as_deref(), claim)?;
-    Ok(claims)
+    Ok((identity, claims, witness))
+}
+
+/// Where a held read found a displaced table ([`displaced`]): the data folder's identity and the
+/// claim's volume witness, as read then. It binds nothing and says nothing of where the folder
+/// was when its claim was written; the read keeps it only to notice that either moved while it
+/// read ([`pinned_and_read_claim`]).
+pub(super) struct Pin {
+    identity: Identity,
+    volume: Option<Vec<u8>>,
+}
+
+/// The [`Pin`] of the data folder at `dir` where `claim` no longer holds it because the folder
+/// was relocated (another inode, another or unreadable persistent volume, or another device
+/// number with no volume witness); none where the claim holds it, as [`check`] judges. It reads
+/// what [`check`] reads and writes nothing. A volume witness beside the claim is held to its
+/// form whatever the relocation: [`check`] names another inode without reading the witness, and
+/// this refuses a malformed or foreign one there too, in the words [`check`] has for it where
+/// the inode is the claim's.
+///
+/// # Errors
+/// The claim has an invalid length, the folder's identity or the claim folder cannot be read, or
+/// the claim's volume witness is unreadable, malformed or another claim's: damaged custody,
+/// which no read answers from.
+pub(super) fn displaced(
+    dir: &Path,
+    claim_dir: &Path,
+    claim_name: &str,
+    claim: &[u8],
+) -> Result<Option<Pin>> {
+    let (identity, _, volume) = observed(dir, claim_dir, claim_name)?;
+    match judged(&identity, volume.as_deref(), claim) {
+        Ok(()) => Ok(None),
+        // The witness, where there is one, was judged the claim's own (`Volume`), or there is
+        // none (`Device`).
+        Err(Lost::Volume | Lost::Device) => Ok(Some(Pin { identity, volume })),
+        // Given before the witness was read, and of a claim of a claim's length, whose anchor
+        // `witnesses` may read.
+        Err(Lost::Inode) => {
+            if volume
+                .as_deref()
+                .is_some_and(|witness| !witnesses(witness, claim))
+            {
+                return Err(Lost::Witness.error());
+            }
+            Ok(Some(Pin { identity, volume }))
+        }
+        Err(lost @ (Lost::Length | Lost::Witness)) => Err(lost.error()),
+    }
+}
+
+/// [`check_and_read_claim`] for a held read of a displaced table, which has no binding to judge:
+/// the claim now at `claim_name`, none where it cannot be read, once the data folder and the
+/// claim's volume witness are found as `pin` holds them.
+///
+/// # Errors
+/// The folder's identity, the claim folder or the volume witness cannot be read; or the folder
+/// or the witness is not as `pin` holds it, which is `snapshot_changed`: the read observes
+/// again.
+pub(super) fn pinned_and_read_claim(
+    dir: &Path,
+    claim_dir: &Path,
+    claim_name: &str,
+    pin: &Pin,
+) -> Result<Option<Vec<u8>>> {
+    let (identity, claims, volume) = observed(dir, claim_dir, claim_name)?;
+    if identity != pin.identity || volume != pin.volume {
+        return Err(Error::snapshot_changed());
+    }
+    Ok(claims.read(claim_name, CLAIM_LEN).ok())
 }
 
 /// Called only from a writable open, after the ready claim and complete prefix checked.

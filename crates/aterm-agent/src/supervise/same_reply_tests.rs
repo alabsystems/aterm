@@ -1840,7 +1840,10 @@ fn a_persons_message_said_again_no_point_saw_busy_is_judged_as_one_in_new_words(
         .flat_map(|a| [2, 1].map(|n| (a, n)))
     {
         for (name, last) in [
-            ("done", "⏺ All done: nothing is left to do here."),
+            (
+                "done",
+                "⏺ All done: nothing is left to do here.\n\n  ATERM-TASK-DONE",
+            ),
             (
                 "landed",
                 "⏺ Nothing left: the parser and lexer are merged to main and pushed.",

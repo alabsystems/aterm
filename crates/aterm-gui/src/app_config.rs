@@ -217,7 +217,6 @@ pub(crate) struct Config {
     pub(crate) font_weight_dark_nudge: Option<f32>,
     pub(crate) stem_gamma: Option<f32>,
     pub(crate) font_hinting: Option<String>,
-    pub(crate) font_subpixel: Option<String>,
     pub(crate) line_height: Option<f32>,
     pub(crate) font_size_scale: Option<f32>,
     pub(crate) adjust_baseline: Option<i64>,
@@ -1548,7 +1547,7 @@ impl Default for ResolvedTrailPresentation {
                 unknown: false,
             },
             beam: aterm_effects::cursor_glow::style_has_beam_of(style, raw),
-            ribbon_tall: false,
+            ribbon_tall: true,
             ribbon_flat: false,
             classic_mono: false,
             pet_species: aterm_effects::cursor_pet::species(crate::prefs::DEFAULT_CURSOR_PET),
@@ -3896,13 +3895,6 @@ impl Config {
             .unwrap_or_else(|| "full".to_string())
     }
 
-    /// Effective Linux subpixel mode.
-    pub(crate) fn font_subpixel_or_default(&self) -> String {
-        self.font_subpixel
-            .clone()
-            .unwrap_or_else(|| "off".to_string())
-    }
-
     /// Line-height multiplier, default [`DEFAULT_LINE_HEIGHT`] (`1.1` on Windows, `1.0` elsewhere), clamped 0.8..=2.0 (the renderer floors at 0.5).
     pub(crate) const fn line_height_or_default(&self) -> f32 {
         match self.line_height {
@@ -6178,7 +6170,6 @@ struct ReloadRenderSnapshot {
     font_thicken: bool,
     stem_gamma: f32,
     font_hinting: String,
-    font_subpixel: String,
     font_variations: Vec<(u32, f32)>,
     font_weight_dark_nudge: f32,
     render_knobs: RenderKnobs,
@@ -6202,7 +6193,6 @@ impl ReloadRenderSnapshot {
             font_thicken: app.font_thicken,
             stem_gamma: app.stem_gamma,
             font_hinting: app.font_hinting.clone(),
-            font_subpixel: app.font_subpixel.clone(),
             font_variations: app.font_variations.clone(),
             font_weight_dark_nudge: app.font_weight_dark_nudge,
             render_knobs: app.render_knobs,
@@ -6229,7 +6219,6 @@ impl ReloadRenderSnapshot {
         app.font_thicken = self.font_thicken;
         app.stem_gamma = self.stem_gamma;
         app.font_hinting = self.font_hinting;
-        app.font_subpixel = self.font_subpixel;
         app.font_variations = self.font_variations;
         app.font_weight_dark_nudge = self.font_weight_dark_nudge;
         app.render_knobs = self.render_knobs;
@@ -6281,7 +6270,6 @@ fn restore_render_config_fields(target: &mut Config, previous: &Config) {
         font_weight_dark_nudge,
         stem_gamma,
         font_hinting,
-        font_subpixel,
         line_height,
         font_size_scale,
         adjust_baseline,
@@ -7035,8 +7023,6 @@ impl App {
         let raster = self.glyph_raster_knobs();
         self.backend.pin_glyph_raster_knobs(&raster);
         self.backend.set_text_blending(self.text_blending);
-        let subpixel = self.font_subpixel.clone();
-        self.backend.set_font_subpixel(&subpixel);
         self.backend
             .set_minimum_contrast(self.render_knobs.minimum_contrast);
         self.backend
@@ -8185,17 +8171,14 @@ impl App {
         let new_thicken = config.font_thicken_or_default();
         let new_stem_gamma = config.stem_gamma_or_default();
         let new_font_hinting = config.font_hinting_or_default();
-        let new_font_subpixel = config.font_subpixel_or_default();
         let typography_changed = new_blending != self.text_blending
             || new_thicken != self.font_thicken
             || (new_stem_gamma - self.stem_gamma).abs() > f32::EPSILON
-            || new_font_hinting != self.font_hinting
-            || new_font_subpixel != self.font_subpixel;
+            || new_font_hinting != self.font_hinting;
         self.text_blending = new_blending;
         self.font_thicken = new_thicken;
         self.stem_gamma = new_stem_gamma;
         self.font_hinting = new_font_hinting;
-        self.font_subpixel = new_font_subpixel;
         let new_knobs = RenderKnobs::from_config(&view, &colors);
         let knob_changes = self.render_knobs.diff(&new_knobs);
         self.render_knobs = new_knobs;
@@ -8290,8 +8273,6 @@ impl App {
                 self.backend.set_stem_gamma(self.stem_gamma);
                 let hinting = self.font_hinting.clone();
                 self.backend.set_font_hinting(&hinting);
-                let subpixel = self.font_subpixel.clone();
-                self.backend.set_font_subpixel(&subpixel);
             }
             for &change in &knob_changes {
                 self.apply_render_knob(change);
@@ -8303,8 +8284,6 @@ impl App {
             self.backend.set_stem_gamma(self.stem_gamma);
             let hinting = self.font_hinting.clone();
             self.backend.set_font_hinting(&hinting);
-            let subpixel = self.font_subpixel.clone();
-            self.backend.set_font_subpixel(&subpixel);
             for &change in &knob_changes {
                 self.apply_render_knob(change);
             }

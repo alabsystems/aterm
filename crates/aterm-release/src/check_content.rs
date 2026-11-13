@@ -131,6 +131,17 @@ pub fn context(
     half: ReleaseHalf,
     admission: Admission,
 ) -> String {
+    context_with_environment(
+        frozen_tools_sha256,
+        seal,
+        command,
+        half,
+        admission,
+        effective_environment(command),
+    )
+}
+
+pub(crate) fn effective_environment(command: &Command) -> BTreeMap<Vec<u8>, Vec<u8>> {
     let mut environment: BTreeMap<Vec<u8>, Vec<u8>> = std::env::vars_os()
         .map(|(name, value)| (os_bytes(&name), os_bytes(&value)))
         .collect();
@@ -142,6 +153,19 @@ pub fn context(
             environment.remove(&name);
         }
     }
+    environment
+}
+
+/// The same context with an explicitly validated source-reader environment projection.
+/// Ordinary qualification always calls `context`, retaining its complete environment.
+pub(crate) fn context_with_environment(
+    frozen_tools_sha256: &str,
+    seal: &str,
+    command: &Command,
+    half: ReleaseHalf,
+    admission: Admission,
+    mut environment: BTreeMap<Vec<u8>, Vec<u8>>,
+) -> String {
     environment.remove(&os_bytes(OsStr::new(aterm_capacity::POOL_ENV)));
     let mut h = aterm_digest::Sha256::new();
     part(&mut h, CONTEXT_DOMAIN.as_bytes());
@@ -187,19 +211,19 @@ pub fn item_context(frozen_tools_sha256: &str, seal: &str) -> String {
 }
 
 #[cfg(unix)]
-fn os_bytes(value: &OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(value: &OsStr) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt as _;
     value.as_bytes().to_vec()
 }
 
 #[cfg(windows)]
-fn os_bytes(value: &OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(value: &OsStr) -> Vec<u8> {
     use std::os::windows::ffi::OsStrExt as _;
     value.encode_wide().flat_map(u16::to_le_bytes).collect()
 }
 
 #[cfg(not(any(unix, windows)))]
-fn os_bytes(value: &OsStr) -> Vec<u8> {
+pub(crate) fn os_bytes(value: &OsStr) -> Vec<u8> {
     value.to_string_lossy().as_bytes().to_vec()
 }
 

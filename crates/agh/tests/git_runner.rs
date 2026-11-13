@@ -28,6 +28,7 @@ use crate::common;
 mod abrupt_stop_tests;
 mod commit_ancestry_tests;
 mod inventory_retry_tests;
+mod object_view_tests;
 mod partial_have_tests;
 mod raw_blob_tests;
 
@@ -2395,7 +2396,14 @@ fn read_only_fetches_preserve_pushurl_refusals_and_writes_still_reject_them() {
     for run in [
         GitRun::fetch(&slug, &source),
         GitRun::fetch_main(&slug, &source, "refs/agh/main"),
-        GitRun::fetch_ref(&slug, &source, "refs/heads/main", "refs/agh/exact", true),
+        GitRun::fetch_ref(
+            &slug,
+            &source,
+            "refs/heads/main",
+            "refs/agh/exact",
+            true,
+            agh::git::FetchScope::NativeExact,
+        ),
         GitRun::fetch_batch(
             &slug,
             &source,
@@ -3181,6 +3189,7 @@ fn an_exact_fetch_keeps_tag_objects_and_leaves_checkout_state_alone() {
                 reference,
                 "refs/agh/exact",
                 true,
+                agh::git::FetchScope::NativeExact,
             ))
             .unwrap_or_else(|error| panic!("{}", error.why));
         assert_eq!(result.as_, None);
@@ -3203,6 +3212,7 @@ fn an_exact_fetch_keeps_tag_objects_and_leaves_checkout_state_alone() {
         &second,
         "refs/agh/exact",
         true,
+        agh::git::FetchScope::NativeExact,
     ))
     .unwrap();
     assert_eq!(
@@ -3969,8 +3979,16 @@ fn exact_fetch_borrows_a_complete_caller_s_objects_and_receives_only_what_it_lac
     let ahead = ahead("git-exact-haves");
     let [warm, cold, shallow] = ahead.callers.each_ref().map(PathBuf::as_path);
     let slug = common::slug("fixture-dev/app");
-    let read =
-        |caller: &Path| GitRun::fetch_ref(&slug, caller, "refs/tags/v4", "refs/agh/exact", true);
+    let read = |caller: &Path| {
+        GitRun::fetch_ref(
+            &slug,
+            caller,
+            "refs/tags/v4",
+            "refs/agh/exact",
+            true,
+            agh::git::FetchScope::NativeExact,
+        )
+    };
     let closure = ahead.objects(&["refs/tags/v4"]);
     let lacked = ahead.objects(&["refs/tags/v4", "--not", &ahead.tip]);
     assert_eq!(lacked, 2, "the upstream commit and its tag");
@@ -4039,6 +4057,7 @@ fn exact_fetch_refuses_filesystem_symlinks_in_refs_and_reflogs() {
                 &first,
                 "refs/agh/victim",
                 true,
+                agh::git::FetchScope::NativeExact,
             ))
             .unwrap_err();
         assert!(error.why.contains("filesystem symlink"), "{}", error.why);
@@ -4067,6 +4086,7 @@ fn exact_fetch_refuses_filesystem_symlinks_in_refs_and_reflogs() {
             &first,
             "refs/agh/exact",
             true,
+            agh::git::FetchScope::NativeExact,
         ))
         .unwrap_err();
     assert!(error.why.contains("hard link"), "{}", error.why);
@@ -4090,7 +4110,14 @@ fn exact_fetch_rejects_ambiguous_sources_and_non_owned_destinations_before_runni
         ("refs/heads/main", "refs/agh/../main"),
     ] {
         let error = gh
-            .run_git(&GitRun::fetch_ref(&slug, world.path(), source, into, true))
+            .run_git(&GitRun::fetch_ref(
+                &slug,
+                world.path(),
+                source,
+                into,
+                true,
+                agh::git::FetchScope::NativeExact,
+            ))
             .unwrap_err();
         assert_eq!(error.kind, Kind::Usage, "{source} {into}: {}", error.why);
     }
@@ -4120,6 +4147,7 @@ fn anonymous_release_fetch_cannot_use_available_writer_credentials() {
             "refs/heads/main",
             "refs/agh/anonymous",
             true,
+            agh::git::FetchScope::NativeExact,
         )
         .with_named(named),
     )
@@ -5579,15 +5607,9 @@ fn a_vault_routed_run_reads_and_pushes_as_the_vault_token() {
     assert!(files(&dirs.grants()).is_empty(), "a grant outlived the run");
 }
 
-/// A vault token whose login the client learned while another call held the record's lock
-/// routes the client's call, but its login is not recorded, so git's helper, which reads the
-/// record and asks GitHub nothing, would not answer as it: the run is Refused before any
-/// grant or child, never sent to end Unauthenticated.
-#[test]
-fn a_vault_login_the_helper_cannot_read_refuses_the_run() {
-    let root = common::scratch("git-vault-unrecorded");
-    let fake = FakeGithub::start();
-    let dirs = Dirs::under(root.path());
+/// A vault token's world: its dev token the vault's file, `fixture-dev/app` pushable by it.
+fn vault_dev_world(root: &Path, fake: &FakeGithub) -> (Dirs, String) {
+    let dirs = Dirs::under(root);
     let token = agh_fake::token("vault-dev");
     fake.add_token(&token, "fixture-dev");
     let path = agh::identity::vault::Slot::Dev.path(&dirs.home);
@@ -5599,13 +5621,74 @@ fn a_vault_login_the_helper_cannot_read_refuses_the_run() {
     common::write_token(path.parent().expect("the vault directory"), name, &token);
     fake.add_repo("fixture-dev/app", RepoSpec::private().push("fixture-dev"));
     fake.set_tag("fixture-dev/app", "v1", common::MAIN_SHA);
+    (dirs, token)
+}
+
+/// A client that learns a vault token's login while another agh call holds the record's lock
+/// waits for it and records the login, so git's helper, which reads the record and asks
+/// GitHub nothing, answers as the vault's dev profile (on a loaded Mac
+/// several concurrent calls learned the login at once, and each but the holder recorded
+/// nothing and refused its git run). The holder lets go at the client's first contended
+/// attempt. Negative control, run by hand: with the record's wait at zero (one attempt, the
+/// take before this fix) the run is refused with "dev's login is not in the vault adoption
+/// record, which git's credential helper reads", the KI's refusal.
+#[test]
+fn a_vault_login_learned_under_another_calls_lock_is_recorded_after_it() {
+    let root = common::scratch("git-vault-waited");
+    let fake = FakeGithub::start();
+    let (dirs, _token) = vault_dev_world(root.path(), &fake);
+    let held = agh::identity::vault::hold_record_lock_for_tests(&dirs).expect("the record lock");
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(Some(held)));
+    let contended = std::rc::Rc::new(std::cell::Cell::new(0_u32));
+    let gh = aterm_uds::file_lock::with_lock_wait_observer(
+        {
+            let (holder, contended) = (holder.clone(), contended.clone());
+            move |_file| {
+                contended.set(contended.get() + 1);
+                holder.borrow_mut().take();
+            }
+        },
+        || {
+            let (ctx, _captured) = common::ctx(root.path(), &fake, git_env());
+            let mut ctx = ctx.with_git_helper(common::helper());
+            ctx.fx = Arc::new(Fx::simulated(live_start()));
+            ctx.github()
+                .unwrap_or_else(|e| panic!("the client: {}", e.why))
+        },
+    );
+    let slug = common::slug("fixture-dev/app");
+    let out = gh
+        .run_git(&GitRun::push_delete(
+            &slug,
+            "refs/tags/v1",
+            common::MAIN_SHA,
+        ))
+        .unwrap_or_else(|e| panic!("the run: {}", e.into_data().why));
+    assert_eq!(out.as_.as_deref(), Some("dev"));
+    assert!(
+        contended.get() >= 1,
+        "the client never waited on the held lock"
+    );
+    assert!(holder.borrow().is_none(), "the holder was never let go");
+}
+
+/// A vault token whose login the client learned while another call held the record's lock
+/// past the wait routes the client's call, but its login is not recorded, so git's helper,
+/// which reads the record and asks GitHub nothing, would not answer as it: the run is
+/// Refused before any grant or child, never sent to end Unauthenticated.
+#[test]
+fn a_vault_login_held_past_the_wait_refuses_the_run() {
+    let root = common::scratch("git-vault-unrecorded");
+    let fake = FakeGithub::start();
+    let (dirs, token) = vault_dev_world(root.path(), &fake);
     let _held = agh::identity::vault::hold_record_lock_for_tests(&dirs).expect("the record lock");
-    let (ctx, _captured) = common::ctx(root.path(), &fake, git_env());
-    let mut ctx = ctx.with_git_helper(common::helper());
-    ctx.fx = Arc::new(Fx::simulated(live_start()));
-    let gh = ctx
-        .github()
-        .unwrap_or_else(|e| panic!("the client: {}", e.why));
+    let gh = agh::identity::vault::with_record_wait_for_tests(Duration::ZERO, || {
+        let (ctx, _captured) = common::ctx(root.path(), &fake, git_env());
+        let mut ctx = ctx.with_git_helper(common::helper());
+        ctx.fx = Arc::new(Fx::simulated(live_start()));
+        ctx.github()
+            .unwrap_or_else(|e| panic!("the client: {}", e.why))
+    });
     let slug = common::slug("fixture-dev/app");
     for run in [
         GitRun::ls_remote(&slug, None),
@@ -5623,3 +5706,5 @@ fn a_vault_login_the_helper_cannot_read_refuses_the_run() {
     assert!(git_seen(&fake, "fixture-dev/app").is_empty());
     assert!(!dirs.grants().exists(), "a refused run wrote a grant");
 }
+
+pub(crate) mod source_cache_tests;

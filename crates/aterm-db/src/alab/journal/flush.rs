@@ -17,6 +17,7 @@ use super::{
     heard,
     place::Holding,
     relay::Heard,
+    upd::Records,
 };
 use crate::{
     Error, Result, att,
@@ -56,7 +57,7 @@ pub(crate) enum Flushed {
     Kept(&'static str),
 }
 
-/// [`pass_with`] with no holdings report, so no place row changes.
+/// [`pass_with`] with no holdings report and no update record, so no place or `upd` row changes.
 ///
 /// # Errors
 /// As [`pass_with`].
@@ -68,13 +69,15 @@ pub(crate) fn pass(
     off: bool,
     now: u64,
 ) -> Result<Flushed> {
-    pass_with(paths, spool, presence, &|| None, off, now)
+    pass_with(paths, spool, presence, &|| None, &|| None, off, now)
 }
 
 /// One flusher pass at `now` (Unix seconds); `presence` is read only when a record is made, and
 /// `holdings` (what this Mac holds that no preference here names, [`super::place`]) only once a
 /// table read is due, so a quiet minute asks the harness nothing; `None` from it leaves every
-/// place row as the book holds it. With the journal off (`off`, `[alab] journal = false`, [`super::publishing`]) what the spool
+/// place row as the book holds it. `record` (this Mac's update record, [`super::upd`]) is read
+/// every pass, a small file another process may have changed; a record the last `upd` row did
+/// not say is due as a sharp event is, and `None` leaves the row as it was. With the journal off (`off`, `[alab] journal = false`, [`super::publishing`]) what the spool
 /// and the outbox hold is dropped unpublished and folded into nothing, and the pass writes only
 /// the `sum` row that says so: once a week, and once when the journal is turned off or on.
 ///
@@ -110,10 +113,20 @@ pub(crate) fn pass_with(
     spool: &Spool,
     presence: &dyn Fn() -> Presence,
     holdings: &dyn Fn() -> Option<Vec<Holding>>,
+    record: &Records,
     off: bool,
     now: u64,
 ) -> Result<Flushed> {
-    pass_started(paths, spool, presence, holdings, off, now, Instant::now())
+    pass_started(
+        paths,
+        spool,
+        presence,
+        holdings,
+        record,
+        off,
+        now,
+        Instant::now(),
+    )
 }
 
 /// The local half of a pass, which reads no table: what the spool took in since the last pass is
@@ -160,21 +173,28 @@ pub(super) fn take_in(spool: &Spool, off: bool, now: u64) -> Result<(Book, Vec<E
 }
 
 /// [`pass_with`] with local custody admission's hang detector running from `started`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one pass's inputs, each distinct"
+)]
 pub(super) fn pass_started(
     paths: &Paths,
     spool: &Spool,
     presence: &dyn Fn() -> Presence,
     holdings: &dyn Fn() -> Option<Vec<Holding>>,
+    record: &Records,
     off: bool,
     now: u64,
     started: Instant,
 ) -> Result<Flushed> {
     let (mut book, mut outbox) = take_in(spool, off, now)?;
+    book.upd = if off { None } else { record() };
     let period = now / WEEK;
     // Without a table read: nothing can be due while a hold stands (the pace line, a kept
     // append's retry), nor unless the week is new, a sharp event or a batch waits, or the routine
     // interval passed since the last write or the last read that found nothing to write.
-    let waiting = outbox.iter().any(Event::sharp) || outbox.len() >= book::BATCH_EVENTS;
+    let waiting =
+        outbox.iter().any(Event::sharp) || book.upd_waiting() || outbox.len() >= book::BATCH_EVENTS;
     let routine = now
         >= book
             .flushed_at
@@ -496,6 +516,7 @@ pub(crate) fn read_window(
     let uses = owned::read_owned(&USE, ops, resolve);
     let relays = owned::read_owned(&RELAY, ops, resolve);
     let places = owned::read_owned(&super::PLACE, ops, resolve);
+    let upds = owned::read_owned(&super::UPD, ops, resolve);
     let mut heard = Heard::default();
     let mut batches = Vec::new();
     let mut in_window: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
@@ -512,6 +533,7 @@ pub(crate) fn read_window(
                 .chain(uses.rows.values())
                 .chain(relays.rows.values())
                 .chain(places.rows.values())
+                .chain(upds.rows.values())
                 .filter(|row| row.machine == *me)
                 .map(|row| counter(&row.value)),
         )

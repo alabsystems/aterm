@@ -167,7 +167,7 @@ impl Doorbell {
     /// made nonblocking.
     pub fn new() -> io::Result<Self> {
         use std::os::fd::AsFd as _;
-        let (reader, ringer) = crate::kept_out(std::io::pipe)?;
+        let (reader, ringer) = crate::pipe()?;
         for fd in [reader.as_fd(), ringer.as_fd()] {
             // SAFETY: F_GETFL reads the flags of a descriptor this function owns.
             let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };

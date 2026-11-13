@@ -354,6 +354,9 @@ pub(crate) struct LeadingInputOptions {
     pub supervisor_revision: Option<u64>,
     /// The duty this coordinated input performs, never inferred from a key's text.
     pub harness_duty: Option<aterm_agent::harness::contract::Scope>,
+    /// `harness-lane=<lane>`: the harness's lane that makes this write, which the one observe
+    /// gate weighs ([`aterm_agent::harness::agent_image::withholds`]).
+    pub harness_lane: Option<aterm_agent::harness::agent_image::Lane>,
     /// `cause=@<off>|<seq>`: the mail or record this input acted on, which the turn it opens names.
     pub cause: Option<crate::session_log::CauseRef>,
     /// `act=approve|deny|answer`: what this input means for the approval box or question it dismisses.
@@ -401,6 +404,18 @@ const IF_SUPERVISOR_USAGE: &str =
 
 const SUPERVISOR_INPUT_USAGE: &str = "ERR usage: typed supervisor input takes if-supervisor=<holder> if-supervisor-revision=<n> harness-duty=<scope> together, once\n";
 
+/// The refusal of a `harness-lane=` that names no lane, or is given twice: the lanes' own words.
+fn harness_lane_usage() -> String {
+    let words: Vec<&str> = aterm_agent::harness::agent_image::Lane::ALL
+        .into_iter()
+        .map(aterm_agent::harness::agent_image::Lane::word)
+        .collect();
+    format!(
+        "ERR usage: harness-lane=<{}> names the harness's lane, once\n",
+        words.join("|")
+    )
+}
+
 impl LeadingInputOptions {
     /// The complete typed request; malformed or incomplete groups are already a usage refusal.
     pub(crate) fn supervisor_request(
@@ -429,6 +444,11 @@ fn take_supervisor_option(opts: &mut LeadingInputOptions, head: &str) -> bool {
         match aterm_agent::harness::contract::Scope::from_word(value) {
             Some(duty) if opts.harness_duty.replace(duty).is_none() => {}
             _ => opts.refusal = Some(SUPERVISOR_INPUT_USAGE.to_string()),
+        }
+    } else if let Some(value) = head.strip_prefix(aterm_agent::harness::agent_image::LANE_OPTION) {
+        match aterm_agent::harness::agent_image::Lane::of_word(value) {
+            Some(lane) if opts.harness_lane.replace(lane).is_none() => {}
+            _ => opts.refusal = Some(harness_lane_usage()),
         }
     } else {
         return false;

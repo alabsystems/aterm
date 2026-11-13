@@ -1403,6 +1403,7 @@ impl Run<'_> {
                             signing: Signing::Unsigned,
                             upload: false,
                             env,
+                            build_within: None,
                         },
                     )
                     .map(|outcome| (outcome.build, outcome.asset, outcome.manifest))

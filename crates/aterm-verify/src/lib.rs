@@ -44,6 +44,7 @@ pub mod browser;
 pub mod cells;
 mod census_fix;
 pub mod changed;
+pub mod changelog_fragments;
 pub mod changelog_guard;
 pub mod checks;
 pub mod cli;
@@ -64,9 +65,10 @@ pub mod findings;
 pub mod fmt;
 pub mod git_paths;
 pub mod git_provider;
-mod harness_debt;
+pub mod harness_debt;
 pub mod input_content;
 pub mod ladder;
+pub mod launch_agent;
 pub mod libtest;
 pub mod libtest_json;
 pub mod lint_content;
@@ -78,6 +80,7 @@ pub mod plan;
 #[cfg(unix)]
 pub mod provision;
 pub mod release_input;
+pub mod release_input_facts;
 mod released_shim;
 pub mod report;
 mod resource_waits;
@@ -150,6 +153,9 @@ pub mod exit {
     pub const COULD_NOT_RUN: i32 = 3;
 }
 
+/// Select derived verification targets without moving the native compiler cache.
+pub const SIDE_LANES_ENV: &str = "ATERM_VERIFY_LANES_DIR";
+
 /// The environment, read once at startup on the main thread.
 #[derive(Clone, Debug, Default)]
 pub struct EnvSnapshot {
@@ -184,6 +190,9 @@ pub struct EnvSnapshot {
     pub rustc_vars: Vec<(&'static str, String)>,
     /// `CARGO_TARGET_DIR`, absolute.
     pub cargo_target_dir: Option<PathBuf>,
+    /// Optional derived-target root, relative to the source root unless absolute.
+    /// Consumed by this verifier and removed from its children.
+    pub side_lanes_dir: Option<PathBuf>,
     /// Cargo's explicitly set layout selectors ([`CARGO_LAYOUT_VARS`]). Startup capture anchors
     /// relative environment paths at its working directory; manually supplied values retain
     /// the selected source root as their base.
@@ -202,6 +211,10 @@ pub struct EnvSnapshot {
     /// judge (a release hands each child its own); unset, they read the engine origin's main
     /// ([`engine::named`]).
     pub publication_engine: Option<OsString>,
+    /// Explicit pinned-reader repository; raw emptiness is retained so malformed pins refuse.
+    pub publication_engine_git_dir: Option<OsString>,
+    /// Explicit pinned-reader commit paired with the repository above.
+    pub publication_engine_commit: Option<OsString>,
     /// `ATERM_DISK_COVERED` ([`aterm_capacity::DISK_COVER_ENV`]): the name of the disk claim the
     /// work this run is part of holds (the release's), which covers the run's disk
     /// ([`disk::admit`]). Read here alone and removed from every child ([`CHILD_ENV_REMOVED`]),
@@ -285,6 +298,7 @@ impl EnvSnapshot {
                     cwd: Some(cwd),
                     env: &lookup,
                     read: &|_| Ok(None),
+                    read_manifest: &|_| Ok(None),
                     writable: &|_| Some(false),
                 };
                 aterm_toolchain::build_cache::cargo_build_dir_hint_with(&machine)
@@ -305,11 +319,13 @@ impl EnvSnapshot {
     }
 
     /// The variables that name the publication engine ([`engine::named`]), as this snapshot
-    /// holds them: `PUBLICATION_ENGINE` and `HOME`.
+    /// holds them, including the raw explicit pin pair (even malformed empty values).
     #[must_use]
     pub fn engine_var(&self, name: &str) -> Option<OsString> {
         match name {
             "PUBLICATION_ENGINE" => self.publication_engine.clone(),
+            engine::GIT_DIR_ENV => self.publication_engine_git_dir.clone(),
+            engine::COMMIT_ENV => self.publication_engine_commit.clone(),
             "HOME" => Some(self.home.clone().into_os_string()).filter(|h| !h.is_empty()),
             _ => None,
         }
@@ -362,6 +378,7 @@ impl EnvSnapshot {
                 .filter_map(|k| Some((*k, std::env::var_os(k)?.to_string_lossy().into_owned())))
                 .collect(),
             cargo_target_dir,
+            side_lanes_dir: var_path(SIDE_LANES_ENV).filter(|p| !p.as_os_str().is_empty()),
             cargo_home,
             qualify_red_marker: var_path("ATERM_QUALIFY_RED_MARKER").filter(|p| p.is_absolute()),
             cargo_layout,
@@ -369,6 +386,8 @@ impl EnvSnapshot {
             rust_test_threads: std::env::var_os("RUST_TEST_THREADS"),
             native_packages,
             publication_engine: std::env::var_os("PUBLICATION_ENGINE").filter(|v| !v.is_empty()),
+            publication_engine_git_dir: std::env::var_os(engine::GIT_DIR_ENV),
+            publication_engine_commit: std::env::var_os(engine::COMMIT_ENV),
             disk_cover: std::env::var(aterm_capacity::DISK_COVER_ENV)
                 .ok()
                 .filter(|m| !m.trim().is_empty()),
@@ -419,6 +438,7 @@ pub fn main_build_dir(env: &EnvSnapshot, root: &Path) -> Option<String> {
         cwd: Some(root),
         env: &lookup,
         read: &read_config,
+        read_manifest: &aterm_toolchain::build_cache::read_manifest,
         writable: &writable_dir,
     };
     let probe = ["--unverified".to_string(), "test".to_string()];
@@ -475,6 +495,7 @@ impl NativeBuildPlan {
             cwd: Some(&root),
             env: &lookup,
             read: &read_config,
+            read_manifest: &aterm_toolchain::build_cache::read_manifest,
             writable: &writable_dir,
         };
         let selected = cargo_target_hint_with(&machine)
@@ -526,6 +547,7 @@ impl NativeBuildPlan {
             cwd: Some(&root),
             env: &lookup,
             read: &read_config,
+            read_manifest: &aterm_toolchain::build_cache::read_manifest,
             writable: &writable_dir,
         };
         let compiler_layout = cargo_home_hint_with(&machine).and_then(|cargo_home| {
@@ -706,6 +728,7 @@ pub fn fallback_build_dir(env: &EnvSnapshot, root: &Path, target: &Path) -> Opti
         cwd: Some(root),
         env: &lookup,
         read: &read_config,
+        read_manifest: &aterm_toolchain::build_cache::read_manifest,
         writable: &writable_dir,
     };
     target_build_dir(&target, &machine)
@@ -780,6 +803,7 @@ fn prepare_selected_build_dir(
         cwd: Some(root),
         env: &lookup,
         read: &read_config,
+        read_manifest: &aterm_toolchain::build_cache::read_manifest,
         writable: &writable_dir,
     };
     if !automatic_target {
@@ -1159,12 +1183,13 @@ pub struct Ctx {
     /// What enumerates the workspace members for adaptive test-compile shaping. Production reads
     /// Cargo's resolved workspace; a planner test supplies a fixed graph beside [`Ctx::unit_graph`].
     pub workspace_members: fn(&Ctx) -> changed::Members,
-    /// What the run's shaped test compile has built so far, and what the fresh check said
-    /// ([`shape::fresh_check`]).
+    /// What the run's shaped test compile has built so far, what the fresh check said
+    /// ([`shape::fresh_check`]), and what every compile call reported of its build directory
+    /// ([`disk::note_call`]).
     pub shape_run: Mutex<shape::Run>,
-    /// When the run began (its context was made), which a release run's record of what it used
-    /// names ([`disk::keep_used`]): a unit of the main lane's build directory written since is one
-    /// some compile of the run built.
+    /// When the run began (its context was made), which the run's record of what it used names
+    /// ([`disk::keep_used`]): a unit of one of its build directories written since is one some
+    /// compile of the run built.
     pub began: std::time::SystemTime,
     /// What names each compiler of a test compile for its unit, its span and, where it is heavy,
     /// its unit's record ([`memory::read_unit`] but in a test).
@@ -1193,10 +1218,13 @@ pub const CARGO_RUN_ENV: [&str; 7] = aterm_toolchain::build_cache::CARGO_RUN_ENV
 /// own claim and which a test binary must never read (a release's children would then run its
 /// tests unlike a developer's). All test commands explicitly inject their own
 /// marker and disposable HOME through `test_env`, including in a Background main lane.
-pub const CHILD_ENV_REMOVED: [&str; 10] = {
-    let mut all = [aterm_capacity::DISK_COVER_ENV; 10];
+pub const CHILD_ENV_REMOVED: [&str; 13] = {
+    let mut all = [aterm_capacity::DISK_COVER_ENV; 13];
     all[8] = stages::CHECKERS_ENV;
     all[9] = "ATERM_RELEASE_*";
+    all[10] = SIDE_LANES_ENV;
+    all[11] = engine::GIT_DIR_ENV;
+    all[12] = engine::COMMIT_ENV;
     let mut i = 0;
     while i < CARGO_RUN_ENV.len() {
         all[i] = CARGO_RUN_ENV[i];
@@ -3366,8 +3394,11 @@ fn toolchain_lines(ctx: &Ctx) -> String {
             ctx.target_dir.display()
         )),
     }
-    if let Some(dir) = &ctx.cached_lanes_dir {
-        s.push_str(&format!("verification cache: {}\n", dir.display()));
+    if ctx.env.side_lanes_dir.is_some() || ctx.cached_lanes_dir.is_some() {
+        s.push_str(&format!(
+            "verification cache: {}\n",
+            plan::lanes_dir(ctx).display()
+        ));
     }
     s
 }
@@ -3913,10 +3944,30 @@ pub fn run_cli(args: &[String], cwd: &Path) -> i32 {
     };
     #[cfg(unix)]
     {
-        if let Some(line) = disk::keep_used(&ctx, code == exit::PASS) {
-            let _ = log.as_mut().map(|f| writeln!(f, "{line}"));
+        // A run an interrupt or its first proven red ended stopped short of its compile calls:
+        // it keeps nothing. The verdict does not decide it otherwise: a run that compiled all
+        // it uses and failed a test used the same units.
+        let kept = if stopping() {
+            Vec::new()
+        } else {
+            disk::keep_used(&ctx)
+        };
+        for one in &kept {
+            let _ = log.as_mut().map(|f| writeln!(f, "{}", one.line));
         }
         let_disk_go(disk, code == exit::PASS, log.as_mut(), ctx.events.as_ref());
+        // After the run's last measure, so what it wrote is measured before any of it goes;
+        // and the verdict is decided: a trim that panics is dropped, and says so. The trim is
+        // held to a bound on its time and stops once an interrupt is ending the run
+        // (`disk::trim_used`): an interrupt here ends the run as one during its last measure
+        // does (`end_run`), and what the trim had moved aside the next run finishes.
+        let trimmed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            disk::trim_used(&ctx, &kept)
+        }))
+        .unwrap_or_else(|_| vec!["disk: the trim was dropped (it panicked)".to_owned()]);
+        for line in trimmed {
+            let _ = log.as_mut().map(|f| writeln!(f, "{line}"));
+        }
     }
     end_run(&ctx, &scratch);
     if parsed.background && stopping() && code != exit::FAILED {

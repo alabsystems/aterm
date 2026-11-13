@@ -45,8 +45,8 @@
 //! ([`landed`], and [`crate::measure::Written`]'s drop), and a second interrupt, which ends the
 //! process at once, removes them first ([`undo_on_hard_exit`]). Only a kill leaves them, and
 //! step 1 of the next run refuses them as leftovers. An interrupt is the run's (exit 128 + the
-//! signal), never a step's refusal. What stays a person's or an agent's: the CHANGELOG line, the
-//! commit, the merge and the push.
+//! signal), never a step's refusal. What stays a person's or an agent's: the changelog entry (its
+//! own file under `changes/`), the commit, the merge and the push.
 
 use std::path::{Path, PathBuf};
 
@@ -690,7 +690,7 @@ pub fn cmd_codex_measure(args: &[String]) -> Res {
             .join(" ")
     );
     println!(
-        "left to do by hand: a CHANGELOG line under [Unreleased], the commit, the merge and the push"
+        "left to do by hand: a changelog entry file under changes/, the commit, the merge and the push"
     );
     Ok(0)
 }

@@ -35,8 +35,11 @@ const REPLY_PACE_S: f64 = 0.02;
 /// A plain report of progress: no done claim, no defense, no question.
 pub const WORK: &str = "Implemented the parser module and its unit tests in this turn.";
 
-/// A done claim (`says_done`), with no defense.
-pub const DONE_CLAIM: &str = "Merged the parser and pushed it to origin/main. All done.";
+/// A done claim (`says_done`), with no defense: a legacy `ATERM-TASK-DONE` line, the one such
+/// claim the reader still takes since no words are read for one (2026-11-05). The token stands
+/// last, as an older primer taught it, so it is the reply's last line, which the journal's
+/// `EVENT idle` row keeps ([`DONE_CLAIM_READ`]).
+pub const DONE_CLAIM: &str = "Merged the parser and pushed it to origin/main.\n\nATERM-TASK-DONE";
 
 const DEFENSE_HEAD: &str = "Nothing left:";
 
@@ -212,7 +215,7 @@ const EXCHANGE_WATCH_MS: i64 = QUIET_UNDER_OFF_MS + 30_000;
 pub const W_WORK: &str = "Wrote the parser module and its unit tests in this turn.";
 pub const W_NEEDS: &str = "Wrote the docs for the parser too.\nNEEDS YOU: rotate the deploy key\nNothing left: the parser is committed and pushed to origin/main.";
 pub const W_DEFENSE: &str = "Wrote the last commit to origin/main.\nNothing left: the parser is committed and pushed to origin/main.";
-pub const W_DONE: &str = "Wrote the parser and pushed it to origin/main. All done.";
+pub const W_DONE: &str = "Wrote the parser and pushed it to origin/main.\n\nATERM-TASK-DONE";
 pub const W_CHECKED: &str = "Wrote the last checks for the parser.\nNothing left: the parser is committed and pushed to origin/main.";
 const W_WORK_KEY: &str = "Wrote the parser module";
 const W_DONE_KEY: &str = "Wrote the parser and pushed";
@@ -222,10 +225,15 @@ const W_DONE_KEY: &str = "Wrote the parser and pushed";
 /// `NEEDS YOU:` line of its own, every line a head agy's reader would take where a blank line in
 /// a message cut it (agy draws the rows under it two columns in, as a reply's: `aterm_phase::agy`'s
 /// header).
-pub const OWNER_CONTINUE: &str = "Keep going on the owner's terms: finish the parser, verify it and land it.\n\nNothing left: is a line you write only once everything is on remote main.\nNEEDS YOU: lines are for credentials only.";
+pub const OWNER_CONTINUE: &str = "Keep going on the owner's terms: finish the parser, verify it and land it.\n\nNothing left: is a line you write only once everything is on remote main.\nNEEDS YOU: lines are for a person's own acts only.";
 const OWNER_KEY: &str = "on the owner's terms";
-const OWNER_TAIL: &str = "lines are for credentials only";
-const DONE_CLAIM_KEY: &str = "Merged the parser";
+const OWNER_TAIL: &str = "lines are for a person's own acts only";
+/// The words [`DONE_CLAIM`] opens with, by which a look at the screen knows it stands.
+pub const DONE_CLAIM_KEY: &str = "Merged the parser";
+
+/// What the journal's `EVENT idle` row keeps of [`DONE_CLAIM`] and [`W_DONE`]: their last line,
+/// the token, which no other reply of a chain that says either one ends with.
+pub const DONE_CLAIM_READ: &str = turn_end::FINISHED;
 
 /// The `[harness]` line that sets [`OWNER_CONTINUE`] as the lab's `continue_text`: a TOML basic
 /// string, its line breaks escaped.
@@ -6252,10 +6260,22 @@ fn at_composer(door: &Door<'_>, sid: &str, agent: &str) -> Option<String> {
 }
 
 /// What stands for `agent` on `text`, tab `sid`'s screen: [`crate::composer_turn::stand_of`], over
-/// the composer row's `ctl cell` replies. Every gate here that asks whether an agent's composer
-/// stands empty before the lab types reads it so, a placeholder no one typed read as empty.
+/// the composer row's `ctl cell` replies and, where a grey glyph asks it, the tab's `ctl cursor`.
+/// Every gate here that asks whether an agent's composer stands empty before the lab types reads
+/// it so, a placeholder no one typed read as empty.
 fn stand_on(door: &Door<'_>, sid: &str, agent: &str, text: &str) -> Stand {
-    crate::composer_turn::stand_of(agent, text, cell_on(door, sid))
+    crate::composer_turn::stand_of(agent, text, cell_on(door, sid), cursor_on(door, sid))
+}
+
+/// Tab `sid`'s caret, from its `ctl cursor` reply, where it answered with a settled frame's
+/// ([`crate::composer_turn::caret_of`]).
+fn cursor_on<'a>(door: &'a Door<'_>, sid: &'a str) -> impl FnOnce() -> Option<(usize, usize)> + 'a {
+    move || {
+        reading_on(door, sid, &["cursor"])
+            .ok()
+            .as_deref()
+            .and_then(crate::composer_turn::caret_of)
+    }
 }
 
 /// Tab `sid`'s `ctl cell <row> <col>` reply, where it answered.
@@ -6450,14 +6470,19 @@ fn start_stand(stand: Stand, input: &Input) -> Stand {
 }
 
 /// [`start_stand`] for `agent` on `text`, its screen, read as every empty-composer gate reads one
-/// ([`crate::composer_turn::stand_of`] over `cell`, the composer row's `ctl cell` replies).
+/// ([`crate::composer_turn::stand_of`] over `cell`, the composer row's `ctl cell` replies, and
+/// `cursor`, the tab's caret).
 fn start_look(
     agent: &str,
     text: &str,
     input: &Input,
     cell: impl FnMut(usize, usize) -> Option<String>,
+    cursor: impl FnOnce() -> Option<(usize, usize)>,
 ) -> Stand {
-    start_stand(crate::composer_turn::stand_of(agent, text, cell), input)
+    start_stand(
+        crate::composer_turn::stand_of(agent, text, cell, cursor),
+        input,
+    )
 }
 
 /// THE LAB PROMPTS A PROGRAM ONLY ONCE IT HAS FINISHED STARTING (v6 §14.10.1, slice at1): its empty
@@ -6490,7 +6515,13 @@ pub(crate) fn started_composer(
                 held = Some(input.clone());
             }
             last.clone_from(&input);
-            let stand = start_look(agent, &text, &input, cell_on(door, sid));
+            let stand = start_look(
+                agent,
+                &text,
+                &input,
+                cell_on(door, sid),
+                cursor_on(door, sid),
+            );
             let ready = matches!(&stand, Stand::Composer(row) if row.is_empty());
             if holds.due(sid, &input, ready) {
                 taking = Some(holds.take(door, sid, label, &input, &status));
@@ -8701,7 +8732,7 @@ fn finished(tab: &Tab, now: i64) -> bool {
         Chain::CruiseO => {
             first(turn_end::RULE_CONTINUE).is_some_and(|c| {
                 s.all_acts().iter().any(|(t, _)| *t > c)
-                    || s.yield_after(c, None, Some(DONE_CLAIM_KEY))
+                    || s.yield_after(c, None, Some(DONE_CLAIM_READ))
                         .event
                         .is_some_and(|(t, _)| now - t >= 20_000)
             }) || done_since(20_000)

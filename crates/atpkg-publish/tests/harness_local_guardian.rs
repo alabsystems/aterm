@@ -79,10 +79,16 @@ struct Running {
     launch: PathBuf,
     source_record: PathBuf,
     child: aterm_uds::spawnfd::Child,
+    /// The launch was shown to have no owner at all, so nothing is left to retire.
+    ownerless: bool,
 }
 
 impl Running {
     fn start(fixture: Fixture) -> Self {
+        Self::start_after(fixture, |_| {})
+    }
+    /// [`Self::start`], with `prepare` run on the launch directory before the client starts.
+    fn start_after(fixture: Fixture, prepare: impl FnOnce(&Path)) -> Self {
         let scratch = aterm_tempfile::Builder::new()
             .prefix("local-guardian-native-")
             .tempdir()
@@ -116,6 +122,7 @@ impl Running {
             config,
             fixture,
             matches!(fixture, Fixture::HangWithChild),
+            prepare,
         )
     }
     fn launch(
@@ -124,10 +131,12 @@ impl Running {
         config: Config,
         fixture: Fixture,
         watch: bool,
+        prepare: impl FnOnce(&Path),
     ) -> Self {
         let prepared =
             harness_local::prepare_fixture(&image(&home), &home, &config, watch, fixture)
                 .expect("prepare fixture");
+        prepare(&prepared.directory);
         let mut command = aterm_uds::spawnfd::command(&prepared.program);
         command
             .args(&prepared.args)
@@ -147,6 +156,7 @@ impl Running {
             launch: prepared.directory,
             source_record: prepared.source_record,
             child,
+            ownerless: false,
         };
         aterm_uds::deadline::prints(&mut running.child, "local fixture client running", HANG);
         running
@@ -155,7 +165,18 @@ impl Running {
         let mut config = self.config.clone();
         config.prefix = self.home.join("other-pkg");
         config.out = self.home.join("other-out");
-        Self::launch(None, self.home.clone(), config, fixture, false)
+        Self::launch(None, self.home.clone(), config, fixture, false, |_| {})
+    }
+    /// Another launch of this same prefix and source, as a later run of the client.
+    fn again(&self, fixture: Fixture) -> Self {
+        Self::launch(
+            None,
+            self.home.clone(),
+            self.config.clone(),
+            fixture,
+            false,
+            |_| {},
+        )
     }
     fn root(&self) -> PathBuf {
         self.config
@@ -267,10 +288,10 @@ impl Drop for Running {
         aterm_uds::deadline::kill_within(&mut self.child, HANG);
         self.finish_fixture();
         let by = Instant::now() + HANG;
-        while Instant::now() < by && !self.physically_retired() {
+        while Instant::now() < by && !self.ownerless && !self.physically_retired() {
             std::thread::sleep(Duration::from_millis(20));
         }
-        if (!self.physically_retired() || std::thread::panicking())
+        if (!(self.ownerless || self.physically_retired()) || std::thread::panicking())
             && let Some(scratch) = self.scratch.take()
         {
             let preserved = scratch.keep();
@@ -309,6 +330,20 @@ fn client_sigkill_and_cooperative_stop_both_retire_the_leaf_before_releasing_own
             leaf.is_some()
         });
         let leaf = leaf.expect("native leaf execution proof");
+        let owner = Identity::parse(&running.owner().expect("actual guardian owner"))
+            .expect("guardian identity");
+        let argv = process::read_process_argv(owner.pid).expect("live guardian argv");
+        assert_eq!(argv.len(), 5);
+        assert_eq!(argv[1], "__harness_local_guard");
+        assert_eq!(Path::new(&argv[2]), running.launch);
+        assert_eq!(&argv[3..], &["--lifeline-fd", "0"]);
+        // The argv alone also fits a forked copy of the client's spawn; the kernel's exec
+        // record, which a fork clears, says this owner started in an image of its own.
+        assert_eq!(
+            process::read_process_execd(owner.pid),
+            Some(true),
+            "the owner exec'd after the detach fork"
+        );
         assert!(
             !ended(&leaf),
             "negative control: the leaf really ran and remained alive"
@@ -439,4 +474,53 @@ fn a_success_bit_without_a_complete_terminal_ack_is_refused() {
     assert!(!terminal.expect("incomplete terminal result").success());
     wait(|| running.retired());
     running.assert_unchanged_harness();
+}
+
+#[test]
+fn an_owner_whose_exec_fails_is_refused_with_its_cause_and_holds_nothing() {
+    let mut failed = Running::start_after(Fixture::Complete, |launch| {
+        aterm_uds::private_file::write_private(launch, "fail-exec.json", b"true")
+            .expect("name an image that is not there");
+    });
+    let mut terminal = None;
+    wait(|| {
+        terminal = failed.child.try_wait().expect("failed-exec client exit");
+        terminal.is_some()
+    });
+    assert!(!terminal.expect("terminal refusal").success());
+    let log = |name: &str| std::fs::read_to_string(failed.launch.join(name)).unwrap_or_default();
+    let (client, guardian) = (log("client.stderr"), log("guardian.stderr"));
+    let cause = std::io::Error::from_raw_os_error(libc::ENOENT).to_string();
+    assert!(
+        guardian.contains("could not exec its image"),
+        "the forked child logs its failed exec itself: {guardian}"
+    );
+    assert!(
+        guardian.contains("exec the local update owner") && guardian.contains(&cause),
+        "the detach process records the exec's own error: {guardian}"
+    );
+    // The client names that cause from the detach process's failure, not the startup bound's
+    // "unacknowledged", which would say the same minute later and name nothing.
+    assert!(
+        client.contains("local update owner did not start") && client.contains(&cause),
+        "the client refuses with the cause: {client}"
+    );
+    assert!(!client.contains("unacknowledged"), "{client}");
+    assert!(failed.owner().is_none(), "no owner ever ran");
+    assert!(failed.active().is_none(), "no attempt was published");
+    failed.ownerless = true;
+    // Nothing of the failed start holds this prefix or its source: the next run owns both.
+    let mut next = failed.again(Fixture::Complete);
+    let mut terminal = None;
+    wait(|| {
+        terminal = next.child.try_wait().expect("next client exit");
+        terminal.is_some()
+    });
+    assert!(
+        terminal.expect("next client completed").success(),
+        "next client: {}",
+        std::fs::read_to_string(next.launch.join("client.stderr")).unwrap_or_default()
+    );
+    wait(|| next.retired());
+    next.assert_unchanged_harness();
 }

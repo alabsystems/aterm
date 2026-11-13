@@ -1,19 +1,23 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! Unattended publication lanes ([`alab`], [`linux`], [`resolve`], [`gap`], [`state`], [`hold`],
-//! [`rows`], [`report`], [`install`], [`units`], [`mark_ran`], [`self_check`]).
+//! Unattended publication lanes ([`alab`], [`linux`], [`tip`], [`ready`], [`lifecycle`],
+//! [`resolve`], [`gap`], [`state`], [`hold`], [`rows`], [`report`], [`install`], [`units`],
+//! [`mark_ran`], [`self_check`]).
 
 pub mod alab;
 pub mod gap;
 pub mod hold;
 pub mod install;
+pub mod lifecycle;
 pub mod linux;
+pub mod ready;
 pub mod report;
 pub mod resolve;
 pub mod reuse;
 pub mod rows;
 pub mod state;
+pub mod tip;
 pub mod units;
 
 use std::path::{Path, PathBuf};
@@ -29,18 +33,22 @@ pub enum LaneKind {
     Alab,
     /// The Linux lane: adds Linux rows to the pinned builds.
     Linux,
+    /// The tip lane: qualifies, packs and stages each plain program's frozen dev main, and
+    /// (staged-only) publishes the ready records in one index.
+    Tip,
 }
 
 impl LaneKind {
-    /// `alab` | `linux`.
+    /// `alab` | `linux` | `tip`.
     /// # Errors
     /// A usage error for anything else.
     pub fn parse(s: &str) -> Result<Self> {
         match s {
             "alab" => Ok(Self::Alab),
             "linux" => Ok(Self::Linux),
+            "tip" => Ok(Self::Tip),
             other => Err(Error::usage(format!(
-                "`{other}` is not a lane (alab | linux)"
+                "`{other}` is not a lane (alab | linux | tip)"
             ))),
         }
     }
@@ -51,6 +59,7 @@ impl LaneKind {
         match self {
             Self::Alab => "alab",
             Self::Linux => "linux",
+            Self::Tip => "tip",
         }
     }
 }
@@ -60,7 +69,8 @@ impl LaneKind {
 pub struct RunFlags {
     /// Decide and print; change nothing.
     pub dry_run: bool,
-    /// Publish eligible existing Linux stages without building missing rows this run.
+    /// Publish what is already qualified and staged without building this run: the Linux
+    /// lane's staged cohorts, or (the tip lane) the Apple ready queue ([`ready`]).
     pub staged_only: bool,
     /// Consume a staging notification, or report idle without contacting a host.
     pub queued: bool,
@@ -89,9 +99,9 @@ impl RunFlags {
             };
             match a.as_str() {
                 "--dry-run" => flags.dry_run = true,
-                "--staged-only" if kind == LaneKind::Linux => flags.staged_only = true,
-                "--queued" if kind == LaneKind::Linux => flags.queued = true,
-                "--json" if kind == LaneKind::Linux => flags.json = true,
+                "--staged-only" if kind != LaneKind::Alab => flags.staged_only = true,
+                "--queued" if kind != LaneKind::Alab => flags.queued = true,
+                "--json" if kind != LaneKind::Alab => flags.json = true,
                 "--sha256" => {
                     let v = value("--sha256")?;
                     if v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -110,10 +120,12 @@ impl RunFlags {
                         "`lane run {}` does not take `{other}` (--dry-run, --sha256 <hex>, \
                          --log <file>{})",
                         kind.as_str(),
-                        if kind == LaneKind::Linux {
-                            ", --triple <linux target>, --staged-only, --queued, --json"
-                        } else {
-                            ""
+                        match kind {
+                            LaneKind::Linux => {
+                                ", --triple <linux target>, --staged-only, --queued, --json"
+                            }
+                            LaneKind::Tip => ", --staged-only, --queued, --json",
+                            LaneKind::Alab => "",
                         }
                     )));
                 }
@@ -126,13 +138,13 @@ impl RunFlags {
     }
 }
 
-/// `atpkg-publish lane <run|stage|install|disarm> <alab|linux> …`.
+/// `atpkg-publish lane <run|stage|install|disarm> <alab|linux|tip> …`.
 /// # Errors
 /// A usage error for an unknown subcommand or lane; otherwise what the subcommand answers.
 pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     let (Some(sub), Some(kind)) = (args.first(), args.get(1)) else {
         return Err(Error::usage(
-            "lane <run|stage|install|disarm> <alab|linux> [flags]",
+            "lane <run|stage|install|disarm> <alab|linux|tip> [flags]",
         ));
     };
     let kind = LaneKind::parse(kind)?;
@@ -173,9 +185,71 @@ fn run_lane(ctx: &Ctx, kind: LaneKind, flags: &RunFlags) -> Result<()> {
     result.map(|_| ())
 }
 
+/// What a run did, as the typed `--json` outcome reports it, whichever lane ran.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Summary {
+    /// Another run held the lock.
+    pub covered: bool,
+    /// Nothing was queued, or everything queued was already published.
+    pub idle: bool,
+    /// The verified head.
+    pub head: Option<u64>,
+    /// The index this run published.
+    pub published: Option<u64>,
+    /// What is ready: signed by this run (Linux), pinned by it (the Apple dispatcher), or
+    /// queued by it for the dispatcher (the tip lane).
+    pub ready: Vec<String>,
+    /// What was deliberately left for another run.
+    pub deferred: Vec<String>,
+    /// What cannot move as things stand.
+    pub held: Vec<String>,
+}
+
+impl From<linux::Outcome> for Summary {
+    fn from(o: linux::Outcome) -> Self {
+        Self {
+            covered: o.covered,
+            idle: o.idle,
+            head: o.head,
+            published: o.published,
+            ready: o.ready,
+            deferred: o.deferred,
+            held: o.held,
+        }
+    }
+}
+
+impl From<ready::Outcome> for Summary {
+    fn from(o: ready::Outcome) -> Self {
+        Self {
+            covered: o.covered,
+            idle: o.idle,
+            head: o.head,
+            published: o.published,
+            ready: o.ready,
+            deferred: o.deferred,
+            held: o.held,
+        }
+    }
+}
+
+impl From<tip::Outcome> for Summary {
+    fn from(o: tip::Outcome) -> Self {
+        Self {
+            covered: o.covered,
+            idle: false,
+            head: o.head,
+            published: None,
+            ready: o.enqueued,
+            deferred: o.skipped,
+            held: o.failed,
+        }
+    }
+}
+
 fn outcome_report<'a>(
     flags: &RunFlags,
-    result: &'a Result<Option<linux::Outcome>>,
+    result: &'a Result<Option<Summary>>,
     log: Vec<String>,
 ) -> RunReport<'a> {
     let outcome = result.as_ref().ok().and_then(Option::as_ref);
@@ -219,13 +293,18 @@ fn run_lane_inner(
     kind: LaneKind,
     flags: &RunFlags,
     log: &mut Vec<String>,
-) -> Result<Option<linux::Outcome>> {
+) -> Result<Option<Summary>> {
     let exe = std::env::current_exe().map_err(|e| Error::io("find this binary's own path", &e))?;
-    mark_ran(&exe);
+    // A tip dry run writes nothing, this mark included.
+    if !(flags.dry_run && kind == LaneKind::Tip) {
+        mark_ran(&exe);
+    }
     let pinned = self_check(&exe, flags.sha256.as_deref(), flags.dry_run, &ctx.state_dir)?;
     let me = match kind {
+        LaneKind::Tip if flags.staged_only => ready::ME,
         LaneKind::Alab => alab::ME,
         LaneKind::Linux => linux::ME,
+        LaneKind::Tip => tip::ME,
     };
     let tx = report::Transcript::new(
         me,
@@ -260,10 +339,43 @@ fn run_with_production_deps(
     kind: LaneKind,
     flags: &RunFlags,
     tx: &report::Transcript,
-) -> Result<Option<linux::Outcome>> {
+) -> Result<Option<Summary>> {
     let packer = crate::artifact::pack::Pack;
     let indexer = crate::channel::index::Index;
     match kind {
+        LaneKind::Tip if flags.staged_only => {
+            if !cfg!(target_os = "macos") {
+                return Err(Error::refused(
+                    "the Apple ready dispatcher publishes Apple rows and runs on macOS only",
+                ));
+            }
+            let host = Triple::host().ok_or_else(|| {
+                Error::refused("the client ships no target for this host: no pin to move")
+            })?;
+            let notifier = report::Journal(tx);
+            let deps = ready::Deps {
+                indexer: &indexer,
+                notifier: &notifier,
+            };
+            let opts = ready::Options::new(ctx, flags.dry_run, flags.queued, host);
+            ready::dispatch(ctx, &opts, &deps, tx).map(|o| Some(o.into()))
+        }
+        LaneKind::Tip => {
+            let host = Triple::host()
+                .filter(|_| cfg!(target_os = "macos"))
+                .ok_or_else(|| {
+                    Error::refused("the tip lane packs Apple rows and runs on macOS only")
+                })?;
+            let notifier = report::Journal(tx);
+            let backend = tip::HostBackend;
+            let deps = tip::Deps {
+                packer: &packer,
+                backend: &backend,
+                notifier: &notifier,
+            };
+            tip::run(ctx, &tip::Options::new(ctx, flags.dry_run, host), &deps, tx)
+                .map(|o| Some(o.into()))
+        }
         LaneKind::Alab => {
             if !cfg!(target_os = "macos") {
                 return Err(Error::refused(
@@ -295,7 +407,7 @@ fn run_with_production_deps(
                 builder: &builder,
                 switch: &linux::live_switch,
             };
-            linux::run(ctx, &opts, &deps, tx).map(Some)
+            linux::run(ctx, &opts, &deps, tx).map(|o| Some(o.into()))
         }
     }
 }

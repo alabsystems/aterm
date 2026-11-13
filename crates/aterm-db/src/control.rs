@@ -441,6 +441,22 @@ impl Repair {
     pub(crate) const fn said(&self) -> Said {
         self.said
     }
+    /// This side appended to `tables` since this hint's last round
+    /// ([`crate::replica::Repair::announce`]): the endpoint tells each peer's hint
+    /// ([`Endpoint::announce`]).
+    pub(crate) fn announce(&mut self, tables: &std::collections::BTreeSet<Digest>, unnamed: bool) {
+        self.data.announce(tables, unnamed);
+    }
+    /// Whether this hint still names a table for a round this side initiates to take before
+    /// the ordinary interval ([`crate::replica::Repair::owes`]).
+    pub(crate) fn owes(&self) -> bool {
+        self.data.owes()
+    }
+    /// [`crate::replica::Repair::announced`] (tests).
+    #[cfg(test)]
+    pub(crate) fn announced(&self) -> (&std::collections::BTreeSet<Digest>, bool) {
+        self.data.announced()
+    }
     /// What this round's application exchange read of this Mac's clock against the peer's
     /// (`crate::clock`, F22), whether or not its table repair then succeeded. None also covers a
     /// round that reached no table-ID list, a peer that sent two marks, and a pre-F22 peer that
@@ -659,19 +675,26 @@ impl Endpoint {
     /// Signed fleet descriptors whose keys this endpoint's historical witness binds to seats,
     /// paired with locally observed contact IPs. The signature covers the descriptor, not the
     /// IP or observation time; the witness need not contain the full current roster.
+    ///
+    /// The book is read at every call. `held` keeps each entry's signature verdict from the
+    /// last call, under every field the check reads, so an entry that stands as it did is not
+    /// checked again (`aterm_net::fleet_member::HeldSignatures`); the witness is asked of each
+    /// held entry's key at every call, and nothing of it is kept.
     pub(crate) fn advertised_versions(
         &self,
         state: &Path,
+        held: &mut aterm_net::fleet_member::HeldSignatures,
     ) -> std::collections::BTreeMap<Actor, (std::net::IpAddr, String)> {
         use aterm_secrets::membership_log::NodeStanding;
         let Some(log) = &self.snapshot_log else {
             return std::collections::BTreeMap::new();
         };
         let membership = log.membership_ref();
-        aterm_net::fleet_member::read_peers(state)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|peer| peer.signature_holds())
+        let book = aterm_net::fleet_member::read_peers(state).unwrap_or_default();
+        let holds = held.judge(&book);
+        book.into_iter()
+            .zip(holds)
+            .filter_map(|(peer, holds)| holds.then_some(peer))
             .filter_map(|peer| {
                 let NodeStanding::Member(actor) = membership.node(peer.key?.bytes()) else {
                     return None;
@@ -870,6 +893,15 @@ impl Endpoint {
         self.paths = Some(paths);
         Ok(self)
     }
+    /// This process appended to `tables` (and, where `unnamed`, to one more it could not name):
+    /// the next round this endpoint initiates with each peer it keeps a hint of visits them
+    /// first ([`peers::Cache::announce`]). The hints are the endpoint's, shared by every round
+    /// with a peer in either direction, and each round starts from the endpoint's copy: what a
+    /// caller wrote into the `Repair` it passes to [`Self::exchange`] would be replaced.
+    pub(crate) fn announce(&self, tables: &std::collections::BTreeSet<Digest>, unnamed: bool) {
+        self.peers.announce(tables, unnamed);
+    }
+
     /// Make the rounds this endpoint initiates repair `first`'s table first while it names one both
     /// sides hold ([`crate::replica::Replica::prefer`]); an endpoint with no tables has none to.
     pub(crate) fn prefer(&mut self, first: crate::replica::First) {
@@ -1765,10 +1797,7 @@ impl Endpoint {
         exchange(
             pass,
             stream,
-            &Disk {
-                dir: &self.dir,
-                trust: self.trust,
-            },
+            &Disk::new(&self.dir, self.trust),
             side,
             repair,
         )
@@ -2429,7 +2458,8 @@ fn authenticate_identity(
 // from the journal's acknowledged prefix beside any writer. Only `retain` of a
 // valid record not yet held takes the writer lock, and only for its ingest, so
 // even a slow remote cannot own the local journal's writer lock. A writer kept
-// busy past the open's short wait leaves the new records unacknowledged.
+// busy past the open's short wait (`Disk::writer_wait`) leaves the new records
+// unacknowledged.
 trait Store {
     const MAX_WIRE: usize;
     fn inventory(&self) -> Result<BTreeSet<Digest>>;
@@ -2451,6 +2481,23 @@ trait Store {
 struct Disk<'a> {
     dir: &'a Path,
     trust: Trust,
+    /// How long `retain` waits for another local writer before it leaves the new records for
+    /// the peer to offer again: [`RETAIN_WRITER_WAIT`] in an exchange.
+    writer_wait: Duration,
+}
+/// An exchange's wait for another local writer of the control journal: short, since a record it
+/// could not take is offered again.
+const RETAIN_WRITER_WAIT: Duration = Duration::from_secs(2);
+impl<'a> Disk<'a> {
+    /// The control journal in `dir` as an exchange keeps it, waiting [`RETAIN_WRITER_WAIT`] for
+    /// another local writer.
+    const fn new(dir: &'a Path, trust: Trust) -> Self {
+        Self {
+            dir,
+            trust,
+            writer_wait: RETAIN_WRITER_WAIT,
+        }
+    }
 }
 impl Store for Disk<'_> {
     const MAX_WIRE: usize = MAX_NODE;
@@ -2507,7 +2554,7 @@ impl Store for Disk<'_> {
             match Journal::open_existing_until(
                 self.dir,
                 self.trust,
-                Instant::now() + Duration::from_secs(2),
+                Instant::now() + self.writer_wait,
             ) {
                 Ok(journal) => Some(journal),
                 // Another local writer kept the journal: acknowledge what is
@@ -2793,19 +2840,7 @@ fn exchange_membership_round(
     } else {
         Vec::new()
     };
-    let batch = store.batch(&ids)?;
-    let (sent, received, deferred) = match side {
-        Side::Initiator => {
-            let (sent, out) = send_batch(stream, &batch)?;
-            let (received, incoming) = receive_batch(stream, store)?;
-            (sent, received, out + incoming)
-        }
-        Side::Responder => {
-            let (received, incoming) = receive_batch(stream, store)?;
-            let (sent, out) = send_batch(stream, &batch)?;
-            (sent, received, out + incoming)
-        }
-    };
+    let (sent, received, deferred) = exchange_batches(stream, store, side, &ids, |_| {})?;
     hint.settle(
         key,
         &ids,
@@ -2854,29 +2889,46 @@ fn exchange(
     };
     let ids = repair.next(&local, &remote);
     repair.phase = Phase::ControlBatch;
-    let batch = store.batch(&ids)?;
-    let (sent, received, deferred) = match side {
-        Side::Initiator => {
-            repair.phase = Phase::BatchSend;
-            let (sent, out) = send_batch(stream, &batch)?;
-            repair.phase = Phase::BatchReceive;
-            let (received, incoming) = receive_batch(stream, store)?;
-            (sent, received, out + incoming)
-        }
-        Side::Responder => {
-            repair.phase = Phase::BatchReceive;
-            let (received, incoming) = receive_batch(stream, store)?;
-            repair.phase = Phase::BatchSend;
-            let (sent, out) = send_batch(stream, &batch)?;
-            (sent, received, out + incoming)
-        }
-    };
+    let (sent, received, deferred) = exchange_batches(stream, store, side, &ids, |phase| {
+        repair.phase = phase;
+    })?;
     repair.phase = Phase::ControlComplete;
     Ok(Report {
         sent,
         received,
         deferred,
     })
+}
+
+/// Fetch outgoing wires in the send turn. Receiving may change which records the
+/// store can expose; only missing identities, never a payload decision, cross it.
+fn exchange_batches(
+    stream: &mut (impl Read + Write),
+    store: &impl Store,
+    side: Side,
+    ids: &[Digest],
+    mut phase: impl FnMut(Phase),
+) -> Result<(usize, usize, usize)> {
+    match side {
+        Side::Initiator => {
+            phase(Phase::ControlBatch);
+            let batch = store.batch(ids)?;
+            phase(Phase::BatchSend);
+            let (sent, out) = send_batch(stream, &batch)?;
+            phase(Phase::BatchReceive);
+            let (received, incoming) = receive_batch(stream, store)?;
+            Ok((sent, received, out + incoming))
+        }
+        Side::Responder => {
+            phase(Phase::BatchReceive);
+            let (received, incoming) = receive_batch(stream, store)?;
+            phase(Phase::ControlBatch);
+            let batch = store.batch(ids)?;
+            phase(Phase::BatchSend);
+            let (sent, out) = send_batch(stream, &batch)?;
+            Ok((sent, received, out + incoming))
+        }
+    }
 }
 
 fn select(
@@ -3013,6 +3065,9 @@ pub(crate) fn read_u32(stream: &mut impl Read) -> Result<u32> {
 }
 
 #[cfg(test)]
-mod advertised_tests;
+pub(crate) mod advertised_tests;
+#[cfg(all(test, unix))]
+#[path = "control/send_boundary_tests.rs"]
+mod send_boundary_tests;
 #[cfg(test)]
 mod tests;

@@ -203,7 +203,10 @@ desks have no row.
   an open OSC 8 link, VT52 mid-address, htop narrowed from 100 columns to 80
   after drawing 99 (`render_debt_cut = 19`), shell integration revoked, held,
   stale or cleared, and Claude Code's two drawers. From v0.137.0 an eighteenth
-  session holds Codex's OSC 7501 program state.
+  session holds Codex's OSC 7501 program state. Desks written after v0.198.0
+  end with a `banner` session: DEC line sizes and DECSCA-protected cells on the
+  alternate screen and on the saved primary (`visible_cells`,
+  `alt_visible_cells`).
 - `held-failed` and `held-withheld` (v0.108.0): a held failed `make` whose lines
   are left behind as a failure (`history_failed`) or as the policy's choice
   (`history_withheld`).

@@ -7,6 +7,9 @@
 /// and a loaded host holds that exec for seconds, which a bounded run of the stand-in (agy's
 /// usage fetch, a version probe) would count against its budget: the bounded run must meet
 /// a stand-in that has already run, and the stand-in's directory may go once this returns.
+/// `body` runs on the `PATH` the bounded run gives it, which may hold nothing (on Linux an agy
+/// read's opener-free `PATH`, `agy_gate::off_screen`), so it names each program it starts by
+/// its absolute path (`/bin/cat`); the shell's builtins (`echo`, `printf`) need none.
 pub(crate) fn proven(path: &std::path::Path, body: &str) {
     use aterm_uds::spawnfd::Stdio;
     use std::os::unix::fs::PermissionsExt as _;

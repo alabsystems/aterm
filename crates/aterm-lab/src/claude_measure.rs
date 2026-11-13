@@ -49,7 +49,7 @@
 //!
 //! What [`crate::measure`] says of a refusal after step 6, an interrupt, a panic and a second
 //! interrupt holds here: the checkout ends as it began. What stays a person's or an agent's: the
-//! CHANGELOG line, the commit, the merge and the push.
+//! changelog entry (its own file under `changes/`), the commit, the merge and the push.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1423,7 +1423,7 @@ pub fn cmd_claude_measure(args: &[String]) -> Res {
             .join(" ")
     );
     println!(
-        "left to do by hand: a CHANGELOG line under [Unreleased], the commit, the merge and the push"
+        "left to do by hand: a changelog entry file under changes/, the commit, the merge and the push"
     );
     Ok(0)
 }

@@ -4,11 +4,11 @@
 //! THE NEED LEDGER: `~/.config/aterm/secrets/needs.toml`, 0600, one row per `(want, purpose)`,
 //! read and written under `needs.lock`. Its folder is one no vault entry can name
 //! (`text::valid_entry_name`), so the vault never overwrites it. Rows carry names, states and
-//! the words a person reads, never a value.
+//! the lines `need ls` prints, never a value.
 
 use super::{
-    Act, Ask, Facts, GhProfile, Need, Proof, Purpose, Reason, RefusalClaim, Retirement, State,
-    Wait, Want, act, settle,
+    Act, Facts, GhProfile, Need, Purpose, Reason, RefusalClaim, Retirement, State, Wait, Want, act,
+    settle,
 };
 use crate::client::{Paths, toml_str};
 use crate::{Error, fsx};
@@ -25,9 +25,9 @@ const MAX_ROWS: usize = 64;
 /// The largest ledger read.
 const MAX_BYTES: usize = 1 << 20;
 
-/// This format requires agh's development consumer to confirm its own delivery. Older
-/// writers reject it rather than automatically fulfilling a migrated request again.
-const FORMAT: i64 = 3;
+/// Format 3 requires agh's development consumer to confirm its own delivery; format 4 holds no
+/// person's ask. Older writers reject it rather than misread its rows.
+const FORMAT: i64 = 4;
 
 /// The ledger's lock, released on drop.
 struct Lock(std::fs::File);
@@ -91,7 +91,7 @@ pub(crate) fn load(paths: &Paths) -> crate::Result<Vec<Need>> {
             let format = container
                 .get("format")
                 .and_then(aterm_toml::Value::as_integer)
-                .filter(|format| matches!(*format, 2 | FORMAT))
+                .filter(|format| matches!(*format, 2 | 3 | FORMAT))
                 .ok_or_else(damaged)?;
             let rows = match container.get("rows") {
                 None => &[][..],
@@ -145,7 +145,7 @@ pub(crate) fn load(paths: &Paths) -> crate::Result<Vec<Need>> {
             // fulfilled. No stored field distinguishes that from a real consumer check.
             // Preserve its identity and evidence, but require confirmation once. A peek
             // only interprets the old format; an actual ledger mutation publishes FORMAT.
-            if format < FORMAT
+            if format < 3
                 && need.want == Want::Gh(GhProfile::Dev)
                 && need.purpose == Purpose::AghDev
                 && need.state == State::Fulfilled
@@ -179,64 +179,41 @@ fn row_of(t: &aterm_toml::Table) -> Option<Need> {
         }),
         None => None,
     };
-    let proof = match n("proof_seq") {
-        Some(seq) => Some(Proof {
-            seq,
-            absent: b("proof_absent")?,
-            every_locker_open: b("proof_every_locker_open")?,
-            before_commons: b("proof_before_commons")?,
-            swept_unheld: b("proof_swept_unheld")?,
-            window_ended: b("proof_window_ended").unwrap_or(false),
-            custodian_silent: b("proof_custodian_silent").unwrap_or(false),
-        }),
-        None => None,
+    // Before format 4 a need no Mac held could await a person. It waits on the lab's Macs now:
+    // a posted one is open on the table, and one never posted is still this Mac's to post.
+    let asked = s("state")? == "awaiting-person";
+    let (state, wait) = match (asked, b("posted")?) {
+        (true, true) => (State::Open, Wait::Holders),
+        (true, false) => (State::Local, Wait::Requester),
+        (false, _) => (State::parse(s("state")?)?, Wait::parse(s("wait")?)?),
     };
-    let ask = match s("ask_what") {
-        Some(what) => Some(Ask {
-            what: what.to_owned(),
-            step: s("ask_step")?.to_owned(),
-            reason: s("ask_reason")?.to_owned(),
-            more: t
-                .get("ask_more")
-                .and_then(aterm_toml::Value::as_array)
-                .map(|lines| {
-                    lines
-                        .iter()
-                        .filter_map(aterm_toml::Value::as_str)
-                        .map(str::to_owned)
-                        .collect()
-                })
-                .unwrap_or_default(),
-            needs_you: s("needs_you")?.to_owned(),
-        }),
-        None => None,
+    let line = if asked {
+        "waits on the lab's Macs".to_owned()
+    } else {
+        s("line").unwrap_or_default().to_owned()
     };
     Some(Need {
         id,
         want: Want::parse(s("want")?).ok()?,
         purpose: Purpose::parse(s("purpose")?)?,
-        state: State::parse(s("state")?)?,
-        wait: Wait::parse(s("wait")?)?,
+        state,
+        wait,
         retired,
         raised: n("raised")?,
         updated: n("updated")?,
         raises: u32::try_from(n("raises")?).ok()?,
         refused: n("refused").map(RefusalClaim::LegacySequence),
         needed: b("needed")?,
-        asking: b("asking")?,
-        proof,
-        ask,
         got: b("got")?,
         got_authorized: b("got_authorized")?,
         raised_again_on_change: b("raised_again_on_change"),
         posted: b("posted")?,
         custodian_silent: b("custodian_silent").unwrap_or(false),
-        late_offer: b("late_offer").unwrap_or(false),
         record: match s("record") {
             Some(text) => Some(unhex(text)?),
             None => None,
         },
-        line: s("line").unwrap_or_default().to_owned(),
+        line,
         seq: n("seq"),
     })
 }
@@ -262,7 +239,6 @@ fn render(paths: &Paths, rows: &[Need]) -> crate::Result<String> {
         put("updated", int(need.updated).to_string());
         put("raises", need.raises.to_string());
         put("needed", need.needed.to_string());
-        put("asking", need.asking.to_string());
         put("got", need.got.to_string());
         put("got_authorized", need.got_authorized.to_string());
         put("posted", need.posted.to_string());
@@ -290,9 +266,6 @@ fn render(paths: &Paths, rows: &[Need]) -> crate::Result<String> {
         if need.custodian_silent {
             put("custodian_silent", "true".to_owned());
         }
-        if need.late_offer {
-            put("late_offer", "true".to_owned());
-        }
         if let Some(retired) = &need.retired {
             put("reason", toml_str(retired.reason.word()));
             put("evidence", toml_str(&retired.evidence));
@@ -300,30 +273,6 @@ fn render(paths: &Paths, rows: &[Need]) -> crate::Result<String> {
             if let Some(generation) = retired.generation {
                 put("generation", int(generation).to_string());
             }
-        }
-        if let Some(proof) = &need.proof {
-            put("proof_seq", int(proof.seq).to_string());
-            put("proof_absent", proof.absent.to_string());
-            put(
-                "proof_every_locker_open",
-                proof.every_locker_open.to_string(),
-            );
-            put("proof_before_commons", proof.before_commons.to_string());
-            put("proof_swept_unheld", proof.swept_unheld.to_string());
-            if proof.window_ended {
-                put("proof_window_ended", "true".to_owned());
-            }
-            if proof.custodian_silent {
-                put("proof_custodian_silent", "true".to_owned());
-            }
-        }
-        if let Some(ask) = &need.ask {
-            put("ask_what", toml_str(&ask.what));
-            put("ask_step", toml_str(&ask.step));
-            put("ask_reason", toml_str(&ask.reason));
-            let more: Vec<String> = ask.more.iter().map(|line| toml_str(line)).collect();
-            put("ask_more", format!("[{}]", more.join(", ")));
-            put("needs_you", toml_str(&ask.needs_you));
         }
     }
     if text.len() > MAX_BYTES {
@@ -423,6 +372,35 @@ pub fn raise_refused(paths: &Paths, want: Want, purpose: Purpose, seq: u64) -> c
         purpose,
         Some(RefusalClaim::LegacySequence(seq)),
     )
+}
+
+/// Raise a need only while its consumer's local admission still holds, including after
+/// waiting for the ledger lock and immediately before saving. `refused` is the same
+/// legacy sequence as [`raise_refused`]. `admitted` must not wait for a vault lock,
+/// reenter this ledger, run a subprocess, use the network or perform effects.
+///
+/// # Errors
+/// As [`raise`], or the consumer withdrew its admission.
+pub fn raise_with_admission(
+    paths: &Paths,
+    want: Want,
+    purpose: Purpose,
+    refused: Option<u64>,
+    admitted: impl Fn() -> crate::Result<()>,
+) -> crate::Result<Need> {
+    admitted()?;
+    with_ledger(paths, |rows, facts| {
+        admitted()?;
+        let raised = raise_in(
+            rows,
+            facts,
+            want,
+            purpose,
+            refused.map(RefusalClaim::LegacySequence),
+        )?;
+        admitted()?;
+        Ok(raised)
+    })
 }
 
 /// Record a consumer refusal only while the captured paired materialization's exact
@@ -753,43 +731,28 @@ fn satisfy_in(
     Ok(Some(next))
 }
 
-/// Withdraw by hand this Mac's needs that `selector` names (a want key or a request id), or,
-/// with `declined`, decline as a person each one awaiting a person; either keeps `note` (§6.2).
+/// Withdraw by hand this Mac's needs that `selector` names (a want key or a request id),
+/// keeping `note` (§6.2).
 ///
 /// # Errors
-/// Nothing in the ledger matches, a decline names no need awaiting a person, or the ledger
-/// cannot be read or written.
-pub fn retire(
-    paths: &Paths,
-    selector: &str,
-    declined: bool,
-    note: &str,
-) -> crate::Result<Vec<Need>> {
+/// Nothing in the ledger matches, or the ledger cannot be read or written.
+pub fn retire(paths: &Paths, selector: &str, note: &str) -> crate::Result<Vec<Need>> {
     with_ledger(paths, |rows, facts| {
         let matches = |need: &Need| need.named(selector);
         if !rows.iter().any(matches) {
             return Err(Error::new(format!(
-                "no need on this Mac is {selector} (aterm secrets need ls names them); a need another Mac raised is withdrawn on that Mac, and one awaiting a person is declined there, or on the vault's admin Mac by the id aterm secrets need ls --all prints"
+                "no need on this Mac is {selector} (aterm secrets need ls names them); a need another Mac raised is withdrawn on that Mac"
             )));
         }
         let mut changed = Vec::new();
         for need in rows.iter_mut().filter(|need| matches(need)) {
-            let step = if declined {
-                Act::Decline(note.to_owned())
-            } else {
-                Act::Withdraw(note.to_owned())
-            };
-            if let Some(next) = act(need, facts, &step) {
+            if let Some(next) = act(need, facts, &Act::Withdraw(note.to_owned())) {
                 *need = next.clone();
                 changed.push(next);
             }
         }
         if changed.is_empty() {
-            return Err(Error::new(if declined {
-                format!("{selector} awaits no person here, so there is nothing to decline")
-            } else {
-                format!("{selector} has already ended")
-            }));
+            return Err(Error::new(format!("{selector} has already ended")));
         }
         Ok(changed)
     })
@@ -818,10 +781,6 @@ pub fn absorb(
             };
             let next = match step {
                 Absorb::Flushed(record) => act(need, facts, &Act::Flush).map(|next| Need {
-                    record: Some(record.clone()),
-                    ..next
-                }),
-                Absorb::Posted(record) => act(need, facts, &Act::Post).map(|next| Need {
                     record: Some(record.clone()),
                     ..next
                 }),

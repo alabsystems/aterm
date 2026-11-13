@@ -337,7 +337,7 @@ fn under_observe_the_point_types_the_policys_own_text_and_books_its_would() {
 }
 
 /// A SESSION THE LOOP MEETS ONLY AT POINTS IS TOLD ITS WAKE AT THE NEXT ONE (the slice-2 plan's
-/// 2.9: an agent whose reader names no background wait, as the removed Gemini CLI's did, so no
+/// 2.9: an agent whose reader names no background wait, so no
 /// break ever opens a hold): a wake that turns ready between two points rides the second point's
 /// act, with no break's line, hold or bookkeeping. NEGATIVE CONTROL: the first point, the wake
 /// still pending, carries nothing.

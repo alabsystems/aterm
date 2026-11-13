@@ -69,6 +69,23 @@ fn costs(dir: &std::path::Path, beside: &std::path::Path) -> (Costs, astream_bro
     )
 }
 
+/// Device flushes for one 256-record checkpoint group and its dependent write.
+fn group_costs(dir: &std::path::Path, beside: &std::path::Path) -> (u64, u64) {
+    let mut log = Log::open(dir, "count", b"pinned", false, limits()).unwrap();
+    log.finish_open().unwrap();
+    let (cost, _) = flushes(|| {
+        log.append_many_then(
+            (0..256).map(|_| ("app/count", vec![1; 64])).collect(),
+            beside,
+            |_, flush| {
+                aterm_uds::private_file::write_private_flushed(beside, "witness", b"256", flush)
+            },
+        )
+        .unwrap()
+    });
+    cost
+}
+
 /// ONE FULL FLUSH ACKNOWLEDGES AN APPEND on a log astream serves Ordered: the record, the
 /// checkpoint's file and its directory each take a barrier, and the commit one full flush. A
 /// dependent write follows the commit: beside the log it takes two barriers more and no full
@@ -97,6 +114,18 @@ fn an_append_takes_one_full_flush_on_an_ordered_log() {
         let _durable = aterm_journal::seam::mutate(aterm_journal::seam::Mutant::Durable);
         costs(&scratch.path().join("durable"), &beside)
     };
+    let group = group_costs(&scratch.path().join("group"), &beside);
+    let strict_group = {
+        let _strict = aterm_journal::seam::serve_strict();
+        group_costs(&scratch.path().join("strict-group"), &beside)
+    };
+    let apart_group = {
+        let _apart = aterm_journal::seam::apart();
+        group_costs(&scratch.path().join("apart-group"), &beside)
+    };
+    println!(
+        "256-record groups: same-device {group:?}, strict {strict_group:?}, apart {apart_group:?}"
+    );
     println!(
         "served={served:?}: ordered {ordered:?}, strict {strict:?}, apart {apart:?}, \
          durable (control) {durable:?}"
@@ -110,6 +139,9 @@ fn an_append_takes_one_full_flush_on_an_ordered_log() {
     if served != astream_broker::Tier::Ordered {
         return;
     }
+    assert_eq!(group, (1, 260));
+    assert_eq!(strict_group, (260, 0));
+    assert_eq!(apart_group, (3, 258));
     // astream's own reopen of a log like the journal's, two records long.
     let bare = scratch.path().join("bare.astream");
     let options = || {

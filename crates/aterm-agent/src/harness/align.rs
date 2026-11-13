@@ -824,7 +824,7 @@ fn capture_with(
     let mut stderr_watch = match stop {
         Some(stop) => {
             let (pipe, writer) =
-                std::io::pipe().map_err(|e| format!("its stderr could not be watched: {e}"))?;
+                aterm_uds::pipe().map_err(|e| format!("its stderr could not be watched: {e}"))?;
             capture_pipe_nonblocking(pipe.as_raw_fd())
                 .map_err(|e| format!("its stderr could not be watched: {e}"))?;
             cmd.stderr(Stdio::from(writer));
@@ -888,7 +888,7 @@ fn capture_with(
     let (tx, rx) = mpsc::channel();
     // Every Unix reader can be cancelled, including during unwinding of an unwatched capture.
     #[cfg(unix)]
-    let cancel_reader = match std::io::pipe() {
+    let cancel_reader = match aterm_uds::pipe() {
         Ok((r, w)) => {
             child.cancel = Some(w);
             Some(r)

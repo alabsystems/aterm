@@ -17,7 +17,8 @@ use atpkg_publish::lane::{self, LaneKind, self_check};
 use atpkg_publish::testkit::NOW;
 use atpkg_publish::triple::Os;
 
-use super::fixture::{Fx, git};
+use super::fixture::{Fx, git, public_repos, release_config, unit_dirs};
+use crate::shared::write_config;
 
 #[derive(Default)]
 struct FakeBuild {
@@ -116,7 +117,7 @@ impl ServiceManager for Recorder {
             .expect("calls")
             .push(format!("lint {}", kind.as_str()));
         match kind {
-            LaneKind::Alab => install::lint_plists(paths),
+            LaneKind::Alab | LaneKind::Tip => install::lint_plists(paths),
             LaneKind::Linux => Ok(Lint::NotRun("the recorder does not run systemd".into())),
         }
     }
@@ -152,6 +153,13 @@ pub(super) struct Box_ {
     pub(super) machine: Machine,
 }
 
+/// A box to install lanes on: a clean checkout of the lane's inputs, a trust checkout whose
+/// origin names the staging owner's `trust`, a signed channel head (git 7), and the agh
+/// routing a lane unit reads: a dev profile writing the staging owner, a release profile
+/// writing `alabsystems`, both token files present, and atpkg-publish's `[[writers]]` grant
+/// over the index repository and every program repository the alab and tip lanes write. The
+/// head's pins select no other repository for a Linux lane (git's packages live in the index
+/// repository), so every lane's `hosts check --host agh` holds here.
 pub(super) fn machine(label: &str, os: Os) -> Box_ {
     let mut fx = Fx::new(label);
     let repo = fx.path("checkout");
@@ -162,6 +170,29 @@ pub(super) fn machine(label: &str, os: Os) -> Box_ {
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "inputs"]);
     fx.ctx.repo_root = repo;
+    super::fixture::trust_checkout(&fx.ctx);
+    fx.publish_head(1, &[("git", 7)]);
+    let tokens = fx.path("unit-tokens");
+    aterm_uds::private_file::create_private_dir(&tokens).expect("the token directory");
+    for name in ["dev", "release"] {
+        aterm_uds::private_file::write_private(
+            &tokens,
+            &format!("{name}.token"),
+            format!("{}\n", agh_fake::token(name)).as_bytes(),
+        )
+        .expect("the token file");
+    }
+    let mut grants = public_repos();
+    for repo in atpkg_publish::hosts_check::tip_program_repos() {
+        let slug = format!("alabsystems/{repo}");
+        if !grants.contains(&slug) {
+            grants.push(slug);
+        }
+    }
+    write_config(
+        &unit_dirs(&fx.ctx),
+        &release_config(&tokens, &fx.ctx.accounts.staging, &grants),
+    );
     let rec = Recorder::new(&fx.ctx.state_dir);
     let machine = Machine {
         os,

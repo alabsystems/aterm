@@ -932,12 +932,13 @@ fn markdown_cmd_a_and_escape_own_exact_source_selection() {
 #[cfg(unix)]
 #[test]
 fn raw_key_sequence_never_reaches_parked_pty_under_native_tab() {
+    use std::os::fd::IntoRawFd;
     use std::sync::Arc;
 
     use aterm_session::sink::SinkWriter;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let (reader, writer) = aterm_uds::pipe().expect("pipe");
+    let pipe = [reader.into_raw_fd(), writer.into_raw_fd()];
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(

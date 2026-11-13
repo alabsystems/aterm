@@ -112,12 +112,16 @@ struct FakeSupervisor {
     loads: RefCell<usize>,
     unloads: RefCell<usize>,
     replaced: std::cell::Cell<bool>,
+    image_known: std::cell::Cell<bool>,
+    renewal_lags: std::cell::Cell<bool>,
+    repaired_after_probe: std::cell::Cell<bool>,
     misplaced: RefCell<Option<String>>,
     renews: RefCell<usize>,
     stop_error: RefCell<Option<&'static str>>,
     releases: RefCell<std::collections::BTreeMap<PathBuf, Option<Release>>>,
     release_probes: RefCell<Vec<PathBuf>>,
     off_on_probe: RefCell<Option<(PathBuf, PathBuf)>>,
+    switched_off: std::cell::Cell<bool>,
 }
 
 impl FakeSupervisor {
@@ -127,12 +131,16 @@ impl FakeSupervisor {
             loads: RefCell::new(0),
             unloads: RefCell::new(0),
             replaced: std::cell::Cell::new(false),
+            image_known: std::cell::Cell::new(true),
+            renewal_lags: std::cell::Cell::new(false),
+            repaired_after_probe: std::cell::Cell::new(false),
             misplaced: RefCell::new(None),
             renews: RefCell::new(0),
             stop_error: RefCell::new(None),
             releases: RefCell::new(std::collections::BTreeMap::new()),
             release_probes: RefCell::new(Vec::new()),
             off_on_probe: RefCell::new(None),
+            switched_off: std::cell::Cell::new(false),
         }
     }
 }
@@ -187,13 +195,27 @@ impl ServiceSupervisor for FakeSupervisor {
     }
 
     fn runs_replaced(&self, _pid: u32, _program: &Path) -> bool {
-        self.replaced.get()
+        let replaced = self.replaced.get();
+        if self.repaired_after_probe.replace(false) {
+            self.replaced.set(false);
+        }
+        replaced
+    }
+
+    fn running_image_matches(&self, _pid: u32, _program: &Path) -> Option<bool> {
+        self.image_known.get().then(|| !self.replaced.get())
     }
 
     fn renew(&self) -> Result<(), String> {
         *self.renews.borrow_mut() += 1;
-        self.replaced.set(false);
+        if !self.renewal_lags.get() {
+            self.replaced.set(false);
+        }
         Ok(())
+    }
+
+    fn switched_off(&self) -> Result<bool, String> {
+        Ok(self.switched_off.get())
     }
 }
 
@@ -329,54 +351,37 @@ fn alab_tcp_is_advertised_on_every_network_a_member_is_on() {
     )
     .unwrap();
 
-    let office_routes = vec!["192.168.1.42".to_owned()];
-    let cafe_routes = vec!["172.20.10.4".to_owned()];
     let now = 1_800_000_000;
     let heard = Some(now - 60);
-    for routes in [&office_routes, &cafe_routes] {
-        assert!(
-            advertises(true, routes, heard, Some(now)),
-            "a member advertises on {routes:?}: no network is special"
-        );
-    }
-    assert!(!advertises(true, &[], heard, Some(now)), "offline");
     assert!(
-        !advertises(false, &office_routes, heard, Some(now)),
-        "swarm off"
+        advertises(true, true, heard, Some(now)),
+        "a member advertises wherever it has a route: no network is special"
     );
+    assert!(!advertises(true, false, heard, Some(now)), "offline");
+    assert!(!advertises(false, true, heard, Some(now)), "swarm off");
     assert!(
-        !advertises(true, &office_routes, None, Some(now)),
+        !advertises(true, true, None, Some(now)),
         "no ALab vault member"
     );
     assert!(
-        !advertises(true, &office_routes, heard, None),
+        !advertises(true, true, heard, None),
         "a clock it cannot read gives no age"
     );
     assert!(
-        !advertises(true, &office_routes, Some(now + 1), Some(now)),
+        !advertises(true, true, Some(now + 1), Some(now)),
         "a word dated after its clock gives no age"
     );
     assert!(
-        advertises(
-            true,
-            &office_routes,
-            Some(now - ALAB_MEMBER_TTL_SECS),
-            Some(now)
-        ),
+        advertises(true, true, Some(now - ALAB_MEMBER_TTL_SECS), Some(now)),
         "its vault heard a day ago to the second"
     );
     assert!(
-        !advertises(
-            true,
-            &office_routes,
-            Some(now - ALAB_MEMBER_TTL_SECS - 1),
-            Some(now)
-        ),
+        !advertises(true, true, Some(now - ALAB_MEMBER_TTL_SECS - 1), Some(now)),
         "its vault unheard a day"
     );
     for paths in [&unconfigured, &foreign_paths] {
         assert!(
-            !should_advertise_alab_tcp_with(paths, None, &cafe_routes, Some(now)),
+            !should_advertise_alab_tcp_with(paths, None, || true, Some(now)),
             "{}: no ALab vault, no advert",
             paths.home.display()
         );
@@ -416,9 +421,8 @@ fn the_lan_responder_stops_at_the_next_ask_after_a_removal_or_turn_off() {
         other => panic!("the vault's creator is in it: {other:?}"),
     };
     let heard = heard_now();
-    let routes = vec!["192.0.2.7".to_owned()];
     let answers =
-        |now: u64| lan_responder_allowed(Some(&state), key, (&paths, None), &routes, Some(now));
+        |now: u64| lan_responder_allowed(Some(&state), key, (&paths, None), || true, Some(now));
     let roster = |toml: &str| {
         let admin = aterm_secrets::client::admin_open(&paths).unwrap();
         let mut doc = admin.doc.clone();
@@ -432,7 +436,7 @@ fn the_lan_responder_stops_at_the_next_ask_after_a_removal_or_turn_off() {
     };
     assert!(answers(heard), "an ALab member answers");
     assert!(
-        !lan_responder_allowed(Some(&state), key, (&paths, None), &[], Some(heard)),
+        !lan_responder_allowed(Some(&state), key, (&paths, None), || false, Some(heard)),
         "offline"
     );
 
@@ -441,7 +445,7 @@ fn the_lan_responder_stops_at_the_next_ask_after_a_removal_or_turn_off() {
         "a day heard to the second"
     );
     assert!(
-        !lan_responder_allowed(Some(&state), key, (&paths, None), &routes, None),
+        !lan_responder_allowed(Some(&state), key, (&paths, None), || true, None),
         "a clock it cannot read"
     );
     assert!(!answers(heard - 1), "a word dated after its clock");
@@ -453,7 +457,7 @@ fn the_lan_responder_stops_at_the_next_ask_after_a_removal_or_turn_off() {
         !should_advertise_alab_tcp_with(
             &paths,
             None,
-            &routes,
+            || true,
             Some(heard + ALAB_MEMBER_TTL_SECS + 1)
         ),
         "its advert too"
@@ -479,13 +483,305 @@ fn the_lan_responder_stops_at_the_next_ask_after_a_removal_or_turn_off() {
 
     let other = aterm_net::fleet::NodeKey::from_bytes([9; 32]);
     assert!(
-        !lan_responder_allowed(Some(&state), other, (&paths, None), &routes, Some(heard)),
+        !lan_responder_allowed(Some(&state), other, (&paths, None), || true, Some(heard)),
         "another node key"
     );
     assert!(
-        !lan_responder_allowed(None, key, (&paths, None), &routes, Some(heard)),
+        !lan_responder_allowed(None, key, (&paths, None), || true, Some(heard)),
         "no state folder"
     );
+}
+
+/// The route is the last thing the responder and the advert ask, and they ask it only where
+/// everything else already allows an answer: a read of the routes asks the kernel's routing
+/// table, and a Mac that left its fleet, turned its node off, is no member, has the swarm off or
+/// cannot date its vault's word has no use for the answer.
+///
+/// NEGATIVE CONTROLS (2026-11-12): with the route asked first in `should_advertise_alab_tcp_with`
+/// (`routed() && advertises(enabled, true, heard, now_secs)`), a Mac that cannot read its clock
+/// asks once (`a clock it cannot read`); with it asked before the node's own files in
+/// `lan_responder_allowed` (`let routed = routed();` first, and `|| routed` passed on), a Mac
+/// that left its fleet asks once (`the fleet left`).
+#[cfg(unix)]
+#[test]
+fn a_node_that_would_not_answer_asks_nothing_of_its_routes() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let paths = aterm_secrets::client::Paths::for_home(&tmp.path().join("home"));
+    let source = tmp.path().join("fixture.vault");
+    aterm_secrets::client::create(&paths, source.to_str().unwrap(), None, Some("m1")).unwrap();
+    aterm_secrets::client::test_alab_standing(&paths);
+    let state = tmp.path().join("state");
+    aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+    let key = aterm_net::fleet_member::node_identity(&state)
+        .unwrap()
+        .key();
+    let heard = match aterm_secrets::client::status(&paths).unwrap().membership {
+        aterm_secrets::client::Membership::In { heard, .. } => heard,
+        other => panic!("the vault's creator is in it: {other:?}"),
+    };
+    // How many times one ask read the routes, and what it answered on a Mac that has one.
+    let asked = |state: Option<&Path>,
+                 key: aterm_net::fleet::NodeKey,
+                 config: Option<&Path>,
+                 now: Option<u64>| {
+        let reads = std::cell::Cell::new(0);
+        let answered = lan_responder_allowed(
+            state,
+            key,
+            (&paths, config),
+            || {
+                reads.set(reads.get() + 1);
+                true
+            },
+            now,
+        );
+        (answered, reads.get())
+    };
+    let member = |state: &Path| asked(Some(state), key, None, Some(heard));
+    assert_eq!(member(&state), (true, 1), "a member asks once");
+
+    let left = state.join(aterm_net::fleet_member::OFF_FILE);
+    std::fs::write(&left, b"").unwrap();
+    assert_eq!(member(&state), (false, 0), "the fleet left");
+    std::fs::remove_file(&left).unwrap();
+    assert_eq!(member(&state), (true, 1), "a member again");
+
+    let off = off_path(&state);
+    std::fs::write(&off, b"").unwrap();
+    assert_eq!(member(&state), (false, 0), "the node turned off");
+    std::fs::remove_file(&off).unwrap();
+
+    let other = aterm_net::fleet::NodeKey::from_bytes([9; 32]);
+    assert_eq!(
+        asked(Some(&state), other, None, Some(heard)),
+        (false, 0),
+        "another node key"
+    );
+    assert_eq!(
+        asked(None, key, None, Some(heard)),
+        (false, 0),
+        "no state folder"
+    );
+    assert_eq!(
+        asked(Some(&state), key, None, None),
+        (false, 0),
+        "a clock it cannot read"
+    );
+    assert_eq!(
+        asked(
+            Some(&state),
+            key,
+            None,
+            Some(heard + ALAB_MEMBER_TTL_SECS + 1)
+        ),
+        (false, 0),
+        "a day and a second unheard"
+    );
+    let swarm_off = tmp.path().join("aterm.toml");
+    std::fs::write(&swarm_off, "[swarm]\nenabled = false\n").unwrap();
+    assert_eq!(
+        asked(Some(&state), key, Some(&swarm_off), Some(heard)),
+        (false, 0),
+        "the swarm off"
+    );
+
+    // The advert's ask, on a Mac that is no member and on this one.
+    let no_vault = aterm_secrets::client::Paths::for_home(&tmp.path().join("no-vault"));
+    for (vault, advertised) in [(&no_vault, false), (&paths, true)] {
+        let reads = std::cell::Cell::new(0);
+        let answered = should_advertise_alab_tcp_with(
+            vault,
+            None,
+            || {
+                reads.set(reads.get() + 1);
+                true
+            },
+            Some(heard),
+        );
+        assert_eq!(
+            (answered, reads.get()),
+            (advertised, usize::from(advertised)),
+            "{}",
+            vault.home.display()
+        );
+    }
+}
+
+/// One kernel event message as `PF_SYSTEM` delivers it (Apple's, the network class's), for a
+/// [`RouteStanding`] over a stand-in socket. On Linux it reads as a netlink message that names a
+/// change, whatever its words.
+#[cfg(unix)]
+fn kernel_event(subclass: u32, code: u32) -> Vec<u8> {
+    [24_u32, 1, 1, subclass, 37, code]
+        .into_iter()
+        .flat_map(u32::to_ne_bytes)
+        .collect()
+}
+
+/// A [`RouteStanding`] that hears what a test writes to the socket returned beside it.
+#[cfg(unix)]
+fn standing_over_a_stand_in() -> (RouteStanding, std::os::unix::net::UnixDatagram) {
+    let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
+    let standing = RouteStanding {
+        changes: Some(aterm_uds::network::RouteChanges::over(heard.into())),
+        changed: None,
+        seen: None,
+    };
+    (standing, kernel)
+}
+
+/// The node's advert and its LAN responder ask whether this Mac has a route many times a
+/// minute, and each read of the routes asks the kernel's routing table. One read that found a
+/// route answers the asks after it until the kernel names a change of network or ten seconds
+/// pass, whichever is first; the next ask then reads again. For a second after a heard change
+/// every ask reads, and the first read after that second is the one that stands. A message that
+/// names no change (a multicast join) ends nothing.
+///
+/// NEGATIVE CONTROLS (2026-11-12), each in `RouteStanding::has_route`: with a heard change
+/// leaving the kept answer (`Some(true) => {}`), the ask after an address change reads nothing
+/// (`an address change`); with a read kept however soon after a change it came (`settled` taken
+/// as `true`), the second ask after the change reads nothing (`a read at a heard change is not
+/// kept`); with no age judged (`.is_some()` for the `ROUTE_STANDS` test), the ask ten seconds on
+/// reads nothing (`ten seconds on`).
+#[cfg(unix)]
+#[test]
+fn a_route_stands_until_a_network_change_or_ten_seconds() {
+    let (mut standing, kernel) = standing_over_a_stand_in();
+    let reads = std::cell::Cell::new(0);
+    let read = || {
+        reads.set(reads.get() + 1);
+        true
+    };
+    let start = Instant::now();
+    for asks in 0..100 {
+        assert!(standing.has_route(start + Duration::from_millis(asks), read));
+    }
+    assert_eq!(reads.get(), 1, "a hundred asks, one read");
+
+    #[cfg(target_os = "macos")]
+    {
+        kernel.send(&kernel_event(2, 7)).expect("a multicast join");
+        assert!(standing.has_route(start + Duration::from_secs(1), read));
+        assert_eq!(reads.get(), 1, "a multicast join is no change of network");
+    }
+
+    kernel.send(&kernel_event(1, 1)).expect("an address change");
+    let changed = start + Duration::from_secs(2);
+    assert!(standing.has_route(changed, read));
+    assert_eq!(reads.get(), 2, "an address change");
+    assert!(standing.has_route(changed, read));
+    assert_eq!(reads.get(), 3, "a read at a heard change is not kept");
+    assert!(standing.has_route(changed + ROUTE_SETTLES - Duration::from_nanos(1), read));
+    assert_eq!(reads.get(), 4, "nor one made before the change has settled");
+    let settled = changed + ROUTE_SETTLES;
+    assert!(standing.has_route(settled, read));
+    assert_eq!(reads.get(), 5, "the first read after it settled");
+    assert!(standing.has_route(settled, read));
+    assert_eq!(reads.get(), 5, "stands: a change is heard once");
+
+    let last = settled + ROUTE_STANDS - Duration::from_nanos(1);
+    assert!(standing.has_route(last, read));
+    assert_eq!(reads.get(), 5, "within ten seconds of the read");
+    assert!(standing.has_route(settled + ROUTE_STANDS, read));
+    assert_eq!(reads.get(), 6, "ten seconds on");
+    assert!(standing.has_route(settled + ROUTE_STANDS + Duration::from_secs(9), read));
+    assert_eq!(reads.get(), 6, "the ten seconds count from the last read");
+
+    // An ask dated before the read it would lean on (two askers, one clock read each) reads.
+    assert!(standing.has_route(settled, read));
+    assert_eq!(
+        reads.get(),
+        7,
+        "a read dated after the ask is not leaned on"
+    );
+}
+
+/// What a standing never keeps: that this Mac has no route, so one that comes online is seen at
+/// the next ask; a route lost at a change of network, which is read as lost; a route read at
+/// the very ask that heard the change, which can be the route the change is about to take away;
+/// and anything at all once nothing can tell it of a change, whether no socket opened or the one
+/// it had failed.
+///
+/// NEGATIVE CONTROLS (2026-11-12), each in `RouteStanding::has_route`: with every read kept
+/// (`self.seen = Some(now)`), the ask after an unrouted read answers that it has a route without
+/// reading (`that it has no route is never kept`); with a read kept however soon after a change
+/// it came (`settled` taken as `true`), the ask after the change answers that it has a route
+/// without reading (`a route read at the change is not kept`); with a missing socket passed over
+/// as no change (`None => {}`), the second ask with no socket reads nothing (`no socket`).
+#[cfg(unix)]
+#[test]
+fn no_route_and_no_change_socket_are_read_at_every_ask() {
+    let reads = std::cell::Cell::new(0);
+    let read = |routed: bool| {
+        let reads = &reads;
+        move || {
+            reads.set(reads.get() + 1);
+            routed
+        }
+    };
+    let start = Instant::now();
+
+    let (mut standing, kernel) = standing_over_a_stand_in();
+    for asks in 1..=3 {
+        assert!(
+            !standing.has_route(start, read(false)),
+            "that it has no route is never kept"
+        );
+        assert_eq!(reads.get(), asks, "no route is read at every ask");
+    }
+    assert!(standing.has_route(start, read(true)), "online");
+    assert!(standing.has_route(start, read(false)), "and it stands");
+    assert_eq!(reads.get(), 4);
+    kernel
+        .send(&kernel_event(1, 2))
+        .expect("an address removed");
+    assert!(!standing.has_route(start, read(false)), "a route lost");
+    assert!(!standing.has_route(start, read(false)));
+    assert_eq!(reads.get(), 6, "and read as lost at every ask");
+
+    // The kernel names the change before the routes follow it: the read at that ask still
+    // finds the route, and the ask after it reads again and finds it gone.
+    reads.set(0);
+    let (mut standing, kernel) = standing_over_a_stand_in();
+    assert!(standing.has_route(start, read(true)));
+    kernel
+        .send(&kernel_event(1, 2))
+        .expect("an address removed");
+    assert!(
+        standing.has_route(start, read(true)),
+        "the routes have not followed the change yet"
+    );
+    assert!(
+        !standing.has_route(start, read(false)),
+        "a route read at the change is not kept"
+    );
+    assert_eq!(reads.get(), 3);
+
+    reads.set(0);
+    let mut deaf = RouteStanding {
+        changes: None,
+        changed: None,
+        seen: None,
+    };
+    for asks in 1..=3 {
+        assert!(deaf.has_route(start, read(true)));
+        assert_eq!(reads.get(), asks, "no socket");
+    }
+    assert!(!deaf.has_route(start, read(false)), "its route lost");
+
+    reads.set(0);
+    let (mut standing, kernel) = standing_over_a_stand_in();
+    assert!(standing.has_route(start, read(true)));
+    assert!(standing.has_route(start, read(false)), "it stands");
+    assert_eq!(reads.get(), 1);
+    let (heard, peer) = std::os::unix::net::UnixStream::pair().expect("a stream pair");
+    drop((peer, kernel));
+    standing.changes = Some(aterm_uds::network::RouteChanges::over(heard.into()));
+    assert!(!standing.has_route(start, read(false)), "a failed socket");
+    assert!(standing.changes.is_none(), "a failed socket is dropped");
+    assert!(standing.has_route(start, read(true)));
+    assert!(!standing.has_route(start, read(false)));
+    assert_eq!(reads.get(), 4, "and every ask reads from then on");
 }
 
 #[test]
@@ -1272,6 +1568,108 @@ fn sync_node_renews_a_replaced_build_and_moves_a_misplaced_job() {
     *sup.misplaced.borrow_mut() = Some("loaded in user/501".to_owned());
     ensure_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap();
     assert_eq!((*sup.renews.borrow(), *sup.loads.borrow()), (1, 2));
+    *sup.misplaced.borrow_mut() = None;
+    sup.replaced.set(true);
+    sup.repaired_after_probe.set(true);
+    ensure_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap();
+    assert_eq!(
+        (*sup.renews.borrow(), *sup.loads.borrow()),
+        (1, 2),
+        "another window repaired the outer Due before the lock: no second renewal or reload"
+    );
+
+    sup.replaced.set(true);
+    sup.renewal_lags.set(true);
+    let mut waited = false;
+    assert_eq!(
+        renew_for_window_with(&home, &state, Some(&config), &prog, false, &sup, |_| {
+            if *sup.renews.borrow() == 1 {
+                return true;
+            }
+            assert_eq!(*sup.renews.borrow(), 2);
+            assert_eq!(
+                window_node_with(&home, &state, Some(&config), &prog, false, &sup).unwrap(),
+                WindowNode::Replaced
+            );
+            waited = true;
+            sup.replaced.set(false);
+            true
+        })
+        .unwrap(),
+        WindowNode::Ready
+    );
+    assert!(waited, "kickstart completion alone is not readiness");
+    assert_eq!(
+        renew_for_window_with(&home, &state, Some(&config), &prog, false, &sup, |pause| {
+            assert!(pause.is_zero());
+            true
+        })
+        .unwrap(),
+        WindowNode::Ready
+    );
+    assert_eq!(
+        *sup.renews.borrow(),
+        2,
+        "a second window sees the repaired image"
+    );
+
+    sup.image_known.set(false);
+    assert!(
+        renew_for_window_with(&home, &state, Some(&config), &prog, false, &sup, |pause| {
+            pause.is_zero()
+        })
+        .is_err()
+    );
+    assert_eq!(
+        *sup.renews.borrow(),
+        2,
+        "unknown is not a replaced image or a ready one"
+    );
+    sup.image_known.set(true);
+    sup.replaced.set(true);
+    assert!(
+        renew_for_window_with(&home, &state, Some(&config), &prog, false, &sup, |pause| {
+            pause.is_zero()
+        })
+        .is_err()
+    );
+    assert_eq!(*sup.renews.borrow(), 3);
+    sup.replaced.set(false);
+    assert_eq!(
+        window_node_with(&home, &state, Some(&config), &prog, false, &sup).unwrap(),
+        WindowNode::Ready,
+        "read-only observation sees a late normal-upkeep repair"
+    );
+
+    let other = tmp.path().join("other-app");
+    std::fs::write(&other, b"same version, different build").unwrap();
+    assert_eq!(
+        renew_for_window_with(&home, &state, Some(&config), &other, false, &sup, |pause| {
+            assert!(pause.is_zero());
+            true
+        })
+        .unwrap(),
+        WindowNode::Unmanaged
+    );
+    sup.replaced.set(true);
+    assert_eq!(
+        renew_for_window_with(&home, &state, Some(&config), &prog, true, &sup, |pause| {
+            assert!(pause.is_zero());
+            true
+        })
+        .unwrap(),
+        WindowNode::Unmanaged
+    );
+    sup.switched_off.set(true);
+    assert_eq!(
+        renew_for_window_with(&home, &state, Some(&config), &prog, false, &sup, |pause| {
+            assert!(pause.is_zero());
+            true
+        })
+        .unwrap(),
+        WindowNode::Unmanaged
+    );
+    assert_eq!((*sup.renews.borrow(), *sup.loads.borrow()), (3, 2));
 }
 
 /// A PLIST AN EARLIER BUILD WROTE IS REWRITTEN: a running job whose unit is not the one this build
@@ -1614,4 +2012,109 @@ fn a_line_break_in_the_program_or_home_adds_no_line_to_the_unit() {
             "{raw:?}: {unit}"
         );
     }
+}
+
+/// A JOB A PERSON SWITCHED OFF STAYS OFF (ATERM-KI-1111-31): a node job whose plist is present and
+/// whose label launchd lists disabled (Login Items, `launchctl disable`) is the person's choice,
+/// so a sync pass neither rewrites its unit nor loads it. Negative control: the same stopped job,
+/// not switched off, is put back. A job that runs is not touched by the switch's reading.
+#[test]
+fn sync_node_leaves_a_job_the_person_switched_off() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let state = tmp.path().join("state");
+    let config = tmp.path().join("aterm.toml");
+    let prog = tmp.path().join("aterm-bin");
+    std::fs::write(&prog, b"stub").unwrap();
+    aterm_uds::atomic_file::write(&config, b"[fleet]\nlisten = \"0.0.0.0:7100\"\n", 0o600).unwrap();
+    aterm_uds::private_file::ensure_private_dir(&state).unwrap();
+    {
+        use std::io::Write as _;
+        let mut f =
+            aterm_uds::private_file::open_private_rw(&state, aterm_net::fleet::KEY_FILE).unwrap();
+        f.write_all(b"0123456789abcdef0123456789abcdef01234567\n")
+            .unwrap();
+    }
+    let sup = FakeSupervisor::new(None);
+    ensure_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap();
+    assert_eq!(*sup.loads.borrow(), 1);
+    let unit = plist_path(&home);
+    let written = std::fs::read_to_string(&unit).unwrap();
+
+    // The person switches it off: it stops, its plist stays, launchd lists it disabled.
+    *sup.pid.borrow_mut() = None;
+    sup.switched_off.set(true);
+    assert!(matches!(
+        read_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap(),
+        SyncNodeState::NotApplicable(why) if why.contains("switched off")
+    ));
+    let said =
+        ensure_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap();
+    assert!(said.starts_with("left as it is:"), "{said}");
+    assert_eq!(
+        *sup.loads.borrow(),
+        1,
+        "a switched-off job is not loaded again"
+    );
+    assert_eq!(std::fs::read_to_string(&unit).unwrap(), written);
+
+    // Negative control: not switched off, the same stopped job is due and put back.
+    sup.switched_off.set(false);
+    assert!(matches!(
+        read_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap(),
+        SyncNodeState::Due { .. }
+    ));
+    ensure_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap();
+    assert_eq!(*sup.loads.borrow(), 2);
+
+    // A running job stays current whatever the disabled list says.
+    sup.switched_off.set(true);
+    assert!(matches!(
+        read_for_sync_with(&home, &state, Some(&config), Some(&prog), false, &sup).unwrap(),
+        SyncNodeState::Current(_)
+    ));
+}
+
+/// launchd's disabled list, as `launchctl print-disabled gui/<uid>` prints it, names the node job
+/// disabled only on its own row with `disabled` (or `true` before macOS 13); an enabled row, another
+/// label and a label that merely starts with the node's are not it. A failed print is an error.
+#[test]
+fn launchd_reads_the_node_jobs_switch_from_print_disabled() {
+    struct Disabled(Result<(bool, String), String>);
+    impl Launchctl for Disabled {
+        fn run(&self, args: &[&str]) -> Result<(bool, String), String> {
+            assert_eq!(args, ["print-disabled", "gui/501"]);
+            self.0.clone()
+        }
+        fn print_service(&self, _target: &str) -> Result<Option<String>, String> {
+            unreachable!("only print-disabled is asked")
+        }
+    }
+    let ask = |answer: Result<(bool, String), String>| {
+        let launchctl = Disabled(answer);
+        Launchd {
+            launchctl: &launchctl,
+            uid: 501,
+            settle: std::time::Duration::ZERO,
+        }
+        .switched_off()
+    };
+    let rows = |state: &str, label: &str| {
+        Ok((
+            true,
+            format!(
+                "disabled services = {{\n\t\"com.apple.Siri.agent\" => disabled\n\t\"{label}\" => {state}\n}}\n"
+            ),
+        ))
+    };
+    assert_eq!(ask(rows("disabled", NODE_LABEL)), Ok(true));
+    assert_eq!(ask(rows("true", NODE_LABEL)), Ok(true));
+    assert_eq!(ask(rows("enabled", NODE_LABEL)), Ok(false));
+    assert_eq!(ask(rows("false", NODE_LABEL)), Ok(false));
+    assert_eq!(ask(rows("disabled", "systems.alab.other")), Ok(false));
+    assert_eq!(
+        ask(rows("disabled", &format!("{NODE_LABEL}.extra"))),
+        Ok(false)
+    );
+    assert!(ask(Ok((false, "Could not find domain".to_owned()))).is_err());
 }

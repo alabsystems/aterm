@@ -361,7 +361,7 @@ fn a_recent_needs_lease_cannot_write_through_a_successor_after_replacement() {
                 let owner = "owner=needs";
                 s.turn_end.observe(
                     &TurnEndReading {
-                        said_tail: Some("NEEDS YOU: the signing credential".to_string()),
+                        said_tail: Some("NEEDS YOU: the signing permission".to_string()),
                         worked: Some(Duration::from_secs(60)),
                         ..TurnEndReading::of(
                             &s.reader(&point.screen.rows).read(&point.screen.rows, None),
@@ -374,7 +374,7 @@ fn a_recent_needs_lease_cannot_write_through_a_successor_after_replacement() {
                     },
                     s.fx.mono(),
                 );
-                assert_eq!(s.turn_end.standing_needs(), ["the signing credential"]);
+                assert_eq!(s.turn_end.standing_needs(), ["the signing permission"]);
                 s.ctl
                     .needs_replies
                     .push_back(replaced("the needs write was not acknowledged"));
@@ -751,7 +751,7 @@ fn final_needs_cleanup_cannot_write_after_relinquished_or_unconfirmed_custody() 
         let point = box_point(&mut s);
         s.turn_end.observe(
             &TurnEndReading {
-                said_tail: Some("NEEDS YOU: the signing credential".to_string()),
+                said_tail: Some("NEEDS YOU: the signing permission".to_string()),
                 worked: Some(Duration::from_secs(60)),
                 ..TurnEndReading::of(
                     &s.reader(&point.screen.rows).read(&point.screen.rows, None),
@@ -908,7 +908,7 @@ fn initial_unsupported_claims_keep_ordinary_needs_metadata_without_timer_authori
     let point = box_point(&mut s);
     s.turn_end.observe(
         &TurnEndReading {
-            said_tail: Some("NEEDS YOU: the signing credential".to_string()),
+            said_tail: Some("NEEDS YOU: the signing permission".to_string()),
             worked: Some(Duration::from_secs(60)),
             ..TurnEndReading::of(
                 &s.reader(&point.screen.rows).read(&point.screen.rows, None),

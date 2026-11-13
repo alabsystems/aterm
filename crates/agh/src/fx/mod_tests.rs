@@ -31,7 +31,7 @@ fn pipe_file(reader: &std::io::PipeReader) -> std::fs::File {
 fn a_scheduled_pipe_writer_is_read_to_its_end() {
     use std::io::Write as _;
     use std::time::Duration;
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = aterm_uds::pipe().expect("pipe");
     let file = pipe_file(&reader);
     writer.write_all(b"fixture tape").expect("whole tape");
     drop(writer);
@@ -56,7 +56,7 @@ fn a_pipe_writer_that_never_finishes_expires() {
     use std::io::{ErrorKind, Write as _};
     use std::time::Duration;
 
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = aterm_uds::pipe().expect("pipe");
     writer.write_all(b"partial tape").expect("partial input");
     let file = pipe_file(&reader);
     let error = super::read_pipe(&file, Duration::from_millis(10))

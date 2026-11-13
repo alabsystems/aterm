@@ -246,6 +246,7 @@ bench-support = []
 # buildplan pins that — so a shipped binary reads none of them.
 dev-seams = [
     "aterm-agent/dev-seams",
+    "aterm-db/dev-seams",
     "aterm-net/dev-seams",
     "aterm-update/dev-seams",
     "atpkg/dev-seams",

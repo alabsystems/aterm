@@ -36,7 +36,7 @@ const NEED_VOTES: usize = 3;
 const REANCHOR_SCREENS: usize = 8;
 /// The most rows a frame may change for a commit to take it in place
 /// ([`AltArchive::commit_in_place`]): each is checked against every row of the previous frame.
-const IN_PLACE_ROWS: usize = 8;
+const IN_PLACE_ROWS: usize = 24;
 const FALLBACK_COMMIT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
 
 /// Cause of a discontinuity between archived rows.
@@ -1150,9 +1150,9 @@ impl RowMemo {
     /// Writes the screen as the last refresh read it into `frame`, derived.
     fn fill(&self, frame: &mut Frame) {
         #[cfg(test)]
-        let stale = self.stale_index;
+        let (stale, stale_ver) = (self.stale_index, self.stale_version);
         #[cfg(not(test))]
-        let stale = false;
+        let (stale, stale_ver) = (false, false);
         frame.indexed &= stale;
         let rows = self.seats.len();
         frame.text.resize_with(rows, String::new);
@@ -1169,7 +1169,11 @@ impl RowMemo {
                 .zip(&self.seats)
         {
             let row = &self.rows[seat.at];
-            text.clone_from(&row.text);
+            if stale_ver || *version == 0 || *version != row.version {
+                text.clone_from(&row.text);
+            } else {
+                debug_assert_eq!(text.as_str(), row.text.as_str());
+            }
             *from = seat.from;
             *hash = row.hash;
             *anchor = row.anchor;
@@ -2093,6 +2097,7 @@ impl AltArchive {
         if done {
             // As a commit leaves it: holding a frame of the screen's rows.
             self.cur.text.resize_with(rows, String::new);
+            self.cur.version.resize(rows, 0);
             #[cfg(test)]
             {
                 self.scratch.in_place += 1;
@@ -2107,14 +2112,18 @@ impl AltArchive {
         let memo = &self.memo;
         let now = |r: usize| &memo.rows[memo.seats[r].at];
         let prev = &self.prev;
-        let blank = |r: usize| {
-            if changed.contains(&r) {
+        let mut blank_ci = 0usize;
+        let all_blank = (0..prev.rows()).all(|r| {
+            while blank_ci < changed.len() && changed[blank_ci] < r {
+                blank_ci += 1;
+            }
+            if blank_ci < changed.len() && changed[blank_ci] == r {
                 now(r).text.is_empty()
             } else {
                 prev.text[r].is_empty()
             }
-        };
-        if (0..prev.rows()).all(blank) {
+        });
+        if all_blank {
             self.evict();
             return true;
         }
@@ -2151,12 +2160,17 @@ impl AltArchive {
                 .any(|&r| prev.hash[r] == h || now(r).hash == h)
         };
         let mut voters = 0;
+        let mut ci = 0usize;
         for i in 0..t {
             if voters == need {
                 break;
             }
+            while ci < changed.len() && changed[ci] < i {
+                ci += 1;
+            }
+            let is_changed = ci < changed.len() && changed[ci] == i;
             if prev.anchor[i]
-                && !changed.contains(&i)
+                && !is_changed
                 && (lax_voters || !shared(prev.hash[i]) && !other_anchor(prev.hash[i], i))
             {
                 voters += 1;

@@ -488,7 +488,7 @@ fn a_film_holds_the_composer_s_row_as_the_window_does() {
     let last = ev.last().expect("the composer's keys").0;
     let at = (last / 16 + 2) * 16;
     let read = |flanks: bool| {
-        let mut r = film_replay("rainbow + cat", DARK, rows, cols);
+        let mut r = film_replay("underline rainbow + cat", DARK, rows, cols);
         r.fx.set_probe_flanks(flanks);
         r.keep = vec![at];
         let _ = r.run(&ev, at - last);

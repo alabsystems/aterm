@@ -73,18 +73,7 @@ impl AghHost {
         dirs: &agh::config::Dirs,
         learn: bool,
     ) -> Result<agh::Github, String> {
-        let env = Arc::new(agh::identity::ProcessEnv);
-        let base = agh::GithubBuilder::new(agh::policy::Router::empty())
-            .transport(Arc::new(agh::wire::http::HttpTransport::new(env.clone())))
-            .endpoints(agh::wire::Endpoints::github_com())
-            .env(env)
-            .fx(Arc::new(agh::Fx::live()))
-            .retry(RetryPolicy::STANDARD)
-            .caller(CALLER)
-            .core_reserve(0)
-            .journal(dirs.clone())
-            .rate_book(agh::rate::RateBook::at(dirs.rate()))
-            .build();
+        let base = Self::base_client(dirs);
         let resolved = if learn {
             agh::routing::adopt_for_host(&base, dirs)
         } else {
@@ -96,6 +85,25 @@ impl AghHost {
                 base.redactor()
                     .apply(&format!("agh identity routing refused: {}", error.why))
             })
+    }
+
+    /// The production client before any routing (`Router::empty()`): github.com over the
+    /// process's own environment and HTTP transport, agh's standard retry policy, caller
+    /// [`CALLER`], and `dirs`' journal and rate book. Routing binds a router to it, and vault
+    /// adoption learns a login through it.
+    pub(crate) fn base_client(dirs: &agh::config::Dirs) -> agh::Github {
+        let env = Arc::new(agh::identity::ProcessEnv);
+        agh::GithubBuilder::new(agh::policy::Router::empty())
+            .transport(Arc::new(agh::wire::http::HttpTransport::new(env.clone())))
+            .endpoints(agh::wire::Endpoints::github_com())
+            .env(env)
+            .fx(Arc::new(agh::Fx::live()))
+            .retry(RetryPolicy::STANDARD)
+            .caller(CALLER)
+            .core_reserve(0)
+            .journal(dirs.clone())
+            .rate_book(agh::rate::RateBook::at(dirs.rate()))
+            .build()
     }
 
     /// Tests: another pause (the contract uses zero).
@@ -395,7 +403,7 @@ impl AghHost {
     ) -> Result<(), HostError> {
         for file in files {
             let ours = agh::github::releases::clobber_temporary(&file.name, &file.sha256);
-            let staged = format!("{}{}", file.name, crate::host::rest::STAGED);
+            let staged = format!("{}{}", file.name, super::STAGED);
             let stale = release.assets.iter().filter(|asset| {
                 asset.name == staged
                     || (asset.name != ours
@@ -483,6 +491,19 @@ impl AghHost {
             }
             Err(e) => return Err(self.write_error(&e)),
         };
+        self.complete_release(&s, &permit, tag, &release, &files, publish)
+    }
+
+    fn complete_release(
+        &self,
+        s: &agh::Slug,
+        permit: &Permit,
+        tag: &str,
+        release: &ReleaseObject,
+        files: &[UploadFile],
+        publish: bool,
+    ) -> Result<(), HostError> {
+        let releases = self.github.releases(s);
         if !release.draft {
             // The created-intent rule found the release this journal's draft was published
             // as: an earlier run's publish landed and its answer was lost. Nothing is uploaded
@@ -490,11 +511,11 @@ impl AghHost {
             // without one on a release published with the same files as a prerelease, and
             // refuses any other. So an immutable release converges, and one made a full
             // release since is refused.
-            return self.converged_published(&s, tag, &release, &files);
+            return self.converged_published(s, tag, release, files);
         }
-        for file in &files {
+        for file in files {
             releases
-                .upload(&permit, &release, file, AghReplace::Never)
+                .upload(permit, release, file, AghReplace::Never)
                 .map_err(|e| self.write_error(&e))?;
         }
         if !publish {
@@ -506,7 +527,7 @@ impl AghHost {
             .collect();
         releases
             .publish(
-                &permit,
+                permit,
                 release.id,
                 &PublishGuard::expecting(expected),
                 &PRERELEASE,
@@ -534,6 +555,40 @@ impl ReleaseHost for AghHost {
         let seen = self.tag_objects(&s, tag, How::writer())?;
         self.observe(&s, tag, &seen);
         Ok(release_of(&self.pick(&s, tag, How::writer(), seen)?))
+    }
+
+    fn complete_created(
+        &self,
+        slug: &Slug,
+        tag: &str,
+        title: &str,
+        notes: &str,
+        files: &[PathBuf],
+    ) -> Result<bool, HostError> {
+        let (s, permit) = self.permit(slug)?;
+        let journal = self
+            .github
+            .journal(&s)
+            .map_err(|error| self.write_error(&error))?;
+        let request = DraftRequest {
+            tag_name: tag.into(),
+            target_commitish: None,
+            name: title.into(),
+            body: notes.into(),
+            prerelease: true,
+            make_latest: Some(MakeLatest::False),
+        };
+        let Some(recovered) = self
+            .github
+            .releases(&s)
+            .recover_created(&permit, &request, &journal)
+            .map_err(|error| self.write_error(&error))?
+        else {
+            return Ok(false);
+        };
+        let files = self.open_files(files)?;
+        self.complete_release(&s, &permit, tag, &recovered.object, &files, true)?;
+        Ok(true)
     }
 
     fn download(

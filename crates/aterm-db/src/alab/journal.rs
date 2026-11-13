@@ -18,15 +18,18 @@
 //! - `heard`: this Mac's archive of every batch it read from the ring, 120 days or 64 MiB.
 //! - [`place`]: what this Mac holds that no preference of its own names (the harness's
 //!   [`place::Holding`]s), written as `place` rows; and the reader of every Mac's live rows.
+//! - [`upd`]: this Mac's one update record (`aterm_update_core::update_record`), written as its
+//!   `upd` row; and the reader of every Mac's live rows.
 //!
 //! The ring's collections are compiled ATT/1 schemas ([`EV`], [`USE`], [`SUM`], [`RELAY`],
-//! [`PLACE`]); every row lives at its writer's own Commons machine uuid and is inert at any
+//! [`PLACE`], [`UPD`]); every row lives at its writer's own Commons machine uuid and is inert at any
 //! other key (`typed::owned`).
 
 pub mod event;
 pub mod place;
 pub mod seen;
 pub mod spool;
+pub mod upd;
 
 pub(crate) mod book;
 pub(crate) mod flush;
@@ -168,12 +171,46 @@ crate::att_collection!(
     }
 );
 
+crate::att_collection!(
+    /// This Mac's update record (`aterm_update_core::update_record::UpdateRecord`, [`upd`]):
+    /// `<uuid32>`, at most 2 KiB: the build it runs and whether it proved itself, the newest
+    /// build offered, the trial under way, the one hold and how the last one ended. `until` is
+    /// when it lapses unless restated.
+    pub UPD = Collection {
+        name: "upd",
+        version: 1,
+        kind: Merge::Owned,
+        writers: Writers::SelfKey,
+        prefix: "",
+        derive: Derive::SignerUuid,
+        columns: &[
+            Column::new("n", Ty::Uint).writer(Writer::Mine),
+            Column::new("period", Ty::Uint).writer(Writer::Mine),
+            Column::new("os", Ty::Enum(&["macos", "linux", "windows", "other"]))
+                .writer(Writer::Mine),
+            Column::new("arch", Ty::Enum(&["aarch64", "x86_64", "other"])).writer(Writer::Mine),
+            Column::new("running", Ty::Uint).writer(Writer::Mine),
+            Column::new("running_sha", Ty::Hex(64))
+                .null()
+                .writer(Writer::Mine),
+            Column::new("proven", Ty::Bool).writer(Writer::Mine),
+            Column::new("offered", Ty::Uint).null().writer(Writer::Mine),
+            Column::new("trial", Ty::Json(512)).null().writer(Writer::Mine),
+            Column::new("hold", Ty::Json(768)).null().writer(Writer::Mine),
+            Column::new("last", Ty::Json(128)).null().writer(Writer::Mine),
+            Column::new("until", Ty::Uint).writer(Writer::Mine),
+        ],
+        unique: &[],
+        max_row: caps::UPD_ROW,
+    }
+);
+
 /// The journal ring's collections, as one typed table. Its records are automatic by nature;
 /// the ring's fixed shares bound them, not a quota.
 pub const JOURNAL: Table = Table {
     application: APPLICATION,
     role: ROLE,
-    collections: &[&EV, &USE, &SUM, &RELAY, &PLACE],
+    collections: &[&EV, &USE, &SUM, &RELAY, &PLACE, &UPD],
     self_quota: usize::MAX,
     ends: &[],
 };

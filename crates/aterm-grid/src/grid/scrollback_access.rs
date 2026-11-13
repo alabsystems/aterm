@@ -292,6 +292,45 @@ impl Grid {
         Some(mat)
     }
 
+    /// Calls `f` on history line `rev_idx` (`0` = newest) without cloning tiered or staged [`Line`]s.
+    fn with_history_line_rev<R>(&self, rev_idx: usize, f: impl FnOnce(&Line) -> R) -> Option<R> {
+        let total = self.storage.scrollback_lines();
+        if rev_idx >= total {
+            return None;
+        }
+        let idx = total - 1 - rev_idx;
+        let actual_tiered = self
+            .storage
+            .scrollback
+            .as_ref()
+            .map_or(0, ScrollbackStorage::line_count);
+        let lazy_count = self.storage.lazy_buffer_lines();
+        if idx < actual_tiered {
+            match self.storage.scrollback()?.with_line(idx, f) {
+                Ok(out) => out,
+                Err(error) => {
+                    aterm_log::warn!("history_line_rev({rev_idx}) failed: {error}");
+                    None
+                }
+            }
+        } else if idx < actual_tiered + lazy_count {
+            self.storage
+                .lazy_buffer
+                .get_line(idx - actual_tiered)
+                .map(f)
+        } else {
+            let ring_idx = idx - actual_tiered - lazy_count;
+            let row = self.storage.ring_history_row(ring_idx)?;
+            let default_extras = scroll_convert::ScrolledRowExtras::default();
+            let extras = self
+                .storage
+                .ring_history_extras(ring_idx)
+                .unwrap_or(&default_extras);
+            let line = Self::row_to_line_with_stored_extras(row, extras);
+            Some(f(&line))
+        }
+    }
+
     /// History row `rev_idx` as its line draws it, with no hole painted.
     fn materialize_history_row(
         &self,
@@ -303,8 +342,9 @@ impl Grid {
         {
             return Some(mat);
         }
-        let line = self.history_line_rev(rev_idx)?;
-        Some(scroll_materialize::materialize_from_line(&line, cols))
+        self.with_history_line_rev(rev_idx, |line| {
+            scroll_materialize::materialize_from_line(line, cols)
+        })
     }
 
     /// The wide glyph that opens the row after history row `rev_idx`, with its
@@ -330,11 +370,10 @@ impl Grid {
             });
             return Some((glyph, bg_rgb));
         }
-        let line = self.history_line_rev(newer)?;
-        let next = scroll_materialize::materialize_from_line(&line, cols);
-        let glyph = *next.cells.first()?;
-        (next.is_wrapped() && glyph.is_wide())
-            .then(|| (glyph, next.get_extra(0).and_then(crate::CellExtra::bg_rgb)))
+        self.with_history_line_rev(newer, |line| {
+            scroll_materialize::first_wrapped_wide_opening(line, cols)
+        })
+        .flatten()
     }
 
     /// Total history lines; same as [`Self::scrollback_lines`].

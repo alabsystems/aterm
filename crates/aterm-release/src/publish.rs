@@ -365,10 +365,29 @@ pub fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-/// The release-org token on disk.
+/// The release-org token's registry entry: the vault lands it on every cutting Mac.
+pub(crate) const CHANNEL_TOKEN: &str = aterm_secrets::entry_class::RELEASE_GH_TOKEN;
+
+/// The release-org token on disk: where the vault lands [`CHANNEL_TOKEN`].
 pub(crate) fn channel_token_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|home| PathBuf::from(home).join(".secrets/gh_access_token_alabsystems"))
+    std::env::var_os("HOME").and_then(|home| {
+        aterm_secrets::materialize::target_path(Path::new(&home), CHANNEL_TOKEN).ok()
+    })
+}
+
+/// [`CHANNEL_TOKEN`]'s registry pointer (`~/…`), as `aterm secrets ls --describe` names it.
+pub(crate) fn channel_token_pointer() -> String {
+    aterm_secrets::registry::pointer(CHANNEL_TOKEN).unwrap_or_else(|| CHANNEL_TOKEN.to_owned())
+}
+
+/// What a gate says when this Mac holds no release-org token: the pointer, and the one way
+/// to get it.
+pub(crate) fn no_channel_token() -> String {
+    format!(
+        "this Mac holds no release-org token at {} (`aterm secrets need gh:release` asks the \
+         lab's Macs for it)",
+        channel_token_pointer()
+    )
 }
 
 /// Dedicated cooperative lock for every real release cut.
@@ -4433,7 +4452,6 @@ pub struct CutCtx {
     pub kind: CutKind,
     pub lease: Option<ReleaseLeaseGuard>,
     pub fence: Option<PublisherFenceGuard>,
-    pub notes_section: String,
     pub journal: Option<Journal>,
     /// The sign step adopted the copy `cut --sign` signed of these bytes ([`SignedRecord`]): the
     /// self-check's executions of it and its signing checks ran there, on the same bytes.
@@ -5746,11 +5764,35 @@ fn recover_published_cut(
         kind: CutKind::Real,
         lease: Some(lease),
         fence: Some(fence),
-        notes_section: version.to_string(),
         journal: Some(journal),
         adopted: false,
     };
     run_pipeline(&mut ctx, Instant::now())
+}
+
+/// The notes a cut ships: the release commit `commit`'s own `## [version]` section
+/// ([`changelog::rolled_body`]), read from its objects in every mode, never from a working tree.
+/// A dry run's release commit is rolled exactly as a real one's and a recut's carries its
+/// section as it stands, so every mode ships the same bytes.
+///
+/// # Errors
+/// The commit's changelog cannot be read, is not UTF-8, or has no such section.
+pub fn release_body_of(git: &dyn ledger::GitRunner, commit: &str, version: &str) -> Result<String> {
+    let spec = format!("{commit}:{}", changelog::CHANGELOG_FILE);
+    let out = ledger::git_read_ok(
+        git,
+        &[
+            "--no-lazy-fetch",
+            "--no-replace-objects",
+            "cat-file",
+            "blob",
+            &spec,
+        ],
+    )
+    .map_err(|e| Error::new(format!("read {spec}: {e}")))?;
+    let text = String::from_utf8(out.stdout)
+        .map_err(|_| Error::new(format!("{spec} is not valid UTF-8")))?;
+    changelog::rolled_body(&text, version)
 }
 
 /// The transcript's `signature` line.
@@ -6469,28 +6511,26 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
                     tail.build, tail.version
                 ),
             );
+            let origin = native_origin(&tree)?;
+            let base = crate::gates::harness_versions_base(&git, &origin, &source, &version)?;
             let plan = ledger::ClaimPlan {
                 version: &version,
                 now,
                 allow_existing_section: recut,
                 max_attempts: ledger::MAX_CLAIM_ATTEMPTS,
                 source: &source,
+                harness_base: base.as_ref().map(|(r, c)| (r.as_str(), c.as_str())),
             };
-            let date = changelog::today_la()?;
-            let rolls = |source: &str, main: &str| {
-                changelog::claim_changelogs(source, main, &version, &date)
-            };
-            let origin = native_origin(&tree)?;
             let claim = crate::cut_timing::measure("claim and verify main", || {
-                ledger::claim(&git, &origin, &tree, &plan, &verified.reserved, &rolls)
+                ledger::claim(&git, &origin, &tree, &plan, &verified.reserved)
             })
             .map_err(|error| discard_on_lost_race(&git, &dist, &version, reserved, error))?;
             step(
                 "",
                 &format!(
                     "pushed \"release: v{version} (build {})\" — the release commit {} is the \
-                     published {} plus the ledger line and the rolled changelog; main took it \
-                     {}  [verified: origin/main == {}, ledger tail == \"{}\"]",
+                     published {} plus the ledger line and the rolled changelog, less the entry \
+                     files it shipped; main took it {}  [verified: origin/main == {}, ledger tail == \"{}\"]",
                     claim.build,
                     &claim.commit[..12],
                     &source[..12],
@@ -6503,6 +6543,22 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
                     claim.ledger_line
                 ),
             );
+            if !claim.harness.is_empty() {
+                // Said once, where the merge is: the next landing owes none of these.
+                let names: Vec<String> = claim
+                    .harness
+                    .iter()
+                    .map(|o| format!("alab {} harness {}.{}", o.harness.cli(), o.to.0, o.to.1))
+                    .collect();
+                step(
+                    "",
+                    &format!(
+                        "the merge raised the harness versions main owes the window v{version} \
+                         opens ({}): their sources changed on main past the release commit",
+                        names.join(", ")
+                    ),
+                );
+            }
             (claim.build, claim.commit)
         }
         CutKind::Draft => unreachable!("drafts never claim"),
@@ -6530,11 +6586,6 @@ pub fn run_cut(repo: &Path, opts: &CutOptions) -> Result<()> {
         journal_path: journal_path.clone(),
         slug: publish_slug,
         tag: format!("v{version}"),
-        notes_section: if kind == CutKind::Real {
-            version.clone()
-        } else {
-            "Unreleased".into()
-        },
         version,
         build,
         commit,
@@ -6736,7 +6787,6 @@ pub fn run_cut_sign(repo: &Path, opts: &CutOptions) -> Result<()> {
         journal_path,
         slug,
         tag: format!("v{version}"),
-        notes_section: "Unreleased".to_string(),
         version,
         build: verified.reserved.build,
         commit: verified.reserved.commit.clone(),
@@ -6931,7 +6981,6 @@ fn resume_cut(
         slug: slug.to_string(),
         version: journal.version.clone(),
         tag: format!("v{}", journal.version),
-        notes_section: journal.version.clone(),
         build: journal.build_number,
         commit: journal.commit.clone(),
         min_build: journal.min_build,
@@ -7391,6 +7440,19 @@ fn spent_remedy(version: &str, build: u64) -> String {
     )
 }
 
+/// Write `notes-<version>.md` and return the body it carries: the release commit's rolled
+/// section read from its objects ([`release_body_of`]), the same bytes in every cut mode and
+/// whatever the working tree's `CHANGELOG.md` holds.
+fn write_release_notes(ctx: &CutCtx) -> Result<String> {
+    let body = release_body_of(&ledger::GitCli::new(&ctx.tree), &ctx.commit, &ctx.version)?;
+    crate::durable::write_fresh(
+        &ctx.notes_path(),
+        changelog::release_notes_document(&ctx.version, &body),
+    )
+    .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
+    Ok(body)
+}
+
 fn step_sign(ctx: &mut CutCtx) -> Result<()> {
     if ctx.kind == CutKind::Real && draft::staged(ctx)? {
         return Ok(());
@@ -7440,14 +7502,7 @@ fn step_sign(ctx: &mut CutCtx) -> Result<()> {
         macho_sha256,
         ..
     } = source;
-    let cl_text = gates::read_bounded_string(&ctx.tree.join(changelog::CHANGELOG_FILE), 64 << 20)
-        .map_err(|e| Error::new(format!("read {}: {e}", changelog::CHANGELOG_FILE)))?;
-    let body = changelog::rolled_body(&cl_text, &ctx.notes_section)?;
-    crate::durable::write_fresh(
-        &ctx.notes_path(),
-        changelog::release_notes_document(&ctx.version, &body),
-    )
-    .map_err(|e| Error::new(format!("write {}: {e}", ctx.notes_path().display())))?;
+    let body = write_release_notes(ctx)?;
 
     let plist_text = gates::read_bounded_string(&copy.app.join("Contents/Info.plist"), 16 << 20)
         .map_err(|e| Error::new(format!("read stamped Info.plist: {e}")))?;
@@ -8911,18 +8966,15 @@ pub fn preflight_channel_target(slug: &str, claimed: bool) -> Result<()> {
         "; nothing was claimed".to_string()
     };
     if !push {
-        let token_path = channel_token_path().map_or_else(
-            || "~/.secrets/gh_access_token_alabsystems".to_string(),
-            |path| path.display().to_string(),
-        );
         return Err(Error::new(if crate::github::has_token() {
             format!(
-                "the release token ({token_path}) cannot write {slug}: grant it write access{then}"
+                "the release token ({}) cannot write {slug}: grant it write access{then}",
+                channel_token_pointer()
             )
         } else {
             format!(
-                "no release token in {token_path}, and an anonymous read cannot write {slug}: \
-                 put the release-org token there{then}"
+                "{}, and an anonymous read cannot write {slug}{then}",
+                no_channel_token()
             )
         }));
     }

@@ -250,6 +250,7 @@ impl TurnRows<'_> {
         self.prompt.is_some_and(is_land_check_prompt)
     }
 
+    /// A land act's reply answers it only as a claim, the defense it asks for.
     fn answered_done(&self) -> bool {
         final_said(self.said).is_none_or(|r| says_done(Some(&r.text)))
     }
@@ -292,7 +293,8 @@ pub enum DoneBy {
     Turn,
     /// The final message of the newest turn of a worker that ended unfinished. It is read as
     /// [`Self::Turn`] is, even where that turn answers a harness check or nudge: such a reply
-    /// says no `DONE` or `LANDED`, so a check's rule would read it as `no-reply`.
+    /// to a land act holds no defense or `LANDED`, so a check's rule would read it as
+    /// `no-reply`.
     Failed,
 }
 
@@ -372,19 +374,23 @@ fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'
         return Err("no-check");
     }
     // THE LAND CHECK'S `LANDED` ends a landing: the report is the defense it audited (the
-    // newest land act's done reply before it), the word itself adding nothing.
+    // newest land act's done reply before it), the word itself adding nothing. Another land act's
+    // reply answers it only as a claim (the defense it asks for). A DONE CHECK'S REPLY IS ITS
+    // ANSWER WHATEVER ITS WORDS: the harness typed the check over a claim and the check asks for
+    // more work, which the reply reports; no words are read for a claim (`turn_end::says_done`),
+    // so a reply in words that an older check asked for is read too.
     let checked = newest.is_land_check();
-    let done = |r: &Report| {
+    let land = newest.is_land();
+    let answered = |r: &Report| {
         if checked {
             landed_reply(Some(&r.text))
         } else {
-            says_done(Some(&r.text))
+            !land || says_done(Some(&r.text))
         }
     };
-    if ends_in_call(newest.said) || !final_said(newest.said).is_some_and(|r| done(&r)) {
+    if ends_in_call(newest.said) || !final_said(newest.said).is_some_and(|r| answered(&r)) {
         return Err("no-reply");
     }
-    let land = newest.is_land();
     let mut checks = vec![newest];
     let mut earlier = before.iter().rev();
     let reported = loop {
@@ -394,7 +400,7 @@ fn by_check(newest: &TurnRows<'_>, before: &[TurnRows<'_>]) -> Result<Report, &'
                     checks.push(t);
                 }
             }
-            Some(t) if t.is_check() && !t.is_land() && t.answered_done() => checks.push(t),
+            Some(t) if t.is_check() && !t.is_land() => checks.push(t),
             other => break other,
         }
     };

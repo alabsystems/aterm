@@ -38,7 +38,6 @@ mod flash_probe;
 mod font_chain_conservation;
 mod font_hinting_config;
 mod font_oracle;
-mod font_subpixel_config;
 mod free_composite;
 mod free_overlay;
 mod fuzz_render_never_panics;

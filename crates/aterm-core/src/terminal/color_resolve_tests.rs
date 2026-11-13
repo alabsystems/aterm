@@ -648,7 +648,7 @@ fn only_a_light_themes_dark_white_on_a_colour_moves() {
         }
     }
     for name in [
-        "Aterm Day",
+        "aterm Day",
         "Linen",
         "Default Light",
         "Gruvbox Light",

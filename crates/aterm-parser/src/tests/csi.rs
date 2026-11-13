@@ -329,3 +329,18 @@ fn add_param_digit_saturates_and_finalize_param_clamps() {
     assert_eq!(full.params.len(), crate::MAX_PARAMS);
     assert_eq!((full.current_param, full.param_started), (0, false));
 }
+
+#[test]
+fn inline_csi_and_esc_fast_paths_match_per_byte_state_machine() {
+    for input in [
+        b"\x1b[100m\x1b[999X\x1b[0m".as_slice(),
+        b"\x1b[12;34H\x1b[;12H\x1b[12;H\x1b[;H\x1b[123;456f",
+        b"\x1b[?2026hhello\x1b[?2026l\x1b[?25l\x1b[?25h\x1b[?1049h\x1b[?1049l",
+        b"\x1b[?h\x1b[?1;2h\x1b[?9999h\x1b[?10000h",
+        b"\x1b(B\x1b)0\x1b7\x1b8\x1b=\x1b>\x1bD\x1bM",
+        b"\x1b]2;aborted\x18\x1b(B\x1b7\x1b[?2026h\x1b[12;34H",
+        b"\x1b[1:2m\x1b(B\x1b[12;34H\x1b7\x1b[100m",
+    ] {
+        assert_whole_read_matches_per_byte(input);
+    }
+}

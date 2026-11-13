@@ -18,6 +18,7 @@ fn private_readonly_files_are_bounded_and_symlink_ancestors_refuse() {
     std::fs::write(&path, b"facts").unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o500)).unwrap();
     let dir = directory(root.path()).unwrap();
+    require_no_acl_entries(&dir).unwrap();
     assert_eq!(read_private(&dir, OsStr::new("record"), 5).unwrap().0, b"facts");
     assert!(read_private(&dir, OsStr::new("record"), 4).is_err());
     std::os::unix::fs::symlink(&path, root.path().join("link")).unwrap();
@@ -47,7 +48,8 @@ fn deny_only_acl_is_private_but_an_allow_entry_is_not() {
     };
     chmod("everyone deny write");
     let dir = directory(root.path()).unwrap();
-    assert!(open_private(&dir, OsStr::new("record")).is_ok());
+    let file = open_private(&dir, OsStr::new("record")).unwrap();
+    assert!(require_no_acl_entries(&file).is_err());
     chmod("everyone allow read");
     assert!(open_private(&dir, OsStr::new("record")).is_err());
 }

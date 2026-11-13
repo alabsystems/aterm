@@ -1908,12 +1908,6 @@ impl App {
         }
     }
 
-    fn reword_owed(&mut self, key: &str, msg: &Message) {
-        if let Some(owed) = self.rows_owed.iter_mut().find(|owed| owed.key == key) {
-            owed.msg = msg.clone();
-        }
-    }
-
     fn forget_owed(&mut self, key: &str) {
         self.rows_owed.retain(|owed| owed.key != key);
     }
@@ -1988,31 +1982,6 @@ impl App {
             &update_words::update_health_entry(kind, body),
             update_words::health_entry_delay(body, now_unix),
         );
-    }
-
-    /// Restates an active update-health warning when its remedy changes.
-    pub(crate) fn restate_update_health(
-        &mut self,
-        kind: update_words::HealthKind,
-        title: &str,
-        body: &str,
-    ) {
-        aterm_log::info!("update-health: restated: {title}: {body}");
-        let msg = update_words::health_warning(kind, title, body);
-        let words = Restatement {
-            title: Some(msg.title.clone()),
-            detail: Some(msg.detail.clone()),
-            ..Restatement::default()
-        };
-        let mut restated = false;
-        for id in self.live_update_health(|live| live == kind) {
-            restated |= self.restate_message(id, words.clone());
-        }
-        self.reword_owed(kind.key(), &msg);
-        self.remember_update_health_said(HealthSaid::of(kind, &msg, body));
-        if !restated {
-            self.record_message(msg);
-        }
     }
 
     /// Resolves update-health warnings answered by `proof`.

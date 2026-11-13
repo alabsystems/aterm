@@ -772,7 +772,7 @@ fn run_log_tool(
     use aterm_uds::spawnfd::{Stdio, Tether as _};
     use std::io::BufRead;
 
-    let Ok((stdout, stdout_end)) = std::io::pipe() else {
+    let Ok((stdout, stdout_end)) = aterm_uds::pipe() else {
         return Err(UnavailableReason::LogToolUnavailable);
     };
     let Ok(mut child) = aterm_uds::spawnfd::command(LOG_TOOL)

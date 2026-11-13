@@ -548,6 +548,55 @@ pub(crate) fn route_for(
     Ok(HelperRoute::over(resolved.router()?.clone()))
 }
 
+/// Refused unless git's credential helper, routing over `dirs` as `route_for(env, dirs,
+/// loose)` routes (`AGH_GIT_LOOSE=1` is `loose`), answers a request for `slug` as `profile`
+/// (`HelperRoute::answers_as`, `granted` when the run writes a grant naming `profile`). agh's
+/// git runner asks it before it spawns a credentialed git, and so does a caller that mounts the
+/// helper ([`super::HelperCommand`]) on a git it runs itself, so that its git never ends on the
+/// helper's `quit=1`, which says nothing. A `dev` or `release` row vault adoption built is
+/// refused as missing from the vault adoption record, with adoption's step for a vault token it
+/// found and did not route (else "run the command again"); any other as agh.toml's, with
+/// `agh auth status`.
+///
+/// # Errors
+///
+/// `route_for`'s refusal, naming `slug`'s repository; Refused as above.
+#[cfg(unix)]
+pub fn require_answer(
+    env: &dyn EnvSource,
+    dirs: &crate::config::Dirs,
+    slug: &Slug,
+    profile: &str,
+    granted: bool,
+    loose: bool,
+) -> Result<()> {
+    let route = route_for(env, dirs, loose).map_err(|error| error.with_repo(slug.to_string()))?;
+    if route.answers_as(slug, profile, granted, env) {
+        return Ok(());
+    }
+    let vault_row = route.adopted && crate::identity::vault::Slot::named(profile).is_some();
+    let (why, next) = if vault_row {
+        (
+            format!(
+                "{profile}'s login is not in the vault adoption record, which git's credential helper reads"
+            ),
+            route
+                .next
+                .unwrap_or_else(|| "run the command again".to_string()),
+        )
+    } else {
+        (
+            format!(
+                "git's credential helper, which reads agh.toml again, does not answer {slug} as {profile}"
+            ),
+            "agh auth status".to_string(),
+        )
+    };
+    Err(Error::refused(why)
+        .with_next(next)
+        .with_repo(slug.to_string()))
+}
+
 #[cfg(test)]
 #[path = "credential_tests.rs"]
 mod tests;

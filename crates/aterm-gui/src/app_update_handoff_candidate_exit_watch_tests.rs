@@ -14,7 +14,7 @@ impl OrphanGate {
 }
 
 fn spawn_orphan(script: &str) -> (u32, OrphanGate) {
-    let (gate_read, gate_write) = super::make_cloexec_pipe().expect("a pipe for the orphan's gate");
+    let (gate_read, gate_write) = aterm_uds::pipe().expect("a pipe for the orphan's gate");
     let mut middle = aterm_uds::spawnfd::command("/bin/sh")
         .arg("-c")
         .arg(format!(
@@ -35,7 +35,10 @@ fn spawn_orphan(script: &str) -> (u32, OrphanGate) {
             .expect("the middle process reports the orphan's pid");
     }
     middle.wait().expect("reap the middle process");
-    (pid.trim().parse().expect("a pid"), OrphanGate(gate_write))
+    (
+        pid.trim().parse().expect("a pid"),
+        OrphanGate(gate_write.into()),
+    )
 }
 
 /// Probing `candidate_gone` on the launched lane preserves the queued exit status.
@@ -73,9 +76,19 @@ fn asking_whether_a_launched_candidate_is_gone_keeps_its_exit_status() {
             );
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let status = handle
-            .witnessed_exit_status()
-            .expect("the exit event is still queued after the probe");
+        // PROC_FLAG_INEXIT can precede the kqueue exit event. The probe must not
+        // consume that event, but observing the former does not queue the latter.
+        let status = loop {
+            if let Some(status) = handle.witnessed_exit_status() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the exit event must remain readable after the probe"
+            );
+            assert!(handle.candidate_gone(candidate));
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        };
         assert_eq!(status.code(), Some(code));
         assert_eq!(
             Lane::classify(
@@ -162,6 +175,64 @@ fn an_exit_the_parent_did_not_see_coming_is_still_recovered_after_the_wait() {
         crate::ChildDeathEvidence::Exited { code: 0 },
         "the knote XNU queued inside `proc_exit` is still there once \
          termination is proven, and an exit code can never be our SIGKILL"
+    );
+}
+
+/// A LAUNCHED CANDIDATE THAT ENDED IS GONE BEFORE LAUNCHD REAPS IT: the launched lane read a
+/// candidate it did not fork as gone only once `kill` found its pid vacant or its birth changed.
+/// `kill` answers for a zombie as for a live process, and the plain `PROC_PIDTBSDINFO` read that
+/// checks the birth finds no zombie, so a successor that crashed, its readiness channel closed as
+/// it exited, read as running until launchd reaped it; with no exit watch its death was then
+/// booked as this process's own kill (`EndedHere`), no evidence against its bytes. It is now gone
+/// from the moment the kernel shows it exiting or a zombie. This test's own unreaped child stands
+/// in for a launched candidate launchd has yet to reap. CONTROL: held at its gate, it is not gone.
+/// NEGATIVE CONTROL: with the pid-and-birth read alone, the zombie reads as running ("THE
+/// ZOMBIE").
+#[test]
+fn a_launched_candidate_that_ended_is_gone_before_launchd_reaps_it() {
+    use super::{HandoffCandidate, HandoffCandidateHandle, HandoffCandidateProbe};
+    let mut child = aterm_uds::spawnfd::command("/bin/sh")
+        .arg("-c")
+        .arg("read -r go; exit 7")
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .stdout(aterm_uds::spawnfd::Stdio::null())
+        .spawn()
+        .expect("spawn the stand-in");
+    let candidate = HandoffCandidate::of_unreaped_spawned(&child);
+    assert!(
+        candidate.birth.is_some(),
+        "PRECONDITION: its birth is read while it runs"
+    );
+    let handle = HandoffCandidateHandle::Launched(None);
+    assert!(
+        !handle.candidate_gone(candidate),
+        "CONTROL: held at its gate, it runs"
+    );
+    drop(child.stdin.take());
+    let pid = libc::pid_t::try_from(candidate.pid).expect("pid fits");
+    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    while super::probe_handoff_candidate(pid) != HandoffCandidateProbe::Exited {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the stand-in exits once its gate closes"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    // SAFETY: signal 0 performs the existence check only and delivers nothing.
+    assert_eq!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "PRECONDITION: `kill` answers for the zombie as for a live process"
+    );
+    assert!(
+        handle.candidate_gone(candidate),
+        "THE ZOMBIE: exited and not yet reaped, it is gone, so its death is never read as this \
+         process's kill"
+    );
+    assert_eq!(
+        child.wait().expect("reap the stand-in").code(),
+        Some(7),
+        "asking reaped nothing: the status is still its own"
     );
 }
 

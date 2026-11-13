@@ -634,7 +634,7 @@ fn watch_network_over(
 ) -> io::Result<NetworkWatch> {
     use aterm_uds::network::RouteWake;
     use std::os::fd::AsFd as _;
-    let (ended, end) = aterm_uds::kept_out(std::io::pipe)?;
+    let (ended, end) = aterm_uds::pipe()?;
     let routes = Arc::new(routes);
     #[cfg(test)]
     let watched = Arc::downgrade(&routes);

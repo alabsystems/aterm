@@ -13,9 +13,11 @@
 //! conflict marker and no gate of `ship release` reads it as wrong, and the next release ships
 //! the entry a second time. The same holds for one entry landed twice under `[Unreleased]`.
 //! A merge across a cut can also strand a branch's copy of an entry the cut did not ship under
-//! the release, beside the copy main keeps under `[Unreleased]` (`verify land` drops such a copy
-//! from the merges it makes): the tree cannot say which copy shipped, so the finding names both
-//! and the release's tag decides.
+//! the release, beside the copy main keeps under `[Unreleased]`: the tree cannot say which copy
+//! shipped, so the finding names both and the release's tag decides. An entry is now its own
+//! file under `changes/`, but raw `[Unreleased]` entries written before that still drain, and
+//! git's line merge across a release can still move one into the rolled section; verify's
+//! changelog guard refuses a released section that gains or loses an entry.
 //!
 //! An entry is a top-level `- ` line and every indented line after it, the blank lines between
 //! them included; it ends at the first line that is neither blank nor indented. Only a whole

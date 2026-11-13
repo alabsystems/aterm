@@ -243,6 +243,7 @@ fn used_units_follow_the_captured_cache_and_reject_a_later_redirect() {
     run_of(&ctx).unwrap().unwrap();
     note_used(
         &ctx,
+        &Dir::Main,
         &[crate::shape::Artifact {
             filenames: vec![
                 world
@@ -256,10 +257,15 @@ fn used_units_follow_the_captured_cache_and_reject_a_later_redirect() {
             test: true,
         }],
         &[],
+        true,
     );
-    assert!(keep_used(&ctx, true).is_some());
+    close(&ctx, &Dir::Main);
+    let said = keep_used(&ctx);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(said[0].of, Dir::Main, "{said:?}");
     let record = world.cache.join(atpkg::build_cache::stale::USED);
-    let used = atpkg::build_cache::stale::Used::decode(&std::fs::read(&record).unwrap()).unwrap();
+    let kept = atpkg::build_cache::stale::Kept::decode(&std::fs::read(&record).unwrap()).unwrap();
+    let used = &kept.runs[&run_key(&ctx)];
     assert_eq!(
         used.profiles["debug"],
         std::collections::BTreeSet::from(["1111111111111111".to_owned()])
@@ -271,7 +277,7 @@ fn used_units_follow_the_captured_cache_and_reject_a_later_redirect() {
     std::fs::create_dir(&outside).unwrap();
     std::fs::write(outside.join("keep"), b"outside data").unwrap();
     std::os::unix::fs::symlink(&outside, &world.cache).unwrap();
-    assert!(keep_used(&ctx, true).is_none());
+    assert!(keep_used(&ctx).is_empty());
     assert!(!outside.join(atpkg::build_cache::stale::USED).exists());
     assert_eq!(
         std::fs::read(outside.join("keep")).unwrap(),
@@ -300,15 +306,16 @@ fn a_valid_cache_replacement_cannot_inherit_units_from_the_admitted_directory() 
             test: true,
         }];
         if !before_note {
-            note_used(&ctx, &artifacts, &[]);
+            note_used(&ctx, &Dir::Main, &artifacts, &[], true);
         }
         let moved = world.home.join("original-cache");
         std::fs::rename(&world.cache, &moved).unwrap();
         world.built();
         if before_note {
-            note_used(&ctx, &artifacts, &[]);
+            note_used(&ctx, &Dir::Main, &artifacts, &[], true);
         }
-        assert!(keep_used(&ctx, true).is_none(), "before_note={before_note}");
+        close(&ctx, &Dir::Main);
+        assert!(keep_used(&ctx).is_empty(), "before_note={before_note}");
         assert!(!world.cache.join(atpkg::build_cache::stale::USED).exists());
         assert!(!moved.join(atpkg::build_cache::stale::USED).exists());
         assert_eq!(

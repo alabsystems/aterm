@@ -274,7 +274,9 @@ fn notary_answers_are_classified_by_every_line_they_carry() {
         "Error: No Keychain password item found for profile: aterm-notary",
     ] {
         match notary_verdict("aterm-notary", false, "", credential) {
-            Check::Owner { fix, .. } => assert!(fix.contains("store-credentials"), "{fix}"),
+            Check::Fail { fix, .. } => {
+                assert!(fix.contains("aterm secrets need notary"), "{fix}");
+            }
             other => panic!("{credential}: {other:?}"),
         }
     }
@@ -313,26 +315,56 @@ fn notary_answers_are_classified_by_every_line_they_carry() {
             owner: false
         }
     );
+    assert_eq!(
+        audited(Check::Todo {
+            what: "w".into(),
+            next: "n".into()
+        }),
+        Audited::Gap {
+            what: "w".into(),
+            fix: "n".into(),
+            owner: false
+        },
+        "a credential waiting at Apple fails the step; the owner is not asked"
+    );
 }
 
 #[test]
-fn a_gap_is_the_owners_by_its_cause_not_its_label() {
-    let at = "~/.secrets/gh_access_token_alabsystems";
-    assert!(matches!(
-        channel_token_verdict(at, "alabsystems/aterm", false, false, false),
-        Check::Owner { .. }
-    ));
-    assert!(
-        matches!(
-            channel_token_verdict(at, "alabsystems/aterm", true, true, false),
-            Check::Fail { .. }
-        ),
-        "a file mode is this machine's"
-    );
-    assert!(matches!(
-        channel_token_verdict(at, "alabsystems/aterm", true, false, true),
-        Check::Pass(_)
-    ));
+fn a_missing_credential_is_filed_with_the_lab_not_asked_of_a_person() {
+    use aterm_secrets::need;
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let paths = aterm_secrets::client::Paths::for_home(dir.path());
+    let source = dir.path().join("filed.vault");
+    aterm_secrets::client::test_create_unbound(&paths, source.to_str().unwrap(), None, Some("m1"))
+        .unwrap();
+    need::test_alab_policy(&paths);
+    let missing = channel_token_missing(Some(Path::new("/nowhere/gh_access_token_alabsystems")));
+    let refused = notary_verdict("notary", false, "", "No Keychain password item found");
+    for (check, want, purpose) in [
+        (missing, Want::Gh(GhProfile::Release), Purpose::AghRelease),
+        (refused, Want::Notary, Purpose::ReleaseNotary),
+    ] {
+        let key = want.key();
+        let check = filed(check, Ok(paths.clone()), want.clone(), purpose);
+        let Check::Fail { fix, .. } = &check else {
+            panic!("{check:?}");
+        };
+        assert!(
+            fix.starts_with(&format!("filed `aterm secrets need {key}` with the lab")),
+            "{fix}"
+        );
+        assert!(
+            matches!(audited(check), Audited::Gap { owner: false, .. }),
+            "a missing credential fails the step; no owner ask is raised"
+        );
+        let requests = need::peek(&paths).unwrap();
+        let request = requests
+            .iter()
+            .find(|n| n.want == want && n.purpose == purpose)
+            .expect("filed in the ledger");
+        assert!(!request.state.ended());
+    }
 }
 
 #[test]
@@ -342,26 +374,26 @@ fn channel_token_file_admission_preserves_regular_rules_and_refuses_aliases_befo
     let dir = aterm_tempfile::tempdir().unwrap();
     let regular = dir.path().join("synthetic-token");
     let check = |path: Option<&Path>, present, may_change| {
-        channel_token_check_at("alabsystems/aterm", may_change, path, || present)
+        channel_token_check_at(may_change, path, || present)
     };
-    assert!(matches!(check(None, false, false), Check::Owner { .. }));
-    assert!(matches!(
-        check(Some(&regular), false, false),
-        Check::Owner { .. }
-    ));
+    assert!(check(None, false, false).is_none());
+    assert!(check(Some(&regular), false, false).is_none());
     std::fs::write(&regular, b"synthetic-token-only").unwrap();
     std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o600)).unwrap();
-    assert!(matches!(check(Some(&regular), true, false), Check::Pass(_)));
-    assert!(matches!(
-        check(Some(&regular), false, false),
-        Check::Owner { .. }
-    ));
-    std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(matches!(
         check(Some(&regular), true, false),
-        Check::Fail { .. }
+        Some(Check::Pass(_))
     ));
-    assert!(matches!(check(Some(&regular), true, true), Check::Pass(_)));
+    assert!(check(Some(&regular), false, false).is_none());
+    std::fs::set_permissions(&regular, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        matches!(check(Some(&regular), true, false), Some(Check::Fail { .. })),
+        "a file mode is this machine's"
+    );
+    assert!(matches!(
+        check(Some(&regular), true, true),
+        Some(Check::Pass(_))
+    ));
     assert_eq!(
         std::fs::metadata(&regular).unwrap().permissions().mode() & 0o777,
         0o600
@@ -378,13 +410,13 @@ fn channel_token_file_admission_preserves_regular_rules_and_refuses_aliases_befo
     );
     for may_change in [false, true] {
         let calls = Cell::new(0);
-        let result = channel_token_check_at("alabsystems/aterm", may_change, Some(&alias), || {
+        let result = channel_token_check_at(may_change, Some(&alias), || {
             calls.set(calls.get() + 1);
             aterm_update_core::github_rest::Token::from_file(&alias)
                 .unwrap()
                 .is_some()
         });
-        assert!(matches!(result, Check::Fail { .. }), "{result:?}");
+        assert!(matches!(result, Some(Check::Fail { .. })), "{result:?}");
         assert_eq!(
             calls.get(),
             0,
@@ -400,52 +432,37 @@ fn channel_token_file_admission_preserves_regular_rules_and_refuses_aliases_befo
     let dangling = dir.path().join("dangling-token");
     std::os::unix::fs::symlink(&missing, &dangling).unwrap();
     for path in [dangling.as_path(), dir.path()] {
-        let result = channel_token_check_at("alabsystems/aterm", false, Some(path), || {
+        let result = channel_token_check_at(false, Some(path), || {
             panic!("an unadmitted token path must not be read")
         });
-        assert!(matches!(result, Check::Fail { .. }), "{result:?}");
+        assert!(matches!(result, Some(Check::Fail { .. })), "{result:?}");
     }
 }
 
 #[test]
 fn every_owner_ask_is_one_the_wire_stands() {
-    for (label, what) in [
-        (
-            "notary",
-            "Apple's developer agreement for team X is missing or expired",
-        ),
-        (
-            "notary",
-            "notarytool profile 'aterm-notary' did not authenticate",
-        ),
-        (APPLE_LABEL, "no Developer ID Application identity"),
-        ("channel", "no channel token"),
-        ("profile", "no credentials profile"),
-        ("roster", "the roster does not authorize this key"),
-    ] {
-        let w = ask_words(label, what);
-        assert!(w.key.starts_with("release."), "{w:?}");
-        assert!(
-            w.reason.chars().count() <= aterm_messages::need::REASON_CAP,
-            "{w:?}"
-        );
-        assert!(
-            w.step.chars().count() <= aterm_messages::need::STEP_CAP,
-            "{w:?}"
-        );
-        let line = format!(
-            "ask {} tag=release {} -- {} -- {}",
-            w.key, w.title, w.reason, w.step
-        );
-        if let Err(e) = aterm_messages::wire::NoticeRequest::parse(&line) {
-            panic!("{line}: {e}");
-        }
+    let w = agreement_ask();
+    assert_eq!(w.key, "release.notary");
+    assert!(
+        w.reason.chars().count() <= aterm_messages::need::REASON_CAP,
+        "{w:?}"
+    );
+    assert!(
+        w.step.chars().count() <= aterm_messages::need::STEP_CAP,
+        "{w:?}"
+    );
+    let line = format!(
+        "ask {} tag=release {} -- {} -- {}",
+        w.key, w.title, w.reason, w.step
+    );
+    if let Err(e) = aterm_messages::wire::NoticeRequest::parse(&line) {
+        panic!("{line}: {e}");
     }
 }
 
 #[test]
 fn notary_credential_failures_raise_the_typed_need_and_live_success_closes_it() {
-    use aterm_secrets::need::{self, Purpose, Want};
+    use aterm_secrets::need;
 
     let dir = aterm_tempfile::tempdir().unwrap();
     let paths = aterm_secrets::client::Paths::for_home(dir.path());
@@ -460,7 +477,12 @@ fn notary_credential_failures_raise_the_typed_need_and_live_success_closes_it() 
         "No Keychain password item found for profile: notary.",
     );
     assert_eq!(refused.need, NotaryNeed::Raise);
-    settle_notary_need(&paths, refused.need).unwrap();
+    filed(
+        refused.check,
+        Ok(paths.clone()),
+        Want::Notary,
+        Purpose::ReleaseNotary,
+    );
     let requests = need::peek(&paths).unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].want, Want::Notary);
@@ -473,11 +495,10 @@ fn notary_credential_failures_raise_the_typed_need_and_live_success_closes_it() 
     ] {
         let probe = notary_probe_verdict("notary", false, "", failure);
         assert_eq!(probe.need, NotaryNeed::Unchanged);
-        assert!(settle_notary_need(&paths, probe.need).unwrap().is_none());
     }
     let ready = notary_probe_verdict("notary", true, "No submission history.", "");
     assert_eq!(ready.need, NotaryNeed::Satisfied);
-    settle_notary_need(&paths, ready.need).unwrap();
+    close_notary_need(&paths).unwrap();
     assert!(need::peek(&paths).unwrap()[0].state.ended());
 }
 
@@ -580,7 +601,7 @@ fn notary_acquire_stores_missing_credential_when_mutable_and_rechecks_live() {
         |_| panic!("--check must not invoke ensure_notary"),
     );
     assert_eq!(check_only.need, NotaryNeed::Raise);
-    assert!(matches!(check_only.check, Check::Owner { .. }));
+    assert!(matches!(check_only.check, Check::Fail { .. }));
 
     for unacquirable in [
         notary_probe_verdict(

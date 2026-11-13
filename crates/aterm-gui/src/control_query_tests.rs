@@ -1674,6 +1674,35 @@ fn each_metrics_form_reaches_the_wire_through_its_own_emitter_and_sink() {
     }
 }
 
+/// Plain `metrics` carries each of Commons repair's counts for this process
+/// (`aterm_db::runtime::cadence`), a whole number, where Commons repair runs (unix).
+///
+/// NEGATIVE CONTROL (2026-11-12): with the summary leaving its Commons counts out, the reply
+/// named none (`commons_rounds_out: None`).
+#[cfg(unix)]
+#[test]
+fn metrics_carries_commons_repairs_counts() {
+    use crate::metrics::wire::law_tests;
+    let reply = super::cmd_metrics(None, "");
+    let tokens = law_tests::tokens(reply.trim_end());
+    for key in [
+        "commons_rounds_out",
+        "commons_rounds_in",
+        "commons_rounds_quiet",
+        "commons_owner_ticks",
+        "commons_beacons",
+        "commons_announces",
+        "commons_signature_checks",
+        "commons_deadline_spawns",
+    ] {
+        let value = tokens.iter().find(|(k, _)| *k == key).map(|(_, v)| *v);
+        assert!(
+            value.is_some_and(|value| value.parse::<u64>().is_ok()),
+            "{key}: {value:?}"
+        );
+    }
+}
+
 #[test]
 fn the_per_owner_ledgers_are_self_labelling_in_both_forms() {
     let reply = super::cmd_metrics_json(None, "");

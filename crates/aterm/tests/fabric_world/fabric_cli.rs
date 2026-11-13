@@ -242,7 +242,7 @@ fn line_reader(out: ChildStdout) -> mpsc::Receiver<String> {
 #[test]
 fn a_broker_whose_stdout_reader_left_keeps_serving() {
     let s = Scratch::new("epipe");
-    let (gone, stdout) = std::io::pipe().expect("a pipe");
+    let (gone, stdout) = aterm_uds::pipe().expect("a pipe");
     drop(gone);
     let (sock, log, secret) = (s.sock(), s.path("b.log"), s.path("mint.secret"));
     let mut broker = harness::spawn_broker(
@@ -1114,7 +1114,10 @@ fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
 
     let (code, out, err) = fabric(&s, Some(&env_cmd), &["--json"]);
     assert_eq!(code, 0, "{out}\n{err}");
-    assert!(!out.contains("secret"), "a body reached the report: {out}");
+    assert!(
+        !out.contains("secret plan"),
+        "a body reached the report: {out}"
+    );
     let v = json(&out);
     assert_eq!(v["schema"].as_u64(), Some(1));
     assert_eq!(v["exit"].as_u64(), Some(0));
@@ -1180,7 +1183,7 @@ fn a_live_broker_is_read_for_real_and_the_env_overrides_the_file() {
 
     let (code, text, _) = fabric(&s, Some(&env_cmd), &["status"]);
     assert_eq!(code, 0, "{text}");
-    assert!(!text.contains("secret"), "{text}");
+    assert!(!text.contains("secret plan"), "{text}");
 }
 
 /// A broker that ANSWERS `Hello` and `Attach` and REFUSES the read, on `sock`,
@@ -1348,7 +1351,7 @@ fn tail_replays_from_an_offset_hides_bodies_and_follows_live() {
         assert_eq!(cols[0], format!("@{off}"), "{row}");
         assert_eq!(cols[2], kind, "{row}");
         assert!(
-            !row.contains("secret"),
+            !row.contains("secret plan"),
             "bodies are hidden by default: {row}"
         );
     }

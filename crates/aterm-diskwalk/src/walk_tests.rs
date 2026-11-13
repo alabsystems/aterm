@@ -205,9 +205,42 @@ fn links_out_counts_each_inode_once_and_names_what_is_shared_outside() {
     };
     let four = alloc(&root.join("a/d/four.bin"));
     let shared = alloc(&root.join("e/shared.bin"));
-    assert_eq!(links.alloc_first_seen, floor + four + shared);
+    // The directories' own blocks: none on APFS, a block or more each on
+    // ext4, where the first live Linux walk found them missing.
+    let dirs = du_first_seen(&root, true);
+    assert_eq!(links.alloc_first_seen, floor + dirs + four + shared);
     assert_eq!(links.shared_out, shared);
-    assert_eq!(links.frees_at_most, floor + four);
+    assert_eq!(links.frees_at_most, floor + dirs + four);
+    // `du`'s own count: every inode once, directories included.
+    assert_eq!(links.alloc_first_seen, du_first_seen(&root, false));
+}
+
+/// `du -s`'s allocation of `root` by std: each inode's blocks once, at its
+/// first link (directories and the root included, nothing followed), or
+/// with `dirs_only` the directories' own blocks alone.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "the test's oracle stats its own scratch files"
+)]
+fn du_first_seen(root: &Path, dirs_only: bool) -> u64 {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut seen = std::collections::HashSet::new();
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let m = std::fs::symlink_metadata(&path).expect("meta");
+        if m.is_dir() {
+            for entry in std::fs::read_dir(&path).expect("read_dir") {
+                stack.push(entry.expect("entry").path());
+            }
+        } else if dirs_only {
+            continue;
+        }
+        if seen.insert((m.dev(), m.ino())) {
+            total += m.blocks() * 512;
+        }
+    }
+    total
 }
 
 #[test]
@@ -789,5 +822,37 @@ fn a_cloud_placeholder_is_never_looked_into_on_the_way_or_at_the_end() {
         crate::walk::file_root(&RootSpec::new(root.join("a/one.bin")), &policy)
             .map(|full| full.map(|full| full.sums.logical)),
         Ok(Some(5_000))
+    );
+}
+
+/// A tree in `/dev/shm` (tmpfs, mounted inside `/dev`, which is devtmpfs)
+/// walks: neither memory file system is a remote volume. The first live
+/// Linux walk refused it as `Remote` because `/dev`'s type was not on the
+/// local list. NEGATIVE CONTROL: the same tree's sums are std's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tree_in_dev_shm_walks_as_a_local_one() {
+    let shm = Path::new("/dev/shm");
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "whether this host has /dev/shm at all, a fixed system path asked before the test's scratch tree is made in it"
+    )]
+    let has_shm = shm.is_dir();
+    if !has_shm {
+        println!("NOT RUN: no /dev/shm on this host");
+        return;
+    }
+    let tmp = aterm_tempfile::TempDir::new_in(shm).expect("a scratch folder in /dev/shm");
+    let root = tmp.path().join("root");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&root).expect("mkdir root");
+    std::fs::create_dir_all(&outside).expect("mkdir outside");
+    build(&root, &outside);
+    let walk = walk_all(&root, &scratch_policy(ListerChoice::Native));
+    let want = oracle(&root);
+    let got = walk.tree().root().subtree;
+    assert_eq!(
+        (got.alloc_fair, got.logical, got.files, got.dirs),
+        (want.alloc_fair, want.logical, want.files, want.dirs)
     );
 }

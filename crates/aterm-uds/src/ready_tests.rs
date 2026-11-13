@@ -37,10 +37,10 @@ fn mixed_readiness_reports_writable_readable_and_hangup_without_consuming_bytes(
         os::fd::AsFd as _,
         time::Instant,
     };
-    let (quiet, _keep) = std::io::pipe().unwrap();
-    let (mut sink, mut writable) = std::io::pipe().unwrap();
-    let (mut readable, mut source) = std::io::pipe().unwrap();
-    let (mut ended, close) = std::io::pipe().unwrap();
+    let (quiet, _keep) = crate::pipe().unwrap();
+    let (mut sink, mut writable) = crate::pipe().unwrap();
+    let (mut readable, mut source) = crate::pipe().unwrap();
+    let (mut ended, close) = crate::pipe().unwrap();
     source.write_all(b"r").unwrap();
     drop(close);
     ended_pipe(ended.as_fd());
@@ -92,7 +92,7 @@ fn a_blocked_writer_is_not_reported_as_readiness_work() {
         os::fd::AsFd as _,
         time::Instant,
     };
-    let (mut drain, mut writer) = std::io::pipe().unwrap();
+    let (mut drain, mut writer) = crate::pipe().unwrap();
     let flags = writer.try_clone().unwrap();
     with_nonblocking(flags.as_fd(), || {
         // Fill the actual pipe completely, including any partial final page.
@@ -107,7 +107,7 @@ fn a_blocked_writer_is_not_reported_as_readiness_work() {
                 other => panic!("filling private pipe: {other:?}"),
             }
         }
-        let (mut hint, mut sender) = std::io::pipe().unwrap();
+        let (mut hint, mut sender) = crate::pipe().unwrap();
         sender.write_all(b"h")?;
         assert_eq!(
             any_interests_until(
@@ -144,9 +144,9 @@ fn many_readiness_preserves_bytes_and_reports_all_ready_indices() {
         io::{Read as _, Write as _},
         os::fd::AsFd as _,
     };
-    let (mut first, mut writer) = std::io::pipe().unwrap();
-    let (second, _quiet) = std::io::pipe().unwrap();
-    let (third, closed) = std::io::pipe().unwrap();
+    let (mut first, mut writer) = crate::pipe().unwrap();
+    let (second, _quiet) = crate::pipe().unwrap();
+    let (third, closed) = crate::pipe().unwrap();
     writer.write_all(b"x").unwrap();
     drop(closed);
     ended_pipe(third.as_fd());
@@ -181,7 +181,7 @@ fn readiness_stack_and_spill_preserve_indices_bytes_and_hangup() {
 
     for size in [1, 8, 9, 32] {
         let (mut readers, mut writers): (Vec<_>, Vec<_>) =
-            (0..size).map(|_| std::io::pipe().unwrap()).unzip();
+            (0..size).map(|_| crate::pipe().unwrap()).unzip();
         for writer in &mut writers {
             writer.write_all(b"x").unwrap();
         }
@@ -230,8 +230,8 @@ fn pair_deadline_preserves_bytes_and_hangup_still_wakes() {
         os::fd::AsFd as _,
         time::Instant,
     };
-    let (mut first, mut writer) = std::io::pipe().unwrap();
-    let (second, other) = std::io::pipe().unwrap();
+    let (mut first, mut writer) = crate::pipe().unwrap();
+    let (second, other) = crate::pipe().unwrap();
     writer.write_all(b"x").unwrap();
     assert!(
         either_until(first.as_fd(), second.as_fd(), Instant::now())
@@ -393,11 +393,12 @@ use std::time::Duration;
 const HANG: Duration = Duration::from_secs(60);
 
 /// Waits under the hang detector for the pipe `reader` reads, with nothing left in it, to be
-/// at its end. Once a test drops its writer the end must come, but not always at once: a
-/// sibling test's child parked between fork and exec (`fork_window::Parked`, or a `pre_exec`
-/// spawn) holds a copy of every descriptor this process had open, that writer included, until
-/// it execs. A check that reads a set of ends at once comes after this, so it reads the set,
-/// not a race with a sibling's fork.
+/// at its end. Once a test drops its writer the end must come, but not always at once where
+/// the kernel keeps no `FD_CLOFORK` (off Apple, or an Apple kernel that ignores the mark): there
+/// a sibling test's child parked between fork and exec (`fork_window::Parked`, or a `pre_exec`
+/// spawn) holds a copy of every descriptor this process had open, the writer of a kept-out pipe
+/// ([`crate::pipe`]) included, until it execs. A check that reads a set of ends at once comes
+/// after this, so it reads the set, not a race with a sibling's fork.
 fn ended_pipe(reader: std::os::fd::BorrowedFd<'_>) {
     assert_eq!(
         super::any_until(&[reader], std::time::Instant::now() + HANG).unwrap(),
@@ -516,7 +517,7 @@ fn a_wait_for_a_read_with_no_timeout_lasts_until_a_byte_comes() {
 #[test]
 fn either_side_ends_the_wait_and_nothing_is_read() {
     let (mut a_near, a_far) = UnixStream::pair().expect("a pair");
-    let (b_read, b_write) = std::io::pipe().expect("a pipe");
+    let (b_read, b_write) = crate::pipe().expect("a pipe");
     let (said, heard) = std::sync::mpsc::channel();
     let waiter = std::thread::spawn(move || {
         let found = either(a_far.as_fd(), b_read.as_fd()).expect("the first wait");
@@ -578,7 +579,7 @@ fn one_ends_when_a_listener_has_a_connection_to_accept() {
 #[test]
 fn a_closed_peer_ends_the_wait() {
     let (near, far) = UnixStream::pair().expect("a pair");
-    let (b_read, _b_write) = std::io::pipe().expect("a pipe");
+    let (b_read, _b_write) = crate::pipe().expect("a pipe");
     drop(far);
     let found = either(b_read.as_fd(), near.as_fd()).expect("the wait");
     assert_eq!(

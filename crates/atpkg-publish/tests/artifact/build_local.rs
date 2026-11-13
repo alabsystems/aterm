@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use atpkg_publish::artifact::build_local::{self, Policy, Profile, Request};
-use atpkg_publish::ctx::Ctx;
+use atpkg_publish::ctx::{Ctx, HostChoice};
 use atpkg_publish::error::Error;
 use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::testkit::Keys;
@@ -39,7 +39,9 @@ fn world(label: &str) -> World {
     let tmp = scratch(label);
     let root = std::fs::canonicalize(tmp.path()).expect("root");
     let host = Arc::new(FakeHost::new());
-    let ctx = Keys::mint("m3", &[]).ctx(&root.join("home"), host.clone());
+    let ctx = Keys::mint("m3", &[])
+        .ctx(&root.join("home"), host.clone())
+        .with_host_choice(HostChoice::Agh);
     let bin = fixture_toolchain(&root.join("toolchains/trust-7d5533b2"));
     put_exe(&bin.join("cargo"), &elf(EM_X86_64, 2, 1));
     put_exe(&bin.join("trustdoc"), &elf(EM_X86_64, 2, 1));

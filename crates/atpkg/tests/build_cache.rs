@@ -764,6 +764,52 @@ fn cargo_in_a_session_gets_the_cache_only_where_it_builds_and_reads_it() {
             }
         }
     }
+    // Discovered roots keep their definition bases through the actual routed shim.
+    // The legacy file wins without reading the shadowed TOML output selection.
+    for release in ["trust", "1.97.1"] {
+        for form in ["discovered", "legacy"] {
+            let target = ws.join(format!("discovered-target-{release}-{form}.noindex"));
+            let build = format!("discovered-build-{release}-{form}.noindex");
+            let config_file = ws.join(if form == "legacy" {
+                ".cargo/config"
+            } else {
+                ".cargo/config.toml"
+            });
+            write(
+                &config_file,
+                &format!(
+                    "include=['layers/layout.toml']\n[build]\ntarget-dir='{}'\n",
+                    target.display()
+                ),
+            );
+            write(
+                &ws.join(".cargo/layers/layout.toml"),
+                &format!("build.build-dir='{build}'"),
+            );
+            if form == "legacy" {
+                write(&ws.join(".cargo/config.toml"), "build.build-dir='shadowed'");
+            }
+            let expected_build = ws.join(".cargo").join(build);
+            if release == "trust" {
+                assert_eq!(run(release, &["build"], &[]), "build\n");
+                let recorded = atpkg::build_cache::registered::roots(&home);
+                for output in [&target, &expected_build] {
+                    assert!(output.is_dir());
+                    assert!(recorded.iter().any(|entry| &entry.root == output));
+                }
+                assert!(!ws.join(".cargo/shadowed").exists());
+            } else {
+                let refused = command(release, &["build"], &[]).output().unwrap();
+                assert_eq!(refused.status.code(), Some(75), "{refused:?}");
+                assert!(refused.stdout.is_empty());
+                assert!(!target.exists() && !expected_build.exists());
+            }
+            std::fs::remove_file(config_file).unwrap();
+            if form == "legacy" {
+                std::fs::remove_file(ws.join(".cargo/config.toml")).unwrap();
+            }
+        }
+    }
     let blocked_build = ws.join("caller-intermediates");
     write(&blocked_build.join("keep"), "caller data");
     let refused = command(
@@ -1021,5 +1067,67 @@ fn actual_cargo_reroutes_prepare_only_the_generated_placement_they_execute() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn routed_workspace_owners_follow_deep_and_effective_package_home_boundaries() {
+    for case in ["deep", "stopped", "moved-relative"] {
+        let temporary = aterm_tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(temporary.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("Library/Caches")).unwrap();
+        let workspace = home.join("workspace");
+        let mut member = workspace.clone();
+        for _ in 0..if case == "deep" { 34 } else { 2 } {
+            member.push("n");
+        }
+        write(
+            &workspace.join("Cargo.toml"),
+            &format!(
+                "[workspace]\nmembers=['{}']\n",
+                member.strip_prefix(&workspace).unwrap().display()
+            ),
+        );
+        write(
+            &member.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.0.0'\n",
+        );
+        let bin = root.join("bin");
+        fake_cargo(&bin, "trust");
+        let launcher = home.join("launcher");
+        std::fs::create_dir(&launcher).unwrap();
+        let target = home.join("selected.noindex");
+        let mut command = aterm_uds::spawnfd::command(aterm_tempfile::bin_exe("atpkg"));
+        command.arg("__reroute").arg("cargo");
+        if case == "moved-relative" {
+            command.args(["-Zunstable-options", "-C"]).arg(&member);
+        }
+        command
+            .arg("build")
+            .arg("--target-dir")
+            .arg(&target)
+            .env_clear()
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env(atpkg::build_admit::LEDGER_ENV, root.join("ledger"))
+            .current_dir(if case == "moved-relative" {
+                &launcher
+            } else {
+                &member
+            });
+        let package_home = match case {
+            "deep" => root.join("cargo-home"),
+            "stopped" => member.parent().unwrap().to_path_buf(),
+            "moved-relative" => PathBuf::from(".."),
+            _ => unreachable!(),
+        };
+        let output = command.env("CARGO_HOME", package_home).output().unwrap();
+        assert!(output.status.success(), "{case}: {output:?}");
+        let recorded = atpkg::build_cache::registered::roots(&home);
+        let selected = recorded.iter().find(|entry| entry.root == target).unwrap();
+        let expected = if case == "deep" { &workspace } else { &member };
+        assert_eq!(selected.owners, std::slice::from_ref(expected), "{case}");
     }
 }

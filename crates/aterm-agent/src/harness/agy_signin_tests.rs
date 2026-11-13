@@ -829,11 +829,17 @@ fn xnu_zombie_only_group_is_a_completed_cleanup() {
         }
     }
 
-    let (mut proof_r, proof_w) = std::io::pipe().unwrap();
+    let (mut proof_r, proof_w) = aterm_uds::pipe().unwrap();
     let (proof_r_fd, proof_w_fd) = (proof_r.as_raw_fd(), proof_w.as_raw_fd());
+    // The proof's write end is the child's: unmarked for this fork alone.
+    let handing = aterm_uds::spawn_lock::handing(&[proof_w_fd]);
     // SAFETY: the child calls only async-signal-safe functions (`close`, `setpgid`, `write`,
     // `_exit`) on descriptors prepared before the fork, then exits without unwinding.
     let pid = unsafe { libc::fork() };
+    if pid != 0 {
+        // The child's copy of the hold is never released: it `_exit`s.
+        drop(handing);
+    }
     assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
     if pid == 0 {
         // SAFETY: the forked child follows the contract above.

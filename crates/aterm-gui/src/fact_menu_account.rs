@@ -22,6 +22,7 @@
 //! the account reader built off-thread, [`crate::account_menu_read`]).
 
 use aterm_agent::harness::account_card::LoginHalf;
+use aterm_agent::harness::account_card::LoginHere;
 use aterm_agent::harness::account_card::{
     AccountCard, Claims, CreditsWord, DayPoint, HistoryFrom, Holder, Home, JournalHeld, Mac,
     NoTable, Seen, Who,
@@ -603,8 +604,14 @@ fn token_section(ctx: &Ctx<'_>) -> (Verdict, Vec<MenuRow>) {
         (_, None) => facts
             .token
             .as_ref()
-            .filter(|token| !(stored && token.login == LoginHalf::InUse))
-            .map(|token| login_half_words(ctx, token.login)),
+            .filter(|token| !(stored && token.login.in_use()))
+            .and_then(|token| match token.login {
+                LoginHere::Half(half) => Some(login_half_words(ctx, half)),
+                LoginHere::Absent => {
+                    Some((Words::of("never signed in on this Mac"), NoteTone::Value))
+                }
+                LoginHere::Unread => None,
+            }),
     };
     if let Some((mut words, tone)) = login {
         if stored {
@@ -661,7 +668,7 @@ fn login_words(ctx: &Ctx<'_>, card: &AccountCard) -> Option<(Words, NoteTone)> {
                 .facts
                 .token
                 .as_ref()
-                .map(|token| token.login)
+                .and_then(|token| token.login.half())
                 .filter(|half| *half == LoginHalf::InUse);
             let half = if ctx.facts.route == Some(AuthRoute::Stored) {
                 card.login.filter(|half| *half != LoginHalf::InUse)

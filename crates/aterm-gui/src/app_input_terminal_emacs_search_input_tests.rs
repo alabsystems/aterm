@@ -63,12 +63,14 @@ fn bare_super_s_r_classifier_is_exhaustive_over_modifier_power_set() {
 
 #[cfg(unix)]
 fn observe_pty(app: &mut App, wid: WindowId) -> [i32; 2] {
+    use std::os::fd::IntoRawFd;
     use std::sync::Arc;
 
     use aterm_session::sink::SinkWriter;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(
@@ -226,13 +228,11 @@ fn claude_classic_and_alt_cmd_r_route_active_grid_and_emit_zero_kitty_bytes() {
 #[cfg(unix)]
 #[test]
 fn accepting_a_live_composer_match_does_not_write_to_its_program() {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::AsRawFd;
     use std::sync::Arc;
 
-    let mut pipe = [-1; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-    let _reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
-    let _writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    let (reader, writer) = aterm_uds::pipe().expect("pipe");
+    let pipe = [reader.as_raw_fd(), writer.as_raw_fd()];
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(
@@ -359,21 +359,18 @@ fn release(app: &mut App, wid: WindowId, code: KeyCode, letter: &str) {
 /// Creates a headless `App` whose session sink writes to a nonblocking pipe.
 #[cfg(unix)]
 fn app_observing_pty() -> (App, std::os::fd::OwnedFd) {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::AsRawFd;
     use std::sync::Arc;
 
-    let mut pipe = [-1; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-    let reader = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
-    let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-    let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+    let (reader, writer) = aterm_uds::pipe().expect("pipe");
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(
-        unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
         0
     );
-    let sink = Arc::new(aterm_session::sink::SinkWriter::new_owned(writer));
-    (App::headless_for_test_with_sink(sink), reader)
+    let sink = Arc::new(aterm_session::sink::SinkWriter::new_owned(writer.into()));
+    (App::headless_for_test_with_sink(sink), reader.into())
 }
 
 /// Everything the program has been sent since the last drain; empty is

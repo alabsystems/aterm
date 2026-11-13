@@ -1676,6 +1676,31 @@ pub fn resolve_aterm(given: Option<String>) -> Result<PathBuf, String> {
     paths().need_aterm().map(Path::to_path_buf)
 }
 
+/// Select the CLI window admission before resolving an app or creating a world.
+fn instance_window_work(args: &mut Vec<String>, window: bool) -> Result<WindowWork, Fail> {
+    let Some(value) = take_value(args, "--functional-memory-mib")? else {
+        return Ok(WindowWork::Timing);
+    };
+    if args.iter().any(|arg| arg == "--functional-memory-mib") {
+        return Err(Fail::usage("instance: duplicate --functional-memory-mib"));
+    }
+    if !window {
+        return Err(Fail::usage(
+            "instance: --functional-memory-mib requires --window",
+        ));
+    }
+    let memory_bytes = value.bytes().all(|byte| byte.is_ascii_digit())
+        .then(|| value.parse::<u64>().ok())
+        .flatten()
+        .and_then(|mib| mib.checked_mul(1024 * 1024))
+        .filter(|bytes| *bytes > 0)
+        .ok_or_else(|| Fail::usage("instance: --functional-memory-mib takes a positive MiB budget that fits in u64 bytes"))?;
+    Ok(WindowWork::Functional {
+        memory_bytes,
+        retain: false,
+    })
+}
+
 fn network_away_delay(args: &mut Vec<String>) -> Result<Option<u64>, Fail> {
     let value = take_value(args, "--network-away-in-ms")?;
     #[cfg(any(test, debug_assertions))]
@@ -1741,6 +1766,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
     let keep = take_flag(&mut a, "--keep");
     let at = take_value(&mut a, "--world")?.map(|p| from_caller(&p));
     let window = take_flag(&mut a, "--window");
+    let window_work = instance_window_work(&mut a, window)?;
     let band = Band::pick(take_value(&mut a, "--band")?.as_deref())?;
     let cold = match take_value(&mut a, "--pages")?.as_deref() {
         None | Some("warm") => false,
@@ -1898,7 +1924,7 @@ pub fn cmd_instance(args: &[String]) -> Res {
         },
         band,
         &world.sock,
-        WindowWork::Timing,
+        window_work,
         prepare,
     )?;
     // From here the instance's end is this verb's to wait for and say: a second signal, even

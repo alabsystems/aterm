@@ -257,10 +257,10 @@ fn native_writer_is_busy(paths: &Paths) {
         matches!(
             native,
             aterm_secrets::client::MaterializationObservation::Blocked(
-                aterm_secrets::client::MaterializationBlocker::LockUnavailable
+                aterm_secrets::client::MaterializationBlocker::WriterBusy
             )
         ),
-        "the actual native lock must be unavailable before releasing its writer"
+        "the actual native lock must be busy before releasing its writer"
     );
 }
 

@@ -561,13 +561,19 @@ fn clicker_at(home: PathBuf, state: PathBuf, sock: Option<String>) -> Clicker {
 }
 
 /// What reads the default permission mode of a tab's Claude Code settings, by the tab's sid
-/// ([`App::permission_default`]).
+/// ([`App::permission_default`]): `None` while the tab's agent is not read yet, which is not a
+/// read that failed, since a click decides nothing on it ([`App::click_permission`]).
 #[derive(Clone)]
-pub(crate) struct Defaults(Arc<dyn Fn(&str) -> PermissionDefault + Send + Sync>);
+pub(crate) struct Defaults(Arc<ReadDefault>);
+
+/// A read of one tab's settings default, by its sid ([`Defaults`]).
+type ReadDefault = dyn Fn(&str) -> Option<PermissionDefault> + Send + Sync;
 
 impl Defaults {
     /// Wrap a read.
-    pub(crate) fn new(f: impl Fn(&str) -> PermissionDefault + Send + Sync + 'static) -> Self {
+    pub(crate) fn new(
+        f: impl Fn(&str) -> Option<PermissionDefault> + Send + Sync + 'static,
+    ) -> Self {
         Self(Arc::new(f))
     }
 }
@@ -576,9 +582,11 @@ impl Defaults {
 /// restart, and its box says the mode could not be read.
 impl Default for Defaults {
     fn default() -> Self {
-        Self::new(|_| PermissionDefault {
-            mode: Resolved::Unread("its agent is not read".to_string()),
-            bypass_disabled: None,
+        Self::new(|_| {
+            Some(PermissionDefault {
+                mode: Resolved::Unread("its agent is not read".to_string()),
+                bypass_disabled: None,
+            })
         })
     }
 }
@@ -589,19 +597,164 @@ impl std::fmt::Debug for Defaults {
     }
 }
 
-/// Production [`Defaults`]: the settings chain of the agent the host's relaunch snapshot names
-/// for the tab, read under that agent's own environment, line and directory
-/// ([`crate::harness_netprobe::permission_default_of_agent`]). A tab with no snapshot (an agent
-/// started under Off) is not read.
-pub(crate) fn live_defaults() -> Defaults {
-    Defaults::new(|tab| match crate::harness_host::published_snapshot(tab) {
-        Some(snap) => {
-            crate::harness_netprobe::permission_default_of_agent(snap.pid, &snap.argv, &snap.cwd)
+/// How long a read default stands before the footer's resolver reads it again.
+const DEFAULT_RECHECK: Duration = Duration::from_secs(2);
+
+/// The most tabs whose default is held: the tabs of one machine's windows.
+const DEFAULT_READS_MAX: usize = 64;
+
+/// One tab's settings default as last read.
+#[derive(Debug, Clone)]
+struct DefaultRead {
+    tab: String,
+    /// The agent it was read for: another process's default is not this one's.
+    pid: u32,
+    /// When it was read; `None` before the first read of this agent's.
+    at: Option<Instant>,
+    /// When the window last asked the resolver for a read ([`DefaultReads::ask`]).
+    asked: Option<Instant>,
+    default: Option<PermissionDefault>,
+}
+
+/// Each tab's settings default, as the footer's resolver thread last read it
+/// ([`note_default`]): the window thread reads no file and no process for a click or its box
+/// ([`live_defaults`]).
+#[derive(Debug, Default)]
+pub(crate) struct DefaultReads(Vec<DefaultRead>);
+
+impl DefaultReads {
+    fn of(&self, tab: &str, pid: u32) -> Option<&DefaultRead> {
+        self.0.iter().find(|r| r.tab == tab && r.pid == pid)
+    }
+
+    fn of_mut(&mut self, tab: &str, pid: u32) -> &mut DefaultRead {
+        // One agent a tab: a relaunched agent's read replaces the ended one's.
+        self.0.retain(|r| r.tab != tab || r.pid == pid);
+        if let Some(at) = self.0.iter().position(|r| r.tab == tab) {
+            return &mut self.0[at];
         }
-        None => PermissionDefault {
-            mode: Resolved::Unread("its agent is not read".to_string()),
-            bypass_disabled: None,
-        },
+        if self.0.len() >= DEFAULT_READS_MAX {
+            self.0.remove(0);
+        }
+        self.0.push(DefaultRead {
+            tab: tab.to_owned(),
+            pid,
+            at: None,
+            asked: None,
+            default: None,
+        });
+        let last = self.0.len() - 1;
+        &mut self.0[last]
+    }
+
+    /// Whether agent `pid` of tab `tab` has no read, or one that has stood [`DEFAULT_RECHECK`]
+    /// at `now`.
+    #[must_use]
+    pub(crate) fn due(&self, tab: &str, pid: u32, now: Instant) -> bool {
+        self.of(tab, pid)
+            .and_then(|r| r.at)
+            .is_none_or(|at| now.saturating_duration_since(at) >= DEFAULT_RECHECK)
+    }
+
+    /// Hold `default` as read at `now` for agent `pid` of tab `tab`: whether it differs from
+    /// the one held.
+    pub(crate) fn hold(
+        &mut self,
+        tab: &str,
+        pid: u32,
+        now: Instant,
+        default: PermissionDefault,
+    ) -> bool {
+        let read = self.of_mut(tab, pid);
+        let moved = read.default.as_ref() != Some(&default);
+        read.at = Some(now);
+        read.default = Some(default);
+        moved
+    }
+
+    /// The default last read for agent `pid` of tab `tab`.
+    #[must_use]
+    pub(crate) fn get(&self, tab: &str, pid: u32) -> Option<PermissionDefault> {
+        self.of(tab, pid).and_then(|r| r.default.clone())
+    }
+
+    /// Whether the window should ask the resolver for a read of agent `pid` of tab `tab` at
+    /// `now`: its read is [`Self::due`] and no ask was made within [`DEFAULT_RECHECK`]. A yes
+    /// records the ask.
+    pub(crate) fn ask(&mut self, tab: &str, pid: u32, now: Instant) -> bool {
+        if !self.due(tab, pid, now) {
+            return false;
+        }
+        let read = self.of_mut(tab, pid);
+        if read
+            .asked
+            .is_some_and(|at| now.saturating_duration_since(at) < DEFAULT_RECHECK)
+        {
+            return false;
+        }
+        read.asked = Some(now);
+        true
+    }
+}
+
+static DEFAULT_READS: Mutex<DefaultReads> = Mutex::new(DefaultReads(Vec::new()));
+
+/// Read the settings' default of the agent `pid`, off the window thread (the footer's resolver,
+/// after it read the session's facts) and at most every [`DEFAULT_RECHECK`]: the settings chain
+/// of the agent the host's relaunch snapshot names, read under that agent's own environment,
+/// line and directory ([`crate::harness_netprobe::permission_default_of_agent`]). An agent no
+/// snapshot names (one started under Off) is not read. No lock is held over the read.
+pub(crate) fn note_default(pid: u32, now: Instant) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(snap) = crate::harness_host::published_snapshot_of_pid(pid) else {
+        return;
+    };
+    let due = DEFAULT_READS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .due(&snap.tab, snap.pid, now);
+    if !due {
+        return;
+    }
+    let default =
+        crate::harness_netprobe::permission_default_of_agent(snap.pid, &snap.argv, &snap.cwd);
+    DEFAULT_READS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .hold(&snap.tab, snap.pid, now, default);
+}
+
+/// Hold `default` for agent `pid` of tab `tab` as the resolver's read, as a test scripts it.
+#[cfg(all(test, unix))]
+pub(crate) fn hold_default_for_test(tab: &str, pid: u32, default: PermissionDefault) {
+    DEFAULT_READS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .hold(tab, pid, Instant::now(), default);
+}
+
+/// Why a tab's default is not told before the resolver's first read of its agent.
+const NOT_READ_YET: &str = "its settings are not read yet";
+
+/// Production [`Defaults`]: the default the resolver last read ([`note_default`]) for the agent
+/// the host's relaunch snapshot names for the tab, so a click and its box read memory alone. A
+/// read is asked for on each frame the chip's title shows, at most once a [`DEFAULT_RECHECK`]
+/// ([`App::ask_default_read`]), and a click uses the last read held. A tab with no snapshot (an
+/// agent started under Off) is not read; an agent the resolver has not read yet is `None`.
+pub(crate) fn live_defaults() -> Defaults {
+    Defaults::new(|tab| {
+        let Some(pid) = crate::harness_host::published_pid(tab) else {
+            return Some(PermissionDefault {
+                mode: Resolved::Unread("its agent is not read".to_string()),
+                bypass_disabled: None,
+            });
+        };
+        DEFAULT_READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(tab, pid)
     })
 }
 
@@ -667,10 +820,42 @@ fn run_click_lane(
 }
 
 impl App {
-    /// The default permission mode of tab `tab`'s Claude Code settings, read now: a few small
-    /// files, fenced and bounded as every read of the chain is.
+    /// The default permission mode of tab `tab`'s Claude Code settings, as the footer's
+    /// resolver last read it off this thread ([`live_defaults`]): no file is read here. One not
+    /// read yet says so, as the box tells it.
     pub(crate) fn permission_default(&self, tab: &str) -> PermissionDefault {
+        self.held_permission_default(tab)
+            .unwrap_or_else(|| PermissionDefault {
+                mode: Resolved::Unread(NOT_READ_YET.to_string()),
+                bypass_disabled: None,
+            })
+    }
+
+    /// The default [`Self::permission_default`] reads, or `None` while the tab's agent is not
+    /// read yet: a click decides nothing on that.
+    pub(crate) fn held_permission_default(&self, tab: &str) -> Option<PermissionDefault> {
         (self.permission_clicks.defaults.0)(tab)
+    }
+
+    /// Ask the footer's resolver to read `session`'s settings default again where the read held
+    /// for its tab is due and none was asked for lately ([`DefaultReads::ask`]). It is asked on
+    /// each frame the permission chip's title shows and by a click made before the first read;
+    /// a click uses the last read held, which a pointer resting on the chip with nothing
+    /// repainting does not renew.
+    pub(crate) fn ask_default_read(&self, session: u64) {
+        let Some(tab) = self.session_sid(session) else {
+            return;
+        };
+        let Some(pid) = crate::harness_host::published_pid(&tab) else {
+            return;
+        };
+        let ask = DEFAULT_READS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .ask(&tab, pid, Instant::now());
+        if ask {
+            self.request_account_read(session);
+        }
     }
 
     /// Whether the host relaunches tab `tab`'s agent when it ends ([`harness::look`]'s

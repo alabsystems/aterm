@@ -3,8 +3,9 @@
 // Author: Andrew Yates
 
 //! agh's git (design §6.9): the isolated runner every git child of agh or its callers runs
-//! under, the credential helper git calls back, and the grants that let the helper answer a
-//! release-tier owner or a push's writer. This module runs the `git` program. It is not
+//! under, the credential helper git calls back, the grants that let the helper answer a
+//! release-tier owner or a push's writer, and how a git keeps a read from fetching lazily
+//! ([`lazy_fetch`], asked of a git its caller runs). This module runs the `git` program. It is not
 //! `agh::github::git`, M1's REST git-data API (commits, refs, trees).
 
 mod ancestry;
@@ -14,6 +15,7 @@ mod fetch;
 pub mod grant;
 #[cfg(test)]
 mod grant_conformance_tests;
+pub mod lazy_fetch;
 mod run;
 #[cfg(unix)]
 mod source_config;
@@ -23,7 +25,7 @@ pub use control::{
     ControlRefChange, ControlRefTransaction, PUBLISHER_FENCE_REF, RELEASE_LEASE_REF,
 };
 pub use fetch::{FETCH_ROWS_MAX, FetchBatch, FetchRow};
-pub use run::{GitOp, GitOut, GitRun, HelperCommand, HelperHost};
+pub use run::{FetchScope, GitOp, GitOut, GitRun, HelperCommand, HelperHost};
 
 /// Admit Git's complete `rev-parse --is-shallow-repository` answer for a native push.
 /// Callers may use the same admission before expensive checks; the push rechecks it.
@@ -88,9 +90,9 @@ pub enum NativePushPhase {
 // `run` stays a private module; its runner is re-exported to the crate alone, so
 // `Github::run_git` (client.rs) calls it as `crate::git::run(self, run)`. The function and
 // the module share the name in different namespaces.
-#[cfg(unix)]
-pub(crate) use run::project_config_names;
 pub(crate) use run::run;
+#[cfg(unix)]
+pub(crate) use run::{project_commit_config, project_config_names};
 
 /// The username the helper answers: GitHub ignores it for a token, and a fixed one keeps
 /// the Basic credential's shape known to the Redactor.

@@ -586,7 +586,7 @@ fn the_top_rule_at_rest_costs_nothing_with_the_harness_on() {
     assert!(
         at_rest.starts_with("\u{2500}\u{2500}    claude \u{2500}")
             && at_rest.ends_with(&format!(
-                "\u{2500} \u{25cf} on  alab v{} (v2.1.283) \u{2500}\u{2500}",
+                "\u{2500} \u{25cf} on  ALab v{} (v2.1.283) \u{2500}\u{2500}",
                 aterm_phase::CliHarness::ClaudeCode.version_str()
             )),
         "the lockup and the lit switch are on the top rule: {at_rest:?}"
@@ -630,7 +630,7 @@ fn the_top_rule_at_rest_costs_nothing_with_the_harness_on() {
     let narrowed = glass_chars(&app, wid, top);
     assert!(
         narrowed.contains(&format!(
-            "alab v{} (v2.1.283)",
+            "ALab v{} (v2.1.283)",
             aterm_phase::CliHarness::ClaudeCode.version_str()
         )) && narrowed.chars().count() == cols,
         "CONTROL: the switch laid anew at {cols}: {narrowed:?}"
@@ -1230,6 +1230,7 @@ fn the_ladder_lays_the_specs_tiers_at_the_specs_widths() {
     let table = [
         ("T0", labels[0] + 40),
         ("T1", labels[1] + 40),
+        ("T2", labels[2] + 40),
         ("no label", 39),
         ("no label icon", 32),
         ("no label bare", 26),
@@ -1558,7 +1559,7 @@ fn the_rule_flows_into_the_switch() {
                 assert_eq!(
                     (cell.fg, cell.bold),
                     (brand, true),
-                    "{at}: `alab`, letter {k}"
+                    "{at}: `ALab`, letter {k}"
                 );
             }
         }
@@ -2449,7 +2450,7 @@ fn the_bare_switch_reads_on_every_ground() {
 
 /// THE THEMED SWITCH READS ON EVERY GROUND: under every harness theme the switch's and the
 /// label's inks (the version's and the switch under the pointer, the quiet words and the switch
-/// at rest, `alab`'s hero letters) read at the name floor on every built-in scheme's ground and
+/// at rest, `ALab`'s hero letters) read at the name floor on every built-in scheme's ground and
 /// on a grey ramp, Silver Aerogel's and Unikitty's included, and so does every glyph of the switch
 /// at rest and under the pointer. CONTROL: the arc's letter lifted but unfloored reads under 1.5:1
 /// on Silver Aerogel.
@@ -2511,12 +2512,12 @@ fn the_themed_switch_reads_on_every_ground() {
                     }
                 }
                 for (what, ink) in [
-                    ("the version", inks.lit),
+                    ("the \u{2b06}\u{fe0f}'s target", inks.lit),
                     ("the quiet words", inks.muted),
-                    ("alab's first letter", inks.brand(0.0)),
-                    ("alab's second letter", inks.brand(1.0 / 3.0)),
-                    ("alab's third letter", inks.brand(2.0 / 3.0)),
-                    ("alab's last letter", inks.brand(1.0)),
+                    ("the mark's first letter", inks.brand(0.0)),
+                    ("the mark's second letter", inks.brand(1.0 / 3.0)),
+                    ("the mark's third letter", inks.brand(2.0 / 3.0)),
+                    ("the mark's last letter", inks.brand(1.0)),
                 ] {
                     let k = reads(ink, blank.bg);
                     if k < floor {
@@ -3056,6 +3057,7 @@ fn the_arrow_ends_the_rule_a_blank_from_its_close() {
         ("T0", labels[0] + 43),
         ("T0 icon", labels[0] + 36),
         ("T1 icon", labels[1] + 36),
+        ("T2 icon", labels[2] + 36),
         ("no label icon", 35),
         ("no label bare", 29),
     ] {
@@ -3254,6 +3256,19 @@ fn the_arrows_words_say_when_the_move_lands() {
             let label = slot.len();
             let (_, over) = slot_top(paint, w);
             let shown = slot_of(&over).expect("the slot");
+            if shown == aterm_types::identity::COMPANY {
+                // The mark alone has room for no form: the slot keeps saying the mark.
+                assert!(
+                    forms.iter().all(|form| form.chars().count() > label),
+                    "{w}: no form fits the mark's own {label} cells"
+                );
+                assert_eq!(
+                    laid_at(&still).0,
+                    laid_at(&over).0,
+                    "{w}: the switch stands where it stood"
+                );
+                continue;
+            }
             let selected = forms
                 .iter()
                 .position(|form| *form == shown)
@@ -3269,8 +3284,9 @@ fn the_arrows_words_say_when_the_move_lands() {
             if grew > 0 {
                 grown += 1;
                 assert!(
-                    selected < required,
-                    "{w}: only a form with the when grows: {shown:?}"
+                    selected < required || forms.iter().all(|form| form.chars().count() > label),
+                    "{w}: a form without the when grows only where none fits the label's own \
+                     cells: {shown:?}"
                 );
             } else {
                 kept += 1;
@@ -3353,12 +3369,15 @@ fn the_arrows_words_say_when_the_move_lands() {
         Some("couldn't update \u{b7} press it again"),
         "a refusal's words"
     );
-    let (_, t4) = slot_top(rest, 40);
-    let (_, t4_over) = slot_top(hovered, 40);
-    assert!(
-        t4.switch.as_ref().is_some_and(|s| s.label.is_none()),
-        "40: no label"
-    );
+    let bare = (24..40)
+        .rev()
+        .find(|&w| {
+            let (_, top) = slot_top(rest, w);
+            top.switch.as_ref().is_some_and(|s| s.label.is_none())
+        })
+        .expect("a width that lays the switch and no label");
+    let (_, t4) = slot_top(rest, bare);
+    let (_, t4_over) = slot_top(hovered, bare);
     assert_eq!(
         t4_over.cells, t4.cells,
         "CONTROL: no label, the hover writes nothing new"
@@ -3372,7 +3391,7 @@ fn the_arrows_words_say_when_the_move_lands() {
 /// (`v2.1.310 · once autopilot is on` at 76 columns), and in its fewest words (`autopilot off`)
 /// only where the room cannot hold that either; a refusal takes the first form that fits the
 /// label's own cells (`the harness is off`). It moves nothing where the form shown fits the
-/// label's own cells, and grows only as far as a whole form needs (`alab v0.5` gives way to
+/// label's own cells, and grows only as far as a whole form needs (`ALab v0.5` gives way to
 /// `autopilot off`). CONTROL: a rule too narrow for any form keeps its label.
 #[test]
 fn a_held_arrows_words_and_a_refusal_keep_their_reason() {
@@ -3498,7 +3517,7 @@ fn a_held_arrows_words_and_a_refusal_keep_their_reason() {
     let (_, rest50) = slot_top(autopilot, 50);
     let (_, press50) = slot_top(autopilot.refused_with(Some("autopilot is off")), 50);
     let short = format!(
-        "alab v{}",
+        "ALab v{}",
         aterm_phase::CliHarness::ClaudeCode.version_str()
     );
     assert_eq!(slot_of(&rest50).as_deref(), Some(short.as_str()), "50: T1");
@@ -3515,8 +3534,8 @@ fn a_held_arrows_words_and_a_refusal_keep_their_reason() {
 }
 
 /// THE LABEL'S HOVER SAYS ONLY WHAT IT LEAVES OUT: under the pointer a Muse label shows its
-/// whole build in the label's own inks (`alab` in the brand's): `alab v0.5 (v1.4.13-R6996.1)`
-/// where `alab v0.5 (v1.4.13)` stood, grown left into the rule's room, the switch moving left by
+/// whole build in the label's own inks (`ALab` in the brand's): `ALab v0.5 (v1.4.13-R6996.1)`
+/// where `ALab v0.5 (v1.4.13)` stood, grown left into the rule's room, the switch moving left by
 /// exactly the cells it grew and no further; where no form fits, and for Claude Code (whose build
 /// is its numbers), the label stands.
 #[test]
@@ -3555,7 +3574,7 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
     let (rest, _) = slot(&compose(muse, 158));
     let (shown, cells) = slot(&compose(over, 158));
     let whole = format!(
-        "alab v{} (v1.4.13-R6996.1)",
+        "ALab v{} (v1.4.13-R6996.1)",
         aterm_phase::CliHarness::Muse.version_str()
     );
     assert_eq!(
@@ -3589,7 +3608,24 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
             .iter()
             .enumerate()
             .all(|(k, c)| c.bold && c.fg == inks.brand(k as f32 / 3.0)),
-        "`alab` keeps the hero's letters"
+        "`ALab` keeps the hero's letters"
+    );
+    // The mark is a click target, so under the pointer it wears the glass's one hover: one
+    // underline from its first glyph to its last, the fine print in the lit ink, no weight
+    // moved; at rest it wears none.
+    let single = aterm_core::terminal::UnderlineStyle::Single;
+    assert!(
+        cells[lead..].iter().all(|c| c.underline == single)
+            && cells[..lead].iter().all(|c| c.underline != single)
+            && cells[lead + 4..]
+                .iter()
+                .all(|c| !c.bold && (c.ch == ' ' || c.fg == inks.lit)),
+        "the hovered mark is underlined over its ink, its fine print lit"
+    );
+    let (_, rest_cells) = slot(&compose(muse, 158));
+    assert!(
+        rest_cells.iter().all(|c| c.underline != single),
+        "CONTROL: at rest the mark wears no underline"
     );
     let snug = (60..158)
         .find(|&w| {
@@ -3613,7 +3649,7 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
     assert_eq!(
         shown.trim_start(),
         format!(
-            "alab v{} (v{full_version})",
+            "ALab v{} (v{full_version})",
             aterm_phase::CliHarness::ClaudeCode.version_str()
         )
     );
@@ -3633,12 +3669,13 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
         },
         158,
     );
+    let said = |top: &ComposedTop| top.cells.iter().map(|c| c.ch).collect::<String>();
     assert_eq!(
-        compose(claude, 158).cells,
-        at_rest.cells,
-        "CONTROL: Claude Code's label says all of its build"
+        said(&compose(claude, 158)),
+        said(&at_rest),
+        "CONTROL: Claude Code's label says all of its build, so its hover changes no glyph"
     );
-    // A pane that lays the last tier (`alab v0.4`) leaves the build out: the hover says it, in
+    // A pane that lays the middle tier (`ALab v0.4`) leaves the build out: the hover says it, in
     // the label's own cells.
     let narrow = 55;
     let rest = SwitchPaint {
@@ -3649,10 +3686,10 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
     assert_eq!(
         rest_words.trim_start(),
         format!(
-            "alab v{}",
+            "ALab v{}",
             aterm_phase::CliHarness::ClaudeCode.version_str()
         ),
-        "the last tier at {narrow}"
+        "the middle tier at {narrow}"
     );
     let (over_words, _) = slot(&compose(claude, narrow));
     assert_eq!(
@@ -3665,6 +3702,93 @@ fn the_labels_hover_says_only_what_it_leaves_out() {
         compose(rest, narrow).switch.map(|s| s.cols),
         "the switch stands where it stood"
     );
+}
+
+/// The label a top line of `w` columns lays over Claude's tail, at rest in Cruise: its words and
+/// its cells, `None` where the rule lays no label.
+fn label_at_width(w: usize) -> Option<(String, Vec<RenderCell>)> {
+    let tail = claude_tail();
+    let paint = SwitchPaint {
+        cli_ver: Inline::new("2.1.305"),
+        ..LIT
+    };
+    let key = key_for(
+        aterm_phase::Program::Claude,
+        tailed_run(w - 12, &tail),
+        Some(paint),
+        Some(CardPalette::Cruise),
+        blank(),
+        KeyFace::default(),
+    );
+    let mut top = ComposedTop::default();
+    compose_top(&key, &mut top, None, &tail);
+    let (cols, _) = top.switch.as_ref()?.label.clone()?;
+    let cells: Vec<RenderCell> = cols.map(|c| top.cells[c - top.col]).collect();
+    Some((cells.iter().map(|c| c.ch).collect(), cells))
+}
+
+/// THE NARROWEST LABEL IS THE MARK ALONE: from a wide pane down, the label reads `ALab v<harness>
+/// (v<build>)`, then `ALab v<harness>`, then `ALab`, then is gone, each form in its turn and
+/// none coming back.
+#[test]
+fn the_narrowest_label_is_the_mark_alone() {
+    let ver = aterm_phase::CliHarness::ClaudeCode.version_str();
+    let mut seen: Vec<Option<String>> = Vec::new();
+    for w in (34..=170).rev() {
+        let label = label_at_width(w).map(|(words, _)| words);
+        if seen.last() != Some(&label) {
+            seen.push(label);
+        }
+    }
+    assert_eq!(
+        seen,
+        [
+            Some(format!("ALab v{ver} (v2.1.305)")),
+            Some(format!("ALab v{ver}")),
+            Some("ALab".to_owned()),
+            None,
+        ],
+        "the label's tiers, widest first, then no label"
+    );
+    assert_eq!(aterm_types::identity::COMPANY, "ALab", "the mark");
+}
+
+/// THE MARK IS THE ONLY BOLD LABEL WORD: at every tier the mark's four letters are bold in the
+/// hero's ramp, and every other letter of the label (the harness's version, the CLI's build) is
+/// fine print: regular weight, in the quiet ink.
+#[test]
+fn the_mark_is_the_only_bold_label_word() {
+    let inks = FaceInks::of(&top_glass(Some(CardPalette::Cruise)));
+    assert_ne!(
+        inks.muted, inks.lit,
+        "CONTROL: the quiet ink is not the lit one"
+    );
+    let mut tiers = std::collections::BTreeSet::new();
+    for w in (34..=170).rev() {
+        let Some((words, cells)) = label_at_width(w) else {
+            continue;
+        };
+        tiers.insert(words.len());
+        let bold: String = cells.iter().filter(|c| c.bold).map(|c| c.ch).collect();
+        assert_eq!(bold, "ALab", "{w}: {words:?}: the mark alone is bold");
+        for (k, c) in cells.iter().enumerate() {
+            if k < 4 {
+                assert_eq!(
+                    c.fg,
+                    inks.brand(k as f32 / 3.0),
+                    "{w}: the mark's letter {k} in the hero's ramp"
+                );
+            } else if c.ch != ' ' {
+                assert_eq!(
+                    (c.fg, c.bold),
+                    (inks.muted, false),
+                    "{w}: {:?} is fine print",
+                    c.ch
+                );
+            }
+        }
+    }
+    assert_eq!(tiers.len(), 3, "CONTROL: every tier was laid: {tiers:?}");
 }
 
 /// A KEPT ARROW STAYS WITH THE PROGRAM IT WAS MINTED FOR: the row a host last sent before it
@@ -4181,7 +4305,7 @@ fn an_arrow_says_a_turns_end_only_for_a_turn() {
 /// A PRESS'S HOVER KEEPS ITS WAIT AND WHAT IT ENDS: with a draft in the composer, the slot under
 /// the pointer on a Claude Code ⬆️ says the press waits for it and what the restart ends, before
 /// the press and once it is under way. Where no form that says both fits the label's own cells
-/// (21 here, `alab v0.5 (v2.1.305)`), the slot grows left into the rule's room for the most said
+/// (21 here, `ALab v0.5 (v2.1.305)`), the slot grows left into the rule's room for the most said
 /// that does: the whole sentence at 144 and 230 columns alike, the wait in its fewest words
 /// (`v2.1.310 · after your draft · ends 1 shell`) at 95; at 80, where none fits, it keeps the
 /// wait and cuts what the restart ends (`v2.1.310 · after your draft`), never to the verb and the
@@ -4471,7 +4595,7 @@ fn a_press_keeps_its_verb_where_the_rule_has_room() {
 /// still says what the press waits for, in its fewest words, before the verb and the target:
 /// `v2.1.310 · after your draft`, `· after its dialog`, `· after the hold`, and an asked move's
 /// `→ v2.1.310 · after your draft`, each grown left into the rule's room only as far as it needs,
-/// since the label's own cells (`alab v0.5 (v2.1.305)`) cannot hold it. CONTROLS:
+/// since the label's own cells (`ALab v0.5 (v2.1.305)`) cannot hold it. CONTROLS:
 /// at 95 the form that names the shells still wins; the verb and the target remain the form after
 /// it. NEGATIVE CONTROLS: with no shell to end there is no second form in the fewest words (the
 /// one there is says the wait alone already); another CLI's arrow, whose words carry no restart,

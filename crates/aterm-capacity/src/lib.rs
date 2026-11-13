@@ -12,7 +12,8 @@
 //! waits until the need fits beside the claims already held and those that waited longer
 //! (first in, first out; a later claim goes first only when it fits beside every earlier one's
 //! reservation, or, past a waiter that cannot start yet, within what that waiter SPARES: the most
-//! it may take without delaying that waiter's turn by any claim's end or step, [`spared`]),
+//! it may take without delaying that waiter's turn by any claim's end or step, [`spared`]; past
+//! a waiter no claim's end can start, wherever it fits the room, [`Spared::Stuck`]),
 //! printing one line a minute that names the shortfall and each holder. A held build's claim
 //! STEPS down to what its run phase claims once its tree runs a program its build made, and
 //! back up should its run outgrow that ([`mod@phase`], CAP3). That is
@@ -24,9 +25,10 @@
 //! first while it waits for that, so it is not kept from being overtaken (the trade, in
 //! [`mod@admit`]). Its relief runs at once, and a look still beyond the room after it, with no
 //! scratch claim held there that could meet it, is refused ([`Error::Unmet`], UNMET): nothing it
-//! would wait for frees disk. A memory need with no margin that does
-//! not fit, where no other claim holds memory or waits ahead for it, is admitted ALONE: what it
-//! is short of is work no claim holds, whose end no claim's end brings, so a wait for it would
+//! would wait for frees disk. A memory need with no margin that does not fit, where no other
+//! claim holds memory or waits ahead for it (a waiter no claim's end can start aside,
+//! [`Spared::Stuck`]), is admitted ALONE: what it is short of is work no claim holds, whose end
+//! no claim's end brings, so a wait for it would
 //! have no bound; it runs with no other memory claim beside it, each waiting while it is held
 //! ([`Short::Alone`]). Resource-only admission refuses at once a need that can never fit here: all the memory
 //! that can ever be available or more (physical memory less what is wired,
@@ -157,8 +159,8 @@ mod retained_cohort_tests;
 
 pub use admit::{
     Alone, CREDIT_MAX, Claim, Error, Forced, Holder, Pace, Polled, QuietStart, Relief, Reserve,
-    Short, Shortfall, Waiter, admit, admit_relieved, admit_until, admit_with, covered_memory,
-    covering, covering_disk, gib, never, reserved, span, spared,
+    Short, Shortfall, Spared, Waiter, admit, admit_relieved, admit_until, admit_with,
+    covered_memory, covering, covering_disk, gib, never, reserved, span, spared,
 };
 #[cfg(unix)]
 pub use cohort_environment::capacity_cohort_environment;
@@ -389,7 +391,9 @@ pub struct Need {
     pub path: Option<PathBuf>,
     /// The checkout it runs for, where that is not its working directory's (a tool that confines its working directory to `/`); unset, the working directory's enclosing checkout. A [`Record`] keeps it as its `checkout`, never here.
     pub checkout: Option<String>,
-    /// Admit its memory only ALONE ([`Self::alone`]): once no other claim holds memory or waits ahead for it, whatever is available, and while it is held no other memory claim is admitted.
+    /// Admit its memory only ALONE ([`Self::alone`]): once no other claim holds memory or waits
+    /// ahead for it (a waiter no claim's end can start aside, [`Spared::Stuck`]), whatever is
+    /// available, and while it is held no other memory claim is admitted.
     pub alone: bool,
     /// Its memory covers the builds its holder's tree starts ([`Self::covers`]).
     pub covers: bool,
@@ -602,8 +606,9 @@ impl Need {
     }
 
     /// Admit its memory only ALONE: once no other claim on the machine holds memory or waits
-    /// ahead for it, however much is available, and while it is held every other memory claim
-    /// waits ([`Short::Alone`]). What work that needs more memory than can ever be available here
+    /// ahead for it (a waiter no claim's end can start aside, [`Spared::Stuck`]), however
+    /// much is available, and while it is held every other memory claim waits
+    /// ([`Short::Alone`]). What work that needs more memory than can ever be available here
     /// asks: [`never`] refuses such a need otherwise, and admitted beside other claims it would
     /// overrun the machine with them. A memory need with no margin that is short only of memory
     /// no claim holds is admitted alone without asking (the ledger's ALONE rule, [`mod@admit`]).

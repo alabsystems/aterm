@@ -4,11 +4,9 @@
 //! `targo --unverified verify land` (design B10, `docs/DESIGN-fast-build-release-2026-11-05.md`
 //! §4.6): land this checkout's branch on main, judged.
 //!
-//! 1. Fetch main and merge it (M1), stopping on a conflict. `CHANGELOG.md` is merged as sections
-//!    and entries from every agreed merge base, the branch tip and main ([`changelog`]), before
-//!    the merge commit is written. A release section main cut since the fork stays byte-for-byte
-//!    main's; branch additions go into the new `[Unreleased]`. The same rule owns each re-judge's
-//!    merge (step 4). Ambiguous entry identity, content or order stops before a commit.
+//! 1. Fetch main and merge it (M1), stopping on a conflict. The same rule owns each re-judge's
+//!    merge (step 4). A change's changelog entry is its own file under `changes/`, so two
+//!    branches' entries are disjoint paths and need no merge of their own.
 //! 2. Run the dev set over the cone since M1 (`verify --base M1`, B7's export scan included),
 //!    on the committed checkout: one that changes during the run pushes nothing. While it runs,
 //!    main is read at each stage boundary the run's events report and at least every [`POLL`]
@@ -32,8 +30,13 @@
 //!    ([`version::independent_lock`]). The four immutable trees retain every other lock
 //!    byte and the source-proven binary-leaf identity boundary. That
 //!    is seconds of plumbing, so a main that moves again is composed onto again at once
-//!    ([`COMPOSES`] in a row at most, rechecks included). Where the only shared paths are
-//!    Markdown no build, include or test reads (root `*.md` but `CHANGELOG.md`, `docs/**/*.md`,
+//!    ([`COMPOSES`] in a row at most, rechecks included). That count is the push's bound: no
+//!    deadline spans the landings of one judgment, and each remote step runs under its own hang
+//!    detector ([`NETWORK`]; a write under [`WRITE`]). A remote step that fails or times out
+//!    having sent nothing (a read of main, a push agh says it did not send) is made again after
+//!    a doubling pause, [`RETRIES`] in a row at most; a push whose outcome is unknown is never
+//!    made again, and a main that holds its landing took it. Where the only shared paths are
+//!    Markdown no build, include or test reads (root `*.md`, `docs/**/*.md`,
 //!    a member's `SPECS.md`: [`aterm_census::no_reach`], regular files on both sides and in the
 //!    merge, named in no Rust code: [`Git::markdown_shared`]), merge M2 and recheck the merge
 //!    with only the source readers ([`RECHECKS`]), as the merge's own freshly built verifier,
@@ -47,6 +50,28 @@
 //! 5. The landing merge states what ran ([`aterm_types::land_trailer`]), an interrupted judgment
 //!    as interrupted. A branch whose head already merges the main it lands on is that merge,
 //!    restated with the trailers.
+//! 6. A judgment that passed is kept in the worktree ([`KEPT`]) until its landing is on main, so
+//!    no ending between the pass and the push loses it: the next run whose HEAD is the judged
+//!    commit, holding the judged tree, starts at step 4 with that receipt, and judges only what
+//!    step 4's rule says it must.
+//!
+//! Each judgment and each recheck runs as the verifier built from the tree it judges: the argv
+//! its child gets, that child's parse of it, the reading of its record and every rule after it
+//! are one build's. Before each, the landing builds the checkout's verifier; where that build is
+//! not this process's own image (sha256, read at the start, before any build), the landing
+//! writes a handoff and replaces itself in place with that build as `land --resume <file>`
+//! ([`handoff`]). The receiver checks that the checkout still stands at the step's commit,
+//! parses the person's `land` words again and resumes the same step with the receipt, the
+//! re-judge and composition counts, and the branch's crates or the cone they are read over.
+//! A hop happens only between steps, never while a judgment, a build or a push runs: it
+//! carries no deadline, since none spans a judgment's push (step 4), and no unsettled write,
+//! since a write whose outcome is unknown ends the landing. Where step 6's kept judgment
+//! already passed the handed step's revision, the receiver does not run it again: it goes to
+//! the push with that receipt, as the next run would. A step hops at most [`HOPS`] times: the
+//! first receiver was built by the starting image's build recipe, which main may have changed,
+//! so its own build of the same tree may be another image, to which it hands the step on once
+//! more; the second was built by the tree's own recipe, so a build that is still not itself
+//! could not run.
 //!
 //! A tool, not a gate: nothing refuses a push made without it, and the harness records a landing
 //! without its trailers rather than refusing it.
@@ -55,11 +80,17 @@ use crate::exit;
 use aterm_types::land_trailer::{Checked, Interrupted, Rechecked, Row, Stated};
 use aterm_uds::spawnfd::Command;
 use std::collections::BTreeSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+#[path = "land_engine.rs"]
+mod engine;
+#[path = "land_handoff.rs"]
+pub mod handoff;
 #[path = "land_version.rs"]
 mod version;
+
+pub use handoff::{Handoff, Image};
 
 /// The remote main is fetched from and pushed to.
 pub const REMOTE: &str = "origin";
@@ -80,12 +111,33 @@ const BOUNDARY_TICK: Duration = Duration::from_secs(5);
 /// [`aterm_uds::process::END_GRACE`].
 const INTERRUPT_GRACE: Duration =
     crate::exec::group::REPORT_GRACE.saturating_add(aterm_uds::process::END_GRACE);
+/// How many times one step may be handed to another image ([`handoff`]): once by the image
+/// that ran the steps before, and once more by that receiver, built from the step's tree by
+/// the sender's build recipe, whose own build by the tree's recipe may differ.
+pub const HOPS: usize = 2;
 /// How many composition and pre-send obstruction races are allowed before the tool stops.
 /// A different writer or intent never renews this bound.
 pub const COMPOSES: usize = 10;
 /// The exit of a landing the tool stopped while main kept moving: the branch is merged and
 /// judged, not pushed (`EX_TEMPFAIL`, as a yielding `verify watch --sample`).
 pub const STOPPED: i32 = 75;
+/// How many remote failures in a row that sent nothing the push of a passed judgment makes
+/// again before the landing stops with its judgment kept: reads of main that failed or timed
+/// out, and, counted apart, pushes agh says it did not send
+/// ([`crate::remote::Pushed::Unsent`]).
+pub const RETRIES: usize = 5;
+/// The pause before a failed remote step is made again; each further failure in a row doubles it.
+pub const RETRY_PAUSE: Duration = Duration::from_secs(2);
+/// The hang detector on one write of main ([`Wire::write`]): the longest credential grant agh
+/// issues ([`agh::git::GRANT_MAX`]), beyond agh's own wall bound on each of its git children
+/// ([`agh::git::GIT_BUDGET`]). agh opens its write's durable intent before its re-verification
+/// of the pushed history and settles it when it ends, so agh ends its own write first: a write
+/// this tool killed would leave that intent open and refuse every later write of the repository.
+const WRITE: Duration = agh::git::GRANT_MAX;
+const _: () = assert!(WRITE.as_secs() > agh::git::GIT_BUDGET.as_secs());
+/// Where a passed judgment is kept until its landing is on main ([`Git::keep`]): a ref of this
+/// worktree alone, which no fetch or push moves.
+pub const KEPT: &str = "refs/worktree/aterm/land-judged";
 
 /// The checks a recheck runs: the source readers, the only checks that read no-reach Markdown
 /// (`aterm_census::no_reach`).
@@ -111,43 +163,91 @@ const NETWORK: Duration = Duration::from_secs(600);
 /// one ref in each submodule repository, replaced by each import.
 const GITLINK_REF: &str = "refs/agh/verify/gitlink";
 
-/// What the freshly fetched main proves after another writer's pre-send obstruction closes.
-enum PushObservation {
-    Landed,
-    Unchanged,
-    Moved(String),
+/// What the freshly fetched main proves about a push that did not report its landing: after
+/// another writer's pre-send obstruction closed, after a write agh did not send, or after a
+/// failure or a refusal.
+type PushObservation = aterm_land::Observation;
+
+/// The ordinary push and its existing refusal policy are supplied unchanged. Only a typed
+/// refusal that sent nothing permits another attempt of the same landing: an exact pre-send
+/// obstruction, sharing the composition bound with main movement, and a write agh says it did
+/// not send, once `again` allows it ([`unsent_again`]). Main is read before each such attempt.
+fn push_after_intents(
+    budget: &mut aterm_land::Budget,
+    attempt: &dyn Fn() -> Result<crate::remote::Pushed, String>,
+    wait: &dyn Fn(&agh::IntentId) -> Result<(), String>,
+    observe: &dyn Fn() -> Result<PushObservation, String>,
+    refused: &dyn Fn(&str) -> Result<Option<String>, String>,
+    again: &dyn Fn(&str) -> Result<(), String>,
+) -> Result<Option<String>, String> {
+    let moved = std::cell::Cell::new(None);
+    aterm_land::push_after_intents(
+        budget,
+        &|| unsent_again(attempt, again, observe, &moved),
+        wait,
+        observe,
+        &|why| match moved.take() {
+            Some(tip) => Ok(Some(tip)),
+            None => refused(why),
+        },
+    )
 }
 
-/// The ordinary push and its existing refusal policy are supplied unchanged. Only an exact
-/// pre-send obstruction permits another attempt, sharing the composition bound with main
-/// movement. The live callbacks all share the original push's absolute network deadline.
-fn push_after_intents(
+/// One attempt of the shared loop ([`aterm_land::push_after_intents`]): `attempt`'s outcome,
+/// where a write agh says it did not send ([`crate::remote::Pushed::Unsent`]) is made again
+/// once `again` allows it (its pause waited out) and a fresh read of main (`observe`) finds main
+/// where the landing expects it. A main that took the landing is `Done`; one that moved is a
+/// refusal whose tip is left in `moved` for the loop's refusal handler. Any other outcome is
+/// the attempt's own.
+fn unsent_again(
+    attempt: &dyn Fn() -> Result<crate::remote::Pushed, String>,
+    again: &dyn Fn(&str) -> Result<(), String>,
+    observe: &dyn Fn() -> Result<PushObservation, String>,
+    moved: &std::cell::Cell<Option<String>>,
+) -> Result<aterm_land::Attempt<agh::IntentId>, String> {
+    loop {
+        return Ok(match attempt()? {
+            crate::remote::Pushed::Done => aterm_land::Attempt::Done,
+            crate::remote::Pushed::Rejected(why) => aterm_land::Attempt::Rejected(why),
+            crate::remote::Pushed::Blocked { intent, why } => {
+                aterm_land::Attempt::Blocked { intent, why }
+            }
+            crate::remote::Pushed::Unsent(why) => {
+                again(&why)?;
+                match observe()? {
+                    PushObservation::Unchanged => continue,
+                    PushObservation::Landed => aterm_land::Attempt::Done,
+                    PushObservation::Moved(tip) => {
+                        moved.set(Some(tip));
+                        aterm_land::Attempt::Rejected(why)
+                    }
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+fn push_counting(
     composes: &mut usize,
     attempt: &dyn Fn() -> Result<crate::remote::Pushed, String>,
     wait: &dyn Fn(&agh::IntentId) -> Result<(), String>,
     observe: &dyn Fn() -> Result<PushObservation, String>,
     refused: &dyn Fn(&str) -> Result<Option<String>, String>,
+    again: &dyn Fn(&str) -> Result<(), String>,
 ) -> Result<Option<String>, String> {
-    loop {
-        match attempt()? {
-            crate::remote::Pushed::Done => return Ok(None),
-            crate::remote::Pushed::Rejected(why) => return refused(&why),
-            crate::remote::Pushed::Blocked { intent, why } => {
-                if *composes == COMPOSES {
-                    return Err(format!(
-                        "{why}; stopped after {COMPOSES} push/composition races"
-                    ));
-                }
-                *composes += 1;
-                wait(&intent)?;
-                match observe()? {
-                    PushObservation::Landed => return Ok(None),
-                    PushObservation::Moved(tip) => return Ok(Some(tip)),
-                    PushObservation::Unchanged => {}
-                }
-            }
-        }
-    }
+    let moved = std::cell::Cell::new(None);
+    aterm_land::push_after_intents_with_count(
+        COMPOSES,
+        composes,
+        &|| unsent_again(attempt, again, observe, &moved),
+        wait,
+        observe,
+        &|why| match moved.take() {
+            Some(tip) => Ok(Some(tip)),
+            None => refused(why),
+        },
+    )
 }
 
 pub use crate::event_log::{CheckRow, Finished, Judged};
@@ -155,7 +255,8 @@ pub use crate::event_log::{CheckRow, Finished, Judged};
 /// The branch's own crates: a red in one of them is the branch's, whatever main's lane says.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Branch {
-    /// The crates the change itself touched (the cone's seeds), by name.
+    /// The cone's seeds, by name: the crates the change itself touched, and those whose shipped
+    /// code spells another crate's changed path.
     Crates(BTreeSet<String>),
     /// The change reaches every crate (a widened cone: a shared input changed), or its crates
     /// were not read; the reason.
@@ -275,7 +376,7 @@ pub fn decide(judged: &Judged, lane: &Lane, branch: &Branch) -> Decision {
 
 /// Reads whether a poll's question became moot ([`Poll`]): the run it asks about exited, or
 /// reported a red, so its own end decides.
-pub type Moot<'m> = &'m mut dyn FnMut() -> bool;
+pub type Moot<'m> = aterm_land::Moot<'m>;
 
 /// Asked while a judgment runs whether main's newest tip dooms it: `true` interrupts the run. Its
 /// argument reads whether the question became moot meanwhile ([`Moot`]); its read of main ends
@@ -300,32 +401,76 @@ pub enum Ran {
 pub struct Seams<'a> {
     /// A git command in the checkout.
     pub git: &'a dyn Fn(&Path) -> Command,
-    /// Run the dev set on the checkout as it stands over the cone since a base commit. While it
-    /// runs it asks its third argument whether main's newest tip dooms it, at each stage
-    /// boundary its run reports and at least every [`POLL`], until the run reports a red (`FAIL`,
-    /// `NOT RUN`: a check, a stage or a test binary): its own end then decides, as without the
-    /// poll, an inherited red included. A `true` interrupts the run ([`interrupt_judgment`],
-    /// [`Ran::Interrupted`]) unless it ended or reported such a red meanwhile.
-    pub judge: &'a mut dyn FnMut(&Path, &str, Poll<'_>) -> Ran,
+    /// Build the checkout's verifier as it stands: the image each judgment and recheck runs,
+    /// and the one the landing hands itself to where it is not the landing's own
+    /// ([`Seams::hand_over`]).
+    pub verifier: &'a mut dyn FnMut(&Path) -> Result<Image, String>,
+    /// Run the dev set on the checkout (its first argument) as it stands, as the verifier at
+    /// the second argument (built by [`Seams::verifier`] from that checkout, the landing's own
+    /// image), over the cone since a base commit. While it runs it asks its fourth argument
+    /// whether main's newest tip dooms it, at each stage boundary its run reports and at least
+    /// every [`POLL`], until the run reports a red (`FAIL`, `NOT RUN`: a check, a stage or a
+    /// test binary): its own end then decides, as without the poll, an inherited red included.
+    /// A `true` interrupts the run ([`interrupt_judgment`], [`Ran::Interrupted`]) unless it
+    /// ended or reported such a red meanwhile.
+    pub judge: &'a mut dyn FnMut(&Path, &Path, &str, Poll<'_>) -> Ran,
     /// The branch's own crates: the seeds of the cone since the merged main commit.
     pub branch: &'a mut dyn FnMut(&Path, &str) -> Branch,
     /// Main's lane verdict on a main commit, read once each judgment ends.
     pub lane: &'a mut dyn FnMut(&Path, &str) -> Lane,
-    /// Rerun only the source readers ([`RECHECKS`]) on the checkout as it stands over the cone
-    /// since a base commit, with the checkout's own freshly built verifier: the recheck of a
-    /// Markdown compose ([`Composition::Rechecks`]). Nothing interrupts it.
-    pub recheck: &'a mut dyn FnMut(&Path, &str) -> Judged,
+    /// Rerun only the source readers ([`RECHECKS`]) on the checkout as it stands, as the
+    /// verifier at the second argument (the checkout's own fresh build, the landing's own
+    /// image), over the cone since a base commit: the recheck of a Markdown compose
+    /// ([`Composition::Rechecks`]). Nothing interrupts it.
+    pub recheck: &'a mut dyn FnMut(&Path, &Path, &str) -> Judged,
+    /// Hand the landing to an image (the first argument) with the handoff file it wrote (the
+    /// second), in the checkout (the third) ([`handoff::hand_over`]): production's replaces
+    /// this process and returns only when that failed, with the exit.
+    pub hand_over: &'a mut dyn FnMut(&Image, &Path, &Path) -> i32,
     /// Say a line to the person.
     pub say: &'a mut dyn FnMut(&str),
+    /// One remote step of the push phase (each push, and each read of main once a judgment
+    /// passed): [`crate::remote::run`] in production.
+    pub(crate) remote: &'a RemoteStep<'a>,
+    /// Wait out the pause before a failed remote step is made again ([`RETRY_PAUSE`]), and each
+    /// tick of a wait on another writer's open intent.
+    pub pause: &'a dyn Fn(Duration),
 }
 
-/// Land the checkout at `root` ([`Seams`]): the exit code ([`exit`], or [`STOPPED`]).
-pub fn land(root: &Path, seams: &mut Seams<'_>) -> i32 {
+/// How the push phase runs one remote step: a git or agh command for the checkout at the path,
+/// its git made by the maker, ended as hung at the instant ([`crate::remote::run`]'s shape).
+pub(crate) type RemoteStep<'a> = dyn Fn(
+        &Path,
+        &dyn Fn(&Path) -> Command,
+        crate::remote::Tool,
+        &[std::ffi::OsString],
+        Instant,
+    ) -> Result<std::process::Output, String>
+    + 'a;
+
+/// Who lands: the person's `land` words, which a handoff carries for the receiver to parse
+/// again, and this image's sha256, read before any build.
+pub struct Own<'a> {
+    /// The person's `land` words.
+    pub words: &'a [String],
+    /// This process's own image's digest.
+    pub image: &'a str,
+}
+
+/// What a refused handoff leaves the person to do.
+const RERUN: &str = "nothing was pushed. Fix: run `targo --unverified verify land` again: the \
+                     checkout holds the merge, committed";
+/// What a handoff whose checkout left its commit before the resume leaves the person to do.
+const RERUN_MOVED: &str = "nothing was pushed. Fix: run `targo --unverified verify land` again \
+                           once the checkout holds what is to land, committed";
+
+/// Land the checkout at `root` ([`Seams`]) as `own`: the exit code ([`exit`], or [`STOPPED`]).
+pub fn land(root: &Path, own: &Own<'_>, seams: &mut Seams<'_>) -> i32 {
     let git = Git {
         root,
         make: seams.git,
     };
-    match drive(&git, seams) {
+    match drive(&git, own, seams) {
         Ok(code) => code,
         Err(why) => {
             (seams.say)(&format!("verify land: COULD NOT RUN — {why}"));
@@ -334,7 +479,98 @@ pub fn land(root: &Path, seams: &mut Seams<'_>) -> i32 {
     }
 }
 
-fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
+/// Resume, as `own`, the landing of the checkout at `root` another build of this verifier
+/// handed over ([`handoff`]): refused, before anything runs, where the handoff names another
+/// image or checkout, or a base or cone its commit does not hold. The exit code, as
+/// [`land`]'s.
+pub fn resume(root: &Path, own: &Own<'_>, handoff: Handoff, seams: &mut Seams<'_>) -> i32 {
+    let git = Git {
+        root,
+        make: seams.git,
+    };
+    match resume_drive(&git, own, handoff, seams) {
+        Ok(code) => code,
+        Err(why) => {
+            (seams.say)(&format!("verify land: COULD NOT RUN — {why}"));
+            exit::COULD_NOT_RUN
+        }
+    }
+}
+
+fn resume_drive(
+    git: &Git<'_>,
+    own: &Own<'_>,
+    handoff: Handoff,
+    seams: &mut Seams<'_>,
+) -> Result<i32, String> {
+    let tree = admit(git, own, &handoff).map_err(|why| format!("{why}; {RERUN}"))?;
+    let subject = merge_subject(git);
+    (seams.say)(&format!(
+        "verify land: resumed as {tree}'s own verifier ({}) at the {} of {} over {}",
+        short(own.image),
+        step_noun(handoff.step),
+        handoff.at,
+        handoff.base
+    ));
+    engine::resume(git, seams, own, &subject, handoff)
+}
+
+/// Whether `own` may resume `handoff` in the checkout: handed to this image, for this checkout
+/// (compared physically), over a base and a cone its commit holds, from a push source the
+/// landing admits.
+/// The tree of its commit, else why not.
+fn admit(git: &Git<'_>, own: &Own<'_>, handoff: &Handoff) -> Result<String, String> {
+    if handoff.image != own.image {
+        return Err(format!(
+            "the landing was handed to image {}, and this verifier is {}",
+            short(&handoff.image),
+            short(own.image)
+        ));
+    }
+    let physical = |path: &Path| {
+        std::fs::canonicalize(path).map_err(|error| format!("{}: {error}", path.display()))
+    };
+    if physical(&handoff.root)? != physical(git.root)? {
+        return Err(format!(
+            "the landing was handed over for the checkout {}, not {}",
+            handoff.root.display(),
+            git.root.display()
+        ));
+    }
+    for (what, commit) in [("base", &handoff.base), ("cone", &handoff.cone)] {
+        if !git.is_ancestor(commit, &handoff.at)? {
+            return Err(format!(
+                "the handoff's {what} {commit} is not in its commit {}",
+                handoff.at
+            ));
+        }
+    }
+    git.admit_push_source()?;
+    git.tree(&handoff.at)
+}
+
+/// A digest's first twelve digits, as a line names an image.
+fn short(digest: &str) -> &str {
+    digest.get(..12).unwrap_or(digest)
+}
+
+/// A step as a line names it.
+fn step_noun(step: aterm_land::Step) -> &'static str {
+    match step {
+        aterm_land::Step::Qualify => "judgment",
+        aterm_land::Step::Recheck => "recheck",
+    }
+}
+
+/// The landing merge's subject, by the branch HEAD names.
+fn merge_subject(git: &Git<'_>) -> String {
+    let label = git
+        .local(&["symbolic-ref", "--quiet", "--short", "HEAD"])
+        .unwrap_or_else(|_| "HEAD".into());
+    format!("Merge {REMOTE}/{MAIN} into {label}")
+}
+
+fn drive(git: &Git<'_>, own: &Own<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
     let say = |seams: &mut Seams<'_>, line: String| (seams.say)(&line);
     let dirty = git.changes()?;
     if !dirty.is_empty() {
@@ -347,13 +583,11 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
         );
         return Ok(exit::COULD_NOT_RUN);
     }
-    let label = git
-        .local(&["symbolic-ref", "--quiet", "--short", "HEAD"])
-        .unwrap_or_else(|_| "HEAD".into());
-    let subject = format!("Merge {REMOTE}/{MAIN} into {label}");
-    let mut merged = git.fetch()?;
+    let subject = merge_subject(git);
+    let merged = git.fetch()?;
     let start = git.head()?;
     if git.is_ancestor(&start, &merged)? {
+        git.forget();
         say(
             seams,
             format!("verify land: nothing to land — HEAD {start} is on {REMOTE}/{MAIN}"),
@@ -361,152 +595,75 @@ fn drive(git: &Git<'_>, seams: &mut Seams<'_>) -> Result<i32, String> {
         return Ok(exit::PASS);
     }
     git.admit_push_source()?;
-    let merged_here = !git.is_ancestor(&merged, &start)?;
-    if merged_here {
-        match git.merge(&merged, &subject)? {
-            Merge::Clean => {}
-            Merge::Conflict(paths) => return Ok(conflicted(seams, &merged, &paths)),
-            Merge::ChangelogConflict(conflict) => {
-                return Ok(changelog_conflicted(seams, &merged, &conflict));
-            }
-        }
-    }
-    let mut judged_at = git.head()?;
-    let branch = (seams.branch)(git.root, &merged);
-    say(
-        seams,
-        match &branch {
-            Branch::Crates(crates) => format!(
-                "verify land: the branch's crates: {}",
-                crates.iter().cloned().collect::<Vec<_>>().join(", ")
-            ),
-            Branch::Everything(why) => {
-                format!("verify land: the branch reaches every crate ({why}): no red is inherited")
-            }
-        },
-    );
-    let mut stated = Stated::default();
-    let mut rejudges = 0;
-    // Compositions and rechecks since the last full judgment passed: at most COMPOSES in a row.
-    let mut composes = 0;
-    let mut judging = judge(git, seams, &judged_at, &merged, &branch, &mut stated)?;
-    loop {
-        if matches!(judging, Judging::Passed) && stated.rechecks_since_judged().is_empty() {
-            composes = 0;
-        }
-        // A main tip that does not compose, found by the running judgment's poll or by the
-        // passed judgment's push: it is merged and judged again. One that shares only no-reach
-        // Markdown is merged and rechecked.
-        let (tip, cut) = match judging {
-            Judging::Exit(code) => return Ok(code),
-            Judging::Interrupted(tip) => (tip, true),
-            Judging::Passed => {
-                match push(
-                    git,
-                    seams,
-                    &subject,
-                    &judged_at,
-                    &merged,
-                    &mut stated,
-                    &mut composes,
-                )? {
-                    Pushing::Done(code) => return Ok(code),
-                    Pushing::Moved(tip) => (tip, false),
-                    Pushing::Recheck { tip, tree } => {
-                        if let Some(why) = git.moved_from(&judged_at)? {
-                            say(
-                                seams,
-                                format!("verify land: COULD NOT RUN — {why}; nothing was pushed"),
-                            );
-                            return Ok(exit::COULD_NOT_RUN);
-                        }
-                        match git.merge(&tip, &subject)? {
-                            Merge::Conflict(paths) => return Ok(conflicted(seams, &tip, &paths)),
-                            Merge::ChangelogConflict(conflict) => {
-                                return Ok(changelog_conflicted(seams, &tip, &conflict));
-                            }
-                            Merge::Clean => {}
-                        }
-                        let at = git.head()?;
-                        let made = git.tree(&at)?;
-                        if made == tree {
-                            match recheck(git, seams, &at, &tip, &mut stated)? {
-                                Rechecking::Exit(code) => return Ok(code),
-                                Rechecking::Passed => {
-                                    judged_at = at;
-                                    merged = tip;
-                                    judging = Judging::Passed;
-                                    continue;
-                                }
-                            }
-                        }
-                        // The worktree merge is not the tree the rule tested (a submodule or an
-                        // entry merge the plumbing did not make): it is judged in full, as any
-                        // merge of a moved main is.
-                        say(
-                            seams,
-                            format!(
-                                "verify land: merging {tip} made {made}, not {tree}, the tree \
-                                 the Markdown rule tested: it is judged in full"
-                            ),
-                        );
-                        if rejudges == REJUDGES {
-                            say(
-                                seams,
-                                format!(
-                                    "verify land: STOPPED after {REJUDGES} re-judges — the \
-                                     branch is merged with {tip}, not judged there, and nothing \
-                                     was pushed. Run it again"
-                                ),
-                            );
-                            return Ok(STOPPED);
-                        }
-                        judged_at = at;
-                        rejudges += 1;
-                        merged = tip;
-                        judging = judge(git, seams, &judged_at, &merged, &branch, &mut stated)?;
-                        continue;
-                    }
-                }
-            }
-        };
-        if let Some(why) = git.moved_from(&judged_at)? {
+    // A judgment an earlier run passed and kept, where HEAD is still the commit it ran on: this
+    // run starts at its push. Main's tip is then one that moved before the push, as any other.
+    let resumed = match git.kept(&start) {
+        Ok(None) => None,
+        Ok(Some(Ok(kept))) => Some(kept),
+        Ok(Some(Err(why))) => {
             say(
                 seams,
-                format!("verify land: COULD NOT RUN — {why}; nothing was pushed"),
+                format!("verify land: the kept judgment is not resumed: {why}"),
             );
-            return Ok(exit::COULD_NOT_RUN);
+            None
         }
-        if rejudges == REJUDGES {
-            let judged = if cut {
-                "its judgment there interrupted"
-            } else {
-                "judged"
-            };
+        Err(why) => {
+            say(
+                seams,
+                format!("verify land: the kept judgment was not read ({why}): judging"),
+            );
+            None
+        }
+    };
+    let (judged_at, merged, moved) = match &resumed {
+        Some(kept) => {
             say(
                 seams,
                 format!(
-                    "verify land: STOPPED after {REJUDGES} re-judges — the branch is merged with \
-                     {merged}, {judged}, and nothing was pushed. Run it again"
+                    "verify land: resuming at the push: an earlier run judged {} over the cone \
+                     since {}, and HEAD is still that commit",
+                    kept.tree, kept.merged
                 ),
             );
-            return Ok(STOPPED);
-        }
-        match git.merge(&tip, &subject)? {
-            Merge::Conflict(paths) => return Ok(conflicted(seams, &tip, &paths)),
-            Merge::ChangelogConflict(conflict) => {
-                return Ok(changelog_conflicted(seams, &tip, &conflict));
+            if merged != kept.merged {
+                say(
+                    seams,
+                    format!("verify land: {REMOTE}/{MAIN} has moved to {merged} since"),
+                );
             }
-            Merge::Clean => {}
+            let moved = (merged != kept.merged).then_some(merged);
+            (start, kept.merged.clone(), moved)
         }
-        judged_at = git.head()?;
-        rejudges += 1;
-        merged = tip;
-        // Main's intervening edits are already in `merged`. Only the branch's delta from that
-        // tip can change its outcomes, including in the branch's dependents. The merged
-        // checkout still compiles and tests against main's new dependencies.
-        judging = judge(git, seams, &judged_at, &merged, &branch, &mut stated)?;
-    }
+        None => {
+            if !git.is_ancestor(&merged, &start)? {
+                match git.merge(&merged, &subject)? {
+                    Merge::Clean => {}
+                    Merge::Conflict(paths) => return Ok(conflicted(seams, &merged, &paths)),
+                }
+            }
+            (git.head()?, merged, None)
+        }
+    };
+    let revision = aterm_land::Revision {
+        at: judged_at,
+        base: merged,
+    };
+    engine::drive(git, seams, own, &subject, revision, resumed, moved)
+}
+
+/// The branch's own crates over the cone since main commit `base` ([`Seams::branch`]), said.
+fn own_crates(git: &Git<'_>, seams: &mut Seams<'_>, base: &str) -> Branch {
+    let branch = (seams.branch)(git.root, base);
+    (seams.say)(&match &branch {
+        Branch::Crates(crates) => format!(
+            "verify land: the branch's crates: {}",
+            crates.iter().cloned().collect::<Vec<_>>().join(", ")
+        ),
+        Branch::Everything(why) => {
+            format!("verify land: the branch reaches every crate ({why}): no red is inherited")
+        }
+    });
+    branch
 }
 
 /// How a judgment ([`judge`]) came out.
@@ -517,17 +674,8 @@ enum Judging {
     Exit(i32),
     /// Main's tip, which does not compose, interrupted it: no verdict, stated as interrupted.
     Interrupted(String),
-}
-
-/// How a passed judgment's push ([`push`]) came out.
-enum Pushing {
-    /// The landing ends with this exit: it landed, or it stopped.
-    Done(i32),
-    /// Main moved to this tip, which does not compose.
-    Moved(String),
-    /// Main moved to this tip, which composes once a recheck of the merge passes
-    /// ([`Composition::Rechecks`]): the merge's tree.
-    Recheck { tip: String, tree: String },
+    /// It did not run: the tree's own verifier is this image, which the landing goes on as.
+    Elsewhere(Image),
 }
 
 /// How a recheck ([`recheck`]) came out.
@@ -536,91 +684,293 @@ enum Rechecking {
     Passed,
     /// The landing ends with this exit.
     Exit(i32),
+    /// It did not run: the merge's own verifier is this image, which the landing goes on as.
+    Elsewhere(Image),
 }
 
-/// Push the passed judgment of `judged_at` (HEAD, merging main commit `merged`) as the landing
-/// merge, composing onto each moved main the rule allows ([`composition`]) under one network
-/// deadline. `composes` counts the compositions and rechecks since the last full judgment
-/// passed, [`COMPOSES`] at most; a tip that composes only once a recheck passes ends the push.
-fn push(
+/// What the landing holds between its steps.
+struct Held<'o> {
+    /// The branch's own crates, read before the first judgment that runs, as the image that
+    /// runs it: a landing resumed from a kept judgment that judges nothing reads no cone.
+    branch: Option<Branch>,
+    /// The main commit the landing's first judgment merged: the cone the branch's crates are
+    /// read over.
+    cone: String,
+    /// The receipt so far.
+    stated: Stated,
+    /// This image's digest.
+    own: &'o str,
+    /// The handoffs the step about to run has taken: a resumed step's [`Handoff::hop`], 0 for
+    /// one this image came to itself. A step that yields hands over as hop one more.
+    hop: usize,
+}
+
+/// The checkout's verifier, built for a step on `tree` ([`Seams::verifier`]).
+enum Built {
+    /// It is this image: the step runs here, as it.
+    Here(Image),
+    /// It is another image: the landing goes on as it.
+    Elsewhere(Image),
+    /// It did not build (said): the landing ends with this exit.
+    Exit(i32),
+}
+
+/// Build the checkout's verifier for the step at `at` over `base` on `tree`, and compare it
+/// with this image. A step that has taken [`HOPS`] handoffs refuses another image, so a build
+/// that is not its own image never hands on in a loop; one that runs here leaves the next step
+/// none.
+fn built(
     git: &Git<'_>,
     seams: &mut Seams<'_>,
-    subject: &str,
-    judged_at: &str,
-    merged: &str,
-    stated: &mut Stated,
-    composes: &mut usize,
-) -> Result<Pushing, String> {
-    let mut onto = merged.to_owned();
-    let mut composed_tree: Option<String> = None;
-    let push_until = Instant::now() + NETWORK;
-    loop {
-        stated.composed_onto = (onto != merged).then(|| onto.clone());
-        let message = format!("{subject}\n\n{}", stated.trailers());
-        let parents = git.parents(judged_at)?;
-        let landing = match &composed_tree {
-            Some(tree) => git.commit(tree, &[judged_at, &onto], &message)?,
-            // The judged commit already merges the main it lands on (the tool's own merge, or
-            // one made by hand): that merge, restated with its own message and the trailers.
-            None if parents.len() == 2 && parents[1] == onto => {
-                let own = git.local(&["log", "-1", "--format=%B", judged_at])?;
-                let parents: Vec<&str> = parents.iter().map(String::as_str).collect();
-                git.commit(
-                    &git.tree(judged_at)?,
-                    &parents,
-                    &format!("{own}\n\n{}", stated.trailers()),
-                )?
-            }
-            None => git.commit(&git.tree(judged_at)?, &[judged_at, &onto], &message)?,
-        };
-        let tip = match git.push(&landing, &onto, composes, push_until)? {
-            None => {
-                let adopted = git.adopt(&landing, judged_at);
-                (seams.say)(&landed_line(&landing, stated));
-                if let Err(why) = adopted {
-                    (seams.say)(&format!(
-                        "verify land: the landing is on {REMOTE}/{MAIN}, but {why}"
-                    ));
-                }
-                return Ok(Pushing::Done(exit::PASS));
-            }
-            Some(tip) => tip,
-        };
-        (seams.say)(&format!(
-            "verify land: {REMOTE}/{MAIN} moved to {tip} before the push"
-        ));
-        let composition = composition(git, merged, &tip, judged_at)?;
-        if !matches!(composition, Composition::Doomed(_)) {
-            if *composes == COMPOSES {
-                (seams.say)(&format!(
-                    "verify land: STOPPED after {COMPOSES} push/composition races; the \
-                     branch is merged with {merged} and judged, and nothing was pushed. Run \
-                     it again"
-                ));
-                return Ok(Pushing::Done(STOPPED));
-            }
-            *composes += 1;
+    (at, base, tree): (&str, &str, &str),
+    held: &mut Held<'_>,
+) -> Result<Built, String> {
+    let image = match (seams.verifier)(git.root) {
+        Ok(image) => image,
+        Err(why) => {
+            (seams.say)(&format!(
+                "verify land: COULD NOT RUN — {tree}'s verifier did not build: {why}; nothing was \
+                 pushed"
+            ));
+            return Ok(Built::Exit(exit::COULD_NOT_RUN));
         }
-        match composition {
-            Composition::Composes { tree, why } => {
-                (seams.say)(&format!("verify land: composing onto {tip}: {why}"));
-                composed_tree = Some(tree);
-                onto = tip;
+    };
+    if image.digest == held.own {
+        held.hop = 0;
+        return Ok(Built::Here(image));
+    }
+    if held.hop >= HOPS {
+        return Err(format!(
+            "the image the landing was handed to for {at} over {base} hands it on again: its own \
+             build of {tree} ({}) is {}, not itself ({}), after {} handoffs of this step; {RERUN}",
+            image.path.display(),
+            short(&image.digest),
+            short(held.own),
+            held.hop
+        ));
+    }
+    Ok(Built::Elsewhere(image))
+}
+
+/// A judgment an earlier run kept ([`Git::keep`]) that holds for this checkout ([`Git::kept`]).
+struct Kept {
+    /// The judged tree, which HEAD holds.
+    tree: String,
+    /// The main commit the judged commit merged: the base of its last judgment or recheck.
+    merged: String,
+    /// What ran, as the landing merge will state it.
+    stated: Stated,
+}
+
+/// The push phase's remote for one landing: each step run through the landing's seam
+/// ([`RemoteStep`]) under its own hang detector, from its own start ([`NETWORK`] for a read,
+/// [`WRITE`] for a write), and a step that failed having sent nothing made again within
+/// [`RETRIES`]. No deadline spans the steps: what bounds a push is those counts and the
+/// landing's composition budget ([`COMPOSES`]), so a slow remote or a main that keeps moving
+/// never ends a passed judgment by the clock.
+struct Wire<'a> {
+    git: &'a Git<'a>,
+    step: &'a RemoteStep<'a>,
+    pause: &'a dyn Fn(Duration),
+    say: &'a dyn Fn(&str),
+    /// Reads of main that failed in a row.
+    reads: std::cell::Cell<usize>,
+    /// Pushes agh did not send in a row.
+    unsent: std::cell::Cell<usize>,
+    /// What a later run must settle first where the push ended with a write whose outcome is
+    /// unknown, or with an intent still open: a run before that waits on the intent.
+    unsettled: std::cell::RefCell<Option<String>>,
+}
+
+impl<'a> Wire<'a> {
+    fn new(
+        git: &'a Git<'a>,
+        step: &'a RemoteStep<'a>,
+        pause: &'a dyn Fn(Duration),
+        say: &'a dyn Fn(&str),
+    ) -> Self {
+        Self {
+            git,
+            step,
+            pause,
+            say,
+            reads: std::cell::Cell::new(0),
+            unsent: std::cell::Cell::new(0),
+            unsettled: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// One remote step that writes nothing to main, through the seam: ended as hung
+    /// [`NETWORK`] after it starts.
+    fn run(
+        &self,
+        tool: crate::remote::Tool,
+        args: &[std::ffi::OsString],
+    ) -> Result<std::process::Output, String> {
+        (self.step)(
+            self.git.root,
+            self.git.make,
+            tool,
+            args,
+            Instant::now() + NETWORK,
+        )
+    }
+
+    /// One step of a write of main through the seam: ended as hung [`WRITE`] after it starts,
+    /// which agh's own bounds come before.
+    fn write(
+        &self,
+        tool: crate::remote::Tool,
+        args: &[std::ffi::OsString],
+    ) -> Result<std::process::Output, String> {
+        (self.step)(
+            self.git.root,
+            self.git.make,
+            tool,
+            args,
+            Instant::now() + WRITE,
+        )
+    }
+
+    /// Allow `what`, which failed for `why` having sent nothing, to be made again: counted in
+    /// `failed`, said, and its pause waited out ([`RETRY_PAUSE`], doubled by each failure before
+    /// it in a row).
+    ///
+    /// # Errors
+    /// [`RETRIES`] such failures already came in a row: `why`, and that it stopped.
+    fn again(&self, failed: &std::cell::Cell<usize>, what: &str, why: &str) -> Result<(), String> {
+        let before = failed.get();
+        if before == RETRIES {
+            return Err(format!(
+                "{why}; stopped after {RETRIES} failures of {what} in a row"
+            ));
+        }
+        failed.set(before + 1);
+        let pause = RETRY_PAUSE.saturating_mul(1u32 << before);
+        (self.say)(&format!(
+            "verify land: {what} failed ({why}); nothing was sent, so it is made again in {}s \
+             ({} of {RETRIES})",
+            pause.as_secs(),
+            before + 1
+        ));
+        (self.pause)(pause);
+        Ok(())
+    }
+
+    /// Main's tip, fetched into its remote-tracking ref ([`Git::fetch_through`]). A read that
+    /// fails or times out changes nothing, so it is made again ([`Self::again`]).
+    fn main(&self) -> Result<String, String> {
+        loop {
+            match self.git.fetch_through(&|tool, args| self.run(tool, args)) {
+                Ok(tip) => {
+                    self.reads.set(0);
+                    return Ok(tip);
+                }
+                Err(why) => {
+                    self.again(&self.reads, &format!("the read of {REMOTE}/{MAIN}"), &why)?;
+                }
             }
-            Composition::Rechecks { tree, shared } => {
-                (seams.say)(&format!(
-                    "verify land: {tip} composes once {} pass on the merge: the paths it \
-                     shares with the branch are only Markdown no build, include or test reads \
-                     ({})",
-                    RECHECKS.join(", "),
-                    shared.join(", ")
-                ));
-                return Ok(Pushing::Recheck { tip, tree });
-            }
-            Composition::Doomed(why) => {
-                (seams.say)(&format!("verify land: {tip} does not compose: {why}"));
-                return Ok(Pushing::Moved(tip));
-            }
+        }
+    }
+
+    /// Where main stands for a push of `landing` onto `onto`, read afresh.
+    fn observe(&self, landing: &str, onto: &str) -> Result<PushObservation, String> {
+        let tip = self.main()?;
+        if tip == landing || self.git.is_ancestor(landing, &tip)? {
+            return Ok(PushObservation::Landed);
+        }
+        if tip != onto {
+            return Ok(PushObservation::Moved(tip));
+        }
+        Ok(PushObservation::Unchanged)
+    }
+
+    /// Push `landing` to main, expecting main at `onto`: `None` once it landed, or main's new
+    /// tip where it moved ([`Self::settle`]). A push that fails with no typed refusal (one this
+    /// tool's hang detector ended included) has an unknown outcome and is never made again: main
+    /// is read, and one that holds the landing took it; else what a later run must settle first
+    /// is kept ([`Self::unsettled`]).
+    fn push(
+        &self,
+        landing: &str,
+        onto: &str,
+        budget: &mut aterm_land::Budget,
+    ) -> Result<Option<String>, String> {
+        let run = |tool, args: &[std::ffi::OsString]| self.run(tool, args);
+        let remote = crate::remote::Remote::open(self.git.root, REMOTE, &run)?;
+        let write = |tool, args: &[std::ffi::OsString]| self.write(tool, args);
+        let writer = crate::remote::Remote::open(self.git.root, REMOTE, &write)?;
+        let unknown = |why: String| {
+            *self.unsettled.borrow_mut() = Some(format!(
+                "the write of {landing} to {MAIN} ended with an unknown outcome; where agh \
+                 journaled it, its intent stays open (`agh intent list --open`) until it is \
+                 settled, or retracted once the write is known not to have landed"
+            ));
+            why
+        };
+        push_after_intents(
+            budget,
+            &|| {
+                let pushed = writer
+                    .push(&format!("refs/heads/{MAIN}"), Some(onto), landing)
+                    .or_else(|why| match self.observe(landing, onto) {
+                        Ok(PushObservation::Landed) => Ok(crate::remote::Pushed::Done),
+                        Ok(PushObservation::Moved(_) | PushObservation::Unchanged) => {
+                            Err(unknown(format!(
+                                "{why}; {REMOTE}/{MAIN} does not hold the landing, and a push \
+                                 whose outcome is unknown is not made again"
+                            )))
+                        }
+                        Err(read) => Err(unknown(format!(
+                            "{why}; whether {REMOTE}/{MAIN} holds the landing was not read: \
+                             {read}"
+                        ))),
+                    })?;
+                if !matches!(pushed, crate::remote::Pushed::Unsent(_)) {
+                    self.unsent.set(0);
+                }
+                Ok(pushed)
+            },
+            &|intent| {
+                // Another writer's write is bounded by agh as this tool's is ([`WRITE`]): an
+                // intent open past that has no write running.
+                let until = Instant::now() + WRITE;
+                remote.wait_for_intent(intent, &|| {
+                    let left = until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        *self.unsettled.borrow_mut() = Some(format!(
+                            "agh intent {} stayed open for {}s, longer than any agh write runs: \
+                             it is orphaned, and it is retracted once its write is known not to \
+                             have landed (`agh intent list --open`)",
+                            intent.as_str(),
+                            WRITE.as_secs()
+                        ));
+                        return Err(format!(
+                            "another writer's atomic intent stayed open for {}s",
+                            WRITE.as_secs()
+                        ));
+                    }
+                    (self.pause)(left.min(Duration::from_millis(100)));
+                    Ok(())
+                })
+            },
+            // The refused attempt sent nothing. Where main is unchanged the same expected-ref
+            // push runs again; this is not replay of an unknown write.
+            &|| self.observe(landing, onto),
+            &|why| self.settle(landing, onto, why),
+            &|why| self.again(&self.unsent, "the push", why),
+        )
+    }
+
+    /// Where a push of `landing` onto `onto` git reported failed (`why`) left main, fetched: a
+    /// main that holds the landing took it (a connection lost after the server moved the ref
+    /// loses only its report), `None`; one still at `onto` refused it, an error and never a
+    /// retry; else main moved, its new tip.
+    fn settle(&self, landing: &str, onto: &str, why: &str) -> Result<Option<String>, String> {
+        match self.observe(landing, onto)? {
+            PushObservation::Landed => Ok(None),
+            PushObservation::Unchanged => Err(why.to_owned()),
+            PushObservation::Moved(tip) => Ok(Some(tip)),
         }
     }
 }
@@ -682,16 +1032,6 @@ fn composition(
             };
             format!("{blocked}{markdown}")
         }
-        Some(Compose::Entries) => format!(
-            "{} requires the entry-wise worktree merge and rejudgment",
-            changelog::PATH
-        ),
-        Some(Compose::Refused(conflict)) => format!(
-            "its {} entry merge stops at entries {}: {}",
-            changelog::PATH,
-            display_changelog_entries(conflict),
-            conflict.reason
-        ),
         Some(Compose::Conflict) => "the merge is not clean".to_owned(),
     };
     Ok(Composition::Doomed(why))
@@ -703,72 +1043,49 @@ fn composition(
 /// once the poll is moot) and tests a new one ([`composition`]); the first that does not compose
 /// interrupts the run, and nothing it wrote counts: it is stated as interrupted
 /// ([`Stated::interrupted`]). A poll that cannot read or test main changes nothing, and says so
-/// once per run of one reason, unless it became moot meanwhile. [`Judging::Passed`] when it
-/// passed (its judgment added to `stated`), else the exit to stop with or the tip that
-/// interrupted it.
+/// once per run of one reason, unless it became moot meanwhile. It runs as the checkout's own
+/// verifier ([`built`]), which must be this image: else [`Judging::Elsewhere`], before anything
+/// ran. The first judgment that runs reads the branch's crates (`held.branch`) over the cone
+/// since `held.cone` as that image.
+/// [`Judging::Passed`] when it passed (its judgment added to `held.stated`), else the exit to
+/// stop with or the tip that interrupted it.
 fn judge(
     git: &Git<'_>,
     seams: &mut Seams<'_>,
     at: &str,
     base: &str,
-    branch: &Branch,
-    stated: &mut Stated,
+    held: &mut Held<'_>,
 ) -> Result<Judging, String> {
     let tree = git.tree(at)?;
+    let image = match built(git, seams, (at, base, &tree), held)? {
+        Built::Here(image) => image,
+        Built::Elsewhere(image) => return Ok(Judging::Elsewhere(image)),
+        Built::Exit(code) => return Ok(Judging::Exit(code)),
+    };
+    let Held {
+        branch,
+        cone,
+        stated,
+        ..
+    } = held;
+    let branch = &*branch.get_or_insert_with(|| own_crates(git, seams, cone));
     (seams.say)(&format!(
         "verify land: judging {tree} over the cone since {base}"
     ));
-    // The newest tip read that composes: a poll that reads it again has nothing new to test.
-    let mut composed = base.to_owned();
-    let mut failed: Option<String> = None;
-    // The first tip that does not compose, and why: every later poll answers `true` at once.
-    let mut doomed: Option<(String, String)> = None;
+    let mut watch = aterm_land::Watch::new(base);
     let ran = {
         let Seams { judge, say, .. } = &mut *seams;
         let mut poll = |moot: Moot<'_>| {
-            if doomed.is_some() {
-                return true;
-            }
-            let read = git.fetch_unless(NETWORK, &mut *moot).and_then(|tip| {
-                if tip == composed {
-                    return Ok(None);
-                }
-                match composition(git, base, &tip, at)? {
-                    // A tip that composes by either rule changes nothing: a Markdown-only tip's
-                    // recheck waits for the push, where main is read again.
-                    Composition::Composes { .. } | Composition::Rechecks { .. } => {
-                        composed = tip;
-                        Ok(None)
-                    }
-                    Composition::Doomed(why) => Ok(Some((tip, why))),
-                }
-            });
-            match read {
-                Ok(None) => {
-                    failed = None;
-                    false
-                }
-                Ok(Some(found)) => {
-                    doomed = Some(found);
-                    true
-                }
-                // The run's own answer came while main was read, which ended the read: its end
-                // decides, and there is nothing to say.
-                Err(_) if moot() => false,
-                Err(why) => {
-                    if failed.as_ref() != Some(&why) {
-                        say(&format!(
-                            "verify land: {REMOTE}/{MAIN} was not read or tested during the \
-                             judgment ({why}); it goes on"
-                        ));
-                    }
-                    failed = Some(why);
-                    false
-                }
-            }
+            watch.poll(
+                moot,
+                &mut |moot| git.fetch_unless(NETWORK, moot),
+                &mut |tip| composition(git, base, tip, at).map(engine::composition),
+                &mut |why| say(&format!("verify land: {REMOTE}/{MAIN} was not read or tested during the judgment ({why}); it goes on")),
+            )
         };
-        judge(git.root, base, &mut poll)
+        judge(git.root, &image.path, base, &mut poll)
     };
+    let doomed = watch.into_doomed();
     // A run that ended by itself is judged as it ended, whatever a poll answered as it did.
     let interrupted = match (ran, doomed) {
         (Ran::Ended(judged), _) => Err(judged),
@@ -860,22 +1177,30 @@ fn judge(
 }
 
 /// Recheck `at` (HEAD, the merge of main tip `tip` a Markdown compose made) with the source
-/// readers over the cone since `tip` ([`Seams::recheck`]). Nothing is inherited: a recheck
-/// reads no lane, so every red counts. It passes only when each of [`RECHECKS`] ran and said
-/// `ok`, and the checkout is still at `at`, clean: its recheck is then added to `stated`.
+/// readers over the cone since `tip` ([`Seams::recheck`]), as the merge's own verifier
+/// ([`built`]), which must be this image: else [`Rechecking::Elsewhere`], before anything ran.
+/// Nothing is inherited: a recheck reads no lane, so every red counts. It passes only when
+/// each of [`RECHECKS`] ran and said `ok`, and the checkout is still at `at`, clean: its
+/// recheck is then added to `held.stated`.
 fn recheck(
     git: &Git<'_>,
     seams: &mut Seams<'_>,
     at: &str,
     tip: &str,
-    stated: &mut Stated,
+    held: &mut Held<'_>,
 ) -> Result<Rechecking, String> {
     let tree = git.tree(at)?;
+    let image = match built(git, seams, (at, tip, &tree), held)? {
+        Built::Here(image) => image,
+        Built::Elsewhere(image) => return Ok(Rechecking::Elsewhere(image)),
+        Built::Exit(code) => return Ok(Rechecking::Exit(code)),
+    };
+    let stated = &mut held.stated;
     (seams.say)(&format!(
         "verify land: rechecking {tree} with {} over the cone since {tip}",
         RECHECKS.join(", ")
     ));
-    let judged = (seams.recheck)(git.root, tip);
+    let judged = (seams.recheck)(git.root, &image.path, tip);
     if let Some(why) = git.moved_from(at)? {
         (seams.say)(&format!(
             "verify land: COULD NOT RUN — during the recheck, {why}; nothing was pushed"
@@ -947,30 +1272,6 @@ fn conflicted(seams: &mut Seams<'_>, main: &str, paths: &[Vec<u8>]) -> i32 {
     exit::FAILED
 }
 
-fn changelog_conflicted(seams: &mut Seams<'_>, main: &str, conflict: &ChangelogConflict) -> i32 {
-    let entries = display_changelog_entries(conflict);
-    (seams.say)(&format!(
-        "verify land: FAIL — merging {main} conflicts in CHANGELOG.md entries {entries}: {}; \
-         nothing was merged or pushed. Fix the named entries on the branch, then run it again",
-        conflict.reason
-    ));
-    exit::FAILED
-}
-
-/// Entry titles in one diagnostic, escaped so changelog bytes cannot forge another line.
-fn display_changelog_entries(conflict: &ChangelogConflict) -> String {
-    if conflict.entries.is_empty() {
-        "(no entry title could be read)".to_owned()
-    } else {
-        conflict
-            .entries
-            .iter()
-            .map(|entry| format!("\"{}\"", entry.escape_debug()))
-            .collect::<Vec<_>>()
-            .join(", ")
-    }
-}
-
 /// The landed line. Its re-judges count each merge of a moved main judged again, the ones an
 /// interrupted judgment led to included, as the receipt does ([`Stated::rejudges`]).
 fn landed_line(landing: &str, stated: &Stated) -> String {
@@ -1003,18 +1304,6 @@ enum Merge {
     Clean,
     /// Stopped on conflicts, left for the person: the conflicted paths.
     Conflict(Vec<Vec<u8>>),
-    /// The three immutable CHANGELOG inputs do not determine one entry merge. No merge was
-    /// started, so the checkout remains at the branch tip.
-    ChangelogConflict(ChangelogConflict),
-}
-
-/// A semantic CHANGELOG conflict, with the entries that made it undecidable.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ChangelogConflict {
-    /// Why the three-way entry merge has no unique result.
-    reason: String,
-    /// Entry titles (or an exact structural description when no entry could be parsed).
-    entries: Vec<String>,
 }
 
 /// Render Git path bytes on one diagnostic line, preserving invalid bytes as escapes.
@@ -1141,15 +1430,11 @@ fn is_lock_alone(paths: &[Vec<u8>]) -> bool {
 }
 
 /// What composing a checked commit onto moving main makes ([`Git::merge_tree`]): its tree, or
-/// why an ordinary worktree merge and a re-judgment come instead.
+/// a conflict, after which an ordinary worktree merge stops for the person.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Compose {
     /// The clean merge's tree.
     Tree(String),
-    /// The changelog needs its entry-wise worktree merge ([`changelog`]), whose tree is judged.
-    Entries,
-    /// The changelog entry merge stops, for this reason; the worktree merge stops on it too.
-    Refused(ChangelogConflict),
     /// Git's merge conflicts.
     Conflict,
 }
@@ -1159,7 +1444,7 @@ impl Compose {
     fn tree(&self) -> Option<&str> {
         match self {
             Compose::Tree(tree) => Some(tree),
-            Compose::Entries | Compose::Refused(_) | Compose::Conflict => None,
+            Compose::Conflict => None,
         }
     }
 }
@@ -1481,6 +1766,12 @@ impl Git<'_> {
         self.local(&["rev-parse", "--verify", "HEAD^{commit}"])
     }
 
+    /// Where the landing writes its handoff ([`handoff::FILE`]): the checkout's own git
+    /// directory, absolute.
+    fn handoff_file(&self) -> Result<PathBuf, String> {
+        Ok(PathBuf::from(self.local(&["rev-parse", "--absolute-git-dir"])?).join(handoff::FILE))
+    }
+
     /// The checkout's changes no commit holds (`status --porcelain`), submodules included.
     fn changes(&self) -> Result<String, String> {
         self.local(&[
@@ -1611,25 +1902,9 @@ impl Git<'_> {
             .collect())
     }
 
-    /// The tree composing `checked` onto moving `main` makes ([`Compose::Tree`]), or why entry
-    /// merging or a Git conflict requires an ordinary worktree merge and rejudgment.
+    /// The tree composing `checked` onto moving `main` makes ([`Compose::Tree`]), or a Git
+    /// conflict, which requires an ordinary worktree merge.
     fn merge_tree(&self, main: &str, checked: &str) -> Result<Compose, String> {
-        // Semantic entry merging remains qualification work. Only a fully validated result
-        // inherited unchanged from one endpoint can use ordinary Git composition; all other
-        // entry results take the worktree merge below and its judgment.
-        // A refused entry merge composes nothing either: the writer's ordinary merge reruns
-        // it and stops on that refusal, and release input's historical reader counts such a
-        // receipt as not composed, so its commits are judged rather than the input unread.
-        // The outer result is operational: a Git read failure must propagate. Only the inner
-        // semantic conflict is a refused entry merge.
-        let reused_changelog = match self.changelog_merge(checked, main)? {
-            Ok(None) => None,
-            Ok(Some(merged)) => match self.unchanged_changelog_endpoint(checked, main, &merged)? {
-                Some(entry) => Some(entry),
-                None => return Ok(Compose::Entries),
-            },
-            Err(conflict) => return Ok(Compose::Refused(conflict)),
-        };
         let out = self.complete(
             &["merge-tree", "--write-tree", "--no-messages", main, checked],
             LOCAL,
@@ -1640,158 +1915,13 @@ impl Git<'_> {
             .unwrap_or_default()
             .to_owned();
         match out.status.code() {
-            Some(0) if aterm_types::land_trailer::object_id(&first) => {
-                if let Some(expected) = reused_changelog
-                    && self.changelog_entry(&first)? != expected
-                {
-                    return Ok(Compose::Entries);
-                }
-                Ok(Compose::Tree(first))
-            }
+            Some(0) if aterm_types::land_trailer::object_id(&first) => Ok(Compose::Tree(first)),
             Some(1) => Ok(Compose::Conflict),
             _ => Err(format!(
                 "git merge-tree {main} {checked}: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             )),
         }
-    }
-
-    /// A validated entry merge which is exactly one endpoint, while the other endpoint's
-    /// complete changelog entry is unchanged from the sole merge base. This runs only AFTER
-    /// every semantic/restoration/authorship check. The clean Git result must still keep the
-    /// chosen complete entry, and ordinary file independence still decides whether it composes.
-    fn unchanged_changelog_endpoint(
-        &self,
-        checked: &str,
-        main: &str,
-        merged: &str,
-    ) -> Result<Option<Vec<u8>>, String> {
-        let found = self.complete(&["merge-base", "--all", checked, main], LOCAL)?;
-        if !matches!(found.status.code(), Some(0 | 1)) {
-            return Err(format!(
-                "git merge-base --all {checked} {main}: {}",
-                String::from_utf8_lossy(&found.stderr).trim()
-            ));
-        }
-        let text = String::from_utf8_lossy(&found.stdout);
-        let bases: Vec<_> = text.split_whitespace().collect();
-        if bases.len() != 1 || !aterm_types::land_trailer::object_id(bases[0]) {
-            return Ok(None);
-        }
-        let base = self.changelog_entry(bases[0])?;
-        if base.is_empty() {
-            return Ok(None);
-        }
-        for (unchanged, chosen, label) in [(checked, main, "main"), (main, checked, "checked")] {
-            if self.changelog_entry(unchanged)? == base
-                && matches!(self.changelog_text(chosen, label)?, Ok(Some(text)) if text == merged)
-            {
-                let entry = self.changelog_entry(chosen)?;
-                if !entry.is_empty() {
-                    return Ok(Some(entry));
-                }
-            }
-        }
-        Ok(None)
-    }
-
-    /// The complete mode/type/object/path entry. Never trim raw Git path bytes.
-    fn changelog_entry(&self, tree: &str) -> Result<Vec<u8>, String> {
-        let out = self.complete(&["ls-tree", "-z", tree, "--", changelog::PATH], LOCAL)?;
-        if !out.status.success() {
-            return Err(format!(
-                "git ls-tree {tree} -- {}: {}",
-                changelog::PATH,
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
-        }
-        Ok(out.stdout)
-    }
-
-    /// One commit's changelog bytes, without `git`'s ordinary line-output trimming. A missing,
-    /// non-blob or non-UTF-8 changelog is a semantic conflict, not an operational Git failure:
-    /// no entry merge can decide what that endpoint means.
-    fn changelog_text(
-        &self,
-        commit: &str,
-        endpoint: &str,
-    ) -> Result<Result<Option<String>, ChangelogConflict>, String> {
-        let spec = format!("{commit}:{}", changelog::PATH);
-        let out = self.complete(&["cat-file", "blob", &spec], LOCAL)?;
-        if !out.status.success() {
-            let entry = self.complete(&["ls-tree", "-z", commit, "--", changelog::PATH], LOCAL)?;
-            if entry.status.success() && entry.stdout.is_empty() {
-                return Ok(Ok(None));
-            }
-            return Ok(Err(ChangelogConflict {
-                reason: format!(
-                    "{endpoint} does not hold CHANGELOG.md as a blob ({})",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-                entries: vec![format!("CHANGELOG.md at {endpoint}")],
-            }));
-        }
-        Ok(String::from_utf8(out.stdout)
-            .map(Some)
-            .map_err(|_| ChangelogConflict {
-                reason: format!("{endpoint}'s CHANGELOG.md is not UTF-8"),
-                entries: vec![format!("CHANGELOG.md at {endpoint}")],
-            }))
-    }
-
-    /// Whether a commit after `base` authored this exact complete entry. An introduction differs
-    /// from every original parent; importing an entry from one merge parent is inheritance.
-    /// A commit whose changelog is byte for byte one parent's authored none of it, so neither
-    /// text is parsed: a merge that carried main's own changelog of its day, one the strict
-    /// reader refuses, refuses no later landing of that branch.
-    fn entry_written_since(
-        &self,
-        base: &str,
-        tip: &str,
-        entry: &changelog::ExactEntry,
-    ) -> Result<bool, String> {
-        let commits = self.local(&[
-            "rev-list",
-            "--full-history",
-            &format!("{base}..{tip}"),
-            "--",
-            changelog::PATH,
-        ])?;
-        let read = |revision: &str| -> Result<Option<String>, String> {
-            match self.changelog_text(revision, "a historical commit")? {
-                Ok(text) => Ok(text),
-                Err(conflict) => Err(format!(
-                    "{} while reading {revision} ({})",
-                    conflict.reason,
-                    conflict.entries.join(", ")
-                )),
-            }
-        };
-        for commit in commits.lines() {
-            let Some(child) = read(commit)? else {
-                continue;
-            };
-            let parents = self
-                .parents(commit)?
-                .iter()
-                .map(|parent| read(parent))
-                .collect::<Result<Vec<_>, _>>()?;
-            if parents.iter().flatten().any(|text| *text == child) {
-                continue;
-            }
-            if !changelog::holds_entry(&child, entry).map_err(|conflict| conflict.to_string())? {
-                continue;
-            }
-            let mut inherited = false;
-            for text in parents.iter().flatten() {
-                inherited |=
-                    changelog::holds_entry(text, entry).map_err(|conflict| conflict.to_string())?;
-            }
-            if !inherited {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     /// MERGE_HEAD's commit, `None` where the checkout holds no merge.
@@ -1880,265 +2010,12 @@ impl Git<'_> {
         )
     }
 
-    /// Merge the changelog at the immutable branch `tip` and `main` endpoints independently from
-    /// every best merge base, accepting only one byte-identical result. Unlike Git's recursive
-    /// virtual base, no ordering of several factual ancestors is allowed to decide whether an
-    /// entry existed. Equal endpoints are already a unique result and need no ancestor choice.
-    fn changelog_merge(
-        &self,
-        tip: &str,
-        main: &str,
-    ) -> Result<Result<Option<String>, ChangelogConflict>, String> {
-        let tip_text = match self.changelog_text(tip, "the branch tip")? {
-            Ok(text) => text,
-            Err(conflict) => return Ok(Err(conflict)),
-        };
-        let main_text = match self.changelog_text(main, "main")? {
-            Ok(text) => text,
-            Err(conflict) => return Ok(Err(conflict)),
-        };
-        let (tip_text, main_text) = match (tip_text, main_text) {
-            (None, None) => return Ok(Ok(None)),
-            (Some(tip), Some(main)) => (tip, main),
-            (tip, _) => {
-                let missing = if tip.is_none() {
-                    "the branch tip"
-                } else {
-                    "main"
-                };
-                return Ok(Err(ChangelogConflict {
-                    reason: format!("{missing} removed CHANGELOG.md as a file"),
-                    entries: vec![format!("CHANGELOG.md at {missing}")],
-                }));
-            }
-        };
-        if tip_text == main_text {
-            return Ok(Ok(None));
-        }
-        let found = self.complete(&["merge-base", "--all", tip, main], LOCAL)?;
-        let bases_text = String::from_utf8_lossy(&found.stdout);
-        let bases: Vec<&str> = bases_text.split_whitespace().collect();
-        if !matches!(found.status.code(), Some(0 | 1)) {
-            return Err(format!(
-                "git merge-base --all {tip} {main}: {}",
-                String::from_utf8_lossy(&found.stderr).trim()
-            ));
-        }
-        if bases.is_empty() {
-            let entries = changelog::differing_titles(&tip_text, &main_text)
-                .unwrap_or_else(|conflict| conflict.entries);
-            return Ok(Err(ChangelogConflict {
-                reason: "the tips have no merge base".into(),
-                entries,
-            }));
-        }
-        let mut outcomes = Vec::with_capacity(bases.len());
-        for base in &bases {
-            let endpoint = format!("merge base {base}");
-            let text = match self.changelog_text(base, &endpoint)? {
-                Ok(Some(text)) => text,
-                Ok(None) => {
-                    return Ok(Err(ChangelogConflict {
-                        reason: format!("{endpoint} has no CHANGELOG.md"),
-                        entries: vec![format!("CHANGELOG.md at {endpoint}")],
-                    }));
-                }
-                Err(conflict) => return Ok(Err(conflict)),
-            };
-            // Endpoint bytes alone cannot distinguish an unchanged base entry from one a person
-            // deliberately removed and restored. If the other side removes or rewrites it, an
-            // exact authored restoration is opposing evidence and must be resolved explicitly.
-            for (side, side_text, opposite_text) in
-                [(main, &main_text, &tip_text), (tip, &tip_text, &main_text)]
-            {
-                let removed = match changelog::removed_entries(&text, opposite_text) {
-                    Ok(removed) => removed,
-                    Err(conflict) => {
-                        return Ok(Err(ChangelogConflict {
-                            reason: format!(
-                                "merge base {base} cannot identify removals: {}",
-                                conflict.reason
-                            ),
-                            entries: conflict.entries,
-                        }));
-                    }
-                };
-                for entry in removed {
-                    let held = match changelog::holds_entry(side_text, &entry) {
-                        Ok(held) => held,
-                        Err(conflict) => {
-                            return Ok(Err(ChangelogConflict {
-                                reason: format!(
-                                    "merge base {base} cannot identify a restored entry: {}",
-                                    conflict.reason
-                                ),
-                                entries: conflict.entries,
-                            }));
-                        }
-                    };
-                    if !held {
-                        continue;
-                    }
-                    let written = match self.entry_written_since(base, side, &entry) {
-                        Ok(written) => written,
-                        Err(why) => {
-                            return Ok(Err(ChangelogConflict {
-                                reason: format!(
-                                    "merge base {base} cannot prove whether an entry was restored: {why}"
-                                ),
-                                entries: vec![entry.title().to_owned()],
-                            }));
-                        }
-                    };
-                    if written {
-                        return Ok(Err(ChangelogConflict {
-                            reason: format!(
-                                "from merge base {base}, one side explicitly restored an entry the other removes or rewrites"
-                            ),
-                            entries: vec![entry.title().to_owned()],
-                        }));
-                    }
-                }
-            }
-
-            let outcome = changelog::merge(&text, &tip_text, &main_text);
-            if let Ok(merged) = &outcome {
-                let added = match changelog::added_entries(&text, &tip_text) {
-                    Ok(added) => added,
-                    Err(conflict) => {
-                        return Ok(Err(ChangelogConflict {
-                            reason: format!(
-                                "merge base {base} cannot identify branch additions: {}",
-                                conflict.reason
-                            ),
-                            entries: conflict.entries,
-                        }));
-                    }
-                };
-                for entry in added {
-                    let kept = changelog::holds_entry(merged, &entry)
-                        .map_err(|conflict| conflict.to_string());
-                    let on_main = changelog::holds_entry(&main_text, &entry)
-                        .map_err(|conflict| conflict.to_string());
-                    let (kept, on_main) = match (kept, on_main) {
-                        (Ok(kept), Ok(on_main)) => (kept, on_main),
-                        (Err(why), _) | (_, Err(why)) => {
-                            return Ok(Err(ChangelogConflict {
-                                reason: format!(
-                                    "merge base {base} cannot prove an added entry's endpoint: {why}"
-                                ),
-                                entries: vec![entry.title().to_owned()],
-                            }));
-                        }
-                    };
-                    if !kept || on_main {
-                        continue;
-                    }
-                    match self.entry_written_since(base, tip, &entry) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            return Ok(Err(ChangelogConflict {
-                                reason: format!(
-                                    "from merge base {base}, an entry inherited through a merge has no exact authored branch addition"
-                                ),
-                                entries: vec![entry.title().to_owned()],
-                            }));
-                        }
-                        Err(why) => {
-                            return Ok(Err(ChangelogConflict {
-                                reason: format!(
-                                    "merge base {base} cannot prove an added entry's authorship: {why}"
-                                ),
-                                entries: vec![entry.title().to_owned()],
-                            }));
-                        }
-                    }
-                }
-            }
-            outcomes.push((*base, outcome));
-        }
-        let mut conflicts = outcomes
-            .iter()
-            .filter_map(|(base, result)| result.as_ref().err().map(|conflict| (*base, conflict)));
-        if let Some((first_base, first)) = conflicts.next() {
-            let mut entries = first.entries.clone();
-            let mut reasons = vec![format!("{first_base}: {}", first.reason)];
-            for (base, conflict) in conflicts {
-                entries.extend(conflict.entries.iter().cloned());
-                reasons.push(format!("{base}: {}", conflict.reason));
-            }
-            entries.sort();
-            entries.dedup();
-            return Ok(Err(ChangelogConflict {
-                reason: format!(
-                    "the best merge bases do not all determine a result ({})",
-                    reasons.join("; ")
-                ),
-                entries,
-            }));
-        }
-        let first = outcomes[0].1.as_ref().expect("conflicts returned above");
-        let mut entries = Vec::new();
-        let mut disagree = Vec::new();
-        for (base, outcome) in &outcomes[1..] {
-            let outcome = outcome.as_ref().expect("conflicts returned above");
-            if outcome == first {
-                continue;
-            }
-            disagree.push(*base);
-            entries.extend(
-                changelog::differing_titles(first, outcome)
-                    .unwrap_or_else(|conflict| conflict.entries),
-            );
-        }
-        if !disagree.is_empty() {
-            entries.sort();
-            entries.dedup();
-            return Ok(Err(ChangelogConflict {
-                reason: format!(
-                    "best merge base {} and bases {} produce different entry merges; none is \
-                     privileged",
-                    outcomes[0].0,
-                    disagree.join(", ")
-                ),
-                entries,
-            }));
-        }
-        let mut untouched = true;
-        for (base, _) in &outcomes {
-            if self.files(base, tip)?.contains(changelog::PATH.as_bytes()) {
-                untouched = false;
-                break;
-            }
-        }
-        if untouched {
-            // Every entry model agreed, and the branch retained every factual
-            // base's exact file entry. Git's one-sided merge preserves main's
-            // bytes, including spacing the entry serializer would normalize.
-            // Native composition still checks the whole tree; no changed
-            // branch changelog is exempted from entry-wise judgment.
-            return Ok(Ok(None));
-        }
-        Ok(Ok(Some(first.clone())))
-    }
-
-    /// Merge main commit `main` into the checkout and update its submodules. The ordinary merge
-    /// is held before its commit; its line result for CHANGELOG.md (conflicted or not) is replaced
-    /// with [`Self::changelog_merge`]'s entry result from immutable inputs, then the one merge
-    /// commit is written. Thus neither the removed union driver nor a textual merge gets a chance
-    /// to destroy entry identity.
+    /// Merge main commit `main` into the checkout and update its submodules. The merge is held
+    /// before its commit, so a commit git refuses (a signing failure, a held `index.lock`) is
+    /// aborted back to the clean branch tip ([`Self::abort_own_merge`]) rather than left as a
+    /// staged merge the next run cannot start from.
     fn merge(&self, main: &str, subject: &str) -> Result<Merge, String> {
         let tip = self.head()?;
-        let changelog = match self.changelog_merge(&tip, main)? {
-            Ok(text) => text,
-            Err(conflict) => return Ok(Merge::ChangelogConflict(conflict)),
-        };
-        let still = self.head()?;
-        if still != tip {
-            return Err(format!(
-                "HEAD moved from {tip} to {still} while the CHANGELOG merge was being read"
-            ));
-        }
         let out = self
             .status(
                 &[
@@ -2186,22 +2063,26 @@ impl Git<'_> {
                 format!("HEAD moved from {tip} to {after} during its uncommitted merge"),
             ));
         }
-        if let Some(changelog) = changelog {
-            let file = self.root.join(changelog::PATH);
-            std::fs::write(&file, changelog).map_err(|error| {
-                self.abort_own_merge(&tip, main, format!("write {}: {error}", file.display()))
-            })?;
-            self.local(&["add", "--", changelog::PATH])
-                .map_err(|why| self.abort_own_merge(&tip, main, why))?;
-        }
-        let conflicted = self
-            .paths(&["diff", "-z", "--name-only", "--diff-filter=U"])
-            .map_err(|why| self.abort_own_merge(&tip, main, why))?;
         if !conflicted.is_empty() {
             return Ok(Merge::Conflict(conflicted.into_iter().collect()));
         }
-        self.local(&["commit", "--quiet", "--no-verify", "--no-edit"])
+        // A commit's stdout is diagnostic, not a data protocol. Its owning exit decides
+        // success; complete capture remains necessary for the repository reads above.
+        const COMMIT: &[&str] = &["commit", "--quiet", "--no-verify", "--no-edit"];
+        let committed = self
+            .status(COMMIT, LOCAL)
             .map_err(|why| self.abort_own_merge(&tip, main, why))?;
+        if !committed.status.success() {
+            return Err(self.abort_own_merge(
+                &tip,
+                main,
+                format!(
+                    "git {}: {}",
+                    COMMIT.join(" "),
+                    String::from_utf8_lossy(&committed.stderr).trim()
+                ),
+            ));
+        }
         self.update_submodules()?;
         Ok(Merge::Clean)
     }
@@ -2346,69 +2227,103 @@ impl Git<'_> {
         self.local(&args)
     }
 
-    /// Push `landing` to main, expecting main at `onto`: `None` once it landed, or main's new
-    /// tip where it moved ([`Self::settle`]).
-    fn push(
-        &self,
-        landing: &str,
-        onto: &str,
-        composes: &mut usize,
-        until: Instant,
-    ) -> Result<Option<String>, String> {
-        let run = |tool, args: &[std::ffi::OsString]| {
-            crate::remote::run(self.root, self.make, tool, args, until)
-        };
-        let remote = crate::remote::Remote::open(self.root, REMOTE, &run)?;
-        push_after_intents(
-            composes,
-            &|| {
-                if Instant::now() >= until {
-                    return Err("atomic push exceeded its network deadline".into());
-                }
-                remote.push(&format!("refs/heads/{MAIN}"), Some(onto), landing)
-            },
-            &|intent| {
-                remote.wait_for_intent(intent, &|| {
-                    let remaining = until.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(
-                            "foreign atomic intent remained open at the push deadline".into()
-                        );
-                    }
-                    std::thread::sleep(remaining.min(Duration::from_millis(100)));
-                    Ok(())
-                })
-            },
-            &|| {
-                let tip = remote.refresh_main()?;
-                self.local(&["update-ref", &format!("refs/remotes/{REMOTE}/{MAIN}"), &tip])?;
-                if tip == landing || self.is_ancestor(landing, &tip)? {
-                    return Ok(PushObservation::Landed);
-                }
-                if tip != onto {
-                    return Ok(PushObservation::Moved(tip));
-                }
-                // The refused attempt sent nothing and main is unchanged. Re-run both
-                // dry-run and expected-ref push; this is not replay of an unknown write.
-                Ok(PushObservation::Unchanged)
-            },
-            &|why| self.settle(landing, onto, why),
-        )
+    /// Keep the passed judgment `stated` of `judged_at` (which merges main commit `merged`) for a
+    /// later run, at [`KEPT`]: a commit of the judged tree whose parents are `judged_at` and
+    /// `merged` and whose message carries the receipt's trailers, with no composition named. The
+    /// judged tree.
+    fn keep(&self, judged_at: &str, merged: &str, stated: &Stated) -> Result<String, String> {
+        let tree = self.tree(judged_at)?;
+        let mut stated = stated.clone();
+        stated.composed_onto = None;
+        let message = format!(
+            "verify land: the judgment of {tree}, kept until its landing is pushed\n\n{}",
+            stated.trailers()
+        );
+        let record = self.commit(&tree, &[judged_at, merged], &message)?;
+        self.local(&[
+            "update-ref",
+            "-m",
+            "verify land: a judgment passed",
+            KEPT,
+            &record,
+        ])?;
+        Ok(tree)
     }
 
-    /// Where a push of `landing` onto `onto` git reported failed (`why`) left main, fetched: a
-    /// main that holds the landing took it (a connection lost after the server moved the ref
-    /// loses only its report), `None`; one still at `onto` refused it, an error and never a
-    /// retry; else main moved, its new tip.
-    fn settle(&self, landing: &str, onto: &str, why: &str) -> Result<Option<String>, String> {
-        let tip = self.fetch()?;
-        if tip == landing || self.is_ancestor(landing, &tip)? {
-            return Ok(None);
+    /// The judgment kept at [`KEPT`], where it holds for the checkout at `head`: `None` where
+    /// none is kept, else the judgment or why this run does not resume it. It holds only where
+    /// its record is whole (the judged commit and the main commit it merged; a receipt whose
+    /// last judgment or recheck names the record's own tree and that main commit, composed onto
+    /// nothing), `head` is the judged commit and holds the judged tree, and `head` holds that
+    /// main commit: a judgment passes only on the tree it ran on, over the cone it was computed
+    /// from.
+    fn kept(&self, head: &str) -> Result<Option<Result<Kept, String>>, String> {
+        let spec = format!("{KEPT}^{{commit}}");
+        let found = self.complete(&["rev-parse", "-q", "--verify", &spec], LOCAL)?;
+        let record = match found.status.code() {
+            Some(0) => String::from_utf8_lossy(&found.stdout).trim_end().to_owned(),
+            Some(1) if found.stdout.is_empty() => return Ok(None),
+            _ => {
+                return Err(format!(
+                    "git rev-parse {spec}: {}",
+                    String::from_utf8_lossy(&found.stderr).trim()
+                ));
+            }
+        };
+        let parents = self.parents(&record)?;
+        let [judged_at, merged] = parents.as_slice() else {
+            return Ok(Some(Err(format!(
+                "{record} at {KEPT} is not a judged commit and the main commit it merged"
+            ))));
+        };
+        let judged = self.tree(&record)?;
+        let text = self.local(&["log", "-1", "--format=%B", &record])?;
+        let stated = Stated::of_trailers(&text).filter(|stated| {
+            let last = stated
+                .rechecks_since_judged()
+                .last()
+                .map(|recheck| (recheck.tree.as_str(), recheck.onto.as_str()))
+                .or_else(|| {
+                    stated
+                        .checked
+                        .last()
+                        .map(|checked| (checked.tree.as_str(), checked.base.as_str()))
+                });
+            stated.composed_onto.is_none() && last == Some((judged.as_str(), merged.as_str()))
+        });
+        let Some(stated) = stated else {
+            return Ok(Some(Err(format!(
+                "{record} at {KEPT} does not state a judgment of its own tree over the cone \
+                 since {merged}"
+            ))));
+        };
+        if judged_at != head {
+            return Ok(Some(Err(format!(
+                "it judged {judged_at}, and HEAD is {head}"
+            ))));
         }
-        if tip == onto {
-            return Err(why.to_owned());
+        let tree = self.tree(head)?;
+        if tree != judged {
+            return Ok(Some(Err(format!(
+                "it judged {judged}, and HEAD holds {tree}"
+            ))));
         }
-        Ok(Some(tip))
+        if !self.is_ancestor(merged, head)? {
+            return Ok(Some(Err(format!(
+                "HEAD does not hold {merged}, the main commit it merged"
+            ))));
+        }
+        Ok(Some(Ok(Kept {
+            tree,
+            merged: merged.clone(),
+            stated,
+        })))
+    }
+
+    /// Forget the kept judgment ([`KEPT`]): its landing is on main. One that does not delete
+    /// holds for no checkout whose head is not already on main.
+    fn forget(&self) {
+        let _ = self.local(&["update-ref", "-d", KEPT]);
     }
 
     /// Move the checkout's branch from `judged` to the landing: a fast-forward where the landing
@@ -2455,14 +2370,15 @@ impl Git<'_> {
 #[must_use]
 pub fn usage() -> String {
     format!(
-        "usage: targo --unverified verify land [--admit wait|now] [--timeout <seconds|off>]\n\n\
+        "usage: targo --unverified verify land [--admit wait|now] [--timeout <seconds|off>] [--test-cores <n>]\n\n\
          Land this checkout's branch on {REMOTE}/{MAIN}, judged: merge {REMOTE}/{MAIN} (M1), run\n\
          the dev set over the cone since M1, push, and where {MAIN} moved meanwhile compose onto\n\
          it (a clean merge and disjoint or exactly convergent entries, except a sole remaining\n\
          shared Cargo.lock whose isolated local product version alone moved) or merge it and\n\
-         judge the branch's delta from that main tip, at most {REJUDGES} times. Where the\n\
-         shared paths are only Markdown no build, include or test reads (root *.md but\n\
-         CHANGELOG.md, docs/**/*.md, a workspace member's SPECS.md; census's no-reach-read guard\n\
+         judge the branch's delta from that main tip, at most {REJUDGES} times. A {MAIN} that\n\
+         moves again is composed onto again, at most {COMPOSES} times in a row. Where the\n\
+         shared paths are only Markdown no build, include or test reads (root *.md,\n\
+         docs/**/*.md, a workspace member's SPECS.md; census's no-reach-read guard\n\
          holds that set), it merges that tip and reruns only fmt, census and export-scan on the\n\
          merge with the merged tree's own verifier, over the cone since the tip, and states an\n\
          Aterm-Rechecked line; any red there counts. A red main's lane already named at the\n\
@@ -2479,11 +2395,6 @@ pub fn usage() -> String {
          that composes by either rule changes nothing, and a run that already reported a red (FAIL or NOT RUN:\n\
          a check, a stage or a test binary), even one later INHERITED, is not interrupted: its\n\
          end decides.\n\n\
-         CHANGELOG.md is merged before that commit as sections and whole entries from every\n\
-         agreed best merge base, the branch tip and main. Rewrites replace their old entry;\n\
-         removals, restores and reorder-only edits retain their meaning. A release section main\n\
-         cut since the fork is kept exactly, and branch additions remain under [Unreleased].\n\
-         Ambiguous entries or order stop before the merge and name the entries.\n\n\
          Convergence requires identical mode, type and object (or all absent) in checked, new\n\
          main and merge, including parent trees. Disjoint changes need no extra entry reads;\n\
          unavailable evidence retains the original overlap and lock rule.\n\n\
@@ -2492,28 +2403,55 @@ pub fn usage() -> String {
          names the tree that ran; a composed product identity is not that earlier executable.\n\n\
          --admit changes resource admission only, forwarded to every judgment; wait is the\n\
          default. --timeout changes only each judgment's child-work ceiling (3h by default);\n\
-         off removes it. The full dev set and change cone are unchanged.\n\n\
-         GitHub reads and writes use agh (dry-run, expected refs, durable write intents); local\n\
-         remotes use git's file protocol only. Required submodules must already be initialised:\n\
+         off removes it. --test-cores caps the CPU share requested for test execution;\n\
+         admission may grant less. The full dev set and change cone are unchanged.\n\n\
+         A judgment that passed is never lost to the push. The count above is the push's\n\
+         only bound: no deadline spans its landings, and each remote step runs under its own\n\
+         hang detector ({network}s; {write}s for a write, which agh's own bounds come before).\n\
+         A remote step that failed or timed out having sent nothing (a read of {MAIN}, a push\n\
+         agh says it did not send) is made again after a pause that doubles from {pause}s, at\n\
+         most {RETRIES} times in a row; a push whose outcome is unknown is never made again,\n\
+         and a {MAIN} that holds its landing took it. The judgment is kept in this worktree\n\
+         ({KEPT}) until its landing is on {MAIN}: a run that\n\
+         ends before then (stopped at a bound, a remote that stayed down, a kill) is run again,\n\
+         and while HEAD is still the judged commit it goes straight to the push with the same\n\
+         receipt, judging again only where the moved {MAIN} does not compose.\n\n\
+         GitHub reads and writes use agh (expected refs, durable write intents; one write, with\n\
+         no rehearsal that would repeat agh's re-verification of the pushed history while\n\
+         {MAIN} moves); local remotes use git's file protocol only. Required submodules must\n\
+         already be initialised:\n\
          landing never clones one. A commit a merged main pins that a submodule lacks is imported,\n\
          exactly, through that submodule's own {REMOTE}, the same way, and is all it fetches there.\n\n\
+         Each judgment and recheck runs as the verifier built from the tree it judges: where that\n\
+         build is not the running landing, the landing hands itself to it in place and goes on\n\
+         ({resume} <file> is that handoff's own word, never a person's).\n\n\
          Exit: 0 landed (or nothing to land), 1 a red or a conflict (nothing pushed), 2 usage,\n\
          3 could not run, {STOPPED} stopped while {MAIN} kept moving (merged and judged, or its\n\
          judgment interrupted; not pushed).\n",
-        poll = POLL.as_secs() / 60
+        resume = handoff::RESUME,
+        poll = POLL.as_secs() / 60,
+        pause = RETRY_PAUSE.as_secs(),
+        network = NETWORK.as_secs(),
+        write = WRITE.as_secs()
     )
 }
 
+/// Resource controls retained for every landing judgment and re-judgment.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct LandOptions {
-    admit: aterm_capacity::Admit,
-    timeout: Option<String>,
+pub struct LandResources {
+    /// How each judgment asks for capacity.
+    pub admit: aterm_capacity::Admit,
+    /// Its child-work hang ceiling; `None` retains verify's default.
+    pub timeout: Option<String>,
+    /// A ceiling on requested test cores, never a capacity grant.
+    pub test_cores: Option<std::num::NonZeroU32>,
 }
 
-fn options(args: &[String]) -> Option<LandOptions> {
-    let mut options = LandOptions {
+fn options(args: &[String]) -> Option<LandResources> {
+    let mut options = LandResources {
         admit: aterm_capacity::Admit::Wait,
         timeout: None,
+        test_cores: None,
     };
     let mut admit_seen = false;
     let mut timeout_seen = false;
@@ -2560,17 +2498,37 @@ fn options(args: &[String]) -> Option<LandOptions> {
             index += 1;
             continue;
         }
+        if flag == "--test-cores" {
+            if options.test_cores.is_some() {
+                return None;
+            }
+            options.test_cores = Some(args.get(index + 1)?.parse().ok()?);
+            index += 2;
+            continue;
+        }
+        if let Some(value) = flag.strip_prefix("--test-cores=") {
+            if options.test_cores.is_some() {
+                return None;
+            }
+            options.test_cores = Some(value.parse().ok()?);
+            index += 1;
+            continue;
+        }
         return None;
     }
     Some(options)
 }
 
-/// `verify land [--admit wait|now] [--timeout seconds|off] [--help]`, from `cwd`'s checkout.
+/// `verify land [--admit wait|now] [--timeout seconds|off] [--test-cores n] [--help]`, from `cwd`'s checkout.
+/// `verify land --resume <file>` is the landing's own handoff to another build of itself.
 pub fn run(args: &[String], cwd: &Path) -> i32 {
     match args {
         [help] if help == "--help" || help == "-h" => {
             print!("{}", usage());
             return exit::PASS;
+        }
+        [flag, file] if flag == handoff::RESUME => {
+            return resume_cli(Path::new(file), cwd, &mut |line| eprintln!("{line}"));
         }
         _ => {}
     }
@@ -2578,11 +2536,15 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
         Some(options) => options,
         None => {
             eprint!(
-                "verify land: takes only --admit wait|now and --timeout seconds|off\n{}",
+                "verify land: takes only --admit wait|now, --timeout seconds|off and --test-cores n\n{}",
                 usage()
             );
             return exit::USAGE;
         }
+    };
+    let Some(image) = crate::report::running_driver() else {
+        eprintln!("verify land: COULD NOT RUN — this landing's own image could not be read");
+        return exit::COULD_NOT_RUN;
     };
     if crate::git_provider::pin().is_none() {
         eprintln!("verify land: COULD NOT RUN — no absolute executable Git on PATH");
@@ -2595,56 +2557,167 @@ pub fn run(args: &[String], cwd: &Path) -> i32 {
         );
         return exit::COULD_NOT_RUN;
     };
-    let git = |root: &Path| {
-        let mut cmd = crate::judged::command(root, &[]);
-        cmd.env("GIT_TERMINAL_PROMPT", "0");
-        for key in PATHSPEC_MODES {
-            cmd.env_remove(key);
-        }
-        cmd
-    };
-    let mut say = |line: &str| println!("{line}");
-    land(
-        &root,
-        &mut Seams {
-            git: &git,
-            judge: &mut |root, base, poll| {
-                live_judge(root, base, options.admit, options.timeout.as_deref(), poll)
-            },
-            branch: &mut live_branch,
-            lane: &mut live_lane,
-            recheck: &mut |root, base| {
-                live_recheck(root, base, options.admit, options.timeout.as_deref())
-            },
-            say: &mut say,
-        },
-    )
+    with_live_seams(&options, |seams| {
+        land(&root, &Own { words: args, image }, seams)
+    })
 }
 
-/// The dev set over the cone since `base`, run as the checkout's freshly built verifier
-/// (so the merged tree's tools judge it), its rows read from the check-finished events it keeps
-/// and its record's end from its run-finished one. While it runs, `poll` is asked as
-/// [`supervise_judgment`] asks it; a run it interrupts is no verdict.
+/// `verify land --resume <file>`: take the handoff at `file` (removing it), then resume the
+/// landing it holds in `cwd`'s checkout (the checkout's root, where the landing handed itself
+/// over) as this image, under the person's `land` words parsed again by this build. Only the
+/// checkout's own handoff file is read or removed ([`own_handoff`]). A handoff this build does
+/// not read, or words it does not take, could not run: the person typed nothing to this image.
+/// Each line such a refusal says goes to `refuse` (stderr, from [`run`]); once resumed, the
+/// landing says its lines as [`land`] does.
+fn resume_cli(file: &Path, cwd: &Path, refuse: &mut dyn FnMut(&str)) -> i32 {
+    if crate::git_provider::pin().is_none() {
+        refuse(&format!(
+            "verify land: COULD NOT RUN — no absolute executable Git on PATH; {RERUN}"
+        ));
+        return exit::COULD_NOT_RUN;
+    }
+    let Some(root) = crate::checkout_root(cwd) else {
+        refuse(&format!(
+            "verify land: COULD NOT RUN — {} is not inside a git checkout; {RERUN}",
+            cwd.display()
+        ));
+        return exit::COULD_NOT_RUN;
+    };
+    let git = Git {
+        root: &root,
+        make: &live_git,
+    };
+    if let Err(why) = own_handoff(&git, file) {
+        refuse(&format!("verify land: COULD NOT RUN — {why}"));
+        return exit::COULD_NOT_RUN;
+    }
+    let handoff = match Handoff::take(file) {
+        Ok(handoff) => handoff,
+        Err(why) => {
+            refuse(&format!(
+                "verify land: COULD NOT RUN — the landing's handoff {}: {why}; {RERUN}",
+                file.display()
+            ));
+            return exit::COULD_NOT_RUN;
+        }
+    };
+    let Some(image) = crate::report::running_driver() else {
+        refuse(&format!(
+            "verify land: COULD NOT RUN — this landing's own image could not be read; {RERUN}"
+        ));
+        return exit::COULD_NOT_RUN;
+    };
+    let words = handoff.words.clone();
+    let Some(options) = options(&words) else {
+        refuse(&format!(
+            "verify land: COULD NOT RUN — this tree's verify land does not take the landing's \
+             words `{}`; {RERUN}",
+            words.join(" ")
+        ));
+        return exit::COULD_NOT_RUN;
+    };
+    with_live_seams(&options, |seams| {
+        resume(
+            &root,
+            &Own {
+                words: &words,
+                image,
+            },
+            handoff,
+            seams,
+        )
+    })
+}
+
+/// Whether `file` is the checkout's own handoff file ([`Git::handoff_file`]), its directory
+/// compared physically: the only file `--resume` reads or removes. Else why not, leaving
+/// `file` as it was.
+fn own_handoff(git: &Git<'_>, file: &Path) -> Result<(), String> {
+    let expected = git.handoff_file()?;
+    let physical = |path: &Path| {
+        let name = path.file_name()?;
+        let dir = match path.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir,
+            _ => Path::new("."),
+        };
+        Some(std::fs::canonicalize(dir).ok()?.join(name))
+    };
+    match (physical(file), physical(&expected)) {
+        (Some(file), Some(expected)) if file == expected => Ok(()),
+        _ => Err(format!(
+            "{} is not this checkout's handoff, {}: it was left as it was. `{}` is the landing's \
+             own word to the image it hands itself to; to land, run `targo --unverified verify \
+             land`",
+            file.display(),
+            expected.display(),
+            handoff::RESUME
+        )),
+    }
+}
+
+/// A git command in the checkout at `root`, as every live landing step runs one.
+fn live_git(root: &Path) -> Command {
+    let mut cmd = crate::judged::command(root, &[]);
+    cmd.env("GIT_TERMINAL_PROMPT", "0");
+    for key in PATHSPEC_MODES {
+        cmd.env_remove(key);
+    }
+    cmd
+}
+
+/// Run `f` with the live seams under the person's resource controls `options`.
+fn with_live_seams<R>(options: &LandResources, f: impl FnOnce(&mut Seams<'_>) -> R) -> R {
+    let mut say = |line: &str| println!("{line}");
+    f(&mut Seams {
+        git: &live_git,
+        verifier: &mut live_verifier,
+        judge: &mut |root, verifier, base, poll| live_judge(root, verifier, base, options, poll),
+        branch: &mut live_branch,
+        lane: &mut live_lane,
+        recheck: &mut |root, verifier, base| live_recheck(root, verifier, base, options),
+        hand_over: &mut handoff::hand_over,
+        say: &mut say,
+        remote: &crate::remote::run,
+        pause: &std::thread::sleep,
+    })
+}
+
+/// The checkout's verifier, freshly built from it as it stands by its own toolchain (its
+/// `trust.lock`), and that executable's sha256.
+fn live_verifier(root: &Path) -> Result<Image, String> {
+    let env = crate::EnvSnapshot::capture();
+    let tools = crate::preflight(&env, root)?;
+    // This is the native driver, bypassing atpkg's shim. Place its bootstrap too:
+    // main_targo only places children after the nested verifier has already compiled.
+    let plan = crate::NativeBuildPlan::capture(&env, root)
+        .map_err(|error| format!("cannot resolve the build plan: {error}"))?;
+    let path = crate::native_verifier::build(root, &tools.targo, &plan)?;
+    let digest = crate::test_index::digest(&path)
+        .map_err(|error| format!("{} could not be read: {error}", path.display()))?;
+    Ok(Image { path, digest })
+}
+
+/// The dev set over the cone since `base`, run as `verifier`, the checkout's freshly built
+/// verifier (so the merged tree's tools judge it) and the landing's own image, its rows read
+/// from the check-finished events it keeps and its record's end from its run-finished one.
+/// While it runs, `poll` is asked as [`supervise_judgment`] asks it; a run it interrupts is no
+/// verdict.
 fn live_judge(
     root: &Path,
+    verifier: &Path,
     base: &str,
-    admit: aterm_capacity::Admit,
-    timeout: Option<&str>,
+    resources: &LandResources,
     poll: Poll<'_>,
 ) -> Ran {
-    nested(root, base, &[], admit, timeout, poll)
+    nested(root, verifier, base, &[], resources, poll)
 }
 
 /// The source readers ([`RECHECKS`]) over the cone since `base`, run as [`live_judge`] runs the
-/// dev set: the checkout's own verifier, built from the merge it rechecks, so the merged tree's
-/// rules judge it and nothing an earlier build left is reused. Nothing interrupts it.
-fn live_recheck(
-    root: &Path,
-    base: &str,
-    admit: aterm_capacity::Admit,
-    timeout: Option<&str>,
-) -> Judged {
-    match nested(root, base, &RECHECKS, admit, timeout, &mut |_| false) {
+/// dev set: as `verifier`, the checkout's own verifier built from the merge it rechecks and the
+/// landing's own image, so the merged tree's rules judge it and nothing an earlier build left
+/// is reused. Nothing interrupts it.
+fn live_recheck(root: &Path, verifier: &Path, base: &str, resources: &LandResources) -> Judged {
+    match nested(root, verifier, base, &RECHECKS, resources, &mut |_| false) {
         Ran::Ended(judged) => judged,
         Ran::Interrupted { secs } => Judged {
             code: exit::COULD_NOT_RUN,
@@ -2654,14 +2727,14 @@ fn live_recheck(
     }
 }
 
-/// `checks` (the dev set where empty) over the cone since `base`, as the checkout's freshly
-/// built verifier.
+/// `checks` (the dev set where empty) over the cone since `base`, as `verifier`, the
+/// checkout's freshly built verifier.
 fn nested(
     root: &Path,
+    verifier: &Path,
     base: &str,
     checks: &[&str],
-    admit: aterm_capacity::Admit,
-    timeout: Option<&str>,
+    resources: &LandResources,
     poll: Poll<'_>,
 ) -> Ran {
     let began = Instant::now();
@@ -2673,26 +2746,12 @@ fn nested(
         })
     };
     let env = crate::EnvSnapshot::capture();
-    let tools = match crate::preflight(&env, root) {
-        Ok(tools) => tools,
-        Err(why) => return not_run(why),
-    };
     let dir = match aterm_tempfile::tempdir() {
         Ok(dir) => dir,
         Err(e) => return not_run(format!("cannot make a scratch directory: {e}")),
     };
     let events = dir.path().join("verify.events");
-    // This is the native driver, bypassing atpkg's shim. Place its bootstrap too:
-    // main_targo only places children after the nested verifier has already compiled.
-    let build_plan = match crate::NativeBuildPlan::capture(&env, root) {
-        Ok(plan) => plan,
-        Err(error) => return not_run(format!("cannot resolve the build plan: {error}")),
-    };
-    let verifier = match crate::native_verifier::build(root, &tools.targo, &build_plan) {
-        Ok(verifier) => verifier,
-        Err(error) => return not_run(error),
-    };
-    let command = judgment_command(&verifier, root, base, checks, &events, admit, &env, timeout);
+    let command = judgment_command(verifier, root, base, checks, &events, resources, &env);
     let mut cmd = match command {
         Ok(cmd) => cmd,
         Err(error) => return not_run(format!("cannot own the nested verifier: {error}")),
@@ -2955,10 +3014,10 @@ fn record(line: &[u8], report: &mut Report) {
 /// the group is killed and the leader reaped ([`aterm_uds::deadline::settle_child`]). Nothing
 /// outside the group is signalled. What its members had started outside it ([`started_outside`]:
 /// read before the signal, and again while the leader ends, so what they start meanwhile joins)
-/// ends by its own parent-death watch, a step at a time: a verifier Targo's run left in a group
-/// of its own ([`own_judgment`]) once its parent in the group is gone, and each stage group once
-/// its verifier is. This returns once all of that is gone, or once [`INTERRUPT_GRACE`] passed
-/// with none of it ending: what the run held (its capacity claims, its build's locks) is released
+/// ends by its own parent-death watch, a step at a time: each stage group once its verifier is
+/// gone, and its children once their parents are. This returns once all of that is gone, or once
+/// [`INTERRUPT_GRACE`] passed with none of it ending: what the run held (its capacity claims, its
+/// build's locks) is released
 /// as its holders end, so the re-judge after it finds them free. A process one of those starts
 /// after the leader is reaped is not awaited. The interrupted run is no verdict.
 pub fn interrupt_judgment(child: &mut aterm_uds::spawnfd::Child) {
@@ -3094,31 +3153,6 @@ fn beyond(rows: &[aterm_uds::process::Lineage], group: u32, known: &[Started]) -
     found
 }
 
-/// The nested verifier's private lifetime flag, consumed before it starts threads.
-pub const PARENT_LIFETIME: &str = "--parent-lifetime";
-
-/// Arm the nested verifier's own parent-death watch, even when Targo gave it a separate group.
-/// # Errors
-/// The watch could not be armed, or the host does not support it.
-/// # Safety
-/// Call once at CLI entry, before starting any other thread.
-pub unsafe fn own_judgment(args: &mut Vec<std::ffi::OsString>) -> Result<(), String> {
-    if args.first().is_none_or(|arg| arg != PARENT_LIFETIME) {
-        return Ok(());
-    }
-    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-    {
-        // SAFETY: this function carries the caller's single-threaded entry obligation.
-        unsafe {
-            aterm_uds::tether::hold_parent()?;
-        }
-        args.remove(0);
-        Ok(())
-    }
-    #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
-    Err("this host cannot own a nested verifier's lifetime".to_owned())
-}
-
 /// Run the checkout's freshly built verifier directly, owned by the calling land process, on
 /// `checks` (the dev set where empty: a judgment; [`RECHECKS`]: a recheck). Its test check
 /// brackets each test binary's executable and declared runtime inputs
@@ -3127,21 +3161,19 @@ pub unsafe fn own_judgment(args: &mut Vec<std::ffi::OsString>) -> Result<(), Str
 /// The explicit trampoline uses the caller's current executable, whose `main` must serve
 /// [`aterm_uds::tether::entry`]. It does not depend on the image recorded before a rebuild.
 /// Linux runs its loaded image through `/proc/self/exe`, which a replaced pathname cannot change.
+/// Its words are composed and parsed by one build: a landing whose image is not the checkout's
+/// build hands itself over to that build first ([`handoff`]), so these flags are the landing's
+/// own, internal, and may change with any main.
 /// # Errors
 /// This process's executable path could not be read.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each is one independent part of the nested run's command line"
-)]
 pub fn judgment_command(
     verifier: &Path,
     root: &Path,
     base: &str,
     checks: &[&str],
     events: &Path,
-    admit: aterm_capacity::Admit,
+    resources: &LandResources,
     env: &crate::EnvSnapshot,
-    timeout: Option<&str>,
 ) -> std::io::Result<Command> {
     #[cfg(unix)]
     let mut cmd = {
@@ -3163,17 +3195,18 @@ pub fn judgment_command(
     cmd.process_group(0);
     cmd.current_dir(root);
     crate::native_verifier::configure_runtime(&mut cmd, root, env);
-    #[cfg(any(target_vendor = "apple", target_os = "linux"))]
-    cmd.arg(PARENT_LIFETIME);
     cmd.args(checks)
         .args(["--base", base, "--events"])
         .arg(events)
-        .args([aterm_capacity::Admit::FLAG, admit.word()]);
+        .args([aterm_capacity::Admit::FLAG, resources.admit.word()]);
     if checks.is_empty() || checks.contains(&"test") {
         cmd.arg(crate::cli::INPUT_DRIFT);
     }
-    if let Some(timeout) = timeout {
+    if let Some(timeout) = resources.timeout.as_deref() {
         cmd.args(["--timeout", timeout]);
+    }
+    if let Some(cores) = resources.test_cores {
+        cmd.args(["--test-cores", &cores.to_string()]);
     }
     Ok(cmd)
 }
@@ -3226,9 +3259,6 @@ fn live_lane(root: &Path, commit: &str) -> Lane {
         Err(e) => Lane::Unjudged(format!("its verdict was not read: {e}")),
     }
 }
-
-#[path = "land_changelog.rs"]
-mod changelog;
 
 #[cfg(test)]
 #[path = "land_tests.rs"]

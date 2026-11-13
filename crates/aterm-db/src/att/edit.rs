@@ -234,18 +234,18 @@ pub fn show(
 ) -> Result<usize> {
     let compiled = handle.compiled();
     let scratch = scratch()?;
-    let cells = handle.view()?.cells;
+    let view = handle.view()?;
+    let cells = &view.cells;
     let opened = open_secrets(
         handle,
         collection,
         None,
-        &cells,
+        cells,
         secrets.journal,
         Surface::Grid,
         secrets.when_ms,
     )?;
-    let exported =
-        grid::export_opened(compiled.table, collection, &cells, &[], true, Some(&opened))?;
+    let exported = view.export_grid(compiled.table, collection, &[], true, Some(&opened))?;
     let rows = exported.base.rows.len();
     let text = zeroize::Zeroizing::new(exported.text);
     let name = format!("{}.tsv", collection.name);
@@ -341,7 +341,8 @@ pub fn edit(
 ) -> Result<Edited> {
     let compiled = handle.compiled();
     let scratch = scratch()?;
-    let export = |cells: &Cells, filters: &[Where]| -> Result<grid::Export> {
+    let export = |view: &super::View, filters: &[Where]| -> Result<grid::Export> {
+        let cells = &view.cells;
         let opened = secrets
             .map(|secrets| {
                 open_secrets(
@@ -355,14 +356,7 @@ pub fn edit(
                 )
             })
             .transpose()?;
-        grid::export_opened(
-            compiled.table,
-            collection,
-            cells,
-            filters,
-            reveal,
-            opened.as_ref(),
-        )
+        view.export_grid(compiled.table, collection, filters, reveal, opened.as_ref())
     };
     let name = format!("{}.tsv", collection.name);
     let path = scratch.path().join(&name);
@@ -371,7 +365,7 @@ pub fn edit(
         aterm_uds::private_file::write_private(scratch.path(), &name, text.as_bytes())
             .map_err(|_| Error::new("the grid file could not be written"))
     };
-    let mut exported = export(&handle.view()?.cells, filters)?;
+    let mut exported = export(&handle.view()?, filters)?;
     let mut presented = zeroize::Zeroizing::new(exported.text.clone());
     write(&presented)?;
     let mut line = 1;
@@ -427,12 +421,12 @@ pub fn edit(
                         super::command::safe_key(&item.column),
                     ));
                 }
-                let cells = handle.view()?.cells;
+                let view = handle.view()?;
                 let fresh = if filters.is_empty() {
-                    export(&cells, &[])?.base
+                    export(&view, &[])?.base
                 } else {
                     let matching =
-                        grid::export(compiled.table, collection, &cells, filters, reveal)?;
+                        view.export_grid(compiled.table, collection, filters, reveal, None)?;
                     let mut keep: std::collections::BTreeSet<&str> = matching
                         .base
                         .rows
@@ -442,7 +436,7 @@ pub fn edit(
                     keep.extend(exported.base.rows.iter().map(|(pk, _)| pk.as_str()));
                     keep.extend(plan.born.iter().map(String::as_str));
                     keep.extend(stale.iter().map(|item| item.pk.as_str()));
-                    let mut all = export(&cells, &[])?.base;
+                    let mut all = export(&view, &[])?.base;
                     all.rows.retain(|(pk, _)| keep.contains(pk.as_str()));
                     all
                 };

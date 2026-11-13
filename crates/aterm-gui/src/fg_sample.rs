@@ -179,6 +179,21 @@ pub(crate) fn start_tick_us() -> Option<u64> {
     }
 }
 
+/// The latest wall-clock ms a process whose start reads `start_us` (microseconds on the start
+/// clock, [`start_clock_us`]) may have started at: its start as read plus the start record's tick
+/// ([`start_tick_us`]), carried back from now by the time since on the wall clock the blocks'
+/// stamps read ([`crate::command_ran::wall_ms`]), so a restore places a process by its birth
+/// ([`crate::command_ran::RanFeed::restored_in_shell_group`]). `None` for an unread start (`0`)
+/// and where no start clock is read; a start read after now is now.
+pub(crate) fn started_wall_ms(start_us: u64) -> Option<u64> {
+    if start_us == 0 {
+        return None;
+    }
+    let latest_us = start_us.saturating_add(start_tick_us()?);
+    let since_ms = start_clock_us()?.saturating_sub(latest_us) / 1_000;
+    Some(crate::command_ran::wall_ms().saturating_sub(since_ms))
+}
+
 /// An image a sampler heard, by a sample or from the proc connector ([`FgSampler::connected`]).
 #[derive(Debug)]
 struct Seen {

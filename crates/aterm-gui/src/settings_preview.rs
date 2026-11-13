@@ -3186,7 +3186,6 @@ impl SettingsPreviewSpec {
             }
         } else if key == crate::prefs::EDIT_THEME
             && let Some(identity) = &self.terminal_theme_identity
-            && crate::prefs::theme_mode(Some(raw)) == crate::prefs::ThemeMode::FollowSystem
         {
             identity.label.clone()
         } else if key == crate::prefs::EDIT_CURSOR_TRAIL_STYLE && !self.cursor.trail_enabled {

@@ -4734,7 +4734,7 @@ const LOCAL_VITALS_READING: &str = "reading";
 #[cfg(target_os = "macos")]
 fn run_cmd_stdout_bounded(prog: &str, args: &[&str], wait_ms: u64) -> Option<String> {
     use std::io::Read;
-    let (reader, writer) = std::io::pipe().ok()?;
+    let (reader, writer) = aterm_uds::pipe().ok()?;
     let mut cmd = aterm_uds::spawnfd::command(prog);
     cmd.args(args)
         .stdin(aterm_uds::spawnfd::Stdio::null())

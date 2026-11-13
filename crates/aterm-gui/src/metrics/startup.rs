@@ -585,6 +585,32 @@ pub(crate) fn mark_rust_main_start() {
     let _ = STARTUP.rust_main_wall.set(SystemTime::now());
 }
 
+/// How long ago this process began: its kernel start record against the boot clock now, through
+/// the mach timebase ([`birth_to_main_ns`]), so a wall-clock step does not move it; against the
+/// wall clock only where no boot clock reads (a translated process). `None` where the record is
+/// unreadable or the reading comes before it.
+#[cfg(target_os = "macos")]
+pub(crate) fn process_age() -> Option<Duration> {
+    process_age_at(SystemTime::now())
+}
+
+/// [`process_age`] with the wall clock's reading passed in, which counts only where no boot clock
+/// reads.
+#[cfg(target_os = "macos")]
+fn process_age_at(wall_now: SystemTime) -> Option<Duration> {
+    birth_to_main_ns(
+        read_own_start()?,
+        aterm_uds::process::boot_clock_now(),
+        wall_now,
+        mach_timebase(),
+    )
+    .map(Duration::from_nanos)
+}
+
+/// The time from the kernel's start record `start` to a reading taken later (`main_boot` on the
+/// boot clock, `main_wall` on the wall clock), in nanoseconds: on the boot clock through
+/// `timebase` where both exist, else on the wall clock. `None` where the reading comes before
+/// the start, or neither clock can say.
 fn birth_to_main_ns(
     start: ProcessStart,
     main_boot: Option<BootClock>,
@@ -624,9 +650,30 @@ pub(crate) fn mark_gui_ready_for_winit() {
     let _ = STARTUP.gui_ready.set(Instant::now());
 }
 
-/// Mark the start of winit's first `resumed` callback.
+/// Mark the start of winit's first `resumed` callback: the native launch finished, which a
+/// handoff successor reports to its parent.
 pub(crate) fn mark_first_winit_resumed() {
-    let _ = STARTUP.winit_resumed.set(Instant::now());
+    if STARTUP.winit_resumed.set(Instant::now()).is_ok() {
+        #[cfg(unix)]
+        crate::handoff_progress::report("resumed");
+    }
+}
+
+/// Whether winit's first `resumed` has come: this process's native launch finished.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn launch_finished() -> bool {
+    STARTUP.winit_resumed.get().is_some()
+}
+
+/// Whether this process presented its first window ([`ClaimStamp::FirstPresent`]): its native
+/// launch, its first window and surface and a first frame all ran here.
+#[cfg(unix)]
+#[must_use]
+pub(crate) fn first_present_done() -> bool {
+    STARTUP.claim_stamps[ClaimStamp::FirstPresent.index()]
+        .get()
+        .is_some()
 }
 
 /// Mark the first successfully attached OS window surface.

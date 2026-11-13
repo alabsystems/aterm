@@ -8,7 +8,7 @@ name = "libc"
 # Not `version.workspace = true`: it must meet every consumer's requirement, the
 # strictest being `^0.2.182` (rustix 1.1.4). One it misses leaves the patch
 # silently unused (`targo --unverified forge check` catches it).
-version = "0.2.186"
+version = "0.2.191"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true

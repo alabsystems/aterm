@@ -56,6 +56,10 @@ pub enum Family {
     /// (`vitals.proc.<sid>.leftovers`): the leftover view's whole answer, every reading. A fact
     /// for later, never an alert on screen.
     Vitals,
+    /// This user's programs macOS's program check stranded ten minutes: held since before the
+    /// syspolicyd running now started (`vitals.stranded.programs.held`). A fact for later, never
+    /// an alert on screen.
+    Stranded,
     /// The fabric bridge's own state dir (`fabric.state.<cause>`).
     FabricState,
     /// Harness occupancy (`harness.occupancy.<subject>.<cause>`).
@@ -63,10 +67,6 @@ pub enum Family {
     /// System State's setup of this Mac (`setup.<cause>`): a fact its page says calmly, such
     /// as changes it made and could not log.
     Setup,
-    /// A credential this Mac needs that only a person can give
-    /// (`secrets.need.<want>.awaiting-person`, docs/DESIGN-credential-requests-2026-10-27.md
-    /// §10): the whole answer of the need ledger, every look.
-    Secrets,
     /// agh's needs (`agh.<subject>.<cause>`): facts for a person that agh and atpkg-publish
     /// leave as files under `<state>/agh/needs`. A level family: the window states its whole
     /// answer at each look, so a need whose file is gone ends.
@@ -106,10 +106,10 @@ impl Family {
             Self::HugeDir => "vitals.huge-dir",
             Self::ServiceMemory => "vitals.service-memory",
             Self::Vitals => "vitals.proc",
+            Self::Stranded => "vitals.stranded",
             Self::FabricState => "fabric.state",
             Self::Occupancy => "harness.occupancy",
             Self::Setup => "setup",
-            Self::Secrets => "secrets.need",
             Self::Agh => "agh",
             Self::Join => "members.join",
             Self::NetworkPlace => "network.place",
@@ -136,7 +136,7 @@ impl Family {
             | Self::HugeDir
             | Self::ServiceMemory
             | Self::Vitals
-            | Self::Secrets
+            | Self::Stranded
             | Self::Agh
             | Self::Join
             | Self::NetworkPlace => Mode::Level,
@@ -177,10 +177,10 @@ impl Family {
         Self::HugeDir,
         Self::ServiceMemory,
         Self::Vitals,
+        Self::Stranded,
         Self::FabricState,
         Self::Occupancy,
         Self::Setup,
-        Self::Secrets,
         Self::Agh,
         Self::Join,
         Self::NetworkPlace,
@@ -208,8 +208,8 @@ impl Family {
             | Self::HugeDir
             | Self::ServiceMemory
             | Self::Vitals
+            | Self::Stranded
             | Self::Setup
-            | Self::Secrets
             | Self::Agh
             | Self::NetworkPlace => tags::SYSTEM,
             Self::Render => tags::RENDER,

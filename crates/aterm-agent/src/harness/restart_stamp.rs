@@ -35,6 +35,43 @@ impl Cause {
     }
 }
 
+/// The account an act asks its Codex relaunch to start on. It is an ask, honoured once at that
+/// relaunch's cold admission and only for a row that then proves it serves
+/// ([`super::accounts_pool::cold_launch_env`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Wanted {
+    /// The roster row of this label.
+    Row(String),
+    /// The row a new launch would get on record ([`super::accounts::launch_row`]).
+    Pool,
+}
+
+impl Wanted {
+    /// The stamp's value for it: `{"row":"<label>"}` or `{"pool":true}`.
+    fn to_value(&self) -> aterm_json::Value {
+        let mut o = aterm_json::Map::new();
+        match self {
+            Self::Row(label) => o.insert("row".into(), aterm_json::Value::from(label.as_str())),
+            Self::Pool => o.insert("pool".into(), aterm_json::Value::from(true)),
+        };
+        aterm_json::Value::Object(o)
+    }
+
+    /// The ask a stamp's value names; `None` for any other value, a row label outside the roster
+    /// grammar ([`super::accounts::admissible_label`]) among them.
+    fn from_value(v: &aterm_json::Value) -> Option<Self> {
+        let o = v.as_object().filter(|o| o.len() == 1)?;
+        match (o.get("row"), o.get("pool")) {
+            (Some(label), None) => label
+                .as_str()
+                .filter(|label| super::accounts::admissible_label(label))
+                .map(|label| Self::Row(label.to_string())),
+            (None, Some(pool)) => (pool.as_bool() == Some(true)).then_some(Self::Pool),
+            _ => None,
+        }
+    }
+}
+
 /// The host's input counter when it accepted an explicit restart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Input {
@@ -89,6 +126,8 @@ pub struct Stamp {
     pub cause: Cause,
     /// When the act stamped it, unix seconds.
     pub at: u64,
+    /// The account the act asked its relaunch to start on, if it named one.
+    pub wanted: Option<Wanted>,
     /// Input accepted by this host before the act, when its counter was readable.
     pub input: Option<Input>,
 }
@@ -127,13 +166,20 @@ impl Stamp {
         o.insert("start".into(), aterm_json::Value::from(self.start.as_str()));
         o.insert("cause".into(), aterm_json::Value::from(self.cause.word()));
         o.insert("at".into(), aterm_json::Value::from(self.at));
+        if let Some(wanted) = &self.wanted {
+            o.insert("wanted".into(), wanted.to_value());
+        }
         if let Some(input) = &self.input {
             o.insert("input".into(), input.to_value());
         }
         aterm_json::to_string(&aterm_json::Value::Object(o)).unwrap_or_default()
     }
 
-    /// A stamp read back; `None` for anything else (a torn or foreign file).
+    /// A stamp read back; `None` for anything else (a torn or foreign file). An unreadable
+    /// `wanted` or `input` drops that field alone: a stamp read as `None` would make its
+    /// process's signal exit nobody's, which is never relaunched, so the act's restart outlives a
+    /// destination it cannot name (the session returns on the account it ran on) and a receipt it
+    /// cannot read (the resume line keeps the person's whole grace).
     #[must_use]
     pub fn from_json(text: &str) -> Option<Self> {
         let v: aterm_json::Value = aterm_json::from_str(text).ok()?;
@@ -148,6 +194,7 @@ impl Stamp {
                 .to_string(),
             cause: Cause::parse(v.get("cause")?.as_str()?)?,
             at: v.get("at")?.as_u64()?,
+            wanted: v.get("wanted").and_then(Wanted::from_value),
             input: v.get("input").and_then(Input::from_value),
         })
     }
@@ -203,6 +250,14 @@ pub fn read(state: &Path, tab: &str) -> Option<Stamp> {
 #[must_use]
 pub fn standing(state: &Path, tab: &str, pid: u32, start: &str, now: u64) -> Option<Stamp> {
     read(state, tab).filter(|s| !s.stale(now) && s.names(pid, start))
+}
+
+/// The account the stamp standing for process `pid` started at `start` in tab `tab` asks its
+/// relaunch to start on at `now`: `None` for a plain restart, another process's stamp, a stale one
+/// or none. Asking removes nothing.
+#[must_use]
+pub fn wanted_for(state: &Path, tab: &str, pid: u32, start: &str, now: u64) -> Option<Wanted> {
+    standing(state, tab, pid, start, now)?.wanted
 }
 
 /// Take tab `tab`'s stamp when `ours` says it is the one meant.

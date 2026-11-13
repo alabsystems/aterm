@@ -194,6 +194,115 @@ impl World {
 }
 
 #[test]
+fn advisory_package_inventory_admits_a_producer_while_cleanup_excludes_it() {
+    use std::cell::RefCell;
+    #[derive(Clone)]
+    struct Probe {
+        home: PathBuf,
+        cache: PathBuf,
+        target: PathBuf,
+        manifest: PathBuf,
+        preserve: PathBuf,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Observation {
+        Busy,
+        Admitted,
+    }
+    thread_local! {
+        static INPUT: RefCell<Option<Probe>> = const { RefCell::new(None) };
+        static OUTPUT: Cell<Option<Observation>> = const { Cell::new(None) };
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            INPUT.with(|input| input.borrow_mut().take());
+            OUTPUT.set(None);
+        }
+    }
+    fn producer() {
+        let Some(probe) = INPUT.with(|input| input.borrow_mut().take()) else {
+            return;
+        };
+        let file = crate::metadata_io::open_regular(&probe.cache.join(COORDINATOR)).unwrap();
+        let observation = match crate::lock::Flock::try_lock(file) {
+            Err(std::fs::TryLockError::WouldBlock) => Observation::Busy,
+            Err(std::fs::TryLockError::Error(error)) => panic!("coordinator: {error}"),
+            Ok(_held) => {
+                let kernel = Inert::default();
+                admit_on(
+                    &probe.home,
+                    &Admission {
+                        cache: &probe.cache,
+                        target: &probe.target,
+                        manifest: &probe.manifest,
+                        preserve_if_present: &probe.preserve,
+                        budget: 1 << 30,
+                        attempt: SECOND,
+                        producer_pid: 100,
+                        producer_group: 101,
+                    },
+                    true,
+                    &kernel,
+                    &Fence::default(),
+                )
+                .unwrap();
+                settled_on(
+                    &probe.home,
+                    &probe.cache,
+                    SECOND,
+                    true,
+                    &kernel,
+                    &Fence::default(),
+                )
+                .unwrap();
+                Observation::Admitted
+            }
+        };
+        OUTPUT.set(Some(observation));
+    }
+    fn observe(probe: Probe, step: impl FnOnce()) -> Observation {
+        INPUT.with(|input| *input.borrow_mut() = Some(probe));
+        aterm_uds::progress::heard_by(producer, step);
+        OUTPUT.take().expect("the inventory callback ran")
+    }
+    let mut world = World::new();
+    world.admit(FIRST, 1 << 30).unwrap();
+    world.output(64);
+    world.settle(FIRST, true).unwrap();
+    world.held.take();
+    let probe = Probe {
+        home: world.home.clone(),
+        cache: world.cache.clone(),
+        target: world.target.clone(),
+        manifest: world.manifest.clone(),
+        preserve: world.preserve.clone(),
+    };
+    let payload = std::fs::read(world.target.join("debug/deps/unit")).unwrap();
+    let _clear = Clear;
+    assert_eq!(
+        observe(probe.clone(), || {
+            let _ = super::super::plan(&world.home, std::time::SystemTime::now());
+        }),
+        Observation::Admitted
+    );
+    assert_eq!(
+        world.receipt().package.unwrap().last_settled.as_deref(),
+        Some(SECOND)
+    );
+    assert_eq!(
+        observe(probe, || {
+            assert!(world.reclaim(&Fence::default()).is_empty());
+        }),
+        Observation::Busy
+    );
+    assert_eq!(
+        std::fs::read(world.target.join("debug/deps/unit")).unwrap(),
+        payload
+    );
+}
+
+#[test]
 fn interrupted_creation_keeps_package_custody_and_its_fresh_attempt() {
     use super::super::creation::{Point, faults};
     struct Clear;
@@ -1288,6 +1397,7 @@ fn legacy_roster_overflow_and_unknown_package_producers_remain_retained() {
                 cwd: world.manifest.parent(),
                 env: &env,
                 read: &|_| Ok(None),
+                read_manifest: &|_| Ok(None),
                 writable: &|_| Some(true),
             };
             assert!(

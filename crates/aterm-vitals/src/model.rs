@@ -80,7 +80,8 @@ pub struct ProcSample {
     pub name: String,
     /// Cumulative bytes read from storage, or `None` if unreadable.
     pub disk_read: Option<u64>,
-    /// Cumulative bytes written to storage, or `None` if unreadable.
+    /// Cumulative bytes written to storage; `None` where unreadable (another user's process,
+    /// Windows).
     pub disk_written: Option<u64>,
     /// Cumulative energy its threads used, nanojoules (macOS `ri_energy_nj`); `None` where
     /// unread, and off macOS.
@@ -407,7 +408,9 @@ pub struct MemSample {
     pub app: u64,
     /// Non-pageable kernel/wired memory in bytes.
     pub wired: u64,
-    /// Physical memory holding compressed pages (macOS compressor or Linux zswap), if reported.
+    /// Physical memory holding compressed pages (macOS compressor or Linux zswap); `None` where
+    /// the OS does not say (Linux with zswap off or absent, Windows' compression store, which this
+    /// build does not read), so a surface leaves the class out rather than show a false zero.
     pub compressed: Option<u64>,
     /// The uncompressed bytes the compressor or zswap holds in [`Self::compressed`], if reported.
     pub stored: Option<u64>,

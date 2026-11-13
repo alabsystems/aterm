@@ -401,7 +401,7 @@ fn peak_for_key(
 }
 
 /// Apply the shared capacity margin to a physical peak and round it up to a GiB once.
-fn claim_bytes(peak: u64) -> u64 {
+pub(crate) fn claim_bytes(peak: u64) -> u64 {
     aterm_capacity::peak_claim(peak.max(FLOOR))
         .div_ceil(FLOOR)
         .saturating_mul(FLOOR)

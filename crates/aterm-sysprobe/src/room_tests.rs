@@ -82,7 +82,11 @@ fn linux_reads_its_forks_from_proc_stat() {
     assert_eq!(reader.blocked(), None, "nothing read yet");
     assert_eq!(reader.sample().map(|c| c.len()), Some(1), "the core ticks");
     assert_eq!(reader.forks(), Some(31_337), "the same read's forks");
-    assert_eq!(reader.blocked(), Some(4), "the same read's threads in D");
+    assert_eq!(
+        reader.blocked(),
+        Some(4),
+        "the same read's tasks in I/O wait"
+    );
     assert_eq!(crate::linux::proc_stat_count(cut, "procs_blocked"), None);
     std::fs::remove_file(root.path().join("proc/stat")).expect("the fixture goes");
     assert_eq!(reader.sample(), None);

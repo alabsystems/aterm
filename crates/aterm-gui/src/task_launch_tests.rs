@@ -105,23 +105,6 @@ fn a_task_frame_is_at_most_64_kib() {
     }
     for word in ["claude", "codex", "agy", "muse", "grok"] {
         assert_eq!(worker_word(Some(word)), word);
-        assert_eq!(retired_worker(Some(word)), None, "{word}: no retired agent");
-    }
-    for retired in ["gemini", "Gemini", "gemini-cli", "GEMINI-CLI"] {
-        assert_eq!(
-            retired_worker(Some(retired)).as_deref(),
-            Some(
-                format!(
-                    "ERR spawn agent={retired}: Gemini CLI is no longer supported: agy replaces \
-                     it (agent=agy)\n"
-                )
-                .as_str()
-            ),
-            "the retired Gemini CLI is refused by name, agy named"
-        );
-    }
-    for none in [Some("geminis"), Some("gemini-cli-2"), Some(""), None] {
-        assert_eq!(retired_worker(none), None, "CONTROL: {none:?}");
     }
     for none in [Some("codex-old"), Some("bash"), Some(""), None] {
         assert_eq!(worker_word(none), "claude", "CONTROL: {none:?}");

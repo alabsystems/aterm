@@ -420,6 +420,7 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
     ] {
         assert!(is_tui_argv(&tui), "{tui:?}");
         let snap = crate::harness::relaunch::Snapshot {
+            lifetime: None,
             launch_env: None,
             auth_observed: true,
             tab: "s-1".into(),
@@ -486,6 +487,7 @@ fn only_an_interactive_tui_is_a_tui_never_the_daemon_or_its_updater() {
     ] {
         assert!(!is_tui_argv(&not), "{not:?}");
         let snap = crate::harness::relaunch::Snapshot {
+            lifetime: None,
             launch_env: None,
             auth_observed: true,
             tab: "s-1".into(),

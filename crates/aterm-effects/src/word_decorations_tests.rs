@@ -4514,6 +4514,29 @@ fn shipping_cat_sprites_preserve_authored_aspect_and_uniform_age_scale() {
     );
 }
 
+/// A word past 65,535 px (4096 columns of 20 px) keeps its cat over it: the cat's left edge
+/// is `i32`, as the sprite it places is, where a `u16` edge wrapped the cat to the far side of
+/// the frame. A word at the grid's start is the control.
+#[test]
+fn a_word_cat_past_the_u16_space_sits_over_its_word() {
+    let geom = EffectGeom {
+        cell_w: 20,
+        cell_h: 40,
+        rows: 3,
+        cols: 4096,
+    };
+    for (start, end) in [(10u16, 12u16), (4090, 4092)] {
+        let g = cat_geometry_for(start, end, 0, geom, cat_variant_v4(0));
+        let (word_x0, word_x1) = (i32::from(start) * 20, (i32::from(end) + 1) * 20);
+        assert!(
+            g.x + i32::from(g.w) > word_x0 && g.x < word_x1,
+            "the cat at x {} (w {}) is off its word {word_x0}..{word_x1}",
+            g.x,
+            g.w
+        );
+    }
+}
+
 #[test]
 fn rotation_alignment_plays_new_twin_and_pins_survivor() {
     let model = aterm_models_effects::sparkle_reflow_cardinality_model();

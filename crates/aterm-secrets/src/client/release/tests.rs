@@ -118,7 +118,8 @@ fn the_newest_signed_roster_wins_over_path_order_and_old_grants() {
     let (_root, paths) = lab(&[]);
     let master = ring_with_master(&paths, &["m22"], &[]);
     let canonical = paths.home.join(VAULT_ROSTER);
-    let legacy = paths.home.join(LEGACY_VAULT_ROSTER);
+    // A roster the profile names, at the 0.145 path: profile data, read because it is named.
+    let legacy = paths.home.join(".aterm/roster/aterm-machines.toml");
     let raw = std::fs::read(&canonical).unwrap();
     let signature = std::fs::read(canonical.with_extension("toml.sig")).unwrap();
     fsx::ensure_private_dir(legacy.parent().unwrap()).unwrap();
@@ -917,25 +918,25 @@ fn the_roster_is_the_one_the_profile_names_else_the_vaults() {
     );
 }
 
-/// While an older vault has not yet rotated its path to `~/.aterm/release-ring/`, `release_host`
-/// still reads the 0.145 `~/.aterm/release-credentials.toml` when the release-ring profile is
-/// absent — and fails closed (never falling back) when the release-ring profile exists with
-/// unsafe permissions.
-/// NEGATIVE CONTROL: falling back on `Err` would read the legacy profile when the release-ring
-/// profile is mode `0644`.
+/// THE 0.145 COPIES UNDER `~/.aterm/` ARE NEVER READ: duplicates of the release ring, recorded for
+/// retirement (ATERM-KI-1112-980). With only them on disk this Mac holds no ring; the canonical
+/// copies alone authorize it (the control).
 #[cfg(unix)]
 #[test]
-fn legacy_profile_is_read_only_when_release_ring_profile_is_absent_and_fails_closed_on_bad_mode() {
-    use std::os::unix::fs::PermissionsExt as _;
+fn the_legacy_ring_copies_are_never_read() {
     let (_root, paths) = lab(&[]);
     ring(&paths, &["m22"], &[]);
+    assert!(
+        test_authorized_ring(&paths),
+        "CONTROL: the canonical ring authorizes"
+    );
     let aterm = paths.home.join(".aterm");
     std::fs::create_dir_all(aterm.join("roster")).unwrap();
     let profile = std::fs::read_to_string(paths.home.join(RELEASE_PROFILE))
         .unwrap()
         .replace(".aterm/release-ring/roster", ".aterm/roster");
     fsx::write_atomic(
-        &paths.home.join(LEGACY_RELEASE_PROFILE),
+        &aterm.join("release-credentials.toml"),
         profile.as_bytes(),
         0o600,
     )
@@ -952,18 +953,9 @@ fn legacy_profile_is_read_only_when_release_ring_profile_is_absent_and_fails_clo
         )
         .unwrap();
     }
-    std::fs::remove_file(paths.home.join(RELEASE_PROFILE)).unwrap();
-    assert!(
-        test_authorized_ring(&paths),
-        "absent release-ring profile falls back to 0.145 profile"
-    );
-
-    let ring_profile = paths.home.join(RELEASE_PROFILE);
-    std::fs::create_dir_all(ring_profile.parent().unwrap()).unwrap();
-    std::fs::write(&ring_profile, b"signing_key = \"c3ludGhldGlj\"\n").unwrap();
-    std::fs::set_permissions(&ring_profile, std::fs::Permissions::from_mode(0o644)).unwrap();
+    std::fs::remove_dir_all(aterm.join("release-ring")).unwrap();
     assert!(
         !test_authorized_ring(&paths),
-        "unsafe release-ring profile fails closed without falling back to legacy profile"
+        "the 0.145 copies alone authorize nothing"
     );
 }

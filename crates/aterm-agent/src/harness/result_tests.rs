@@ -278,9 +278,38 @@ fn a_check_reply_written_late_is_read_again_by_the_checks_rule() {
     }
 }
 
+/// A DONE CHECK'S REPLY IS ITS ANSWER WHATEVER ITS WORDS: the check asks for another kind of work,
+/// and the reply reports it in no claim's form; an earlier check so answered is walked past too.
+/// NEGATIVE CONTROL: a land act's reply in the same words holds no defense, so it is no answer.
+#[test]
+fn a_done_checks_reply_in_words_is_its_answer() {
+    let work = "Widened the suite: two more parser cases pass on main.";
+    let review = "Reviewed the landed diff; nothing to change.";
+    let rows = [
+        user("u-task", "Fix the parser."),
+        says("a-report", "msg_1", "The parser is fixed."),
+        user("u-check1", DONE_CHECK),
+        says("a-reply1", "msg_2", work),
+        user("u-check2", DONE_CHECK),
+        says("a-reply2", "msg_3", review),
+    ];
+    for by in [DoneBy::Check, DoneBy::Turn] {
+        assert_eq!(
+            report(&jsonl(&rows), by).map(|r| (r.text, r.uuid)),
+            Ok((
+                format!("The parser is fixed.\n\n{work}\n\n{review}"),
+                "a-reply2".to_string()
+            )),
+            "{by:?}"
+        );
+    }
+    let rows = landing(LAND, &[says("a-work", "msg_3", work)]);
+    assert_eq!(report(&jsonl(&rows), DoneBy::Check), Err("no-reply"));
+}
+
 #[test]
 fn a_done_check_with_the_standing_rules_is_the_check() {
-    let completion = "All work is complete. All parser tests passed.";
+    let completion = "All work is complete.\nNothing left: all parser tests passed.";
     for rules in [None, Some("leave unrelated files alone")] {
         for irreversible in [false, true] {
             let current = done_check_text(rules, irreversible);
@@ -364,7 +393,7 @@ fn a_legacy_done_check_still_recovers_the_workers_result() {
         DONE_CHECK_MARKER_BEFORE,
         1,
     );
-    let completion = "All work is complete. All parser tests passed.";
+    let completion = "All work is complete.\nNothing left: all parser tests passed.";
     for check in [DONE_CHECK_MARKER_BEFORE, ruled.as_str()] {
         let rows = [
             user("u-task", "Fix the parser."),
@@ -1486,6 +1515,7 @@ fn past_the_bound_the_snapshot_is_read_as_it_stands() {
 /// report. NEGATIVE CONTROL: a snapshot taken by [`DoneBy::Turn`] over the same rows reads nothing.
 #[test]
 fn a_failed_result_that_missed_its_snapshot_is_read_again_by_its_own_rule() {
+    use crate::supervise::policy::land_check::LAND_CHECK;
     const SAID: &str = "Could not finish: the grammar is gone.";
     let root = ScratchDir::new("result", "reread-failed");
     let tasks = root.join("tasks");
@@ -1494,7 +1524,7 @@ fn a_failed_result_that_missed_its_snapshot_is_read_again_by_its_own_rule() {
         user("u-task", "Fix it."),
         says("a-1", "msg_1", "Reading the grammar."),
         turn_duration(),
-        user("u-check", DONE_CHECK),
+        user("u-check", LAND_CHECK),
         said("a-call", "msg_2", &format!("[{}]", tool_use())),
         tool_result("u-result"),
     ];

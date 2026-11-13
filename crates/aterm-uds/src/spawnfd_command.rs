@@ -759,12 +759,12 @@ impl Command {
     ///
     /// # Errors
     /// This attempt's process or scope changed, or the same controlled spawn errors as
-    /// [`Self::spawn`]. Only a current failed attempt supplies a no-child receipt.
+    /// [`Self::spawn`]. Only a current pre-birth failure supplies a no-child receipt. A postbirth error retains the actual receipt.
     pub fn spawn_observed(
         &mut self,
         attempt: super::BirthAttempt,
-    ) -> Result<super::ObservedSpawned, super::SpawnFailure> {
-        super::birth::observe(attempt, || self.spawn())
+    ) -> Result<super::ObservedSpawned, super::SpawnFailure<super::ObservedSpawned>> {
+        super::birth::observe(attempt, || self.start_pending(Fallback::Inherit, true))
     }
 
     /// Consume one actual attempt and start a child in a new, self-led process group. Persist
@@ -776,13 +776,13 @@ impl Command {
     ///
     /// # Errors
     /// This attempt's process or scope changed, or the same controlled spawn errors as
-    /// [`Self::spawn`]. No target program runs on an error.
+    /// [`Self::spawn`]. Postbirth observation failure retains the actual child and does not certify no target execution.
     pub fn spawn_cohort(
         &mut self,
         attempt: super::BirthAttempt,
     ) -> Result<super::Spawned, super::SpawnFailure> {
         self.with_dedicated_process_group(|command| {
-            super::birth::observe_cohort(attempt, || command.spawn())
+            super::birth::observe_cohort(attempt, || command.start_pending(Fallback::Inherit, true))
         })
     }
 
@@ -1315,20 +1315,24 @@ impl Command {
         }
     }
 
-    fn start(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<Child> {
-        let (pid, [stdin, stdout, stderr]) = self.launch(fallback, needs_stdin, false, false)?;
-        Ok(Child {
-            stdin: stdin.map(ChildStdin::from),
-            stdout: stdout.map(ChildStdout::from),
-            stderr: stderr.map(ChildStderr::from),
-            foreground: None,
-            handle: super::LaneChild {
-                pid,
-                status: None,
-                custody: super::WaitCustody::default(),
+    fn start_pending(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<PendingChild> {
+        let (pid, [stdin, stdout, stderr], status) =
+            self.launch(fallback, needs_stdin, false, false)?;
+        Ok(PendingChild {
+            status,
+            child: Child {
+                stdin: stdin.map(ChildStdin::from),
+                stdout: stdout.map(ChildStdout::from),
+                stderr: stderr.map(ChildStderr::from),
+                foreground: None,
+                handle: super::LaneChild {
+                    pid,
+                    status: None,
+                    custody: super::WaitCustody::default(),
+                },
+                usage: None,
+                custody: Arc::new(()),
             },
-            usage: None,
-            custody: Arc::new(()),
         })
     }
 
@@ -1339,7 +1343,7 @@ impl Command {
         needs_stdin: bool,
         replace: bool,
         suspended_exec: bool,
-    ) -> io::Result<(i32, [Option<OwnedFd>; 3])> {
+    ) -> io::Result<(i32, [Option<OwnedFd>; 3], Option<ExecStatus>)> {
         use super::{
             F_GETFD, F_SETFD, FD_CLOEXEC, Image, Placement, Source, c_string, fcntl, placeable,
             placeable_copy,
@@ -1546,19 +1550,7 @@ impl Command {
             },
         )?;
         drop(handed);
-        if let Some(status) = status
-            && let Err(error) = status.after_fork()
-        {
-            // The tether wrote its exec's error and exits; it ran no program.
-            let mut tether = super::LaneChild {
-                pid,
-                status: None,
-                custody: super::WaitCustody::default(),
-            };
-            let _ = tether.wait();
-            return Err(error);
-        }
-        Ok((pid, ours))
+        Ok((pid, ours, status))
     }
 }
 
@@ -1747,6 +1739,8 @@ impl ExecStatus {
                 Ok(_) => break,
             }
         }
+        #[cfg(all(target_os = "macos", debug_assertions))]
+        exec_status_control::after_read()?;
         match <[u8; 4]>::try_from(said.as_slice()) {
             Ok(errno) => Err(io::Error::from_raw_os_error(i32::from_ne_bytes(errno))),
             Err(_) if said.is_empty() => Ok(()),
@@ -1788,13 +1782,11 @@ impl Command {
         }
     }
 
-    fn start(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<Child> {
+    fn start_pending(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<PendingChild> {
         super::note_spawn();
         let (mut command, status) = self.forked()?;
         #[cfg(target_os = "linux")]
         let routed = status.is_some();
-        #[cfg(not(target_os = "linux"))]
-        let _ = status;
         if self.stdin.is_none() && !needs_stdin {
             command.stdin(std::process::Stdio::null());
         }
@@ -1837,26 +1829,21 @@ impl Command {
             },
             super::text_busy_pause,
         )?;
-        #[cfg(target_os = "linux")]
-        if let Some(status) = status
-            && let Err(error) = status.after_fork()
-        {
-            // The tether wrote its exec's error and exits; it ran no program.
-            let _ = child.wait();
-            return Err(error);
-        }
-        Ok(Child {
-            stdin: child.stdin.take(),
-            stdout: child.stdout.take(),
-            stderr: child.stderr.take(),
-            foreground: None,
-            handle: Handle {
-                child,
-                status: None,
-                custody: super::WaitCustody::default(),
+        Ok(PendingChild {
+            status,
+            child: Child {
+                stdin: child.stdin.take(),
+                stdout: child.stdout.take(),
+                stderr: child.stderr.take(),
+                foreground: None,
+                handle: Handle {
+                    child,
+                    status: None,
+                    custody: super::WaitCustody::default(),
+                },
+                usage: None,
+                custody: Arc::new(()),
             },
-            usage: None,
-            custody: Arc::new(()),
         })
     }
 
@@ -2101,4 +2088,69 @@ impl Command {
             "a native-image spawn is macOS's and Linux's",
         ))
     }
+}
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[path = "spawnfd_exec_status_control.rs"]
+mod exec_status_control;
+
+/// Runs the native fixture for exec-status observation failure after proven target execution.
+/// This debug-only control creates no admission or execution authority.
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[doc(hidden)]
+pub fn exec_status_observation_control(world: &std::path::Path) {
+    exec_status_control::run(world);
+}
+
+/// Actual native child ownership exists before status observation can fail.
+pub(super) struct PendingChild {
+    child: Child,
+    status: Option<ExecStatus>,
+}
+
+impl PendingChild {
+    pub(super) fn observe<R>(self, seal: impl FnOnce(Child) -> R) -> Result<R, (R, io::Error)> {
+        let Self { child, status } = self;
+        let owned = seal(child);
+        #[cfg(any(target_vendor = "apple", target_os = "linux"))]
+        if let Some(status) = status
+            && let Err(error) = status.after_fork()
+        {
+            return Err((owned, error));
+        }
+        #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
+        let _ = status;
+        Ok(owned)
+    }
+}
+
+impl Command {
+    fn start(&mut self, fallback: Fallback, needs_stdin: bool) -> io::Result<Child> {
+        match self
+            .start_pending(fallback, needs_stdin)?
+            .observe(|child| child)
+        {
+            Ok(child) => Ok(child),
+            Err((mut child, error)) => {
+                // Ordinary spawning supplies no cancellation receipt. Keep its established
+                // owning wait before reporting the target's exec-status error.
+                let _waited = child.wait();
+                Err(error)
+            }
+        }
+    }
+}
+
+/// TEST SEAM: observe one actual command launch with a status fault only after the target's
+/// fixed execution proof. This changes no admission, command, receipt or settlement policy.
+/// The thread-local fault is restored on return or unwind; the callback still uses the normal
+/// native Command and its actual original resource owner.
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[doc(hidden)]
+pub fn with_exec_status_observation_fault_for_tests<R>(
+    proof: &Path,
+    command: &mut Command,
+    launch: impl FnOnce(&mut Command) -> R,
+) -> R {
+    exec_status_control::with_fault(proof, || launch(command))
 }

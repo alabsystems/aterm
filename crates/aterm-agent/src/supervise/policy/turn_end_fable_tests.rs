@@ -111,6 +111,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,
         leftover: crate::harness::leftover::LeftRead::NotAsked,
+        credentials: crate::supervise::policy::credential_need::CredentialRead::NotAsked,
     }
 }
 
@@ -345,6 +346,9 @@ fn switch(from: &str, launch: Option<&str>, back_at: Option<Instant>) -> ModelSw
         to: FABLE_FALLBACK.to_string(),
         launch: launch.map(str::to_string),
         back_at,
+        back_by: back_at.map(|_| BackBy::Notice),
+        sample_at: None,
+        samples: 0,
         proc: None,
         unproven: false,
     }
@@ -1755,5 +1759,330 @@ fn a_wakes_fact_leaves_the_fallbacks_relaunch_and_its_return_as_they_are() {
             ride.fact()
         ),
         "CONTROL: the continuation alone carries it"
+    );
+}
+
+/// The move onto Opus made at the Fable notice that names no reset, at `t`, with the account's
+/// record of Fable's week naming `recorded`.
+fn moved_unnamed(recorded: Option<Instant>, t: Instant) -> TurnEndState {
+    let mut st = TurnEndState::default();
+    st.fable_recorded(recorded);
+    let a = act(&mut st, &fable(None), t);
+    assert!(falls_back(&a), "{a:?}");
+    st
+}
+
+/// A NOTICE THAT NAMES NO RESET TIMES THE RETURN BY THE ACCOUNT'S RECORD OF FABLE'S WEEK while that
+/// reset is still ahead, and the session returns there; the record is no guess, so nothing is
+/// sampled. NEGATIVE CONTROLS: a record whose reset has passed times nothing (a sample is due
+/// instead), and a reset the notice names outranks the record.
+#[test]
+fn a_notice_that_names_no_reset_times_the_return_by_the_accounts_record_while_it_is_ahead() {
+    let t = t0();
+    let recorded = t + 300 * MIN;
+    let st = moved_unnamed(Some(recorded), t);
+    let m = st.model_switch().expect("the switch");
+    assert_eq!(
+        (m.back_at, m.back_by),
+        (Some(recorded), Some(BackBy::Record))
+    );
+    assert!(
+        !st.model_sample_due(t),
+        "a timed return is sampled for nothing"
+    );
+    let mut st = st;
+    assert!(!restores(&at(
+        &mut st,
+        &idle("Fixed it.", Some(JOB)),
+        recorded - MIN
+    )));
+    assert!(restores(&at(
+        &mut st,
+        &idle("Fixed it.", Some(JOB)),
+        recorded
+    )));
+
+    let st = moved_unnamed(Some(t - MIN), t);
+    let m = st.model_switch().expect("the switch");
+    assert_eq!(
+        (m.back_at, m.back_by),
+        (None, None),
+        "a passed reset times nothing"
+    );
+    assert!(
+        st.model_sample_due(t),
+        "the sample is due at the next quiet moment"
+    );
+
+    let mut st = TurnEndState::default();
+    st.fable_recorded(Some(recorded));
+    let named = t + 60 * MIN;
+    assert!(falls_back(&act(&mut st, &fable(Some(named)), t)));
+    let m = st.model_switch().expect("the switch");
+    assert_eq!((m.back_at, m.back_by), (Some(named), Some(BackBy::Notice)));
+}
+
+/// A SAMPLE OF FABLE'S WEEK TIMES THE RETURN THE NOTICE AND THE RECORD DID NOT: a row with room
+/// left makes it due now, and the next point returns; a row at its limit times it at the reset it
+/// names. A sample that times nothing (no row, a reset not ahead) is taken again a rung later:
+/// half an hour, two hours, then every six (four a day). NEGATIVE CONTROLS: before a rung no
+/// sample is due, a sample nobody waits on changes nothing, and with no sample nothing returns.
+#[test]
+fn a_sample_of_fables_week_times_the_return_and_one_that_times_nothing_is_paced() {
+    let t = t0();
+    let mut st = moved_unnamed(None, t);
+    assert!(st.model_sample_due(t));
+    let later_on = t + 24 * 60 * MIN;
+    assert!(
+        !restores(&at(
+            &mut st.clone(),
+            &idle("Fixed it.", Some(JOB)),
+            later_on
+        )),
+        "nothing returns on no reading"
+    );
+    assert_eq!(
+        st.model_sampled(Some((40, Some(t + 900 * MIN))), t),
+        Some(Sampled::Room { at: t })
+    );
+    assert!(!st.model_sample_due(t), "the return is timed");
+    assert_eq!(
+        st.model_sampled(Some((40, None)), t),
+        None,
+        "nobody waits on it"
+    );
+    assert!(restores(&at(
+        &mut st,
+        &idle("Fixed it.", Some(JOB)),
+        t + MIN
+    )));
+
+    let mut st = moved_unnamed(None, t);
+    let reset = t + 600 * MIN;
+    assert_eq!(
+        st.model_sampled(Some((100, Some(reset))), t),
+        Some(Sampled::Reset { at: reset })
+    );
+    assert_eq!(
+        st.model_switch().and_then(|m| m.back_by),
+        Some(BackBy::Sample)
+    );
+    assert!(!restores(&at(
+        &mut st,
+        &idle("Fixed it.", Some(JOB)),
+        reset - MIN
+    )));
+    assert!(restores(&at(&mut st, &idle("Fixed it.", Some(JOB)), reset)));
+
+    let mut st = moved_unnamed(None, t);
+    let mut now = t;
+    let mut paced = Vec::new();
+    for read in [
+        None,
+        Some((100, None)),
+        Some((100, Some(t - MIN))),
+        None,
+        None,
+    ] {
+        assert!(st.model_sample_due(now), "due at {paced:?}");
+        let Some(Sampled::Again { at }) = st.model_sampled(read, now) else {
+            panic!("{read:?} times nothing");
+        };
+        assert!(!st.model_sample_due(at - Duration::from_secs(1)));
+        paced.push((at - now).as_secs() / 60);
+        now = at;
+    }
+    assert_eq!(paced, [30, 120, 360, 360, 360]);
+    assert_eq!(st.model_switch().map(|m| m.back_at), Some(None));
+}
+
+/// A RETURN MADE ON A SAMPLE'S ROOM LEFT THAT MEETS FABLE'S LIMIT AGAIN IS NO PING-PONG: the next
+/// return so made waits a rung after the last (half an hour, then two hours, then six for ever;
+/// counted here in minutes from the move a minute after it), so a row misread as room left costs
+/// at most four relaunch pairs a day. Only a move made once the last such return held the longest
+/// rung starts the count over, and its room-left reading is due at once again.
+/// NEGATIVE CONTROL: a return the notice timed spends no rung.
+#[test]
+fn a_return_on_room_left_that_meets_the_limit_again_waits_a_rung_before_the_next() {
+    let t = t0();
+    let mut st = TurnEndState::default();
+    let mut now = t;
+    let mut waited = Vec::new();
+    for _ in 0..7 {
+        assert!(
+            falls_back(&act(&mut st, &fable(None), now)),
+            "moved at {now:?}"
+        );
+        let Some(Sampled::Room { at }) = st.model_sampled(Some((10, None)), now + MIN) else {
+            panic!("room left");
+        };
+        waited.push((at - now).as_secs() / 60);
+        let a = act(&mut st, &idle("Fixed it.", Some(JOB)), at);
+        assert!(restores(&a), "{a:?}");
+        now = at + MIN;
+    }
+    assert_eq!(waited, [1, 29, 119, 359, 359, 359, 359]);
+
+    // The last return held the longest rung and more: the count starts over, so the return
+    // after the next wall waits the first rung again, not the sixth hour.
+    let held = now + 360 * MIN;
+    assert!(falls_back(&act(&mut st, &fable(None), held)));
+    assert_eq!(
+        st.model_sampled(Some((10, None)), held),
+        Some(Sampled::Room { at: held })
+    );
+    assert!(restores(&act(&mut st, &idle("Fixed it.", Some(JOB)), held)));
+    assert!(falls_back(&act(&mut st, &fable(None), held + MIN)));
+    assert_eq!(
+        st.model_sampled(Some((10, None)), held + MIN),
+        Some(Sampled::Room {
+            at: held + 30 * MIN
+        })
+    );
+
+    let mut st = TurnEndState::default();
+    let named = t + 30 * MIN;
+    assert!(falls_back(&act(&mut st, &fable(Some(named)), t)));
+    assert!(restores(&act(
+        &mut st,
+        &idle("Fixed it.", Some(JOB)),
+        named
+    )));
+    assert!(falls_back(&act(&mut st, &fable(None), named + MIN)));
+    assert_eq!(
+        st.model_sampled(Some((10, None)), named + MIN),
+        Some(Sampled::Room { at: named + MIN })
+    );
+}
+
+/// THE SAMPLE TAKES THE PROBE'S `/usage` AT A QUIET TURN END WITH NO ACCOUNT ADVISING A PROBE:
+/// the probe's gate opens for a switch that waits on a sample. NEGATIVE CONTROLS: a switch the
+/// notice timed, a session whose relaunch cannot return it, a busy point and a person's typing
+/// each shut it, as with no switch at all.
+#[test]
+fn the_sample_opens_the_probes_gate_only_for_a_switch_that_waits_on_it_at_a_quiet_point() {
+    let t = t0();
+    let mut st = moved_unnamed(None, t);
+    let quiet = idle("Fixed it.", Some(JOB));
+    assert_eq!(
+        st.probe_gate(&quiet, &cfg(), t),
+        Some(ProbeGate::Wall),
+        "the limit's own point is no quiet one"
+    );
+    let _ = at(&mut st, &quiet, t + MIN);
+    assert_eq!(
+        st.probe_gate(&quiet, &cfg(), t + MIN),
+        None,
+        "the first turn end Opus worked to"
+    );
+    let gate = |st: &TurnEndState, r: &TurnEndReading| st.probe_gate(r, &cfg(), t + MIN);
+    let mut timed = TurnEndState::default();
+    assert!(falls_back(&act(&mut timed, &fable(Some(t + 60 * MIN)), t)));
+    let _ = at(&mut timed, &quiet, t + MIN);
+    assert_eq!(gate(&timed, &quiet), Some(ProbeGate::NotDue));
+    assert_eq!(
+        gate(&TurnEndState::default(), &quiet),
+        Some(ProbeGate::NotDue)
+    );
+    let unrestartable = TurnEndReading {
+        restartable: false,
+        ..quiet.clone()
+    };
+    assert_eq!(gate(&st, &unrestartable), Some(ProbeGate::NotDue));
+    let busy = TurnEndReading {
+        phase: Phase::Busy,
+        ..quiet.clone()
+    };
+    assert_eq!(gate(&st, &busy), Some(ProbeGate::NotIdle));
+    let typing = TurnEndReading {
+        person: Some(Duration::from_secs(1)),
+        ..quiet.clone()
+    };
+    assert_eq!(gate(&st, &typing), Some(ProbeGate::Person));
+}
+
+/// THE SAMPLE IS TAKEN ONLY AT THE ACCOUNTS PROBE'S OWN QUIET TURN END, less the account clause:
+/// never into a Land task its `LANDED` ended (nothing more is typed until someone else's turn,
+/// and the return a sample timed is never made while the task rests), nor past an owed reset's
+/// continuation or a standing account move; never where the owner's relaunch switch is off or the
+/// switch's process is not proven, where no return it times can be made. CONTROL: the same switch
+/// at the same quiet point opens the gate.
+#[test]
+fn the_sample_waits_for_the_probes_own_quiet_turn_end_and_a_return_it_can_make() {
+    let t = t0();
+    let quiet = idle("Fixed it.", Some(JOB));
+    let gate = |st: &TurnEndState, r: &TurnEndReading, now: Instant| st.probe_gate(r, &cfg(), now);
+    let mut st = moved_unnamed(None, t);
+    let _ = at(&mut st, &quiet, t + MIN);
+    assert_eq!(
+        gate(&st, &quiet, t + MIN),
+        None,
+        "CONTROL: the sample is due"
+    );
+    let off = TurnEndReading {
+        relaunch_off: true,
+        ..quiet.clone()
+    };
+    assert_eq!(gate(&st, &off, t + MIN), Some(ProbeGate::NotDue));
+    let mut unproven = st.clone();
+    if let Some(m) = unproven.model.as_mut() {
+        m.unproven = true;
+    }
+    assert_eq!(gate(&unproven, &quiet, t + MIN), Some(ProbeGate::NotDue));
+    let mut owed = st.clone();
+    owed.reset_resume = Some(ResetResume {
+        told: t,
+        due: t + MIN,
+    });
+    assert_eq!(gate(&owed, &quiet, t + MIN), Some(ProbeGate::NotTurnEnd));
+    let mut moving = st.clone();
+    moving.account = Some(AccountMove {
+        to: "second".to_string(),
+        at: t,
+        wall: false,
+    });
+    assert_eq!(gate(&moving, &quiet, t + MIN), Some(ProbeGate::NotTurnEnd));
+
+    let land = |r: TurnEndReading| TurnEndReading {
+        autopilot: Autopilot::Land,
+        ..r
+    };
+    let mut now = t + 2 * MIN;
+    let a = act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), now);
+    assert_eq!(a.rule_id(), Some(RULE_LAND), "{a:?}");
+    now += 3 * MIN;
+    let defense = land(idle(
+        "Merged the parser and pushed main.\nNothing left: every branch is merged into the \
+         remote main branch and pushed, and the suites pass on main.",
+        Some(3 * MIN),
+    ));
+    let a = act(&mut st, &defense, now);
+    assert_eq!(a.rule_id(), Some(RULE_LAND_CHECK), "{a:?}");
+    now += MIN;
+    let landed = TurnEndReading {
+        ran_tools: false,
+        ..land(idle(land_check::LANDED, Some(Duration::from_secs(10))))
+    };
+    let mut a = act(&mut st, &landed, now);
+    let rested = TurnEndReading {
+        worked: None,
+        ..landed.clone()
+    };
+    for _ in 0..10 {
+        let TurnEndAction::WaitUntil { until, .. } = a else {
+            break;
+        };
+        now = until;
+        a = act(&mut st, &rested, now);
+    }
+    assert!(st.task_done(), "LANDED lands: {a:?}");
+    assert!(
+        st.model_sample_due(now),
+        "the switch still waits on a sample"
+    );
+    assert_eq!(gate(&st, &rested, now), Some(ProbeGate::NotTurnEnd));
+    assert_eq!(
+        gate(&st, &rested, now + 10 * MIN),
+        Some(ProbeGate::NotTurnEnd)
     );
 }

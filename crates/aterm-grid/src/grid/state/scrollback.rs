@@ -13,6 +13,7 @@ impl GridStorage {
     #[inline]
     pub fn attach_scrollback(&mut self, scrollback: impl Into<ScrollbackStorage>) {
         self.scrollback = Some(scrollback.into());
+        self.history_content_gen += 1;
     }
 
     /// Get a reference to the scrollback storage, if attached.
@@ -25,6 +26,9 @@ impl GridStorage {
     /// Get a mutable reference to the scrollback storage, if attached.
     #[inline]
     pub const fn scrollback_mut(&mut self) -> Option<&mut ScrollbackStorage> {
+        if self.scrollback.is_some() {
+            self.history_content_gen += 1;
+        }
         self.scrollback.as_mut()
     }
 
@@ -34,6 +38,7 @@ impl GridStorage {
     pub fn set_store_line_limit(&mut self, limit: Option<usize>) {
         if let Some(scrollback) = &mut self.scrollback {
             scrollback.set_line_limit(limit);
+            self.history_content_gen += 1;
         }
     }
 

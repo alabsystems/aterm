@@ -12,7 +12,10 @@
 //!    enrolled via `Route::Mailbox`, launches `claude` on the newly bound login directory, and
 //!    serves a turn (`state.account(&label).ran_at.is_some()` and `logins[&label].served_at.is_some()`).
 //! 3. **`--live` mode**: runs the same measured proof against the host's real `claude` binary and
-//!    `~/.secrets/ai-mailbox.toml` (or `--mailbox PATH`), optionally writing `docs/measured/`.
+//!    `~/.secrets/ai-mailbox.toml` (or `--mailbox PATH`).
+//!
+//! A passing run, in either mode, writes what it measured to the lab's state,
+//! `results/claude-mailbox-signin-<UTC time>.md` ([`write_measured_report`]).
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -46,7 +49,6 @@ pub struct MailboxSigninOpts {
     pub email: Option<String>,
     pub label: Option<String>,
     pub mailbox: Option<String>,
-    pub record: bool,
     pub aterm: Option<String>,
     pub keep: bool,
 }
@@ -55,7 +57,7 @@ pub struct MailboxSigninOpts {
 pub fn parse_mailbox_args(args: &[String]) -> Result<MailboxSigninOpts, Fail> {
     if args.iter().any(|a| a == "-h" || a == "--help") {
         return Err(Fail::usage(
-            "swarm mailbox-signin [--live] [--email EMAIL] [--label LABEL] [--mailbox PATH] [--record] [--aterm PATH] [--keep]",
+            "swarm mailbox-signin [--live] [--email EMAIL] [--label LABEL] [--mailbox PATH] [--aterm PATH] [--keep]",
         ));
     }
     let mut rem = args.to_vec();
@@ -69,7 +71,6 @@ pub fn parse_mailbox_args(args: &[String]) -> Result<MailboxSigninOpts, Fail> {
     for arg in rem {
         match arg.as_str() {
             "--live" => opts.live = true,
-            "--record" => opts.record = true,
             "--keep" => opts.keep = true,
             other => {
                 return Err(Fail::usage(format!(
@@ -383,13 +384,16 @@ fn pick_live_email(cfg: &headless_oauth::MailboxConfig, explicit: Option<&str>) 
         .or_else(|| cfg.user.clone().filter(|u| u.contains('@')))
 }
 
+/// Write a passing run's measurements to the lab's state:
+/// `results/claude-mailbox-signin-<UTC time>.md`, one file per run.
 fn write_measured_report(mode: &str, label: &str, ev: &MailboxEvidence) -> Result<PathBuf, String> {
     let stamp = utc_stamp(now_secs());
-    let day = stamp.get(..10).unwrap_or("2026-10-28");
-    let path = PathBuf::from(format!("docs/measured/claude-mailbox-signin-{day}.md"));
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
+    let dir = crate::paths::paths().need_state()?.join("results");
+    let path = dir.join(format!(
+        "claude-mailbox-signin-{}.md",
+        stamp.get(..19).unwrap_or(&stamp).replace(':', "")
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let text = format!(
         "# Measured Claude Mailbox Sign-In (`C0`)\n\n\
          - **Date:** `{stamp}`\n\
@@ -916,9 +920,9 @@ pub fn cmd_mailbox_signin(args: &[String]) -> Res {
     }
 
     cleanup.map_err(Fail::die)?;
-    if opts.record {
-        let report = write_measured_report(mode_word, &label, &ev)?;
-        println!("  recorded: {}", report.display());
+    match write_measured_report(mode_word, &label, &ev) {
+        Ok(report) => println!("  recorded: {}", report.display()),
+        Err(e) => println!("  could not write the record: {e}"),
     }
 
     println!("swarm mailbox-signin: PASS");

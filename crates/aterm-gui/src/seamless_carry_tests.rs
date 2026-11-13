@@ -3,13 +3,14 @@
 
 //! Seamless handoff control-carry, sidecar, and rollback lane tests.
 
+use std::os::fd::IntoRawFd as _;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use aterm_core::terminal::{AltArchiveImport, Terminal, TerminalCheckpoint};
 
 use super::tests::{
-    ENV_LOCK, ScratchEnv, StageCarry, StagedHandoff, child_proof_from, env_alone, pipe_pair,
-    restage_session, restore_env, stage_carry_handoff, stage_history_handoff, stage_ladder_handoff,
+    ENV_LOCK, ScratchEnv, StageCarry, StagedHandoff, child_proof_from, env_alone, restage_session,
+    restore_env, stage_carry_handoff, stage_history_handoff, stage_ladder_handoff,
 };
 use super::*;
 use crate::handoff_carry::{self, ControlCarry};
@@ -114,6 +115,7 @@ pub(super) fn pre_carry_parse(toml: &str) -> Option<SessionHandoff> {
                 status_seen: None,
                 autopilot_end: None,
                 wakes: None,
+                agent_act: None,
             })
             .collect(),
         roster_seq: None,
@@ -285,8 +287,10 @@ fn this_build() -> Option<String> {
 
 /// Publish `staged` to the successor, run `consume`, and close the pipes.
 fn as_successor<T>(staged: &StagedHandoff, consume: impl FnOnce(i32) -> T) -> T {
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, this_build());
     let out = consume(ready_read);
     for fd in [ready_read, commit_read, commit_write] {
@@ -1057,6 +1061,7 @@ fn manifests_cross_between_the_two_shapes_both_ways() {
             status_seen: None,
             autopilot_end: None,
             wakes: None,
+            agent_act: None,
         }],
         roster_seq: None,
         fabric_attached: Vec::new(),

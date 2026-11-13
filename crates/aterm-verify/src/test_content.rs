@@ -12,7 +12,8 @@
 //! `read-only = true` additionally asserts that the target, every peer in the dispatch
 //! and external writers leave its roots, executable, helpers and toolchain inputs immutable,
 //! including transient mutate-and-restore writes which snapshots cannot observe. The
-//! finalized environment is exact. `volatile-environment` is the closed set of per-invocation
+//! finalized environment is exact apart from the verifier invocation's own names
+//! (`content_environment`). `volatile-environment` is the closed set of per-invocation
 //! verifier variables whose concrete values the target reads; it must be present even when the
 //! set is empty. An empty root list asserts that the tests open no files. Compiled sources are
 //! deliberately not roots: their effect is already in the executable digest, and a `#[cfg(test)]`
@@ -37,6 +38,35 @@ use crate::testrun::Binary;
 /// The on-disk proof and content-key domain.
 pub const SCHEMA: u32 = 1;
 
+/// The named inputs of one content key, each with the first 16 hex digits of its value's
+/// SHA-256. The key is the digest of every pair in name order, so two keys of one binary differ
+/// exactly where a part does: a carry that was refused names the parts that moved
+/// ([`moved_parts`]), and a part that moves on every run is seen in the first refusal instead of
+/// never.
+pub type KeyParts = BTreeMap<String, String>;
+
+/// The parts of `current` whose digest `prior` does not hold, and the parts only `prior` has.
+/// Empty when either side recorded none: a proof from before parts existed says nothing.
+#[must_use]
+pub fn moved_parts(prior: &KeyParts, current: &KeyParts) -> Vec<String> {
+    if prior.is_empty() || current.is_empty() {
+        return Vec::new();
+    }
+    let mut moved: Vec<String> = current
+        .iter()
+        .filter(|(name, digest)| prior.get(*name) != Some(*digest))
+        .map(|(name, _)| name.clone())
+        .chain(
+            prior
+                .keys()
+                .filter(|name| !current.contains_key(*name))
+                .cloned(),
+        )
+        .collect();
+    moved.sort();
+    moved
+}
+
 /// One prior successful execution. A `--passed-binaries` file is JSONL, one proof per line.
 ///
 /// `outcome` deliberately remains in the proof even though only `ok` is accepted: a run
@@ -55,6 +85,14 @@ pub struct CarryProof {
     /// reconstructs this exact prior invocation before any current-hop harness is started.
     pub json: bool,
     pub execution_s: f64,
+    /// The key's named parts when the proof was made ([`KeyParts`]); diagnostic only. The carry
+    /// decision compares `exe_sha256` and `content_key`, never these shortened digests.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub key_parts: KeyParts,
+    /// The release run (its logs directory's name) whose execution passed. A binary carried
+    /// again keeps the run that executed it, so a carried row always names real work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_run: Option<String>,
 }
 
 /// Prior successful executions, by Cargo rerun spec.
@@ -66,6 +104,8 @@ pub struct Evidence {
     pub exe_sha256: Option<String>,
     pub content_key: Option<String>,
     pub reason: Option<String>,
+    /// The key's named parts; empty when there is no key.
+    pub parts: KeyParts,
 }
 
 impl Evidence {
@@ -89,6 +129,8 @@ impl CarryProof {
             input_reason: evidence.reason.clone(),
             json: false,
             execution_s,
+            key_parts: evidence.parts.clone(),
+            origin_run: None,
         }
     }
 
@@ -227,15 +269,17 @@ impl EvidenceBuilder {
         let exe_sha256 = self.file_digest(&command.program).ok();
         let content_key = self.content_key(binary, command, exe_sha256.as_deref());
         match content_key {
-            Ok(content_key) => Evidence {
+            Ok((content_key, parts)) => Evidence {
                 exe_sha256,
                 content_key: Some(content_key),
                 reason: None,
+                parts,
             },
             Err(reason) => Evidence {
                 exe_sha256,
                 content_key: None,
                 reason: Some(reason),
+                parts: KeyParts::new(),
             },
         }
     }
@@ -258,7 +302,7 @@ impl EvidenceBuilder {
         binary: &Binary,
         command: &Cmd,
         exe_sha256: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<(String, KeyParts), String> {
         if !command.program.is_absolute() || !binary.record.exe().is_absolute() {
             return Err(format!(
                 "the command and recorded executable paths must be absolute: {} and {}",
@@ -316,6 +360,15 @@ impl EvidenceBuilder {
                 "the test command does not declare its finalized complete environment".to_owned(),
             );
         }
+        // The non-Unix encoding below is UTF-8, so no replacement may merge exact inputs.
+        #[cfg(not(unix))]
+        if command
+            .envs
+            .iter()
+            .any(|(name, value)| name.to_str().is_none() || value.to_str().is_none())
+        {
+            return Err("a finalized environment name or value is not valid Unicode".into());
+        }
         let exact_env = effective_env(command);
         let manifest = exact_env
             .get(b"CARGO_MANIFEST_DIR".as_slice())
@@ -330,54 +383,55 @@ impl EvidenceBuilder {
         let package = self.package_inputs(&manifest, &binary.spec)?;
         let env = content_environment(&exact_env, &self.scratch, &package.volatile_environment);
 
-        let mut hash = aterm_digest::Sha256::new();
-        part(&mut hash, b"domain", b"aterm-test-content-key-v1");
-        part(&mut hash, b"spec", binary.spec.as_bytes());
-        part(&mut hash, b"executable", exe_sha256.as_bytes());
-        part(
-            &mut hash,
-            b"executable-runtime-identity",
-            &runtime_file_identity(&command.program)?,
-        );
-        part(
-            &mut hash,
-            b"working-directory-resolved",
+        let mut parts = Parts::default();
+        parts.add("spec", binary.spec.as_bytes());
+        parts.add("executable", exe_sha256.as_bytes());
+        file_identity(&mut parts, "executable", &command.program)?;
+        parts.add(
+            "working-directory-resolved",
             &os_bytes(physical_cwd.as_os_str()),
         );
-        part(&mut hash, b"package-inputs", package.digest.as_bytes());
-        part(&mut hash, b"carry-context", context.as_bytes());
-        part(&mut hash, b"verifier", verifier.as_bytes());
-        command_identity(&mut hash, command, &env);
+        parts.add("working-directory", &os_bytes(cwd.as_os_str()));
+        parts.add("package-inputs", package.digest.as_bytes());
+        parts.add("carry-context", context.as_bytes());
+        parts.add("verifier", verifier.as_bytes());
+        let mut argv = aterm_digest::Sha256::new();
+        part(&mut argv, b"argv", &os_bytes(command.program.as_os_str()));
+        for argument in &command.args {
+            part(&mut argv, b"argv", &os_bytes(argument));
+        }
+        parts.add("argv", &argv.finalize());
+        for (name, value) in &env {
+            let name = std::str::from_utf8(name)
+                .map_err(|_| "a finalized environment variable name is not UTF-8".to_owned())?;
+            parts.add(format!("env:{name}"), value);
+        }
 
         for (name, path) in env
             .iter()
             .filter(|(name, _)| name.starts_with(b"CARGO_BIN_EXE_"))
         {
+            let name = std::str::from_utf8(name)
+                .map_err(|_| "a finalized environment variable name is not UTF-8".to_owned())?;
             let path = PathBuf::from(os_from_bytes(path));
             if !path.is_absolute() {
                 return Err(format!(
-                    "{} names a non-absolute helper {}",
-                    String::from_utf8_lossy(name),
+                    "{name} names a non-absolute helper {}",
                     path.display()
                 ));
             }
             let digest = self.file_digest(&path).map_err(|why| {
                 format!(
-                    "{} names an unreadable helper {}: {why}",
-                    String::from_utf8_lossy(name),
+                    "{name} names an unreadable helper {}: {why}",
                     path.display()
                 )
             })?;
-            part(&mut hash, b"helper-name", name);
-            part(&mut hash, b"helper-bytes", digest.as_bytes());
-            part(
-                &mut hash,
-                b"helper-runtime-identity",
-                &runtime_file_identity(&path)?,
-            );
+            let helper = format!("helper:{name}");
+            parts.add(helper.clone(), digest.as_bytes());
+            file_identity(&mut parts, &helper, &path)?;
         }
 
-        Ok(aterm_codec::hex::encode_lower(&hash.finalize()))
+        Ok(parts.finish())
     }
 
     fn package_inputs(&self, manifest: &Path, spec: &str) -> Result<PackageInputs, String> {
@@ -550,16 +604,8 @@ fn package_inputs(manifest_dir: &Path, target: &str) -> Result<PackageInputs, St
         roots.push((b"workspace-runtime".as_slice(), relative, workspace.clone()));
     }
     let mut volatile_environment = list("volatile-environment")?;
-    let allowed = [
-        crate::runs::VERIFY_RUN_ENV,
-        crate::testrun::SUBPROCESS_SLOTS_ENV,
-        aterm_capacity::COVER_ENV,
-        "HOME",
-        "USERPROFILE",
-        "TMPDIR",
-    ];
     for name in &volatile_environment {
-        if !allowed.contains(&name.as_str()) {
+        if !CAPABILITIES.contains(&name.as_str()) {
             return Err(format!(
                 "test-inputs.volatile-environment has unknown verifier capability {name:?}"
             ));
@@ -812,11 +858,12 @@ fn same_physical_path(left: &Path, right: &Path) -> Result<bool, String> {
     }
 }
 
-/// Conservative execution identity of a file this test executes. Bytes alone are insufficient:
-/// an equal executable which moved behind a symlink or whose execution metadata changed must run
-/// rather than inherit a prior pass. Unix ctime binds ACL/xattr changes without reading or
-/// recording their possibly platform-specific values; atime is deliberately absent because this
-/// verifier's own read can move it.
+/// Conservative execution identity of a compiler tool the lint key names. Bytes alone are
+/// insufficient there: an equal tool which moved behind a symlink or whose execution metadata
+/// changed must lint again rather than inherit a prior pass. Unix ctime binds ACL/xattr changes
+/// without reading or recording their possibly platform-specific values; atime is deliberately
+/// absent because this verifier's own read can move it. A store tool is installed once and never
+/// relinked, so these fields repeat; a test executable's do not ([`file_identity`]).
 pub(crate) fn runtime_file_identity(path: &Path) -> Result<Vec<u8>, String> {
     let path = path
         .canonicalize()
@@ -861,27 +908,68 @@ pub(crate) fn runtime_file_identity(path: &Path) -> Result<Vec<u8>, String> {
     Ok(identity)
 }
 
-fn command_identity(
-    hash: &mut aterm_digest::Sha256,
-    command: &Cmd,
-    env: &BTreeMap<Vec<u8>, Vec<u8>>,
-) {
-    part(
-        hash,
-        b"cwd",
-        &command
-            .cwd
-            .as_deref()
-            .map_or_else(Vec::new, |path| os_bytes(path.as_os_str())),
+/// A content key under construction: each named input and the SHA-256 of its value.
+#[derive(Default)]
+struct Parts(BTreeMap<String, [u8; 32]>);
+
+impl Parts {
+    fn add(&mut self, name: impl Into<String>, value: &[u8]) {
+        let mut hash = aterm_digest::Sha256::new();
+        hash.update(value);
+        let name = name.into();
+        let replaced = self.0.insert(name.clone(), hash.finalize());
+        debug_assert!(
+            replaced.is_none(),
+            "content key part {name:?} was added twice"
+        );
+    }
+
+    /// The key over every part, and the parts' shortened digests for a refused carry to name.
+    fn finish(self) -> (String, KeyParts) {
+        let mut hash = aterm_digest::Sha256::new();
+        part(&mut hash, b"domain", b"aterm-test-content-key-v3");
+        let mut short = KeyParts::new();
+        for (name, digest) in &self.0 {
+            part(&mut hash, name.as_bytes(), digest);
+            short.insert(name.clone(), aterm_codec::hex::encode_lower(&digest[..8]));
+        }
+        (aterm_codec::hex::encode_lower(&hash.finalize()), short)
+    }
+}
+
+/// The parts of a file this test executes which the tree and its build decide and which a
+/// process can act on: where it resolves, that it is a regular file, and who may execute it.
+/// Bytes are a separate part.
+///
+/// Device, inode, link count, block count and the times are deliberately absent. Cargo gives a
+/// relinked or re-uplifted file a new inode, link count and times while its bytes stay equal, so
+/// a key holding them repeats only for a file no build step touched; and a target whose package
+/// declares `content-only = true` observes files by name, type and bytes, never by those fields.
+fn file_identity(parts: &mut Parts, name: &str, path: &Path) -> Result<(), String> {
+    let path = path
+        .canonicalize()
+        .map_err(|error| format!("{}: {error}", path.display()))?;
+    let metadata =
+        std::fs::metadata(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    parts.add(format!("{name}-path"), &os_bytes(path.as_os_str()));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let mut access = Vec::new();
+        for value in [metadata.mode(), metadata.uid(), metadata.gid()] {
+            access.extend(value.to_le_bytes());
+        }
+        parts.add(format!("{name}-access"), &access);
+    }
+    #[cfg(not(unix))]
+    parts.add(
+        format!("{name}-access"),
+        &[u8::from(metadata.permissions().readonly())],
     );
-    part(hash, b"argv", &os_bytes(command.program.as_os_str()));
-    for argument in &command.args {
-        part(hash, b"argv", &os_bytes(argument));
-    }
-    for (name, value) in env {
-        part(hash, b"env-name", name);
-        part(hash, b"env-value", value);
-    }
+    Ok(())
 }
 
 fn effective_env(command: &Cmd) -> BTreeMap<Vec<u8>, Vec<u8>> {
@@ -896,12 +984,31 @@ fn effective_env(command: &Cmd) -> BTreeMap<Vec<u8>, Vec<u8>> {
     env
 }
 
-/// The exact finalized environment, except for verifier capabilities a bounded target declares
-/// that it does not inspect. Their concrete values are deliberately per invocation: the run
-/// record names this verifier process, and the private home and subprocess-slot directory live
-/// below its random scratch root. Their policy and implementation are already bound by the
-/// verifier digest. A target which reads one names it in `volatile-environment`, making its bytes
-/// exact. The field accepts only the capabilities below, so a misspelling fails closed.
+/// The verifier-owned values a target can declare it reads exactly: the run record,
+/// subprocess slots, capacity cover, private home and temporary directory, and Cargo's
+/// macOS fallback library path containing that home.
+const CAPABILITIES: [&str; 7] = [
+    crate::runs::VERIFY_RUN_ENV,
+    crate::testrun::SUBPROCESS_SLOTS_ENV,
+    aterm_capacity::COVER_ENV,
+    "HOME",
+    "USERPROFILE",
+    "TMPDIR",
+    "DYLD_FALLBACK_LIBRARY_PATH",
+];
+
+/// The exact finalized environment, except for what names this verifier invocation and no
+/// input of a bounded target. The capabilities ([`CAPABILITIES`]) are per invocation by
+/// construction: the run record names this verifier process, and the private home and
+/// subprocess-slot directory live below its random scratch root. That root also reaches values
+/// Cargo composes while it records the command under the private home: on macOS its
+/// `DYLD_FALLBACK_LIBRARY_PATH` ends with the loader's defaults, `$HOME/lib` first. That
+/// fallback path's elements below the scratch root lose only that root's spelling; suffixes
+/// and elements outside it stay exact. Other variables remain byte-exact, including a custom
+/// value that happens to name a path below the scratch root. The policy and implementation of
+/// what the verifier puts below its root are already bound by the verifier digest. A target
+/// which reads a capability names it in `volatile-environment`, making that variable's bytes
+/// exact. The field accepts only the capabilities, so a misspelling fails closed.
 fn content_environment(
     exact: &BTreeMap<Vec<u8>, Vec<u8>>,
     scratch: &Path,
@@ -929,6 +1036,8 @@ fn content_environment(
                 b"$VERIFIER_CAPACITY_COVER".to_vec()
             } else if matches!(name.as_slice(), b"HOME" | b"USERPROFILE" | b"TMPDIR") {
                 normalized_scratch_path(value, scratch)
+            } else if name == b"DYLD_FALLBACK_LIBRARY_PATH" {
+                normalized_scratch_list(value, scratch)
             } else {
                 value.clone()
             };
@@ -937,11 +1046,23 @@ fn content_environment(
         .collect()
 }
 
+/// `value` as a path list ([`std::env::split_paths`]'s separator) with the scratch root
+/// replaced in each element below it. A single path is a list of one. An element which only
+/// shares a spelling prefix with the root (`/tmp/atv1` and `/tmp/atv12`) is outside it.
+fn normalized_scratch_list(value: &[u8], scratch: &Path) -> Vec<u8> {
+    const SEPARATOR: u8 = if cfg!(windows) { b';' } else { b':' };
+    let elements: Vec<Vec<u8>> = value
+        .split(|byte| *byte == SEPARATOR)
+        .map(|element| normalized_scratch_path(element, scratch))
+        .collect();
+    elements.join(&SEPARATOR)
+}
+
 fn normalized_scratch_path(value: &[u8], scratch: &Path) -> Vec<u8> {
-    let value = os_from_bytes(value);
-    let path = Path::new(&value);
+    let path = os_from_bytes(value);
+    let path = Path::new(&path);
     path.strip_prefix(scratch).map_or_else(
-        |_| os_bytes(path.as_os_str()),
+        |_| value.to_vec(),
         |relative| {
             let mut normalized = b"$VERIFIER_SCRATCH".to_vec();
             let suffix = os_bytes(relative.as_os_str());

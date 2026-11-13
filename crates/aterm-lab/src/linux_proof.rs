@@ -461,6 +461,10 @@ pub fn test_run(up: &Up, cargo: impl Fn(&[&str]) -> Vec<String>, args: &[&str]) 
 /// The packages whose Linux tests the proof runs.
 pub const TESTED: [&str; 4] = ["aterm-uds", "aterm-pty", "libc", "amacs-files"];
 
+/// The system readers' packages (P7): `/proc` and `/sys`, the job probe, the walker and the vitals
+/// engine over them, with their live examples built alongside their tests.
+pub const SYSTEM: [&str; 3] = ["aterm-sysprobe", "aterm-vitals", "aterm-diskwalk"];
+
 /// The package whose library tests the proof runs on their own row: the renderer's glyph and
 /// icon tests measure the face the guest resolves as its system face.
 pub const RENDER: &str = "aterm-render";
@@ -2102,6 +2106,27 @@ fn run(ask: &ProofArgs, kind: &str) -> Res {
             let out = test_run(&up, workspace, &tests);
             rows.push(translator_not_runs(
                 test_verdict(&format!("{tag} tests: uds pty libc files"), &out),
+                &out.text,
+                arch,
+            ));
+            if let Err(s) = crate::stop::check() {
+                stopped = Some(s);
+                break 'arches;
+            }
+            // `--examples` builds their live checks too (the sweep, the job probe and the walk
+            // held to `du`), which `--tests` alone never compiles.
+            let mut system = vec!["--no-fail-fast", "--tests", "--examples"];
+            for p in SYSTEM {
+                system.extend(["-p", p]);
+            }
+            system.extend(["--", "--nocapture"]);
+            if arch == Arch::X86_64 {
+                system.push(ROSETTA_ONE_AT_A_TIME);
+            }
+            println!("\n=== {tag}: aterm-sysprobe, aterm-vitals, aterm-diskwalk tests ===");
+            let out = test_run(&up, workspace, &system);
+            rows.push(translator_not_runs(
+                test_verdict(&format!("{tag} tests: sysprobe vitals diskwalk"), &out),
                 &out.text,
                 arch,
             ));

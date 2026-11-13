@@ -118,6 +118,8 @@ pub(crate) struct WarmBlock {
     compressed: Vec<u8>,
     /// Number of lines in block (for counting without decompression).
     line_count: usize,
+    /// Validated physical line count encoded by [`Self::from_page`], or `0` when unverified.
+    pub(crate) encoded_line_count: usize,
     /// Consecutive decompression failure count. Reset on success.
     decompress_failures: Cell<u8>,
 }
@@ -129,6 +131,7 @@ impl WarmBlock {
         Self {
             compressed: vec![0x04, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF],
             line_count,
+            encoded_line_count: 0,
             decompress_failures: std::cell::Cell::new(0),
         }
     }
@@ -143,10 +146,12 @@ impl WarmBlock {
     #[must_use]
     fn from_page(line_count: usize, serialized: &[u8]) -> Self {
         let compressed = crate::lz4::compress_prepend_size(serialized).unwrap_or_default();
+        let encoded_line_count = if compressed.is_empty() { 0 } else { line_count };
 
         Self {
             compressed,
             line_count,
+            encoded_line_count,
             decompress_failures: Cell::new(0),
         }
     }
@@ -410,6 +415,16 @@ impl WarmTier {
     /// Get a line by index (0 = oldest visible line across all blocks).
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn get_line(&self, idx: usize) -> Result<Option<Line>, super::ScrollbackError> {
+        self.with_line(idx, Clone::clone)
+    }
+
+    /// Borrow a line by index (`0` = oldest visible line across all blocks) without cloning it.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(crate) fn with_line<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(&Line) -> R,
+    ) -> Result<Option<R>, super::ScrollbackError> {
         if idx >= self.line_count {
             return Ok(None);
         }
@@ -432,7 +447,7 @@ impl WarmTier {
                 .flatten()
                 .find(|(cached_idx, _)| *cached_idx == block_idx)
             {
-                let Some(line) = lines.get(line_in_block).cloned() else {
+                let Some(line) = lines.get(line_in_block) else {
                     return Err(super::ScrollbackError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
@@ -440,7 +455,7 @@ impl WarmTier {
                         ),
                     )));
                 };
-                return Ok(Some(line));
+                return Ok(Some(f(line)));
             }
         }
 
@@ -454,7 +469,7 @@ impl WarmTier {
             return Err(super::ScrollbackError::Quarantined(block.line_count()));
         }
         let lines = block.decompress()?;
-        let Some(line) = lines.get(line_in_block).cloned() else {
+        let Some(line) = lines.get(line_in_block) else {
             return Err(super::ScrollbackError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -462,8 +477,9 @@ impl WarmTier {
                 ),
             )));
         };
+        let out = f(line);
         self.cache_block(block_idx, lines);
-        Ok(Some(line))
+        Ok(Some(out))
     }
 
     /// Clear all blocks.
@@ -500,6 +516,7 @@ impl WarmTier {
         if let Some(block) = self.blocks.front_mut() {
             let old_bytes = block.compressed.len();
             block.compressed = vec![0x04, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF];
+            block.encoded_line_count = 0;
             let new_bytes = block.compressed.len();
             self.bytes_used.set(Self::adjust_bytes(
                 self.bytes_used.get(),

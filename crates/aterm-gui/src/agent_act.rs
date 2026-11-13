@@ -6,19 +6,24 @@
 //!
 //! The foreground group's leader is read where the kernel keeps it: the image's path and the
 //! file it was mapped from, the process's start, the team of a Developer ID signature the kernel
-//! validated ([`live_team`]) and, for a script shell, its script. The verdict ([`Verdict`]) is
-//! kept per session under that key ([`Key`]): the same process running the same file keeps it,
-//! and an exec (another file) or a new process (another start) is read again. The hosted loop's
+//! validated ([`live_team`]), its pid version (Apple's, which every exec moves) and, for a script
+//! shell, its script. The verdict ([`Verdict`]) is kept per session under that key ([`Key`]):
+//! the same process running the same file keeps it, and so does one whose image no longer stats
+//! (unlinked since its exec) while its pid version stands; an exec (another file or version) or
+//! a new process (another start) is read again. A seamless update carries each confirmation to
+//! its successor ([`carry_row`], [`adopt_carried`]), which keeps it for an image no read can
+//! confirm again (unlinked) while the pid version stands, and reads a linked one afresh; a crash's
+//! successor has no carry and reads every image afresh. The hosted loop's
 //! one gate asks [`hosted`] before each input verb (`HostCtl`'s `Ctl::agent_act`), and the
 //! host's roster pass reads each agent session's ([`roster_read`]); the main thread's readers
 //! (`status supervisor_act=`, the session's needs, a wall's answer) take only what a read kept
 //! ([`cached`]), so they never reach the kernel.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
-use aterm_agent::harness::agent_image::{self, Act, FileId, Image, Places, Proof};
+use aterm_agent::harness::agent_image::{self, Act, FileId, Image, Lane, Places, Proof};
 use aterm_phase::Program;
 use atpkg::image::ImageRoots;
 
@@ -39,6 +44,10 @@ pub(crate) struct Kernel {
     pub(crate) team: fn(u32) -> Option<String>,
     /// A script shell's script: its `argv[1]`.
     pub(crate) script: fn(i32) -> Option<PathBuf>,
+    /// The group leader's pid version, which every exec moves and an unlink of its image does
+    /// not (Apple's `p_idversion`, [`aterm_uds::process::Identity::idversion`]); `None` where the
+    /// kernel keeps none (Linux, whose `/proc/<pid>/exe` keeps an unlinked image's inode).
+    pub(crate) version: fn(i32) -> Option<i32>,
 }
 
 impl Kernel {
@@ -49,7 +58,12 @@ impl Kernel {
         start_us: crate::holder_image::start_us_of,
         team: live_team,
         script: live_script,
+        version: live_version,
     };
+}
+
+fn live_version(group: i32) -> Option<i32> {
+    aterm_uds::process::read_identity(group).and_then(|id| id.idversion)
 }
 
 /// The mapped file: on Linux `/proc/<pid>/exe` itself (an image unlinked since its exec is still
@@ -109,21 +123,32 @@ impl Where {
 }
 
 /// What a kept verdict stands on: the same leader of the same group, started at the same time,
-/// mapped from the same file, running the same script.
+/// running the same script, and not exec'd since: the same pid version where the kernel keeps
+/// one, else mapped from the same file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Key {
     group: i32,
     start_us: Option<u64>,
     file: Option<FileId>,
     script: Option<FileId>,
+    version: Option<i32>,
 }
 
 impl Key {
-    /// Whether a verdict kept under this key may stand for a later read of the same key: only
-    /// where the kernel gave the process's start and its image's identity, so that an exec or a
-    /// new process moves it. A key without either is read afresh each time.
-    const fn stands(&self) -> bool {
-        self.start_us.is_some() && self.file.is_some()
+    /// Whether a verdict kept under `kept` stands for this read, so that an exec or a new process
+    /// moves it and nothing else does: only where the kernel gave the process's start, the same
+    /// in both, with the same group and script, and either the same pid version in both (Apple:
+    /// every exec moves it, and an image unlinked since its exec, which macOS's `proc_pidpath`
+    /// no longer names, keeps it, so the verdict its live read earned stands with no `codesign`
+    /// run) or, where either read has none (Linux), the image's identity in both and the same.
+    /// A key with neither is read afresh each time.
+    fn stands_for(&self, kept: &Self) -> bool {
+        self.start_us.is_some()
+            && (self.group, self.start_us, self.script) == (kept.group, kept.start_us, kept.script)
+            && match (self.version, kept.version) {
+                (Some(now), Some(then)) => now == then,
+                _ => self.file.is_some() && self.file == kept.file,
+            }
     }
 }
 
@@ -145,6 +170,10 @@ struct Kept {
     key: Key,
     agent: Program,
     verdict: Verdict,
+    /// A confirmation the outgoing process of a seamless update carried ([`adopt_carried`]):
+    /// it stands only for a read that gives no image identity (the image unlinked since its
+    /// exec), and a read that gives one is read afresh, under this build's own rules.
+    carried: bool,
 }
 
 /// Each session's kept verdict, by sid.
@@ -169,19 +198,21 @@ fn key_of(group: i32, kernel: &Kernel) -> (Key, Option<PathBuf>) {
         .filter(|script| script.is_absolute())
         .and_then(|script| FileId::of(&script));
     let start_us = pid.and_then(|_| (kernel.start_us)(group));
+    let version = pid.and_then(|_| (kernel.version)(group));
     (
         Key {
             group,
             start_us,
             file,
             script,
+            version,
         },
         exe,
     )
 }
 
 /// The verdict on `sid`'s `agent`, its foreground group `group`, through `kernel`: kept while the
-/// kernel's key stands, read afresh otherwise, the places read by `places` only when a verdict
+/// kernel's key stands ([`Key::stands_for`]), read afresh otherwise, the places read by `places` only when a verdict
 /// is. Nothing readable of the leader is [`Act::Observe`]. A key that moved while the verdict
 /// was read is not kept: the next read reads again.
 pub(crate) fn read_with(
@@ -196,7 +227,11 @@ pub(crate) fn read_with(
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .get(sid)
-        .filter(|kept| key.stands() && kept.key == key && kept.agent == agent)
+        .filter(|kept| {
+            key.stands_for(&kept.key)
+                && kept.agent == agent
+                && (!kept.carried || key.file.is_none())
+        })
     {
         return kept.verdict;
     }
@@ -238,10 +273,112 @@ pub(crate) fn read_with(
                 key,
                 agent,
                 verdict,
+                carried: false,
             },
         );
     }
     verdict
+}
+
+/// A confirmation as a seamless update carries it to its successor (`SessionRecord::agent_act`,
+/// [`adopt_carried`]): `sid`'s kept verdict when it is [`Act::On`] under a key that names its
+/// leader's start and pid version, as one row, `group=<g> start=<us> version=<v> agent=<name>
+/// proof=<word>`, with ` script=<dev>.<ino>` for a script shell's. Only the pid version proves to
+/// another process that no exec came since the live read (Linux keeps none, and its
+/// `/proc/<pid>/exe` reads an unlinked image afresh), and an observed agent is read afresh.
+#[cfg(any(unix, test))]
+pub(crate) fn carry_row(sid: &str) -> Option<String> {
+    let kept = KEPT.lock().unwrap_or_else(PoisonError::into_inner);
+    let kept = kept.get(sid)?;
+    let (Act::On, Some(proof), Some(start), Some(version)) = (
+        kept.verdict.act,
+        kept.verdict.proof,
+        kept.key.start_us,
+        kept.key.version,
+    ) else {
+        return None;
+    };
+    let mut row = format!(
+        "group={} start={start} version={version} agent={} proof={}",
+        kept.key.group,
+        kept.agent.name(),
+        proof.word()
+    );
+    if let Some(script) = kept.key.script {
+        row.push_str(&format!(" script={}.{}", script.dev, script.ino));
+    }
+    Some(row)
+}
+
+/// THE SUCCESSOR'S TAKE OF A CARRIED CONFIRMATION ([`carry_row`]) for adopted session `sid`: kept
+/// as the host's read under the carried key, where it stands for a read of the successor's own
+/// only while the kernel gives the same leader the same start and pid version (no exec since the
+/// outgoing process's live read, [`Key::stands_for`]) and gives no image identity: an image
+/// unlinked since its exec, whose verdict no read can earn again (macOS's `proc_pidpath` names
+/// no path for it, and `codesign` cannot verify it by its pid, measured on 27.0). Whether `row`
+/// read; a row that does not keeps nothing.
+pub(crate) fn adopt_carried(sid: &str, row: &str) -> bool {
+    let Some((key, agent, proof)) = carried_of(row) else {
+        return false;
+    };
+    KEPT.lock().unwrap_or_else(PoisonError::into_inner).insert(
+        sid.to_string(),
+        Kept {
+            key,
+            agent,
+            verdict: Verdict {
+                act: Act::On,
+                proof: Some(proof),
+            },
+            carried: true,
+        },
+    );
+    true
+}
+
+/// The key, agent and proof a [`carry_row`] row names: each field once, the five it needs and a
+/// script's identity at most; another field is a later build's and is passed over.
+fn carried_of(row: &str) -> Option<(Key, Program, Proof)> {
+    let (mut group, mut start, mut version, mut agent, mut proof, mut script) =
+        (None, None, None, None, None, None);
+    for field in row.split_ascii_whitespace() {
+        let (name, value) = field.split_once('=')?;
+        let again = match name {
+            "group" => group.replace(value.parse::<i32>().ok().filter(|g| *g > 1)?),
+            "start" => start.replace(value.parse::<u64>().ok()?).map(|_| 0),
+            "version" => version.replace(value.parse::<i32>().ok()?),
+            "agent" => agent
+                .replace(Program::ALL.into_iter().find(|p| p.name() == value)?)
+                .map(|_| 0),
+            "proof" => proof
+                .replace(Proof::ALL.into_iter().find(|p| p.word() == value)?)
+                .map(|_| 0),
+            "script" => {
+                let (dev, ino) = value.split_once('.')?;
+                script
+                    .replace(FileId {
+                        dev: dev.parse().ok()?,
+                        ino: ino.parse().ok()?,
+                    })
+                    .map(|_| 0)
+            }
+            _ => None,
+        };
+        if again.is_some() {
+            return None;
+        }
+    }
+    Some((
+        Key {
+            group: group?,
+            start_us: Some(start?),
+            file: None,
+            script,
+            version: Some(version?),
+        },
+        agent?,
+        proof?,
+    ))
 }
 
 /// The act a read kept for `sid` leading `group`, without reaching the kernel; `None` before any.
@@ -272,12 +409,95 @@ pub(crate) fn keep_for_test(sid: &str, agent: Program, group: i32, act: Act) {
                 start_us: None,
                 file: None,
                 script: None,
+                version: None,
             },
             agent,
             verdict: Verdict { act, proof: None },
+            carried: false,
         },
     );
 }
+
+/// Keep `act` as the host's read of `sid`'s `agent` leading `group`, a live group the kernel
+/// reads (the test's own process), under the key the kernel gives it now, so that the gate's own
+/// read of it ([`read_with`] through [`Kernel::LIVE`]) stands on it; and forget what the gate
+/// said of `sid`.
+#[cfg(test)]
+pub(crate) fn keep_live_for_test(sid: &str, agent: Program, group: i32, act: Act) {
+    let (key, _) = key_of(group, &Kernel::LIVE);
+    assert!(
+        key.stands_for(&key),
+        "the kernel reads group {group}: {key:?}"
+    );
+    KEPT.lock().unwrap_or_else(PoisonError::into_inner).insert(
+        sid.to_string(),
+        Kept {
+            key,
+            agent,
+            verdict: Verdict { act, proof: None },
+            carried: false,
+        },
+    );
+    WITHHELD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(sid);
+    SAID.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(sid);
+}
+
+/// Forget what the host read of `sid`, as a seamless update's successor starts knowing nothing
+/// of it. Built where the carry's tests are (Unix).
+#[cfg(all(test, unix))]
+pub(crate) fn forget_kept_for_test(sid: &str) {
+    KEPT.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .remove(sid);
+}
+
+/// The confirmation a Claude Code's tab carries when the host confirmed it by its team (leader
+/// `group`, started at `start_us`, under pid version `version`), for the handoff fixture desks:
+/// the producer's own row ([`carry_row`]). Built where the desks are (Unix).
+#[cfg(all(test, unix))]
+pub(crate) fn fixture_row(group: i32, start_us: u64, version: i32) -> String {
+    let sid = format!("fixture-{group}-{start_us}");
+    KEPT.lock().unwrap_or_else(PoisonError::into_inner).insert(
+        sid.clone(),
+        Kept {
+            key: Key {
+                group,
+                start_us: Some(start_us),
+                file: None,
+                script: None,
+                version: Some(version),
+            },
+            agent: Program::Claude,
+            verdict: Verdict {
+                act: Act::On,
+                proof: Some(Proof::Team),
+            },
+            carried: false,
+        },
+    );
+    let row = carry_row(&sid).expect("a confirmation carries a row");
+    forget_kept_for_test(&sid);
+    row
+}
+
+/// How many withheld lines the gate logged of `sid` ([`withheld`]).
+#[cfg(test)]
+pub(crate) fn withheld_said(sid: &str) -> usize {
+    SAID.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(sid)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Each session's count of the withheld lines [`withheld`] logged: a test's ear on `aterm.log`.
+#[cfg(test)]
+static SAID: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
 
 /// Whether `act` is news for `sid`: not the act last told of it. It is told from here on.
 pub(crate) fn take_told(sid: &str, act: Act) -> bool {
@@ -304,6 +524,10 @@ pub(crate) fn forget_gone(live: &[&str]) {
     );
     prune(
         &mut TOLD.lock().unwrap_or_else(PoisonError::into_inner),
+        live,
+    );
+    prune(
+        &mut WITHHELD.lock().unwrap_or_else(PoisonError::into_inner),
         live,
     );
 }
@@ -410,9 +634,80 @@ pub(crate) fn roster_read_with(
     }
 }
 
+/// The lanes whose write the gate withheld from each session, each said once ([`withheld`]):
+/// `None` for a write that named no lane.
+static WITHHELD: Mutex<BTreeMap<String, BTreeSet<Option<Lane>>>> = Mutex::new(BTreeMap::new());
+
+/// THE ONE OBSERVE GATE, at the control server's input admission (`control::admit_with`), where
+/// every write the window harness makes into a session goes through, whichever lane makes it
+/// and whether or not that lane asked first: the refusal of a harness write into `ctx`'s
+/// session that names `lane`, or `None` where it passes ([`agent_image::withholds`]). A
+/// foreground that names no agent takes it (it goes into no agent: a shell, say, where a
+/// relaunch types its line); an agent the host admits is judged by its kernel-confirmed act
+/// ([`read_with`], kept per process), and one it does not admit (a Codex that is no codex-alab)
+/// is observed. The first refusal of each lane in a session says so in `aterm.log`, words only,
+/// and the session's next confirmation lets it be said again.
+pub(crate) fn withheld(ctx: &crate::SessionCtx, lane: Option<Lane>) -> Option<String> {
+    withheld_with(ctx, lane, &Kernel::LIVE, &Where::live)
+}
+
+/// [`withheld`] through `kernel` and `places` ([`read_with`]).
+pub(crate) fn withheld_with(
+    ctx: &crate::SessionCtx,
+    lane: Option<Lane>,
+    kernel: &Kernel,
+    places: &dyn Fn() -> Where,
+) -> Option<String> {
+    let (named, agent, group) = {
+        let timeline = ctx.timeline.lock().unwrap_or_else(PoisonError::into_inner);
+        let publication = timeline.agent();
+        (
+            crate::harness_host::identified_agent(publication),
+            crate::harness_host::agent_of(publication),
+            publication.program_pgid,
+        )
+    };
+    let sid = ctx.self_id.as_str();
+    let act = match crate::harness_host::admitted_as(ctx, agent, group) {
+        Some(agent) => Some(read_with(sid, agent, group, kernel, places).act),
+        None => named.map(|_| Act::Observe),
+    };
+    if !agent_image::withholds(act, lane) {
+        return None;
+    }
+    let news = WITHHELD
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .entry(sid.to_string())
+        .or_default()
+        .insert(lane);
+    if news {
+        aterm_log::info!(
+            "harness @{sid}: {} write withheld: supervisor_act=observe why={}",
+            lane.map_or("unnamed", Lane::word),
+            why(Act::Observe)
+        );
+        #[cfg(test)]
+        {
+            *SAID
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(sid.to_string())
+                .or_default() += 1;
+        }
+    }
+    Some(format!("{}\n", agent_image::OBSERVE_REFUSAL))
+}
+
 /// Tell `verdict` for `sid` once per move of its act: the session log's `meta field=supervisor
 /// why=confirmed|unconfirmed` and an `aterm.log` line, words only.
 fn tell(ctx: &crate::SessionCtx, sid: &str, verdict: Verdict) {
+    if verdict.act == Act::On {
+        WITHHELD
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(sid);
+    }
     if take_told(sid, verdict.act) {
         aterm_log::info!(
             "harness @{sid}: supervisor_act={} proof={}",

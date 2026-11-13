@@ -151,9 +151,7 @@ impl Kind {
             Kind::Refused => "read why= and next=; agh policy check names every fault of the rows",
             Kind::Usage => "agh help <verb>",
             Kind::CouldNotRun => "retry later, once the cause why= names is gone",
-            Kind::Unauthenticated => {
-                "agh auth status names the token and its remedy; agh auth add NAME --file PATH replaces"
-            }
+            Kind::Unauthenticated => "agh auth status names the token and its remedy",
             Kind::Forbidden => "a person grants what sub= and accepted= name",
             Kind::NotFound => "the thing does not exist",
             Kind::NotVisible => {

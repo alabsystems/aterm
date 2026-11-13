@@ -46,8 +46,10 @@ pub use complete::{
     output_until_complete_stdout_observed, output_until_complete_stdout_with_limit,
     output_until_complete_stdout_with_limit_unless,
     output_while_process_progressing_complete_stdout,
+    output_while_process_progressing_complete_stdout_records_unless,
     output_while_process_progressing_complete_stdout_unless, output_within_complete_listing,
     output_within_complete_stdout_records, output_within_complete_stdout_records_from,
+    output_within_complete_stdout_records_from_unless,
 };
 #[cfg(unix)]
 pub use complete::{RetainedOutputError, output_until_complete_stdout_retained};
@@ -911,7 +913,9 @@ pub struct ProcessProgressProbe {
 }
 
 impl ProcessProgressProbe {
-    fn read(&mut self, root: u32) -> Option<u64> {
+    /// Observe the root and its complete descendant tree's CPU and I/O. An unread or
+    /// incomparable tree returns `None`, never evidence that the child stopped progressing.
+    pub fn read(&mut self, root: u32) -> Option<u64> {
         self.read_over(process_progress_tree(root))
     }
 

@@ -78,6 +78,7 @@ fn a_content_change_invalidates_every_memoized_row() {
 fn a_line_arriving_while_scrolled_back_reshuffles_rows_correctly() {
     let mut grid = grid_with_history(40);
     grid.scroll_display(10);
+    let cached_row1 = history_row(&grid, 1);
     let text_row0 = row_text(&grid, 0);
     let text_row1 = row_text(&grid, 1);
     assert_ne!(text_row0, text_row1, "the fixture rows are not distinct");
@@ -86,6 +87,7 @@ fn a_line_arriving_while_scrolled_back_reshuffles_rows_correctly() {
         grid.write_char(ch);
     }
     grid.scroll_up(1);
+    let after_row0 = history_row(&grid, 0);
     assert_eq!(
         row_text(&grid, 0),
         text_row1,
@@ -96,6 +98,10 @@ fn a_line_arriving_while_scrolled_back_reshuffles_rows_correctly() {
         text_row0,
         "viewport row 0 still shows the pre-arrival line — a row was served by \
          INDEX across a history growth"
+    );
+    assert!(
+        Arc::ptr_eq(&cached_row1, &after_row0),
+        "live-screen writes and scroll_up invalidated unchanged absolute history rows"
     );
 }
 
@@ -122,4 +128,41 @@ fn memoized_rows_match_a_fresh_materialize_across_a_scrub() {
         }
         grid.scroll_display(-1);
     }
+}
+
+#[test]
+fn early_wrap_hole_row_reflects_live_row_zero_edits_without_stale_memo() {
+    let mut grid = Grid::new(1, 5);
+    for ch in "AAAA".chars() {
+        grid.write_char(ch);
+    }
+    // Wide char at col 4 of a 1x5 grid wraps early, scrolling "AAAA" into
+    // `rev_idx == 0` with an early-wrap hole and placing '漢' at live row 0.
+    let _ = grid.pre_wrap_wide_ecols(crate::Cell::EMPTY);
+    assert!(grid.write_wide_char_at_cursor_packed(
+        '漢',
+        crate::PackedColors::DEFAULT,
+        crate::CellFlags::empty(),
+    ));
+    grid.scroll_display(1);
+
+    let first = history_row(&grid, 0);
+    grid.set_cursor(0, 0);
+    assert!(grid.write_wide_char_at_cursor_packed(
+        '国',
+        crate::PackedColors::with_indexed_bg(1),
+        crate::CellFlags::empty(),
+    ));
+    let second = history_row(&grid, 0);
+    let fresh = grid
+        .materialize_scrollback_row_full(0, grid.cols())
+        .expect("history row exists");
+    assert_eq!(
+        *second, fresh,
+        "early-wrap hole row at rev_idx == 0 must track live row 0 wide opening"
+    );
+    assert_ne!(
+        *first, *second,
+        "mutating live row 0's wide opening background must update the early-wrap history row"
+    );
 }

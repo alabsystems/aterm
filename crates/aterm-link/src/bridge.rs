@@ -6647,8 +6647,10 @@ impl Bridge {
                 .mutant(crate::sim::world::Mutant::ReplayWithoutReadingBack);
             #[cfg(not(test))]
             let read_back = true;
-            // An older build's entry names no head, and one journaled on another log is bound by
-            // nothing here: each published again as before.
+            // An older build's entry names no head, and one journaled on a log that keeps its id
+            // and continues nothing, or whose lineage is unknown, is bound by nothing here: each
+            // published again as before. One journaled on another log is read back from its start
+            // (`Bridge::read_back_from`).
             if let Some(from) = self
                 .read_back_from(entry.log, entry.at)
                 .filter(|_| read_back)
@@ -6660,6 +6662,10 @@ impl Bridge {
                              at @{off}, read back; it is not published again"
                         );
                         self.claim(off, seq);
+                        let landed = publication_identity(&entry.subject, &entry.body);
+                        if !self.land_key_winner(decoded.from.as_deref(), seq, &landed, off) {
+                            return false;
+                        }
                         let ours = self.on_own_lane(&entry.subject);
                         self.land_replayed(seq, off, ours);
                         continue;
@@ -6752,6 +6758,12 @@ impl Bridge {
                     if !entry.pin.via_key {
                         self.claim(off, seq);
                     }
+                    let landed = actual
+                        .clone()
+                        .unwrap_or_else(|| publication_identity(&entry.subject, &entry.body));
+                    if !self.land_key_winner(decoded.from.as_deref(), seq, &landed, off) {
+                        return false;
+                    }
                     let ours = actual
                         .as_ref()
                         .is_none_or(|identity| self.on_own_lane(&identity.subject));
@@ -6791,7 +6803,17 @@ impl Bridge {
     /// that the offsets name records published since the move, a copy an earlier replay
     /// published among them, which the entry's head on its own log may lie above (aterm-link
     /// B05 review: a replay at a head above the new log's put the copy below it, and the next
-    /// replay, missing it, published a second); `None` on another log, or for no head.
+    /// replay, missing it, published a second); 0 on ANOTHER LOG (another id, told with its
+    /// lineage: `state::another_log`), since every record on it landed after the entry was
+    /// journaled, so a copy found there is one an earlier attempt on this very log published,
+    /// whose settle the disk then refused (ATERM-KI-1111-4: the sim's seed 104 of
+    /// `Opts::lossy_logs` met a replay on another log whose `land_replayed` write failed, and
+    /// the next attach, reading nothing back, published a second copy once a cut dropped the
+    /// first one's key); `None` for no head, for a log whose lineage the link cannot read, and
+    /// for one that keeps the id and continues nothing (a restored or shortened copy, a move
+    /// older than the lineage's window), which may still hold records from before the entry: a
+    /// read back from 0 there would settle the entry on an earlier identical record and never
+    /// publish it, so it is published again, as before.
     fn read_back_from(
         &self,
         log: Option<astream_broker::LogIdentity>,
@@ -6803,7 +6825,22 @@ impl Bridge {
         if was == now {
             return Some(at);
         }
-        let fork = now.continues(was, conn.log_lineage()?)?;
+        let lineage = conn.log_lineage()?;
+        if crate::state::another_log(Some(was), Some(now), Some(lineage)) {
+            #[cfg(test)]
+            if self
+                .fx
+                .mutant(crate::sim::world::Mutant::NoReadBackOnAnotherLog)
+            {
+                return None;
+            }
+            #[cfg(test)]
+            if self.fx.mutant(crate::sim::world::Mutant::AnotherLogAsAMove) {
+                return Some(at);
+            }
+            return Some(0);
+        }
+        let fork = now.continues(was, lineage)?;
         #[cfg(test)]
         if self
             .fx
@@ -6945,7 +6982,7 @@ impl Bridge {
     /// this bridge knows its sequence's record is ([`Bridge::claims`]: the attach's replay
     /// settled its entry there, or an earlier retry published it), or else read back
     /// ([`Bridge::landed_since`]) from the head the pin was made at (`PublishPin::at`, which a
-    /// move brings down to where the new log continues the old, or takes out:
+    /// move brings down to where the new log continues the old, and another log to its start:
     /// `StateDir::publication_offset_resets`), or, for a pin whose file holds no head (a
     /// receipt's), from that of its record in flight while it stands. `None` for none; for a
     /// pin that names no head and has no record in flight on this log, which is published again
@@ -7440,6 +7477,43 @@ impl Bridge {
             self.awaiting_drain.remove(&seq);
         } else {
             self.unsettled.insert(off, seq);
+        }
+    }
+
+    /// The key whose winner the attach's replay landed at `off`, told it
+    /// ([`StateDir::land_key_winner`]): `sender`'s, the post's `from=`. `false` where the disk
+    /// refused it, and the attach is given up: the next one reads the record back and tells it
+    /// again. NEGATIVE CONTROL (`Mutant::ReplayLeavesTheKeysWinnerUntold`).
+    fn land_key_winner(
+        &self,
+        sender: Option<&str>,
+        seq: u64,
+        landed: &PublishIdentity,
+        off: u64,
+    ) -> bool {
+        #[cfg(test)]
+        if self
+            .fx
+            .mutant(crate::sim::world::Mutant::ReplayLeavesTheKeysWinnerUntold)
+        {
+            return true;
+        }
+        // A post's `from=` is its session (`post_body`); anything that cannot name a file in
+        // `keys/` names no key.
+        let Some(sid) = sender.filter(|sid| {
+            !sid.is_empty() && !sid.starts_with('.') && !sid.contains(['/', '@', '\0'])
+        }) else {
+            return true;
+        };
+        match self.state.land_key_winner(sid, seq, landed, off) {
+            Ok(_) => true,
+            Err(e) => {
+                stderr_line!(
+                    "aterm-link: the key whose winner the in-flight record at sequence {seq} \
+                     landed at @{off} could not be told it: {e}; not attaching"
+                );
+                false
+            }
         }
     }
 
@@ -8729,6 +8803,14 @@ impl Bridge {
         let continues = seen
             .continues(ident, lineage)
             .filter(|_| ident.is_some() && ident != seen.id);
+        #[cfg(test)]
+        let continues = continues.or_else(|| {
+            (ident.is_some()
+                && ident != seen.id
+                && lineage.is_some()
+                && self.fx.mutant(crate::sim::world::Mutant::AnotherLogAsAMove))
+            .then(|| seen.high.min(head))
+        });
         seen.replaced_by(head, ident).then_some(Replaced {
             head,
             was_high: seen.high,
@@ -8805,6 +8887,22 @@ impl Bridge {
         keep_below: Option<u64>,
         lineage: Option<&astream_broker::Lineage>,
     ) -> io::Result<(usize, usize)> {
+        #[cfg(test)]
+        let keep_below = keep_below.or_else(|| {
+            self.fx
+                .mutant(crate::sim::world::Mutant::KeepFloorOnAnotherLog)
+                .then(|| self.log_witness.high.max(self.bus_high))
+        });
+        #[cfg(test)]
+        self.state.skip_publication_resets(
+            self.fx
+                .mutant(crate::sim::world::Mutant::ForgetPinResetsOnAnotherLog),
+        );
+        #[cfg(test)]
+        self.state.pin_head_gone_on_another_log(
+            self.fx
+                .mutant(crate::sim::world::Mutant::PinHeadGoneOnAnotherLog),
+        );
         let keep_below = keep_below.map(|f| f.min(head));
         let kept = |off: u64| keep_below.is_some_and(|f| off < f);
         #[cfg(test)]
@@ -8819,9 +8917,9 @@ impl Bridge {
         if forget_pin {
             self.mirror_forget_log()?;
         }
-        let dropped = self
-            .state
-            .forget_log_offsets(head, log, keep_below, lineage)?;
+        let dropped =
+            self.state
+                .forget_log_offsets(head, self.bus_log, log, keep_below, lineage)?;
         for (seq, face) in &dropped {
             stderr_line!(
                 "aterm-link: the in-flight record at sequence {seq} on {face} was decided on \
@@ -14071,7 +14169,7 @@ fn stand_by(
     take: impl FnOnce() -> io::Result<BridgeLock> + Send + 'static,
 ) -> io::Result<BridgeLock> {
     use std::os::fd::AsFd as _;
-    let (woken, wake) = std::io::pipe()?;
+    let (woken, wake) = aterm_uds::pipe()?;
     let (answer, answered) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name(STANDBY_THREAD.to_string())

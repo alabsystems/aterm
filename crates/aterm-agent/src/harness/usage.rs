@@ -1264,7 +1264,7 @@ const PANEL_TITLES: [(&str, &str); 5] = [
     ("Current session", "five_hour"),
     ("Current week (all models)", "seven_day"),
     ("Current week (Sonnet only)", "seven_day_sonnet"),
-    ("Current week (Fable)", "seven_day_overage_included"),
+    ("Current week (Fable)", FABLE_WEEK_WINDOW),
     ("Spend limit", "spend_limit"),
 ];
 
@@ -1500,6 +1500,10 @@ pub fn usage_panel_read(rows: &[String], header: usize) -> PanelRead {
 const SESSION_WINDOW: &str = "five_hour";
 const WEEK_WINDOW: &str = "seven_day";
 
+/// The window key of the panel's `Current week (Fable)` row ([`PANEL_TITLES`]): Fable's own week,
+/// the bucket its limit notice names ([`super::profile::Bucket::Fable`]).
+pub const FABLE_WEEK_WINDOW: &str = super::profile::Bucket::Fable.id();
+
 /// A settled panel's windows as the roster's sample ([`super::accounts::Sample`], what `accounts::note_sample` records).
 #[must_use]
 pub fn panel_sample(
@@ -1520,16 +1524,8 @@ pub fn panel_sample_local(
     zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
 ) -> Option<super::accounts::Sample> {
     use super::accounts::{RESET_BELIEVED_S, SESSION_WINDOW_S, STAMP_SKEW_S, Sample};
-    use crate::supervise::limit;
     let read = |name: &str, ahead_max: i64| {
-        let window = windows.iter().find(|w| w.name == name)?;
-        let reset = window
-            .reset_text
-            .as_deref()
-            .and_then(limit::parse_reset)
-            .map(|spec| limit::reset_at_local(&spec, now, local_at, zone_offset_at))
-            .filter(|at| at.saturating_sub(now) <= ahead_max);
-        Some((window.used_pct, reset))
+        panel_window_local(windows, name, ahead_max, now, local_at, zone_offset_at)
     };
     let session = read(
         SESSION_WINDOW,
@@ -1549,6 +1545,29 @@ pub fn panel_sample_local(
         at: now,
         by: String::new(),
     })
+}
+
+/// The settled panel's window `name` as its percent used and its reset placed on the clock at
+/// `now` (`local_at`, `zone_offset_at`: [`panel_sample_local`]'s), a reset more than `ahead_max`
+/// seconds ahead read as none; `None` where the panel drew no such row.
+#[must_use]
+pub fn panel_window_local(
+    windows: &[PanelWindow],
+    name: &str,
+    ahead_max: i64,
+    now: i64,
+    local_at: &dyn Fn(i64) -> Option<i64>,
+    zone_offset_at: &dyn Fn(&str, i64) -> Option<i64>,
+) -> Option<(u32, Option<i64>)> {
+    use crate::supervise::limit;
+    let window = windows.iter().find(|w| w.name == name)?;
+    let reset = window
+        .reset_text
+        .as_deref()
+        .and_then(limit::parse_reset)
+        .map(|spec| limit::reset_at_local(&spec, now, local_at, zone_offset_at))
+        .filter(|at| at.saturating_sub(now) <= ahead_max);
+    Some((window.used_pct, reset))
 }
 
 /// The fold's per-model totals as spend rows.

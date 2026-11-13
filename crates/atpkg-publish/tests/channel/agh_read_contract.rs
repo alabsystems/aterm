@@ -755,6 +755,29 @@ fn case_probe_public(w: &dyn World) {
     );
 }
 
+/// A PROBE THAT IS NOT ANSWERED DECIDES NOTHING: the download host's 500 or 403 for an asset
+/// it holds is `Unknown`, never `Absent`, so no reader (the newest-index walk, the mirror's
+/// confirmations, the index's served check) takes an outage for absence. NEGATIVE CONTROL:
+/// mapping agh's `Unknown` to `Absent` fails both.
+#[test]
+fn agh_probe_public_answers_an_outage_or_a_refusal_unknown_never_absent() {
+    let w = AghWorld::new();
+    w.put("v1", false, true, &[("a.bin", b"ay"), ("b.bin", b"bee")]);
+    assert_eq!(
+        w.host.probe_public(&slug(), "v1", "a.bin"),
+        Probe::Present,
+        "the control: the asset is there"
+    );
+    let download = |asset: &str| Match::web(&format!("/{SLUG}/releases/download/v1/{asset}"));
+    w.fake.fault_always(download("a.bin"), answering(500));
+    w.fake.fault_always(download("b.bin"), answering(403));
+    for asset in ["a.bin", "b.bin"] {
+        let probe = w.host.probe_public(&slug(), "v1", asset);
+        assert!(matches!(probe, Probe::Unknown(_)), "{asset}: {probe:?}");
+    }
+    assert_eq!(w.fake.violations(), Vec::<String>::new());
+}
+
 #[test]
 fn probe_public_fake() {
     case_probe_public(&FakeWorld::new());
@@ -1098,6 +1121,30 @@ fn agh_repo_seen_answers_false_only_when_both_reads_miss() {
         .map(|s| s.had_authorization)
         .collect();
     assert_eq!(reads, [true, false], "{:?}", w.fake.seen());
+
+    // An existing private repository this identity cannot read answers as a missing one.
+    let hidden = Slug::new(OWNER, "private-hidden");
+    w.fake
+        .add_repo("fixture-dev/private-hidden", RepoSpec::private());
+    let release = w.host.release(&hidden, "atpkg-x-1");
+    assert!(
+        matches!(release, Err(HostError::Unreachable(_))),
+        "the existing private repository is unreadable to fixture-dev-bot: {release:?}"
+    );
+    let from = w.fake.seen().len();
+    assert_eq!(w.host.repo_seen(&hidden), Ok(false));
+    let asked: Vec<(String, bool)> = w.fake.seen()[from..]
+        .iter()
+        .map(|seen| (seen.path_and_query.clone(), seen.had_authorization))
+        .collect();
+    assert_eq!(
+        asked,
+        [
+            ("/repos/fixture-dev/private-hidden".to_string(), true),
+            ("/repos/fixture-dev/private-hidden".to_string(), false),
+        ],
+        "an existing private repository answers the same two misses as a missing one"
+    );
     assert!(matches!(
         w.host.repo_seen(&Slug::new("fixture-ext", "packs")),
         Err(HostError::Refused(_))
@@ -1123,6 +1170,250 @@ fn agh_repo_seen_does_not_repeat_an_already_anonymous_404() {
         .map(|seen| seen.had_authorization)
         .collect();
     assert_eq!(reads, [false], "{:?}", w.fake.seen());
+}
+
+/// A status.
+fn answering(status: u16) -> Fault {
+    Fault::Status {
+        status,
+        body: String::new(),
+        headers: vec![],
+    }
+}
+
+/// Whether each request for `path` since the `from`th carried a credential, in order.
+fn asked_since(w: &AghWorld, from: usize, path: &str) -> Vec<bool> {
+    w.fake.seen()[from..]
+        .iter()
+        .filter(|seen| seen.path_and_query == path)
+        .map(|seen| seen.had_authorization)
+        .collect()
+}
+
+/// AN OWNER THAT DOES NOT ANSWER IS NOT AN ANSWER: a repository read that fails other than
+/// as a miss (a 500 on the identity's read, or on the anonymous read after the identity's
+/// 404) is `Unreachable`, never `Ok(false)`, so the D50 arm never stages a pack it could not
+/// check is not public. A private repository the identity can push to is seen, and a transient
+/// 504 on the anonymous read is retried within agh's budget to the 200 behind it. NEGATIVE
+/// CONTROL: `repo_seen` answering every error as unseen fails the first half.
+#[test]
+fn agh_repo_seen_answers_an_outage_as_an_error_never_as_unseen() {
+    let w = AghWorld::new();
+    let outage = "/repos/fixture-dev/outage";
+    w.fake.fault_always(Match::api(outage), answering(500));
+    let from = w.fake.seen().len();
+    let seen = w.host.repo_seen(&Slug::new(OWNER, "outage"));
+    assert!(matches!(seen, Err(HostError::Unreachable(_))), "{seen:?}");
+    assert_eq!(
+        asked_since(&w, from, outage),
+        [true],
+        "the first read decides"
+    );
+
+    let anonymous = "/repos/fixture-dev/anonymous-outage";
+    w.fake.fault(Match::api(anonymous), answering(404));
+    w.fake.fault_always(Match::api(anonymous), answering(500));
+    let from = w.fake.seen().len();
+    let seen = w.host.repo_seen(&Slug::new(OWNER, "anonymous-outage"));
+    assert!(matches!(seen, Err(HostError::Unreachable(_))), "{seen:?}");
+    assert_eq!(asked_since(&w, from, anonymous), [true, false]);
+
+    w.fake.add_repo(
+        "fixture-dev/private-pushed",
+        RepoSpec::private().push("fixture-dev-bot"),
+    );
+    assert_eq!(
+        w.host.repo_seen(&Slug::new(OWNER, "private-pushed")),
+        Ok(true),
+        "a private repository the identity can see"
+    );
+    assert_eq!(w.fake.violations(), Vec::<String>::new());
+
+    let w = AghWorld::with_policy(true, true, RetryPolicy::STANDARD);
+    let transient = "/repos/fixture-dev/transient";
+    // A public repository whose identity read answers 404, then whose anonymous read answers
+    // 504 once before GitHub's own 200.
+    w.fake.add_repo("fixture-dev/transient", RepoSpec::public());
+    w.fake.fault(Match::api(transient), answering(404));
+    w.fake.fault(Match::api(transient), answering(504));
+    let from = w.fake.seen().len();
+    let seen = w.host.repo_seen(&Slug::new(OWNER, "transient"));
+    assert_eq!(seen, Ok(true), "{:?}", w.fake.seen());
+    assert_eq!(asked_since(&w, from, transient), [true, false, false]);
+    assert_eq!(w.fake.violations(), Vec::<String>::new());
+}
+
+/// A MOVE IS NO MISS: a repository whose old name answers 301 is no repository GitHub lacks.
+/// agh follows a move whose new name its anonymous lookup can read, so a moved public
+/// repository is seen; one whose new name that lookup cannot read is `not_visible` with a move
+/// (`Sub::Moved`), which `repo_seen` answers `Unreachable`, never `Ok(false)`. NEGATIVE
+/// CONTROL: counting a moved `not_visible` as a miss answers the private move `Ok(false)`.
+#[test]
+fn agh_repo_seen_never_counts_a_move_as_a_miss() {
+    let w = AghWorld::new();
+    w.fake
+        .add_repo("fixture-dev/old-public", RepoSpec::public());
+    w.fake
+        .rename_repo("fixture-dev/old-public", "fixture-dev/new-public");
+    assert_eq!(
+        w.host.repo_seen(&Slug::new(OWNER, "old-public")),
+        Ok(true),
+        "{:?}",
+        w.fake.seen()
+    );
+
+    w.fake.add_repo(
+        "fixture-dev/old-private",
+        RepoSpec::private().push("fixture-dev-bot"),
+    );
+    w.fake
+        .rename_repo("fixture-dev/old-private", "fixture-dev/new-private");
+    let from = w.fake.seen().len();
+    let seen = w.host.repo_seen(&Slug::new(OWNER, "old-private"));
+    assert!(
+        matches!(&seen, Err(HostError::Unreachable(why)) if why.contains("moved")),
+        "{seen:?} after {:?}",
+        &w.fake.seen()[from..]
+    );
+    assert_eq!(
+        asked_since(&w, from, "/repos/fixture-dev/old-private"),
+        [true],
+        "the move ends the read; no anonymous read follows it"
+    );
+    assert_eq!(w.fake.violations(), Vec::<String>::new());
+}
+
+/// What a failed or answered-absent `AghHost::download` leaves of the caller's files. Every
+/// requested name is resolved before anything is downloaded, so a name the release lacks
+/// writes nothing, even a present name asked before it. agh stages each asset as
+/// `<dest>.agh-part` and renames it only after its digest check, so a 503 or a 404 on asset k
+/// leaves asset k's final file as it was, while an asset before k already holds its verified
+/// bytes: assets are placed one at a time, not all or none. The part file is agh's own
+/// staging name, which no caller can own through this API (a listed asset named like one is
+/// refused), so a stale one is removed. NEGATIVE CONTROL: downloading each asset as its name
+/// resolves writes `a.bin` before `missing.bin` is found absent, which fails the first half.
+#[test]
+fn agh_download_failure_and_absence_preserve_caller_owned_files() {
+    let held: &[u8] = b"caller's completed bytes";
+    let lay = |dir: &Path, names: &[&str]| {
+        for name in names {
+            std::fs::write(dir.join(name), held).expect("the caller's final file");
+            std::fs::write(
+                agh::download::part_path(&dir.join(name)),
+                b"a stale part of agh's",
+            )
+            .expect("a stale part");
+        }
+    };
+    let kept = |dir: &Path, name: &str| {
+        assert_eq!(
+            std::fs::read(dir.join(name)).expect("the caller's final survives"),
+            held,
+            "{name}"
+        );
+        assert!(
+            !agh::download::part_path(&dir.join(name)).exists(),
+            "{name}: agh's part file is removed"
+        );
+    };
+
+    // A name the release lacks: nothing is written, not even the present name asked first.
+    let w = AghWorld::new();
+    w.put("v1", false, true, &[("a.bin", b"new bytes")]);
+    let dir = scratch("agh-preserve-absent");
+    std::fs::write(dir.path().join("a.bin"), held).expect("the caller's final file");
+    assert_eq!(
+        w.host
+            .download(&slug(), "v1", &["a.bin", "missing.bin"], dir.path()),
+        Err(HostError::NotFound)
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("a.bin")).expect("a.bin"),
+        held,
+        "an absent name writes nothing"
+    );
+    assert!(!dir.path().join("missing.bin").exists());
+    assert_eq!(w.download_attempts(), 0, "nothing is downloaded");
+    assert_eq!(w.fake.violations(), Vec::<String>::new());
+
+    // An outage (503, retried to exhaustion) or an answered 404 on the second asset.
+    for (status, expected) in [(503, "unreachable"), (404, "not-found")] {
+        let w = AghWorld::new();
+        let id = w.fake.add_release(
+            SLUG,
+            ReleaseSpec::published("v1", "2026-10-01T00:00:00Z").prerelease(true),
+        );
+        w.fake
+            .add_asset(id, AssetSpec::uploaded("a.bin", b"new ay bytes"));
+        let b = w
+            .fake
+            .add_asset(id, AssetSpec::uploaded("b.bin", b"new bee bytes"));
+        w.fake.fault_always(
+            Match::api(&format!("{ASSETS}{b}")).method("GET"),
+            Fault::Status {
+                status,
+                body: String::new(),
+                headers: Vec::new(),
+            },
+        );
+        let dir = scratch(&format!("agh-preserve-{status}"));
+        lay(dir.path(), &["a.bin", "b.bin"]);
+        let result = w
+            .host
+            .download(&slug(), "v1", &["a.bin", "b.bin"], dir.path());
+        match (status, &result) {
+            (404, Err(HostError::NotFound)) | (503, Err(HostError::Unreachable(_))) => {}
+            _ => panic!("{expected}: {result:?}"),
+        }
+        assert_eq!(
+            std::fs::read(dir.path().join("a.bin")).expect("a.bin"),
+            b"new ay bytes",
+            "the asset before the failure holds its verified bytes"
+        );
+        assert!(!agh::download::part_path(&dir.path().join("a.bin")).exists());
+        kept(dir.path(), "b.bin");
+        assert_eq!(w.fake.violations(), Vec::<String>::new());
+    }
+}
+
+/// A public read that does not deliver leaves the caller's file alone: an absent asset is
+/// `Absent`, and an outage of the download host and the API is `Unknown`, never absence; in
+/// neither is `dest` written. NEGATIVE CONTROL: removing `dest` after a read that did not
+/// deliver fails both halves; reading a failed outage as absence fails the second.
+#[test]
+fn agh_public_fetch_outage_preserves_caller_owned_bytes() {
+    let w = AghWorld::new();
+    w.put("v1", false, true, &[("a.bin", b"ay")]);
+    let dir = scratch("agh-public-preserve");
+    let dest = dir.path().join("asset.bin");
+    let held = b"caller's completed bytes";
+    std::fs::write(&dest, held).expect("the earlier fetch");
+    let absent = w.host.fetch_public(&slug(), "v1", "missing.bin", &dest, 64);
+    assert_eq!(absent, Probe::Absent);
+    assert_eq!(
+        std::fs::read(&dest).expect("the caller's bytes survive an absent asset"),
+        held
+    );
+
+    let unavailable = || Fault::Status {
+        status: 503,
+        body: String::new(),
+        headers: Vec::new(),
+    };
+    w.fake
+        .fault_always(Match::web(&format!("/{SLUG}/releases/")), unavailable());
+    w.fake.fault_always(Match::cdn(), unavailable());
+    w.fake.fault_always(
+        Match::api(&format!("/repos/{SLUG}/releases")),
+        unavailable(),
+    );
+    let failed = w.host.fetch_public(&slug(), "v1", "a.bin", &dest, 64);
+    assert!(matches!(failed, Probe::Unknown(_)), "{failed:?}");
+    assert_eq!(
+        std::fs::read(&dest).expect("the caller's bytes survive a failed read"),
+        held
+    );
+    assert!(!agh::download::part_path(&dest).exists());
 }
 
 #[test]

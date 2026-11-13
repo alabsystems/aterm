@@ -22,7 +22,7 @@ fn layout() -> Layout {
     )
 }
 
-/// The three classes, and every rejection beside them: CHANGELOG.md (until §2.1b), other
+/// The three classes (root Markdown includes CHANGELOG.md), and every rejection beside them: other
 /// file types, a fork's or an excluded crate's Markdown, a SPECS.md that is not at a member's
 /// root, docs Markdown a package owns, and paths with empty, `.` or `..` segments.
 #[test]
@@ -31,6 +31,7 @@ fn the_class_is_root_docs_and_member_spec_markdown() {
     for path in [
         "AGENTS.md",
         "README.md",
+        "CHANGELOG.md",
         "docs/KNOWN_ISSUES.md",
         "docs/measured/x/README.md",
         "crates/a/SPECS.md",
@@ -38,7 +39,6 @@ fn the_class_is_root_docs_and_member_spec_markdown() {
         assert!(class(path, &layout), "{path}");
     }
     for path in [
-        "CHANGELOG.md",
         "Cargo.toml",
         "docs/shot.png",
         "docs/conf.toml",

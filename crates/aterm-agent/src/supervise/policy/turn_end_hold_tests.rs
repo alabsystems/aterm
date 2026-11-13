@@ -9,7 +9,7 @@ use crate::supervise::policy::turn_end::HoldStart;
 
 const WORK: &str = "Implemented the parser module and its unit tests in this turn.";
 const CLEAN: &str = "Nothing left: the parser is committed and pushed to origin/main.";
-const NEED: &str = "rotate the deploy key";
+const NEED: &str = "rotate the deploy nod";
 
 fn needs_defense() -> String {
     format!("NEEDS YOU: {NEED}\n{CLEAN}")

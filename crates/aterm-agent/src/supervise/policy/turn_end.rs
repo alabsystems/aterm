@@ -14,6 +14,7 @@ use aterm_phase::{ApiCause, Program};
 use super::super::config::{Autopilot, SupervisorConfig};
 use super::super::limit::ResetClock;
 use super::approval::PriorityWord;
+use super::credential_need::{self, RULE_CREDENTIAL};
 use super::exception::FUTILE_AFTER_TRIES;
 use super::go_ahead::{self, RULE_GO_AHEAD};
 use super::land_check;
@@ -10408,78 +10409,10 @@ pub const ACCOUNT_MOVES_PER_WINDOW: usize = 4;
 
 const ACCOUNT_WAIT_FLOOR: Duration = Duration::from_secs(60);
 
-/// The words a worker says it is DONE with.
-pub const DONE_PHRASES: &[&str] = &[
-    "nothing left to do",
-    "nothing else to do",
-    "nothing more to do",
-    "nothing further to do",
-    "nothing left to work on",
-    "no further work",
-    "no remaining work",
-    "no more work",
-    "all done",
-    "all tasks are complete",
-    "all tasks complete",
-    "everything is done",
-    "everything is already done",
-    "everything is complete",
-    "already complete",
-    "work is complete",
-    "work is done",
-    "task is complete",
-    "workflow is finished",
-    "workflow is complete",
-    "all tasks are completed",
-    "all tasks completed",
-    "everything is completed",
-    "work is completed",
-    "task is completed",
-    "workflow is completed",
-    "everything was completed",
-    "everything is already completed",
-    "everything was already completed",
-    "everything has already been completed",
-    "everything had already been completed",
-    "everything was already done",
-    "all tasks were completed",
-    "all tasks are already completed",
-    "all tasks were already completed",
-    "all tasks have already been completed",
-    "all tasks had already been completed",
-    "work was completed",
-    "work is already completed",
-    "work was already completed",
-    "work has already been completed",
-    "work had already been completed",
-    "task was completed",
-    "task is already completed",
-    "task was already completed",
-    "task has already been completed",
-    "task had already been completed",
-    "completed successfully",
-    "what would you like me to work on",
-    "what would you like me to do",
-    "what should i work on",
-    "what else would you like",
-    "let me know if you need anything",
-    "let me know if there's anything else",
-    "what's next?",
-    "anything else?",
-    "i'm stopping here",
-    "i am stopping here",
-    "i'll stop here",
-    "i will stop here",
-    "i've stopped.",
-    "i have stopped.",
-    "so the next session can",
-    "everything i can do is",
-    "everything this machine can do",
-    "nothing more i can do",
-    "nothing else i can do",
-];
-
-/// WHETHER THE WORKER'S LAST WORDS CLAIM IT IS DONE.
+/// Whether the tail has a `Nothing left:` defense line ([`needs::defense_line`]) or a
+/// legacy done token ([`says_done_outright`]), outside its `NEEDS YOU` lines.
+/// Ordinary completion prose receives normal turn-end handling. A claim ends no task:
+/// Cruise requests another kind of work; Land finishes only at its land check's `LANDED` answer.
 #[must_use]
 pub fn says_done(tail: Option<&str>) -> bool {
     let Some(t) = tail else {
@@ -10490,393 +10423,22 @@ pub fn says_done(tail: Option<&str>) -> bool {
     }
     LAST.with(|last| {
         last.get_or(t, || {
-            needs::defense_line(t).is_some() || says_done_read(&needs::without_needs(t))
+            needs::defense_line(t).is_some() || says_done_outright(&needs::without_needs(t))
         })
     })
 }
 
-const CHECK_ECHO: [&str; 3] = [
-    "nothing of the job is left",
-    "everything left needs a person",
-    "finished and verified",
-];
-
-fn says_done_read(t: &str) -> bool {
-    if says_done_outright(t) {
-        return true;
-    }
-    let flat = done_flat(t);
-    says_idle(&flat) || CHECK_ECHO.iter().any(|echo| said_as_report(&flat, echo))
-}
-
-fn said_as_report(flat: &str, echo: &str) -> bool {
-    flat.match_indices(echo).any(|(at, _)| {
-        !negated_before(flat, at)
-            && !conditional_at(flat, at, echo)
-            && !partial_subject_at(flat, at, echo)
-    })
-}
-
-const CLAUSE_ENDS: &[char] = &[',', ';', ':', '.', '!', '?', '—', '–', '(', ')'];
-
-fn clause_before(flat: &str, at: usize) -> Vec<&str> {
-    flat[..at]
-        .rsplit(CLAUSE_ENDS)
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .collect()
-}
-
-fn conditional_at(flat: &str, at: usize, phrase: &str) -> bool {
-    const IF: &[&str] = &["if", "when", "whenever", "unless", "once"];
-    const STATES: &[&[&str]] = &[
-        &["provided"],
-        &["providing"],
-        &["assuming"],
-        &["supposing"],
-        &["as", "soon", "as"],
-        &["as", "long", "as"],
-    ];
-    const LEADS: &[&[&str]] = &[
-        &["after"],
-        &["before"],
-        &["by", "the", "time"],
-        &["in", "case"],
-        &["whether"],
-    ];
-    let after = if phrase.ends_with(CLAUSE_ENDS) {
-        ""
-    } else {
-        flat[at + phrase.len()..]
-            .split(CLAUSE_ENDS)
-            .next()
-            .unwrap_or("")
-    };
-    let mut words = clause_before(flat, at);
-    let p = words.len();
-    words.push("\0");
-    words.extend(after.split_whitespace());
-    let word = |j: Option<usize>| j.and_then(|j| words.get(j)).copied().unwrap_or("");
-    (0..words.len()).any(|i| {
-        let w = words[i];
-        let (next, prev, prev2) = (
-            word(i.checked_add(1)),
-            word(i.checked_sub(1)),
-            word(i.checked_sub(2)),
-        );
-        let count = w == "once"
-            && (matches!(next, "more" | "again")
-                || prev == "at"
-                || (prev == "than" && prev2 == "more"));
-        let rest = &words[i..];
-        let leads = i < p
-            && (LEADS.iter().any(|s| words[i..p].starts_with(s))
-                || (matches!(w, "until" | "till") && waits_at(&words, i)));
-        (IF.contains(&w) && !count) || STATES.iter().any(|s| rest.starts_with(s)) || leads
-    })
-}
-
-fn partial_subject_at(flat: &str, at: usize, phrase: &str) -> bool {
-    const WHOLE: &[&str] = &[
-        "the", "this", "that", "my", "your", "our", "all", "whole", "entire",
-    ];
-    const PART: &[&str] = &[
-        "half",
-        "most",
-        "some",
-        "part",
-        "much",
-        "almost",
-        "nearly",
-        "mostly",
-        "partly",
-        "largely",
-        "practically",
-        "virtually",
-        "of",
-    ];
-    let noun = phrase.starts_with("task ") || phrase.starts_with("work ");
-    if !(noun || phrase.starts_with("all ") || phrase.starts_with("everything ")) {
-        return false;
-    }
-    let before = clause_before(flat, at);
-    let mut i = before.len();
-    if noun {
-        while i > 0 && WHOLE.contains(&before[i - 1]) {
-            i -= 1;
-        }
-        if i == before.len() && i > 0 {
-            // A modifier, not a determiner, just before the noun.
-            return true;
-        }
-    }
-    match i.checked_sub(1).map(|j| before[j]) {
-        Some("of") => i < 2 || before[i - 2] != "all",
-        Some(w) => PART.contains(&w),
-        None => false,
-    }
-}
-
+/// Whether `t` holds a legacy done line: [`FINISHED`] alone on a line ([`is_finished_line`]), or
+/// `DONE` as the whole reply (the answer [`DONE_CHECK_BEFORE`] asked for).
 #[must_use]
 pub(crate) fn says_done_outright(t: &str) -> bool {
-    if t.lines().any(is_finished_line) || t.trim_matches(|c: char| !c.is_alphanumeric()) == "DONE" {
-        return true;
-    }
-    let blocks: Vec<String> = done_blocks(&without_code(t))
-        .iter()
-        .map(|b| done_flat(b))
-        .collect();
-    let last = blocks.len().saturating_sub(1);
-    DONE_PHRASES.iter().any(|p| {
-        blocks
-            .iter()
-            .enumerate()
-            .any(|(i, b)| said_done_phrase(b, p, i == last))
-    })
-}
-
-fn without_code(t: &str) -> String {
-    let mut block = None;
-    let mut out: Vec<String> = Vec::new();
-    for line in t.lines() {
-        if needs::fenced_line(line, &mut block) {
-            out.push(String::new());
-            continue;
-        }
-        let parts: Vec<&str> = line.split('`').collect();
-        let last = parts.len().saturating_sub(1);
-        let kept: Vec<&str> = parts
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| i % 2 == 0 || (last % 2 == 1 && i == last))
-            .map(|(_, p)| *p)
-            .collect();
-        out.push(kept.join(" "));
-    }
-    out.join("\n")
-}
-
-fn done_blocks(t: &str) -> Vec<String> {
-    let mut blocks: Vec<String> = Vec::new();
-    let mut open = false;
-    let mut introduced = false;
-    for line in t.lines() {
-        let l = line.trim();
-        if l.is_empty() {
-            open = false;
-            continue;
-        }
-        if !open || (opens_item(l) && !introduced) {
-            blocks.push(String::new());
-            open = true;
-            introduced = false;
-        }
-        let b = blocks.last_mut().expect("a block was opened");
-        b.push(' ');
-        b.push_str(l);
-        introduced |= l.ends_with(':');
-    }
-    blocks
-}
-
-fn opens_item(l: &str) -> bool {
-    let rest = if let Some(r) = l.strip_prefix(['-', '*', '•']) {
-        r
-    } else if l.starts_with('#') {
-        l.trim_start_matches('#')
-    } else {
-        let digits = l.trim_start_matches(|c: char| c.is_ascii_digit());
-        if digits.len() == l.len() {
-            return false;
-        }
-        match digits.strip_prefix(['.', ')']) {
-            Some(r) => r,
-            None => return false,
-        }
-    };
-    rest.starts_with(char::is_whitespace)
-}
-
-const BUSY: &[&str] = &[
-    "still running",
-    "still going",
-    "still working",
-    "still in progress",
-    "is running:",
-    "are running:",
-    "next step",
-    "is next",
-];
-
-const WAIT_WORDS: &[&str] = &["until", "till", "once"];
-
-const WAIT_PHRASES: &[&str] = &[
-    "will notify",
-    "notify me",
-    "notifies me",
-    "waiting on",
-    "waiting for",
-    "reports back",
-    "report back",
-];
-
-const ASKS_NEXT: &[&str] = &["what's next?", "anything else?"];
-
-fn said_done_phrase(flat: &str, phrase: &str, last: bool) -> bool {
-    flat.match_indices(phrase).any(|(at, _)| {
-        if !whole_words_at(flat, at, phrase) {
-            return false;
-        }
-        if negated_before(flat, at)
-            || conditional_at(flat, at, phrase)
-            || partial_subject_at(flat, at, phrase)
-        {
-            return false;
-        }
-        let (start, end) = sentence_of(flat, at, phrase);
-        if waits_in(&flat[start..end]) {
-            return false;
-        }
-        !(ASKS_NEXT.contains(&phrase)
-            && (!last || flat[at + phrase.len()..].chars().any(char::is_alphanumeric)))
-    })
-}
-
-fn whole_words_at(flat: &str, at: usize, phrase: &str) -> bool {
-    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
-    let end = at + phrase.len();
-    !word(flat[..at].chars().next_back())
-        && !(phrase.ends_with(char::is_alphanumeric) && word(flat[end..].chars().next()))
-}
-
-fn sentence_of(flat: &str, at: usize, phrase: &str) -> (usize, usize) {
-    const ENDS: [&str; 3] = [". ", "! ", "? "];
-    let start = ENDS
-        .iter()
-        .filter_map(|e| flat[..at].rfind(e).map(|i| i + e.len()))
-        .max()
-        .unwrap_or(0);
-    let from = at + phrase.trim_end_matches(['.', '?', '!']).len();
-    let end = ENDS
-        .iter()
-        .filter_map(|e| flat[from..].find(e).map(|i| from + i + 1))
-        .min()
-        .unwrap_or(flat.len());
-    (start, end)
-}
-
-fn waits_in(sentence: &str) -> bool {
-    if WAIT_PHRASES
-        .iter()
-        .chain(BUSY)
-        .any(|w| sentence.contains(w))
-    {
-        return true;
-    }
-    let words: Vec<&str> = sentence
-        .split(|c: char| !(c.is_alphanumeric() || c == '\'' || c == '-'))
-        .filter(|w| !w.is_empty())
-        .collect();
-    (0..words.len()).any(|i| WAIT_WORDS.contains(&words[i]) && waits_at(&words, i))
-}
-
-fn waits_at(words: &[&str], i: usize) -> bool {
-    const PERSON: &[&str] = &["you", "you're", "you've", "someone", "somebody"];
-    const PERSON_NOUN: &[&str] = &["owner", "user", "person", "owner's", "user's", "person's"];
-    const PERSONS_ACT: &[&str] = &[
-        "review",
-        "approval",
-        "go",
-        "decision",
-        "reply",
-        "answer",
-        "input",
-        "feedback",
-        "sign",
-        "confirmation",
-        "ok",
-        "okay",
-        "say",
-        "permission",
-        "instructions",
-        "response",
-        "call",
-    ];
-    let word = |j: Option<usize>| j.and_then(|j| words.get(j)).copied().unwrap_or("");
-    let (next, next2) = (word(i.checked_add(1)), word(i.checked_add(2)));
-    let (prev, prev2) = (word(i.checked_sub(1)), word(i.checked_sub(2)));
-    let person = PERSON.contains(&next)
-        || (matches!(next, "the" | "a") && PERSON_NOUN.contains(&next2))
-        || (next == "your"
-            && next2
-                .split('-')
-                .next()
-                .is_some_and(|w| PERSONS_ACT.contains(&w)));
-    let count = words[i] == "once"
-        && (matches!(next, "more" | "again")
-            || prev == "at"
-            || (prev == "than" && prev2 == "more"));
-    !(person || count)
-}
-
-fn said_unnegated(flat: &str, phrase: &str) -> bool {
-    flat.match_indices(phrase)
-        .any(|(at, _)| !negated_before(flat, at))
-}
-
-fn negated_before(flat: &str, at: usize) -> bool {
-    flat[..at]
-        .split(' ')
-        .rev()
-        .filter(|w| !w.is_empty())
-        .take(2)
-        .take_while(|w| !w.ends_with(['.', ',', ':', ';', '!', '?']))
-        .any(|w| w == "not" || w == "cannot" || w.ends_with("n't"))
-}
-
-fn done_flat(t: &str) -> String {
-    t.to_lowercase()
-        .replace('’', "'")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn says_idle(flat: &str) -> bool {
-    const EMPTY_QUEUE: &[&str] = &["all queued work has landed", "all queued work is landed"];
-    if BUSY.iter().chain(STOP_PHRASES).any(|b| flat.contains(b)) {
-        return false;
-    }
-    if EMPTY_QUEUE.iter().any(|p| said_unnegated(flat, p)) {
-        return true;
-    }
-    let words: Vec<(&str, bool)> = flat
-        .split(' ')
-        .map(|w| {
-            let end = &w[w.trim_end_matches(|c: char| !c.is_alphanumeric()).len()..];
-            (
-                w.trim_matches(|c: char| !c.is_alphanumeric()),
-                end.contains(['.', ',', ':', ';', '!', '?']),
-            )
-        })
-        .collect();
-    let one_clause = |w: &[(&str, bool)]| w[..w.len() - 1].iter().all(|&(_, ends)| !ends);
-    let be = |w: &str| matches!(w, "is" | "are");
-    let idle = |w: &str| matches!(w, "running" | "queued");
-    let none_of = |w: &[(&str, bool)]| w[0].0 == "no" || (w[0].0 == "nothing" && w[1].0 == "else");
-    let of_one = words
-        .windows(4)
-        .any(|w| one_clause(w) && none_of(w) && be(w[2].0) && idle(w[3].0));
-    of_one
-        || words
-            .windows(3)
-            .any(|w| one_clause(w) && w[0].0 == "nothing" && be(w[1].0) && idle(w[2].0))
+    t.lines().any(is_finished_line) || t.trim_matches(|c: char| !c.is_alphanumeric()) == "DONE"
 }
 
 pub(crate) fn is_continue_rule(rule: &str) -> bool {
     rule == RULE_CONTINUE
         || rule == RULE_GO_AHEAD
+        || rule == RULE_CREDENTIAL
         || rule == RULE_SUGGESTION
         || is_answer_rule(rule)
         || rule == RULE_DONE_CHECK
@@ -10901,6 +10463,17 @@ pub const FABLE: &str = "fable";
 /// The model a session at Fable's own limit is relaunched on ([`fallback_for`]): Claude Opus 5.5,
 /// by its full id, on the same account (owner, 2026-11-11).
 pub const FABLE_FALLBACK: &str = "claude-opus-5-5";
+
+/// THE PACE OF FABLE'S `/usage` SAMPLES ON A SWITCH NO READING HAS TIMED, and of returns made on
+/// a sample's room left: rung `n` (the last for ever) of the rungs a wall that names no reset keeps
+/// ([`crate::harness::accounts::NO_RESET_WALL_S`]: half an hour, two hours, six), the same
+/// unknown end: six samples in a switch's first day, four a day after it.
+#[must_use]
+pub fn fable_rung(n: u32) -> Duration {
+    let rungs = crate::harness::accounts::NO_RESET_WALL_S;
+    let i = usize::try_from(n).map_or(rungs.len() - 1, |n| n.min(rungs.len() - 1));
+    Duration::from_secs(u64::try_from(rungs[i]).unwrap_or(0))
+}
 
 /// WHAT THE SESSION'S LAUNCH SAYS OF ITS MODEL, as its host reads the agent's own argv
 /// (`IdleHost::launch_model`): the one fact [`fallback_for`] needs besides the notice, as a
@@ -11818,6 +11391,10 @@ pub struct TurnEndReading {
     /// Under Land an unkept row holds the landing ([`HoldLeg::Left`]); a view that cannot say holds
     /// nothing.
     pub leftover: crate::harness::leftover::LeftRead,
+    /// HOW THE HOST RESOLVED the turn's credential lines at this yield
+    /// (`IdleHost::credentials`, [`Self::credential_lines`]): asked only where the turn names
+    /// one, and not by a tape recorded without the door ([`super::credential_need`]).
+    pub credentials: super::credential_need::CredentialRead,
 }
 
 /// THE TURN A SCREEN'S LAST WORDS CLOSE ([`TurnEndReading::answered`]).
@@ -11977,7 +11554,7 @@ impl TurnEndReading {
     #[must_use]
     pub fn need_before(&self) -> bool {
         self.needs_before()
-            .is_some_and(|t| !needs::needs_you(&t).is_empty())
+            .is_some_and(|t| !needs::persons_needs(&t).is_empty())
     }
 
     /// [`Self::turn_said`], its messages told apart ([`Self::turn_breaks`]).
@@ -12004,6 +11581,27 @@ impl TurnEndReading {
         )
     }
 
+    /// THE TURN'S CREDENTIAL LINES ([`needs::credential_needs`]): its reply's and its earlier
+    /// messages', each once; none where the turn was interrupted.
+    #[must_use]
+    pub fn credential_lines(&self) -> Vec<String> {
+        if self.interrupted {
+            return Vec::new();
+        }
+        let (_, said) = self.needs_said();
+        let mut out: Vec<String> = Vec::new();
+        for line in [said, self.turn_said.as_deref()]
+            .into_iter()
+            .flatten()
+            .flat_map(needs::credential_needs)
+        {
+            if !out.contains(&line) {
+                out.push(line);
+            }
+        }
+        out
+    }
+
     /// WHETHER A NEED THE TURN NAMED STANDS: the reply's own, or one its earlier messages named
     /// that the reply did not retract ([`Self::need_before`]).
     #[must_use]
@@ -12012,7 +11610,7 @@ impl TurnEndReading {
             || self
                 .said_tail
                 .as_deref()
-                .is_some_and(|t| !needs::needs_you(t).is_empty())
+                .is_some_and(|t| !needs::persons_needs(t).is_empty())
     }
 
     /// THE GO-AHEAD THE REPLY PARKS ON ([`go_ahead::parked`]): the turn's earlier messages and its
@@ -12265,6 +11863,7 @@ impl TurnEndReading {
             }),
             repo: crate::harness::repo_work::RepoRead::Clean,
             leftover: crate::harness::leftover::LeftRead::NotAsked,
+            credentials: super::credential_need::CredentialRead::NotAsked,
         }
     }
 
@@ -12836,12 +12435,54 @@ pub struct ModelSwitch {
     /// the return puts back ([`Restart::ModelBack`]).
     pub launch: Option<String>,
     pub back_at: Option<Instant>,
+    /// What timed [`Self::back_at`] ([`BackBy`]); `None` while nothing has.
+    pub back_by: Option<BackBy>,
+    /// While no reading has timed the return: the instant before which no `/usage` sample of
+    /// Fable's week is taken (`None`: the next quiet moment), and how many were taken that timed
+    /// none ([`TurnEndState::model_sampled`]).
+    pub sample_at: Option<Instant>,
+    pub samples: u32,
     /// The agent process the switch is in ([`TurnEndState::agent_process`]); `None` until the
     /// host names one.
     pub proc: Option<SwitchProc>,
     /// The host names another process than [`Self::proc`] and no conversation of it yet: the
     /// switch's return waits until it does, as that process may be another program.
     pub unproven: bool,
+}
+
+/// WHAT TIMED A MODEL SWITCH'S RETURN ([`ModelSwitch::back_by`]): never a guess, each a reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackBy {
+    /// The reset the limit's notice named (or its tracked wall's, or the credits' it began on).
+    Notice,
+    /// The reset of Fable's week the account's record names ([`TurnEndState::fable_recorded`]).
+    Record,
+    /// The reset a `/usage` sample's `Current week (Fable)` row names at its limit.
+    Sample,
+    /// A `/usage` sample's `Current week (Fable)` row with room left: Fable serves again.
+    Room,
+}
+
+/// FABLE'S WEEK AS ONE READING SHOWS IT: a `/usage` panel's `Current week (Fable)` row, or the
+/// account's record of the week a session's screen said (`IdleHost::fable_week`): the whole
+/// percent used (`None`: a record of a limit reset with no figure since) and its reset, unix
+/// seconds, where the reading named one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FableWeek {
+    pub pct: Option<u32>,
+    pub reset: Option<i64>,
+}
+
+/// WHAT A `/usage` SAMPLE OF FABLE'S WEEK DID TO THE SWITCH THAT WAITED ON IT
+/// ([`TurnEndState::model_sampled`]), for its journal record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sampled {
+    /// Room left: the return is due `at` (now, or a rung after the last return so made).
+    Room { at: Instant },
+    /// Spent, its reset named: the return is due `at`.
+    Reset { at: Instant },
+    /// No row, no reset ahead, or no panel read: sampled again `at`.
+    Again { at: Instant },
 }
 
 /// The agent process a model switch is in, as its host names it.
@@ -13437,6 +13078,16 @@ pub struct TurnEndState {
     fallback_unasked: bool,
     fallback_unix: Option<i64>,
     fallback_started: Option<i64>,
+    /// The reset of Fable's week the account's record names, as the host read it at Fable's
+    /// limit ([`Self::fable_recorded`]).
+    fable_record: Option<Instant>,
+    /// The returns made on a sample's room left since one last held the longest rung, and the
+    /// last one's instant: the next such return waits the rung of that count after it
+    /// ([`fable_rung`]: half an hour, two hours, then six for ever), so a row that reads room left
+    /// while Fable is spent costs at most four relaunch pairs a day once the rungs are climbed,
+    /// never a ping-pong. The count starts over only at a move onto Opus made the longest rung or
+    /// more after the last such return, which held that long (`Self::restarted`).
+    room_backs: Option<(u32, Instant)>,
     notice_unix: Option<i64>,
     account: Option<AccountMove>,
     account_asked: bool,
@@ -13654,6 +13305,9 @@ pub struct TurnEndState {
     gap_turn: bool,
     credits: Option<CreditsEpisode>,
     go_aheads: GoAheads,
+    /// What the credential act told this session ([`credential_need::told_line`]'s keys): each
+    /// fact is told once.
+    credentials_told: std::collections::BTreeSet<String>,
     /// Where the person's last key holds the go-ahead from ([`Self::person_keyed`]): for
     /// [`GO_AHEAD_HELD`] after it no go-ahead answers the replies, which may agree to or restate
     /// a hold the person gave.
@@ -13730,6 +13384,8 @@ impl TurnEndState {
             fallback_unasked: false,
             fallback_unix: None,
             fallback_started: None,
+            fable_record: None,
+            room_backs: None,
             notice_unix: None,
             account: None,
             account_asked: false,
@@ -13855,6 +13511,7 @@ impl TurnEndState {
             gap_turn: false,
             credits: None,
             go_aheads: GoAheads::default(),
+            credentials_told: std::collections::BTreeSet::new(),
             go_ahead_person: None,
             person_key: None,
             go_ahead_booked: None,
@@ -16640,6 +16297,17 @@ impl TurnEndState {
                 .is_some_and(|t| named_class(t.class) && !t.seeded)
     }
 
+    /// THE CREDENTIAL LINE THIS POINT OWES the agent ([`credential_need::told_line`]): what the
+    /// host resolved of the turn's credential lines that this session has not told, and its keys.
+    #[must_use]
+    pub fn credential_owed(&self, reading: &TurnEndReading) -> Option<(String, Vec<String>)> {
+        credential_need::told_line(
+            &reading.credential_lines(),
+            &reading.credentials,
+            &self.credentials_told,
+        )
+    }
+
     /// THE GO-AHEAD THIS POINT IS OWED (owner, 2026-10-29: "how dare you block on me for go
     /// ahead!"): the reading's park on a person's go-ahead for its own reversible work
     /// ([`TurnEndReading::go_ahead_past`]), where Cruise answers it, or Land once its instruction
@@ -17243,7 +16911,16 @@ impl TurnEndState {
                 back(t);
             }
         }
-        if let Some(t) = self.model.as_mut().and_then(|m| m.back_at.as_mut()) {
+        if let Some(m) = self.model.as_mut() {
+            for t in [&mut m.back_at, &mut m.sample_at].into_iter().flatten() {
+                back(t);
+            }
+        }
+        for t in [&mut self.fable_record]
+            .into_iter()
+            .flatten()
+            .chain(self.room_backs.as_mut().map(|(_, at)| at))
+        {
             back(t);
         }
         if let Some(c) = &mut self.credits {
@@ -17295,6 +16972,67 @@ impl TurnEndState {
     #[must_use]
     pub const fn model_switch(&self) -> Option<&ModelSwitch> {
         self.model.as_ref()
+    }
+
+    /// THE RESET OF FABLE'S WEEK THE ACCOUNT'S RECORD NAMES (`at`, `None`: none named or none
+    /// kept), told by the loop where it reads the launch's model at Fable's limit: the move onto
+    /// Opus at a notice that names no reset times its return by it while it is still ahead.
+    pub const fn fable_recorded(&mut self, at: Option<Instant>) {
+        self.fable_record = at;
+    }
+
+    /// WHETHER A `/usage` SAMPLE OF FABLE'S WEEK IS DUE at `now`: a switch stands whose return no
+    /// reading has timed ([`ModelSwitch::back_at`] `None`), in the process it was made for, and
+    /// its pace allows one ([`ModelSwitch::sample_at`]). The loop takes it at a quiet turn end by
+    /// the accounts probe's own `/usage` ([`Self::probe_gate`]) and tells what it read
+    /// ([`Self::model_sampled`]).
+    #[must_use]
+    pub fn model_sample_due(&self, now: Instant) -> bool {
+        self.model.as_ref().is_some_and(|m| {
+            m.back_at.is_none() && !m.unproven && m.sample_at.is_none_or(|at| now >= at)
+        })
+    }
+
+    /// WHAT A `/usage` SAMPLE READ OF FABLE'S WEEK (`read`: the `Current week (Fable)` row's
+    /// percent and its reset as an instant; `None`: no row, or no panel read after the `/usage`
+    /// was entered), told by the loop at `now` while [`Self::model_sample_due`]. A row with room
+    /// left (under 100%) is Fable serving again: the return is due now, or, where returns were
+    /// made so since one last held the longest rung, the rung of their count after the last
+    /// (`room_backs`). A row at its limit whose reset is ahead times the return at that reset.
+    /// Anything else names no return and the next sample waits a rung ([`fable_rung`]). `None`
+    /// where no sample was due.
+    pub fn model_sampled(
+        &mut self,
+        read: Option<(u32, Option<Instant>)>,
+        now: Instant,
+    ) -> Option<Sampled> {
+        if !self.model_sample_due(now) {
+            return None;
+        }
+        let room_after = self
+            .room_backs
+            .map(|(n, last)| later(last, fable_rung(n.saturating_sub(1))));
+        let m = self.model.as_mut()?;
+        let said = match read {
+            Some((pct, _)) if pct < 100 => {
+                let at = room_after.map_or(now, |at| at.max(now));
+                m.back_at = Some(at);
+                m.back_by = Some(BackBy::Room);
+                Sampled::Room { at }
+            }
+            Some((_, Some(at))) if at > now => {
+                m.back_at = Some(at);
+                m.back_by = Some(BackBy::Sample);
+                Sampled::Reset { at }
+            }
+            Some(_) | None => {
+                let at = later(now, fable_rung(m.samples));
+                m.samples = m.samples.saturating_add(1);
+                m.sample_at = Some(at);
+                Sampled::Again { at }
+            }
+        };
+        Some(said)
     }
 
     /// Whether the act [`Self::acted`] last recorded (a typed act; a restart is [`Self::restarted`]'s) was typed IN A LIMIT'S PLACE.
@@ -17779,6 +17517,23 @@ impl TurnEndState {
     ) -> Option<AccountPoint> {
         let rotates = account_rotates(self, reading, cfg);
         let follows = login_follows(self, reading, cfg);
+        if !(rotates || follows) {
+            return None;
+        }
+        self.point_moving(reading, rotates, follows)
+    }
+
+    /// [`Self::account_point_moving`] past its account clause, whether accounts rotate here
+    /// (`rotates`) and a lost login is followed (`follows`): with neither, the quiet turn end a
+    /// `/usage` sample of Fable's week for a switch's return is taken at
+    /// ([`Self::probe_gate`]), on the same terms as the accounts probe's own: a point of a tab
+    /// with a task not yet done, no reset's continuation owed, no account move standing.
+    fn point_moving(
+        &self,
+        reading: &TurnEndReading,
+        rotates: bool,
+        follows: bool,
+    ) -> Option<AccountPoint> {
         let lost = follows
             && self
                 .wall
@@ -17789,7 +17544,6 @@ impl TurnEndState {
             || reading.upgrading
             || (self.task_done() && !lost)
             || self.reset_resume.is_some()
-            || !(rotates || follows)
         {
             return None;
         }
@@ -17850,14 +17604,22 @@ impl TurnEndState {
         cfg: &SupervisorConfig,
         now: Instant,
     ) -> Option<ProbeGate> {
-        let _ = now;
         let grace = Duration::from_secs(u64::from(cfg.human_grace_s));
         let owed = self.awaiting.is_some() || self.after.is_some() || self.account_resume;
+        let advised = matches!(reading.account, Some(AccountAdvice::Probe { .. }));
+        // A SAMPLE OF FABLE'S WEEK FOR A SWITCH'S RETURN ([`Self::model_sample_due`]) takes the
+        // probe's `/usage` at the same quiet turn end ([`Self::point_moving`]: never past a
+        // done task, an owed continuation or a standing account move), on a session whose
+        // relaunch can return it, whether or not any account rotates.
+        let sample =
+            !advised && self.model_sample_due(now) && reading.restartable && !reading.relaunch_off;
+        let turn_end = if sample {
+            self.point_moving(reading, false, false) == Some(AccountPoint::TurnEnd)
+        } else {
+            self.account_point(reading, cfg) == Some(AccountPoint::TurnEnd)
+        };
         let checks = [
-            (
-                !matches!(reading.account, Some(AccountAdvice::Probe { .. })),
-                ProbeGate::NotDue,
-            ),
+            (!advised && !sample, ProbeGate::NotDue),
             (reading.phase != Phase::Idle, ProbeGate::NotIdle),
             (!reading.authoritative, ProbeGate::NotAuthoritative),
             (reading.survey, ProbeGate::Survey),
@@ -17872,10 +17634,7 @@ impl TurnEndState {
             (reading.pending_input, ProbeGate::PendingInput),
             (reading.interrupted, ProbeGate::Interrupted),
             (reading.asked().is_some(), ProbeGate::Question),
-            (
-                self.account_point(reading, cfg) != Some(AccountPoint::TurnEnd),
-                ProbeGate::NotTurnEnd,
-            ),
+            (!turn_end, ProbeGate::NotTurnEnd),
             (owed, ProbeGate::ActOwed),
             // THE LAND CHECK GOES FIRST: it is one step of the landing, typed at its defense's
             // point ([`decide_turn_end`]); a probe there would put its panel between the defense
@@ -19742,7 +19501,7 @@ impl TurnEndState {
         };
         if add_only {
             if let Some(words) = words {
-                self.needs.join(needs::needs_you(&words));
+                self.needs.join(needs::persons_needs(&words));
             }
             return;
         }
@@ -19753,7 +19512,7 @@ impl TurnEndState {
         let Some(t) = tail else {
             return;
         };
-        let named = needs::needs_you(t);
+        let named = needs::persons_needs(t);
         if named.is_empty() && needs::defense_line(t).is_none() && !retracted {
             // A reply that goes on without the lines a go-ahead decided but did not type yet
             // answers them as its submission would (DESIGN-harness-autopilot §15.6).
@@ -20168,6 +19927,11 @@ impl TurnEndState {
             // (`Session::turn_end_execute`), so this one sent no words its decision judged, and
             // the loop puts their lines back as for an act not submitted.
             self.go_ahead_answered(&[]);
+        }
+        if typed_rule == Some(RULE_CREDENTIAL)
+            && let Some((_, keys)) = self.credential_owed(reading)
+        {
+            self.credentials_told.extend(keys);
         }
         self.act_words.clone_from(&typed_text);
         let land_text = reading.autopilot == Autopilot::Land
@@ -20637,11 +20401,25 @@ impl TurnEndState {
                     .credits
                     .take_if(|c| c.model.is_some())
                     .filter(|_| track.is_none());
-                let back_at = reading
+                let noticed = reading
                     .reset_at
                     .or_else(|| track.and_then(|t| t.named).map(|n| n.at))
                     .or_else(|| credits.as_ref().and_then(|c| c.reset))
                     .filter(|&r| r > now);
+                // A notice that names no reset times the return by the account's record of
+                // Fable's week, while it is ahead; with neither, a `/usage` sample times it
+                // (`Self::model_sampled`). Nothing is guessed.
+                let (back_at, back_by) = match (noticed, self.fable_record.filter(|&r| r > now)) {
+                    (Some(at), _) => (Some(at), Some(BackBy::Notice)),
+                    (None, Some(at)) => (Some(at), Some(BackBy::Record)),
+                    (None, None) => (None, None),
+                };
+                // A move made the longest rung or more after the last return made on room left
+                // starts that count over: the return held the longest rung, so no pace of such
+                // returns falls below one a longest rung.
+                self.room_backs = self.room_backs.filter(|(_, last)| {
+                    now.saturating_duration_since(*last) < fable_rung(u32::MAX)
+                });
                 let from = bucket_model(&reading.wall_message)
                     .or_else(|| track.and_then(|t| bucket_model(&t.said)))
                     .or_else(|| credits.and_then(|c| c.model));
@@ -20650,6 +20428,9 @@ impl TurnEndState {
                     to: to.clone(),
                     launch: reading.launch_model.back_to(),
                     back_at,
+                    back_by,
+                    sample_at: None,
+                    samples: 0,
                     proc: None,
                     unproven: false,
                 });
@@ -20663,6 +20444,15 @@ impl TurnEndState {
             }
             Restart::Model { .. } => self.fallback_unmade = true,
             Restart::ModelBack { .. } => {
+                if made
+                    && self
+                        .model
+                        .as_ref()
+                        .is_some_and(|m| m.back_by == Some(BackBy::Room))
+                {
+                    let n = self.room_backs.map_or(0, |(n, _)| n);
+                    self.room_backs = Some((n.saturating_add(1), now));
+                }
                 self.model = None;
                 self.fallback_unasked = false;
             }
@@ -23059,6 +22849,13 @@ fn continue_policy(
     // THE GO-AHEAD: a park on a person's go-ahead for the agent's own
     // reversible work is an ask its standing go-ahead answers ([`go_ahead_answer`]).
     let park = state.go_ahead_owed(reading, now);
+    // THE CREDENTIAL LINE: a credential is never a person's need; what aterm found or filed for
+    // the turn's credential lines is told once a fact ([`credential_need::told_line`]). The
+    // go-ahead's park outranks it.
+    let credential = match park {
+        Some(_) => None,
+        None => state.credential_owed(reading),
+    };
     let gate_ask = match park {
         Some(_) => Some(GO_AHEAD_WHY.to_string()),
         None => asked.clone(),
@@ -23157,6 +22954,14 @@ fn continue_policy(
     if let Some(first) = state.go_ahead_first(reading, cfg, now) {
         let (text, rule_id) = land_words(state, reading, state.needs_ack_owed_past(&first.needs));
         return budgeted(TurnEndAction::Type { text, rule_id });
+    }
+    // The credential line outranks the done check and Land's own acts, as the go-ahead does: the
+    // step it blocks is recorded, and the work goes on.
+    if let Some((text, _)) = credential {
+        return budgeted(TurnEndAction::Type {
+            text: act_words(&text, &[], reading.rules.as_deref()),
+            rule_id: RULE_CREDENTIAL,
+        });
     }
     if let Some(act) = words_act(
         state,

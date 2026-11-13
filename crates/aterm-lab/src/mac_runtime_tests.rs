@@ -356,9 +356,16 @@ fn retained_rows_stay_under_the_guest_run_and_disk_units_match_tart() {
     assert!(verifier_log(&log.replace(".ubd/", "../../")).is_none());
     assert!(verifier_log(&log.replace("123-456.log", "123-pid.log")).is_none());
     assert!(verifier_log(&log.replace("runs.noindex/", "runs.noindex/next/")).is_some());
-    assert!(ledger_member("docs/measured/fabric/take-1.json"));
-    assert!(!ledger_member("docs/measured/../../secret"));
-    assert!(!ledger_member("/docs/measured/fabric/take-1.json"));
+    let ledgers = perf_ledgers();
+    assert_eq!(
+        ledger_member(&format!("{ledgers}/fabric/take-1.json")),
+        Some("fabric/take-1.json")
+    );
+    assert_eq!(ledger_member(&format!("{ledgers}/../../secret")), None);
+    assert_eq!(ledger_member(&format!("{ledgers}/fabric/../../x")), None);
+    assert_eq!(ledger_member(&format!("{ledgers}.evil/take-1.json")), None);
+    assert_eq!(ledger_member(&format!("{ledgers}/")), None);
+    assert_eq!(ledger_member("fabric/take-1.json"), None);
     let df = |free| format!("Filesystem 1G-blocks Used Available\ndisk 100 0 {free}\n");
     assert!(disk_room(&df(84), 60)); // 84 GiB exceeds the 90 decimal GB disk + margin.
     assert!(!disk_room(&df(83), 60));

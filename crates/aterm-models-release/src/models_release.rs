@@ -1898,7 +1898,7 @@ pub fn release_yank_successor_first_model() -> Model {
     }
 }
 
-/// The release claim, where it lands, and the reader that classifies the next cut: the writer/reader contract of `ledger::reserve` + `ledger::claim` + `changelog::claim_changelogs` (writers) and `publish::real_cut_version` over `verify::derive_cut_mode` (reader), in crates/aterm-release.
+/// The release claim, where it lands, and the reader that classifies the next cut: the writer/reader contract of `ledger::reserve` + `ledger::claim` + `changelog::release_text` and `changelog::landing_text` (writers) and `publish::real_cut_version` over `verify::derive_cut_mode` (reader), in crates/aterm-release.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn release_claim_landing_model() -> Model {

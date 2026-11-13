@@ -440,6 +440,9 @@ enum Refusal {
     NotShown,
     /// The tab's conversation has not been read, so there is none to restart.
     Unread,
+    /// The agent's settings default is not read yet, so what a restart would change is not
+    /// known ([`App::held_permission_default`]).
+    SettingsUnread,
     /// The click can never be made here ([`ClickRefusal`]).
     Click(ClickRefusal),
     /// The click's restart failed.
@@ -452,6 +455,7 @@ impl Refusal {
         match self {
             Refusal::NotShown => "not on screen right now",
             Refusal::Unread => "its conversation isn't read yet",
+            Refusal::SettingsUnread => "its settings aren't read yet",
             Refusal::Click(why) => why.says(),
             Refusal::Failed => "the restart failed",
         }
@@ -628,10 +632,11 @@ pub(crate) enum OverChips {
     No,
     /// A chip: a press acts on it.
     Chip,
-    /// Glass a click does nothing on: the blank between two chips, a top line's harness label
-    /// (hover only, every button on it swallowed), or a fact with nothing to click
+    /// Glass whose motion is not the pane's and that is no chip: the blank between two chips, a
+    /// top line's mark (the hand where a press opens the site, [`App::mark_press_opens`], the
+    /// arrow elsewhere; every button on it taken), or a fact with nothing to click
     /// ([`Fact::clicks`]: the folder, the branch, the context, whose right-click still opens
-    /// their card). The arrow cursor, no hover paint, and the motion is not the pane's.
+    /// their card). No chip's hover paint, and the motion is not the pane's.
     Gap,
 }
 
@@ -640,7 +645,7 @@ impl OverChips {
     pub(crate) const fn of_glass(at: Option<&(u64, GlassAt)>) -> Self {
         match at {
             None => Self::No,
-            Some((_, GlassAt::Chip(None) | GlassAt::Label | GlassAt::Gap)) => Self::Gap,
+            Some((_, GlassAt::Chip(None) | GlassAt::Mark | GlassAt::Gap)) => Self::Gap,
             Some((_, GlassAt::Fact(fact, restores))) => {
                 if fact.clicks(!restores.is_empty()) {
                     Self::Chip
@@ -911,10 +916,11 @@ pub(crate) enum GlassAt {
     Chip(Option<Chip>),
     /// The top rule's harness switch (`border_toggles`), as the paint drew it.
     Switch(crate::autopilot::HarnessSwitch),
-    /// A top line's harness label (`border_toggles`): a hover shows the CLI's whole build in the
-    /// label's slot, only where the label shortens it (`label_whole`); every press on it is
-    /// swallowed.
-    Label,
+    /// A top line's mark, `ALab` with its fine print (`border_toggles`): a hover shows the
+    /// CLI's whole build in the label's slot, only where the label shortens it (`label_whole`);
+    /// a primary press opens the site as a card line's mark does
+    /// ([`App::press_claude_glass_hit`]), and a secondary press does nothing.
+    Mark,
     /// A top line's ⬆️ of a newer CLI build (`border_toggles`): a press asks for the move now.
     Upgrade,
     /// A blank that is an element's own and no part of what a click acts on (the side blanks of
@@ -929,7 +935,7 @@ pub(crate) enum GlassAt {
 /// ([`WindowLights::part_hover`]); the switch has its own ([`WindowLights::switch_hover`]).
 const fn part_of(glass: GlassAt) -> Option<crate::claude_footer::HoverAt> {
     match glass {
-        GlassAt::Label => Some(crate::claude_footer::HoverAt::Label),
+        GlassAt::Mark => Some(crate::claude_footer::HoverAt::Label),
         GlassAt::Upgrade => Some(crate::claude_footer::HoverAt::Arrow),
         GlassAt::Chip(_) | GlassAt::Switch(_) | GlassAt::Gap | GlassAt::Fact(..) => None,
     }
@@ -989,8 +995,8 @@ pub(crate) struct WindowLights {
     pub(crate) part_hover: Option<(u64, crate::claude_footer::HoverAt)>,
     /// The rules' title slots the last frame drew ([`TitleHit`]).
     pub(crate) title_hits: Vec<TitleHit>,
-    /// The card or banner hit under the pointer: `(session, is_link, is_front)`.
-    pub(crate) glass_hit_hover: Option<(u64, bool, bool)>,
+    /// The card line's mark under the pointer: `(session, is_front)`.
+    pub(crate) glass_hit_hover: Option<(u64, bool)>,
     /// The window pixel the last motion put the pointer on while it hovered the glass.
     glass_hover_px: Option<(f64, f64)>,
     /// The grid the lists were laid.
@@ -1027,8 +1033,9 @@ pub(crate) struct BorderSwitch {
     /// neither side blank): a press anywhere on them turns it, and a hover underlines exactly
     /// these.
     pub(crate) ink: std::ops::Range<usize>,
-    /// The harness label's cells (`alab v0.5 (v2.1.305)`): hover only.
-    pub(crate) label: Option<std::ops::Range<usize>>,
+    /// The mark's cells, its fine print included (`ALab v0.5 (v2.1.305)`): a hover shows the
+    /// CLI's whole build, a press opens the site.
+    pub(crate) mark: Option<std::ops::Range<usize>>,
     /// The ⬆️ of a newer CLI build with its side blanks: a press asks for the move now.
     pub(crate) arrow: Option<std::ops::Range<usize>>,
     pub(crate) session: u64,
@@ -1318,13 +1325,13 @@ pub(crate) fn lights_now() -> Instant {
 }
 
 /// The pointer's hover on the glass: a chip or fact, a quota chart column, a switch, a top
-/// line's part, a card or banner hit.
+/// line's part, a card line's mark.
 type GlassHover = (
     Option<(u64, Target)>,
     Option<(u64, u8, usize)>,
     Option<u64>,
     Option<(u64, crate::claude_footer::HoverAt)>,
-    Option<(u64, bool, bool)>,
+    Option<(u64, bool)>,
 );
 
 impl WindowLights {
@@ -1362,7 +1369,7 @@ impl WindowLights {
 
     /// A digest of where the last paint laid what a pointer hit-tests ([`App::claude_glass_at`] and
     /// [`App::claude_glass_hit_at`]): the chips' cells, the switches with their labels and arrows,
-    /// the facts and the card/banner hits.
+    /// the facts and the card lines' marks.
     fn places(&self, card_hits: u64, focused: Option<u64>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1377,7 +1384,7 @@ impl WindowLights {
                 b.frame_row,
                 b.term_row,
                 &b.cols,
-                &b.label,
+                &b.mark,
                 &b.arrow,
                 b.session,
             )
@@ -3712,6 +3719,17 @@ impl App {
         click: Option<ClickShown>,
         jobs: String,
     ) {
+        // While the chip's title shows (under the pointer or the keyboard) a click may follow:
+        // each frame drawn then asks the resolver to read the settings' default again, at most
+        // once a recheck, and the window thread reads no file. The click uses the last read held.
+        if crate::permission_click::RESTARTS
+            && self
+                .windows
+                .get(&wid)
+                .is_some_and(|ws| ws.claude_lights.light_titled(session))
+        {
+            self.ask_default_read(session);
+        }
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
@@ -4278,7 +4296,7 @@ impl App {
         let over = at.and_then(|(session, glass)| match glass {
             GlassAt::Chip(chip) => Some((session, Target::Chip(chip?))),
             GlassAt::Fact(fact, _) => Some((session, Target::Fact(fact))),
-            GlassAt::Switch(_) | GlassAt::Label | GlassAt::Upgrade | GlassAt::Gap => None,
+            GlassAt::Switch(_) | GlassAt::Mark | GlassAt::Upgrade | GlassAt::Gap => None,
         });
         let switch =
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
@@ -4330,9 +4348,26 @@ impl App {
         }
     }
 
-    fn glass_hit_hover_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, bool, bool)> {
-        let (session, url) = self.claude_glass_hit_at(wid, x, y)?;
-        Some((session, url.is_some(), self.session_is_front(wid, session)))
+    fn glass_hit_hover_at(&self, wid: WindowId, x: f64, y: f64) -> Option<(u64, bool)> {
+        let (session, _) = self.claude_glass_hit_at(wid, x, y)?;
+        Some((session, self.session_is_front(wid, session)))
+    }
+
+    /// Whether a press on `session`'s mark in `wid` would open the site under the modifiers
+    /// held now: with the link modifier, or with none in the pane in front
+    /// ([`Self::press_claude_glass_hit`]).
+    pub(crate) fn mark_press_opens(&self, wid: WindowId, session: u64) -> bool {
+        let mods = self.windows.get(&wid).map(|ws| ws.mods).unwrap_or_default();
+        crate::app_mouse::link_modifier_held(mods)
+            || (mods.is_empty() && self.session_is_front(wid, session))
+    }
+
+    /// Whether the pointer rests on a top line's mark in `wid` ([`GlassAt::Mark`]).
+    pub(crate) fn pointer_on_top_mark(&self, wid: WindowId) -> bool {
+        let Some((x, y)) = self.windows.get(&wid).map(|ws| ws.last_cursor_px) else {
+            return false;
+        };
+        matches!(self.claude_glass_at(wid, x, y), Some((_, GlassAt::Mark)))
     }
 
     /// The cursor follows the glass's hover.
@@ -4404,7 +4439,7 @@ impl App {
         let over = at.and_then(|(session, glass)| match glass {
             GlassAt::Chip(chip) => Some((session, Target::Chip(chip?))),
             GlassAt::Fact(fact, _) => Some((session, Target::Fact(fact))),
-            GlassAt::Switch(_) | GlassAt::Label | GlassAt::Upgrade | GlassAt::Gap => None,
+            GlassAt::Switch(_) | GlassAt::Mark | GlassAt::Upgrade | GlassAt::Gap => None,
         });
         let switch =
             at.and_then(|(session, glass)| matches!(glass, GlassAt::Switch(_)).then_some(session));
@@ -4476,10 +4511,10 @@ impl App {
             Some((b.session, GlassAt::Gap))
         } else if let Some(b) = lights.border_toggles.iter().find(|b| {
             b.frame_row == row
-                && b.label.as_ref().is_some_and(|cols| cols.contains(&col))
+                && b.mark.as_ref().is_some_and(|cols| cols.contains(&col))
                 && !self.chrome_owns_terminal_cell(wid, b.term_row, col)
         }) {
-            Some((b.session, GlassAt::Label))
+            Some((b.session, GlassAt::Mark))
         } else {
             lights
                 .fact_hits
@@ -4792,7 +4827,7 @@ impl App {
                 true
             }
             // The folder, the branch and the context have nothing to click: the press is
-            // swallowed, as the label's is.
+            // swallowed, as a gap's is.
             GlassAt::Fact(fact, restores) if !fact.clicks(!restores.is_empty()) => {
                 if self.inline_rename_edit(wid).is_some() {
                     self.clear_strip_press(wid);
@@ -4803,10 +4838,21 @@ impl App {
             GlassAt::Fact(fact, restores) => {
                 self.press_visible_claude_fact(wid, session, fact, restores)
             }
-            // The label is hover only, and a gap is nothing: its press, and its release, go
-            // nowhere.
-            GlassAt::Label | GlassAt::Gap => {
+            // A gap is nothing: its press, and its release, go nowhere.
+            GlassAt::Gap => {
                 if self.inline_rename_edit(wid).is_some() {
+                    self.clear_strip_press(wid);
+                    self.settle_rename_edit(wid);
+                }
+                true
+            }
+            // The mark takes every press on it: a primary press opens the site where a card
+            // line's mark would, and any other settles a tab name being edited and goes nowhere.
+            GlassAt::Mark => {
+                let url = aterm_types::identity::SITE_URL;
+                if (secondary || !self.press_claude_glass_hit(wid, session, url, at))
+                    && self.inline_rename_edit(wid).is_some()
+                {
                     self.clear_strip_press(wid);
                     self.settle_rename_edit(wid);
                 }
@@ -4932,19 +4978,19 @@ impl App {
         true
     }
 
-    /// A left press on `session`'s harness words on the glass ([`Self::claude_glass_hit_at`]: a
-    /// banner's rows, the card line's link).
+    /// A left press on one of `session`'s marks on the glass: the card line's
+    /// ([`Self::claude_glass_hit_at`]) or the top line's ([`GlassAt::Mark`]), `url` its link.
     ///
-    /// On a link a plain press (no modifier held) in the focused pane opens it, as a
-    /// link-modifier press does in any pane, once per double click; in an unfocused pane a plain
-    /// press is that pane's focus click and opens nothing, and a press with another modifier
-    /// (Shift extending a selection, Option taking one from a tracking app) is the rows' own. A
-    /// press the words take settles a tab name being edited first.
+    /// A plain press (no modifier held) in the focused pane opens the link, as a link-modifier
+    /// press does in any pane, once per double click; in an unfocused pane a plain press is that
+    /// pane's focus click and opens nothing, and a press with another modifier (Shift extending
+    /// a selection, Option taking one from a tracking app) is the rows' own. A press the mark
+    /// takes settles a tab name being edited first.
     fn press_claude_glass_hit(
         &mut self,
         wid: WindowId,
         session: u64,
-        url: Option<&'static str>,
+        url: &'static str,
         at: Instant,
     ) -> bool {
         let Some(mods) = self.windows.get(&wid).map(|ws| ws.mods) else {
@@ -4952,7 +4998,7 @@ impl App {
         };
         let modifier = crate::app_mouse::link_modifier_held(mods);
         let front = self.session_is_front(wid, session);
-        let opens = url
+        let opens = Some(url)
             .filter(|url| crate::is_safe_url(url))
             .filter(|_| modifier || (front && mods.is_empty()));
         let tracking = front
@@ -5161,7 +5207,16 @@ impl App {
             return;
         };
         use crate::permission_box::Told;
-        let (told, stands) = crate::permission_box::click_told(pill, self.permission_default(&tab));
+        let Some(default) = self.held_permission_default(&tab) else {
+            // Before the resolver's first read of this agent nothing says what the restart
+            // would change: ask for the read and let the next click decide on it.
+            self.ask_default_read(session);
+            if let Some(ws) = self.windows.get_mut(&wid) {
+                refuse(ws, Refusal::SettingsUnread);
+            }
+            return;
+        };
+        let (told, stands) = crate::permission_box::click_told(pill, default);
         if !stands {
             self.explain_unchanged(wid, session, &told);
             return;
@@ -5808,7 +5863,8 @@ impl App {
                 | HarnessChip::Usage
                 | HarnessChip::Account
                 | HarnessChip::Title
-                | HarnessChip::Link(_)
+                | HarnessChip::Mark
+                | HarnessChip::CardMark
                 | HarnessChip::Upgrade => {}
                 HarnessChip::Mode => {
                     if let Some(s) = ws.claude_lights.sessions.get(&node.session) {
@@ -5961,8 +6017,27 @@ impl App {
                 return;
             }
             HarnessChip::Title => return,
-            HarnessChip::Link(link) => {
-                self.open_claude_link_for_reader(wid, session, link);
+            HarnessChip::CardMark => {
+                self.open_claude_link_for_reader(wid, session);
+                return;
+            }
+            HarnessChip::Mark => {
+                let shown = self.windows.get(&wid).is_some_and(|ws| {
+                    ws.claude_lights.border_toggles.iter().any(|b| {
+                        b.session == session
+                            && b.mark.as_ref().is_some_and(|cols| {
+                                !self.chrome_owns_terminal_span(wid, b.term_row, cols.clone())
+                            })
+                    })
+                });
+                let url = aterm_types::identity::SITE_URL;
+                if shown && crate::is_safe_url(url) {
+                    if self.inline_rename_edit(wid).is_some() {
+                        self.clear_strip_press(wid);
+                        self.settle_rename_edit(wid);
+                    }
+                    crate::app_mouse::open_url_external(url);
+                }
                 return;
             }
             HarnessChip::Upgrade => {
@@ -6043,7 +6118,7 @@ pub(crate) fn harness_switch_nodes(
 ) -> Vec<crate::a11y_tree::GridChip> {
     use crate::a11y_tree::{GridChip, HarnessChip};
     let product = b.program.product();
-    let mut nodes = Vec::with_capacity(2);
+    let mut nodes = Vec::with_capacity(3);
     // The node is the cells a press turns the switch on ([`BorderSwitch::ink`]), so a reader's
     // hit on any of them acts.
     if !b.ink.is_empty() {
@@ -6060,6 +6135,22 @@ pub(crate) fn harness_switch_nodes(
             row,
             col: b.ink.start,
             width: b.ink.len(),
+        });
+    }
+    if let Some(cols) = b.mark.as_ref() {
+        let (company, site) = (aterm_types::identity::COMPANY, aterm_types::identity::SITE);
+        nodes.push(GridChip {
+            session: b.session,
+            chip: HarnessChip::Mark,
+            label: format!("{company}, {site}"),
+            description: Some(format!(
+                "Opens {} in the browser",
+                aterm_types::identity::SITE_URL
+            )),
+            toggled: None,
+            row,
+            col: cols.start,
+            width: cols.len(),
         });
     }
     let up_words = crate::claude_footer::up_said(&b.paint.up, b.paint.jobs.as_str(), b.paint.press);

@@ -23,6 +23,8 @@ pub(crate) struct ReleaseLine {
     step: String,
     boundary: String,
     at: u64,
+    /// The step's 95th-percentile duration its progress is judged by (0: none recorded).
+    p95_s: u64,
 }
 
 fn text(value: &Value, key: &str) -> Option<String> {
@@ -82,6 +84,7 @@ impl ReleaseLine {
             step: text(&record, "step")?,
             boundary: text(&record, "boundary")?,
             at: record["at"].as_u64()?,
+            p95_s: record["p95_s"].as_u64()?,
         })
     }
 
@@ -99,7 +102,7 @@ impl ReleaseLine {
                 "node": self.node, "host": self.host, "sid": self.sid,
                 "pid": self.pid, "boot": self.boot, "start": self.start
             },
-            "step": self.step, "boundary": self.boundary, "at": self.at
+            "step": self.step, "boundary": self.boundary, "at": self.at, "p95_s": self.p95_s
         })
         .to_string()
     }

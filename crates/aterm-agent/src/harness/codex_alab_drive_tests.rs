@@ -55,6 +55,7 @@ fn primary_copy(rig: &Rig, thread: &str) -> crate::harness::self_claimed::Copy {
     let resume = validate(&record, TUI, &live)
         .expect("the primary record is validated against its live launch");
     crate::harness::self_claimed::Copy {
+        lifetime: None,
         pid: TUI,
         start: "Thu Oct 16 08:00:00 2026".to_string(),
         home: rig.home.clone(),
@@ -666,6 +667,7 @@ impl Rig {
 
     fn snap(&self, home_env: Option<String>) -> crate::harness::relaunch::Snapshot {
         crate::harness::relaunch::Snapshot {
+            lifetime: None,
             launch_env: None,
             auth_observed: true,
             route: crate::harness::accounts::AuthRoute::Outside,
@@ -855,6 +857,7 @@ fn stamp_input(rig: &Rig, host: String) -> crate::harness::restart_stamp::Input 
             start: snap.start,
             cause: Cause::Asked,
             at: now_s(),
+            wanted: None,
             input: Some(input.clone()),
         },
     )
@@ -1042,6 +1045,56 @@ fn an_explicit_restart_keeps_its_input_receipt_through_a_deferred_attempt() {
         rig.typed().len(),
         1,
         "the resumed conversation is never typed twice"
+    );
+}
+
+/// AN EXPLICIT RESTART KEEPS ITS INPUT RECEIPT WHEN A LATER ATTEMPT SETTLES ANOTHER ROW: the
+/// first attempt files its record on one account's login, reads the stamp's receipt and
+/// consumes the stamp; a later attempt of the same exit whose admission settled another row
+/// closes that record (`resumed-elsewhere`) and files a new one, which keeps the receipt the
+/// consumed stamp can no longer give, so the input the act accepted does not hold the line again.
+#[test]
+fn an_explicit_restart_keeps_its_input_receipt_when_a_later_attempt_settles_another_row() {
+    let rig = Rig::new("explicit-restart-other-row", &["zsh: terminated codex"]);
+    rig.twin_to_build(true);
+    let input = stamp_input(
+        &rig,
+        crate::harness::restart_stamp::input_host().expect("host"),
+    );
+    *rig.screen_input.lock().expect("screen input") = Some(7);
+    *rig.status_extra.lock().expect("status") = " human_ms=500 human_seq=7 hold=1".to_string();
+    let snap = rig.snap(None);
+    let on = |row: &str| {
+        let mut resume = rig.resume(None);
+        resume.codex_auth_path = Some(format!("/Users//me/.aterm/accounts-codex/{row}/auth.json"));
+        resume
+    };
+    let held = self_claimed_after_exit(
+        &rig.opts,
+        &snap,
+        &on("acct-a"),
+        ExitCause::Asked,
+        &rig.kernel,
+    );
+    assert_eq!(held.step, "wait:held", "{held:?}");
+    assert_eq!(rig.state().line_input, Some(input.clone()));
+    assert!(crate::harness::restart_stamp::read(&rig.opts.state, TAB).is_none());
+    *rig.status_extra.lock().expect("status") = " human_ms=500 human_seq=7".to_string();
+    let done = self_claimed_after_exit(
+        &rig.opts,
+        &snap,
+        &on("acct-b"),
+        ExitCause::Asked,
+        &rig.kernel,
+    );
+    assert_eq!(done.step, "done:resumed", "{done:?}\n{:#?}", rig.asked());
+    assert_eq!(rig.state().line_input, Some(input));
+    let typed = rig.typed();
+    assert_eq!(typed.len(), 1, "{typed:#?}");
+    assert!(typed[0].contains("acct-b"), "{typed:#?}");
+    assert!(
+        typed[0].contains("if-human=7 "),
+        "the accepted counter is fenced: {typed:#?}"
     );
 }
 

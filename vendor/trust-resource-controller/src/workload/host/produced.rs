@@ -112,7 +112,10 @@ impl Registration {
             return Err(invalid());
         }
         let key = Key::read(&mut d)?;
-        let program = InputFile { path: d.bytes()?, sha256: d.array()? };
+        let program = InputFile {
+            path: d.bytes()?,
+            sha256: d.array()?,
+        };
         let runtime_roots = paths_read(&mut d, MAX_RUNTIME_ROOTS)?;
         let producer_attempt = match d.number()? {
             0 => None,
@@ -120,7 +123,12 @@ impl Registration {
             _ => return Err(invalid()),
         };
         d.done()?;
-        let value = Self { key, program, runtime_roots, producer_attempt };
+        let value = Self {
+            key,
+            program,
+            runtime_roots,
+            producer_attempt,
+        };
         value.validate()?;
         Ok(value)
     }
@@ -195,7 +203,10 @@ impl RegistrationReply {
                 }
                 Self::Registered(RegistrationAck { key, executable })
             }
-            1 => Self::Refused { key, reason: d.text()? },
+            1 => Self::Refused {
+                key,
+                reason: d.text()?,
+            },
             _ => return Err(invalid()),
         };
         d.done()?;
@@ -244,7 +255,8 @@ pub fn protected_environment_name(name: &[u8]) -> bool {
         ]
         .iter()
         .any(|prefix| {
-            name.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+            name.get(..prefix.len())
+                .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
         })
 }
 /// Dynamic loader input must come from the separately held exact runtime
@@ -252,7 +264,8 @@ pub fn protected_environment_name(name: &[u8]) -> bool {
 /// the request's semantics when the host injects its held runtime paths.
 pub fn loader_override_name(name: &[u8]) -> bool {
     [b"DYLD_".as_slice(), b"LD_"].iter().any(|prefix| {
-        name.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix))
+        name.get(..prefix.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(prefix))
     })
 }
 fn kind_number(kind: MemberKind) -> io::Result<u64> {
@@ -260,6 +273,7 @@ fn kind_number(kind: MemberKind) -> io::Result<u64> {
         MemberKind::BuildScript => Ok(1),
         MemberKind::Inventory => Ok(2),
         MemberKind::Sample => Ok(3),
+        MemberKind::Coordinator => Ok(4),
         MemberKind::CompilerQuery => Err(invalid()),
     }
 }
@@ -268,6 +282,7 @@ fn kind_read(number: u64) -> io::Result<MemberKind> {
         1 => Ok(MemberKind::BuildScript),
         2 => Ok(MemberKind::Inventory),
         3 => Ok(MemberKind::Sample),
+        4 => Ok(MemberKind::Coordinator),
         _ => Err(invalid()),
     }
 }
@@ -294,6 +309,7 @@ impl ProducedRequest {
             MemberKind::BuildScript => args.is_empty(),
             MemberKind::Inventory => matches!(args.as_slice(),[arg] if arg==b"--list"),
             MemberKind::Sample => matches!(args.as_slice(),[arg] if arg==b"--test-threads=1"),
+            MemberKind::Coordinator => super::coordinator::Plan::from_startup_args(args).is_ok(),
             MemberKind::CompilerQuery => false,
         };
         if !supported || self.member.binding.root_attempt != self.key.root_attempt {
@@ -342,8 +358,12 @@ impl ProducedRequest {
     }
     pub fn hello(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
-        let attempt: String =
-            self.key.root_attempt.iter().map(|byte| format!("{byte:02x}")).collect();
+        let attempt: String = self
+            .key
+            .root_attempt
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         Ok(format!(
             "{{\"version\":3,\"role\":\"{PURPOSE}\",\"session\":\"{}\",\"attempt\":\"{attempt}\"}}",
             self.member.binding.session

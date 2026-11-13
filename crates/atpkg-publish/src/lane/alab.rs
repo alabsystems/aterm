@@ -43,8 +43,10 @@ pub const ENGINE_REPO: &str = "publication";
 /// directory ([`engine_ledger`]).
 const ENGINE_MAIN: &str = "refs/atpkg-publish/engine-main";
 
-/// The Apple targets: one build carries both rows, so the pins are resolved for both
-/// (and a program the two resolve to different builds is refused, not collapsed).
+/// The Apple targets: one build carries both rows. Each target's pin is resolved on its own
+/// ([`crate::pins::by_target`]): an overlay that pins a program ahead on one target (the tip
+/// lane's Apple silicon pins) is normal, the lowest target decides whether a newer release
+/// moves anything, and an overlay the release passes is moved with it, never left behind.
 pub const TARGETS: &[Triple] = programs::DUAL_DARWIN;
 
 /// How one run is told to behave.
@@ -142,7 +144,7 @@ pub enum Staging {
 pub struct Facts {
     /// The program.
     pub program: &'static ProgramDef,
-    /// Its pin on the Apple targets.
+    /// Its pin on the Apple targets: the lowest of the targets' pins.
     pub pin: Option<Build>,
     /// Its newest signed release, resolved.
     pub release: std::result::Result<SignedRelease, ReleaseGap>,
@@ -150,6 +152,9 @@ pub struct Facts {
     pub staging: Staging,
     /// Whether its build is latched BLOCKED.
     pub latched: bool,
+    /// The Apple targets an overlay already pins at the release's build: that build is
+    /// public there, and its signed manifest cannot gain the rows the other targets need.
+    pub public_on: BTreeSet<Triple>,
 }
 
 /// One program's decision.
@@ -234,6 +239,14 @@ pub fn decide(f: &Facts) -> Decision {
     }
     if r.build < pin {
         return Decision::Ahead;
+    }
+    if !f.public_on.is_empty() {
+        return Decision::Skip(format!(
+            "build {} is already public on {} through an overlay, and a published pack never \
+             gains rows — the other Apple target moves with the next signed release",
+            r.build,
+            super::state::names(&f.public_on.iter().copied().collect::<Vec<_>>())
+        ));
     }
     let (required, staged) = match &f.staging {
         Staging::Known { required, staged } => (required.clone(), staged.clone()),
@@ -503,8 +516,10 @@ fn locked(
             "index-{n} carries no [[channels]] block — no pins to track"
         ))
     })?;
-    let pins = crate::pins::for_targets(&channel, TARGETS)?;
-    state.check_pins(TARGETS, &pins, n, tx)?;
+    let by_target = crate::pins::by_target(&channel, TARGETS)?;
+    let pins = crate::pins::lowest(&by_target);
+    let floors = crate::pins::floors(&by_target);
+    state.check_pins(TARGETS, &floors, n, tx)?;
     let groups = super::hold::groups_of(&head.index, pins.keys().map(String::as_str))?;
     if !opts.dry_run {
         crate::identity::signer_for(ctx, &head.roster)?;
@@ -535,7 +550,17 @@ fn locked(
     let mut rows = Vec::new();
     let mut required_of: BTreeMap<&str, BTreeSet<Triple>> = BTreeMap::new();
     for def in programs::PROGRAMS.iter().filter(|d| d.lane_tracked()) {
-        let facts = gather(ctx, opts, state, &head, &pins, &work, &mut clones, def, tx);
+        let facts = gather(
+            ctx,
+            opts,
+            state,
+            &head,
+            &by_target,
+            &work,
+            &mut clones,
+            def,
+            tx,
+        );
         if let Staging::Known { required, .. } = &facts.staging {
             required_of.insert(def.name, required.clone());
         }
@@ -614,7 +639,7 @@ fn locked(
     }
 
     if candidates.is_empty() && pending.is_empty() {
-        state.record(n, TARGETS, &pins)?;
+        state.record(n, TARGETS, &floors)?;
         write_sync(ctx, state, None, &[], &bundles, &gaps, horizon.as_deref())?;
         notify_gaps(ctx, opts, deps, state, &gaps);
         if !bundles.is_empty() {
@@ -676,7 +701,7 @@ fn locked(
     }
     outcome.held = held.iter().map(|p| (*p).to_string()).collect();
     if pin_now.is_empty() {
-        state.record(n, TARGETS, &pins)?;
+        state.record(n, TARGETS, &floors)?;
         write_sync(ctx, state, None, &[], &bundles, &gaps, horizon.as_deref())?;
         notify_gaps(ctx, opts, deps, state, &gaps);
         if !held.is_empty() {
@@ -714,15 +739,17 @@ fn locked(
     }
 
     let mut delta = Delta::default();
-    let mut moved = pins.clone();
+    let mut moved = by_target.clone();
     for p in &pin_now {
         if let Some(b) = rows
             .iter()
             .find(|r| r.program.name == *p)
             .and_then(Row::build)
         {
-            delta.pins.insert((*p).to_string(), b);
-            moved.insert((*p).to_string(), b);
+            move_pin(&channel, &mut delta, p, b);
+            for cell in moved.entry((*p).to_string()).or_default().values_mut() {
+                *cell = (*cell).max(b);
+            }
         }
     }
     if !not_ready.is_empty() || !held.is_empty() {
@@ -757,7 +784,7 @@ fn locked(
                 n.saturating_add(1)
             ))
         })?;
-    state.record(published.index_build, TARGETS, &moved)?;
+    state.record(published.index_build, TARGETS, &crate::pins::floors(&moved))?;
     let pinned: Vec<(&str, String, Build)> = pin_now
         .iter()
         .filter_map(|p| {
@@ -797,6 +824,39 @@ fn locked(
     outcome.published = Some(published.index_build);
     outcome.rows = rows.clone();
     Ok(outcome)
+}
+
+/// Move `program` to `build` on every Apple target still below it: `pin` when the build is
+/// past it, and each Apple overlay the build passes. An overlay below the new `pin` is
+/// retired (the target then follows `pin`); one below `build` while `pin` stays ahead is
+/// raised; one at or past `build` is carried untouched.
+pub fn move_pin(channel: &atpkg::Channel, delta: &mut Delta, program: &str, build: Build) {
+    let global = channel.pin.get(program).copied();
+    let follows = global.is_none_or(|g| build > g);
+    if follows {
+        delta.pins.insert(program.to_string(), build);
+    }
+    for t in TARGETS {
+        let Some(&overlay) = channel
+            .pin_by_target
+            .get(t.as_str())
+            .and_then(|cells| cells.get(program))
+        else {
+            continue;
+        };
+        if overlay >= build {
+            continue;
+        }
+        if follows {
+            delta.retire_target.insert((*t, Some(program.to_string())));
+        } else {
+            delta
+                .target_pins
+                .entry(*t)
+                .or_default()
+                .insert(program.to_string(), build);
+        }
+    }
 }
 
 fn preflight(ctx: &Ctx, deps: &Deps<'_>) -> Result<()> {
@@ -905,41 +965,47 @@ enum CachedLedger {
 /// promote records on the engine's main. A dry run reads it the same way: the read writes only
 /// under `work`, which every run lays down afresh.
 fn engine_ledger(ctx: &Ctx, engine: &Slug, work: &Path) -> CachedLedger {
-    let dir = work.join("engine.git");
-    let read = crate::git::run(work, &["init", "--quiet", "--bare", "engine.git"])
-        .map_err(|e| {
-            format!(
-                "could not make {} to read {engine}'s main: {e}",
-                ctx.shown(&dir)
-            )
-        })
-        .and_then(|_| {
-            owner_written(&dir)
-                .map_err(|e| format!("could not clear the write bits of {}: {e}", ctx.shown(&dir)))
-        })
-        .and_then(|()| {
-            ctx.hosts
-                .staging
-                .fetch_main(engine, &dir, ENGINE_MAIN)
-                .map_err(|e| format!("could not read {engine}'s main from the host ({e})"))
-        })
-        .and_then(|()| {
-            let commit = crate::git::run(&dir, &["rev-parse", "--verify", ENGINE_MAIN])
-                .map_err(|e| format!("{engine}'s main was fetched but cannot be read: {e}"))?;
-            let text = crate::git::run(&dir, &["show", &format!("{ENGINE_MAIN}:mappings.json")])
-                .map_err(|e| format!("{engine}'s main has no readable mappings.json: {e}"))?;
-            Ok((
-                format!("{engine} main {}", &commit[..commit.len().min(12)]),
-                text,
-            ))
-        });
-    match read {
+    match engine_main_file(ctx, engine, work, "mappings.json") {
         Err(why) => CachedLedger::Unread(why),
         Ok((at, text)) => match aterm_json::from_str(&text) {
             Ok(value) => CachedLedger::Parsed { at, value },
             Err(e) => CachedLedger::Invalid(format!("the ledger on {at} does not parse: {e}")),
         },
     }
+}
+
+/// `path` as `engine`'s main holds it, and the main it was read from (`<slug> main <commit12>`),
+/// read through the staging host into a bare repository under `work`
+/// ([`crate::host::ReleaseHost::fetch_main`]), never from an engine checkout on this Mac.
+pub(super) fn engine_main_file(
+    ctx: &Ctx,
+    engine: &Slug,
+    work: &Path,
+    path: &str,
+) -> std::result::Result<(String, String), String> {
+    let dir = work.join("engine.git");
+    if !dir.join("HEAD").exists() {
+        crate::git::run(work, &["init", "--quiet", "--bare", "engine.git"]).map_err(|e| {
+            format!(
+                "could not make {} to read {engine}'s main: {e}",
+                ctx.shown(&dir)
+            )
+        })?;
+        owner_written(&dir)
+            .map_err(|e| format!("could not clear the write bits of {}: {e}", ctx.shown(&dir)))?;
+        ctx.hosts
+            .staging
+            .fetch_main(engine, &dir, ENGINE_MAIN)
+            .map_err(|e| format!("could not read {engine}'s main from the host ({e})"))?;
+    }
+    let commit = crate::git::run(&dir, &["rev-parse", "--verify", ENGINE_MAIN])
+        .map_err(|e| format!("{engine}'s main was fetched but cannot be read: {e}"))?;
+    let text = crate::git::run(&dir, &["show", &format!("{ENGINE_MAIN}:{path}")])
+        .map_err(|e| format!("{engine}'s main has no readable {path}: {e}"))?;
+    Ok((
+        format!("{engine} main {}", &commit[..commit.len().min(12)]),
+        text,
+    ))
 }
 
 struct Clones<'a> {
@@ -1009,19 +1075,21 @@ fn gather(
     opts: &Options,
     state: &LaneState,
     head: &VerifiedQuad,
-    pins: &BTreeMap<String, Build>,
+    by_target: &BTreeMap<String, BTreeMap<Triple, Build>>,
     work: &Path,
     clones: &mut Clones<'_>,
     def: &'static ProgramDef,
     tx: &Transcript,
 ) -> Facts {
-    let pin = pins.get(def.name).copied();
+    let cells = by_target.get(def.name);
+    let pin = cells.and_then(|c| c.values().min().copied());
     let mut facts = Facts {
         program: def,
         pin,
         release: Err(ReleaseGap::NoTag(String::new())),
         staging: Staging::NotLooked,
         latched: false,
+        public_on: BTreeSet::new(),
     };
     let Some(pin) = pin else {
         return facts;
@@ -1043,6 +1111,15 @@ fn gather(
     };
     facts.latched = state.blocked_file(def.name, rel.build).exists();
     if rel.build <= pin {
+        return facts;
+    }
+    facts.public_on = cells
+        .into_iter()
+        .flatten()
+        .filter(|(_, b)| **b == rel.build)
+        .map(|(t, _)| *t)
+        .collect();
+    if !facts.public_on.is_empty() {
         return facts;
     }
     facts.staging = staging_of(ctx, head, work, def, pin, rel.build);
@@ -1442,6 +1519,7 @@ fn pack(
                     signing: Signing::MachineKey,
                     upload: true,
                     env: Vec::new(),
+                    build_within: None,
                 },
             )
             .map_err(|e| format!("the pack failed for {triple}: {e}"))?;
@@ -1809,7 +1887,7 @@ pub fn parse_vv(text: &str) -> Option<PinCommit> {
 /// Clears the group and world write bits a umask such as 002 leaves on `repo` and its config:
 /// agh reads a repository's config only where no one else could have written it, and this
 /// repository is the run's own.
-fn owner_written(repo: &Path) -> std::io::Result<()> {
+pub(super) fn owner_written(repo: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     for path in [repo.to_path_buf(), repo.join("config")] {
         use std::os::unix::fs::PermissionsExt as _;

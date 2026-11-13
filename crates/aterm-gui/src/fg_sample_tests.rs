@@ -670,11 +670,12 @@ fn a_job_left_in_the_background_just_before_the_prompt_is_heard_for_no_later_blo
 /// the child exit and reap it.
 fn with_parked_fork<T>(f: impl FnOnce(i32) -> T) -> T {
     use std::os::fd::AsRawFd as _;
-    let (go_r, go_w) = std::io::pipe().expect("pipe");
+    let (go_r, go_w) = aterm_uds::pipe().expect("pipe");
     let (go_fd, go_w_fd) = (go_r.as_raw_fd(), go_w.as_raw_fd());
     // Held across the fork alone, so the child copies no neighbour's descriptor between its
-    // creation and its close-on-fork mark (`aterm_uds::kept_out`).
-    let spawning = aterm_uds::spawn_lock::spawning();
+    // creation and its close-on-fork mark (`aterm_uds::kept_out`); `go`'s read end, which the
+    // child keeps, loses its own mark for this fork alone.
+    let spawning = aterm_uds::spawn_lock::handing(&[go_fd]);
     // SAFETY: the child calls only async-signal-safe functions (`close`, `read`, `_exit`) on
     // descriptors opened before `fork`, then exits without unwinding.
     let pid = unsafe { libc::fork() };
@@ -1132,4 +1133,34 @@ fn a_loss_while_bytes_wait_lasts_until_a_quiet_stand_down() {
         [During::Window],
         "unread at the loss: lost until a quiet stand-down"
     );
+}
+
+/// M2 land (audit 4 review): a restore places a process by its birth on the blocks' wall clock:
+/// a start read on the start clock is carried back from now by the time since, plus the start
+/// record's tick (the latest it may have started at). A start read now is now; one read ten
+/// seconds ago is ten seconds before now; an unread start (`0`) is none. NEGATIVE CONTROL
+/// (scratch): the time since not carried back (every start reads now) fails the second
+/// assertion.
+#[test]
+fn a_start_is_carried_to_the_wall_clock_by_the_time_since() {
+    use super::{start_clock_us, start_tick_us, started_wall_ms};
+    use crate::command_ran::wall_ms;
+    let before = wall_ms();
+    let (Some(now_us), Some(tick_us)) = (start_clock_us(), start_tick_us()) else {
+        assert_eq!(started_wall_ms(1), None, "no start clock: no wall ms");
+        return;
+    };
+    let tick_ms = tick_us.div_ceil(1_000);
+    let fresh = started_wall_ms(now_us).expect("a start read now");
+    let older = started_wall_ms(now_us - 10_000_000).expect("a start ten seconds ago");
+    let after = wall_ms();
+    assert!(
+        before <= fresh && fresh <= after,
+        "{before} <= {fresh} <= {after}"
+    );
+    assert!(
+        before.saturating_sub(10_000) <= older && older <= after.saturating_sub(10_000) + tick_ms,
+        "{before} - 10 s <= {older} <= {after} - 10 s + {tick_ms} ms"
+    );
+    assert_eq!(started_wall_ms(0), None, "an unread start");
 }

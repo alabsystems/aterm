@@ -2633,7 +2633,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         crate::harness::stand_in::proven(
             &fake_agy,
             &format!(
-                "for arg in \"$@\"; do\n  case \"$arg\" in\n    --config-dir*|-config-dir*) exit 2 ;;\n  esac\ndone\ncat '{}'\n",
+                "for arg in \"$@\"; do\n  case \"$arg\" in\n    --config-dir*|-config-dir*) exit 2 ;;\n  esac\ndone\n/bin/cat '{}'\n",
                 usage_file.display()
             ),
         );
@@ -2700,7 +2700,7 @@ I1022 09:30:56.364166 375 server_oauth.go:224] applyAuthResult: email=interviews
         let local_agy = local_bin.join("agy");
         crate::harness::stand_in::proven(
             &local_agy,
-            &format!("cat '{}'\n", switched_usage.display()),
+            &format!("/bin/cat '{}'\n", switched_usage.display()),
         );
         tmp.ran();
         std::fs::write(
@@ -3799,7 +3799,7 @@ fn a_running_agys_footer_reads_its_usage_once() {
     crate::harness::stand_in::proven(
         &agy,
         &format!(
-            "echo read >> '{}'\ncat '{}'\n",
+            "echo read >> '{}'\n/bin/cat '{}'\n",
             count.display(),
             usage.display()
         ),
@@ -3921,7 +3921,10 @@ fn a_skipped_agy_footer_read_is_made_later_and_a_failed_one_is_not_repeated() {
 /// NEGATIVE CONTROL: a person's ask (the fact menu's explicit `Refresh usage` action, which
 /// `muse_usage_forget` records) lets a live Muse session whose `prev.usage_read` is already
 /// `true` kick one fresh read, whereas ordinary aged resolver passes never re-read.
-#[cfg(unix)]
+///
+/// macOS only: the reads are counted as the stand-in's runs, and a read runs `muse serve` only
+/// under macOS's no-desk sandbox (`muse_usage::serve_command`; Muse Code has no other build).
+#[cfg(target_os = "macos")]
 #[test]
 fn muse_usage_forget_allows_one_explicit_refresh_on_a_live_session() {
     let mut tmp = aterm_uds::deadline::KeptUntilRan::new(tmp_dir("muse-forget-refresh").keep());

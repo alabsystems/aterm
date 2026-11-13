@@ -146,6 +146,8 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
     let model = handoff_address_owner_model();
     let mut c = candidate();
     let gate = crate::spawn::DeferredReaderGate::closed();
+    let fleet_path = c.sock_dir.join(format!("wf-{}.sock", std::process::id()));
+    let fleet = Arc::new(std::sync::Mutex::new(None));
 
     let before = launched(&model);
     for sid in c.ids() {
@@ -165,9 +167,13 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
         let link = c.link.clone();
         let bound = c.bound.take().expect("bound");
         let lent = guard.lend();
+        let (fleet_path, fleet) = (fleet_path.clone(), Arc::clone(&fleet));
         std::thread::spawn(move || {
             let _state = lent.enter();
-            publish_when_committed(bound, Some(&gate), Some(&link), Some(&root), &store)
+            publish_when_committed(bound, Some(&gate), Some(&link), Some(&root), &store, || {
+                *fleet.lock().unwrap() =
+                    Some(std::os::unix::net::UnixListener::bind(fleet_path).expect("fleet relay"));
+            })
         })
     };
 
@@ -200,12 +206,20 @@ fn a_candidates_entries_name_it_only_after_the_commit() {
         !publisher.is_finished(),
         "the publication waits on the Commit"
     );
+    assert!(
+        !fleet_path.exists(),
+        "the node must not discover a successor's fleet relay before Commit"
+    );
 
     gate.release();
     let listener = publisher
         .join()
         .expect("the publisher")
         .expect("a committed candidate publishes");
+    assert!(
+        fleet_path.exists(),
+        "the committed fleet relay is published"
+    );
     let mut committed = before.clone();
     assert!(model.fire("Commit", &mut committed));
     for sid in c.ids() {
@@ -246,6 +260,8 @@ fn the_ungated_publication_is_the_caught_boot_time_step() {
     let mut c = candidate();
     let gate = crate::spawn::DeferredReaderGate::closed();
     let before = launched(&model);
+    let fleet_path = c.sock_dir.join(format!("wf-{}.sock", std::process::id()));
+    let mut fleet = None;
 
     let listener = publish_when_committed(
         c.bound.take().expect("bound"),
@@ -253,8 +269,16 @@ fn the_ungated_publication_is_the_caught_boot_time_step() {
         Some(&c.link),
         Some(&c.root),
         &c.store,
+        || {
+            fleet = Some(std::os::unix::net::UnixListener::bind(&fleet_path).expect("fleet relay"));
+        },
     )
     .expect("an ungated launch publishes at once");
+    assert!(fleet.is_some());
+    assert!(
+        fleet_path.exists(),
+        "CONTROL: removing the gate also exposes the fleet relay before Commit"
+    );
     for sid in [c.root.0.clone(), c.carried.clone()] {
         let after = project(&c.sock_dir, &sid, &c.sock_path, Some(&gate));
         assert_eq!(

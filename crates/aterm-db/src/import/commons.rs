@@ -154,6 +154,9 @@ impl Imports {
     }
     /// [`Self::snapshot`] where the import table is declared here: `None` where nothing declared
     /// it, this Mac having set up no account catalog, and every other failure remains an error.
+    /// In a fenced home whose selection record holds no completion, a relocated table is
+    /// answered from its held prefix (`documents::application::observe_store_if_here`), which
+    /// [`Self::snapshot`] refuses.
     pub fn snapshot_if_declared(&self) -> Result<Option<Snapshot>> {
         crate::documents::application::observe_store_if_here(
             &self.paths,

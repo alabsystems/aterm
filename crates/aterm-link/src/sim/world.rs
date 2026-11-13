@@ -550,6 +550,30 @@ pub(crate) enum Mutant {
     /// carried the winner's record below the base, unread, and dropped its dedup key, the
     /// re-post lands a second copy of its key beside the one its reader is still handed.
     KeyedRepostWithoutReadingBack,
+    /// An in-flight entry journaled on a log before ANOTHER LOG is read back from nowhere on it
+    /// (`Bridge::read_back_from`'s `None`), so a copy an earlier replay on this log published,
+    /// its settle refused by the disk, is published again once a cut dropped its key
+    /// (ATERM-KI-1111-4).
+    NoReadBackOnAnotherLog,
+    /// `StateDir::forget_log_offsets` takes no pin's head out on another log: a pin's `at` stays
+    /// the old log's head (`StateDir::publication_offset_resets` skipped).
+    ForgetPinResetsOnAnotherLog,
+    /// `Bridge::forget_log_offsets` keeps the old log's offsets below its high water on another
+    /// log, as if it continued them.
+    KeepFloorOnAnotherLog,
+    /// `Bridge::judge_log` reads another log as a move that continues the old one to the lower
+    /// of its high water and the new head.
+    AnotherLogAsAMove,
+    /// The attach's replay lands a keyed post's record anew and leaves its key naming no
+    /// winner's offset (`Bridge::land_key_winner` skipped): on another log, or past a move's
+    /// fork, the key's next re-post reads no winner back and, past a cut that carried the
+    /// record and dropped its dedup key, lands a second copy of its key (ATERM-KI-1111-4).
+    ReplayLeavesTheKeysWinnerUntold,
+    /// Another log takes every pin's head out (`StateDir::publication_offset_resets`), as every
+    /// build before ATERM-KI-1111-4 did: a retry reads nothing back, so an attempt the attach's
+    /// replay published there, its answer unknown, is published again once a cut dropped its
+    /// dedup key.
+    PinHeadGoneOnAnotherLog,
 }
 
 /// What one run is.
@@ -681,6 +705,18 @@ pub(crate) struct Opts {
     /// waits for good, which the world's first census met in seeds 75 and 98 (a limit of
     /// `Bridge::unverified_publication`'s case 5 the F23 report records, not a law to judge).
     pub(crate) strays: bool,
+    /// THE LOG SET ASIDE (ATERM-KI-1111-4, a stream of its own): one open of the broker in six
+    /// follows `aterm link broker --retire-log` ([`bus::Broker::retire_log`]), so the bridge
+    /// attaches to ANOTHER LOG, a fresh id that continues nothing, with every record the old
+    /// one held gone.
+    pub(crate) retire_logs: bool,
+    /// A POISONED BROKER (ATERM-KI-1111-4, the same stream): on a weak tier the log's next full
+    /// flush fails now and then ([`bus::Broker::fail_next_full_flush`]), so the escalated post,
+    /// commit or `Settle` that asks for it is answered "outcome unknown", the tier latches to
+    /// Strict and every write is refused until a reopen that moves the generation; a poisoned
+    /// broker is stopped and opened again by its supervisor, as `aterm link broker` exits 75 on
+    /// a poison ([`crate::broker_health`]) and is started again.
+    pub(crate) poisons: bool,
 }
 
 /// The session the other writer under the node's producer id posts from ([`Opts::strays`]).
@@ -820,6 +856,20 @@ impl Opts {
             same_device: false,
             keys: false,
             strays: false,
+            retire_logs: false,
+            poisons: false,
+        }
+    }
+
+    /// THE LOSSY-LOG SWEEP's configuration for `seed` (ATERM-KI-1111-4): the committed one,
+    /// with logs set aside and poisoned brokers among the faults ([`Opts::retire_logs`],
+    /// [`Opts::poisons`]), drawn from a stream of their own so every other draw is the
+    /// committed seed's.
+    pub(crate) fn lossy_logs(seed: u64) -> Self {
+        Self {
+            retire_logs: true,
+            poisons: true,
+            ..Self::seed(seed)
         }
     }
 
@@ -1070,6 +1120,19 @@ pub(crate) struct Stats {
     pub(crate) broadcasts_given_up_told: u64,
     /// Handoffs ([`Opts::handoffs`]).
     pub(crate) handoffs: u64,
+    /// ANOTHER LOG (ATERM-KI-1111-4): opens that settled one (an empty log's, a loss that kept
+    /// none, a retired log's), logs set aside ([`Opts::retire_logs`]), full flushes that
+    /// failed and poisoned the broker ([`Opts::poisons`]), the writes refused while it was
+    /// poisoned, and the restarts its supervisor made of a poisoned broker.
+    pub(crate) another_logs: u64,
+    pub(crate) retired_logs: u64,
+    pub(crate) poisoned: u64,
+    pub(crate) poisoned_refusals: u64,
+    pub(crate) poison_restarts: u64,
+    /// Steps of the model tap's slots opened on a log after one was set aside: a slot opened
+    /// before a retire is no longer followed past it ([`super::conform::View::retired_logs`]),
+    /// so these are the tap's only refinement checks of a world that retires a log.
+    pub(crate) tap_past_a_retire: u64,
 }
 
 /// One ask with a deadline a session posted ([`Opts::deadlines`]).
@@ -1230,7 +1293,8 @@ struct World {
     epoch: u64,
     marker: u64,
     sent: BTreeMap<String, Sent>,
-    /// Every halt row the person published, in order.
+    /// Every halt row the person published, in order, a press astream answered with an unknown
+    /// outcome among them.
     halt_rows: Vec<(String, bool)>,
     peer_seq: u64,
     person_seq: u64,
@@ -1288,6 +1352,9 @@ struct World {
     /// Every key a note was posted under, by its name: who posted it, to whom, and the markers
     /// of its posts, first to last ([`World::repost`], [`World::key_copies`]).
     keyed: BTreeMap<String, Keyed>,
+    /// Logs set aside and poisoned brokers ([`Opts::retire_logs`], [`Opts::poisons`]), a
+    /// stream of their own, drawn from only in a world of either.
+    log_rng: Rng,
 }
 
 /// The posts of one idempotency key ([`Opts::keys`]).
@@ -1512,6 +1579,7 @@ impl World {
             seen: std::cell::RefCell::new(Vec::new()),
             key_rng: Rng::new(seed ^ 0x0ce7_5eed_4e75_0f23),
             keyed: BTreeMap::new(),
+            log_rng: Rng::new(seed ^ 0x0109_c0de_1111_0004),
         };
         // The first open's tick, asked for at once when its rules are set.
         w.tick_now();
@@ -1908,10 +1976,14 @@ impl World {
         let landed =
             self.core
                 .broker
-                .publish_as(producer(PEER), self.peer_seq, &subject, body.as_bytes());
+                .publish_told(producer(PEER), self.peer_seq, &subject, body.as_bytes());
         self.note(format!("peer mail {marker} to {sid}: {landed:?}"));
-        if landed.is_some() {
+        // An outcome astream calls unknown (a poisoned log, ATERM-KI-1111-4) is a mail sent:
+        // its record is held out of sight, and a reopen may keep it.
+        if landed.is_ok() {
             self.stats.mail += 1;
+        }
+        if landed != Err(false) {
             self.sent.insert(
                 marker,
                 Sent {
@@ -2563,10 +2635,13 @@ impl World {
         let landed =
             self.core
                 .broker
-                .publish_as(producer(PEER), self.peer_seq, &subject, body.as_bytes());
+                .publish_told(producer(PEER), self.peer_seq, &subject, body.as_bytes());
         self.note(format!("say {marker} on {topic}: {landed:?}"));
-        if landed.is_some() {
+        // An outcome astream calls unknown is a broadcast said: a reopen may keep its record.
+        if landed.is_ok() {
             self.stats.says += 1;
+        }
+        if landed != Err(false) {
             self.says.insert(marker, topic.to_string());
         }
     }
@@ -2719,7 +2794,7 @@ impl World {
             self.core.wall_ms(),
             if on { "on" } else { "off" }
         );
-        let landed = self.core.broker.publish_as(
+        let landed = self.core.broker.publish_told(
             producer(PERSON),
             self.person_seq,
             &subject,
@@ -2729,8 +2804,11 @@ impl World {
             "halt {} {marker}: {landed:?}",
             if on { "on" } else { "off" }
         ));
-        if landed.is_some() {
+        // An outcome astream calls unknown is a press made: a reopen may keep its record.
+        if landed.is_ok() {
             self.stats.halts += 1;
+        }
+        if landed != Err(false) {
             self.halt_rows.push((marker, on));
         }
     }
@@ -2743,7 +2821,15 @@ impl World {
         let mut rng = self.rng.fork(0xb0);
         let r = self.core.broker.stop(stop, &mut rng);
         self.stats.broker_restarts += 1;
-        if r.generation_after != r.generation_before {
+        self.book_restart(&r);
+    }
+
+    /// What a restart took, booked for the laws, and [`bus::law_check`] on it: a stop's
+    /// ([`World::broker_stop`]) or a retired log's ([`World::broker_start`]).
+    fn book_restart(&mut self, r: &bus::Restart) {
+        if r.another_log {
+            self.stats.another_logs += 1;
+        } else if r.generation_after != r.generation_before {
             self.stats.moves += 1;
         }
         self.stats.lost_records += r.before.len() as u64 - r.kept;
@@ -2769,7 +2855,7 @@ impl World {
             }
         }
         let oracle = lock(&self.core.broker.state).oracle.clone();
-        for v in bus::law_check(&r, &oracle) {
+        for v in bus::law_check(r, &oracle) {
             self.violations.push(format!("broker law: {v}"));
         }
     }
@@ -2780,6 +2866,15 @@ impl World {
     /// open after it aterm's again); one that sets them ticks at once, as astream's first tick
     /// is asked for when its rules are set.
     fn broker_start(&mut self) {
+        // THE LOG SET ASIDE while the broker is down ([`Opts::retire_logs`]): every record it
+        // held is gone, so every offset at or above 0 may name another record now.
+        if self.opts.retire_logs && self.log_rng.chance(1, 6) {
+            if let Some(r) = self.core.broker.retire_log() {
+                self.stats.retired_logs += 1;
+                self.note("broker log retired (--retire-log)");
+                self.book_restart(&r);
+            }
+        }
         let drawn = self.opts.retained && self.opts.cuts;
         // A world of strays opens with rules every time: on a broker that set none nothing
         // drops a stray record's dedup key, so nothing ends the hold it puts on a sender
@@ -3068,11 +3163,40 @@ impl World {
         if self.opts.deadlines && self.ask_rng.chance(1, 6) {
             self.decide();
         }
+        if self.opts.poisons {
+            self.poison_step();
+        }
         // Before a tick can take what an `expired` is judged against.
         self.judge_expiries();
         self.retention_step(true);
         self.collect_notes();
         self.check_always();
+    }
+
+    /// A POISONED BROKER'S DRAWS ([`Opts::poisons`]), from [`World::log_rng`]: on a weak tier
+    /// that is up and healthy, now and then the next full flush fails; and a poisoned broker is
+    /// stopped and opened again, as its supervisor restarts an `aterm link broker` that exited 75
+    /// on its poison. The stop is a crash: a power cut drawn while it is poisoned stays one.
+    fn poison_step(&mut self) {
+        let (up, healthy, owed) = {
+            let s = lock(&self.core.broker.state);
+            (s.up, s.poison.is_none(), s.fail_full_flush)
+        };
+        if up && healthy && !owed && self.tier != Tier::Strict && self.log_rng.chance(1, 40) {
+            self.note("broker: the next full flush fails");
+            self.core.broker.fail_next_full_flush();
+        }
+        if up && !healthy && self.log_rng.chance(1, 3) {
+            self.restart_poisoned();
+        }
+    }
+
+    /// A POISONED BROKER RESTARTED by its supervisor: a crash and an open.
+    fn restart_poisoned(&mut self) {
+        self.stats.poison_restarts += 1;
+        self.note("broker poisoned: its supervisor restarts it");
+        self.broker_stop(Stop::Crash);
+        self.broker_start();
     }
 
     /// A fingerprint of everything that can still move.
@@ -3103,6 +3227,11 @@ impl World {
         self.core.disarm_kill();
         self.note("settle");
         self.core.device.clean_disk();
+        // A fault armed and not met is disarmed, and a poisoned broker its supervisor restarts.
+        lock(&self.core.broker.state).fail_full_flush = false;
+        if self.core.broker.poisoned() {
+            self.restart_poisoned();
+        }
         if !lock(&self.core.broker.state).up {
             self.core.broker.start();
             self.tick_now();
@@ -3249,7 +3378,11 @@ impl World {
             records,
             gone: self.core.broker.gone(),
             log: ident.to_string(),
-            generation: ident.generation,
+            // The identity's moves so far, another log's among them: astream numbers another
+            // log's generations from 0 again, and to the model it is a move that kept nothing
+            // a reader can continue from (`FabricExactlyOnce`'s `g`).
+            generation: self.stats.moves + self.stats.another_logs,
+            retired_logs: self.stats.retired_logs,
             group_start: self.core.broker.group_start(&group),
             alive: self.live.is_some(),
             owed: self
@@ -4184,7 +4317,7 @@ impl World {
             bad.extend(self.mirror_gaps());
         }
         bad.extend(self.mirror_stopped_for_its_pin());
-        if self.stats.moves == 0 {
+        if self.stats.moves == 0 && self.stats.another_logs == 0 {
             bad.extend(self.mirror_twice_raw());
         }
         if self.opts.deadlines {
@@ -4398,6 +4531,11 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
     (w.stats.gap_fenced, w.stats.fences_lifted) = w.core.broker.fence_counts();
     w.stats.rate_limited = w.core.broker.rate_limited_total();
     w.stats.settles = w.core.broker.settles();
+    {
+        let b = lock(&w.core.broker.state);
+        w.stats.poisoned = b.poisons;
+        w.stats.poisoned_refusals = b.poisoned_refusals;
+    }
     w.stats.pin_durable_replaces = w.core.device.pin_durable_replaces();
     // THE LAW OF THE LIMIT'S WAIT (critic item E06, `bus::State::rate_laws`): judged at the door,
     // where a bridge that retried a refusal for the rate at once meets it.
@@ -4468,6 +4606,7 @@ pub(crate) fn run(opts: &Opts) -> Outcome {
     w.stats.renamed_unflushed = errors.renamed_unflushed;
     w.stats.appends_cut = errors.appends_cut;
     w.stats.disk_full_refused = errors.disk_full;
+    w.stats.tap_past_a_retire = w.tap.checked_past_a_retire;
     Outcome {
         seed: opts.seed,
         tier: w.tier,

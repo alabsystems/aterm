@@ -129,7 +129,7 @@ fn native_object_original_parent_actor() {
     let source_root = File::open(path).unwrap();
     let source = File::open(path.join("input.rs")).unwrap();
     let sdk_input = File::open(path.join("selected-input")).unwrap();
-    let (read, write) = std::io::pipe().unwrap();
+    let (read, write) = aterm_uds::pipe().unwrap();
     let originals: Vec<OwnedFd> = vec![
         read.into(),
         write.into(),
@@ -212,7 +212,7 @@ fn native_object_output_ofds_survive_sender_death() {
         b"readonly fixture, no SDK authority",
     )
     .unwrap();
-    let (lock_read, mut release) = std::io::pipe().unwrap();
+    let (lock_read, mut release) = aterm_uds::pipe().unwrap();
     let mut command = spawnfd::command(std::env::current_exe().unwrap());
     command
         .args(["--exact", PARENT, "--nocapture"])

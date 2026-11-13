@@ -5,9 +5,9 @@
 //! No table dump approximates policy routing: RTM_GETROUTE asks the kernel for
 //! this destination, source, uid, protocol and port tuple.
 
+use super::{Heard, Route, align4, refuse, u16_at, u32_at};
 #[cfg(target_os = "linux")]
 use super::{MAX_REPLY, Socket, sequence};
-use super::{Route, align4, refuse, u16_at, u32_at};
 use std::{
     io,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
@@ -16,11 +16,21 @@ use std::{
 const HEADER: usize = 16;
 const MESSAGE: usize = 12;
 
-/// Validate every netlink message in one notification datagram. This socket only joins
-/// multicast groups; it never sends the queries whose unicast replies could wake a recheck.
-pub(super) fn route_changed(bytes: &[u8]) -> io::Result<bool> {
+/// Whether an rtnetlink message of type `kind` can change what `getifaddrs`, an interface's
+/// index or its sysfs entry says: every type but the route ones (`RTM_NEWROUTE` through
+/// `RTM_GETROUTE`, 24 to 27) and the rule ones (`RTM_NEWRULE` through `RTM_GETRULE`, 32 to 35,
+/// linux/rtnetlink.h), which change how a packet is routed and never a link or its addresses.
+/// A type this build does not know moves it.
+const fn moves_interfaces(kind: u16) -> bool {
+    !matches!(kind, 24..=27 | 32..=35)
+}
+
+/// Validate every netlink message in one notification datagram and say the most they tell a
+/// listener ([`Heard`]). This socket only joins multicast groups; it never sends the queries
+/// whose unicast replies could wake a recheck.
+pub(super) fn route_changed(bytes: &[u8]) -> io::Result<Heard> {
     let mut at = 0;
-    let mut changed = false;
+    let mut heard = Heard::Nothing;
     while at < bytes.len() {
         let length = usize::try_from(u32_at(bytes, at)?)
             .map_err(|_| refuse("invalid route notification length"))?;
@@ -34,14 +44,15 @@ pub(super) fn route_changed(bytes: &[u8]) -> io::Result<bool> {
                     "route notification reports an error or lost messages",
                 ));
             }
-            _ => changed = true,
+            kind if moves_interfaces(kind) => heard = Heard::Attachments,
+            _ => heard = heard.max(Heard::Routes),
         }
         at += align4(length)?;
     }
     if at != bytes.len() || bytes.is_empty() {
         return Err(refuse("invalid route notification padding"));
     }
-    Ok(changed)
+    Ok(heard)
 }
 
 fn attribute(wire: &mut Vec<u8>, kind: u16, bytes: &[u8]) {

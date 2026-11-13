@@ -31,6 +31,12 @@ name = "atpkg-abrew"
 path = "src/abrew_main.rs"
 test = false
 
+# Inert development fixture: serves native tether entry without application startup.
+[[bin]]
+name = "atpkg-status-fixture"
+path = "tests/status_fixture.rs"
+test = false
+
 [features]
 # Development seams in an optimized build (`aterm_types::dev_seam!`: ATPKG_REGISTRY,
 # ATPKG_STAGE_DISK_REVERIFY, ATPKG_WAIT_ANNOUNCE_GRACE_MS; `config::DEV_SEAMS`: `[packages]`
@@ -160,6 +166,11 @@ aterm-dirfd = { workspace = true }
 # `caller_shell::ProcArgs::env_var`. Already in atpkg's Windows graph through
 # aterm-toolchain and aterm-uds; pure Rust and kernel32/ntdll FFI there.
 [target.'cfg(windows)'.dependencies]
+aterm-sysprobe = { workspace = true }
+
+# `input_seal::machine_facts`: the OS build and model a sealed identity binds
+# (`aterm_sysprobe::os_build`, `machine_model`). Already in the macOS graph through aterm-capacity.
+[target.'cfg(target_os = "macos")'.dependencies]
 aterm-sysprobe = { workspace = true }
 
 [dev-dependencies]

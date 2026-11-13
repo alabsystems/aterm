@@ -104,6 +104,7 @@ fn exact_fetch_identity_keeps_refs_and_auth_mode_but_not_local_paths() {
             source,
             into,
             anonymous,
+            crate::git::FetchScope::NativeExact,
         ))
     };
     let expected = request("/first/checkout", "refs/heads/main", "refs/agh/exact", true);
@@ -129,6 +130,38 @@ fn exact_fetch_identity_keeps_refs_and_auth_mode_but_not_local_paths() {
             expected,
             request("/first/checkout", source, into, anonymous)
         );
+    }
+}
+
+#[test]
+fn exact_fetch_closure_scopes_cannot_share_a_replay_identity() {
+    use crate::git::{FetchScope, GitRun};
+    let slug = crate::slug::Slug::new("owner", "repo").unwrap();
+    let root = std::path::Path::new("/not-opened");
+    let scopes = [
+        FetchScope::NativeExact,
+        FetchScope::MetadataOnly,
+        FetchScope::SelectedCheckout { cache: None },
+        FetchScope::SelectedCheckout {
+            cache: Some(root.into()),
+        },
+        FetchScope::FullSource { cache: root.into() },
+    ];
+    let keys: Vec<_> = scopes
+        .into_iter()
+        .map(|scope| {
+            super::git_request(&GitRun::fetch_ref(
+                &slug,
+                root,
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "refs/agh/exact",
+                true,
+                scope,
+            ))
+        })
+        .collect();
+    for (index, key) in keys.iter().enumerate() {
+        assert!(keys[..index].iter().all(|other| other != key));
     }
 }
 

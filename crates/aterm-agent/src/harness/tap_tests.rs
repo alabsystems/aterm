@@ -692,6 +692,7 @@ fn reading(pid: u32, api_ms: u64, five: Option<u32>, seven: Option<u32>) -> Read
         cache_expires_at: None,
         version: None,
         model: None,
+        effort: None,
         ctx_left: None,
         dur_us: 0,
         row: None,
@@ -828,6 +829,74 @@ fn a_reading_keeps_the_context_left_claude_code_counts() {
     assert_eq!(
         Reading::of_json(old).expect("an older file reads").ctx_left,
         None
+    );
+}
+
+/// THE EFFORT THE SESSION IS SET TO (Claude Code 2.1.310's status-line payload; 2.1.322 builds
+/// the same field): `effort` carries `level`, the level Claude Code's own `/effort` shows at
+/// that run, which the file keeps as the word it is; the transcript names it only in the rows of
+/// requests already sent. A run whose only news is the level rewrites the file, so a switch
+/// typed while a turn runs is on disk at the next run. A payload that names none, or names it in
+/// anything but one lowercase word, reads as none, never as a level; an older file, which never
+/// had the key, reads as none too.
+#[test]
+fn a_reading_keeps_the_effort_claude_code_reports() {
+    let at = |level: &str| PAYLOAD_2_1_310.replace(r#"{"level":"high"}"#, level);
+    assert_ne!(at("null"), PAYLOAD_2_1_310, "the payload names its effort");
+    let r = Reading::of_stdin(PAYLOAD_2_1_310, &vars(), NOW).expect("a reading");
+    assert_eq!(r.effort.as_deref(), Some("high"));
+    assert_eq!(Reading::of_json(&r.to_json()).expect("reads back"), r);
+
+    let dir = scratch("effort");
+    let said = |payload: &str| {
+        let _ = tap(payload.as_bytes(), &vars(), Some(dir.path()));
+        Reading::read(dir.path(), SID, 68537, 0)
+            .expect("the reading")
+            .0
+            .effort
+    };
+    assert_eq!(
+        said(&at(r#"{"level":"medium"}"#)).as_deref(),
+        Some("medium")
+    );
+    assert_eq!(
+        said(PAYLOAD_2_1_310).as_deref(),
+        Some("high"),
+        "the same figures at another level are a new file, not a re-report"
+    );
+    assert_eq!(
+        said(&at(r#"{"level":"ultra"}"#)).as_deref(),
+        Some("ultra"),
+        "a level a later build adds is kept as it is spelled"
+    );
+    for none in [
+        "null",
+        "{}",
+        r#"{"level":null}"#,
+        r#"{"level":3}"#,
+        r#"{"level":""}"#,
+        r#"{"level":"High"}"#,
+        r#"{"level":"very high"}"#,
+        r#"{"level":"aaaaaaaaaaaaaaaaa"}"#,
+    ] {
+        assert_eq!(said(&at(none)), None, "{none}");
+    }
+    let unnamed = PAYLOAD_2_1_310.replace(r#""effort":{"level":"high"},"#, "");
+    assert_ne!(unnamed, PAYLOAD_2_1_310);
+    assert_eq!(said(&unnamed), None, "a payload with no effort");
+    let old = r#"{"v":1,"at":5,"sid":"s-1","pid":7,"session":null,"login":null,"home":null,
+"api_ms":3,"five_hour":null,"seven_day":null,"cache":{},"version":null}"#;
+    assert_eq!(
+        Reading::of_json(old).expect("an older file reads").effort,
+        None
+    );
+    assert_eq!(
+        Reading::of_json(
+            &r.to_json()
+                .replace(r#""effort":"high""#, r#""effort":"High""#)
+        ),
+        None,
+        "a file whose effort is no level word is not a reading"
     );
 }
 

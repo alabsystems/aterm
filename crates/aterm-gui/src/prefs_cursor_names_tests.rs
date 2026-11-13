@@ -463,9 +463,9 @@ fn a_fresh_config_draws_the_rainbow_beside_the_cat() {
         ),
         (None, None)
     );
-    // The theme's shape is the underline, and one row names it.
+    // The theme's shape is the tall band with its line under the words, and one row names it.
     let rainbow = resolve_trail_presentation("rainbow", "cat");
-    assert!(!rainbow.ribbon_tall && !rainbow.ribbon_flat);
+    assert!(rainbow.ribbon_tall && !rainbow.ribbon_flat);
     assert_eq!(rainbow.pet_species, Some(PetSpecies::Cat));
     let rainbows = TRAIL_STYLES
         .iter()

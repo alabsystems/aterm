@@ -226,3 +226,10 @@ semantic metadata), separate from the unchanged 1MiB native socket and64KiB
 field limits. It retains completed/incomplete query observations without private
 request capabilities. Decoded reports create no SDK, CPU, memory, execution,
 retirement, source authentication or proof authority.
+
+Tests run on stock std as well as Trust's; a test that needs Trust's descriptor
+inheritance is `#[cfg(trust_std)]`. On Linux, `host_boot` opens `/etc/machine-id`,
+which a container image may lack (the `rust` image does). There, every
+`client::metadata` test whose fixture calls `host_boot().unwrap()` panics with
+`NotFound`, under any feature set that enables `client`. Mount the host's file
+read-only (`-v /etc/machine-id:/etc/machine-id:ro`).

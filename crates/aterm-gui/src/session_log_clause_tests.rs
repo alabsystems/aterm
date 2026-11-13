@@ -542,6 +542,7 @@ fn a_lifted_relaunch_shows_the_harness_restarting_until_its_ttl() {
         .as_str()
         .to_string();
     let report = aterm_agent::harness::upgrade_drive::Report {
+        rung: None,
         pid: 4242,
         tab: sid.clone(),
         session: "c0ffee".to_string(),

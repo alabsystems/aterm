@@ -98,9 +98,14 @@ fn malformed_route_frames_and_conflicting_interfaces_fail_closed() {
     let mut wrong = bytes.clone();
     wrong[4..6].copy_from_slice(&9_u16.to_ne_bytes());
     assert!(parse(&wrong, 88, 77).is_err());
+    // A lookup the kernel refused keeps the kernel's errno, as the failed write of a plain
+    // RTM_GET does: "no route" is ESRCH either way.
     let mut wrong = bytes.clone();
-    wrong[24] = 1;
-    assert!(parse(&wrong, 88, 77).is_err());
+    wrong[24..28].copy_from_slice(&libc::ESRCH.to_ne_bytes());
+    assert_eq!(
+        parse(&wrong, 88, 77).unwrap_err().raw_os_error(),
+        Some(libc::ESRCH)
+    );
     let mut wrong = bytes.clone();
     wrong[2] = 6;
     assert!(parse(&wrong, 88, 77).is_err());
@@ -118,19 +123,46 @@ fn malformed_route_frames_and_conflicting_interfaces_fail_closed() {
 #[test]
 fn scoped_requests_are_native_bounded_and_read_only() {
     let peer: SocketAddr = "[fe80::2%3]:99".parse().unwrap();
-    let bytes = request(peer, 88, 77, None).unwrap();
-    assert_eq!(bytes[3], 4);
+    let bytes = request(peer, 88, 77, None, RTM_GET_SILENT).unwrap();
+    assert_eq!(bytes[3], 0x11);
+    let plain = request(peer, 88, 77, None, RTM_GET).unwrap();
+    assert_eq!(plain[3], 0x4);
+    assert_eq!(
+        (&plain[..3], &plain[4..]),
+        (&bytes[..3], &bytes[4..]),
+        "the two lookups differ in their type alone"
+    );
+    // RTM_ADD through RTM_LOCK, and whatever else is no lookup, is never written.
+    for kind in (0..=u8::MAX).filter(|kind| ![0x4, 0x11].contains(kind)) {
+        assert!(request(peer, 88, 77, None, kind).is_err(), "{kind:#x}");
+    }
     assert_eq!(u16_at(&bytes, 4).unwrap(), 3);
     assert_eq!(u32_at(&bytes, 8).unwrap(), 0x0100_0000);
     assert_eq!(u32_at(&bytes, 12).unwrap(), 0x11);
     assert_eq!(&bytes[HEADER + 10..HEADER + 12], &3_u16.to_be_bytes());
     assert_eq!(u32_at(&bytes, HEADER + 24).unwrap(), 0);
     assert_eq!(usize::from(u16_at(&bytes, 0).unwrap()), bytes.len());
-    assert!(request("[fe80::2%65536]:99".parse().unwrap(), 1, 1, None).is_err());
-    let bound = request("192.0.2.1:99".parse().unwrap(), 88, 77, Some(3)).unwrap();
+    assert!(
+        request(
+            "[fe80::2%65536]:99".parse().unwrap(),
+            1,
+            1,
+            None,
+            RTM_GET_SILENT
+        )
+        .is_err()
+    );
+    let bound = request(
+        "192.0.2.1:99".parse().unwrap(),
+        88,
+        77,
+        Some(3),
+        RTM_GET_SILENT,
+    )
+    .unwrap();
     assert_eq!(u16_at(&bound, 4).unwrap(), 3);
     assert_eq!(u32_at(&bound, 8).unwrap(), 0x0100_0000);
-    assert!(request(peer, 88, 77, Some(4)).is_err());
+    assert!(request(peer, 88, 77, Some(4), RTM_GET_SILENT).is_err());
 }
 
 #[cfg(target_os = "macos")]
@@ -166,6 +198,52 @@ fn live_link_local_route_uses_the_kernel_embedded_zone() {
     }
 }
 
+/// Either type of lookup reads the same route through [`lookup_as`], or is refused with the same
+/// errno: loopback, loopback's link-local address, a destination the default route takes, this
+/// Mac's own default gateway where it has one (a LAN peer, asked of the routing table with no
+/// packet) and an IPv6 destination, which a Mac with no unscoped IPv6 default refuses with
+/// `ESRCH` in the silent lookup's answer and in the plain one's write.
+///
+/// NEGATIVE CONTROL (2026-11-12, on a Mac with no unscoped IPv6 default): with `parse` reading a
+/// refused answer as `refuse("Darwin rejected the route query")`, the silent lookup's "no route"
+/// loses its errno and this fails for the IPv6 destination (`left: Err((None,
+/// PermissionDenied, ..))`, `right: Err((Some(3), ..))`).
+#[cfg(target_os = "macos")]
+#[test]
+fn either_type_of_lookup_reads_the_same_route_or_the_same_refusal() {
+    let lo0 = super::super::index("lo0").unwrap();
+    let mut peers: Vec<SocketAddr> = vec![
+        "127.0.0.1:9".parse().unwrap(),
+        SocketAddr::V6(std::net::SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            9,
+            0,
+            lo0,
+        )),
+        "192.0.2.1:9".parse().unwrap(),
+        "[2001:db8::1]:9".parse().unwrap(),
+    ];
+    let primary = aterm_uds::network::default_routes().primary;
+    if let Some(gateway) = primary.and_then(|primary| primary.gateway) {
+        peers.push(SocketAddr::new(gateway.into(), 9));
+    }
+    let outcome = |route: io::Result<Route>| {
+        route.map_err(|error| (error.raw_os_error(), error.kind(), error.to_string()))
+    };
+    for peer in peers {
+        let asked = |kind: u8| {
+            outcome(lookup_as(peer, None, super::super::deadline(), |write| {
+                write(kind)
+            }))
+        };
+        let plain = asked(RTM_GET);
+        assert_eq!(asked(RTM_GET_SILENT), plain, "{peer}");
+        // The lookup the process makes is one of the two.
+        let made = lookup(None, peer, None, super::super::deadline());
+        assert_eq!(outcome(made), plain, "{peer}");
+    }
+}
+
 /// The routing messages that can change an attachment move the interface generation, and the
 /// route-table ones, which an idle Mac's ARP and route lookups send all the time, do not.
 #[test]
@@ -182,8 +260,18 @@ fn interface_and_address_messages_move_the_interface_generation() {
     for kind in (0x1..=0x14).chain([0x40]) {
         assert_eq!(
             route_changed(&routing_message(kind)).unwrap(),
-            !matches!(kind, 0x4 | 0x14),
-            "listener validity must include route changes but not its own lookups: {kind:#x}"
+            match kind {
+                0x4 | 0x7 | 0x14 => Heard::Nothing,
+                0x1..=0xb => Heard::Routes,
+                _ => Heard::Attachments,
+            },
+            "listener validity must include route changes but no lookup, answered or failed, \
+             and an attachment is read again only for what moves the generation: {kind:#x}"
+        );
+        assert_eq!(
+            route_changed(&routing_message(kind)).unwrap() == Heard::Attachments,
+            moves_interfaces(kind),
+            "{kind:#x}"
         );
     }
     for end in 0..HEADER {
@@ -296,13 +384,26 @@ fn a_drain_moves_the_generation_for_interface_messages_and_what_it_cannot_vouch_
             socket: super::super::Socket(socket.into()),
             room: 64 * 1024,
         };
-        assert!(!changes.drain().unwrap());
+        assert_eq!(changes.drain().unwrap(), Heard::Nothing);
         kernel.send(&routing_message(0x4)).unwrap();
-        assert!(
-            !changes.drain().unwrap(),
+        assert_eq!(
+            changes.drain().unwrap(),
+            Heard::Nothing,
             "a route lookup cannot wake itself"
         );
-        for kind in [0x1, 0x3, 0xc, 0xe] {
+        kernel.send(&routing_message(0x7)).unwrap();
+        assert_eq!(
+            changes.drain().unwrap(),
+            Heard::Nothing,
+            "a lookup that found no route changed none"
+        );
+        for (kind, heard) in [
+            (0x1, Heard::Routes),
+            (0x2, Heard::Routes),
+            (0x3, Heard::Routes),
+            (0xc, Heard::Attachments),
+            (0xe, Heard::Attachments),
+        ] {
             kernel.send(&routing_message(kind)).unwrap();
             let mut ready = libc::pollfd {
                 fd: changes.fd().as_raw_fd(),
@@ -311,8 +412,19 @@ fn a_drain_moves_the_generation_for_interface_messages_and_what_it_cannot_vouch_
             };
             // SAFETY: ready is one live initialized pollfd, and changes owns the descriptor.
             assert_eq!(unsafe { libc::poll(&raw mut ready, 1, 0) }, 1);
-            assert!(changes.drain().unwrap());
-            assert!(!changes.drain().unwrap(), "the message was consumed");
+            assert_eq!(changes.drain().unwrap(), heard, "{kind:#x}");
+            assert_eq!(
+                changes.drain().unwrap(),
+                Heard::Nothing,
+                "the message was consumed"
+            );
+        }
+        // The most any message of one drain tells stands, in either order.
+        for kinds in [[0x1, 0xc], [0xc, 0x1]] {
+            for kind in kinds {
+                kernel.send(&routing_message(kind)).unwrap();
+            }
+            assert_eq!(changes.drain().unwrap(), Heard::Attachments);
         }
         kernel.send(&[0]).unwrap();
         assert!(
@@ -362,6 +474,105 @@ fn local_attachments_are_read_again_once_the_routing_socket_moves() {
     assert_eq!(recheck(Some(0xe)), 2, "RTM_IFINFO");
     assert_eq!(recheck(None), 2, "after RTM_IFINFO");
     assert_eq!(recheck(Some(0xc)), 3, "RTM_NEWADDR");
+    STAND_IN.set(None);
+    crate::lan::FIXED_NOW.set(None);
+}
+
+/// A listener that hears a change of an interface or an address on its own routing socket
+/// judges by a fresh read of the attachments at once, and once more
+/// [`crate::slots::ACCEPT_POLL`] later, though the socket that moves the generation (another
+/// socket, here a stand-in that hears nothing) stood still: with no timer, the kept read would
+/// otherwise stand until its expiry. A lookup asks for neither and does not turn the listener's
+/// server: its answer (`RTM_GET`), or the `RTM_MISS` of one that found no route, which a Mac
+/// with no IPv6 default route hears several times a second from any program that keeps
+/// connecting toward one. A change of the route table (`RTM_ADD`, `RTM_DELETE`, `RTM_CHANGE`)
+/// turns the server, as it did before, and asks for neither either: it moves no interface, the
+/// kept read stands and no look is owed. Half the socket's room found queued, of whatever types,
+/// is read afresh: the kernel may have dropped a message there. The listener's socket is a
+/// stand-in this test delivers the messages to, on a clock it holds.
+///
+/// NEGATIVE CONTROLS (2026-11-12): without `forget_attachments()` in `Listener::drain_changes`,
+/// the read after `RTM_NEWADDR` is the kept one (`left: 1, right: 2`); with a route-table
+/// message forgetting and owing a look as an address one does (`Heard::Routes` taken with
+/// `Heard::Attachments` there), `RTM_ADD` owes a look (`left: Some(..), right: None`); with
+/// `RouteChanges::drain` not weighing what it found queued, half the room of `RTM_MISS` owes
+/// none (`left: None, right: Some(..)`); with `RTM_MISS` read as a route change
+/// (`route_changed` without its `0x7`), the miss turns the server ("a lookup changes no
+/// route: 0x7").
+#[cfg(target_os = "macos")]
+#[test]
+fn a_change_a_listener_hears_reads_the_attachments_afresh_now_and_once_more() {
+    use crate::slots::ACCEPT_POLL;
+
+    let (_silent, socket) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    STAND_IN.set(Some(Watch::over(socket.into(), 64 * 1024)));
+    let start = std::time::Instant::now();
+    crate::lan::FIXED_NOW.set(Some(start));
+    let (kernel, heard) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    let local = "127.0.0.1:0".parse().unwrap();
+    let listener = crate::lan::Listener::bind(local, crate::lan::Scope::Loopback)
+        .unwrap()
+        .hearing(heard.into());
+    let enumerations = crate::lan::ENUMERATIONS.get();
+    let read = || {
+        crate::lan::local_attachments(Some(local), None).unwrap();
+        crate::lan::ENUMERATIONS.get() - enumerations
+    };
+    assert_eq!(read(), 1);
+    assert_eq!(read(), 1, "kept");
+
+    // RTM_GET, RTM_MISS.
+    for kind in [0x4, 0x7] {
+        kernel.send(&routing_message(kind)).unwrap();
+        assert!(
+            !listener.drain_changes().unwrap(),
+            "a lookup changes no route: {kind:#x}"
+        );
+        assert_eq!(listener.validity_deadline(), None, "{kind:#x} owes no look");
+        assert_eq!(read(), 1, "{kind:#x} leaves the kept read");
+    }
+
+    // RTM_ADD, RTM_DELETE, RTM_CHANGE.
+    for kind in [0x1, 0x2, 0x3] {
+        kernel.send(&routing_message(kind)).unwrap();
+        assert!(
+            listener.drain_changes().unwrap(),
+            "a route change turns the server: {kind:#x}"
+        );
+        assert_eq!(listener.validity_deadline(), None, "{kind:#x} owes no look");
+        listener.recheck().unwrap();
+        assert_eq!(read(), 1, "{kind:#x} leaves the kept read");
+    }
+
+    kernel.send(&routing_message(0xc)).unwrap();
+    assert!(listener.drain_changes().unwrap(), "RTM_NEWADDR");
+    assert_eq!(read(), 2, "RTM_NEWADDR on the listener's socket alone");
+    assert_eq!(listener.validity_deadline(), Some(start + ACCEPT_POLL));
+    listener.recheck().unwrap();
+    assert_eq!(
+        listener.validity_deadline(),
+        Some(start + ACCEPT_POLL),
+        "a recheck before the look is due leaves it owed"
+    );
+    assert_eq!(read(), 2, "and reads nothing");
+
+    crate::lan::FIXED_NOW.set(Some(start + ACCEPT_POLL));
+    listener.recheck().unwrap();
+    assert_eq!(listener.validity_deadline(), None, "the look was given");
+    assert_eq!(read(), 3, "by a fresh read");
+    assert_eq!(read(), 3, "which is kept again");
+
+    // Route-table messages alone, half the room of them: one may have been dropped unseen.
+    let (kernel, heard) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    let listener = listener.hearing_in(heard.into(), 2 * HEADER);
+    kernel.send(&routing_message(0x7)).unwrap();
+    assert!(listener.drain_changes().unwrap());
+    assert_eq!(
+        listener.validity_deadline(),
+        Some(start + 2 * ACCEPT_POLL),
+        "a look is owed"
+    );
+    assert_eq!(read(), 4, "and the read is fresh");
     STAND_IN.set(None);
     crate::lan::FIXED_NOW.set(None);
 }

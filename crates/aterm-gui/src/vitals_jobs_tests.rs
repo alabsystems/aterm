@@ -426,22 +426,16 @@ fn a_line_fed_past_a_passs_clock_is_the_next_passs() {
 #[cfg(unix)]
 #[test]
 fn a_pass_that_finds_keys_driven_since_the_last_stamps_its_clock() {
-    let mut fds = [0; 2];
-    // SAFETY: `fds` is two writable ints.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-    let [r, w] = fds;
-    let sink = aterm_session::sink::SinkWriter::new(w);
+    use std::os::fd::AsRawFd as _;
+    let (r, w) = aterm_uds::pipe().expect("pipe");
+    let sink = aterm_session::sink::SinkWriter::new(w.as_raw_fd());
     let feed = JobFeed::default();
     let first = feed.typed_at(1_000, sink.driven_input());
     let still = feed.typed_at(3_000, sink.driven_input());
     assert_eq!(sink.write_frame(b"x").expect("a key"), 1);
     let typed = feed.typed_at(5_000, sink.driven_input());
     let kept = feed.typed_at(7_000, sink.driven_input());
-    // SAFETY: both ends are this test's.
-    unsafe {
-        libc::close(r);
-        libc::close(w);
-    }
+    drop((r, w));
     assert_eq!(
         (first, still, typed, kept),
         (None, None, Some(5_000), Some(5_000))

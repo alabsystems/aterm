@@ -112,27 +112,41 @@ pub fn composer_row(agent: &str, screen: &str) -> Option<String> {
 /// the row a `ctl cell <row> <col>` read names).
 #[must_use]
 pub fn composer_at(agent: &str, screen: &str) -> Option<(usize, String)> {
+    let (at, lines) = composer_lines_at(agent, screen)?;
+    Some((at, lines.into_iter().next()?))
+}
+
+/// The composer's rows on a screen `ctl text` gave, from the screen row its first stands on
+/// ([`composer_at`] reads the first): each of its rows as `agent`'s composer reader reads them,
+/// one at least.
+#[must_use]
+pub fn composer_lines_at(agent: &str, screen: &str) -> Option<(usize, Vec<String>)> {
     let rows: Vec<String> = screen
         .replace(NBSP, " ")
         .split('\n')
         .map(str::to_string)
         .collect();
-    let first = |(at, lines): (usize, Vec<String>)| Some((at, lines.into_iter().next()?));
+    let some = |(at, lines): (usize, Vec<String>)| (!lines.is_empty()).then_some((at, lines));
     if agent == "muse" {
-        return first(aterm_phase::muse::composer_draft(&rows)?);
+        return some(aterm_phase::muse::composer_draft(&rows)?);
     }
     if agent == "codex" {
-        let at = rows.iter().rposition(|r| r.starts_with('›'))?;
+        let at = rows
+            .iter()
+            .rposition(|r| r.starts_with('›') || r.starts_with('»'))?;
         if rows[at + 1..].iter().any(|r| r.starts_with("  › ")) {
             return None;
         }
-        return Some((at, rows[at].trim_start_matches('›').trim().to_string()));
+        return Some((
+            at,
+            vec![rows[at].trim_start_matches(['›', '»']).trim().to_string()],
+        ));
     }
     if agent == "agy" {
-        return first(aterm_phase::agy::composer_draft(&rows)?);
+        return some(aterm_phase::agy::composer_draft(&rows)?);
     }
     if agent == "kimi" {
-        return first(aterm_phase::kimi::composer(&rows)?);
+        return some(aterm_phase::kimi::composer(&rows)?);
     }
     let idx: Vec<usize> = rows
         .iter()
@@ -143,13 +157,24 @@ pub fn composer_at(agent: &str, screen: &str) -> Option<(usize, String)> {
     let [.., top, bot] = idx.as_slice() else {
         return None;
     };
-    let first = rows
+    let mut lines: Vec<String> = rows
         .get(top + 1..*bot)
-        .and_then(<[String]>::first)
-        .cloned()
-        .unwrap_or_default();
-    let t = first.strip_prefix('❯').unwrap_or(&first);
-    Some((top + 1, t.trim().to_string()))
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let row = if i == 0 {
+                row.strip_prefix('❯').unwrap_or(row)
+            } else {
+                row
+            };
+            row.trim().to_string()
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    Some((top + 1, lines))
 }
 
 /// The spinner's busy row (`✻ Verb… (Ns · …)`), if any.

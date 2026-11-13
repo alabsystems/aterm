@@ -37,7 +37,10 @@ pub enum MetadataOutputStream {
 type OutputObserver<'a> = dyn FnMut(MetadataOutputStream, &[u8]) -> io::Result<()> + 'a;
 mod contained;
 mod produced;
-pub use contained::{CompletedProducedOperation, ContainedProducedError, ContainedProducedMember};
+pub use contained::{
+    CompletedProducedOperation, ContainedProducedError, ContainedProducedMember,
+    SuccessfulProducedCompletion,
+};
 mod refusal;
 pub use produced::{ProducedError, ProducedFailureObservation, ProducedMember, ProducedResult};
 mod linker;
@@ -59,9 +62,10 @@ impl std::fmt::Debug for MetadataError {
         match self {
             Self::BeforeRequest(error) => f.debug_tuple("BeforeRequest").field(error).finish(),
             Self::Refused => f.write_str("Refused"),
-            Self::Unknown { error, .. } => {
-                f.debug_struct("Unknown").field("error", error).finish_non_exhaustive()
-            }
+            Self::Unknown { error, .. } => f
+                .debug_struct("Unknown")
+                .field("error", error)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -81,12 +85,17 @@ enum NativeQueryRequest {
     Resolver(crate::resolver::SealedResolverQueryRequest),
     Workload(crate::workload::host::CompilerQuery),
     Paired(crate::paired_qualification::query::CompilerQuery),
+    NativeJob(crate::native_job::query::CompilerQuery),
     Produced(
         crate::workload::host::produced::ProducedRequest,
         crate::workload::host::produced::RegistrationAck,
     ),
     ContainedProduced(
         crate::workload::host::contained::Request,
+        crate::workload::host::produced::RegistrationAck,
+    ),
+    Coordinator(
+        crate::workload::host::coordinator::Request,
         crate::workload::host::produced::RegistrationAck,
     ),
 }
@@ -100,12 +109,16 @@ impl NativeQueryRequest {
         match self {
             Self::Produced(request, ack) => Some((request, ack)),
             Self::ContainedProduced(request, ack) => Some((&request.produced, ack)),
+            Self::Coordinator(request, ack) => Some((&request.contained.produced, ack)),
             _ => None,
         }
     }
 }
 trait NativeQuery {
     fn contained(&self) -> Option<&crate::workload::host::contained::Request> {
+        None
+    }
+    fn coordinator(&self) -> Option<&crate::workload::host::coordinator::Request> {
         None
     }
     fn linker(&self) -> Option<&crate::linker::Request> {
@@ -126,6 +139,9 @@ trait NativeQuery {
         None
     }
     fn paired_query(&self) -> Option<&crate::paired_qualification::query::CompilerQuery> {
+        None
+    }
+    fn native_job_query(&self) -> Option<&crate::native_job::query::CompilerQuery> {
         None
     }
     fn output_limit(&self) -> usize {
@@ -206,10 +222,37 @@ impl NativeQuery for crate::paired_qualification::query::CompilerQuery {
         Some(self)
     }
 }
+impl NativeQuery for crate::native_job::query::CompilerQuery {
+    fn member(&self) -> &crate::Request {
+        &self.member
+    }
+    fn validate_request(&self) -> io::Result<()> {
+        self.validate()
+    }
+    fn payload(&self) -> io::Result<Vec<u8>> {
+        self.encode()
+    }
+    fn purpose_hello(&self) -> io::Result<Vec<u8>> {
+        self.hello()
+    }
+    fn validate_prepared(&self, p: &MetadataPrepared) -> io::Result<()> {
+        self.validate_prepared(p)
+    }
+    fn native_job_query(&self) -> Option<&crate::native_job::query::CompilerQuery> {
+        Some(self)
+    }
+}
 impl NativeQuery for NativeQueryRequest {
     fn contained(&self) -> Option<&crate::workload::host::contained::Request> {
         match self {
             Self::ContainedProduced(request, _) => Some(request),
+            Self::Coordinator(request, _) => Some(&request.contained),
+            _ => None,
+        }
+    }
+    fn coordinator(&self) -> Option<&crate::workload::host::coordinator::Request> {
+        match self {
+            Self::Coordinator(request, _) => Some(request),
             _ => None,
         }
     }
@@ -226,8 +269,10 @@ impl NativeQuery for NativeQueryRequest {
             Self::Resolver(r) => r.member(),
             Self::Workload(r) => r.member(),
             Self::Paired(r) => r.member(),
+            Self::NativeJob(r) => r.member(),
             Self::Produced(r, _) => &r.member,
             Self::ContainedProduced(r, _) => &r.produced.member,
+            Self::Coordinator(r, _) => &r.contained.produced.member,
         }
     }
     fn validate_request(&self) -> io::Result<()> {
@@ -237,8 +282,10 @@ impl NativeQuery for NativeQueryRequest {
             Self::Resolver(r) => r.validate_request(),
             Self::Workload(r) => r.validate_request(),
             Self::Paired(r) => r.validate_request(),
+            Self::NativeJob(r) => r.validate_request(),
             Self::Produced(r, _) => r.validate(),
             Self::ContainedProduced(r, _) => r.validate(),
+            Self::Coordinator(r, _) => r.validate(),
         }
     }
     fn payload(&self) -> io::Result<Vec<u8>> {
@@ -248,8 +295,10 @@ impl NativeQuery for NativeQueryRequest {
             Self::Resolver(r) => r.payload(),
             Self::Workload(r) => r.payload(),
             Self::Paired(r) => r.payload(),
+            Self::NativeJob(r) => r.payload(),
             Self::Produced(r, _) => r.encode(),
             Self::ContainedProduced(r, _) => r.encode(),
+            Self::Coordinator(r, _) => r.encode(),
         }
     }
     fn purpose_hello(&self) -> io::Result<Vec<u8>> {
@@ -259,8 +308,10 @@ impl NativeQuery for NativeQueryRequest {
             Self::Resolver(r) => r.purpose_hello(),
             Self::Workload(r) => r.purpose_hello(),
             Self::Paired(r) => r.purpose_hello(),
+            Self::NativeJob(r) => r.purpose_hello(),
             Self::Produced(r, _) => r.hello(),
             Self::ContainedProduced(r, _) => r.hello(),
+            Self::Coordinator(r, _) => r.hello(),
         }
     }
     fn validate_prepared(&self, p: &MetadataPrepared) -> io::Result<()> {
@@ -270,9 +321,10 @@ impl NativeQuery for NativeQueryRequest {
             Self::Resolver(r) => r.validate_prepared(p),
             Self::Workload(r) => r.validate_prepared(p),
             Self::Paired(r) => r.validate_prepared(p),
-            Self::Produced(..) | Self::ContainedProduced(..) => {
-                Err(invalid("produced output requires its separate mixed-root preparation"))
-            }
+            Self::NativeJob(r) => r.validate_prepared(p),
+            Self::Produced(..) | Self::ContainedProduced(..) | Self::Coordinator(..) => Err(
+                invalid("produced output requires its separate mixed-root preparation"),
+            ),
         }
     }
     fn produced_prepared(
@@ -287,7 +339,9 @@ impl NativeQuery for NativeQueryRequest {
         }
         let prepared = crate::workload::host::produced::ProducedPrepared::decode(bytes, request)?;
         if prepared.executable != ack.executable || prepared.key != ack.key {
-            return Err(invalid("produced preparation differs from original live registration"));
+            return Err(invalid(
+                "produced preparation differs from original live registration",
+            ));
         }
         Ok(Some(prepared))
     }
@@ -304,9 +358,15 @@ impl NativeQuery for NativeQueryRequest {
             _ => None,
         }
     }
+    fn native_job_query(&self) -> Option<&crate::native_job::query::CompilerQuery> {
+        match self {
+            Self::NativeJob(query) => Some(query),
+            _ => None,
+        }
+    }
     fn output_limit(&self) -> usize {
         match self {
-            Self::Produced(..) | Self::ContainedProduced(..) => {
+            Self::Produced(..) | Self::ContainedProduced(..) | Self::Coordinator(..) => {
                 crate::workload::host::produced::MAX_OUTPUT_BYTES
             }
             Self::Linker(_) => crate::linker::MAX_OUTPUT,
@@ -342,13 +402,18 @@ fn ordered(request: &impl NativeQuery, descriptions: Vec<OwnedFd>) -> io::Result
         // SAFETY: observe only this owned live descriptor's flags.
         let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
         if flags < 0 || flags & libc::FD_CLOEXEC == 0 || descriptors.insert(source, fd).is_some() {
-            return Err(invalid("metadata descriptions must be distinct owned CLOEXEC handles"));
+            return Err(invalid(
+                "metadata descriptions must be distinct owned CLOEXEC handles",
+            ));
         }
     }
     let mut result = Vec::new();
     if let Some(cpu) = request.member().delegations.cpu {
-        result
-            .push(descriptors.remove(&cpu.source).ok_or_else(|| invalid("missing original CPU"))?);
+        result.push(
+            descriptors
+                .remove(&cpu.source)
+                .ok_or_else(|| invalid("missing original CPU"))?,
+        );
     }
     let gnu = match &request.member().delegations.gnu {
         GnuTransport::NumericPipe { read, write } | GnuTransport::NamedFifo { read, write, .. } => {
@@ -371,6 +436,38 @@ fn ordered(request: &impl NativeQuery, descriptions: Vec<OwnedFd>) -> io::Result
                 .remove(&descriptor.source)
                 .ok_or_else(|| invalid("missing original GNU handle"))?,
         );
+    }
+    if let Some(coordinator) = request.coordinator() {
+        result.push(
+            descriptors
+                .remove(&coordinator.primary.source)
+                .ok_or_else(|| invalid("missing original coordinator primary"))?,
+        );
+        result.push(
+            descriptors
+                .remove(&coordinator.broker.source)
+                .ok_or_else(|| invalid("missing original parent broker endpoint"))?,
+        );
+        use std::os::unix::fs::MetadataExt as _;
+        for lock in &coordinator.outputs.locks {
+            let mut selected = None;
+            for (number, fd) in &descriptors {
+                let meta = File::from(fd.try_clone()?).metadata()?;
+                if (meta.dev(), meta.ino()) == (lock.backing.device, lock.backing.inode) {
+                    if selected.replace(*number).is_some() {
+                        return Err(invalid("duplicate original output description"));
+                    }
+                }
+            }
+            result.push(
+                descriptors
+                    .remove(
+                        &selected
+                            .ok_or_else(|| invalid("missing original coordinator output guard"))?,
+                    )
+                    .expect("selected held description"),
+            );
+        }
     }
     if !descriptors.is_empty() {
         return Err(invalid("unrequested metadata descriptions"));
@@ -420,6 +517,18 @@ impl Client {
     ) -> Result<MetadataMember, MetadataError> {
         self.native_query(&NativeQueryRequest::Paired(request.clone()), io, deadline)
     }
+    pub fn native_job_query(
+        &self,
+        request: &crate::native_job::query::CompilerQuery,
+        io: MetadataIo,
+        deadline: Instant,
+    ) -> Result<MetadataMember, MetadataError> {
+        self.native_query(
+            &NativeQueryRequest::NativeJob(request.clone()),
+            io,
+            deadline,
+        )
+    }
     fn native_query(
         &self,
         request: &NativeQueryRequest,
@@ -437,7 +546,9 @@ impl Client {
             let stdin = File::open("/dev/null")?;
             control.send(&hello, deadline)?;
             if control.receive(deadline)? != [0x50] {
-                return Err(invalid("metadata host did not prepare the negotiated purpose"));
+                return Err(invalid(
+                    "metadata host did not prepare the negotiated purpose",
+                ));
             }
             host.revalidate(deadline)?;
             Ok((
@@ -481,8 +592,12 @@ impl Client {
                 _ => return Err(invalid("metadata host readiness was malformed")),
             }
             member.host.revalidate(deadline)?;
-            let mut rights =
-                vec![stdin.as_fd(), stdout.as_fd(), stderr.as_fd(), target_events.as_fd()];
+            let mut rights = vec![
+                stdin.as_fd(),
+                stdout.as_fd(),
+                stderr.as_fd(),
+                target_events.as_fd(),
+            ];
             rights.extend(member._descriptions.iter().map(AsFd::as_fd));
             jobserver_utils::descriptor_transfer::send(
                 member.host.stream(),
@@ -491,7 +606,9 @@ impl Client {
                 deadline,
             )?;
             if member.control.receive(deadline)? != [1] {
-                return Err(invalid("metadata host did not acknowledge descriptor attachment"));
+                return Err(invalid(
+                    "metadata host did not acknowledge descriptor attachment",
+                ));
             }
             member.pin.validate(deadline)?;
             Ok(true)
@@ -501,7 +618,10 @@ impl Client {
         match attach {
             Ok(true) => Ok(member),
             Ok(false) => Err(MetadataError::Refused),
-            Err(error) => Err(MetadataError::Unknown { member: Box::new(member), error }),
+            Err(error) => Err(MetadataError::Unknown {
+                member: Box::new(member),
+                error,
+            }),
         }
     }
 }
@@ -511,15 +631,26 @@ impl MetadataMember {
     /// EOF and original host validation. Missing components remain unobserved;
     /// no malformed/unknown execution can yield a measured zero.
     pub fn accounting(&self) -> Option<crate::accounting::Observation> {
-        self.result_delivered.then_some(self.streams.state.accounting).flatten()
+        self.result_delivered
+            .then_some(self.streams.state.accounting)
+            .flatten()
     }
     /// Available only after actual output/event EOF and original host recheck.
     pub fn paired_completion(&self) -> Option<&crate::paired_qualification::query::Completion> {
-        self.result_delivered.then_some(self.streams.state.paired.as_ref()).flatten()
+        self.result_delivered
+            .then_some(self.streams.state.paired.as_ref())
+            .flatten()
+    }
+    pub fn native_job_completion(&self) -> Option<&crate::native_job::query::Completion> {
+        self.result_delivered
+            .then_some(self.streams.state.native_job.as_ref())
+            .flatten()
     }
     /// The old workload completion remains a separate v1 observation.
     pub fn workload_completion(&self) -> Option<&crate::workload::host::Completion> {
-        self.result_delivered.then_some(self.streams.state.workload.as_ref()).flatten()
+        self.result_delivered
+            .then_some(self.streams.state.workload.as_ref())
+            .flatten()
     }
     pub fn started(&self) -> Option<Started> {
         self.streams.state.started
@@ -558,7 +689,10 @@ impl MetadataMember {
         }
         self.failure_observed = true;
         self.poisoned = true;
-        Some(self.streams.take_failure_observation_inner(&self.request, observer))
+        Some(
+            self.streams
+                .take_failure_observation_inner(&self.request, observer),
+        )
     }
 
     /// Bounded nonblocking work except a ready partial event frame, whose
@@ -622,12 +756,18 @@ impl MetadataMember {
             StreamReady::Completed => {
                 self.pin.validate(deadline)?;
                 let state = &mut self.streams.state;
-                let prepared =
-                    state.prepared.take().ok_or_else(|| invalid("missing preparation"))?;
-                let started =
-                    state.started.take().ok_or_else(|| invalid("missing actual start"))?;
-                let completion =
-                    state.completed.take().ok_or_else(|| invalid("missing completion"))?;
+                let prepared = state
+                    .prepared
+                    .take()
+                    .ok_or_else(|| invalid("missing preparation"))?;
+                let started = state
+                    .started
+                    .take()
+                    .ok_or_else(|| invalid("missing actual start"))?;
+                let completion = state
+                    .completed
+                    .take()
+                    .ok_or_else(|| invalid("missing completion"))?;
                 self.poisoned = true;
                 self.result_delivered = true;
                 Ok(Some(MetadataResult {
@@ -648,8 +788,10 @@ fn require_workload_observer(request: &NativeQueryRequest) -> io::Result<()> {
         request,
         NativeQueryRequest::Workload(_)
             | NativeQueryRequest::Paired(_)
+            | NativeQueryRequest::NativeJob(_)
             | NativeQueryRequest::Produced(..)
             | NativeQueryRequest::ContainedProduced(..)
+            | NativeQueryRequest::Coordinator(..)
     ) {
         Ok(())
     } else {
@@ -669,7 +811,8 @@ impl ObservedEvents {
     fn record(&mut self, bytes: &[u8]) {
         self.seen = self.seen.saturating_add(bytes.len() as u64);
         let room = METADATA_EVENT_PREFIX_MAX_BYTES.saturating_sub(self.prefix.len());
-        self.prefix.extend_from_slice(&bytes[..bytes.len().min(room)]);
+        self.prefix
+            .extend_from_slice(&bytes[..bytes.len().min(room)]);
     }
 }
 enum StreamReady {
@@ -739,7 +882,9 @@ impl MetadataStreams {
         started: Instant,
     ) -> io::Result<StreamReady> {
         if self.failed {
-            return Err(invalid("native stream has an earlier protocol/capture failure"));
+            return Err(invalid(
+                "native stream has an earlier protocol/capture failure",
+            ));
         }
         let outcome = self.poll_checked(request, deadline, observer, started);
         if outcome.is_err() {
@@ -775,14 +920,25 @@ impl MetadataStreams {
             }
             let frame_deadline = deadline.min(started + Duration::from_secs(60));
             let observed = &mut self.observed;
-            let bytes =
-                self.events.receive_observed(frame_deadline, |bytes| observed.record(bytes))?;
+            let bytes = self
+                .events
+                .receive_observed(frame_deadline, |bytes| observed.record(bytes))?;
             let root = request.member().binding.root_attempt;
             let member = request.member().member_attempt;
             if let Some(loan) = request.linker()
                 && crate::wire::header(&bytes, crate::linker::PREPARED_TAG).is_ok()
             {
-                self.state.accept_linker(crate::linker::Prepared::decode(&bytes, loan)?)?;
+                self.state
+                    .accept_linker(crate::linker::Prepared::decode(&bytes, loan)?)?;
+                continue;
+            }
+            if let Some(coordinator) = request.coordinator()
+                && crate::wire::header(&bytes, 85).is_ok()
+            {
+                let prepared =
+                    crate::workload::host::coordinator::Prepared::decode(&bytes, coordinator)?;
+                self.state.accept_produced(prepared.produced.clone())?;
+                self.state.coordinator_prepared = Some(prepared);
                 continue;
             }
             if let Some(prepared) = request.produced_prepared(&bytes)? {
@@ -796,7 +952,10 @@ impl MetadataStreams {
                     MetadataEvent::Completed(completion.completed)
                 } else {
                     let event = MetadataEvent::decode(&bytes, root, member)?;
-                    if matches!(event, MetadataEvent::Completed(_) | MetadataEvent::Prepared(_)) {
+                    if matches!(
+                        event,
+                        MetadataEvent::Completed(_) | MetadataEvent::Prepared(_)
+                    ) {
                         return Err(invalid(
                             "linker loan requires distinct preparation/retirement",
                         ));
@@ -816,7 +975,41 @@ impl MetadataStreams {
                 } else {
                     let event = MetadataEvent::decode(&bytes, root, member)?;
                     if matches!(event, MetadataEvent::Completed(_)) {
-                        return Err(invalid("paired query requires full60-bound55/v2 retirement"));
+                        return Err(invalid(
+                            "paired query requires full60-bound55/v2 retirement",
+                        ));
+                    }
+                    event
+                }
+            } else if let Some(query) = request.native_job_query() {
+                use crate::native_job::query::Completion;
+                let expected: [u8; 32] = query.plan_sha256;
+                if let Ok(completion) = Completion::decode(&bytes, query, expected) {
+                    self.state.accounting = Some(completion.observation);
+                    self.state.native_job = Some(completion.clone());
+                    MetadataEvent::Completed(completion.completed)
+                } else {
+                    let event = MetadataEvent::decode(&bytes, root, member)?;
+                    if matches!(event, MetadataEvent::Completed(_)) {
+                        return Err(invalid(
+                            "native job query requires full106-bound55/v3 retirement",
+                        ));
+                    }
+                    event
+                }
+            } else if let Some(query) = request.native_job_query() {
+                use crate::native_job::query::Completion;
+                let expected: [u8; 32] = query.plan_sha256;
+                if let Ok(completion) = Completion::decode(&bytes, query, expected) {
+                    self.state.accounting = Some(completion.observation);
+                    self.state.native_job = Some(completion.clone());
+                    MetadataEvent::Completed(completion.completed)
+                } else {
+                    let event = MetadataEvent::decode(&bytes, root, member)?;
+                    if matches!(event, MetadataEvent::Completed(_)) {
+                        return Err(invalid(
+                            "native job query requires full106-bound55/v3 retirement",
+                        ));
                     }
                     event
                 }
@@ -896,7 +1089,11 @@ impl MetadataStreams {
         request: &impl NativeQuery,
         observer: &mut Option<&mut OutputObserver<'_>>,
     ) -> MetadataFailureObservation {
-        let capture_error = self.output.drain_observed(observer).err().map(|e| e.to_string());
+        let capture_error = self
+            .output
+            .drain_observed(observer)
+            .err()
+            .map(|e| e.to_string());
         MetadataFailureObservation {
             root_attempt: request.member().binding.root_attempt,
             member_attempt: request.member().member_attempt,
@@ -917,6 +1114,7 @@ struct Lifecycle {
     attached: bool,
     prepared: Option<MetadataPrepared>,
     produced: Option<crate::workload::host::produced::ProducedPrepared>,
+    coordinator_prepared: Option<crate::workload::host::coordinator::Prepared>,
     linker: Option<crate::linker::Prepared>,
     linker_completed: Option<crate::linker::Completion>,
     started: Option<Started>,
@@ -928,6 +1126,7 @@ struct Lifecycle {
     accounting: Option<crate::accounting::Observation>,
     workload: Option<crate::workload::host::Completion>,
     paired: Option<crate::paired_qualification::query::Completion>,
+    native_job: Option<crate::native_job::query::Completion>,
     contained: Option<crate::workload::host::contained::Completion>,
 }
 impl Lifecycle {
@@ -945,7 +1144,9 @@ impl Lifecycle {
             || prepared.policy != program::RUNTIME_POLICY
             || prepared.scope != program::INPUT_SCOPE
         {
-            return Err(invalid("linker preparation ordering or original input profile differs"));
+            return Err(invalid(
+                "linker preparation ordering or original input profile differs",
+            ));
         }
         self.linker = Some(prepared);
         Ok(())
@@ -965,7 +1166,9 @@ impl Lifecycle {
             || prepared.host != host
             || prepared.boot != boot
         {
-            return Err(invalid("produced preparation ordering or original host differs"));
+            return Err(invalid(
+                "produced preparation ordering or original host differs",
+            ));
         }
         self.produced = Some(prepared);
         Ok(())
@@ -988,7 +1191,9 @@ impl Lifecycle {
                     || prepared.host != host
                     || prepared.boot != boot
                 {
-                    return Err(invalid("metadata preparation ordering or input policy mismatch"));
+                    return Err(invalid(
+                        "metadata preparation ordering or input policy mismatch",
+                    ));
                 }
                 self.prepared = Some(prepared);
             }
@@ -1017,7 +1222,11 @@ impl Lifecycle {
                             "produced Started is not its original suspended child",
                         ));
                     }
-                    if self.linker.as_ref().is_some_and(|p| p.identity != started.identity) {
+                    if self
+                        .linker
+                        .as_ref()
+                        .is_some_and(|p| p.identity != started.identity)
+                    {
                         return Err(invalid(
                             "linker Started differs from original suspended child",
                         ));
@@ -1112,8 +1321,9 @@ impl Capture {
                         break;
                     }
                     Ok(count) => {
-                        let available =
-                            self.limit.saturating_sub(self.bytes[0].len() + self.bytes[1].len());
+                        let available = self
+                            .limit
+                            .saturating_sub(self.bytes[0].len() + self.bytes[1].len());
                         self.bytes[index].extend_from_slice(&buffer[..count.min(available)]);
                         self.exceeded |= count > available;
                         if let Some(observer) = observer.as_mut() {

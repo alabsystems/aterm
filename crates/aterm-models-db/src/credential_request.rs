@@ -5,16 +5,15 @@
 
 use aterm_spec::derive::Model;
 
-/// A want one Mac raises ends fulfilled, retired with a checkable reason, or awaiting a person;
-/// no value reaches a Mac the policy does not give it to; a person is asked only when no Mac can
-/// give it. `st`: 0 none, 1 local (the need ledger), 2 open, 3 offered, 4 published,
-/// 5 fulfilled, 6 retired, 7 awaiting a person. `why`: 1 never-stored, 2 never-copied,
-/// 3 not-authorized, 4 not-needed, 5 not-held, 6 declined, 7 requester-gone, 8 lapsed.
-/// `kind`: 0 copyable, 1 nowhere, 2 per Mac, 3 vault-only. `wait`, the one party that moves a
-/// non-final state: 1 holders, 2 the custodian, 3 the person, 4 the requester, 5 the founding.
-/// `pa`, `askok` and `okr` record, at the step that publishes, asks or raises again, whether
-/// the law's condition held then, so a mutant of an honest guard breaks the law, not only a
-/// named mutant.
+/// A want one Mac raises ends fulfilled or retired with a checkable reason; no value reaches a
+/// Mac the policy does not give it to; no request is ever handed to a person. `st`: 0 none,
+/// 1 local (the need ledger), 2 open, 3 offered, 4 published, 5 fulfilled, 6 retired. `why`:
+/// 1 never-stored, 2 never-copied, 3 not-authorized, 4 not-needed, 5 not-held, 7 requester-gone,
+/// 8 lapsed (6, declined, is an earlier build's that nothing writes now). `kind`: 0 copyable,
+/// 1 nowhere, 2 per Mac, 3 vault-only. `wait`, the one party that moves a non-final state:
+/// 1 holders, 2 the custodian, 4 the requester, 5 the founding. `pa` and `okr` record, at the
+/// step that publishes or raises again, whether the law's condition held then, so a mutant of
+/// an honest guard breaks the law, not only a named mutant.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn credential_request_model() -> Model {
@@ -22,23 +21,20 @@ pub fn credential_request_model() -> Model {
         DbCredentialRequest {
             const Buggy = 0;
             var st = 0; var why = 0; var kind = 0;
-            var commons = 0; var hidden = 0; var person = 0;
+            var commons = 0;
             var auth = 1; var gen = 0; var atgen = 0;
             var inv = 0; var held = 0; var swept = 0; var lost = 0; var need = 1;
             var wait = 0; var quiet = 0;
-            var posted = 0; var got = 0; var you = 0; var raises = 0;
-            var pa = 0; var askok = 0; var okr = 0; var stray = 0; var rogue = 0;
+            var posted = 0; var got = 0; var raises = 0;
+            var pa = 0; var okr = 0; var stray = 0; var rogue = 0;
 
-            action Source when (st == 0 && person == 0) { person = 1; }
-            action Hidden when (st == 0 && hidden == 0) { hidden = 1; }
             action Raise when (st == 0 && raises == 0) {
                 st = 1; raises = 1; wait = if commons == 1 { 4 } else { 5 };
             }
             action RaiseNowhere when (st == 0 && raises == 0) { st = 1; kind = 1; raises = 1; wait = 4; }
             action RaisePerMachine when (st == 0 && raises == 0) { st = 1; kind = 2; raises = 1; wait = 4; }
             action RaiseVaultOnly when (st == 0 && raises == 0) {
-                st = 1; kind = 3; person = 1; raises = 1;
-                wait = if commons == 1 || hidden == 0 { 4 } else { 5 };
+                st = 1; kind = 3; raises = 1; wait = if commons == 1 { 4 } else { 5 };
             }
             action CommonsReady when (commons == 0) {
                 commons = 1; wait = if st == 1 && wait == 5 { 4 } else { wait };
@@ -46,16 +42,11 @@ pub fn credential_request_model() -> Model {
             action Catalog when (st == 1 && (kind == 1 || kind == 2)) {
                 st = 6; why = if kind == 1 { 1 } else { 2 }; wait = 0;
             }
-            action Absent when (st == 1 && kind == 3 && commons == 0 && hidden == 0 && inv == 0 && auth == 1) {
-                st = 7; wait = 3; you = 1;
-                askok = if inv == 0 && ((commons == 0 && hidden == 0) || (swept == 1 && held == 0)) { 1 } else { 0 };
-            }
             action Flush when (st == 1 && commons == 1 && (kind == 0 || kind == 3) && auth == 1) {
                 st = 2; posted = 1; swept = 0; wait = 1;
             }
-            action Post when (st == 7 && posted == 0 && commons == 1) { posted = 1; }
-            action Unauthorized when ((st == 1 || st == 2 || st == 7) && (kind == 0 || kind == 3) && auth == 0) {
-                st = 6; why = 3; atgen = gen; wait = 0; you = 0;
+            action Unauthorized when ((st == 1 || st == 2) && (kind == 0 || kind == 3) && auth == 0) {
+                st = 6; why = 3; atgen = gen; wait = 0;
             }
             action Stored when (inv == 0 && st > 0 && 4 > st) { inv = 1; }
             action Widen when (st == 2 && auth == 1 && inv == 1) { st = 4; got = 1; pa = auth; wait = 4; }
@@ -66,29 +57,22 @@ pub fn credential_request_model() -> Model {
             action Revoked when (st == 3 && auth == 0) { st = 6; why = 3; atgen = gen; wait = 0; }
             action Apply when (st == 4) { st = 5; wait = 0; }
             action Sweep when (st == 2 && auth == 1 && inv == 0 && held == 0 && swept == 0) { swept = 1; wait = 2; }
-            action NotHeld when (st == 2 && auth == 1 && inv == 0 && held == 0 && swept == 1 && person == 0) {
+            action NotHeld when (st == 2 && auth == 1 && inv == 0 && held == 0 && swept == 1) {
                 st = 6; why = 5; wait = 0;
             }
-            action NeedsPerson when (st == 2 && auth == 1 && inv == 0 && held == 0 && swept == 1 && person == 1) {
-                st = 7; wait = 3; you = 1;
-                askok = if inv == 0 && ((commons == 0 && hidden == 0) || (swept == 1 && held == 0)) { 1 } else { 0 };
+            action Unneeded when (need == 1 && st > 0 && 5 > st) {
+                need = 0; st = 6; why = 4; wait = 0;
             }
-            action LateOffer when (st == 7 && posted == 1 && held == 1 && auth == 1) { st = 3; wait = 2; you = 0; }
-            action Give when (st == 7 && auth == 1) { st = 4; got = 1; inv = 1; pa = auth; wait = 4; you = 0; }
-            action Decline when (st == 7) { st = 6; why = 6; wait = 0; you = 0; }
-            action Unneeded when (need == 1 && ((st > 0 && 5 > st) || st == 7)) {
-                need = 0; st = 6; why = 4; wait = 0; you = 0;
-            }
-            action Gone when (posted == 1 && ((st > 1 && 5 > st) || st == 7)) { st = 6; why = 7; wait = 0; you = 0; }
+            action Gone when (posted == 1 && st > 1 && 5 > st) { st = 6; why = 7; wait = 0; }
             action Quiet when (posted == 1 && quiet == 0) { quiet = 1; }
-            action Lapse when (posted == 1 && quiet == 1 && (st == 2 || st == 7)) { st = 6; why = 8; wait = 0; you = 0; }
+            action Lapse when (posted == 1 && quiet == 1 && st == 2) { st = 6; why = 8; wait = 0; }
             action Policy when (2 > gen) { gen = gen + 1; auth = if auth == 1 { 0 } else { 1 }; }
             action NeedAgain when (st == 6 && why == 4 && need == 0) { need = 1; }
             action Reraise when (st == 6 && need == 1 && raises == 1
                 && (why == 4 || why == 8 || (why == 3 && (gen > atgen || atgen > gen)) || (why == 5 && held == 1))) {
                 st = 1; why = 0; swept = 0; got = 0; pa = 0; posted = 0; raises = 2; quiet = 0;
                 okr = if why == 4 || why == 8 || (why == 3 && (gen > atgen || atgen > gen)) || (why == 5 && held == 1) { 1 } else { 0 };
-                wait = if commons == 1 || kind == 1 || kind == 2 || (kind == 3 && hidden == 0) { 4 } else { 5 };
+                wait = if commons == 1 || kind == 1 || kind == 2 { 4 } else { 5 };
             }
 
             action BuggyPublishUnauthorized when (Buggy == 1 && st == 3 && auth == 0) { st = 4; got = 1; pa = auth; wait = 4; }
@@ -100,20 +84,11 @@ pub fn credential_request_model() -> Model {
                 st = 1; why = 0; raises = 2; wait = 4;
                 okr = if why == 4 || why == 8 || (why == 3 && (gen > atgen || atgen > gen)) || (why == 5 && held == 1) { 1 } else { 0 };
             }
-            action BuggyDeclineKeepsNeedsYou when (Buggy == 7 && st == 7) { st = 6; why = 6; wait = 0; }
             action BuggyFulfilledOnOffer when (Buggy == 8 && st == 3) { st = 5; wait = 0; }
             action BuggyPublishToEveryone when (Buggy == 9 && st == 3 && auth == 1) { st = 4; got = 1; inv = 1; pa = auth; wait = 4; stray = 1; }
             action BuggyPublishWithoutCustody when (Buggy == 10 && st == 3 && auth == 1) { st = 4; got = 1; inv = 1; pa = auth; wait = 4; rogue = 1; }
-            action BuggyAskPersonForHeld when (Buggy == 11 && st == 2 && held == 1 && inv == 0 && auth == 1) {
-                st = 7; wait = 3; you = 1;
-                askok = if inv == 0 && ((commons == 0 && hidden == 0) || (swept == 1 && held == 0)) { 1 } else { 0 };
-            }
-            action BuggyAbsentDespiteHidden when (Buggy == 12 && st == 1 && kind == 3 && commons == 0 && hidden == 1) {
-                st = 7; wait = 3; you = 1;
-                askok = if inv == 0 && ((commons == 0 && hidden == 0) || (swept == 1 && held == 0)) { 1 } else { 0 };
-            }
-            action BuggyLapseLive when (Buggy == 13 && posted == 1 && quiet == 0 && (st == 2 || st == 7)) {
-                st = 6; why = 8; wait = 0; you = 0;
+            action BuggyLapseLive when (Buggy == 13 && posted == 1 && quiet == 0 && st == 2) {
+                st = 6; why = 8; wait = 0;
             }
             action BuggyParkSweep when (Buggy == 1 && st == 2 && auth == 1 && inv == 0 && held == 0 && swept == 0) {
                 swept = 2;
@@ -124,23 +99,21 @@ pub fn credential_request_model() -> Model {
             invariant NotHeldNeedsSweep: 5 > why || why > 5 || swept == 1;
             invariant RetiredHasReason: 6 > st || st > 6 || why > 0;
             invariant WaiterNamed: ((st == 0 || st == 5 || st == 6) && wait == 0)
-                || (((st > 0 && 5 > st) || st == 7) && wait > 0);
+                || (st > 0 && 5 > st && wait > 0);
             invariant NoSameReasonReraise: 2 > raises || okr == 1;
-            invariant NeedsYouOnlyAwaitingPerson: (you == 0 || st == 7) && (7 > st || you == 1);
             invariant FulfilledGotIt: 5 > st || st > 5 || got == 1;
             invariant NoStrayValue: stray == 0;
             invariant OnlyCustodianPublishes: rogue == 0;
-            invariant NoNeedlessAsk: you == 0 || askok == 1;
             invariant LapseOnlyQuiet: 8 > why || why > 8 || quiet == 1;
             invariant SweepDecides: swept <= 1;
-            bound StRange: st <= 7; bound WhyRange: why <= 8; bound WaitRange: wait <= 5;
+            bound StRange: st <= 6; bound WhyRange: why <= 8; bound WaitRange: wait <= 5;
             bound SweptRange: swept <= 2; bound GenRange: gen <= 2; bound RaisesRange: raises <= 2;
         }
     }
 }
 
-/// A REQUEST ENDS: every raised want is, infinitely often, fulfilled, retired with its reason or
-/// awaiting a person, assuming each party's step is taken once it stays possible, the founding
+/// A REQUEST ENDS: every raised want is, infinitely often, fulfilled or retired with its reason,
+/// assuming each party's step is taken once it stays possible, the founding
 /// included (`CommonsReady`: the vault admin's window runs a release that founds Commons).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
@@ -150,8 +123,8 @@ pub fn credential_request_liveness() -> aterm_spec::derive::Liveness {
     aterm_spec::derive::Liveness {
         name: "ARequestEnds",
         goal: or_(
-            or_(eq(var("st"), int(0)), eq(var("st"), int(5))),
-            or_(eq(var("st"), int(6)), eq(var("st"), int(7))),
+            eq(var("st"), int(0)),
+            or_(eq(var("st"), int(5)), eq(var("st"), int(6))),
         ),
         weak: vec![
             "CommonsReady",
@@ -165,7 +138,6 @@ pub fn credential_request_liveness() -> aterm_spec::derive::Liveness {
             "Apply",
             "Sweep",
             "NotHeld",
-            "NeedsPerson",
         ],
         strong: vec![],
         mutants: vec!["BuggyParkSweep"],

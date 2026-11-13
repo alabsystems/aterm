@@ -116,6 +116,126 @@ fn the_journal_names_macs_by_the_last_projection_until_there_is_no_lab() {
     assert!(last.is_none(), "no lab drops the projection");
 }
 
+/// WHAT A REGISTRY READ IS TO THE FLEET TABLES: a projection, and the one held through an
+/// unmoved inventory, are the registry read now; a partial history is held, dated by the read
+/// that projected the rows the tables still show, however many partial reads follow.
+/// NEGATIVE CONTROL: with the offer chosen by whether a projection is held (`last.is_some()`),
+/// a partial history after a projection is offered as read: `registry=live` at the partial
+/// read's time, `` a partial history after a projection `` fails.
+#[test]
+fn a_partial_history_is_offered_to_the_fleet_tables_as_held_never_as_a_fresh_read() {
+    use aterm_db::fleet::{Folder, HELD_PARTIAL, Reading};
+    const T0: u64 = 1_800_000_000_000;
+
+    let mut named = LabView::default();
+    named.me = Some("pk-me".into());
+    let mut last = None;
+    let folder = Folder::new();
+    let mut offer = |read: Option<LabRead>, at_ms: u64| {
+        let (view, lab) = lab_offer(read, &mut last);
+        let word = match &lab {
+            Reading::Read(offered) => {
+                assert!(
+                    Arc::ptr_eq(offered, &view),
+                    "the projection the journal names by"
+                );
+                "read"
+            }
+            Reading::Off => "off",
+            Reading::Held(why) => why,
+        };
+        folder.offer_lab(lab, Reading::Off, at_ms);
+        folder.fold_now(at_ms);
+        let lab = folder.tables().value.sources.lab;
+        (word, lab.word(), lab.why(), lab.at_ms())
+    };
+
+    assert_eq!(
+        offer(Some(LabRead::Partial), T0 - 300_000),
+        (HELD_PARTIAL, "held", Some(HELD_PARTIAL), None),
+        "a first partial history has no rows to keep"
+    );
+    assert_eq!(
+        offer(
+            Some(LabRead::Projected(
+                Box::new(named.clone()),
+                Inventory([1; 32])
+            )),
+            T0
+        ),
+        ("read", "live", None, Some(T0))
+    );
+    // The m22 case: a record whose predecessor has not arrived, for hours.
+    for later in [300_000, 600_000, 6 * 3_600_000] {
+        assert_eq!(
+            offer(Some(LabRead::Partial), T0 + later),
+            (HELD_PARTIAL, "held", Some(HELD_PARTIAL), Some(T0)),
+            "a partial history after a projection, {later} ms on"
+        );
+    }
+    // The history completes with nothing new in it: the registry was read, and is unmoved.
+    assert_eq!(
+        offer(Some(LabRead::Unchanged), T0 + 7 * 3_600_000),
+        ("read", "live", None, Some(T0 + 7 * 3_600_000))
+    );
+    assert_eq!(
+        offer(None, T0 + 8 * 3_600_000),
+        ("off", "off", None, None),
+        "no lab is no registry"
+    );
+}
+
+/// WHAT THE READER OFFERS THE FLEET TABLES WHERE IT READS NO REGISTRY: a policy it cannot read
+/// holds both inputs, a lab turned off drops both, and a home that holds no lab has none.
+#[test]
+fn the_reader_offers_the_fleet_tables_its_policy_refusal_its_off_and_its_absence() {
+    use aterm_db::fleet::{Folder, HELD_POLICY};
+
+    let home = aterm_tempfile::tempdir().unwrap();
+    let config = home.path().join("aterm.toml");
+    let cache = Cache {
+        paths: Paths::for_home(home.path()),
+        config: config.clone(),
+        spool: None,
+        held: Mutex::new(None),
+        lab: Mutex::new(None),
+        reader: OnceLock::from(()),
+    };
+    let write =
+        |text: &str| aterm_uds::atomic_file::write(&config, text.as_bytes(), 0o600).unwrap();
+    let folder = Folder::new();
+    let offered = || {
+        cache.read_into(&folder);
+        folder.fold_now(0);
+        let sources = folder.tables().value.sources;
+        aterm_db::fleet::command::sources_line(&sources)
+    };
+    assert_eq!(
+        aterm_db::fleet::command::sources_line(&folder.tables().value.sources),
+        "registry=never journal=never network=never fleet_read=never",
+        "CONTROL: nothing is offered before a read"
+    );
+
+    write("[alab\n");
+    assert_eq!(
+        offered(),
+        format!(
+            "registry=held({HELD_POLICY}) journal=held({HELD_POLICY}) network=never fleet_read=never"
+        )
+    );
+    write("[alab]\nroster = false\n");
+    assert_eq!(
+        offered(),
+        "registry=off journal=off network=never fleet_read=never"
+    );
+    // The policy allows the lab and this home holds none: there is no registry to read.
+    write("[alab]\nroster = true\n");
+    assert_eq!(
+        offered(),
+        "registry=off journal=off network=never fleet_read=never"
+    );
+}
+
 /// A test process installs no journal source.
 /// NEGATIVE CONTROL: with `holds` true, `install` would install one and `current` answer.
 #[test]

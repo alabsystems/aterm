@@ -203,6 +203,61 @@ impl Spawned {
         self.observed.child_mut()
     }
 
+    /// Ask this original dedicated group to terminate. The unreaped original
+    /// leader pins its group number, including after the leader has exited.
+    /// This proves neither group drain nor release of any resource.
+    /// # Errors
+    /// The original owner/scope or child custody changed, the leader was reaped,
+    /// or the kernel refused the request.
+    pub fn terminate_group(&mut self) -> io::Result<()> {
+        self.signal_group(libc::SIGTERM)
+    }
+
+    /// Continue this original dedicated group, under the same original-child
+    /// requirements as [`Self::terminate_group`]. This is no execution receipt.
+    /// # Errors
+    /// Original custody is unavailable or the kernel refused the request.
+    pub fn continue_group(&mut self) -> io::Result<()> {
+        self.signal_group(libc::SIGCONT)
+    }
+
+    /// Request uncatchable termination of this original dedicated group, under
+    /// the same original-child requirements as [`Self::terminate_group`].
+    /// Kernel acceptance is never a group-drain or resource-release receipt.
+    /// # Errors
+    /// Original custody is unavailable or the kernel refused the request.
+    pub fn kill_group(&mut self) -> io::Result<()> {
+        self.signal_group(libc::SIGKILL)
+    }
+
+    fn signal_group(&mut self, signal: i32) -> io::Result<()> {
+        let group = i32::try_from(self.child_mut().id())
+            .ok()
+            .filter(|group| *group > 1)
+            .ok_or_else(|| io::Error::other("invalid original dedicated group"))?;
+        if !self.key().is_current()
+            || !self.is_original_child()
+            || !self.child_mut().owns_unreaped()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "group control requires its original current owner and unreaped dedicated birth",
+            ));
+        }
+        // SAFETY: only the controlled dedicated-group spawn creates Spawned.
+        // Its same original Child is exclusively borrowed, remains unreaped,
+        // and pins group > 1 against number reuse even after terminal exit.
+        // The actual owner, host, boot and namespace were checked above. No
+        // caller-supplied pid, decoded record or replacement Child is accepted.
+        if unsafe { libc::kill(-group, signal) } == 0 {
+            return Ok(());
+        }
+        let refused = io::Error::last_os_error();
+        let errno = refused.raw_os_error();
+        process::settle_group_signal(group, refused)
+            .map_err(|settled| errno.map_or(settled, io::Error::from_raw_os_error))
+    }
+
     /// Surrender the receipt while retaining the actual child.
     #[must_use]
     pub fn into_child(self) -> Child {
@@ -211,8 +266,8 @@ impl Spawned {
 }
 
 /// This exact one-use attempt did not start a target. Its original process cancelled it
-/// before execution, or the controlled spawn failed while that process and scope stayed current.
-/// The public command has no caller pre-exec callbacks; spawn errors precede target execution.
+/// before native birth, or native spawn failed while that process and scope stayed current.
+/// A postbirth target-exec or observation error cannot construct this receipt.
 #[derive(Debug)]
 pub struct NotSpawned {
     key: BirthKey,
@@ -222,31 +277,30 @@ pub struct NotSpawned {
 /// A controlled no-child outcome or a refusal carrying no cancellation proof. A stale copy
 /// of an attempt cannot certify that its original owner did not start a child.
 #[derive(Debug)]
-pub enum SpawnFailure {
-    /// This exact attempt completed its controlled spawn without starting the target.
+pub enum SpawnFailure<R = Spawned> {
+    /// This exact attempt completed native spawn without starting a child.
     NotSpawned(Box<NotSpawned>),
-    /// No authoritative no-child conclusion was produced.
+    /// No native child was returned and no authoritative no-child conclusion was produced.
     Refused(io::Error),
+    /// Native birth occurred, but target exec observation failed. This retains the same
+    /// actual owned receipt; neither the diagnostic nor leader exit proves cohort closure.
+    Unbound {
+        /// The actual child sealed before observation, never reconstructed from a PID.
+        spawned: Box<R>,
+        /// The original exec-status observation or reported target-exec error.
+        error: io::Error,
+    },
 }
 
-impl SpawnFailure {
-    /// Keep a genuine no-child proof, or the refusal that could not supply one.
+impl<R> SpawnFailure<R> {
+    /// Keep a genuine no-child proof, or preserve the entire unresolved failure owner.
     ///
     /// # Errors
-    /// The original refusal when this failure contains no cancellation proof.
-    pub fn into_not_spawned(self) -> io::Result<NotSpawned> {
+    /// The original failure, including actual postbirth custody when present.
+    pub fn into_not_spawned(self) -> Result<NotSpawned, Self> {
         match self {
             Self::NotSpawned(proof) => Ok(*proof),
-            Self::Refused(error) => Err(error),
-        }
-    }
-
-    /// Discard any cancellation proof and retain the diagnostic error.
-    #[must_use]
-    pub fn into_error(self) -> io::Error {
-        match self {
-            Self::NotSpawned(proof) => proof.into_error(),
-            Self::Refused(error) => error,
+            other => Err(other),
         }
     }
 }
@@ -275,19 +329,41 @@ impl NotSpawned {
 // no arbitrary caller pre-exec callback. The cohort entry additionally forces a dedicated group.
 pub(super) fn observe(
     attempt: BirthAttempt,
-    spawn: impl FnOnce() -> io::Result<Child>,
-) -> Result<ObservedSpawned, SpawnFailure> {
+    spawn: impl FnOnce() -> io::Result<super::no_fork::PendingChild>,
+) -> Result<ObservedSpawned, SpawnFailure<ObservedSpawned>> {
+    observe_as(attempt, spawn, |observed| observed)
+}
+
+pub(super) fn observe_cohort(
+    attempt: BirthAttempt,
+    spawn: impl FnOnce() -> io::Result<super::no_fork::PendingChild>,
+) -> Result<Spawned, SpawnFailure<Spawned>> {
+    observe_as(attempt, spawn, |observed| Spawned { observed })
+}
+
+fn observe_as<R>(
+    attempt: BirthAttempt,
+    spawn: impl FnOnce() -> io::Result<super::no_fork::PendingChild>,
+    seal: impl FnOnce(ObservedSpawned) -> R,
+) -> Result<R, SpawnFailure<R>> {
     if !attempt.key.is_current() {
         return Err(SpawnFailure::Refused(io::Error::other(
             "spawn attempt belongs to another process or kernel scope",
         )));
     }
     match spawn() {
-        Ok(child) => Ok(ObservedSpawned {
-            custody: child.custody_key(),
-            key: attempt.key,
-            child,
-        }),
+        Ok(pending) => pending
+            .observe(|child| {
+                seal(ObservedSpawned {
+                    custody: child.custody_key(),
+                    key: attempt.key,
+                    child,
+                })
+            })
+            .map_err(|(spawned, error)| SpawnFailure::Unbound {
+                spawned: Box::new(spawned),
+                error,
+            }),
         Err(error) if attempt.key.is_current() => {
             Err(SpawnFailure::NotSpawned(Box::new(NotSpawned {
                 key: attempt.key,
@@ -298,13 +374,6 @@ pub(super) fn observe(
             "spawn scope changed before its failure could be certified: {error}"
         )))),
     }
-}
-
-pub(super) fn observe_cohort(
-    attempt: BirthAttempt,
-    spawn: impl FnOnce() -> io::Result<Child>,
-) -> Result<Spawned, SpawnFailure> {
-    observe(attempt, spawn).map(|observed| Spawned { observed })
 }
 
 #[cfg(test)]

@@ -164,8 +164,15 @@ fn child_failures_preserve_spawn_post_start_and_timeout_phases() {
 /// granted` and an answer from a window older than the walk leave the ask to macOS.
 #[test]
 fn the_windows_answer_tells_a_walk_that_takes_the_ask_from_a_not_now_and_other_pages() {
-    use AccessibilityWalk::{NotNow, NotTaken, OtherPages, Taken};
+    use AccessibilityWalk::{Behind, NotNow, NotTaken, OtherPages, Taken};
     for (reply, want) in [
+        // The window's desk door refused: the run's tab is not the one in front, and
+        // macOS is not asked in the walk's place.
+        (
+            "ERR desk refused behind: this brings System Settings up, and the tab that \
+             asked is not the one in front of the person\n",
+            Behind,
+        ),
         ("OK walking accessibility\n", Taken),
         ("OK walking fda accessibility", Taken),
         ("OK walking fda not-now:accessibility\n", NotNow),

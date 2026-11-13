@@ -7,21 +7,26 @@
 use aterm_spec::derive::*;
 
 /// Four test binaries considered in the plan's priority order on a share of `Share` cores and a bound of
-/// `Memory` bytes: binary `i` holds `Ci` cores and `Pi` bytes while it runs. The first fitting queued binary
+/// `Memory` bytes: binary `i` requests `Ci` cores and holds `Pi` bytes while it runs. The first
+/// two binaries can reduce their running charges `c1` and `c2` to a smaller positive external
+/// grant, returning the difference without releasing memory. The other two request one core.
+/// The first fitting queued binary
 /// starts only while its charge fits in what the running binaries' charges leave of the share and
 /// its peak in what their peaks leave of the claim, and, beside a running binary, only while the
 /// running binaries' live rate (`live`, which their reads move a core at a time while one runs)
 /// and its charge stay within the share and one core. An ending binary gives both back. Once halted (the run's ceiling, or a
 /// red under fail-fast) nothing more starts.
 ///
-/// The constants make each rule bind somewhere: the second binary beside the first passes the
-/// share and fits the claim; the third beside the second fits the share and passes the claim; the
+/// Before grant reconciliation, the constants make each rule bind somewhere: the second binary
+/// beside the first passes the share and fits the claim; the third beside the second fits the
+/// share and passes the claim; the
 /// fourth beside the third fits both, so only the live rate can hold it back. A blocked earlier
 /// binary cannot prevent that fourth from using spare capacity. Each charge is at
 /// most the share and each peak at most the claim, so the head always starts once nothing runs.
 ///
 /// The production projection: `pi` is binary `i`'s phase (0 queued, 1 running, 2 done), `next`
-/// the number started plus one (5 once all started), `held` and `bytes`
+/// the number started plus one (5 once all started), `c1` and `c2` the reconciled charges,
+/// `held` and `bytes`
 /// what the dispatcher counts held, `halted` whether it halted. `started_halted` and `extra` are
 /// what only a mutant moves.
 ///
@@ -30,6 +35,8 @@ use aterm_spec::derive::*;
 /// (`StartOverMemory3`), one that releases a charge twice (`ReleaseAgain1`), one that ends a
 /// binary keeping what it held (`FinishKeepingCharge2`), and one that starts after a halt
 /// (`StartAfterHalt1`).
+/// Each injected grant fault fires once through `extra`: its first effect already breaks a law.
+/// This bounds compound fault actions that would otherwise accumulate bookkeeping errors forever.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn test_dispatch_model() -> Model {
@@ -51,6 +58,8 @@ pub fn test_dispatch_model() -> Model {
             var p2 = 0;
             var p3 = 0;
             var p4 = 0;
+            var c1 = 2;
+            var c2 = 2;
             var next = 1;
             var held = 0;
             var bytes = 0;
@@ -89,12 +98,12 @@ pub fn test_dispatch_model() -> Model {
             }
             action Finish1 when (p1 == 1) {
                 p1 = 2;
-                held = held - C1;
+                held = held - c1;
                 bytes = bytes - P1;
             }
             action Finish2 when (p2 == 1) {
                 p2 = 2;
-                held = held - C2;
+                held = held - c2;
                 bytes = bytes - P2;
             }
             action Finish3 when (p3 == 1) {
@@ -115,6 +124,29 @@ pub fn test_dispatch_model() -> Model {
             }
             action Halt when (halted == 0) {
                 halted = 1;
+            }
+
+            action Grant1 when (p1 == 1 && c1 > 1) {
+                c1 = c1 - 1;
+                held = held - 1;
+            }
+            action Grant2 when (p2 == 1 && c2 > 1) {
+                c2 = c2 - 1;
+                held = held - 1;
+            }
+            action ZeroGrant1 when (Buggy == 1 && extra == 0 && p1 == 1 && c1 > 0) {
+                held = held - c1;
+                c1 = 0;
+                extra = 1;
+            }
+            action GrantWithoutReturning1 when (Buggy == 1 && extra == 0 && p1 == 1 && c1 > 1) {
+                c1 = c1 - 1;
+                extra = 1;
+            }
+            action GrowGrant1 when (Buggy == 1 && extra == 0 && p1 == 1 && c1 == C1) {
+                c1 = c1 + 1;
+                held = held + 1;
+                extra = 1;
             }
 
             action StartOverShare2 when (Buggy == 1 && halted == 0 && next == 2
@@ -147,20 +179,23 @@ pub fn test_dispatch_model() -> Model {
                 started_halted = 1;
             }
 
-            invariant ChargesWithinShare: (if (p1 == 1) { C1 } else { 0 })
-                + (if (p2 == 1) { C2 } else { 0 }) + (if (p3 == 1) { C3 } else { 0 })
+            invariant GrantsStayPositive: c1 > 0 && c2 > 0;
+            invariant GrantsStayWithinRequests: c1 <= C1 && c2 <= C2;
+            invariant ChargesWithinShare: (if (p1 == 1) { c1 } else { 0 })
+                + (if (p2 == 1) { c2 } else { 0 }) + (if (p3 == 1) { C3 } else { 0 })
                 + (if (p4 == 1) { C4 } else { 0 }) <= Share;
             invariant PeaksWithinClaim: (if (p1 == 1) { P1 } else { 0 })
                 + (if (p2 == 1) { P2 } else { 0 }) + (if (p3 == 1) { P3 } else { 0 })
                 + (if (p4 == 1) { P4 } else { 0 }) <= Memory;
-            invariant HeldIsTheRunningCharges: held == (if (p1 == 1) { C1 } else { 0 })
-                + (if (p2 == 1) { C2 } else { 0 }) + (if (p3 == 1) { C3 } else { 0 })
+            invariant HeldIsTheRunningCharges: held == (if (p1 == 1) { c1 } else { 0 })
+                + (if (p2 == 1) { c2 } else { 0 }) + (if (p3 == 1) { C3 } else { 0 })
                 + (if (p4 == 1) { C4 } else { 0 });
             invariant BytesAreTheRunningPeaks: bytes == (if (p1 == 1) { P1 } else { 0 })
                 + (if (p2 == 1) { P2 } else { 0 }) + (if (p3 == 1) { P3 } else { 0 })
                 + (if (p4 == 1) { P4 } else { 0 });
             invariant NothingStartsAfterHalt: started_halted == 0;
-            bound DispatchIsFinite: p1 <= 2 && p2 <= 2 && p3 <= 2 && p4 <= 2 && next <= 5
+            invariant StartCountWithinPlan: next <= 5;
+            bound DispatchStateRanges: p1 <= 2 && p2 <= 2 && p3 <= 2 && p4 <= 2
                 && live <= Share + 1 && extra <= 1;
         }
     }

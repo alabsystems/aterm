@@ -1006,9 +1006,26 @@ pub type Built = (
     std::time::SystemTime,
 );
 
-/// What a run's shaped test compile has done so far ([`crate::Ctx::shape_run`]): the files each
-/// cut built, what each call's time line says of them, and the units of the build directory
-/// every call reported as its outputs.
+/// What a run's compile calls reported of one build directory ([`Run::used`]).
+#[derive(Debug, Default)]
+pub struct Noted {
+    /// The units of the directory each call's artifacts and build script runs are outputs of,
+    /// fresh or built, and the packages the calls built tests of.
+    pub used: atpkg::build_cache::stale::Used,
+    /// A call into the directory did not pass, or what it reported could not be read (its
+    /// output, or the directory it built into): the units are not all the run uses, so nothing
+    /// of it is kept.
+    pub failed: bool,
+    /// The call that completes what the run builds there passed ([`crate::disk::close`]): for
+    /// the main lane's, the test compile's whole or closing call; for the lint lane's, the last
+    /// of a dev run's lint passes, all of which passed. A run that made no such call keeps
+    /// nothing of the directory.
+    pub closed: bool,
+}
+
+/// What a run's compile calls have done so far ([`crate::Ctx::shape_run`]): the files each cut
+/// of its shaped test compile built, what each call's time line says of them, and the units of
+/// each build directory every compile call reported as its outputs.
 #[derive(Debug, Default)]
 pub struct Run {
     /// Each cut that passed ([`Built`]).
@@ -1018,11 +1035,16 @@ pub struct Run {
     pub pending_refusals: Vec<Piece>,
     /// What the fresh check said for each call, by its index.
     pub said: std::collections::BTreeMap<usize, String>,
-    /// The units of the main lane's build directory each call's artifacts are outputs of, fresh
-    /// or built, and the packages the calls built tests of ([`crate::disk::note_used`]): what a
-    /// release run that passes keeps as the record the cache's bound reads
-    /// ([`crate::disk::keep_used`], `atpkg::build_cache::stale::USED`).
-    pub used: atpkg::build_cache::stale::Used,
+    /// By build directory, what every compile call into it reported ([`crate::disk::note_call`]):
+    /// what a run whose calls there completed keeps, at its end, as its scope's run in the
+    /// record at that directory's top ([`crate::disk::keep_used`],
+    /// `atpkg::build_cache::stale::USED`).
+    pub used: std::collections::BTreeMap<crate::disk::Dir, Noted>,
+    /// The stages that build into the main lane's build directory which the run skipped as it
+    /// ran, by a word each ([`crate::disk::note_skipped`]): what its compile calls report of
+    /// that directory leaves their units out, so its record of it is kept under a scope that
+    /// says so ([`crate::disk::run_key`]).
+    pub skipped: std::collections::BTreeSet<&'static str>,
     /// The shared-cache binding admitted before these unit observations, retained through
     /// publication so a replacement directory cannot inherit the earlier cache's unit set.
     pub(crate) used_cache: Option<std::sync::Arc<atpkg::build_cache::registered::KnownCargoCache>>,

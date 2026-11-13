@@ -15,7 +15,7 @@ mod connection;
 #[cfg(unix)]
 mod private;
 #[cfg(unix)]
-pub use private::require_no_acl_grants;
+pub use private::{require_no_acl_entries, require_no_acl_grants};
 #[cfg(unix)]
 pub mod process;
 #[cfg(unix)]
@@ -25,4 +25,7 @@ mod reader;
 #[cfg(unix)]
 pub mod schema;
 #[cfg(unix)]
-pub use reader::{Host, Instance, PinnedHelper, PinnedProgram, Store};
+pub use reader::{
+    Host, HostControlTransfer, Instance, ORIGINAL_CONTROL_DESCRIPTORS, PinnedHelper, PinnedProgram,
+    Store,
+};

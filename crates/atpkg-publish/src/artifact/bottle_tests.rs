@@ -7,6 +7,66 @@ use super::*;
 use crate::artifact::relocate::ObjectRefs;
 use crate::artifact::tarwrite::RawFrames;
 
+#[cfg(unix)]
+#[test]
+fn git_wrapper_relocates_without_path_utilities() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let work = aterm_tempfile::tempdir().unwrap();
+    let stage = work.path().join("original install");
+    let core = stage.join("libexec/git-core");
+    std::fs::create_dir_all(&core).unwrap();
+    std::fs::create_dir_all(stage.join("share/git-core/templates")).unwrap();
+    let backend = core.join("git");
+    std::fs::write(
+        &backend,
+        b"#!/bin/sh\nprintf '%s\\n' \"$ATERM_GIT_ROOT\" \"$GIT_EXEC_PATH\" \"$GIT_TEMPLATE_DIR\" \"$#\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&backend, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(install_git_wrapper("git", &stage).unwrap());
+    let moved = work.path().join("moved git's install");
+    std::fs::rename(&stage, &moved).unwrap();
+    let moved = moved.canonicalize().unwrap();
+    let poison = work.path().join("poison");
+    std::fs::create_dir(&poison).unwrap();
+    let marker = work.path().join("dirname-called");
+    let dirname = poison.join("dirname");
+    std::fs::write(
+        &dirname,
+        b"#!/bin/sh\nprintf called > \"$ATPKG_POISON_MARKER\"\nexit 97\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&dirname, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for path in [std::ffi::OsStr::new(""), poison.as_os_str()] {
+        let mut command = aterm_uds::spawnfd::command(moved.join("bin/git"));
+        command
+            .args(["argument with spaces", "--version"])
+            .env("PATH", path)
+            .env("ATPKG_POISON_MARKER", &marker)
+            .env_remove("GIT_EXEC_PATH")
+            .env_remove("GIT_TEMPLATE_DIR");
+        let output =
+            aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+                .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            format!(
+                "{}\n{}\n{}\n2\nargument with spaces\n--version\n",
+                moved.display(),
+                moved.join("libexec/git-core").display(),
+                moved.join("share/git-core/templates").display()
+            )
+        );
+        assert!(!marker.exists());
+    }
+}
+
 #[test]
 fn cli_accepts_one_archive_or_install_tree_and_refuses_ambiguous_inputs() {
     use crate::host::fake::FakeHost;
@@ -740,6 +800,112 @@ fn pack_bottle_packs_git_and_gh_merges_dual_darwin_and_refuses_missing_dep() {
             .join("lib/atpkg-vendored/libpcre2-8.0.dylib")
             .is_file()
     );
+}
+
+#[cfg(unix)]
+fn staged_git_wrapper() -> (aterm_tempfile::TempDir, PathBuf) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let temp = aterm_tempfile::tempdir().expect("tempdir");
+    let original = temp.path().join("original stage");
+    let core = original.join("libexec/git-core/git");
+    std::fs::create_dir_all(core.parent().unwrap()).expect("core directory");
+    std::fs::create_dir_all(original.join("share/git-core/templates")).expect("templates");
+    std::fs::write(
+        &core,
+        b"#!/bin/sh\nprintf '%s\\n' \"$ATERM_GIT_ROOT\" \"$GIT_EXEC_PATH\" \
+          \"$GIT_TEMPLATE_DIR\" \"$@\"\nexit 37\n",
+    )
+    .expect("payload");
+    std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o755))
+        .expect("executable payload");
+    assert!(install_git_wrapper("git", &original).expect("install real producer wrapper"));
+    let relocated = temp.path().join("relocated stage with spaces");
+    std::fs::rename(&original, &relocated).expect("relocate staged wrapper and payload");
+    let relocated = relocated.canonicalize().expect("physical stage root");
+    (temp, relocated)
+}
+
+#[cfg(unix)]
+fn assert_staged_git_wrapper_runs(stage: &Path, path: &std::ffi::OsStr) {
+    for (program, script, directory) in [
+        (stage.join("bin/git"), None, stage.to_path_buf()),
+        (PathBuf::from("./bin/git"), None, stage.to_path_buf()),
+        (PathBuf::from("/bin/sh"), Some("git"), stage.join("bin")),
+    ] {
+        for overrides in [false, true] {
+            let mut command = aterm_uds::spawnfd::command(&program);
+            command.current_dir(&directory);
+            if let Some(script) = script {
+                command.arg(script);
+            }
+            command
+                .env_clear()
+                .env("PATH", path)
+                .args(["argument with spaces", "--literal"]);
+            let exec = if overrides {
+                command.env("GIT_EXEC_PATH", "caller exec directory");
+                "caller exec directory".to_owned()
+            } else {
+                stage.join("libexec/git-core").display().to_string()
+            };
+            let templates = if overrides {
+                command.env("GIT_TEMPLATE_DIR", "caller templates directory");
+                "caller templates directory".to_owned()
+            } else {
+                stage.join("share/git-core/templates").display().to_string()
+            };
+            let output =
+                aterm_uds::deadline::output_within(&mut command, aterm_spec::wait::MUST_HAPPEN)
+                    .expect("staged wrapper starts");
+            assert_eq!(
+                output.status.code(),
+                Some(37),
+                "{program:?} {script:?} from {directory:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "{program:?} {script:?} from {directory:?}: {output:?}"
+            );
+            assert_eq!(
+                output.stdout,
+                format!(
+                    "{}\n{exec}\n{templates}\nargument with spaces\n--literal\n",
+                    stage.display()
+                )
+                .as_bytes()
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn git_wrapper_works_without_a_caller_tool_path() {
+    let (_temp, stage) = staged_git_wrapper();
+    assert_staged_git_wrapper_runs(&stage, std::ffi::OsStr::new(""));
+}
+
+#[cfg(unix)]
+#[test]
+fn git_wrapper_works_with_poisoned_path_tools() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let (temp, stage) = staged_git_wrapper();
+    let poisoned = temp.path().join("poisoned caller tools");
+    std::fs::create_dir(&poisoned).expect("poison directory");
+    for name in ["dirname", "pwd"] {
+        let tool = poisoned.join(name);
+        std::fs::write(
+            &tool,
+            b"#!/bin/sh\nprintf 'caller tool ran\\n' >&2\nexit 89\n",
+        )
+        .expect("poison tool");
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755))
+            .expect("executable poison");
+    }
+    assert_staged_git_wrapper_runs(&stage, poisoned.as_os_str());
 }
 
 #[cfg(unix)]

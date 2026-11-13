@@ -20,67 +20,6 @@ type BuiltRestoreLeaf = (
     Option<crate::tab_model::TabId>,
 );
 
-#[derive(Debug)]
-pub(crate) struct RestoredWorkerCheck {
-    pub(crate) session: u64,
-    nonce: aterm_session::LaunchNonce,
-    record: crate::task_record::TaskRecord,
-}
-
-impl RestoredWorkerCheck {
-    /// This check, where its worker's agent has ended: the process the leaf names is gone, and
-    /// `shell_leads` says no job stands in front of the shell it ran in. The leaf names one pid, and
-    /// the image can be older than a newer agent or any other job there, which is the roster's to
-    /// name: that pid's death says nothing of what runs in the tab now.
-    fn observed(
-        self,
-        pid: u32,
-        start: &str,
-        presence: aterm_uds::process::ProcessPresence,
-        current_start: Option<&str>,
-        shell_leads: bool,
-    ) -> Option<Self> {
-        (shell_leads && Self::ended(pid, start, presence, current_start)).then_some(self)
-    }
-    fn ended(
-        pid: u32,
-        start: &str,
-        presence: aterm_uds::process::ProcessPresence,
-        current_start: Option<&str>,
-    ) -> bool {
-        pid > 1
-            && !start.is_empty()
-            && (matches!(
-                presence,
-                aterm_uds::process::ProcessPresence::Absent
-                    | aterm_uds::process::ProcessPresence::Exited
-            ) || current_start.is_some_and(|current| current != start))
-    }
-}
-
-/// Whether the shell `pid` on `master` leads its terminal now, with no job in front of it. A read
-/// that failed says no. A kept shell leads its session ([`aterm_pty::record_adopted_shell`]), so its
-/// group is its pid.
-fn shell_leads_its_terminal(master: i32, pid: i32) -> bool {
-    pid > 0 && crate::quit_safety::foreground_pgrp(master) == pid
-}
-
-/// The start of `pid` to compare a leaf's with, where a differing one proves another process holds
-/// the pid: on a Mac, where the kernel stores it, spelled as the leaf's was. Elsewhere `None`, so
-/// only an empty pid proves a death: Linux's `ps -o lstart=` computes the start from the boot time,
-/// which a step of the clock moves, and Windows' spelling here is not a leaf's.
-fn stored_start(pid: u32) -> Option<String> {
-    if cfg!(target_vendor = "apple") {
-        aterm_agent::harness::restart_stamp::kernel_start(pid)
-    } else {
-        None
-    }
-}
-
-#[cfg(test)]
-#[path = "app_restore_kept_worker_tests.rs"]
-mod kept_worker_tests;
-
 /// A historical held-tab notice. Codex preparation reads account and executable files, so it
 /// runs off the main thread. Its result is only logged; it never starts or changes a session.
 struct HeldNotice {
@@ -514,70 +453,6 @@ fn recovery_capability(
 }
 
 impl App {
-    pub(crate) fn finish_restored_worker_check(&mut self, check: RestoredWorkerCheck) {
-        let Some(session) = self
-            .pool
-            .get(check.session)
-            .filter(|session| session.ctx.nonce == check.nonce)
-        else {
-            return;
-        };
-        let mut mark = crate::task_record::TaskMark::new(crate::task_record::TaskState::Exited);
-        mark.why = Some(crate::task_record::WHY_EXIT);
-        let _ = crate::task_record::mark_session_task_if(
-            &session.ctx,
-            check.session,
-            &mark,
-            std::time::Duration::ZERO,
-            |current| current == Some(&check.record),
-        );
-    }
-
-    fn check_kept_worker(
-        &self,
-        session: u64,
-        ctx: &crate::SessionCtx,
-        agent: &restore::AgentRestore,
-        shell_leads: bool,
-    ) {
-        let Some(proxy) = self.proxy.clone() else {
-            return;
-        };
-        let Some(record) = ctx
-            .timeline
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .task()
-            .filter(|record| {
-                record.state == crate::task_record::TaskState::Working
-                    && record.why == Some(crate::task_record::WHY_RESTORED)
-            })
-            .cloned()
-        else {
-            return;
-        };
-        let check = RestoredWorkerCheck {
-            session,
-            nonce: ctx.nonce,
-            record,
-        };
-        let (pid, start) = (agent.pid, agent.start.clone());
-        let _ = std::thread::Builder::new()
-            .name("aterm-restored-worker".into())
-            .spawn(move || {
-                crate::qos::set_self(crate::qos::Role::Background);
-                let presence = i32::try_from(pid)
-                    .ok()
-                    .map(aterm_uds::process::process_presence)
-                    .unwrap_or(aterm_uds::process::ProcessPresence::Unknown);
-                let current_start = stored_start(pid);
-                if let Some(check) =
-                    check.observed(pid, &start, presence, current_start.as_deref(), shell_leads)
-                {
-                    let _ = proxy.send_event(crate::Wake::RestoredWorkerEnded(check));
-                }
-            });
-    }
     /// Captures the full [`restore::RestoreManifest`] across all open windows.
     pub(crate) fn capture_restore_manifest(&self) -> restore::RestoreManifest {
         self.capture_manifest(false, false)
@@ -3832,13 +3707,8 @@ impl App {
                     FillingShell::Registered(id) => (*id, self.pool.get(*id)),
                     FillingShell::Unregistered(session) => (session.id, Some(*session)),
                 };
-                if let Some((ctx, shell_leads)) = shell.map(|shell| {
-                    (
-                        shell.ctx.clone(),
-                        shell_leads_its_terminal(shell.master, shell.pid),
-                    )
-                }) {
-                    self.check_kept_worker(session, &ctx, agent, shell_leads);
+                if let Some(ctx) = shell.map(|shell| shell.ctx.clone()) {
+                    self.check_kept_worker(session, &ctx, agent);
                 }
                 aterm_log::info!("restore: the reattached shell keeps its agent; not relaunched");
             } else if !self.handoff_successor && not_resumed {

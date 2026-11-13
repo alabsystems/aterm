@@ -215,19 +215,6 @@ impl Want {
         )
     }
 
-    /// Whether a person can make a new one when no Mac holds it.
-    #[must_use]
-    pub const fn person_sourced(&self) -> bool {
-        matches!(
-            self,
-            Self::SiteDeployerKey
-                | Self::Notary
-                | Self::Mailbox(_)
-                | Self::MailboxComponent(_)
-                | Self::Gh(_)
-        )
-    }
-
     /// The vault entries it arrives as, the first the one a request is answered by.
     #[must_use]
     pub fn entries(&self) -> Vec<String> {
@@ -279,37 +266,6 @@ impl Want {
             Self::VaultIdentity => "this Mac's vault identity".to_owned(),
             Self::CommonsDeviceKey => "this Mac's Commons device key".to_owned(),
             Self::CommonsControl => "the Commons control entry".to_owned(),
-        }
-    }
-
-    /// Who makes a new one when no Mac holds it.
-    #[must_use]
-    pub fn source(&self) -> &'static str {
-        match self {
-            Self::SiteDeployerKey => {
-                "a person with owner rights on the site's Google Cloud project mints a key for the alab-site-deployer service account"
-            }
-            Self::Notary => "a person makes an app-specific password at account.apple.com",
-            Self::Mailbox(_) => "the mailbox's own password, which only its owner holds",
-            Self::MailboxComponent(component) => match component.part() {
-                crate::mailbox_component::Part::Password => {
-                    "the mailbox's login password, held by its owner"
-                }
-                crate::mailbox_component::Part::SecondPassword => {
-                    "the mailbox's separate decryption password, held by its owner"
-                }
-                crate::mailbox_component::Part::Totp => {
-                    "the mailbox's TOTP seed, not a one-time code"
-                }
-            },
-            Self::Gh(_) => "a person makes a new token at github.com/settings/tokens",
-            Self::Entry(_) => "the vault's admin",
-            Self::PaperMaster => "paper",
-            Self::Login(_) | Self::BrowserProfile(_) | Self::RefreshToken(_) => {
-                "the vendor, on each Mac"
-            }
-            Self::VaultIdentity | Self::CommonsDeviceKey => "this Mac",
-            Self::CommonsControl => "the vault admin's aterm",
         }
     }
 

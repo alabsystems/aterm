@@ -11,21 +11,100 @@ use aterm_secrets::commons::roster::Role;
 use std::collections::BTreeMap;
 
 fn data(lab: &Lab) -> (Scope, Digest) {
+    table(lab, "records", b"retained before device-number change")
+}
+
+/// The `recovery-test` application's table `role`, declared by home 0 and holding `payload` as
+/// its one record: its scope and that record's id.
+fn table(lab: &Lab, role: &str, payload: &[u8]) -> (Scope, Digest) {
     let bootstrap = lab.bootstrap(0);
     let session = Session::open(&bootstrap).unwrap();
     let directory = Directory::new(&lab.paths[0], bootstrap.trust());
     let scope = directory
         .publish(
             &session,
-            &Descriptor::application(bootstrap.trust(), "recovery-test", "records", 1).unwrap(),
+            &Descriptor::application(bootstrap.trust(), "recovery-test", role, 1).unwrap(),
         )
         .unwrap();
     let mut store = Store::open(&session, &directory.path(scope).unwrap(), scope).unwrap();
-    let id = store
-        .commit_catalog(&session, b"retained before device-number change")
-        .unwrap()
-        .id;
+    let id = store.commit_catalog(&session, payload).unwrap().id;
     (scope, id)
+}
+
+/// Where `paths`' home keeps the claim of `scope`'s table.
+fn claim_path(paths: &Paths, scope: Scope) -> PathBuf {
+    paths.dir.join("commons/table-claims").join(format!(
+        "{}.claim",
+        aterm_codec::hex::encode_lower(&scope.digest())
+    ))
+}
+
+/// Where the volume witness of the claim at `claim` is kept: beside it, as `<claim>.volume`.
+fn volume_witness(claim: &Path) -> PathBuf {
+    let mut name = claim.as_os_str().to_owned();
+    name.push(".volume");
+    PathBuf::from(name)
+}
+
+/// Displace `scope`'s table alone in `paths`' home, and return its claim's path: the folder stays
+/// put and only the device number its claim recorded differs, with no volume witness, as on m22
+/// (ATERM-KI-1109-1). Every other table's binding holds.
+fn displace(paths: &Paths, scope: Scope) -> PathBuf {
+    rebound(paths, scope, 0)
+}
+
+/// [`displace`], but it is the inode its claim recorded that differs from the folder's, as where
+/// the folder was copied or restored into a new one.
+fn displace_inode(paths: &Paths, scope: Scope) -> PathBuf {
+    rebound(paths, scope, 8)
+}
+
+/// Add one to the number at `field` of the folder identity the claim of `scope`'s table recorded
+/// in `paths`' home (the device number at 0, the inode at 8), and return the claim's path.
+fn rebound(paths: &Paths, scope: Scope, field: usize) -> PathBuf {
+    let claim = claim_path(paths, scope);
+    let mut bytes = std::fs::read(&claim).unwrap();
+    let at = 5 + 104 + 48 + 16 + field;
+    let old = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+    bytes[at..at + 8].copy_from_slice(&(old + 1).to_le_bytes());
+    fsx::write_atomic(&claim, &bytes, 0o600).unwrap();
+    claim
+}
+
+/// Give the folder at `dir` another inode with everything it holds: what a copy or a restore of
+/// it into a new folder at the same path leaves. The old folder exists until the new one does,
+/// so the new one cannot be given its inode.
+fn refolder(dir: &Path) {
+    let aside = dir.with_extension("aside");
+    std::fs::rename(dir, &aside).unwrap();
+    private_file::create_private_dir(dir).unwrap();
+    for entry in std::fs::read_dir(&aside).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::rename(entry.path(), dir.join(entry.file_name())).unwrap();
+    }
+    std::fs::remove_dir(&aside).unwrap();
+}
+
+/// Flip one bit of the receipt witness the claim at `claim` holds, so the table's journal no
+/// longer reaches the prefix its claim acknowledged: a table whose prefix has no witness.
+fn tear(claim: &Path) {
+    let mut bytes = std::fs::read(claim).unwrap();
+    *bytes.last_mut().unwrap() ^= 1;
+    fsx::write_atomic(claim, &bytes, 0o600).unwrap();
+}
+
+/// Every path under `dir`, folders included: what a read that left an empty folder or a lock file
+/// behind adds to, which [`files`] (regular files' bytes) need not show.
+fn entries(dir: &Path) -> std::collections::BTreeSet<PathBuf> {
+    let mut all = std::collections::BTreeSet::new();
+    for entry in std::fs::read_dir(dir).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            all.extend(entries(&entry.path()));
+        }
+        all.insert(entry.path());
+    }
+    all
 }
 
 fn changed_device(lab: &Lab) {
@@ -83,15 +162,7 @@ fn a_displaced_application_triggers_succession_with_a_healthy_catalog() {
         let session = Session::observe(&bootstrap).unwrap();
         assert!(!recovery_required(&session, false).unwrap());
     }
-    let claim = original.dir.join("commons/table-claims").join(format!(
-        "{}.claim",
-        aterm_codec::hex::encode_lower(&scope.digest())
-    ));
-    let mut bytes = std::fs::read(&claim).unwrap();
-    let at = 5 + 104 + 48 + 16;
-    let old = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-    bytes[at..at + 8].copy_from_slice(&(old + 1).to_le_bytes());
-    fsx::write_atomic(&claim, &bytes, 0o600).unwrap();
+    displace(&original, scope);
     let before_claims = files(&original.dir.join("commons/table-claims"));
     let before_tables = files(&original.dir.join("commons/tables"));
 
@@ -147,16 +218,7 @@ fn a_displaced_application_with_a_refused_prefix_cannot_start_succession() {
     let lab = Lab::new(&[Role::Writer]);
     let (scope, _) = data(&lab);
     let original = &lab.paths[0];
-    let claim = original.dir.join("commons/table-claims").join(format!(
-        "{}.claim",
-        aterm_codec::hex::encode_lower(&scope.digest())
-    ));
-    let mut bytes = std::fs::read(&claim).unwrap();
-    let at = 5 + 104 + 48 + 16;
-    let old = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-    bytes[at..at + 8].copy_from_slice(&(old + 1).to_le_bytes());
-    *bytes.last_mut().unwrap() ^= 1;
-    fsx::write_atomic(&claim, &bytes, 0o600).unwrap();
+    tear(&displace(original, scope));
     let before = files(&original.dir);
 
     let bootstrap = lab.bootstrap(0);
@@ -731,7 +793,7 @@ fn observed_lineage_never_repairs_custody_or_runs_recovery() {
 
 #[test]
 fn a_running_successor_materializes_later_vault_values_without_a_manual_sync() {
-    use crate::runtime::{Diagnostic, Runtime, Status};
+    use crate::runtime::{Diagnostic, Passes, Runtime, Status};
     use aterm_secrets::text::Audience;
 
     let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
@@ -768,12 +830,15 @@ fn a_running_successor_materializes_later_vault_values_without_a_manual_sync() {
         .tempdir_in("/tmp")
         .unwrap();
     let (ready, started) = std::sync::mpsc::channel();
+    // The successor's vault reader passes when this test asks, not on its 30-second timer.
+    let passes = std::sync::Arc::new(Passes::default());
     let runtime = Runtime::start_diagnostic(
         next.clone(),
         selection.config.clone(),
         Diagnostic {
             observer_config: observer.path().join("aterm.toml"),
             recover_writer: false,
+            vault: passes.clone(),
         },
         move |status| {
             let _ = ready.send(status);
@@ -791,19 +856,25 @@ fn a_running_successor_materializes_later_vault_values_without_a_manual_sync() {
     doc.set_entry(&Audience::Everyone, "ongoing-input", b"inert-after")
         .unwrap();
     client::admin_publish(&original, &admin, &doc).unwrap();
-    let until = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
-    let updated = loop {
-        let updated = client::read_verified_entry(&next, &expected, "ongoing-input")
+    let read = || {
+        client::read_verified_entry(&next, &expected, "ongoing-input")
             .unwrap()
-            .is_some_and(|entry| entry.value().as_slice() == b"inert-after");
-        if updated || Instant::now() >= until {
-            break updated;
-        }
-        std::thread::sleep(Duration::from_millis(50));
+            .unwrap()
+            .value()
+            .as_slice()
+            .to_vec()
     };
+    // The publish alone leaves the successor's private home as it was: a reader pass applies it.
+    assert_eq!(read(), b"inert-before");
+    let passed = passes.pass(aterm_spec::wait::MUST_HAPPEN);
+    let updated = read();
     runtime.stop();
     assert!(
-        updated,
+        passed,
+        "the running successor's vault reader never ended a pass"
+    );
+    assert_eq!(
+        updated, b"inert-after",
         "a running successor never applied the later vault value"
     );
     assert_eq!(
@@ -2046,53 +2117,6 @@ fn a_selection_whose_paths_are_not_utf8_reads_back_as_the_same_paths() {
     }
 }
 
-/// After m1's writer succession its requests are delegated: the successor signs them and the
-/// original Writer authorizes delivery to its own recipient (§21). The original actor stays a
-/// current Writer but writes nothing more, so the window decision on m1's own request names m3,
-/// the one Mac that did not answer, and never m1 itself.
-/// NEGATIVE CONTROL: m3, which never swept it, is named.
-#[test]
-fn a_window_decision_after_succession_never_names_the_requesters_own_mac() {
-    use aterm_secrets::need::{self, Purpose, Unanswered, Want};
-    let mut lab = Lab::new(&[Role::Writer, Role::Writer, Role::Writer]);
-    for paths in &lab.paths {
-        need::test_alab_policy(paths);
-    }
-    let original = lab.paths[0].clone();
-    data(&lab);
-    changed_device(&lab);
-    let mut selection = reserved(&lab);
-    let next = move_admitted_candidate(&mut lab);
-    need::test_alab_policy(&next);
-    import(&mut selection).unwrap();
-    assert_eq!(crate::application_paths(&original).unwrap(), next);
-    need::raise(&original, Want::Mailbox("absent".into()), Purpose::ByHand).unwrap();
-    let now = aterm_time::unix_millis().unwrap();
-    assert_eq!(
-        crate::credentials::pass_at(&original, now).unwrap().posted,
-        1
-    );
-    // A minute past the window, so the request's own receipt, later than `now`, is inside it.
-    let window_end = now + need::WANT_WINDOW_SECS * 1000 + 60_000;
-    let decided = crate::credentials::custodian_pass_at(&original, window_end)
-        .unwrap()
-        .unwrap();
-    assert_eq!(decided.asked.len(), 1, "{decided:?}");
-    let heard = crate::credentials::pass_at(&original, window_end).unwrap();
-    let thread = &heard.threads[0];
-    assert!(thread.origin.is_some(), "a delegated request");
-    assert_eq!(
-        thread.unanswered,
-        Unanswered {
-            hosts: vec!["m3".into()],
-            others: 0
-        }
-    );
-    let rows = need::list(&original).unwrap();
-    let line = &rows[0].line;
-    assert!(line.contains(", and m3 did not answer:"), "{line}");
-}
-
 /// A successor home's table read observes its predecessor once, after it has opened the
 /// selected home's custody: the session keeps that observation ([`Session::observe_selected`]),
 /// and its generation checks take none of the predecessor's custody. So a holder of the
@@ -2708,6 +2732,977 @@ fn a_pending_succession_reads_the_original_rather_than_its_candidate() {
     );
     let declared = crate::documents::application::peek_declaration(&original, records, given_time);
     assert!(declared.unwrap().is_some());
+}
+
+/// The descriptor of the `recovery-test` application's table `role` ([`table`]).
+fn described(role: &'static str) -> impl Fn(&Bootstrap) -> Result<Descriptor> {
+    move |bootstrap| Descriptor::application(bootstrap.trust(), "recovery-test", role, 1)
+}
+
+/// The read the account catalog makes of [`data`]'s table in `paths`' home
+/// (`observe_store_if_here`, as `Proposals::snapshot_if_declared` and
+/// `Imports::snapshot_if_declared` call it): the one reader that answers a fenced home's
+/// displaced table (SF-13). It must finish: its bound is the hang detector.
+fn observe_here<T>(
+    paths: &Paths,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<Option<T>> {
+    crate::documents::application::observe_store_if_here(
+        paths,
+        records,
+        Some(Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+        action,
+    )
+}
+
+/// A strict reader's answer for [`data`]'s table in `paths`' home
+/// (`observe_store_if_declared_within`, which every `observe_store*` reader but
+/// `observe_store_if_here` is built on).
+fn observe_strictly(paths: &Paths) -> Result<Option<usize>> {
+    let read_by = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    crate::documents::application::observe_store_if_declared_within(
+        paths,
+        records,
+        read_by,
+        &|| read_by,
+        rows,
+    )
+}
+
+/// A lab whose home 0 holds [`data`]'s table displaced ([`displace`]) and is fenced by a writer
+/// recovery whose import cannot complete (its candidate is never admitted): the lab, the table's
+/// scope and the selection.
+fn fenced_with_a_displaced_table() -> (Lab, Scope, Selection) {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let (moved, _) = data(&lab);
+    displace(&lab.paths[0], moved);
+    let mut selection = reserved(&lab);
+    assert!(import(&mut selection).is_err());
+    assert!(selection.complete.is_none());
+    (lab, moved, selection)
+}
+
+/// SF-13 (ATERM-KI-1109-1): m22's home, whose writer fenced because two tables' directory
+/// bindings were lost. In the fenced original, `records` and the account proposals are displaced
+/// (each folder in place, its claim's device number another, no volume witness), `bound` is not,
+/// and `torn` is displaced with a claim whose receipt witness its journal does not reach. The
+/// read the account catalog makes (`observe_store_if_here`, `Proposals::snapshot_if_declared`)
+/// answers each displaced table from its witnessed prefix in the original home, and the bound
+/// one as before. It writes nothing in either home and adds no entry to them; it repairs no
+/// binding (the custody inspection reports it lost during and after the read, and a strict
+/// reader refuses the same table in the same home and session); it opens the original, never
+/// the incomplete candidate; and the store it hands out gives no fence and no custody identity.
+/// The table whose prefix has no witness still refuses, the held read's refusal beside the
+/// binding's, and the home stays fenced.
+/// NEGATIVE CONTROL: with `observe_store_if_here` passing `held = false`, as before SF-13, the
+/// fenced read of `records` fails with the binding error (run on the unchanged code: it did).
+/// With `Preserving::of` and `stands` taking a home that has no selection for a preserving one,
+/// the unfenced reads answer. With the store's observing read (`journals::Read::witnessed`)
+/// taking the journal's own chain for the claim's witness, the read of `torn` answers. With
+/// `Store::custody_id` or `Store::fence` not refusing a displaced store, the assertions inside
+/// the read fail. With `Directory::observe_table_if_exists` taking the held path, the strict
+/// reads inside and beside the read answer.
+#[test]
+fn a_fenced_homes_displaced_table_is_read_from_its_witnessed_prefix() {
+    use crate::accounts::proposals::Proposals;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    let (moved, moved_id) = data(&lab);
+    let (bound, _) = table(&lab, "bound", b"its binding holds");
+    let (torn, _) = table(&lab, "torn", b"its witness does not");
+    let proposals = Proposals::at(original.clone()).initialize().unwrap();
+    displace(&original, moved);
+    displace(&original, proposals);
+    tear(&displace(&original, torn));
+    // Each read's bound is its own hang detector, never one budget for the whole test.
+    let read_by = || Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let count = |role: &'static str| {
+        crate::documents::application::observe_store_if_here(
+            &original,
+            described(role),
+            Some(read_by()),
+            rows,
+        )
+    };
+    let account_catalog =
+        || Proposals::at_until(original.clone(), read_by()).snapshot_if_declared();
+
+    // CONTROL: no succession fences this home yet, so each displaced table refuses, witnessed
+    // prefix or not, and the bound one reads.
+    let binding = count("records").err().unwrap();
+    assert!(!binding.is_busy(), "{binding}");
+    let binding = binding.to_string();
+    assert_eq!(count("torn").err().unwrap().to_string(), binding);
+    assert_eq!(account_catalog().err().unwrap().to_string(), binding);
+    assert_eq!(count("bound").unwrap(), Some(1));
+    assert!(!root(&original).exists());
+
+    // The fence, as on m22: the candidate is never admitted, so no import completes.
+    let mut selection = reserved(&lab);
+    let next = candidate(&original);
+    assert!(import(&mut selection).is_err());
+    assert!(import(&mut selection).is_err());
+    assert!(
+        Selection::read(&original)
+            .unwrap()
+            .unwrap()
+            .complete
+            .is_none()
+    );
+    // What the binding and the prefix of each table are, by the custody inspection
+    // (`aterm db commons-custody`): (binding lost, prefix witnessed).
+    let custody_of = |scope: Scope| {
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::observe(&bootstrap).unwrap();
+        let evidence = custody::inspect(&session, scope.digest()).unwrap();
+        assert_eq!(
+            evidence.json()["directory"]["binding_matches"].as_bool(),
+            Some(evidence.directory.as_ref().unwrap().binding_error.is_none())
+        );
+        (
+            evidence.directory.unwrap().binding_error.is_some(),
+            evidence.prefix.unwrap().map(drop),
+        )
+    };
+    assert_eq!(custody_of(moved), (true, Ok(())));
+    assert_eq!(custody_of(proposals), (true, Ok(())));
+    assert_eq!(custody_of(bound), (false, Ok(())));
+    let (torn_lost, torn_prefix) = custody_of(torn);
+    let unwitnessed = torn_prefix.unwrap_err();
+    assert!(torn_lost);
+
+    let candidate_files = files(&next.dir);
+    let lab_files = files(lab._home.path());
+    let lab_entries = entries(lab._home.path());
+
+    // The read names the original, and reads the displaced table there.
+    assert_eq!(
+        observed_generation_until(&original, read_by()).unwrap(),
+        original
+    );
+    let read = observe_here(&original, |session, store, scope| {
+        assert_eq!(scope, moved);
+        assert_eq!(session.paths(), &original);
+        let directory = Directory::new(session.paths(), session.trust());
+        let path = directory.path(scope)?;
+        // The store is the original home's own primary folder for the table, alone: no
+        // recovery replica and no candidate's copy.
+        assert!(store.is_primary_at(&path));
+        assert!(store.is_displaced());
+        // It is a read and nothing else: no fence for a repair round, no custody identity for
+        // a resource pin.
+        assert!(store.fence().is_none());
+        assert!(store.custody_id(session).is_err());
+        assert!(store.primary_custody_id(session).is_err());
+        // The binding is as lost as it was: the strict readers refuse this table in this home
+        // and session, and the recovery trigger and the inspection still see it lost.
+        for strict in [
+            Store::observe(session, &path, scope).err(),
+            directory.observe_table(session, scope).err(),
+        ] {
+            assert_eq!(strict.unwrap().to_string(), binding);
+        }
+        assert!(custody::directory_binding_lost(session, scope.digest())?);
+        assert!(
+            custody::inspect(session, scope.digest())?
+                .directory
+                .unwrap()
+                .binding_error
+                .is_some()
+        );
+        Ok((
+            store.inventory(session)?.copied().collect::<Vec<_>>(),
+            store.catalog(session)?[0].payload().to_vec(),
+        ))
+    });
+    assert_eq!(
+        read.unwrap(),
+        Some((
+            vec![moved_id],
+            b"retained before device-number change".to_vec()
+        ))
+    );
+    assert!(
+        account_catalog().unwrap().is_some(),
+        "the account proposals read"
+    );
+    // The bound table reads as it always did: an ordinary observation, with its fence.
+    let ordinary = crate::documents::application::observe_store_if_here(
+        &original,
+        described("bound"),
+        Some(read_by()),
+        |session, store, scope| {
+            assert!(!store.is_displaced() && store.fence().is_some());
+            rows(session, store, scope)
+        },
+    );
+    assert_eq!(ordinary.unwrap(), Some(1));
+    // CONTROL: a strict reader still refuses the displaced table in the fenced home.
+    assert_eq!(
+        observe_strictly(&original).err().unwrap().to_string(),
+        binding
+    );
+    // CONTROL: the table whose prefix its claim does not witness still refuses: the binding's
+    // refusal, with the held read's (the inspection's own prefix refusal) beside it.
+    let refused = count("torn").err().unwrap();
+    assert!(!refused.is_busy(), "{refused}");
+    let refused = refused.to_string();
+    assert!(
+        refused
+            .strip_suffix(&binding)
+            .is_some_and(|held| held.contains(&unwitnessed)),
+        "{refused}"
+    );
+
+    // Still fenced, and nothing written: no file changed and no entry added in the lab's
+    // homes, the candidate's included.
+    assert_eq!(
+        completed_generation_until(&original, read_by())
+            .err()
+            .unwrap()
+            .to_string(),
+        PRESERVING
+    );
+    assert!(guard(&original, true).is_err());
+    assert!(allow_mutation(&original).is_err());
+    assert_eq!(
+        files(&next.dir),
+        candidate_files,
+        "the candidate is untouched"
+    );
+    assert_eq!(
+        files(lab._home.path()),
+        lab_files,
+        "the reads wrote nothing"
+    );
+    assert_eq!(
+        entries(lab._home.path()),
+        lab_entries,
+        "the reads left nothing behind"
+    );
+    // The binding was not repaired: the inspection reports it lost after the reads too.
+    assert_eq!(custody_of(moved), (true, Ok(())));
+    assert_eq!(custody_of(proposals), (true, Ok(())));
+}
+
+/// A held read of a displaced table (SF-13) stands on where it found the table's folder and
+/// volume witness, and on its home's selection record, and answers only while each is as it
+/// found it: a change during the read is `snapshot_changed`, which a reader observes again.
+/// What the next observation finds decides it afresh: a volume witness that is malformed or
+/// another claim's is damaged custody, not a relocation, and refuses as it does for every
+/// reader; a selection that names another writer or lab, or that completed, is not this home's
+/// standing fence, and the binding's refusal returns with why no read was held beside it. A
+/// change that lands inside the held open itself is `snapshot_changed` too, not a refusal.
+/// NEGATIVE CONTROL: with `directory::pinned_and_read_claim` not comparing the folder's
+/// identity, the read under another volume answers; with it not comparing the volume witness's
+/// bytes, the read that wrote a witness answers. With `directory::displaced` pinning the folder
+/// on `Lost::Witness`, the read beside the malformed witness answers. With
+/// `Custody::current_claim` not asking `Preserving::stands`, the reads that rewrote the
+/// selection answer. With `Preserving::of` not comparing the selection's writer, its lab or its
+/// completion, the matching read after the rewrite answers. With `Directory::observe_displaced`
+/// not returning a busy held read as busy, the read whose selection moved inside the open is a
+/// refusal of the binding.
+#[test]
+fn a_held_read_of_a_displaced_table_stops_when_its_pin_or_its_fence_moves() {
+    let (lab, moved, mut selection) = fenced_with_a_displaced_table();
+    let original = lab.paths[0].clone();
+    // This home's first read through the account catalog's path, its preamble included
+    // (`commons_here`), writes nothing and leaves nothing behind.
+    let before = (files(lab._home.path()), entries(lab._home.path()));
+    assert_eq!(observe_here(&original, rows).unwrap(), Some(1));
+    assert_eq!((files(lab._home.path()), entries(lab._home.path())), before);
+    let binding = observe_strictly(&original).err().unwrap().to_string();
+    let mut another_writer = selection.clone();
+    another_writer.actor = "00".repeat(48);
+    let mut another_lab = selection.clone();
+    another_lab.trust = "00".repeat(80);
+
+    // The selection moves during the held open itself, at the last replay the read makes (the
+    // displaced table's: the strict open before it refuses at its claim and replays nothing).
+    // The open's own check finds it moved, and the read is told to observe again.
+    let replays = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+    let counted = replays.clone();
+    let read = crate::table::store::with_each_replay_observed(
+        move || counted.set(counted.get() + 1),
+        || observe_here(&original, rows),
+    );
+    assert_eq!(read.unwrap(), Some(1));
+    let (last, seen) = (
+        replays.get(),
+        std::rc::Rc::new(std::cell::Cell::new(0_usize)),
+    );
+    assert!(last > 0);
+    let (other, at) = (another_writer.clone(), seen.clone());
+    let read = crate::table::store::with_each_replay_observed(
+        move || {
+            at.set(at.get() + 1);
+            if at.get() == last {
+                other.save().unwrap();
+            }
+        },
+        || observe_here(&original, rows),
+    );
+    assert_eq!(seen.get(), last, "the selection moved inside the held open");
+    assert!(read.err().unwrap().is_snapshot_changed());
+    selection.save().unwrap();
+
+    // The folder is found elsewhere while the read holds its store, then where it was.
+    let read = observe_here(&original, |session, store, scope| {
+        assert!(store.is_displaced());
+        let elsewhere =
+            crate::table::store::with_volume_for_test([7; 16], || rows(session, store, scope));
+        assert!(elsewhere.err().unwrap().is_snapshot_changed());
+        rows(session, store, scope)
+    });
+    assert_eq!(read.unwrap(), Some(1));
+
+    // A volume witness appears beside the claim while the read holds its store.
+    let witness = volume_witness(&claim_path(&original, moved));
+    let read = observe_here(&original, |session, store, scope| {
+        fsx::write_new(&witness, &[0; 53], 0o600).unwrap();
+        rows(session, store, scope)
+    });
+    assert!(read.err().unwrap().is_snapshot_changed());
+    // That witness is no claim's: damaged custody, which the held read refuses in the strict
+    // reader's own words.
+    let damaged = observe_here(&original, rows).err().unwrap();
+    assert!(!damaged.is_busy(), "{damaged}");
+    assert_ne!(damaged.to_string(), binding);
+    assert_eq!(
+        damaged.to_string(),
+        observe_strictly(&original).err().unwrap().to_string()
+    );
+    std::fs::remove_file(&witness).unwrap();
+    assert_eq!(observe_here(&original, rows).unwrap(), Some(1));
+
+    // The selection comes to name another writer, then another lab, while the read holds its
+    // store; and a selection that names either is not this home's fence.
+    let not_held = |refused: Error| {
+        assert!(!refused.is_busy(), "{refused}");
+        let refused = refused.to_string();
+        refused
+            .strip_suffix(&binding)
+            .is_some_and(|held| held.contains(NOT_HELD))
+    };
+    for other in [another_writer, another_lab] {
+        selection.save().unwrap();
+        let read = observe_here(&original, |session, store, scope| {
+            other.save().unwrap();
+            rows(session, store, scope)
+        });
+        assert!(read.err().unwrap().is_snapshot_changed());
+        assert!(not_held(observe_here(&original, rows).err().unwrap()));
+    }
+    selection.save().unwrap();
+    assert_eq!(observe_here(&original, rows).unwrap(), Some(1));
+
+    // The selection completes while the read holds its store.
+    let read = observe_here(&original, |session, store, scope| {
+        selection.complete = Some([0; 32]);
+        selection.save().unwrap();
+        rows(session, store, scope)
+    });
+    assert!(read.err().unwrap().is_snapshot_changed());
+    // A completed selection is no standing fence either. The account catalog's read stops at
+    // the selection (this completion matches no seal), so the gate is asked in a session of the
+    // original directly.
+    assert_eq!(
+        observe_here(&original, rows).err().unwrap().to_string(),
+        PRESERVING
+    );
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    assert_eq!(
+        Preserving::of(&session).err().unwrap().to_string(),
+        NOT_HELD
+    );
+    let refused = Directory::new(&original, session.trust())
+        .observe_held_table(&session, moved)
+        .err()
+        .unwrap();
+    assert!(not_held(refused));
+}
+
+/// A held read of a displaced table (SF-13) answers a table whose folder has another inode than
+/// its claim recorded, a relocation as m22's changed device number is; but never beside a volume
+/// witness that is not one. The strict judgment names the inode before it reads the witness, so
+/// the strict reader's words are the same with and without the damaged witness; the held read
+/// holds the witness to its form itself, and its refusal, in the words the strict reader has for
+/// such a witness beside a claim whose inode holds (`other`'s), stands beside the inode's.
+/// NEGATIVE CONTROL: with `directory::displaced` pinning a folder that has another inode without
+/// asking `witnesses` of the witness beside its claim, the read beside the zeroed witness
+/// answers. With `directory::displaced` refusing `Lost::Inode`, the fenced read of the table
+/// refuses in the inode's words.
+#[test]
+fn a_held_read_answers_another_inode_but_never_beside_a_damaged_volume_witness() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    let (moved, _) = data(&lab);
+    let (other, _) = table(&lab, "other", b"its device number changed");
+    let witness = volume_witness(&displace_inode(&original, moved));
+    fsx::write_new(
+        &volume_witness(&displace(&original, other)),
+        &[0; 53],
+        0o600,
+    )
+    .unwrap();
+    // Each wait's bound is its own hang detector, never one budget for the whole test.
+    let read_by = || Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let strictly = |role: &'static str| {
+        crate::documents::application::observe_store_if_declared_within(
+            &original,
+            described(role),
+            read_by(),
+            &read_by,
+            rows,
+        )
+        .err()
+        .unwrap()
+        .to_string()
+    };
+    let here = |role: &'static str| {
+        crate::documents::application::observe_store_if_here(
+            &original,
+            described(role),
+            Some(read_by()),
+            |session, store, scope| {
+                assert!(store.is_displaced());
+                rows(session, store, scope)
+            },
+        )
+    };
+    // The two bindings are lost in different words: the inode's, and the damaged witness's.
+    let inode = strictly("records");
+    let damaged = strictly("other");
+    assert_ne!(inode, damaged);
+    // CONTROL: no succession fences this home yet, so neither table is read.
+    assert_eq!(here("records").err().unwrap().to_string(), inode);
+    assert_eq!(here("other").err().unwrap().to_string(), damaged);
+
+    let mut selection = reserved(&lab);
+    assert!(import(&mut selection).is_err());
+    assert!(selection.complete.is_none());
+    // The fenced home's held read answers the folder with another inode; a strict reader does
+    // not.
+    assert_eq!(here("records").unwrap(), Some(1));
+    assert_eq!(strictly("records"), inode);
+    assert_eq!(here("other").err().unwrap().to_string(), damaged);
+
+    // CONTROL: a witness that is none appears beside the claim. The strict reader says what it
+    // said, having named the inode first; the held read refuses, for the witness.
+    fsx::write_new(&witness, &[0; 53], 0o600).unwrap();
+    assert_eq!(strictly("records"), inode);
+    let refused = here("records").err().unwrap();
+    assert!(!refused.is_busy(), "{refused}");
+    let refused = refused.to_string();
+    assert!(
+        refused
+            .strip_suffix(&inode)
+            .is_some_and(|held| held.contains(&damaged)),
+        "{refused}"
+    );
+    // With it gone, the table reads again: the witness alone refused it.
+    std::fs::remove_file(&witness).unwrap();
+    assert_eq!(here("records").unwrap(), Some(1));
+}
+
+/// A held read of a displaced table (SF-13) answers each relocation the strict judgment names
+/// of a claim that has its volume witness: a folder found on another persistent volume than
+/// the witness names, or on one that cannot be read; and a folder with another inode, beside
+/// the witness written for its claim, whatever volume that names. It answers none of them
+/// beside a witness that is not its claim's: one of another length, another magic or another
+/// anchor, or another claim's own witness. There the strict reader names the inode as before,
+/// and the held read's refusal, in the words the strict reader has for such a witness where the
+/// inode holds, stands beside it. On the volume the witness names, the claim holds its folder
+/// and the read is an ordinary observation.
+/// NEGATIVE CONTROL: with `directory::displaced` refusing `Lost::Volume`, the fenced reads on
+/// another or an unreadable volume refuse; with it refusing `Lost::Inode`, the read of the
+/// refoldered table does. With `directory::displaced` pinning a folder that has another inode
+/// without asking `witnesses`, each read of the refoldered table beside a damaged witness
+/// answers; with `witnesses` not comparing the length or the magic, the read beside the witness
+/// that differs in that alone answers; with it not comparing the anchor, the strict reader
+/// takes the witness with another anchor for the claim's, and the test stops where it asks for
+/// that reader's words.
+#[test]
+fn a_held_read_answers_another_volume_and_a_moved_folder_beside_its_claims_own_witness() {
+    use crate::table::store::with_volume_for_test;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    // Each writable open here witnesses the volume its table's folder is on.
+    let (moved, _) = with_volume_for_test([1; 16], || data(&lab));
+    let bootstrap = lab.bootstrap(0);
+    let directory = Directory::new(&original, bootstrap.trust());
+    let witness = volume_witness(&claim_path(&original, moved));
+    let written = std::fs::read(&witness).unwrap();
+    let anothers = std::fs::read(volume_witness(&claim_path(
+        &original,
+        directory.catalog_scope(),
+    )))
+    .unwrap();
+    assert_ne!(anothers, written);
+    let strictly = || observe_strictly(&original).err().unwrap().to_string();
+    let held = || {
+        observe_here(&original, |session, store, scope| {
+            assert!(store.is_displaced() && store.fence().is_none());
+            rows(session, store, scope)
+        })
+    };
+    // CONTROL: no succession fences this home yet, so its tables, found on a volume that cannot
+    // be read, are not read.
+    let volume = strictly();
+    assert_eq!(held().err().unwrap().to_string(), volume);
+
+    let mut selection = reserved(&lab);
+    assert!(import(&mut selection).is_err());
+    assert!(selection.complete.is_none());
+    // Found on a volume that cannot be read, then on another: the held read answers, and a
+    // strict reader refuses.
+    assert_eq!(held().unwrap(), Some(1));
+    assert_eq!(strictly(), volume);
+    with_volume_for_test([2; 16], || {
+        assert_eq!(held().unwrap(), Some(1));
+        assert_eq!(strictly(), volume);
+    });
+
+    // From here the folders are found on the volume their witnesses name, so every claim holds.
+    with_volume_for_test([1; 16], || {
+        let bound = observe_here(&original, |session, store, scope| {
+            assert!(!store.is_displaced() && store.fence().is_some());
+            rows(session, store, scope)
+        });
+        assert_eq!(bound.unwrap(), Some(1));
+        assert_eq!(observe_strictly(&original).unwrap(), Some(1));
+        // The words a strict reader has for a witness that is not the claim's.
+        let mut foreign = written.clone();
+        foreign[5] ^= 1;
+        fsx::write_atomic(&witness, &foreign, 0o600).unwrap();
+        let damaged = strictly();
+        assert_ne!(damaged, volume);
+        assert_eq!(held().err().unwrap().to_string(), damaged);
+        fsx::write_atomic(&witness, &written, 0o600).unwrap();
+
+        // The table's folder alone is given another inode, beside its claim's own witness.
+        refolder(&directory.path(moved).unwrap());
+        let inode = strictly();
+        assert!(inode != volume && inode != damaged, "{inode}");
+        assert_eq!(held().unwrap(), Some(1));
+        // The witness names another volume: it is still the claim's, and the folder moved.
+        let mut elsewhere = written.clone();
+        elsewhere[37] ^= 1;
+        fsx::write_atomic(&witness, &elsewhere, 0o600).unwrap();
+        assert_eq!(strictly(), inode);
+        assert_eq!(held().unwrap(), Some(1));
+
+        // CONTROL: beside a witness that is not the claim's, the held read refuses.
+        let mut magic = written.clone();
+        magic[0] ^= 1;
+        for (what, damage) in [
+            ("another length", &written[..written.len() - 1]),
+            ("another magic", &magic),
+            ("another anchor", &foreign),
+            ("another claim's witness", &anothers),
+        ] {
+            fsx::write_atomic(&witness, damage, 0o600).unwrap();
+            assert_eq!(strictly(), inode);
+            let refused = held().expect_err(what);
+            assert!(!refused.is_busy(), "{refused}");
+            let refused = refused.to_string();
+            assert!(
+                refused
+                    .strip_suffix(&inode)
+                    .is_some_and(|held| held.contains(&damaged)),
+                "{refused}"
+            );
+        }
+        fsx::write_atomic(&witness, &written, 0o600).unwrap();
+        assert_eq!(held().unwrap(), Some(1));
+    });
+}
+
+/// A displaced claim is only ever observed, in the primary region and without initializing
+/// (SF-13): the open refuses any other use of one before it opens a journal, so no writer,
+/// witness publication or volume backfill is reachable without the claim's hold on its folder,
+/// whatever a later constructor asks. Nothing is written by the refused opens.
+/// NEGATIVE CONTROL: with `Store::open_claimed` not refusing a displaced claim, the recovery
+/// and the initializing open answer, and the writable one opens the journal's writer and is
+/// refused only afterwards, by the home's fence and in its words; with any one of the three
+/// conditions dropped, that case answers or refuses in other words than the other two.
+#[test]
+fn a_displaced_table_is_never_opened_writable_in_recovery_or_initializing() {
+    let (lab, moved, _selection) = fenced_with_a_displaced_table();
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    let before = (files(lab._home.path()), entries(lab._home.path()));
+    let open = |read_only, region, initialize| {
+        let held = Preserving::of(&session).unwrap().unwrap();
+        Store::observe_displaced_as(&session, moved, held, read_only, region, initialize)
+    };
+    assert!(
+        open(true, Region::Primary, false)
+            .unwrap()
+            .is_some_and(|store| store.is_displaced())
+    );
+    let refusals: Vec<_> = [
+        (false, Region::Primary, false),
+        (true, Region::Recovery, false),
+        (true, Region::Primary, true),
+    ]
+    .into_iter()
+    .map(|(read_only, region, initialize)| {
+        let refused = open(read_only, region, initialize).err().unwrap();
+        assert!(!refused.is_busy(), "{refused}");
+        refused.to_string()
+    })
+    .collect();
+    assert!(
+        refusals.iter().all(|refused| *refused == refusals[0]),
+        "{refusals:?}"
+    );
+    assert_eq!((files(lab._home.path()), entries(lab._home.path())), before);
+}
+
+/// A relocation that displaces every table of a home displaces its catalog with them (m114's
+/// case, [`changed_device`]), and the account catalog's read needs the catalog first: in the
+/// fenced home it answers both from their witnessed prefixes (SF-13), writing nothing, while a
+/// strict reader and the declaration peek still refuse.
+/// NEGATIVE CONTROL: with `observe_declared` reading the catalog through `snapshot_existing`
+/// where `held`, the fenced read fails on the catalog's binding; with `Preserving::of` and
+/// `stands` taking a home that has no selection for a preserving one, the unfenced read answers.
+#[test]
+fn a_fenced_home_whose_every_table_is_displaced_still_reads_its_declared_table() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    data(&lab);
+    changed_device(&lab);
+    // CONTROL: unfenced, the read refuses at the catalog.
+    let binding = observe_here(&original, rows).err().unwrap();
+    assert!(!binding.is_busy(), "{binding}");
+    let mut selection = reserved(&lab);
+    assert!(import(&mut selection).is_err());
+    let before = (files(lab._home.path()), entries(lab._home.path()));
+    assert_eq!(observe_here(&original, rows).unwrap(), Some(1));
+    assert_eq!(
+        observe_strictly(&original).err().unwrap().to_string(),
+        binding.to_string()
+    );
+    assert!(
+        crate::documents::application::peek_declaration(
+            &original,
+            records,
+            Instant::now() + aterm_spec::wait::MUST_HAPPEN
+        )
+        .is_err()
+    );
+    assert_eq!((files(lab._home.path()), entries(lab._home.path())), before);
+}
+
+/// The gate of a held read (SF-13) judges no currency; the open it gates does, and keeps busy.
+/// A vault writer that takes the home's state lock as the account catalog's read reaches that
+/// gate (the ordinary observation of the displaced table has refused and no recovery replica
+/// has answered, both with no writer there) leaves the gate's answer what it was, and the read
+/// is busy, which a reader observes again: the held open takes no source read of the vault
+/// under the writer. Asked directly under that writer, the gate still answers. The home's access
+/// is log-backed, as a Mac's is since F18, so a judgment of its currency reads the vault.
+/// A writer that is there from the read's start shows nothing of this: the read is busy at its
+/// first observation, before any gate, so the writer arrives at the gate itself
+/// (`seams::Point::HeldGate`).
+/// NEGATIVE CONTROL: with `Preserving::of` reaching the lab through `Session::control_context`,
+/// the read under the writer refuses in the binding's words, "Commons membership changed during
+/// endpoint setup" beside them, which is not busy; and the gate asked directly refuses so too.
+/// With `Directory::observe_displaced` not returning a busy held read as busy, the read is the
+/// binding's refusal with the busy open's words beside it.
+#[test]
+fn a_vault_writer_at_a_held_reads_gate_is_busy_not_a_refusal() {
+    let lab = Lab::with_foundation(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    client::seed_vault_genesis(&original, &lab._home.path().join("genesis.v2")).unwrap();
+    let (moved, _) = data(&lab);
+    displace(&original, moved);
+    let mut selection = reserved(&lab);
+    assert!(import(&mut selection).is_err());
+    assert!(selection.complete.is_none());
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    let held = || {
+        observe_here(&original, |session, store, scope| {
+            assert!(store.is_displaced());
+            rows(session, store, scope)
+        })
+    };
+    // CONTROL: with no writer the read answers the displaced table.
+    assert_eq!(held().unwrap(), Some(1));
+
+    // The writer arrives as the read reaches its gate, and stays until the read has returned.
+    let writer = std::rc::Rc::new(std::cell::RefCell::new(None));
+    seams::at(seams::Point::HeldGate, {
+        let (writer, original) = (writer.clone(), original.clone());
+        move || {
+            let arrived = client::test_hold_state_lock(&original).unwrap();
+            assert!(writer.borrow_mut().replace(arrived).is_none());
+        }
+    });
+    let read = held();
+    let writer = writer
+        .borrow_mut()
+        .take()
+        .expect("CONTROL: the read reached its gate, where the writer arrived");
+    let busy = read.expect_err("a held read answered under a vault writer");
+    assert!(busy.is_busy(), "{busy}");
+    // CONTROL: in the writer's moment a session's currency is not judged, and the judgment that
+    // keeps no busy takes that for membership that changed. The gate does not ask it.
+    let unjudged = session.control_context().err().unwrap();
+    assert!(!unjudged.is_busy(), "{unjudged}");
+    assert!(Preserving::of(&session).unwrap().is_some());
+    drop(writer);
+    assert_eq!(held().unwrap(), Some(1));
+}
+
+/// Where a recovery replica of a displaced table is enrolled, it answers the held read (SF-13)
+/// as it answers every reader, and a moment in which that replica is busy is busy for the held
+/// read, which observes again: the displaced primary does not answer in the replica's place. A
+/// replica that refuses otherwise answers nothing, and there the held read answers the primary
+/// from its witnessed prefix. A strict reader, in the replica's busy moment, refuses with the
+/// binding's words as it did before SF-13.
+/// NEGATIVE CONTROL: with `Directory::observe_table_if_exists_as` not returning a busy recovery
+/// observation where `held`, the held read beside the busy replica answers the displaced
+/// primary; with it returning one to every reader (`held &&` dropped), the strict read there is
+/// busy; with it returning every refusal of the replica where `held`, the held read beside the
+/// replica that refuses otherwise refuses too.
+#[test]
+fn a_held_read_is_busy_while_the_recovery_replica_that_answers_it_is() {
+    use crate::table::store::with_open_hook;
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    let (moved, _) = data(&lab);
+    let bootstrap = lab.bootstrap(0);
+    let directory = Directory::new(&original, bootstrap.trust());
+    // The replica is enrolled while the home may still write: before the fence.
+    {
+        let session = Session::open(&bootstrap).unwrap();
+        directory.recovery().enroll(&session, moved).unwrap();
+    }
+    displace(&original, moved);
+    let mut selection = reserved(&lab);
+    assert!(import(&mut selection).is_err());
+    assert!(selection.complete.is_none());
+    let session = Session::observe(&bootstrap).unwrap();
+    let primary = directory.path(moved).unwrap();
+    let replica = directory.recovery().path(moved).unwrap();
+    let binding = Store::observe(&session, &primary, moved).err().unwrap();
+    assert!(!binding.is_busy(), "{binding}");
+    let binding = binding.to_string();
+
+    // The replica answers the held read and the strict one alike.
+    for answered in [
+        directory.observe_held_table(&session, moved).unwrap(),
+        directory.observe_table(&session, moved).unwrap(),
+    ] {
+        assert!(answered.is_recovery() && !answered.is_displaced());
+    }
+
+    // The replica is busy: every open of it that reaches its journal says so.
+    let opens = std::rc::Rc::new(std::cell::Cell::new(0_usize));
+    let beside_busy = |read: &dyn Fn() -> Result<Store>| {
+        let counted = opens.clone();
+        with_open_hook(
+            &replica,
+            move || {
+                counted.set(counted.get() + 1);
+                Err(Error::busy())
+            },
+            read,
+        )
+    };
+    let held = beside_busy(&|| directory.observe_held_table(&session, moved));
+    assert_eq!(opens.get(), 1, "CONTROL: the replica's open was reached");
+    let held = held
+        .err()
+        .expect("the displaced primary answered for a busy replica");
+    assert!(held.is_busy(), "{held}");
+    let strict = beside_busy(&|| directory.observe_table(&session, moved));
+    assert_eq!(opens.get(), 2, "CONTROL: the replica's open was reached");
+    let strict = strict.err().unwrap();
+    assert!(!strict.is_busy(), "{strict}");
+    assert_eq!(strict.to_string(), binding);
+
+    // The replica refuses otherwise: it answers nothing, and the held read answers the primary.
+    let held = with_open_hook(
+        &replica,
+        || Err(Error::new("the replica refuses")),
+        || directory.observe_held_table(&session, moved),
+    )
+    .unwrap();
+    assert!(held.is_displaced() && held.is_primary_at(&primary));
+    assert_eq!(rows(&session, &held, moved).unwrap(), 1);
+}
+
+/// A fenced home that lost its selection record holds no read of a displaced table (SF-13),
+/// and says so: the gate reads no selection, finds the reservation and the candidate link still
+/// fencing the home, and refuses in words, which stand beside the binding's refusal. Nothing is
+/// written by the refused read. A home nothing fences gives the gate nothing to say, and the
+/// binding's refusal stands alone there.
+/// NEGATIVE CONTROL: with `Preserving::of` giving `Ok(None)` for a fenced home with no selection,
+/// the read after the loss refuses in the binding's bare words and the gate answers `None`; with
+/// it refusing every home that has no selection, the unfenced gate refuses and the unfenced read
+/// carries the gate's words.
+#[test]
+fn a_fenced_home_that_lost_its_selection_record_holds_no_read_and_says_why() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let original = lab.paths[0].clone();
+    let (moved, _) = data(&lab);
+    displace(&original, moved);
+    let bootstrap = lab.bootstrap(0);
+    // CONTROL: nothing fences this home yet. The gate holds nothing and says nothing, and the
+    // read refuses as a strict reader's does.
+    assert!(!fenced(&original).unwrap());
+    assert!(
+        Preserving::of(&Session::observe(&bootstrap).unwrap())
+            .unwrap()
+            .is_none()
+    );
+    let binding = observe_strictly(&original).err().unwrap().to_string();
+    assert_eq!(
+        observe_here(&original, rows).err().unwrap().to_string(),
+        binding
+    );
+
+    let mut selection = reserved(&lab);
+    assert!(import(&mut selection).is_err());
+    assert!(selection.complete.is_none());
+    assert_eq!(observe_here(&original, rows).unwrap(), Some(1));
+
+    // The selection record is lost; the reservation and the candidate's link remain.
+    std::fs::remove_file(root(&original).join(STATE)).unwrap();
+    assert!(Selection::read(&original).unwrap().is_none());
+    assert!(fenced(&original).unwrap());
+    let before = (files(lab._home.path()), entries(lab._home.path()));
+    let refused = observe_here(&original, rows).err().unwrap();
+    assert!(!refused.is_busy(), "{refused}");
+    let refused = refused.to_string();
+    assert!(
+        refused
+            .strip_suffix(&binding)
+            .is_some_and(|held| held.contains(UNSELECTED)),
+        "{refused}"
+    );
+    let session = Session::observe(&bootstrap).unwrap();
+    let gate = Preserving::of(&session).err().unwrap();
+    assert!(!gate.is_busy(), "{gate}");
+    assert_eq!(gate.to_string(), UNSELECTED);
+    drop(session);
+    assert_eq!(
+        observe_strictly(&original).err().unwrap().to_string(),
+        binding
+    );
+    assert_eq!((files(lab._home.path()), entries(lab._home.path())), before);
+}
+
+/// A succession that completed stays completed for the readers of its original's held records
+/// when the original's selection file is lost (SF-19). The completing import leaves a mark
+/// beside the selection; a recovery pass gives one to a completion an earlier release recorded
+/// without it. With the file lost, and again once a reservation has written it back in the bytes
+/// of a succession that never completed, the read gate of a pending succession (FL-14,
+/// `guard_read_until`) and the gate of a displaced table's held read (SF-13, `Preserving::of`)
+/// both refuse, since the successor may have authored; the next pass completes the import again.
+/// CONTROL: a fenced home whose import never completed has no mark and both gates hold its read.
+/// NEGATIVE CONTROL: with `import_until` writing no mark, the first `may_have_completed` assertion
+/// fails; with `advance_at` writing none, or writing it only after the pass's own checks, the
+/// one after the refused pass; with `held_here`
+/// not asking for the mark, the read gate answers `Ok` once the file is lost; with
+/// `generation_until` not asking where it reads no selection, both generation readers answer the
+/// original for the lost file, and where it reads one without a completion, the observing reader
+/// does for the record written again; with `Preserving::of` not asking, it answers `Some` for
+/// that record.
+#[test]
+fn a_completed_succession_whose_selection_was_lost_is_not_read_as_never_completed() {
+    #[track_caller]
+    fn refused<T>(answer: Result<T>) -> String {
+        answer.err().expect("the read is refused").to_string()
+    }
+    let by = || Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let preserving = "Commons writer succession is still preserving old records";
+    let superseded = "original Commons writer is fenced by succession";
+    {
+        let (lab, _, selection) = fenced_with_a_displaced_table();
+        let pending = &lab.paths[0];
+        assert!(selection.complete.is_none());
+        assert!(!may_have_completed(pending).unwrap());
+        guard_read_until(pending, by()).unwrap();
+        assert_eq!(&observed_generation_until(pending, by()).unwrap(), pending);
+        let bootstrap = lab.bootstrap(0);
+        let session = Session::observe(&bootstrap).unwrap();
+        assert!(Preserving::of(&session).unwrap().is_some());
+        drop(session);
+        assert_eq!(observe_here(pending, rows).unwrap(), Some(1));
+    }
+
+    let mut served = served();
+    let _peer = allowed_member(&mut served, "m2");
+    let lab = &served.lab;
+    let original = lab.paths[0].clone();
+    let config = original.home.join("config.toml");
+    data(lab);
+    changed_device(lab);
+    assert!(!may_have_completed(&original).unwrap());
+    let next = advance(&original, &config).unwrap();
+    assert!(completes(&original));
+    assert!(may_have_completed(&original).unwrap());
+    assert_eq!(refused(guard_read_until(&original, by())), superseded);
+
+    // A completion recorded by a release that wrote no mark: the next pass writes it, before
+    // any check that can refuse the pass. An owner under another config path is refused, and
+    // the mark is written all the same.
+    let mark = root(&original).join(COMPLETED);
+    std::fs::remove_file(&mark).unwrap();
+    assert!(!may_have_completed(&original).unwrap());
+    assert!(advance(&original, &original.home.join("other.toml")).is_err());
+    assert!(may_have_completed(&original).unwrap());
+    std::fs::remove_file(&mark).unwrap();
+    assert_eq!(advance(&original, &config).unwrap(), next);
+    assert!(may_have_completed(&original).unwrap());
+
+    // The selection file is lost. The home reads as one with no selection, and refuses.
+    let state = root(&original).join(STATE);
+    std::fs::remove_file(&state).unwrap();
+    assert!(Selection::read(&original).unwrap().is_none());
+    assert_eq!(refused(guard_read_until(&original, by())), preserving);
+    assert_eq!(
+        refused(observed_generation_until(&original, by())),
+        preserving
+    );
+    assert_eq!(
+        refused(completed_generation_until(&original, by())),
+        preserving
+    );
+
+    // A reservation writes it again: byte for byte the record of a succession that never
+    // completed, which the kept reservation still holds.
+    let again = reserve(&original, &config, &lab.bootstrap(0)).unwrap();
+    assert!(again.complete.is_none());
+    assert_eq!(
+        std::fs::read(&state).unwrap(),
+        std::fs::read(root(&original).join(FENCE)).unwrap()
+    );
+    assert_eq!(refused(guard_read_until(&original, by())), preserving);
+    assert_eq!(
+        refused(observed_generation_until(&original, by())),
+        preserving
+    );
+    assert_eq!(
+        refused(completed_generation_until(&original, by())),
+        preserving
+    );
+    let bootstrap = lab.bootstrap(0);
+    let session = Session::observe(&bootstrap).unwrap();
+    assert_eq!(refused(Preserving::of(&session)), NOT_HELD);
+    drop(session);
+    assert!(observe_here(&original, rows).is_err());
+
+    // The next pass imports again and the succession stands completed as before.
+    assert_eq!(advance(&original, &config).unwrap(), next);
+    assert!(completes(&original));
+    assert!(may_have_completed(&original).unwrap());
+    assert_eq!(refused(guard_read_until(&original, by())), superseded);
 }
 
 /// A fleet label's registry generation ([`crate::att::current_within`]) is the read's to answer:

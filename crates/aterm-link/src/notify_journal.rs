@@ -31,7 +31,7 @@
 //! carries the stamps the notifier holds (in order, the window's), never ones it let go.
 //!
 //! ONE WRITER: a notifier holds its root store, and every log's store under it, by an exclusive
-//! lock for its life ([`super::Store::hold`]), and a second one on the same state dir is refused
+//! lock for its life ([`super::Store::open`]), and a second one on the same state dir is refused
 //! at its start, so no other writer appends to or renames over a file a notifier holds. An
 //! append goes to the descriptor it opened once ([`StepsFile::target`]), on a file that is an
 //! owned regular single-link file of the bytes it read or wrote ([`StepsFile::open`]); anything
@@ -61,11 +61,11 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use aterm_durable::Flush;
 
-use super::{flush_dir, note_bytes, note_flush, read_bounded_bytes, warn, Store, JOURNAL_KEEP};
+use super::{flush_dir, note_bytes, note_flush, warn, Store, JOURNAL_KEEP};
 use crate::state::journal::{self, End, Record, Replay};
 
 fn number(word: &str) -> Option<u64> {
@@ -402,7 +402,7 @@ pub(super) fn read(bytes: &[u8]) -> journal::Read<Verdicts> {
 #[derive(Debug)]
 pub(super) struct StepsFile {
     /// The store's root, whose [`FILE`] it is.
-    root: PathBuf,
+    store: Store,
     /// What the file holds, as its steps say: a rewrite writes it whole.
     pub(super) held: Verdicts,
     /// The descriptor appends go to, once one was made.
@@ -461,13 +461,13 @@ thread_local! {
 }
 
 impl StepsFile {
-    fn new(root: &Path, held: Verdicts, len: u64, steps: u64, whole: bool) -> Self {
+    fn new(store: &Store, held: Verdicts, len: u64, steps: u64, whole: bool) -> Self {
         #[cfg(test)]
         let from_file = OPEN_BOUND_FROM_FILE.with(std::cell::Cell::get);
         #[cfg(not(test))]
         let from_file = false;
         Self {
-            root: root.to_path_buf(),
+            store: store.clone(),
             bound: if from_file {
                 Bound::after(steps, len)
             } else {
@@ -484,9 +484,14 @@ impl StepsFile {
         }
     }
 
-    /// The store root whose journal it is.
-    pub(super) fn root(&self) -> &Path {
-        &self.root
+    pub(super) fn same_device(&self, other: &Self) -> bool {
+        self.store
+            .directory
+            .file
+            .metadata()
+            .ok()
+            .zip(other.store.directory.file.metadata().ok())
+            .is_some_and(|(a, b)| super::file_id(&a).0 == super::file_id(&b).0)
     }
 
     /// Put `steps` in the file, flushed by `flush`: appended to it in one write, or, where the
@@ -551,11 +556,8 @@ impl StepsFile {
             held.stamps.dedup();
         }
         let (bytes, next) = held.encode()?;
-        let store = Store {
-            root: self.root.clone(),
-        };
         self.file = None;
-        let dir = store.put_bytes(FILE, &bytes)?;
+        let dir = self.store.put_bytes(FILE, &bytes)?;
         flush_dir(&dir, flush)?;
         self.held = held;
         self.len = bytes.len() as u64;
@@ -569,7 +571,7 @@ impl StepsFile {
     /// The descriptor an append goes to: the one held, or one opened now ([`StepsFile::open`]).
     /// None where there is none to open: the file is then rewritten whole. The one held stays
     /// the file and its bytes between appends, since this notifier is its store's one writer
-    /// ([`super::Store::hold`]); an append that failed part-way lets it go ([`StepsFile::write`]).
+    /// ([`super::Store::open`]); an append that failed part-way lets it go ([`StepsFile::write`]).
     ///
     /// # Errors
     /// The file's open or its `stat`.
@@ -587,13 +589,12 @@ impl StepsFile {
     /// # Errors
     /// The open or its `stat`.
     fn open(&self) -> io::Result<Option<std::fs::File>> {
-        use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
-        let path = self.root.join(FILE);
-        let file = match std::fs::OpenOptions::new()
-            .append(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&path)
-        {
+        use std::os::unix::fs::MetadataExt as _;
+        let file = match self.store.directory.open_file(
+            std::ffi::OsStr::new(FILE),
+            aterm_dirfd::OFlags::WRONLY | aterm_dirfd::OFlags::APPEND,
+            0,
+        ) {
             Ok(file) => file,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) if e.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
@@ -709,34 +710,26 @@ impl Store {
     /// migration's write.
     fn read_steps(&self) -> io::Result<StepsFile> {
         let path = self.root.join(FILE);
-        let bytes = match read_bounded_bytes(&path, READ_MAX) {
+        let bytes = match self.read_bytes(FILE, READ_MAX) {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                match std::fs::symlink_metadata(&path) {
-                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => {
-                        return self.migrate();
-                    }
-                    Err(other) => return Err(other),
-                    Ok(_) => return Err(e),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match self.metadata(FILE) {
+                Err(missing) if missing.kind() == io::ErrorKind::NotFound => {
+                    return self.migrate();
                 }
-            }
+                Err(other) => return Err(other),
+                Ok(_) => return Err(e),
+            },
             Err(e) => return Err(e),
         };
         let _ = self.set_aside(&LINE_FILES, false);
         let read = read(&bytes);
         Ok(match read.end {
-            End::Clean => StepsFile::new(
-                &self.root,
-                read.index,
-                read.valid_len,
-                read.next_step,
-                false,
-            ),
+            End::Clean => StepsFile::new(self, read.index, read.valid_len, read.next_step, false),
             End::Cut | End::Torn => {
-                StepsFile::new(&self.root, read.index, read.valid_len, read.next_step, true)
+                StepsFile::new(self, read.index, read.valid_len, read.next_step, true)
             }
             End::Fault { at, why } => {
-                let name = self.free_name(FAULT);
+                let name = self.free_name(FAULT)?;
                 let kept = self.put_bytes(&name, &bytes).map(|_| ());
                 warn(&format!(
                     "{} does not read whole ({why} at byte {at}){}; it is read from its whole \
@@ -750,7 +743,7 @@ impl Store {
                         Err(e) => format!(", and its bytes could not be kept ({e})"),
                     }
                 ));
-                StepsFile::new(&self.root, journal::salvage_as(&bytes), 0, 0, true)
+                StepsFile::new(self, journal::salvage_as(&bytes), 0, 0, true)
             }
         })
     }
@@ -766,140 +759,36 @@ impl Store {
     /// The journal's write: then nothing is set aside, and the next load migrates again.
     fn migrate(&self) -> io::Result<StepsFile> {
         let Some(held) = self.line_verdicts(true) else {
-            return Ok(StepsFile::new(&self.root, Verdicts::default(), 0, 0, true));
+            return Ok(StepsFile::new(self, Verdicts::default(), 0, 0, true));
         };
         let (bytes, steps) = held.encode()?;
         let dir = self.put_bytes(FILE, &bytes)?;
         flush_dir(&dir, Flush::Ordered)?;
         let _ = self.set_aside(&LINE_FILES, false);
-        Ok(StepsFile::new(
-            &self.root,
-            held,
-            bytes.len() as u64,
-            steps,
-            false,
-        ))
-    }
-
-    /// What the line files a build before the journal wrote say: `journal` (a verdict a line),
-    /// `rate` (the stamps, comma-joined) and `suppressed` (`<n> t=<mark>`). None where there is
-    /// none of them. A line file that does not read (not text, too long, not a regular file) is
-    /// read as empty, as a build before the journal read it, and said on stderr: to be set
-    /// aside with its bytes kept where `migrating` ([`Store::migrate`]), left as it was
-    /// otherwise ([`Store::read_verdicts`]).
-    fn line_verdicts(&self, migrating: bool) -> Option<Verdicts> {
-        let mut present = false;
-        let [journal, rate, suppressed] = LINE_FILES.map(|name| match self.carry_text(name) {
-            Ok(text) => {
-                present |= text.is_some();
-                text
-            }
-            Err(e) => {
-                present = true;
-                unread(&self.root.join(name), &e, migrating);
-                None
-            }
-        });
-        if !present {
-            return None;
-        }
-        let mut held = Verdicts::default();
-        for line in journal.as_deref().unwrap_or_default().lines() {
-            if is_line(line) {
-                note(&mut held.lines, line.to_string());
-            }
-        }
-        for t in rate.as_deref().unwrap_or_default().split(',') {
-            if let Some(t) = crate::parse_uint::<u64>(t.trim()) {
-                note_stamp(&mut held.stamps, t);
-            }
-        }
-        let text = suppressed.unwrap_or_default();
-        let mut words = text.split_whitespace();
-        let n = words.next().and_then(crate::parse_uint).unwrap_or(0);
-        let mark = words
-            .find_map(|w| w.strip_prefix("t="))
-            .and_then(crate::parse_uint)
-            .unwrap_or(0);
-        held.suppressed = (n, mark);
-        Some(held)
-    }
-
-    /// What a line-format [`STANDING`] file says ([`parse_standing`]): `None` where there is
-    /// none, `Some(None)` where there is one that does not read. That one is said on stderr, as
-    /// [`Store::line_verdicts`] says a line file, to be set aside with its bytes kept where
-    /// `migrating` ([`Store::load`]) and left as it was otherwise ([`Store::read_verdicts`]),
-    /// and it says no standing values: the journal's stand, which a line file that reads
-    /// replaces.
-    fn line_standing(&self, migrating: bool) -> Option<Option<Vec<(String, String)>>> {
-        match self.carry_text(STANDING) {
-            Ok(text) => text.as_deref().map(|text| Some(parse_standing(text))),
-            Err(e) => {
-                unread(&self.root.join(STANDING), &e, migrating);
-                Some(None)
-            }
-        }
-    }
-
-    /// The cursor files a build before the cursors were steps wrote, `cur/<key>` a selector
-    /// ([`CURSORS`]), by key, with the offset each says, or why it does not read (not text, too
-    /// long, not a regular file, not an offset): a load migrates that one as none, said on
-    /// stderr, and sets it aside with its bytes kept ([`Store::load`]); a read-only read
-    /// refuses it, as an incomplete read ([`Store::read_verdicts`]), or reads it as none
-    /// ([`Store::cursor`]). A temporary a replace left (a name that starts with `.` or ends
-    /// `.tmp`) and a file set aside before ([`SET_ASIDE`]) are no cursor. Empty where there is
-    /// no [`CURSORS`].
-    ///
-    /// # Errors
-    /// [`CURSORS`] is there and does not list (not a directory, unreadable), or an entry of it.
-    pub(super) fn line_cursors(&self) -> io::Result<Vec<(String, io::Result<u64>)>> {
-        let dir = self.root.join(CURSORS);
-        let entries = match std::fs::read_dir(&dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return match std::fs::symlink_metadata(&dir) {
-                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
-                    Err(other) => Err(other),
-                    Ok(_) => Err(e),
-                };
-            }
-            Err(e) => return Err(e),
-        };
-        let mut cursors = Vec::new();
-        for entry in entries {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(key) = name.to_str().filter(|k| {
-                !k.starts_with('.')
-                    && !k.ends_with(".tmp")
-                    && !k.ends_with(SET_ASIDE)
-                    && !k.contains(&format!("{SET_ASIDE}."))
-            }) else {
-                continue;
-            };
-            let path = entry.path();
-            let off = super::read_bounded_text(&path, 4096).and_then(|text| {
-                crate::parse_uint::<u64>(text.trim()).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "not a notifier cursor")
-                })
-            });
-            cursors.push((key.to_string(), off));
-        }
-        cursors.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(cursors)
+        Ok(StepsFile::new(self, held, bytes.len() as u64, steps, false))
     }
 
     /// `name`, or, where that is taken, the first of `name.1`, `name.2`, … that is not: where
     /// a copy is kept without replacing one kept before it.
-    fn free_name(&self, name: &str) -> String {
-        let taken = |n: &str| std::fs::symlink_metadata(self.root.join(n)).is_ok();
-        if !taken(name) {
-            return name.to_string();
+    fn free_name(&self, name: &str) -> io::Result<String> {
+        let free = |candidate: &str| match self.metadata(candidate) {
+            Ok(_) => Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(error) => Err(error),
+        };
+        if free(name)? {
+            return Ok(name.to_owned());
         }
-        (1u64..)
-            .map(|k| format!("{name}.{k}"))
-            .find(|n| !taken(n))
-            .unwrap_or_else(|| name.to_string())
+        for index in 1u64.. {
+            let candidate = format!("{name}.{index}");
+            if free(&candidate)? {
+                return Ok(candidate);
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "notify archive names exhausted",
+        ))
     }
 
     /// Rename each of the line files `names` there is aside ([`SET_ASIDE`]), each directory an
@@ -914,122 +803,50 @@ impl Store {
     /// The last rename refused, once every other was tried: a caller whose file a later load
     /// would read again over newer steps ([`STANDING`]) fails on it.
     fn set_aside(&self, names: &[&str], read: bool) -> io::Result<()> {
-        let mut moved = std::collections::BTreeSet::new();
+        let mut moved = std::collections::BTreeMap::new();
         let mut refused = None;
         for &name in names {
-            let from = self.root.join(name);
-            if std::fs::symlink_metadata(&from).is_err() {
-                continue;
+            match self.metadata(name) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    refused = Some(error);
+                    continue;
+                }
             }
             let base = format!("{name}{SET_ASIDE}");
-            let free = self.free_name(&base);
-            let to = self.root.join(&free);
-            match super::test_fault(&free).and_then(|()| std::fs::rename(&from, &to)) {
-                Ok(()) => {
-                    moved.insert(to.parent().unwrap_or(&self.root).to_path_buf());
-                    if free != base && !read {
-                        warn(&format!(
-                            "{} was written after the journal took its place and is not read; \
-                             it is kept as {}",
-                            from.display(),
-                            to.display()
-                        ));
-                    }
+            let result = (|| {
+                let free = self.free_name(&base)?;
+                let (from_parent, from_leaf) = self.directory.parent(name, false)?;
+                let (to_parent, to_leaf) = self.directory.parent(&free, false)?;
+                super::test_fault(&free)?;
+                from_parent.rename(&from_leaf, &to_parent, &to_leaf)?;
+                for directory in [from_parent, to_parent] {
+                    moved.insert(super::file_id(&directory.file.metadata()?), directory);
                 }
-                Err(e) => {
+                if free != base && !read {
                     warn(&format!(
-                        "could not set {} aside as {}: {e}",
-                        from.display(),
-                        to.display()
+                        "{} was written after its journal and is kept as {}",
+                        self.root.join(name).display(),
+                        self.root.join(free).display()
                     ));
-                    refused = Some(e);
                 }
+                Ok::<(), io::Error>(())
+            })();
+            if let Err(error) = result {
+                warn(&format!(
+                    "could not set {} aside: {error}",
+                    self.root.join(name).display()
+                ));
+                refused = Some(error);
             }
         }
-        for dir in moved {
-            if let Err(e) = flush_dir(&dir, Flush::Ordered) {
-                warn(&format!("{}: {e}", dir.display()));
+        for directory in moved.into_values() {
+            if let Err(error) = flush_dir(&directory, Flush::Ordered) {
+                warn(&format!("{}: {error}", directory.path.display()));
             }
         }
         refused.map_or(Ok(()), Err)
-    }
-
-    /// The verdicts the store's journal holds, read and never written: its whole steps (a
-    /// torn last step reads as the steps before it), or, in a store with no journal, what its
-    /// line files say ([`Store::line_verdicts`]); a store with neither holds none. A
-    /// line-format [`STANDING`] file there that reads says its standing values, as a load
-    /// migrates it ([`Store::load`]), and a cursor's file there moves its key's cursor forward
-    /// to what it says ([`Store::line_cursors`]). A line file that does not read is read as empty (a
-    /// [`STANDING`] one as saying none, the journal's standing values kept), as a load reads
-    /// it, and left as it was, so an old store's unreadable line file fails no carry from it;
-    /// a cursor's file that does not read is refused, since a carry without it would start
-    /// that selector over. What [`Store::carry`] carries from a store it must not change,
-    /// which may be the live one.
-    ///
-    /// # Errors
-    /// The journal does not read, or reads as a fault (damage before an intact step), or a
-    /// cursor's file there does not read, or its [`CURSORS`] directory does not list: an
-    /// incomplete read.
-    pub(super) fn read_verdicts(&self) -> io::Result<Verdicts> {
-        let mut held = self.read_journal(false)?;
-        if let Some(Some(standing)) = self.line_standing(false) {
-            held.standing = standing;
-        }
-        for (key, off) in self.line_cursors()? {
-            forward(&mut held.cursors, &key, off?);
-        }
-        Ok(held)
-    }
-
-    /// `key`'s cursor as the store holds it, read and never written, as a load would read and
-    /// migrate it ([`Store::load`]): the journal's, from its whole steps (a torn last step
-    /// read as the steps before it, damage before an intact step read around, as a load
-    /// salvages it, so a damaged journal never reads as a selector with no cursor), moved
-    /// forward to a cursor's file there that reads (`cur/<key>`), never back. None where
-    /// neither reads.
-    pub(super) fn read_cursor(&self, key: &str) -> Option<u64> {
-        let mut cursors = self
-            .read_journal(true)
-            .map(|held| held.cursors)
-            .unwrap_or_default();
-        if let Some(off) = self
-            .line_cursors()
-            .ok()
-            .and_then(|cursors| cursors.into_iter().find(|(k, _)| k == key))
-            .and_then(|(_, off)| off.ok())
-        {
-            forward(&mut cursors, key, off);
-        }
-        cursors.get(key).copied()
-    }
-
-    /// [`Store::read_verdicts`] but for a line-format [`STANDING`] file and the cursors' files.
-    /// Damage before an intact step is refused, an incomplete read, unless `salvage`: then the
-    /// whole steps before and after it are read, as a load reads them ([`Store::read_steps`]).
-    fn read_journal(&self, salvage: bool) -> io::Result<Verdicts> {
-        let path = self.root.join(FILE);
-        let bytes = match read_bounded_bytes(&path, READ_MAX) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                return match std::fs::symlink_metadata(&path) {
-                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => {
-                        Ok(self.line_verdicts(false).unwrap_or_default())
-                    }
-                    Err(other) => Err(other),
-                    Ok(_) => Err(e),
-                };
-            }
-            Err(e) => return Err(e),
-        };
-        let read = read(&bytes);
-        match read.end {
-            End::Fault { .. } if salvage => Ok(journal::salvage_as(&bytes)),
-            End::Fault { at, why } => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{}: {why} at byte {at}", path.display()),
-            )),
-            End::Clean | End::Cut | End::Torn => Ok(read.index),
-        }
     }
 
     /// Replace the store's journal by one holding `held`, its directory flushed by `flush`.
@@ -1120,24 +937,25 @@ pub fn suppressed_count(state_dir: &Path) -> u64 {
 /// does not read.
 #[must_use]
 pub fn cursor_of(state_dir: &Path, key: &str) -> Option<u64> {
-    Store {
-        root: state_dir.join("notify"),
-    }
-    .read_cursor(key)
+    Store::<super::ReadOnly>::existing(state_dir.join("notify"))
+        .ok()?
+        .read_cursor(key)
 }
 
 /// A test's rewind of selector `key`'s cursor in `<state>/notify/` (a key is
 /// [`super::Sel::key`]) to `off`, back or forward: one step of its journal, ordered, the store
 /// as it would stand had its cursor never passed `off`. No notifier may hold the store
-/// ([`super::Store::hold`]); a cursor's file cannot set it back ([`forward`]).
+/// ([`super::Store::open`]); a cursor's file cannot set it back ([`forward`]).
 ///
 /// # Errors
 /// The store's open ([`Store::load`]) or the step's write.
 #[cfg(any(test, debug_assertions))]
 pub fn rewind_cursor(state_dir: &Path, key: &str, off: u64) -> io::Result<()> {
-    Store {
-        root: state_dir.join("notify"),
-    }
+    Store::open(
+        state_dir
+            .to_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 notify state"))?,
+    )?
     .load()?
     .write(
         &[Step {
@@ -1159,7 +977,8 @@ fn forward(cursors: &mut BTreeMap<String, u64>, key: &str, off: u64) {
 }
 
 fn read_only(state_dir: &Path) -> Verdicts {
-    read_bounded_bytes(&state_dir.join("notify").join(FILE), READ_MAX)
+    Store::<super::ReadOnly>::existing(state_dir.join("notify"))
+        .and_then(|store| store.read_bytes(FILE, READ_MAX))
         .map(|bytes| read(&bytes).index)
         .unwrap_or_default()
 }
@@ -1167,3 +986,191 @@ fn read_only(state_dir: &Path) -> Verdicts {
 #[cfg(test)]
 #[path = "notify_journal_tests.rs"]
 pub(super) mod tests;
+
+impl<Access> Store<Access> {
+    /// What the line files a build before the journal wrote say: `journal` (a verdict a line),
+    /// `rate` (the stamps, comma-joined) and `suppressed` (`<n> t=<mark>`). None where there is
+    /// none of them. A line file that does not read (not text, too long, not a regular file) is
+    /// read as empty, as a build before the journal read it, and said on stderr: to be set
+    /// aside with its bytes kept where `migrating` ([`Store::migrate`]), left as it was
+    /// otherwise ([`Store::read_verdicts`]).
+    fn line_verdicts(&self, migrating: bool) -> Option<Verdicts> {
+        let mut present = false;
+        let [journal, rate, suppressed] = LINE_FILES.map(|name| match self.carry_text(name) {
+            Ok(text) => {
+                present |= text.is_some();
+                text
+            }
+            Err(e) => {
+                present = true;
+                unread(&self.root.join(name), &e, migrating);
+                None
+            }
+        });
+        if !present {
+            return None;
+        }
+        let mut held = Verdicts::default();
+        for line in journal.as_deref().unwrap_or_default().lines() {
+            if is_line(line) {
+                note(&mut held.lines, line.to_string());
+            }
+        }
+        for t in rate.as_deref().unwrap_or_default().split(',') {
+            if let Some(t) = crate::parse_uint::<u64>(t.trim()) {
+                note_stamp(&mut held.stamps, t);
+            }
+        }
+        let text = suppressed.unwrap_or_default();
+        let mut words = text.split_whitespace();
+        let n = words.next().and_then(crate::parse_uint).unwrap_or(0);
+        let mark = words
+            .find_map(|w| w.strip_prefix("t="))
+            .and_then(crate::parse_uint)
+            .unwrap_or(0);
+        held.suppressed = (n, mark);
+        Some(held)
+    }
+
+    /// What a line-format [`STANDING`] file says ([`parse_standing`]): `None` where there is
+    /// none, `Some(None)` where there is one that does not read. That one is said on stderr, as
+    /// [`Store::line_verdicts`] says a line file, to be set aside with its bytes kept where
+    /// `migrating` ([`Store::load`]) and left as it was otherwise ([`Store::read_verdicts`]),
+    /// and it says no standing values: the journal's stand, which a line file that reads
+    /// replaces.
+    fn line_standing(&self, migrating: bool) -> Option<Option<Vec<(String, String)>>> {
+        match self.carry_text(STANDING) {
+            Ok(text) => text.as_deref().map(|text| Some(parse_standing(text))),
+            Err(e) => {
+                unread(&self.root.join(STANDING), &e, migrating);
+                Some(None)
+            }
+        }
+    }
+
+    /// The cursor files a build before the cursors were steps wrote, `cur/<key>` a selector
+    /// ([`CURSORS`]), by key, with the offset each says, or why it does not read (not text, too
+    /// long, not a regular file, not an offset): a load migrates that one as none, said on
+    /// stderr, and sets it aside with its bytes kept ([`Store::load`]); a read-only read
+    /// refuses it, as an incomplete read ([`Store::read_verdicts`]), or reads it as none
+    /// ([`Store::cursor`]). A temporary a replace left (a name that starts with `.` or ends
+    /// `.tmp`) and a file set aside before ([`SET_ASIDE`]) are no cursor. Empty where there is
+    /// no [`CURSORS`].
+    ///
+    /// # Errors
+    /// [`CURSORS`] is there and does not list (not a directory, unreadable), or an entry of it.
+    pub(super) fn line_cursors(&self) -> io::Result<Vec<(String, io::Result<u64>)>> {
+        let directory = match self.directory.child(std::ffi::OsStr::new(CURSORS), false) {
+            Ok(directory) => directory,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match self.metadata(CURSORS) {
+                Err(missing) if missing.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+                Err(other) => return Err(other),
+                Ok(_) => return Err(error),
+            },
+            Err(error) => return Err(error),
+        };
+        let mut cursors = Vec::new();
+        for name in directory.names()? {
+            let Some(key) = name.to_str().filter(|key| {
+                !key.starts_with('.')
+                    && !key.ends_with(".tmp")
+                    && !key.ends_with(SET_ASIDE)
+                    && !key.contains(&format!("{SET_ASIDE}."))
+            }) else {
+                continue;
+            };
+            let off = directory
+                .read(&name, 4096)
+                .and_then(|bytes| {
+                    String::from_utf8(bytes)
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+                })
+                .and_then(|text| {
+                    crate::parse_uint::<u64>(text.trim()).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "not a notifier cursor")
+                    })
+                });
+            cursors.push((key.to_owned(), off));
+        }
+        cursors.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(cursors)
+    }
+
+    /// The verdicts the store's journal holds, read and never written: its whole steps (a
+    /// torn last step reads as the steps before it), or, in a store with no journal, what its
+    /// line files say ([`Store::line_verdicts`]); a store with neither holds none. A
+    /// line-format [`STANDING`] file there that reads says its standing values, as a load
+    /// migrates it ([`Store::load`]), and a cursor's file there moves its key's cursor forward
+    /// to what it says ([`Store::line_cursors`]). A line file that does not read is read as empty (a
+    /// [`STANDING`] one as saying none, the journal's standing values kept), as a load reads
+    /// it, and left as it was, so an old store's unreadable line file fails no carry from it;
+    /// a cursor's file that does not read is refused, since a carry without it would start
+    /// that selector over. What [`Store::carry`] carries from a store it must not change,
+    /// which may be the live one.
+    ///
+    /// # Errors
+    /// The journal does not read, or reads as a fault (damage before an intact step), or a
+    /// cursor's file there does not read, or its [`CURSORS`] directory does not list: an
+    /// incomplete read.
+    pub(super) fn read_verdicts(&self) -> io::Result<Verdicts> {
+        let mut held = self.read_journal(false)?;
+        if let Some(Some(standing)) = self.line_standing(false) {
+            held.standing = standing;
+        }
+        for (key, off) in self.line_cursors()? {
+            forward(&mut held.cursors, &key, off?);
+        }
+        Ok(held)
+    }
+
+    /// `key`'s cursor as the store holds it, read and never written, as a load would read and
+    /// migrate it ([`Store::load`]): the journal's, from its whole steps (a torn last step
+    /// read as the steps before it, damage before an intact step read around, as a load
+    /// salvages it, so a damaged journal never reads as a selector with no cursor), moved
+    /// forward to a cursor's file there that reads (`cur/<key>`), never back. None where
+    /// neither reads.
+    pub(super) fn read_cursor(&self, key: &str) -> Option<u64> {
+        let mut cursors = self
+            .read_journal(true)
+            .map(|held| held.cursors)
+            .unwrap_or_default();
+        if let Some(off) = self
+            .line_cursors()
+            .ok()
+            .and_then(|cursors| cursors.into_iter().find(|(k, _)| k == key))
+            .and_then(|(_, off)| off.ok())
+        {
+            forward(&mut cursors, key, off);
+        }
+        cursors.get(key).copied()
+    }
+
+    /// [`Store::read_verdicts`] but for a line-format [`STANDING`] file and the cursors' files.
+    /// Damage before an intact step is refused, an incomplete read, unless `salvage`: then the
+    /// whole steps before and after it are read, as a load reads them ([`Store::read_steps`]).
+    fn read_journal(&self, salvage: bool) -> io::Result<Verdicts> {
+        let path = self.root.join(FILE);
+        let bytes = match self.read_bytes(FILE, READ_MAX) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                return match self.metadata(FILE) {
+                    Err(missing) if missing.kind() == io::ErrorKind::NotFound => {
+                        Ok(self.line_verdicts(false).unwrap_or_default())
+                    }
+                    Err(other) => Err(other),
+                    Ok(_) => Err(e),
+                };
+            }
+            Err(e) => return Err(e),
+        };
+        let read = read(&bytes);
+        match read.end {
+            End::Fault { .. } if salvage => Ok(journal::salvage_as(&bytes)),
+            End::Fault { at, why } => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: {why} at byte {at}", path.display()),
+            )),
+            End::Clean | End::Cut | End::Torn => Ok(read.index),
+        }
+    }
+}

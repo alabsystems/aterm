@@ -219,6 +219,27 @@ fn an_excerpt_reserves_causes_before_context_and_keeps_distinct_locations() {
 }
 
 #[test]
+fn compiler_excerpt_keeps_locations_before_optional_context() {
+    let output: String = (0..5)
+        .map(|i| format!("warning: unused helper {i}\n  --> src/helper_{i}.rs:1:1\n   |\n1 | fn helper() {{}}\n   |    ^^^^^^\n"))
+        .collect();
+    let found = excerpt(&output, MESSAGE_LINES);
+    assert!(found.len() <= MESSAGE_LINES);
+    for i in 0..5 {
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains(&format!("unused helper {i}")))
+        );
+        assert!(
+            found
+                .iter()
+                .any(|line| line.contains(&format!("src/helper_{i}.rs:1:1")))
+        );
+    }
+}
+
+#[test]
 fn logger_only_failures_still_show_each_distinct_error() {
     let repeated = "ERROR transport could not write";
     let mut output: String = (0..32)

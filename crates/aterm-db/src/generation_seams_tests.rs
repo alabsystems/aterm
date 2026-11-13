@@ -3,13 +3,21 @@
 
 use std::cell::RefCell;
 
-/// Where in [`super::Observation::check`] a hook runs, for each predecessor.
+/// Where a hook runs: in [`super::Observation::check`], for each predecessor, or at the gate of
+/// a held read ([`super::Preserving::of`]).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Point {
-    /// Its custody is revalidated; this Mac's standing in its vault is not yet judged.
+    /// The predecessor's custody is revalidated; this Mac's standing in its vault is not yet
+    /// judged.
     BeforeDenial,
-    /// Its vault does not deny this Mac; the check's access is not yet judged current.
+    /// The predecessor's vault does not deny this Mac; the check's access is not yet judged
+    /// current.
     BeforeCurrent,
+    /// The gate of a held read is asked and has read nothing yet. Asked by a read
+    /// (`catalog::Directory::observe_displaced`), the ordinary observation of the table has
+    /// refused and no recovery replica has answered, neither of them busy, and the held open
+    /// has not begun.
+    HeldGate,
 }
 
 /// A hook and the point it waits for.
@@ -19,7 +27,7 @@ thread_local! {
     static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
 }
 
-/// Run `hook` once this thread's next generation check reaches `point`.
+/// Run `hook` once, when this thread next reaches `point`.
 pub(crate) fn at(point: Point, hook: impl FnMut() + 'static) {
     HOOK.with(|slot| *slot.borrow_mut() = Some((point, Box::new(hook))));
 }

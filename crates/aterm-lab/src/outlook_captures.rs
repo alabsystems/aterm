@@ -97,8 +97,8 @@ impl Look {
 
     const fn theme(self) -> &'static str {
         match self {
-            Look::Day => "Aterm Day",
-            Look::Night => "Aterm Night",
+            Look::Day => "aterm Day",
+            Look::Night => "aterm Night",
         }
     }
 }

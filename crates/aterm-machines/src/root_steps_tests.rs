@@ -107,6 +107,68 @@ fn owed_reads_each_step_and_an_unreadable_one_owes_nothing() {
     }
 }
 
+/// The naming permission's reading tells the rule setup's password step owes from one it never
+/// owes: `Missing` exactly where [`owed`] holds the rule (no file, or one that is not a
+/// root-owned 0440 file), `Other` for a standing rule of an older build's bytes, `Current` for
+/// this build's rule for this process's account, and an error where the account cannot read the
+/// rule, which `owed` holds nothing for either. `name_rule_current` is `Ok(true)` on `Current`
+/// alone. NEGATIVE CONTROL: reading a standing rule of other bytes as `Missing` promises a step
+/// `owed` does not hold.
+#[test]
+fn the_naming_rule_reading_tells_a_missing_rule_from_an_older_one() {
+    let alice = user("alice", 501);
+    let current = name_rule("alice").unwrap();
+    let older = "alice ALL = (root) NOPASSWD: /usr/sbin/scutil ^--set ComputerName m1$\n";
+    let stands = |bytes: Option<&str>, stat: Option<Stat>| {
+        let mut sys = Fake::root();
+        sys.logged_in(&alice);
+        sys.euid = alice.uid;
+        if let Some(bytes) = bytes {
+            sys.file(ADMITTED_NAME_RULE, bytes.as_bytes());
+        }
+        if let Some(stat) = stat {
+            sys.stat_of(ADMITTED_NAME_RULE, stat);
+        }
+        sys
+    };
+    for (case, sys, reading) in [
+        ("absent", stands(None, None), Ok(NameRuleReading::Missing)),
+        (
+            "account-owned",
+            stands(Some(current.as_str()), Some(rule_stat(501, 0o440))),
+            Ok(NameRuleReading::Missing),
+        ),
+        (
+            "older",
+            stands(Some(older), Some(rule_stat(0, 0o440))),
+            Ok(NameRuleReading::Other),
+        ),
+        (
+            "current",
+            stands(Some(current.as_str()), Some(rule_stat(0, 0o440))),
+            Ok(NameRuleReading::Current),
+        ),
+        (
+            "unreadable",
+            stands(None, Some(rule_stat(0, 0o440))),
+            Err(()),
+        ),
+    ] {
+        let read = name_rule_reading(&sys);
+        assert_eq!(read.clone().map_err(|_| ()), reading, "{case}: {read:?}");
+        assert_eq!(
+            owed(&sys).contains(&Owed::NameRule),
+            reading == Ok(NameRuleReading::Missing),
+            "{case}"
+        );
+        assert_eq!(
+            name_rule_current(&sys).ok(),
+            read.ok().map(|read| read == NameRuleReading::Current),
+            "{case}"
+        );
+    }
+}
+
 /// The raw process boundary requires complete UTF-8 streams and a successful definite
 /// answer. Neither a valid prefix before corrupt bytes nor a failed tool can authorize
 /// the root item, even if the other stream looks like a disabled-mode sentence.

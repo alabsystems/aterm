@@ -4,6 +4,35 @@
 use super::*;
 
 #[test]
+fn drawn_theme_uses_canonical_builtin_labels_without_accepting_fallbacks() {
+    let status = |label: &str, miss: &str| format!("OK label={label:?} miss={miss}");
+    assert!(theme_is_drawn(&status("aterm Night", "-"), "Aterm Night"));
+    assert!(theme_is_drawn(&status("Nord", "-"), "nord"));
+    assert!(theme_is_drawn(
+        &status("Lab Mono Dark", "-"),
+        "Lab Mono Dark"
+    ));
+    assert!(!theme_is_drawn(&status("aterm Day", "-"), "Aterm Night"));
+    assert!(!theme_is_drawn(
+        &status("aterm Night", "missing"),
+        "Aterm Night"
+    ));
+    assert!(!theme_is_drawn(&status("Default", "missing"), "missing"));
+    for misleading in [
+        r#"OK old_label="aterm Night" label="Nord" miss=-"#,
+        r#"OK note="label=\"aterm Night\"" label="Nord" miss=-"#,
+        r#"OK label="aterm Night" label="Nord" miss=-"#,
+        r#"OK label="aterm Night" miss=- miss=missing"#,
+        r#"OK label="aterm Night" miss=- note="unfinished"#,
+    ] {
+        assert!(!theme_is_drawn(misleading, "Aterm Night"), "{misleading}");
+    }
+    let custom = "Lab miss=- \\\" quoted";
+    assert!(theme_is_drawn(&status(custom, "-"), custom));
+    assert!(!theme_is_drawn(&status(custom, "missing"), custom));
+}
+
+#[test]
 fn a_chrome_reply_names_each_chip() {
     let got = chips(
         "toolbar-tabs count=2\n\

@@ -28,6 +28,11 @@ use std::{
 
 #[cfg(test)]
 mod append_tests;
+mod batch;
+#[cfg(test)]
+mod batch_conformance_tests;
+#[cfg(test)]
+mod batch_tests;
 mod contributor;
 pub mod custody;
 #[cfg(test)]
@@ -41,6 +46,7 @@ pub use cutoff::cut_removed_writer;
 mod directory;
 #[cfg(test)]
 mod enrollment_tests;
+mod group;
 pub(crate) use directory::remove_claim_files;
 
 #[cfg(test)]
@@ -57,6 +63,8 @@ mod held;
 #[cfg(test)]
 mod hook_tests;
 mod journals;
+mod listeners;
+pub(crate) use listeners::listen;
 #[cfg(unix)]
 mod pending;
 #[cfg(test)]
@@ -148,7 +156,7 @@ fn replay_admitted(header: &Header) {
 }
 
 /// How many stores this thread has opened and how many times it has checked one
-/// ([`Store::check`]). Every open ends `open_region` by checking its store, so a read that stands
+/// ([`Store::check`]). Every open ends `open_claimed` by checking its store, so a read that stands
 /// on that check adds none.
 #[cfg(test)]
 pub(crate) fn test_opens_and_checks() -> (usize, usize) {
@@ -426,7 +434,10 @@ pub fn with_append_sink<T>(sink: impl Fn(&Appended<'_>) + 'static, run: impl FnO
     run()
 }
 
-fn appended(record: &Appended<'_>) {
+/// Hand `record`, an append to a store whose claim lives in `claim_dir`, to that custody's
+/// listeners ([`listen`]), then to this thread's sink or the process's.
+fn appended(record: &Appended<'_>, claim_dir: &Path) {
+    listeners::tell(record, claim_dir);
     #[cfg(any(test, debug_assertions))]
     if let Some(sink) = THREAD_SINK.with(|slot| slot.borrow().clone()) {
         sink(record);
@@ -440,10 +451,32 @@ struct Stored {
     wire: StoredWire,
     header: Header,
     receipt: Receipt,
-    quarantine: Option<(Digest, u64, u64)>,
+    payload: PayloadState,
     /// The member-signed removal cutoff this operation is ([`cutoff`]), read once as it is
     /// admitted.
     cut: Option<cutoff::Cut>,
+}
+
+/// A signature and custody witness retain bytes; only a fresh historical grant opens payloads.
+#[derive(PartialEq, Eq)]
+enum PayloadState {
+    Ready,
+    Quarantined(Digest, u64, u64),
+    AwaitingMembership,
+}
+impl PayloadState {
+    fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+    fn awaiting_membership(&self) -> bool {
+        matches!(self, Self::AwaitingMembership)
+    }
+    fn quarantine(&self) -> Option<(Digest, u64, u64)> {
+        match *self {
+            Self::Quarantined(roster, epoch, authored_ms) => Some((roster, epoch, authored_ms)),
+            _ => None,
+        }
+    }
 }
 
 /// Replays share the journal's immutable allocation. An ingest owns its new bytes without
@@ -525,6 +558,9 @@ pub struct MetadataEvidence {
 /// quarantined records its witnessed prefix holds (replay opens no payload of those), and the
 /// headers of the discarded sources its certificates keep; an open admits each header as that
 /// index would and builds the index only at first use.
+/// A held read of a displaced table ([`Self::observe_displaced`]) is an observation whose checks
+/// hold a pin of where its data folder was found; every other store's checks judge its claim's
+/// hold on that folder.
 /// Application plaintext is decrypted per read. Replay can reuse a retained non-cutoff
 /// authentication fact only after fresh historical-writer and key admission. Reopen after a control change; open for a
 /// short local batch, then drop the store and session before network I/O.
@@ -558,6 +594,9 @@ pub struct Store {
     observation: [u8; 64],
     /// A merged reader keeps the other snapshot's custody checks, never its writer.
     observed_primary: Option<Box<Store>>,
+    /// Set for a held read of a displaced table alone ([`Self::observe_displaced`]): what its
+    /// checks hold in place of the claim's hold on its data folder.
+    displaced: Option<Displaced>,
 }
 
 /// One writer's records in a [`Store`]: how many, and their wire bytes together.
@@ -612,6 +651,7 @@ impl Fence {
             claim_dir: &self.claim_dir,
             claim_name: &self.claim_name,
             claim: &self.claim,
+            displaced: None,
         };
         Ok(custody.admits(session)?
             && custody.current_claim()?.as_deref() == Some(self.claim.as_slice()))
@@ -633,13 +673,30 @@ pub(crate) enum Enrollment {
 }
 
 /// What an open reads before its journal ([`Store::claimed`]): the session's source reads its
-/// replay holds, and the enrollment claim, judged, with whether it is pending.
+/// replay holds, and the enrollment claim, judged, with whether it is pending; the region,
+/// capacity and mode it was judged for, which the open then proceeds under
+/// ([`Store::open_claimed`]); and, for a held read of a displaced table alone
+/// ([`Store::claimed_displaced`]), what stands in for the claim's hold on its data folder.
 struct Claimed<'s, 'a> {
     sources: super::SourceReads<'s, 'a>,
     claim_dir: PathBuf,
     claim_name: String,
     claim: Vec<u8>,
     pending: bool,
+    region: Region,
+    capacity: Capacity,
+    read_only: bool,
+    displaced: Option<Displaced>,
+}
+
+/// What a held read of a displaced table stands on where every other open stands on the claim's
+/// hold on its data folder ([`Store::observe_displaced`]): where the folder and the claim's
+/// volume witness were found, and the fenced home's selection record as the read found it.
+/// Neither is a binding, and every check of the store holds it to both
+/// ([`Custody::current_claim`]).
+struct Displaced {
+    pin: directory::Pin,
+    held: crate::generation::Preserving,
 }
 
 /// The custody a store was read under, which [`Store::check`] and a [`Fence`] judge alike.
@@ -651,6 +708,8 @@ struct Custody<'a> {
     claim_dir: &'a Path,
     claim_name: &'a str,
     claim: &'a [u8],
+    /// Set for a held read of a displaced table alone ([`Store::observe_displaced`]).
+    displaced: Option<&'a Displaced>,
 }
 
 impl Custody<'_> {
@@ -666,12 +725,34 @@ impl Custody<'_> {
 
     /// The claim now in the claim folder, once the data folder and the claim volume are judged to
     /// hold the claim read ([`directory::check_and_read_claim`]); none where it cannot be read.
+    /// A held read of a displaced table has no such hold to judge: its home's selection record
+    /// must stand as the read found it ([`crate::generation::Preserving::stands`]), and its data
+    /// folder and volume witness must be found as the read pinned them
+    /// ([`directory::pinned_and_read_claim`]).
     ///
     /// # Errors
     /// The claim read is malformed, or the data folder's identity or the claim volume's witness is
-    /// unreadable or does not hold it.
+    /// unreadable or does not hold it. For a held read of a displaced table: the selection
+    /// record, the data folder's identity or the volume witness is unreadable; or the selection
+    /// record, the folder or the witness is no longer as the read found it (`snapshot_changed`).
     fn current_claim(&self) -> Result<Option<Vec<u8>>> {
-        directory::check_and_read_claim(self.data_dir, self.claim_dir, self.claim_name, self.claim)
+        let Some(displaced) = self.displaced else {
+            return directory::check_and_read_claim(
+                self.data_dir,
+                self.claim_dir,
+                self.claim_name,
+                self.claim,
+            );
+        };
+        if !displaced.held.stands()? {
+            return Err(Error::snapshot_changed());
+        }
+        directory::pinned_and_read_claim(
+            self.data_dir,
+            self.claim_dir,
+            self.claim_name,
+            &displaced.pin,
+        )
     }
 }
 impl Store {
@@ -927,6 +1008,7 @@ impl Store {
             claim_name,
             claim,
             pending,
+            ..
         } = Self::claimed(session, dir, scope, Capacity::default(), true, region)?;
         if pending {
             return Ok(None);
@@ -940,10 +1022,11 @@ impl Store {
             claim_dir: &claim_dir,
             claim_name: &claim_name,
             claim: &claim,
+            displaced: None,
         };
-        let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
-        let ids = journals::read(dir, &claim[..ANCHOR_LEN], Capacity::default().journal())?
-            .repair_ids(acknowledged)?;
+        let journal = journals::read(dir, &claim[..ANCHOR_LEN], Capacity::default().journal())?;
+        let boundary = group::read(&claim_dir, &claim_name, &claim)?;
+        let ids = journal.repair_ids(boundary)?;
         if !custody.admits(session)? || custody.current_claim()?.as_deref() != Some(&claim) {
             return Err(Error::snapshot_changed());
         }
@@ -1110,8 +1193,9 @@ impl Store {
         )
     }
 
-    /// What every open of `scope`'s store at `dir` reads before its journal, and the enrollment
-    /// probe reads alone ([`Self::enrollment_region`]): it takes the session's source reads, the
+    /// What every open of `scope`'s store at `dir` but the held read of a displaced table
+    /// ([`Self::claimed_displaced`]) reads before its journal, and the enrollment probe reads
+    /// alone ([`Self::enrollment_region`]): it takes the session's source reads, the
     /// mutation guard unless `read_only`, and judges the location, `capacity` and the session's
     /// context, then reads and judges the enrollment claim, and a ready claim's hold on its data
     /// folder (`directory::check`). A pending claim has bound no folder yet.
@@ -1120,6 +1204,27 @@ impl Store {
     /// One of those judgments refuses, or the claim is missing, damaged, or of another scope or
     /// writer.
     fn claimed<'s, 'a>(
+        session: &'s Session<'a>,
+        dir: &Path,
+        scope: Scope,
+        capacity: Capacity,
+        read_only: bool,
+        region: Region,
+    ) -> Result<Claimed<'s, 'a>> {
+        let claimed = Self::claim_read(session, dir, scope, capacity, read_only, region)?;
+        if !claimed.pending {
+            directory::check(dir, &claimed.claim_dir, &claimed.claim_name, &claimed.claim)?;
+        }
+        Ok(claimed)
+    }
+
+    /// [`Self::claimed`] up to the enrollment claim, read and judged, and no further: a ready
+    /// claim's hold on its data folder is the caller's to judge (`claimed`) or to pin
+    /// ([`Self::claimed_displaced`]).
+    ///
+    /// # Errors
+    /// As [`Self::claimed`], but for a ready claim that does not hold its data folder.
+    fn claim_read<'s, 'a>(
         session: &'s Session<'a>,
         dir: &Path,
         scope: Scope,
@@ -1144,16 +1249,103 @@ impl Store {
         let claim = private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN)
             .map_err(|_| Error::new("table enrollment claim is missing or damaged"))?;
         let pending = validate_claim_region(session, scope, &claim, region)?;
-        if !pending {
-            directory::check(dir, &claim_dir, &claim_name, &claim)?;
-        }
         Ok(Claimed {
             sources,
             claim_dir,
             claim_name,
             claim,
             pending,
+            region,
+            capacity,
+            read_only,
+            displaced: None,
         })
+    }
+
+    /// [`Self::claimed`] for a held read of the session's primary table `scope` at `dir` whose
+    /// ready claim no longer holds its relocated data folder: every judgment `claimed` makes of
+    /// an observing primary open, with the folder pinned as found (`directory::displaced`) where
+    /// `claimed` judges the claim's hold on it. `None` where the claim is pending or holds its
+    /// folder: nothing there is displaced, and the ordinary open judges it.
+    ///
+    /// # Errors
+    /// As [`Self::claimed`], but for a relocated data folder; a claim volume witness that is
+    /// malformed or another claim's still refuses.
+    fn claimed_displaced<'s, 'a>(
+        session: &'s Session<'a>,
+        dir: &Path,
+        scope: Scope,
+        held: crate::generation::Preserving,
+    ) -> Result<Option<Claimed<'s, 'a>>> {
+        let mut claimed = Self::claim_read(
+            session,
+            dir,
+            scope,
+            Capacity::default(),
+            true,
+            Region::Primary,
+        )?;
+        if claimed.pending {
+            return Ok(None);
+        }
+        let Some(pin) =
+            directory::displaced(dir, &claimed.claim_dir, &claimed.claim_name, &claimed.claim)?
+        else {
+            return Ok(None);
+        };
+        claimed.displaced = Some(Displaced { pin, held });
+        Ok(Some(claimed))
+    }
+
+    /// Observe the session's own primary table `scope` from its witnessed prefix where its
+    /// directory binding was lost to a relocation (`directory::displaced`), for a home `held`
+    /// found fenced with a selection record that holds no completion
+    /// ([`crate::generation::Preserving`]). The data folder is the one the session's home gives
+    /// the table ([`crate::catalog::Directory::path`]), never a caller's. In every other respect
+    /// this is the observing open ([`Self::observe`]): the claim must name this scope and the
+    /// session's writer, the journal must carry the claim's anchor, the records are exactly
+    /// those the claim's receipt witness acknowledges, and each is authenticated under the
+    /// session. Like it, this takes the session's source reads and no writer of the journal; it
+    /// writes nothing and backfills no volume witness, and the store it returns can only be
+    /// read: it has no [`Fence`] and no custody identity
+    /// ([`Self::custody_id`]), and each check of it holds the selection record, the folder and
+    /// the volume witness to what this open found ([`Custody::current_claim`]). `None` where the
+    /// claim is pending or holds its folder, which the ordinary open judges.
+    ///
+    /// # Errors
+    /// As [`Self::observe`], but for a relocated data folder; or what the open found moved while
+    /// it read (`snapshot_changed`).
+    pub(crate) fn observe_displaced(
+        session: &Session<'_>,
+        scope: Scope,
+        held: crate::generation::Preserving,
+    ) -> Result<Option<Self>> {
+        let dir = crate::catalog::Directory::new(session.paths(), session.trust()).path(scope)?;
+        match Self::claimed_displaced(session, &dir, scope, held)? {
+            Some(claimed) => Self::open_claimed(session, &dir, scope, false, claimed).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// [`Self::observe_displaced`] as a constructor that broke its rule would ask: the claim it
+    /// reads, then marked for a writable open, another region or an initializing open, each of
+    /// which [`Self::open_claimed`] must refuse before it opens a journal.
+    #[cfg(test)]
+    pub(crate) fn observe_displaced_as(
+        session: &Session<'_>,
+        scope: Scope,
+        held: crate::generation::Preserving,
+        read_only: bool,
+        region: Region,
+        initialize: bool,
+    ) -> Result<Option<Self>> {
+        let dir = crate::catalog::Directory::new(session.paths(), session.trust()).path(scope)?;
+        let Some(mut claimed) = Self::claimed_displaced(session, &dir, scope, held)? else {
+            return Ok(None);
+        };
+        claimed.read_only = read_only;
+        claimed.region = region;
+        Self::open_claimed(session, &dir, scope, initialize, claimed).map(Some)
     }
 
     fn open_region(
@@ -1164,6 +1356,31 @@ impl Store {
         capacity: Capacity,
         read_only: bool,
         region: Region,
+    ) -> Result<Self> {
+        let claimed = Self::claimed(session, dir, scope, capacity, read_only, region)?;
+        Self::open_claimed(session, dir, scope, initialize, claimed)
+    }
+
+    /// An open of `scope`'s store at `dir` from its claim on: the journal read or opened as
+    /// `claimed` was judged for, the replay, and the store's first check. A claim marked
+    /// displaced ([`Self::claimed_displaced`]) is only ever observed, in the primary region and
+    /// without initializing: any other open of one is refused here, before a journal is opened,
+    /// so no writer, witness publication or volume backfill is reachable without the claim's
+    /// hold on its data folder.
+    ///
+    /// # Errors
+    /// A displaced claim is asked for a writable, recovery or initializing open; the claim is
+    /// pending and the open does not initialize; and from there every refusal the open it was
+    /// judged for has ([`Self::open`], [`Self::observe`]): the claim's receipt witness does not
+    /// decode, the journal or a record refuses, the store's check does, or, for a writable
+    /// open, the session's context, its mutation guard or the capacity admission refuses, or
+    /// the witness publication, the directory flush or the folder's remembered identity fails.
+    fn open_claimed(
+        session: &Session<'_>,
+        dir: &Path,
+        scope: Scope,
+        initialize: bool,
+        claimed: Claimed<'_, '_>,
     ) -> Result<Self> {
         // Keep each admitted vault source stable through local replay. Live
         // authority is checked before replay, before finalization and before
@@ -1179,7 +1396,16 @@ impl Store {
             claim_name,
             mut claim,
             pending,
-        } = Self::claimed(session, dir, scope, capacity, read_only, region)?;
+            region,
+            capacity,
+            read_only,
+            displaced,
+        } = claimed;
+        if displaced.is_some() && (!read_only || region != Region::Primary || initialize) {
+            return Err(Error::new(
+                "a displaced table is only observed: never written, initialized or read as recovery custody",
+            ));
+        }
         if pending && !initialize {
             return Err(Error::enrollment_pending());
         }
@@ -1190,11 +1416,15 @@ impl Store {
         claim[4] = b'1';
         let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
         let (log, replay) = if read_only {
-            (
-                None,
-                journals::read(dir, &claim[..ANCHOR_LEN], capacity.journal())?
-                    .witnessed(acknowledged)?,
-            )
+            // Read physical facts before their group permission: a newly observed checkpoint
+            // must not be judged under a permit snapshot taken before that group began.
+            let journal = journals::read(dir, &claim[..ANCHOR_LEN], capacity.journal())?;
+            let boundary = if pending {
+                acknowledged.into()
+            } else {
+                group::read(&claim_dir, &claim_name, &claim)?
+            };
+            (None, journal.witnessed(boundary)?)
         } else {
             let mut log = Log::open(
                 dir,
@@ -1210,7 +1440,12 @@ impl Store {
                     error.into()
                 }
             })?;
-            let replay = replay::read(&mut log, acknowledged, pending)?;
+            let boundary = if pending {
+                acknowledged.into()
+            } else {
+                group::read(&claim_dir, &claim_name, &claim)?
+            };
+            let replay = replay::read(&mut log, boundary, pending)?;
             (Some(log), replay)
         };
         // The scope is fixed for the open: whether it is the catalog is judged once, here, for the
@@ -1240,25 +1475,22 @@ impl Store {
             conflicts: BTreeMap::new(),
             observation: session.access_observation(),
             observed_primary: None,
+            displaced,
         };
         // The complete acknowledged prefix is verified before any opaque
         // record is considered for quarantine. The tail has no such authority.
         store.witness = replay.witness;
-        // The one unwitnessed append a cut-off writer can leave (replay allows no more). A
-        // writing open adopts it below and publishes its witness: that makes it a new record
-        // here, which the append sink hears of as of any append. Where it came from is lost
+        // The independently permitted unwitnessed tail a cut-off writer can leave. A
+        // writing open adopts it below and publishes its witness: each record is new here,
+        // which the append sink hears of as of any append. Where it came from is lost
         // with the writer, so it is `Local`: one publish too many is harmless, a missed one
         // is not.
-        let adopted = (store.witness.count > acknowledged.count)
-            .then(|| replay.entries.last())
-            .flatten()
-            .map(|entry| {
-                (
-                    entry.receipt.offset,
-                    entry.conflict,
-                    entry.wire.wire().to_vec(),
-                )
-            });
+        let adopted: Vec<_> = replay
+            .entries
+            .iter()
+            .filter(|entry| entry.receipt.offset >= acknowledged.count)
+            .map(|entry| (entry.receipt.offset, entry.conflict, entry.wire.clone()))
+            .collect();
         #[cfg(test)]
         if let Some(observe) = REPLAY_OBSERVER.with(|slot| slot.borrow_mut().take()) {
             observe();
@@ -1280,7 +1512,14 @@ impl Store {
                         store.admit_proof(&conflict)?;
                         if let Some(source) = conflict.discarded() {
                             causal
-                                .source(&store.records, |held| &held.header, &source.header)
+                                .source(
+                                    &store.records,
+                                    |held| {
+                                        (!held.payload.awaiting_membership())
+                                            .then_some(&held.header)
+                                    },
+                                    &source.header,
+                                )
                                 .map_err(|_| Error::new("invalid discarded-source header"))?;
                             #[cfg(test)]
                             replay_admitted(&source.header);
@@ -1293,18 +1532,31 @@ impl Store {
                             return Err(Error::new("duplicate physical table conflict"));
                         }
                     } else {
-                        let stored =
-                            replay::restore(batch, receipt, wire, acknowledged.count, catalog)?;
+                        let stored = replay::restore(
+                            batch,
+                            receipt,
+                            wire,
+                            acknowledged.count,
+                            catalog,
+                            read_only,
+                        )?;
                         store.admit(&stored.header, stored.wire.len())?;
                         store.operation_bytes += stored.wire.len();
-                        let Some(slot) = causal
-                            .operation(
-                                store.records.entry(receipt.id),
-                                |held| &held.header,
-                                &stored.header,
-                            )
-                            .map_err(|_| Error::new("invalid table replay header"))?
-                        else {
+                        let slot = if stored.payload.awaiting_membership() {
+                            match store.records.entry(receipt.id) {
+                                std::collections::btree_map::Entry::Vacant(slot) => Some(slot),
+                                std::collections::btree_map::Entry::Occupied(_) => None,
+                            }
+                        } else {
+                            causal
+                                .operation(
+                                    store.records.entry(receipt.id),
+                                    |held| &held.header,
+                                    &stored.header,
+                                )
+                                .map_err(|_| Error::new("invalid table replay header"))?
+                        };
+                        let Some(slot) = slot else {
                             return Err(Error::new("duplicate physical table record"));
                         };
                         #[cfg(test)]
@@ -1327,20 +1579,23 @@ impl Store {
             }
             if pending || store.witness != acknowledged {
                 store.publish_witness(store.witness)?;
-                if let Some((offset, conflict, wire)) = &adopted {
-                    appended(&Appended {
-                        table: scope.digest(),
-                        recovery: store.is_recovery(),
-                        kind: if *conflict {
-                            AppendKind::Conflict
-                        } else {
-                            AppendKind::Operation
+                for (offset, conflict, wire) in &adopted {
+                    appended(
+                        &Appended {
+                            table: scope.digest(),
+                            recovery: store.is_recovery(),
+                            kind: if *conflict {
+                                AppendKind::Conflict
+                            } else {
+                                AppendKind::Operation
+                            },
+                            offset: *offset,
+                            length: store.witness.count,
+                            via: Via::Local,
+                            wire: wire.wire(),
                         },
-                        offset: *offset,
-                        length: store.witness.count,
-                        via: Via::Local,
-                        wire,
-                    });
+                        &store.claim_dir,
+                    );
                 }
             }
             // Complete a possible earlier rename whose directory barrier failed.
@@ -1358,7 +1613,9 @@ impl Store {
     /// Stable identity of this local enrollment, excluding its advancing
     /// receipt witness. An application pin can detect replacement custody even
     /// when generic discovery has already enrolled an empty table again. A
-    /// combined observation has no single enrollment identity.
+    /// combined observation has no single enrollment identity, and a held read of a displaced
+    /// table ([`Self::observe_displaced`]) has none an application may pin: its claim does not
+    /// hold its data folder.
     pub(crate) fn custody_id(&self, session: &Session<'_>) -> Result<Digest> {
         self.check(session)?;
         if self.observed_primary.is_some() {
@@ -1366,13 +1623,28 @@ impl Store {
                 "combined table observation has no single custody identity",
             ));
         }
+        if self.displaced.is_some() {
+            return Err(Error::new(
+                "displaced table observation has no bound custody identity",
+            ));
+        }
         Ok(custody_of(&self.claim))
     }
+    /// Whether this is a held read of a displaced table ([`Self::observe_displaced`]).
+    #[cfg(test)]
+    pub(crate) const fn is_displaced(&self) -> bool {
+        self.displaced.is_some()
+    }
     /// This store's custody as [`Self::check`] reads it, apart from its records ([`Fence`]); none
-    /// for a writer's store, whose records its own appends move, one whose append is uncertain, or
-    /// a combined view, whose records are two claims' prefixes.
+    /// for a writer's store, whose records its own appends move, one whose append is uncertain,
+    /// a combined view, whose records are two claims' prefixes, or a held read of a displaced
+    /// table ([`Self::observe_displaced`]), whose claim does not hold its data folder.
     pub(crate) fn fence(&self) -> Option<Fence> {
-        if self.log.is_some() || self.poisoned || self.observed_primary.is_some() {
+        if self.log.is_some()
+            || self.poisoned
+            || self.observed_primary.is_some()
+            || self.displaced.is_some()
+        {
             return None;
         }
         Some(Fence {
@@ -1397,6 +1669,7 @@ impl Store {
             claim_dir: &self.claim_dir,
             claim_name: &self.claim_name,
             claim: &self.claim,
+            displaced: self.displaced.as_ref(),
         }
     }
     #[cfg_attr(
@@ -1549,20 +1822,25 @@ impl Store {
             return Err(Error::new("table actor has restricted signed history"));
         }
         self.admit(record.header(), wire.len())?;
-        let mut proposed = self.index()?.clone();
-        proposed
-            .insert(record.header().clone())
+        self.index()?
+            .check_insert(record.header())
             .map_err(|_| Error::new("table index refused header or capacity"))?;
         let receipt = self.append(SUBJECT, wire, id, via)?;
+        // The durable append precedes retained in-memory evidence. An unexpected index refusal
+        // leaves the handle poisoned, so only a fresh replay can recover its witnessed record.
+        self.index
+            .get_mut()
+            .ok_or_else(|| Error::new("table index unavailable after append"))?
+            .insert(record.header().clone())
+            .map_err(|_| Error::new("table index refused witnessed header"))?;
         self.operation_bytes += wire.len();
-        self.index = OnceLock::from(proposed);
         self.hold(
             id,
             Stored {
                 wire: StoredWire::Owned(wire.into()),
                 header: record.header().clone(),
                 receipt,
-                quarantine: None,
+                payload: PayloadState::Ready,
                 cut: cutoff::decode(record.payload()),
             },
         );
@@ -1616,19 +1894,22 @@ impl Store {
         };
         self.claim = claim;
         self.witness = witness;
-        appended(&Appended {
-            table: self.scope.digest(),
-            recovery: self.is_recovery(),
-            kind: if subject == CONFLICT_SUBJECT {
-                AppendKind::Conflict
-            } else {
-                AppendKind::Operation
+        appended(
+            &Appended {
+                table: self.scope.digest(),
+                recovery: self.is_recovery(),
+                kind: if subject == CONFLICT_SUBJECT {
+                    AppendKind::Conflict
+                } else {
+                    AppendKind::Operation
+                },
+                offset,
+                length: self.witness.count,
+                via,
+                wire,
             },
-            offset,
-            length: self.witness.count,
-            via,
-            wire,
-        });
+            &self.claim_dir,
+        );
         Ok(Receipt {
             id,
             received_ms,
@@ -1697,17 +1978,21 @@ impl Store {
         Ok(receipt)
     }
 
-    /// The headers the causal index holds ([`Self::index`]): each record's, then each discarded
-    /// source `conflicts` keeps. Headers sharing an id are equal, and each is shaped: an open
+    /// The headers the causal index holds ([`Self::index`]): each record's except those awaiting
+    /// membership evidence, then each discarded source `conflicts` keeps. Headers sharing an id are equal, and each is shaped: an open
     /// admits each one as the index would (`ReplayIndex`), and every later site that adds a record
     /// or a source to this store admits it to the index first.
     fn retained_headers(&self) -> impl Iterator<Item = &Header> {
-        self.records.values().map(|stored| &stored.header).chain(
-            self.conflicts
-                .values()
-                .filter_map(|stored| stored.conflict.discarded())
-                .map(|source| &source.header),
-        )
+        self.records
+            .values()
+            .filter(|stored| !stored.payload.awaiting_membership())
+            .map(|stored| &stored.header)
+            .chain(
+                self.conflicts
+                    .values()
+                    .filter_map(|stored| stored.conflict.discarded())
+                    .map(|source| &source.header),
+            )
     }
 
     /// The causal index's `forks` ([`Index::forks`]), read from the headers it holds with no index
@@ -1747,6 +2032,7 @@ impl Store {
         move |id| {
             self.records
                 .get(id)
+                .filter(|stored| !stored.payload.awaiting_membership())
                 .map(|stored| &stored.header)
                 .or_else(|| sources.get(id).copied())
         }
@@ -1767,7 +2053,7 @@ impl Store {
     fn quarantined_actors(&self) -> BTreeSet<Actor> {
         self.records
             .values()
-            .filter(|record| record.quarantine.is_some())
+            .filter(|record| record.payload.quarantine().is_some())
             .map(|record| record.header.actor)
             .chain(
                 self.conflicts
@@ -1862,7 +2148,7 @@ impl Store {
             self.records
                 .values()
                 .filter(|record| {
-                    record.quarantine.is_some() && !forks.contains(&record.header.actor)
+                    record.payload.quarantine().is_some() && !forks.contains(&record.header.actor)
                 })
                 .map(|record| proof_key(record.header.actor, Some(record.header.id))),
         );
@@ -1919,7 +2205,7 @@ impl Store {
         let id: Digest = key[49..].try_into().unwrap();
         self.records
             .get(&id)
-            .filter(|stored| stored.quarantine.is_some() && stored.header.actor == actor)
+            .filter(|stored| stored.payload.quarantine().is_some() && stored.header.actor == actor)
             .map(|stored| {
                 Conflict::from_discarded(session, self.scope, &stored.wire)
                     .map(|proof| proof.wire().to_vec())
@@ -2476,7 +2762,7 @@ impl Store {
             .filter_map(|(id, stored)| {
                 let cut = stored.cut?;
                 let signer = stored.header.actor;
-                (cut.actor != signer && !withheld.contains(id) && stored.quarantine.is_none())
+                (cut.actor != signer && !withheld.contains(id) && stored.payload.is_ready())
                     .then_some((*id, signer, stored.header.sequence, cut))
             })
             .collect();
@@ -2581,7 +2867,7 @@ impl Store {
     ) -> Option<aterm_secrets::commons::constraints::Frontier> {
         self.records
             .values()
-            .filter(|stored| stored.header.actor == actor && stored.quarantine.is_none())
+            .filter(|stored| stored.header.actor == actor && stored.payload.is_ready())
             .max_by(|a, b| {
                 a.header
                     .sequence
@@ -2742,7 +3028,7 @@ impl Store {
             .iter()
             .filter(|(id, stored)| {
                 withheld.contains(*id)
-                    || stored.quarantine.is_some()
+                    || stored.payload.quarantine().is_some()
                     || !allowed.permits(id)
                     || by_epoch.contains(*id)
                     || !(writers.contains(&stored.header.actor)
@@ -2807,7 +3093,7 @@ impl Store {
     /// the returned `Vec<Record>` rather than decrypted twice.
     ///
     /// Every caller opens this store in `session` just before (`discovery_records_from`'s and
-    /// `snapshot_from_primary`'s callers), and the open ends with its check (`open_region`); a
+    /// `snapshot_from_primary`'s callers), and the open ends with its check (`open_claimed`); a
     /// control writer's open then seals its pending writes (`seal_pending`), whose commits run
     /// checks of their own, and where one is refused before it appends, its error is dropped and
     /// the open returns the store ([`Self::open`]). The batch stands on the open's check, or on
@@ -2895,18 +3181,32 @@ impl Store {
         self.region == Region::Primary && self.observed_primary.is_none() && self.data_dir == path
     }
 
+    fn require_membership_evidence(&self) -> Result<()> {
+        if self
+            .records
+            .values()
+            .any(|stored| stored.payload.awaiting_membership())
+        {
+            return Err(Error::awaiting_membership(
+                "table has unavailable historical membership evidence",
+            ));
+        }
+        Ok(())
+    }
+
     fn metadata_from(
         &self,
         session: &Session<'_>,
         batch: &ReadBatch<'_, '_>,
         projection: Projection,
     ) -> Result<Vec<MetadataEvidence>> {
+        self.require_membership_evidence()?;
         let eligible: BTreeSet<_> = projection.ordered.into_iter().collect();
         let mut evidence = self
             .records
             .values()
             .map(|stored| {
-                let record = if stored.quarantine.is_none() {
+                let record = if stored.payload.is_ready() {
                     Some(batch.authenticate(&stored.wire)?)
                 } else {
                     None
@@ -2914,7 +3214,8 @@ impl Store {
                 let (roster, epoch, authored_ms) = match &record {
                     Some(record) => (*record.roster(), record.epoch(), record.authored_ms()),
                     None => stored
-                        .quarantine
+                        .payload
+                        .quarantine()
                         .expect("unavailable payload has witnessed quarantine metadata"),
                 };
                 Ok(MetadataEvidence {
@@ -2985,8 +3286,8 @@ impl Store {
         self.check(session)?;
         Ok(self.writers.get(&actor).map_or(0, |held| held.records))
     }
-    /// Operations eligible for strict peer ingestion. Quarantined records,
-    /// conflicting actors and their causal dependents are withheld; negative
+    /// Operations eligible for strict peer ingestion. Records awaiting membership, quarantined
+    /// records, conflicting actors and their causal dependents are withheld; negative
     /// certificates have a separate transfer path.
     pub fn replication_inventory(
         &self,
@@ -3002,7 +3303,7 @@ impl Store {
             .filter(move |(id, _)| !excluded.contains(*id))
             .map(|(id, _)| id)
     }
-    /// IDs withheld from replication by quarantine and its causal closure. As with
+    /// IDs withheld from replication by unavailable membership, quarantine and their causal closure. As with
     /// `inventory_unchecked`, the caller stands on the store's check in its admitted session.
     #[cfg_attr(
         any(test, debug_assertions),
@@ -3042,7 +3343,10 @@ impl Store {
         }
         let forked = self.conflicted();
         for (id, stored) in &self.records {
-            if stored.quarantine.is_some() || forked.contains(&stored.header.actor) {
+            if stored.payload.awaiting_membership()
+                || stored.payload.quarantine().is_some()
+                || forked.contains(&stored.header.actor)
+            {
                 pending.push(*id);
             }
         }
@@ -3115,7 +3419,8 @@ impl Store {
             .values()
             .filter_map(|stored| {
                 stored
-                    .quarantine
+                    .payload
+                    .quarantine()
                     .map(|(roster, epoch, authored_ms)| Quarantined {
                         header: stored.header.clone(),
                         receipt: stored.receipt,
@@ -3195,10 +3500,11 @@ impl Store {
     )]
     pub fn liability_evidence(&self, session: &Session<'_>) -> Result<Vec<Record>> {
         self.check(session)?;
+        self.require_membership_evidence()?;
         if self
             .records
             .values()
-            .any(|stored| stored.quarantine.is_some())
+            .any(|stored| stored.payload.quarantine().is_some())
         {
             return Err(Error::new(
                 "table liability evidence is quarantined; keep allocations reserved",

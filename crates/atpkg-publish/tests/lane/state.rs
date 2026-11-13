@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use atpkg_publish::lane::LaneKind;
 use atpkg_publish::lane::hold::{Holds, of_members};
 use atpkg_publish::lane::report::{self, Recorded, Transcript};
-use atpkg_publish::lane::state::{LaneState, Lock, PRUNE_AFTER_SECS};
+use atpkg_publish::lane::state::{EVIDENCE_KEEP_SECS, LaneState, Lock, PRUNE_AFTER_SECS};
 use atpkg_publish::testkit::NOW;
 use atpkg_publish::triple::{
     AARCH64_APPLE_DARWIN, AARCH64_UNKNOWN_LINUX_GNU, X86_64_APPLE_DARWIN, X86_64_UNKNOWN_LINUX_GNU,
@@ -182,6 +182,106 @@ fn attempts_count_up_clear_on_success_and_age_out() {
         !file.exists(),
         "an entry one second past PRUNE_AFTER_SECS is pruned"
     );
+}
+
+#[test]
+fn raising_the_floors_never_lowers_what_another_writer_left() {
+    let tmp = scratch("state-raise");
+    let s = LaneState::of(LaneKind::Tip, tmp.path());
+    s.ensure().expect("state");
+    let arm = [AARCH64_APPLE_DARWIN];
+    let seen = |s: &LaneState| {
+        std::fs::read_to_string(&s.pins_seen)
+            .expect("pins")
+            .lines()
+            .skip(1)
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    // The dispatcher published index 134 and moved ay while a pass that read index 133 ran.
+    s.raise(134, &arm, &pins(&[("ay", 15), ("nn", 3)]))
+        .expect("the dispatcher's floors");
+    // The pass ends and records the older head it read: nothing falls.
+    s.raise(133, &arm, &pins(&[("ay", 14), ("nn", 3), ("ty", 9)]))
+        .expect("the pass's floors");
+    assert_eq!(s.index_seen().expect("a floor"), 134);
+    assert_eq!(seen(&s), ["ay 15", "nn 3", "ty 9"]);
+    // So the gates still refuse what the dispatcher's floors refuse.
+    let tx = Transcript::memory("t");
+    assert!(s.check_index(133).is_err());
+    assert!(
+        s.check_pins(&arm, &pins(&[("ay", 14), ("nn", 3), ("ty", 9)]), 134, &tx)
+            .is_err()
+    );
+    // A newer head raises them.
+    s.raise(135, &arm, &pins(&[("ay", 16), ("nn", 3), ("ty", 9)]))
+        .expect("a newer head");
+    assert_eq!(s.index_seen().expect("a floor"), 135);
+    assert_eq!(seen(&s), ["ay 16", "nn 3", "ty 9"]);
+    // Floors recorded for another target set say nothing of this one: they are replaced.
+    s.raise(135, &[X86_64_APPLE_DARWIN], &pins(&[("ay", 12)]))
+        .expect("another target's floors");
+    assert_eq!(seen(&s), ["ay 12"]);
+}
+
+#[test]
+fn a_builds_evidence_ages_out_unless_a_latch_still_names_it() {
+    let tmp = scratch("state-evidence");
+    let s = LaneState::of(LaneKind::Tip, tmp.path());
+    s.ensure().expect("state");
+    let kept = |rel: &str| s.dir.join(rel).exists();
+    for build in ["ay-5", "ay-6"] {
+        std::fs::create_dir_all(s.dir.join(format!("logs/{build}/attempt-1"))).expect("logs");
+        std::fs::write(
+            s.dir.join(format!("logs/{build}/attempt-1/unit.stdout")),
+            "raw\n",
+        )
+        .expect("a log");
+        std::fs::create_dir_all(s.dir.join("receipts")).expect("receipts");
+        std::fs::write(s.dir.join(format!("receipts/{build}.json")), "{}").expect("a receipt");
+        std::fs::create_dir_all(s.dir.join("retired")).expect("retired");
+        std::fs::write(
+            s.dir.join(format!("retired/{build}.ready.toml.refused")),
+            "",
+        )
+        .expect("a retired record");
+    }
+    // ay-6 is latched: a person is still pointed at what it left.
+    std::fs::write(s.blocked_file("ay", 6), "# latched\n").expect("a latch");
+    let all = [
+        "logs/ay-5",
+        "receipts/ay-5.json",
+        "retired/ay-5.ready.toml.refused",
+        "logs/ay-6/attempt-1/unit.stdout",
+        "receipts/ay-6.json",
+        "retired/ay-6.ready.toml.refused",
+    ];
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("after the epoch")
+            .as_secs(),
+    )
+    .expect("a time");
+    // Within the keep nothing goes.
+    s.prune_evidence(now + EVIDENCE_KEEP_SECS - 3600);
+    for rel in all {
+        assert!(kept(rel), "{rel} was swept early");
+    }
+    // Past it the unlatched build's evidence goes and the latched build's stays.
+    s.prune_evidence(now + EVIDENCE_KEEP_SECS + 3600);
+    for rel in &all[..3] {
+        assert!(!kept(rel), "{rel} outlived its keep");
+    }
+    for rel in &all[3..] {
+        assert!(kept(rel), "{rel} is what a latch points at");
+    }
+    // The latch deleted, its build's evidence ages out like any other.
+    std::fs::remove_file(s.blocked_file("ay", 6)).expect("unlatch");
+    s.prune_evidence(now + EVIDENCE_KEEP_SECS + 3600);
+    for rel in &all[3..] {
+        assert!(!kept(rel), "{rel} outlived its latch");
+    }
 }
 
 #[test]

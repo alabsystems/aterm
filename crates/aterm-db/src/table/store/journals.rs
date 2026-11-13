@@ -26,7 +26,7 @@
 //! Each open still judges the claim, source classification, historical writer and key under its
 //! own session, with reused keys revalidated before return. Only a known non-cutoff payload can
 //! avoid another cryptographic opening during replay; cutoff payloads and actual application
-//! payload reads still decrypt ([`Read::witnessed`], then `Store::open_region`).
+//! payload reads still decrypt ([`Read::witnessed`], then `Store::open_claimed`).
 //!
 //! An ask whose folder and files stand as that witness showed them is answered from what is kept
 //! with nothing opened, read or hashed: a fresh read then would open the same files under the
@@ -53,7 +53,7 @@
 //! exposes, and links an open still holds once its table let them go.
 
 use super::{
-    Witness,
+    group::Boundary,
     replay::{self, Linked, Replay},
 };
 use crate::{Error, Result};
@@ -161,7 +161,7 @@ impl Read {
     /// Only repair ordering hints may use these unclassified IDs.
     pub(super) fn repair_ids(
         self,
-        acknowledged: Witness,
+        acknowledged: impl Into<Boundary>,
     ) -> Result<std::collections::BTreeSet<astream_wire::sync::Digest>> {
         replay::repair_ids(&self.links, self.refused, acknowledged)
     }
@@ -169,7 +169,8 @@ impl Read {
     /// This read's records witnessed against `acknowledged` ([`replay::witnessed`]). Replay clones
     /// share immutable wires and their signature facts. A store taking a wire's bytes moves them
     /// where nothing keeps them, and copies them where a kept table does.
-    pub(super) fn witnessed(self, acknowledged: Witness) -> Result<Replay> {
+    pub(super) fn witnessed(self, acknowledged: impl Into<Boundary>) -> Result<Replay> {
+        let acknowledged = acknowledged.into();
         match Arc::try_unwrap(self.links) {
             Ok(links) => replay::witnessed(Cow::Owned(links), self.refused, acknowledged),
             Err(links) => replay::witnessed(Cow::Borrowed(&links), self.refused, acknowledged),

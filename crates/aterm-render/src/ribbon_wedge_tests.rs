@@ -14,7 +14,7 @@
 use super::{
     BeamClip, BeamRows, GlowBlend, GlowQuad, RampCost, RampSink, RibbonVertex, WEDGE_EDGE_PX,
     glass_profile, glow_lerp, glow_lerp_rgb, ribbon_beam_into, ribbon_glass_into,
-    ribbon_wedge_into, smoothstep01,
+    ribbon_wedge_into, smoothstep,
 };
 use crate::test_counters::{take_glass_slabs, take_wedge_slabs};
 use aterm_core::render::GlowRamps;
@@ -353,7 +353,7 @@ fn tail_clip() -> BeamClip {
 fn tail(at: f32, spine: f32) -> Vec<RibbonVertex> {
     (0..=TAIL_CELLS)
         .map(|k| {
-            let up = 0.96 * CH as f32 * smoothstep01(k as f32 / 2.5);
+            let up = 0.96 * CH as f32 * smoothstep(k as f32 / 2.5);
             RibbonVertex {
                 x: at + (k * CW) as f32,
                 spine,
@@ -909,7 +909,7 @@ fn a_saturated_budget_sheds_a_wedge_head_first() {
 const MELT: f32 = 2.5;
 
 /// The glass's profile (PRISM-GLASS §2.2, §15.2 1.7): whole from the spine
-/// to [`MELT`] px under its reach, `smoothstep01((reach - d) / melt)` over
+/// to [`MELT`] px under its reach, `smoothstep((reach - d) / melt)` over
 /// those px, nothing at or past the reach, the same on both sides, and
 /// nothing for a reach that is not a positive number; a melt that is not one
 /// is a hard edge. The negative control: [`super::ribbon_profile`] at shoulder
@@ -928,7 +928,7 @@ fn the_glass_profile_is_whole_to_its_melt_and_nothing_past_its_reach() {
             if reach - d >= MELT {
                 assert_eq!(p, 1.0, "reach {reach}: whole at d {d}");
             } else if d < reach {
-                assert_eq!(p, smoothstep01((reach - d) / MELT), "reach {reach}, d {d}");
+                assert_eq!(p, smoothstep((reach - d) / MELT), "reach {reach}, d {d}");
             } else {
                 assert_eq!(p, 0.0, "reach {reach}: dark at d {d}");
             }

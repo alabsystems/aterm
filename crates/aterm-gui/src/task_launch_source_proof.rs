@@ -21,6 +21,15 @@ pub(crate) fn spawn(
     environment: &[(String, String)],
 ) -> Result<Child, String> {
     launch.current()?;
+    let codex_home = env
+        .home
+        .as_ref()
+        .ok_or("fixture HOME missing")?
+        .join(".codex");
+    // An explicit CODEX_HOME must already exist when the normal SDK config
+    // loader canonicalizes it. Keep that prerequisite inside this private world.
+    aterm_secrets::fsx::ensure_private_dir(&codex_home)
+        .map_err(|_| "source proof CODEX_HOME unavailable")?;
     let cli = worker::worker_cli(aterm_phase::Program::Codex).ok_or("Codex worker unavailable")?;
     let starter = worker::Starter {
         exe: launch.candidate().to_path_buf(),
@@ -28,12 +37,7 @@ pub(crate) fn spawn(
         env: vec![
             (
                 "CODEX_HOME".into(),
-                env.home
-                    .as_ref()
-                    .ok_or("fixture HOME missing")?
-                    .join(".codex")
-                    .to_string_lossy()
-                    .into_owned(),
+                codex_home.to_string_lossy().into_owned(),
             ),
             (
                 "CODEX_AUTH_PATH".into(),
@@ -76,7 +80,10 @@ pub(crate) fn spawn(
         )
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // The fixture host already owns a private failure log. Preserve the
+        // debug child's fixed phase/error diagnostics there, never on its SDK
+        // protocol stdout, so a hung constructor can be located without secrets.
+        .stderr(Stdio::inherit())
         .tether();
     for name in &starter.unset {
         command.env_remove(name);

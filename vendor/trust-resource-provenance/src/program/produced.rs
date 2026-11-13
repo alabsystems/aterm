@@ -13,6 +13,12 @@ use super::*;
 
 mod evidence;
 pub use evidence::{BoundedEvidenceFile, HeldEvidenceRoot};
+mod data;
+pub use data::HeldRootFile;
+mod directory;
+mod publication;
+pub use directory::HeldRootDirectory;
+pub use publication::PublicationExclusions;
 
 pub const RUNTIME_POLICY: &str = "native-produced/macho-arm64-original-output-sdk-v1";
 
@@ -20,9 +26,14 @@ struct OutputBacking {
     path: PathBuf,
     file: File,
     before: Metadata,
+    // Derived roots retain the original master-relative no-follow chain.
+    ancestry: Option<HeldRootDirectory>,
+    // LAST: native descriptor accounting outlives every retained original.
+    retention: Option<Arc<dyn Send + Sync>>,
 }
 impl OutputBacking {
     fn validate(&self, deadline: Instant) -> io::Result<()> {
+        if let Some(original) = &self.ancestry { original.validate(deadline)?; }
         let current = directory(&self.path, deadline)?;
         // A compiler may add outputs. That does not replace its original root
         // or permit changed ownership, permissions, ACLs or pathname routing.
@@ -44,15 +55,59 @@ impl HeldOutputRoot {
     pub fn open(root: &Path, deadline: Instant) -> io::Result<Self> {
         let file = directory(root, deadline)?;
         let before = owned(&file, true, false)?;
-        let backing = Arc::new(OutputBacking { path: root.to_owned(), file, before });
+        let backing = Arc::new(OutputBacking {
+            path: root.to_owned(),
+            file,
+            before,
+            ancestry: None,
+            retention: None,
+        });
         backing.validate(deadline)?;
         Ok(Self { backing })
+    }
+    /// Continue a genuinely held child directory as a selected compilation
+    /// root. The actual original master/ancestor FDs remain in this owner;
+    /// no absolute-path reopen or saved identity constructs the selection.
+    /// Reserve the additional description BEFORE this operation. It grants
+    /// no writer, compiler, publication or resource authority by itself.
+    pub fn from_original_directory(original: HeldRootDirectory, deadline: Instant) -> io::Result<Self> {
+        original.validate(deadline)?;
+        let path=original.path().to_owned();
+        let file=File::from(original.descriptor(deadline)?.try_clone_to_owned()?);
+        let before=owned(&file,true,false)?;
+        let output=Self {backing:Arc::new(OutputBacking {path,file,before,ancestry:Some(original),retention:None})};
+        output.validate(deadline)?; Ok(output)
+    }
+    /// Attach lifetime-only native accounting before sharing the newly held
+    /// root. This can only extend retention of an already genuine original;
+    /// it creates no admission, writer, materialization or execution grant.
+    pub fn retain_descriptor_guard(mut self, guard: Arc<dyn Send + Sync>) -> io::Result<Self> {
+        let backing=Arc::get_mut(&mut self.backing).ok_or_else(|| refused("selected output root was shared before descriptor accounting"))?;
+        if backing.retention.is_some() { return Err(refused("selected output root already retains descriptor accounting")); }
+        backing.retention=Some(guard); Ok(self)
+    }
+    pub fn derived_from(&self, master: &HeldOutputRoot) -> bool {
+        self.backing.ancestry.as_ref().is_some_and(|directory| directory.belongs_to_root(master))
+    }
+    pub fn original_identity(&self, deadline:Instant) -> io::Result<(u64,u64)> {
+        self.validate(deadline)?; Ok((self.backing.before.dev(),self.backing.before.ino()))
+    }
+    pub fn descriptor_count(&self) -> usize {
+        1 + self.backing.ancestry.as_ref().map_or(0,HeldRootDirectory::descriptor_count)
     }
     pub fn path(&self) -> &Path {
         &self.backing.path
     }
     pub fn validate(&self, deadline: Instant) -> io::Result<()> {
         self.backing.validate(deadline)
+    }
+    /// Borrow the SAME held directory after its current native name/identity
+    /// bookend. This creates no new description, writer, resource admission or
+    /// completion authority; the caller must retain its actual output owners.
+    pub fn descriptor(&self, deadline: Instant) -> io::Result<std::os::fd::BorrowedFd<'_>> {
+        use std::os::fd::AsFd as _;
+        self.validate(deadline)?;
+        Ok(self.backing.file.as_fd())
     }
 
     /// Prepare bounded, create-only failure evidence before compilation. The
@@ -119,7 +174,12 @@ impl HeldOutputRoot {
             self.validate(deadline)?;
             sdk.validate(deadline)?;
             let inputs = capture(self.path(), &sdk, program, expected, runtime_roots, deadline)?;
-            let held = HeldProducedProgram { output: Arc::clone(&self.backing), sdk, inputs };
+            let held = HeldProducedProgram {
+                output: Arc::clone(&self.backing),
+                sdk,
+                inputs,
+                descriptor_guard: None,
+            };
             held.validate(deadline)?;
             Ok(held)
         }
@@ -132,8 +192,73 @@ pub struct HeldProducedProgram {
     output: Arc<OutputBacking>,
     sdk: Arc<HeldProgram>,
     inputs: HeldProgram,
+    // LAST: lifetime-only accounting survives every shared image owner.
+    descriptor_guard: Option<Arc<dyn Send + Sync>>,
 }
 impl HeldProducedProgram {
+    /// Attach an already admitted descriptor envelope before sharing this
+    /// genuine image. This grants no native execution or producer authority.
+    pub fn retain_descriptor_guard(mut self, guard: Arc<dyn Send + Sync>) -> io::Result<Self> {
+        if self.descriptor_guard.is_some() {
+            return Err(refused("produced image already retains descriptor accounting"));
+        }
+        self.descriptor_guard = Some(guard);
+        Ok(self)
+    }
+    /// Owned image/loader metadata only; shared original SDK/output owners
+    /// and file contents are not counted again. This performs no IO.
+    pub fn retained_bytes(&self) -> Option<usize> {
+        fn file(value: &FileObservation) -> Option<usize> {
+            value.path.capacity().checked_add(value.sha256.capacity())
+        }
+        let inputs = &self.inputs;
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(inputs.root.capacity())?
+            .checked_add(file(&inputs.executable.observation)?)?
+            .checked_add(inputs.runtime.capacity().checked_mul(std::mem::size_of::<HeldFile>())?)?;
+        for held in &inputs.runtime {
+            bytes = bytes.checked_add(file(&held.observation)?)?;
+        }
+        for path in inputs.directories.keys() {
+            bytes = bytes
+                .checked_add(
+                    std::mem::size_of::<(PathBuf, HeldDirectory)>()
+                        .checked_mul(11)?
+                        .checked_add(128)?,
+                )?
+                .checked_add(path.capacity())?;
+        }
+        let observation = &inputs.observation;
+        bytes = bytes
+            .checked_add(file(&observation.executable)?)?
+            .checked_add(
+                observation
+                    .runtime
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<FileObservation>())?,
+            )?
+            .checked_add(
+                observation.loader_paths.capacity().checked_mul(std::mem::size_of::<PathBuf>())?,
+            )?
+            .checked_add(
+                observation
+                    .system_dependencies
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<String>())?,
+            )?
+            .checked_add(observation.host.capacity())?
+            .checked_add(observation.boot.capacity())?;
+        for value in &observation.runtime {
+            bytes = bytes.checked_add(file(value)?)?;
+        }
+        for path in &observation.loader_paths {
+            bytes = bytes.checked_add(path.capacity())?;
+        }
+        for value in &observation.system_dependencies {
+            bytes = bytes.checked_add(value.capacity())?;
+        }
+        Some(bytes)
+    }
     pub fn observation(&self) -> &ProgramObservation {
         self.inputs.observation()
     }
@@ -145,6 +270,9 @@ impl HeldProducedProgram {
     }
     pub fn sdk_observation(&self) -> &ProgramObservation {
         self.sdk.observation()
+    }
+    pub fn sdk_root(&self) -> &Path {
+        self.sdk.root()
     }
     /// Borrow the SAME originally held read-only executable for a separately
     /// authenticated live output registration. Revalidate the complete original

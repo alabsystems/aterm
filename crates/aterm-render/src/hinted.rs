@@ -75,22 +75,7 @@ impl HintBank {
         coords: &[(u32, f32)],
         slot: u8,
     ) -> Option<std::sync::Arc<HintingInstance>> {
-        self.instance_with(key_ptr, bytes, index, px, mode.options(), coords, slot)
-    }
-
-    /// [`Self::instance`] with the hinter target handed in directly: the seam the subpixel raster ([`crate::subpixel`]) uses to memoize LCD-target instances in its own bank (the map key does not carry the target, so one bank must never hold two targets for one face and px).
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn instance_with(
-        &mut self,
-        key_ptr: usize,
-        bytes: &[u8],
-        index: u32,
-        px: f32,
-        target: Option<Target>,
-        coords: &[(u32, f32)],
-        slot: u8,
-    ) -> Option<std::sync::Arc<HintingInstance>> {
-        let target = target?;
+        let target = mode.options()?;
         if !px.is_finite() || px <= 0.0 {
             return None;
         }
@@ -147,7 +132,7 @@ pub(crate) fn hinted_glyph_raster(
         w + 2 * crate::variation::RASTER_PAD,
         h + 2 * crate::variation::RASTER_PAD,
     );
-    pen.fill(&mut ras, x_min - pad, y_max + pad, 1.0);
+    pen.fill(&mut ras, x_min - pad, y_max + pad);
     let cov = crate::variation::crop_padded_coverage(&ras, w, h);
     Some((w, h, x_min as i32, y_min as i32, advance, cov))
 }
@@ -191,15 +176,9 @@ impl PathPen {
         }
     }
 
-    /// Replay into `ras`, flipping y about `y_max` and translating by `x_min`, with x scaled by `xs` after the translate (`1.0` is an exact identity; `3.0` is the subpixel raster's horizontal oversample).
-    pub(crate) fn fill(
-        &self,
-        ras: &mut crate::raster::Rasterizer,
-        x_min: f32,
-        y_max: f32,
-        xs: f32,
-    ) {
-        let map = |x: f32, y: f32| crate::raster::point((x - x_min) * xs, y_max - y);
+    /// Replay into `ras`, flipping y about `y_max` and translating by `x_min`.
+    pub(crate) fn fill(&self, ras: &mut crate::raster::Rasterizer, x_min: f32, y_max: f32) {
+        let map = |x: f32, y: f32| crate::raster::point(x - x_min, y_max - y);
         let mut last = crate::raster::point(0.0, 0.0);
         let mut start = last;
         let close = |ras: &mut crate::raster::Rasterizer,
@@ -242,53 +221,29 @@ impl PathPen {
     }
 }
 
-/// The recording half (pixels, y up), as plain methods so both the `OutlineSink` impl below
-/// and the subpixel raster's unhinted outline can feed it.
-impl PathPen {
-    #[inline]
-    pub(crate) fn move_to(&mut self, x: f32, y: f32) {
+/// The recording half (pixels, y up).
+impl aterm_font::OutlineSink for PathPen {
+    fn move_to(&mut self, x: f32, y: f32) {
         self.see(x, y);
         self.cmds.push(Cmd::Move(x, y));
     }
-    #[inline]
-    pub(crate) fn line_to(&mut self, x: f32, y: f32) {
+    fn line_to(&mut self, x: f32, y: f32) {
         self.see(x, y);
         self.cmds.push(Cmd::Line(x, y));
     }
-    #[inline]
-    pub(crate) fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
-        self.see(cx, cy);
-        self.see(x, y);
-        self.cmds.push(Cmd::Quad(cx, cy, x, y));
-    }
-    #[inline]
-    pub(crate) fn curve_to(&mut self, c0x: f32, c0y: f32, c1x: f32, c1y: f32, x: f32, y: f32) {
-        self.see(c0x, c0y);
-        self.see(c1x, c1y);
-        self.see(x, y);
-        self.cmds.push(Cmd::Curve(c0x, c0y, c1x, c1y, x, y));
-    }
-    #[inline]
-    pub(crate) fn close(&mut self) {
-        self.cmds.push(Cmd::Close);
-    }
-}
-
-impl aterm_font::OutlineSink for PathPen {
-    fn move_to(&mut self, x: f32, y: f32) {
-        PathPen::move_to(self, x, y);
-    }
-    fn line_to(&mut self, x: f32, y: f32) {
-        PathPen::line_to(self, x, y);
-    }
     fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
-        PathPen::quad_to(self, x1, y1, x, y);
+        self.see(x1, y1);
+        self.see(x, y);
+        self.cmds.push(Cmd::Quad(x1, y1, x, y));
     }
     fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
-        PathPen::curve_to(self, x1, y1, x2, y2, x, y);
+        self.see(x1, y1);
+        self.see(x2, y2);
+        self.see(x, y);
+        self.cmds.push(Cmd::Curve(x1, y1, x2, y2, x, y));
     }
     fn close(&mut self) {
-        PathPen::close(self);
+        self.cmds.push(Cmd::Close);
     }
 }
 

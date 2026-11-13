@@ -216,7 +216,7 @@ fn the_mug_waits_for_held_alone() {
     assert_eq!(hear(&[b'x'; 256][..], SAYS), Heard::Not, "past cap");
     assert_eq!(hear(&b"error\n"[..], SAYS), Heard::Not);
     assert_eq!(hear(&b""[..], SAYS), Heard::Ended);
-    let (read, _write) = std::io::pipe().expect("pipe");
+    let (read, _write) = aterm_uds::pipe().expect("pipe");
     assert_eq!(hear(read, Duration::from_millis(50)), Heard::Not);
     assert_eq!(hear(&b"\xff\n"[..], SAYS), Heard::Not, "not a line of text");
 }

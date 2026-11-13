@@ -2,7 +2,7 @@
 //! an original graph, native retirement, SDK custody or a producing admission.
 use std::os::fd::AsFd as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 
 use super::*;
@@ -16,10 +16,13 @@ struct Source {
 impl Source {
     fn new() -> Self {
         use std::time::{SystemTime, UNIX_EPOCH};
+        // Parallel tests can read one clock microsecond; the sequence keeps each fixture its own.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let directory = std::env::temp_dir().join(format!(
-            "object-client-source-{}-{}",
+            "object-client-source-{}-{}-{}",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(directory.join("src/bootstrap")).unwrap();
         let directory = std::fs::canonicalize(directory).unwrap();

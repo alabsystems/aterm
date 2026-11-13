@@ -1514,17 +1514,6 @@ pub(crate) fn theme_pair_label(raw: &str) -> Option<String> {
     })
 }
 
-/// [`theme_pair_label`] without its tail, for a control too narrow for the whole of it.
-pub(crate) fn theme_pair_short_label(raw: &str) -> Option<String> {
-    theme_pair_names(raw).map(|(dark, light)| {
-        if dark == light {
-            dark
-        } else {
-            format!("{dark} / {light}")
-        }
-    })
-}
-
 /// The `theme` value for a `(dark, light)` pair, in the selector grammar's spelling.
 pub(crate) fn theme_split_value(dark: &str, light: &str) -> String {
     format!("dark:{dark},light:{light}")

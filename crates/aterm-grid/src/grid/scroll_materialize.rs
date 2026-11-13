@@ -134,6 +134,71 @@ pub(crate) const fn leaves_wrap_hole(filled: u16, cols: u16) -> bool {
     (filled as u32) + 1 == (cols as u32)
 }
 
+/// Uniform non-wide, non-RGB, non-`OPENS_CELL` style covering all characters in `text`.
+#[inline]
+fn uniform_ascii_style(
+    line: &Line,
+    text_byte_len: usize,
+) -> Option<(PackedColor, PackedColor, CellFlags)> {
+    let attrs = match line.attrs() {
+        None => CellAttrs::DEFAULT,
+        Some(rle) => {
+            let [run] = rle.runs() else {
+                return None;
+            };
+            if usize::try_from(run.length).unwrap_or(usize::MAX) < text_byte_len
+                && run.value != CellAttrs::DEFAULT
+            {
+                return None;
+            }
+            run.value
+        }
+    };
+    if attrs.opens_cell() || (attrs.fg >> 24) == 0x01 || (attrs.bg >> 24) == 0x01 {
+        return None;
+    }
+    let flags = CellFlags::from_bits(attrs.flags);
+    if flags.contains(CellFlags::WIDE) {
+        return None;
+    }
+    Some((PackedColor(attrs.fg), PackedColor(attrs.bg), flags))
+}
+
+/// Inspect only the opening cell of a soft-wrapped [`Line`] to recover a wide glyph and its
+/// truecolor background for early-wrap hole painting, without materializing the full row.
+#[must_use]
+#[allow(clippy::cast_possible_truncation)] // RGB channel masks bounded to 0xFF
+pub(in crate::grid) fn first_wrapped_wide_opening(
+    line: &Line,
+    cols: u16,
+) -> Option<(super::Cell, Option<[u8; 3]>)> {
+    if !line.is_wrapped() || cols < 2 {
+        return None;
+    }
+    let text = line.as_str()?;
+    let cell = StoredCells::new(line, text, cols).next()?;
+    if !cell.wide {
+        return None;
+    }
+    let flags = CellFlags::from_bits(cell.attrs.flags).union(CellFlags::WIDE);
+    let is_complex = cell.chars > 1 || cell.base as u32 > super::Cell::MAX_DIRECT_CODEPOINT;
+    let fg = PackedColor(cell.attrs.fg);
+    let bg = PackedColor(cell.attrs.bg);
+    let glyph = if is_complex {
+        let mut g = super::Cell::with_style(' ', fg, bg, flags);
+        g.set_overflow_index(0);
+        g
+    } else {
+        super::Cell::with_style(cell.base, fg, bg, flags)
+    };
+    let bg_rgb = ((cell.attrs.bg >> 24) == 0x01).then_some([
+        ((cell.attrs.bg >> 16) & 0xFF) as u8,
+        ((cell.attrs.bg >> 8) & 0xFF) as u8,
+        (cell.attrs.bg & 0xFF) as u8,
+    ]);
+    Some((glyph, bg_rgb))
+}
+
 /// Materialize a scrollback [`Line`] into a [`MaterializedRow`], restoring hyperlinks.
 #[must_use]
 pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
@@ -149,8 +214,23 @@ pub fn materialize_from_line(line: &Line, cols: u16) -> MaterializedRow {
         return row;
     };
 
+    let uniform = uniform_ascii_style(line, text.len());
     let mut walk = StoredCells::new(line, text, cols);
-    for cell in walk.by_ref() {
+    walk.ascii_runs = uniform.is_some();
+    loop {
+        if let Some((byte, col, count)) = walk.ascii_run()
+            && let Some((fg, bg, flags)) = uniform
+        {
+            let src = &text.as_bytes()[byte..byte + usize::from(count)];
+            let dst = &mut row.cells[usize::from(col)..usize::from(col + count)];
+            for (slot, &b) in dst.iter_mut().zip(src) {
+                *slot = super::Cell::with_style(b as char, fg, bg, flags);
+            }
+            continue;
+        }
+        let Some(cell) = walk.next() else {
+            break;
+        };
         let flags = CellFlags::from_bits(cell.attrs.flags);
         let is_complex = cell.chars > 1 || cell.base as u32 > super::Cell::MAX_DIRECT_CODEPOINT;
         let fg = PackedColor(cell.attrs.fg);

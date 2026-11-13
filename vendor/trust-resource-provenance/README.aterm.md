@@ -1,18 +1,14 @@
 # Maintained native resource sources
 
-Library Rust sources are copied from canonical Trust 6441b55c27ed2da4cd6bda5f85ce40277d22ef70,
-`crates/trust-resource-provenance`. Local manifests redirect maintained dependencies;
-standalone binary and example targets are outside this library snapshot.
-The canonical source has authenticated API and native Git readback. Current
-Aterm qualification is tracked independently.
+The imported base is published Trust `b27fbd29fd181a19d806fa8c8b9c57a0bc160b76`.
+Local manifests redirect dependencies to this repository and omit standalone
+binaries/examples. Licenses accompany the maintained source. Source bytes and
+protocol data create no CPU, memory, execution, SDK or installed Host authority.
+Consumer qualification is independent of canonical qualification.
 
-The Bootstrap graph marker revision and explicit old-marker refusal control
-are imported from canonical Trust `44d395c5530760f3390f3861551e1d0a53fdf280`.
-The native validator requires `TRUSTBGRAPH00002` and closed fields
-`[3, 71, 72, 73, 74, 2]`; the older graph declaration refuses. Existing Aterm
-60-second original-deadline controls and all other profiles are preserved.
-
-The contained member mode retains the actual original native target retirement,
-GNU descriptions and accepted Host transport. Protocol data, marker declarations
-and copied source create no execution, SDK, input release, CPU or proof authority.
-Paired and runtime-input Host route activation is outside this contribution.
+Process, protocol-marker, system-command and image-pin tests retain Aterm's
+original-deadline/owned-fixture controls. Reader lifecycle tests now use the
+canonical owned-child implementation with its 60-second hang detector. All
+production entry points retain their canonical behavior and target guards.
+Trait imports needed by the local std facade are retained. Native connected-peer
+and held output-directory accessors observe retained originals; they confer no grant.

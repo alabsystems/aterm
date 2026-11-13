@@ -783,10 +783,7 @@ pub(super) fn connected(
     let control = exchange(
         pass,
         stream,
-        &Disk {
-            dir: &endpoint.dir,
-            trust: endpoint.trust,
-        },
+        &Disk::new(&endpoint.dir, endpoint.trust),
         side,
         &mut lease,
     )?;

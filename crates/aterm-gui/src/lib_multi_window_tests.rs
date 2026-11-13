@@ -3393,13 +3393,12 @@ fn focus_loss_scrubs_stale_modifiers_without_breaking_real_chords() {
     let wid = WindowId(0);
     let model = focus_modifier_cache_model();
     #[cfg(unix)]
-    let mut pipe = [0; 2];
-    #[cfg(unix)]
-    assert_eq!(
-        unsafe { libc::pipe(pipe.as_mut_ptr()) },
-        0,
-        "PTY observer pipe"
-    );
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| {
+            use std::os::fd::IntoRawFd;
+            [r.into_raw_fd(), w.into_raw_fd()]
+        })
+        .expect("PTY observer pipe");
     #[cfg(unix)]
     let read_flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     #[cfg(unix)]

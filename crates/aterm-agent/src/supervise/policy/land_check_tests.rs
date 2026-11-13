@@ -77,9 +77,9 @@ fn only_landed_lands() {
 #[test]
 fn a_need_in_the_answer_is_a_need() {
     for alone in [
-        "NEEDS YOU: rotate the deploy key",
-        "NEEDS YOU: rotate the deploy key\nLANDED",
-        "LANDED\n\nNEEDS YOU: rotate the deploy key.",
+        "NEEDS YOU: rotate the deploy nod",
+        "NEEDS YOU: rotate the deploy nod\nLANDED",
+        "LANDED\n\nNEEDS YOU: rotate the deploy nod.",
     ] {
         assert_eq!(
             land_check_answer(alone, None, false),
@@ -89,18 +89,18 @@ fn a_need_in_the_answer_is_a_need() {
     }
     assert_eq!(
         land_check_answer(
-            "NEEDS YOU: rotate the deploy key\nThe docs PR is still open.",
+            "NEEDS YOU: rotate the deploy nod\nThe docs PR is still open.",
             None,
             false
         ),
         CheckAnswer::Needs { rest_landed: false }
     );
     assert_eq!(
-        land_check_answer("LANDED", Some("NEEDS YOU: the signing key".into()), false),
+        land_check_answer("LANDED", Some("NEEDS YOU: the signing nod".into()), false),
         CheckAnswer::Needs { rest_landed: true }
     );
     assert_eq!(
-        land_check_answer("NEEDS YOU: rotate the deploy key", None, true),
+        land_check_answer("NEEDS YOU: rotate the deploy nod", None, true),
         CheckAnswer::Needs { rest_landed: false },
         "a cut answer never rests"
     );
@@ -133,7 +133,7 @@ fn the_answers_last_word_on_needs_wins() {
     );
     assert_eq!(
         land_check_answer(
-            "NEEDS YOU: rotate the deploy key\nLANDED",
+            "NEEDS YOU: rotate the deploy nod\nLANDED",
             Some("NEEDS YOU: nothing".into()),
             false
         ),

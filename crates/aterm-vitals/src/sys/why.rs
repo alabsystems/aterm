@@ -6,7 +6,7 @@
 use super::json::Jv;
 use super::query::{ScopeArg, SysQuery, View};
 use super::view::{
-    Line, c2, classes_json, exact_partition, header_line, mem_classes, mem_clauses, rec,
+    Line, c2, class_why, classes_json, exact_partition, header_line, mem_classes, mem_clauses, rec,
     scope_keys, unavailable,
 };
 use super::{Ctx, clock_s, exe_word};
@@ -681,7 +681,7 @@ impl<'a> Reading<'a> {
         };
         let exact = exact_partition(self.ctx);
         let c = mem_classes(m, exact);
-        let b = |i: usize| rec(c[i].1, "not_sampled");
+        let b = |i: usize| rec(c[i].1, class_why(self.ctx));
         vec![
             line(
                 "classes",
@@ -1224,7 +1224,7 @@ pub fn why_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, o: &mut Jv) {
                 "classes",
                 s.mem.as_ref().map_or_else(
                     || Jv::why("unsupported"),
-                    |m| classes_json(m, exact_partition(ctx)),
+                    |m| classes_json(m, exact_partition(ctx), class_why(ctx)),
                 ),
             );
             if w.a.facts.as_ref().is_some_and(|f| f.lane.on()) {

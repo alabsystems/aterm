@@ -28,6 +28,7 @@ fn back_to(model: Option<&str>) -> Restart {
 /// A Claude Code process launched as `argv`, in tab `s-1`, with no host reads behind it.
 fn claude(argv: &[&str]) -> Snapshot {
     Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         route: crate::harness::accounts::AuthRoute::Outside,
@@ -408,6 +409,7 @@ fn a_model_move_whose_own_relaunch_was_retired_unissued_holds_no_claim() {
     let why = to_opus();
     let ask = RestartAsk::of(&why, 600);
     let report = Report {
+        rung: None,
         pid: 4242,
         tab: "s-1".to_string(),
         session: SESSION.to_string(),

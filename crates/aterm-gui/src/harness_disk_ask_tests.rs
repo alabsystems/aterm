@@ -2166,6 +2166,53 @@ fn a_typed_line_records_the_free_figure_read_as_it_went_not_the_boards() {
     }
 }
 
+/// A line the server's observe gate withholds (the session's agent is unconfirmed,
+/// [`aterm_agent::harness::agent_image::WITHHELD`]) is handed on by the lease, as a session
+/// that may not be asked is, and the step says why, `released:unconfirmed`: nothing is
+/// typed, and the session holds it no more. NEGATIVE CONTROL (run): with the withheld step
+/// returned as the step's word, the line stays claimed by the observed session.
+#[test]
+fn a_line_the_observe_gate_withholds_is_handed_on() {
+    let state = aterm_tempfile::TempDir::new().expect("owned lease dir");
+    let host = ask::HostId {
+        pid: 9,
+        start: "start-9".to_owned(),
+    };
+    let now = now_ms();
+    let key = "dev:observed-break";
+    owed_at(state.path(), key, &host, "s-observed", now);
+    let owed = crate::disk_board::AskOwed {
+        key: key.to_owned(),
+        text: "the line".to_owned(),
+    };
+    let at = AtBreak {
+        state: state.path(),
+        host: &host,
+        sid: "s-observed",
+        owed: &owed,
+        now,
+        unfit: None,
+        held: None,
+        free: 10 * GIB,
+        level: Level::Short,
+    };
+    assert_eq!(
+        at.step(
+            || aterm_agent::harness::agent_image::WITHHELD.to_owned(),
+            || panic!("measured a line that never went")
+        ),
+        RELEASED_UNCONFIRMED
+    );
+    let lease = ask::read(state.path()).expect("valid fixture lease");
+    let phase = lease.entry(key).map(|e| &e.phase);
+    assert!(
+        !matches!(phase, Some(ask::Phase::Owed { pick, .. } | ask::Phase::Asked { pick, .. })
+            if pick.sid == "s-observed"),
+        "handed on: {phase:?}"
+    );
+    assert!(typed_last(key).is_none(), "nothing typed");
+}
+
 #[test]
 fn a_turn_break_the_loop_holds_types_nothing_and_claims_nothing() {
     let state = aterm_tempfile::TempDir::new().expect("owned lease dir");

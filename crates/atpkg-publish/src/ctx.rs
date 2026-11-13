@@ -137,8 +137,8 @@ impl HostChoice {
     }
 }
 
-/// Live routing clears both the current invalid need and the retired missing-file need.
-const CONFIG_NEEDS: [&str; 2] = ["agh.config.missing", "agh.config.invalid"];
+/// The config need live routing clears.
+const CONFIG_NEED: &str = "agh.config.invalid";
 
 /// A live host's identity/configuration refusal, recorded for a later caller.
 fn config_need(why: &str, at: u64) -> agh::needs::Need {
@@ -150,12 +150,10 @@ fn config_refusal(why: &str, shown: &str, h: &str) -> String {
     format!("{why}: the lanes route their GitHub identities through it ({shown}, --host {h})")
 }
 
-/// Clear both config needs under `dirs` (best effort, as `from_home_hosts`' success does).
+/// Clear the config need under `dirs` (best effort, as `from_home_hosts`' success does).
 /// It reads no agh.toml and creates nothing: a missing needs folder stays missing.
-pub(crate) fn clear_config_needs(dirs: &agh::config::Dirs) {
-    for key in CONFIG_NEEDS {
-        let _ = agh::needs::clear(dirs, key);
-    }
+pub(crate) fn clear_config_need(dirs: &agh::config::Dirs) {
+    let _ = agh::needs::clear(dirs, CONFIG_NEED);
 }
 
 #[cfg(all(test, unix))]
@@ -326,9 +324,6 @@ impl Ctx {
                 if learn {
                     let need = config_need(&why, u64::try_from(now_unix).unwrap_or(0));
                     let _ = agh::needs::raise(&dirs, &need);
-                    for key in CONFIG_NEEDS.iter().filter(|k| **k != need.key) {
-                        let _ = agh::needs::clear(&dirs, key);
-                    }
                 }
                 return Err(Error::cannot_run(config_refusal(
                     &why,
@@ -338,7 +333,7 @@ impl Ctx {
             }
         };
         if learn {
-            clear_config_needs(&dirs);
+            clear_config_need(&dirs);
         }
         ctx.hosts = Hosts {
             staging: Arc::new(staging),

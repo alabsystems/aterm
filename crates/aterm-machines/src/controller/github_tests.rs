@@ -219,18 +219,15 @@ fn a_token_for_another_login_sends_nothing() {
     clean(&sys);
 }
 
-/// No token file names the verb that stores one; a token file others can read, or one that
-/// holds no single token, is refused and names the verb that replaces it. None of them
-/// sends anything, and none runs git.
+/// No token file, a token file others can read, or one that holds no single token blocks the
+/// key call, which says so and asks nobody for a token. None of them sends anything, and none
+/// runs git.
 #[test]
-fn no_usable_token_file_names_the_verb_that_stores_one_and_sends_nothing() {
+fn no_usable_token_file_blocks_the_key_call_and_sends_nothing() {
     let sys = Fake::default();
     let err = revoke(&sys, token_file(), "fleetbot", &[1]).unwrap_err();
-    assert!(
-        err.contains("no GitHub token for fleetbot is stored"),
-        "{err}"
-    );
-    assert!(err.contains("aterm machines github login"), "{err}");
+    assert!(err.contains("no GitHub token for fleetbot at"), "{err}");
+    assert!(!err.contains("github login"), "{err}");
     assert!(sys.calls().is_empty(), "{:?}", sys.calls());
     for (bytes, mode, why) in [
         (TOKEN, 0o644, "private regular file"),
@@ -241,10 +238,7 @@ fn no_usable_token_file_names_the_verb_that_stores_one_and_sends_nothing() {
         stored(&sys, bytes, mode);
         let err = revoke(&sys, token_file(), "fleetbot", &[1]).unwrap_err();
         assert!(err.contains(why), "{err}");
-        assert!(
-            err.contains("aterm machines github login replaces it"),
-            "{err}"
-        );
+        assert!(err.contains("host key calls are blocked"), "{err}");
         assert!(!err.contains(TOKEN), "{err}");
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
     }
@@ -404,136 +398,5 @@ fn an_account_that_is_not_a_login_is_refused_before_anything_is_read() {
     stored(&sys, TOKEN, 0o600);
     let err = revoke(&sys, token_file(), "--user=x", &[1]).unwrap_err();
     assert!(err.contains("not a GitHub login"), "{err}");
-    let err = login(
-        &sys,
-        token_file(),
-        "a\nb",
-        Secret::new(TOKEN.as_bytes()).unwrap(),
-    )
-    .unwrap_err();
-    assert!(err.contains("not a GitHub login"), "{err}");
     assert!(sys.calls().is_empty());
-}
-
-/// A token that is empty or holds whitespace is no token: nothing is stored or asked.
-#[test]
-fn a_token_that_is_not_one_word_stores_nothing_and_asks_nothing() {
-    for token in [&b"a b"[..], b"", b"a\nb"] {
-        let sys = Fake::default();
-        let err = login(&sys, token_file(), "fleetbot", Secret::new(token).unwrap()).unwrap_err();
-        assert!(err.contains("not one word"), "{err}");
-        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
-        assert_eq!(sys.written(&token_file().to_string_lossy()), None);
-    }
-}
-
-/// `aterm machines github login` stores the token in the controller's token file (0600) only
-/// once GitHub signs it in as the account with the key scope, and reads it back; git and the
-/// login keychain are never asked. Negative controls: another account's token, a classic
-/// token without the scope, and one GitHub refuses each store nothing.
-#[test]
-fn login_stores_a_token_only_after_github_vouches_for_it() {
-    let user = |login: &str| format!(r#"{{"login":"{login}"}}"#);
-    let cases: [(Result<GithubResponse, String>, Option<&str>); 5] = [
-        (
-            answer(
-                200,
-                &[("X-OAuth-Scopes", "repo, admin:public_key")],
-                &user("FleetBot"),
-            ),
-            None,
-        ),
-        (answer(200, &[], &user("fleetbot")), None),
-        (
-            answer(
-                200,
-                &[("X-OAuth-Scopes", "admin:public_key")],
-                &user("someone-else"),
-            ),
-            Some("signs in as \"someone-else\", not fleetbot; nothing was stored"),
-        ),
-        (
-            answer(
-                200,
-                &[("X-OAuth-Scopes", "repo, read:public_key")],
-                &user("fleetbot"),
-            ),
-            Some("lacks the admin:public_key scope"),
-        ),
-        (
-            answer(401, &[], BAD_CREDENTIALS_BODY),
-            Some("GitHub GET /user: HTTP 401 (Bad credentials); nothing was stored"),
-        ),
-    ];
-    for (reply, refused) in cases {
-        let sys = Fake::default();
-        sys.on_github_rest(RestMethod::Get, "/user", reply);
-        let result = login(
-            &sys,
-            token_file(),
-            "fleetbot",
-            Secret::new(TOKEN.as_bytes()).unwrap(),
-        );
-        let calls = sys.calls();
-        match refused {
-            None => {
-                result.unwrap();
-                assert_eq!(
-                    calls,
-                    [
-                        "github GET /user".to_owned(),
-                        "mkdir /controller/keys 700".to_owned(),
-                        format!("write {TOKEN_FILE} 600"),
-                    ]
-                );
-                assert_eq!(sys.mode_of(TOKEN_FILE), Some(0o600));
-                assert_eq!(
-                    stored_token(&sys, token_file(), "fleetbot")
-                        .unwrap()
-                        .bytes(),
-                    TOKEN.as_bytes()
-                );
-            }
-            Some(why) => {
-                let err = result.unwrap_err();
-                assert!(err.contains(why), "{err}");
-                assert_eq!(calls, ["github GET /user"], "nothing was stored");
-                assert!(sys.written(TOKEN_FILE).is_none());
-            }
-        }
-        clean(&sys);
-    }
-}
-
-/// A token file the read-back cannot read as a private file of this account's fails the
-/// login, and the error carries no token.
-#[test]
-fn a_token_file_that_does_not_read_back_fails() {
-    let sys = Fake::default();
-    sys.on_github_rest(
-        RestMethod::Get,
-        "/user",
-        answer(200, &[], r#"{"login":"fleetbot"}"#),
-    );
-    sys.stat_of(
-        TOKEN_FILE,
-        Stat {
-            uid: 0,
-            gid: 0,
-            mode: 0o644,
-            dir: false,
-            symlink: false,
-            len: TOKEN.len() as u64,
-        },
-    );
-    let err = login(
-        &sys,
-        token_file(),
-        "fleetbot",
-        Secret::new(TOKEN.as_bytes()).unwrap(),
-    )
-    .unwrap_err();
-    assert!(err.contains("private regular file"), "{err}");
-    assert!(!err.contains(TOKEN), "{err}");
-    clean(&sys);
 }

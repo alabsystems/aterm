@@ -30,6 +30,19 @@ struct Keeper {
     file: File,
 }
 static KEEPER: OnceLock<Option<Keeper>> = OnceLock::new();
+/// Borrow of the actual process-entry owner. No Context/File/locator can
+/// construct this; the original global keeper remains held until process exit.
+pub(super) struct OriginalSdkKeeper(&'static Keeper);
+impl OriginalSdkKeeper {
+    pub(super) fn validate(&self, context: &Context) -> io::Result<()> {
+        self.0.validate(context.sdk.as_ref().ok_or_else(refused)?)
+    }
+}
+pub(super) fn retain_sdk_keeper(context: &Context) -> io::Result<OriginalSdkKeeper> {
+    let keeper = KEEPER.get().and_then(Option::as_ref).ok_or_else(refused)?;
+    keeper.validate(context.sdk.as_ref().ok_or_else(refused)?)?;
+    Ok(OriginalSdkKeeper(keeper))
+}
 fn refused() -> io::Error {
     io::Error::new(io::ErrorKind::PermissionDenied, "original inherited SDK lease unavailable")
 }
@@ -102,9 +115,17 @@ pub unsafe fn capture_sdk_lease(pending: PendingSdkCapture) -> io::Result<()> {
         io::Error::new(io::ErrorKind::AlreadyExists, "SDK early capture already complete")
     })
 }
+/// Observe only the immutable result of genuine entry capture. This grants no
+/// lease or execution; missing capture is an error, never inferred absence.
+pub fn original_lease_present() -> io::Result<bool> {
+    KEEPER.get().map(|keeper| keeper.is_some()).ok_or_else(refused)
+}
+
 /// Forward only the still-original captured SDK locator, never a reopened path
 /// or unrelated descriptor. The global keeper retains its duplicate while the
 /// caller retains the original inherited number through child retirement.
+/// Restore the locator from that capture even when the command environment was
+/// cleared; never consult a later ambient value to select the descriptor.
 /// No Context/lease authentication is inferred by this transparent handoff.
 pub fn inherit_original_lease(command: &mut std::process::Command) -> io::Result<()> {
     let Some(keeper) = KEEPER.get().ok_or_else(refused)?.as_ref() else {
@@ -115,7 +136,9 @@ pub fn inherit_original_lease(command: &mut std::process::Command) -> io::Result
     {
         return Err(refused());
     }
-    super::member::inherit_descriptions(command, &[keeper.original])
+    super::member::inherit_descriptions(command, &[keeper.original])?;
+    command.env(SDK_LEASE_ENV, keeper.original.to_string());
+    Ok(())
 }
 
 impl Keeper {

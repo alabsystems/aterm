@@ -990,7 +990,8 @@ impl App {
     /// What the slider's pick does once the press `done` ended `end` at `now`: a pick that
     /// waited for it is typed, unless that press already typed its level; the pick that press
     /// typed settles ([`EFFORT_SETTLE`]) where it ended done and is dropped where it stopped,
-    /// so the thumb is the footer's again. A waiting pick's refusal is the effort card's note.
+    /// so the thumb is the footer's again. A waiting pick's refusal is the effort card's note. A
+    /// press the person stopped drops a waiting pick too: nothing more is sent after them.
     pub(crate) fn effort_after(
         &mut self,
         wid: WindowId,
@@ -1008,28 +1009,33 @@ impl App {
             return;
         };
         let typed = done == Slash::Effort(wish.level);
-        let next = if wish.queued && !(typed && end == SlashEnd::Done) {
-            match self.pick_effort(wid, session, wish.level) {
-                Ok(()) => return,
-                Err(why) => {
-                    self.claude_facts.entry(session).or_default().menu_note =
-                        Some((Fact::Effort, why.says("", None)));
-                    None
+        let next =
+            if wish.queued && end == SlashEnd::Stopped(crate::claude_slash::SlashRefusal::Person) {
+                // The person stopped the press ("nothing more sent"): a pick waiting on it is
+                // dropped, never typed over their cancel.
+                None
+            } else if wish.queued && !(typed && end == SlashEnd::Done) {
+                match self.pick_effort(wid, session, wish.level) {
+                    Ok(()) => return,
+                    Err(why) => {
+                        self.claude_facts.entry(session).or_default().menu_note =
+                            Some((Fact::Effort, why.says("", None)));
+                        None
+                    }
                 }
-            }
-        } else if typed && end == SlashEnd::Done {
-            crate::claude_lights::wake_after(session, EFFORT_SETTLE);
-            Some(EffortWish {
-                queued: false,
-                until: Some(now + EFFORT_SETTLE),
-                ..wish
-            })
-        } else if typed {
-            None
-        } else {
-            // Another press's end: a pick already settling keeps its own deadline.
-            Some(wish)
-        };
+            } else if typed && end == SlashEnd::Done {
+                crate::claude_lights::wake_after(session, EFFORT_SETTLE);
+                Some(EffortWish {
+                    queued: false,
+                    until: Some(now + EFFORT_SETTLE),
+                    ..wish
+                })
+            } else if typed {
+                None
+            } else {
+                // Another press's end: a pick already settling keeps its own deadline.
+                Some(wish)
+            };
         self.claude_facts.entry(session).or_default().effort_wish = next;
     }
 

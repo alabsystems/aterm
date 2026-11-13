@@ -341,8 +341,7 @@ fn native_preview_rejects_a_local_origin_before_running_any_seal_probe() {
         }
     }
 
-    let mut c = cut("group-native-origin", &FLOOR, &[]);
-    c.rig.ctx = c.rig.ctx.clone().with_host_choice(HostChoice::Agh);
+    let c = cut("group-native-origin", &FLOOR, &[]);
     git(
         &c.trust_repo,
         &["remote", "set-url", "origin", "/local/copy"],
@@ -626,7 +625,18 @@ fn the_trust_repo_must_hold_the_seals_commit() {
     let c = cut("group-repo", &FLOOR, &[]);
     let mut req = request(&c, Mode::DryRun);
     req.trust_repo = c.rig.path("nowhere");
-    assert!(refused(&c, &req).contains("the trust repo is not a checkout"));
+    // The native arm's source identity check comes first, so a missing checkout stops there.
+    let e = refused(&c, &req);
+    assert!(e.contains("resolve source repository"), "{e}");
+    // The `gh` arm, said outright: it runs no source identity check, so a missing checkout is
+    // refused as none. Under agh that refusal is unreachable (an admitted source is a
+    // repository), so S5 deletes it with the arm.
+    let mut gh = cut("group-repo-gh", &FLOOR, &[]);
+    gh.rig.ctx = gh.rig.ctx.clone().with_host_choice(HostChoice::Gh);
+    let mut req = request(&gh, Mode::DryRun);
+    req.trust_repo = gh.rig.path("nowhere");
+    let e = refused(&gh, &req);
+    assert!(e.contains("the trust repo is not a checkout"), "{e}");
     *c.probe.vv.borrow_mut() = vv("9999999999999999999999999999999999999999", MAC);
     let e = refused(&c, &request(&c, Mode::DryRun));
     assert!(e.contains("is not in"), "{e}");
@@ -787,13 +797,22 @@ fn the_seed_receipt_is_required_unless_the_switch_reads_dormant() {
 
 #[test]
 fn staging_needs_its_writer_and_key_but_never_a_public_writer() {
-    let c = cut("group-identity", &FLOOR, &[]);
+    // The `gh` arm's token checks, said outright: the rig holds no token file, and under agh
+    // the writers are asked instead (`staging_asks_only_its_writers_under_agh`).
+    let gh = |label| {
+        let mut c = cut(label, &FLOOR, &[]);
+        c.rig.ctx = c.rig.ctx.clone().with_host_choice(HostChoice::Gh);
+        std::fs::create_dir_all(c.rig.ctx.tokens.staging.parent().expect("secrets dir"))
+            .expect("mkdir secrets");
+        c
+    };
+    let c = gh("group-identity");
     let e = refused(&c, &request(&c, Mode::StageUpload));
     assert!(
         e.contains("--stage-upload needs the staging owner's token at ~/.secrets/gh_access_token"),
         "{e}"
     );
-    let control = cut("group-identity-ok", &FLOOR, &[]);
+    let control = gh("group-identity-ok");
     std::fs::write(&control.rig.ctx.tokens.staging, "staging-token\n").expect("token");
     let (o, log) = ok(&control, &request(&control, Mode::StageUpload));
     assert_eq!(o.index_build, None);
@@ -804,7 +823,7 @@ fn staging_needs_its_writer_and_key_but_never_a_public_writer() {
     );
     assert!(!log.text().contains("  3. index "));
 
-    std::fs::remove_file(&c.rig.ctx.tokens.channel).expect("rm token");
+    assert!(!c.rig.ctx.tokens.channel.exists(), "no public writer");
     std::fs::write(&c.rig.ctx.tokens.staging, "staging-token\n").expect("token");
     ok(&c, &request(&c, Mode::StageUpload));
     c.packs.packs.borrow_mut().clear();
@@ -902,8 +921,6 @@ impl ReleaseHost for RefusesOne {
 #[test]
 fn staging_asks_only_its_writers_under_agh() {
     let mut c = cut("group-writers", &FLOOR, &[]);
-    std::fs::remove_file(&c.rig.ctx.tokens.channel).expect("rm token");
-    c.rig.ctx = c.rig.ctx.clone().with_host_choice(HostChoice::Agh);
     let channel = c.rig.ctx.index_slug();
     let staging = c.rig.ctx.staging_slug(atpkg::manifest::INDEX_REPO);
     let nothing_ran = |c: &Cut| {

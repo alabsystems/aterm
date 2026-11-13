@@ -17,6 +17,14 @@ mod release_pilot;
 mod native;
 
 #[cfg(target_os = "macos")]
+#[path = "build_admit_status_tests.rs"]
+mod status_observation;
+
+#[cfg(target_os = "macos")]
+#[path = "build_admit_unclaimed_tests.rs"]
+mod unclaimed_observation;
+
+#[cfg(target_os = "macos")]
 #[path = "build_admit_cohort_tests.rs"]
 mod cohort;
 
@@ -2027,7 +2035,7 @@ fn standin_reads_key_passes_on_its_terminal() {
 fn a_key_passes_on_only_where_the_terminals_key_misses_the_build() {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     assert!(front::key_passes(-1));
-    let (read, _write) = std::io::pipe().expect("a pipe");
+    let (read, _write) = aterm_uds::pipe().expect("a pipe");
     assert!(front::key_passes(read.as_raw_fd()));
     let (master, slave) = aterm_pty::open_pty_pair().expect("a terminal");
     // SAFETY: both descriptors were just opened and are owned by nothing else.

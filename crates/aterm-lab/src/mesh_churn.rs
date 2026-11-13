@@ -125,7 +125,7 @@ pub const HANG: Duration = Duration::from_secs(60);
 pub const LIVELOCK: Duration = Duration::from_secs(600);
 
 /// The usage line.
-pub const USAGE: &str = "mesh churn [--n N] [--seed S] [--minutes M] [--whole-wraps] [--negative-control NAME] [--aterm PATH] [--keep] [--record] [--label WORD]";
+pub const USAGE: &str = "mesh churn [--n N] [--seed S] [--minutes M] [--whole-wraps] [--negative-control NAME] [--aterm PATH] [--keep] [--label WORD]";
 
 /// This lab's verb for a Mac's subscriber ([`member_main`]).
 pub const MEMBER_VERB: &str = "mesh-churn-member";
@@ -292,8 +292,6 @@ pub struct Args {
     pub aterm: Option<String>,
     /// Keep the worlds after the run.
     pub keep: bool,
-    /// Write the record under `docs/measured/`.
-    pub record: bool,
     /// A word naming the record beside its arm.
     pub label: Option<String>,
 }
@@ -323,7 +321,6 @@ pub fn parse(args: &[String], seed: u64) -> Result<Args, Fail> {
         control: None,
         aterm: None,
         keep: false,
-        record: false,
         label: None,
     };
     let mut it = args.iter();
@@ -377,7 +374,6 @@ pub fn parse(args: &[String], seed: u64) -> Result<Args, Fail> {
             "--aterm" => out.aterm = Some(value("--aterm")?),
             "--whole-wraps" => out.whole_wraps = true,
             "--keep" => out.keep = true,
-            "--record" => out.record = true,
             "--label" => {
                 let v = value("--label")?;
                 if !label_word(&v) {
@@ -3981,7 +3977,6 @@ pub fn record_arm(args: &Args) -> (String, String) {
     (arm, flags)
 }
 
-/// Write the run's record under `docs/measured/` when `to_docs`, else under the lab's results.
 /// A checkout's commit and whether its tracked files differ from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tree {
@@ -4012,7 +4007,7 @@ impl Tree {
 }
 
 /// What a record adds where the checkout moved during the run: the record names the tree the
-/// run's image was built from ([`Lab::tree`]), and this the tree it was written beside.
+/// run's image was built from ([`Lab::tree`]), and this the checkout's tree when it was written.
 #[must_use]
 pub fn moved_note(began: &Tree, now: &Tree) -> String {
     if began == now {
@@ -4029,24 +4024,19 @@ pub fn moved_note(began: &Tree, now: &Tree) -> String {
     )
 }
 
-fn write_record(lab: &Lab, text: &str, checks: &[Check], to_docs: bool) -> Result<String, String> {
+/// Write the run's record, whatever its checks found, to the lab's state:
+/// `results/mesh-churn<arm>-<UTC time>.md` ([`record_arm`]), one file per run.
+fn write_record(lab: &Lab, text: &str, checks: &[Check]) -> Result<String, String> {
     let p = crate::paths::paths();
     let stamp = crate::util::utc_stamp(crate::util::now_secs());
     let date = stamp.get(..10).unwrap_or("undated").to_owned();
     let (arm, flags) = record_arm(&lab.args);
-    let path = if to_docs {
-        p.repo
-            .join("docs/measured")
-            .join(format!("mesh-churn{arm}-{date}.md"))
-    } else {
-        p.need_state()?.join("results").join(format!(
-            "mesh-churn{arm}-{}.md",
-            stamp.get(..19).unwrap_or(&stamp).replace(':', "")
-        ))
-    };
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
+    let dir = p.need_state()?.join("results");
+    let path = dir.join(format!(
+        "mesh-churn{arm}-{}.md",
+        stamp.get(..19).unwrap_or(&stamp).replace(':', "")
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let commit = &lab.tree.commit;
     let dirty = if lab.tree.dirty {
         " with uncommitted changes"
@@ -4152,15 +4142,12 @@ fn cmd_churn(words: &[String], driver: bool) -> Res {
     let checks = judge(&ev);
     let text = report(&lab, &ev, &checks);
     println!("\n{text}");
-    let measured = checks.iter().any(|c| c.name == SPLIT_HELD && c.pass);
-    match write_record(&lab, &text, &checks, args.record && measured) {
+    match write_record(&lab, &text, &checks) {
         Ok(path) => println!("written: {path}"),
         Err(e) => println!("could not write the record: {e}"),
     }
-    if args.record && !measured {
-        println!(
-            "not recorded under docs/measured: the split did not hold, so the run measured no build"
-        );
+    if !checks.iter().any(|c| c.name == SPLIT_HELD && c.pass) {
+        println!("the split did not hold, so the run measured no build");
     }
     let failed = checks.iter().filter(|c| !c.pass).count();
     if verdict(&checks, args.control) {

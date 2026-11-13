@@ -52,13 +52,13 @@ const TOKEN: &str = "Built and tested the parser.\nATERM-TASK-DONE";
 const DEFENSE: &str = "Nothing left: the parser and its tests are on origin/main.\n\
                        - The suite passes on main and the worktree is removed.";
 const NEEDS: &str = "Nothing left: the parser and its tests are on origin/main.\n\
-                     NEEDS YOU: the release credential, to sign the build";
+                     NEEDS YOU: the release permission, to sign the build";
 const OPEN_DEFENSE: &str = "Nothing left: the parser is pushed.\n- Its branch is not merged yet.";
 const ANSWERED: &str = "Yes: the old syntax still parses.";
 /// The land check's answers: its one landing word, a list, and a need alone.
 const CHECKED: &str = aterm_agent::supervise::policy::land_check::LANDED;
 const LIST: &str = "The parser's branch is not merged yet.";
-const NEED_ONLY: &str = "NEEDS YOU: the release credential, to sign the build";
+const NEED_ONLY: &str = "NEEDS YOU: the release permission, to sign the build";
 /// A managed worker's own failed conclusion.
 const COULD_NOT_FINISH: &str =
     "Could not finish: the grammar the parser needs was deleted upstream.";
@@ -177,6 +177,7 @@ fn point(
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(at.dirty.then(finding)),
         leftover: LeftRead::Rows(left.to_vec()),
+        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
         fact: None,
         wake: None,
     }

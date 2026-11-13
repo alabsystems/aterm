@@ -298,14 +298,21 @@ fn an_answer_into_a_closed_pipe_exits_cleanly() {
         &["keeper", "--help"],
         &["acaffeine", "--help"],
     ] {
-        let (reader, writer) = std::io::pipe().expect("a pipe");
+        let (reader, writer) = aterm_uds::pipe().expect("a pipe");
         drop(reader);
-        let out = isolated(&mut aterm_cmd(), root.path())
+        let writer_fd = writer.as_raw_fd();
+        let mut cmd = aterm_cmd();
+        isolated(&mut cmd, root.path())
             .args(args)
             .stdin(Stdio::null())
             .stdout(writer)
-            .stderr(Stdio::piped())
-            .output()
+            .stderr(Stdio::piped());
+        // The write end becomes the child's standard output: unmarked for this spawn alone.
+        let handing = aterm_uds::spawn_lock::handing(&[writer_fd]);
+        let spawned = cmd.spawn();
+        drop(handing);
+        let out = spawned
+            .and_then(std::process::Child::wait_with_output)
             .expect("run the aterm binary");
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(
@@ -560,15 +567,22 @@ fn cpu_policy_native_handshake_keeps_actual_credentials_and_bound_capture() {
 fn cpu_policy_native_parent_pipe_closure_ends_the_collector() {
     use std::io::Write;
     let root = private_root();
-    let (reader, mut writer) = std::io::pipe().unwrap();
-    let mut child = isolated(&mut aterm_cmd(), root.path())
+    let (reader, mut writer) = aterm_uds::pipe().unwrap();
+    let stdout = writer.try_clone().unwrap();
+    let stdout_fd = stdout.as_raw_fd();
+    let mut cmd = aterm_cmd();
+    isolated(&mut cmd, root.path())
         .arg(aterm_sysprobe::cpu_policy::COLLECTOR_VERB)
         .env(CPU_POLICY_HANG, cpu_policy_hang_ms())
         .stdin(Stdio::piped())
-        .stdout(Stdio::from(writer.try_clone().unwrap()))
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::piped());
+    // The write end's copy becomes the child's standard output, handed for this spawn alone.
+    let handing = aterm_uds::spawn_lock::handing(&[stdout_fd]);
+    let spawned = cmd.spawn();
+    drop(handing);
+    drop(cmd);
+    let mut child = spawned.unwrap();
     let (_output, _hello) =
         cpu_policy_hello_from(&mut child, std::fs::File::from(OwnedFd::from(reader)));
     // Block final output even when the unprivileged capture immediately refuses.
@@ -617,15 +631,21 @@ fn cpu_policy_fill_output(writer: &mut (impl std::io::Write + AsRawFd)) {
 #[cfg(target_os = "macos")]
 fn cpu_policy_native_watchdog_exits_even_when_identity_stdout_is_blocked() {
     let root = private_root();
-    let (reader, mut writer) = std::io::pipe().unwrap();
+    let (reader, mut writer) = aterm_uds::pipe().unwrap();
     cpu_policy_fill_output(&mut writer);
-    let mut child = isolated(&mut aterm_cmd(), root.path())
+    let writer_fd = writer.as_raw_fd();
+    let mut cmd = aterm_cmd();
+    isolated(&mut cmd, root.path())
         .arg(aterm_sysprobe::cpu_policy::COLLECTOR_VERB)
         .stdin(Stdio::piped())
         .stdout(Stdio::from(writer))
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+        .stderr(Stdio::piped());
+    // The write end becomes the child's standard output: unmarked for this spawn alone.
+    let handing = aterm_uds::spawn_lock::handing(&[writer_fd]);
+    let spawned = cmd.spawn();
+    drop(handing);
+    drop(cmd);
+    let mut child = spawned.unwrap();
     // Keep both the full pipe's reader and the parent input alive: neither EOF
     // nor a SIGPIPE can substitute for the collector's own deadline, which no
     // `CPU_POLICY_HANG` lifts here.

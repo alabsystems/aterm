@@ -733,9 +733,13 @@ impl Grid {
             let before = self.scrollback_lines();
             let ring_cap = self.storage.max_scrollback;
             let store_limit = limit.map(|l| l.saturating_sub(ring_cap));
-            if let Some(sb) = self.scrollback_mut() {
+            // The new share first, then the staged rows into the store under it: drained under
+            // the old share, a raise evicted the oldest lines it was meant to keep. A lowered
+            // share ends the same either way (the drain's pushes evict the oldest).
+            if let Some(sb) = self.storage.scrollback.as_mut() {
                 sb.set_line_limit(store_limit);
             }
+            self.drain_lazy_buffer();
             if let Some(l) = limit
                 && l < ring_cap
             {

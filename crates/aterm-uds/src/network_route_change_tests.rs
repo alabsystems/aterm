@@ -304,7 +304,7 @@ fn a_route_wait_ends_on_a_change_the_other_descriptor_or_its_deadline() {
         .set_nonblocking(true)
         .expect("a writer that never blocks");
     let changes = RouteChanges::over(heard.into());
-    let (quiet, mut ring) = std::io::pipe().expect("the other descriptor");
+    let (quiet, mut ring) = crate::pipe().expect("the other descriptor");
     let flooding = std::sync::Arc::new(AtomicBool::new(true));
     let (flooded, floods) = std::sync::mpsc::channel();
     let (begun, beginning) = std::sync::mpsc::channel();
@@ -390,6 +390,53 @@ fn a_route_wait_ends_on_a_change_the_other_descriptor_or_its_deadline() {
     );
 }
 
+/// An ask without waiting reads what the socket holds now: nothing queued is no change, a
+/// message that names none is read and passed over, a change is told once, and a socket whose
+/// peer is gone is a failure, which its owner drops.
+///
+/// NEGATIVE CONTROL (2026-11-12): with `changed_now` reading nothing (`Some(false)` for its
+/// body), the multicast join stays queued on macOS (`the ask read the message that named no
+/// change`), the first assertion the address change after it would fail too.
+#[test]
+fn an_ask_without_waiting_tells_a_queued_change_once() {
+    let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
+    let witness = heard.try_clone().expect("a second handle");
+    witness
+        .set_nonblocking(true)
+        .expect("a witness that never blocks");
+    let changes = RouteChanges::over(heard.into());
+    assert_eq!(changes.changed_now(), Some(false), "nothing queued");
+    #[cfg(target_os = "macos")]
+    {
+        kernel.send(&kernel_event(2, 7)).expect("a multicast join");
+        assert_eq!(changes.changed_now(), Some(false), "a multicast join");
+        assert_eq!(
+            witness.recv(&mut [0; 64]).map_err(|error| error.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "the ask read the message that named no change"
+        );
+    }
+    kernel.send(&kernel_event(1, 1)).expect("an address change");
+    assert_eq!(
+        changes.changed_now(),
+        Some(true),
+        "an address change queued"
+    );
+    assert_eq!(
+        witness.recv(&mut [0; 64]).map_err(|error| error.kind()),
+        Err(std::io::ErrorKind::WouldBlock),
+        "the ask read the change"
+    );
+    assert_eq!(changes.changed_now(), Some(false), "a change is told once");
+    let (heard, peer) = std::os::unix::net::UnixStream::pair().expect("a stream pair");
+    drop(peer);
+    assert_eq!(
+        RouteChanges::over(heard.into()).changed_now(),
+        None,
+        "a socket whose peer is gone"
+    );
+}
+
 /// Whatever poll(2) reports of either descriptor, an error, a hangup or an invalid
 /// descriptor with no POLLIN included, the wait takes at the poll that reported it, and never
 /// polls again at once with it untaken, which would spin to the deadline: the route socket is
@@ -413,7 +460,7 @@ fn a_wait_takes_any_report_of_either_descriptor_at_once() {
             Ok(())
         }
     };
-    let (quiet, _writer) = std::io::pipe().expect("the other descriptor");
+    let (quiet, _writer) = crate::pipe().expect("the other descriptor");
     for report in [libc::POLLERR, libc::POLLHUP, libc::POLLNVAL] {
         let (heard, kernel) = std::os::unix::net::UnixDatagram::pair().expect("a socket pair");
         let witness = heard.try_clone().expect("a second handle");

@@ -9973,6 +9973,13 @@ impl App {
                 record_presented_grids(ws, views, route, presented_plan);
             }
         }
+        // Every surface books against one successful-present clock, even if the callbacks
+        // between native and terminal booking cross the cold threshold.
+        let input = metrics::PresentInput::read(
+            &self.present_observer,
+            self.windows.get(&id).map(|state| &state.present_metrics),
+            self.capture_barrier == Some(id),
+        );
         let present = self.windows.get_mut(&id).map(|state| {
             let present = acknowledge_successful_present(
                 state,
@@ -10011,6 +10018,7 @@ impl App {
                                     &mut state.present_metrics.pending_native_input,
                                     leaf.view,
                                     raster.paint_serial,
+                                    input,
                                 );
                             }
                         }
@@ -10041,6 +10049,7 @@ impl App {
                                 &mut state.present_metrics.pending_native_input,
                                 view,
                                 raster.paint_serial,
+                                input,
                             );
                         }
                     }
@@ -10094,7 +10103,6 @@ impl App {
         let _recovered = self.recover_latched_gpu_loss(id, None, frame_started);
 
         let present_latency_ns = self.present_latency_ns_with_plan(id, presented_plan);
-        let capture_forced = self.capture_barrier == Some(id);
         let lens_visible = window.is_some()
             && self.windows.get(&id).is_some_and(|state| {
                 !state.occluded
@@ -10103,14 +10111,14 @@ impl App {
                         Some(PresentTarget::Cpu { .. } | PresentTarget::Gpu { .. })
                     )
             });
-        self.stats_lens_presented(id, lens_input, lens_visible, capture_forced);
+        self.stats_lens_presented(id, lens_input, lens_visible, input);
         metrics::record_present(
             present_latency_ns,
             render_ns,
             startup_timing,
             self.windows.get_mut(&id).map(|ws| &mut ws.present_metrics),
             &mut self.present_observer,
-            capture_forced,
+            input,
         );
         self.note_deck_present(id, frame_started, presented_at, acquire_wait_ns);
         self.rewind_presented(id);
@@ -11704,26 +11712,13 @@ impl App {
                         let l = (0xA8u32 * u32::from(alpha)) / 255;
                         let color = (l << 16) | (l << 8) | l;
                         let (top, bot) = (goy + 2 + y as usize, goy + 2 + (y + len) as usize);
-                        for r in 0..rows {
-                            let (b0, b1) = (goy + r * ch, goy + (r + 1) * ch);
-                            let (s0, s1) = (top.max(b0), bot.min(b1));
-                            if s0 < s1 {
-                                ws.fx
-                                    .cursor_mut()
-                                    .glow_scratch
-                                    .push(aterm_render::GlowQuad {
-                                        row: r as u16,
-                                        x: x as u16,
-                                        y: s0 as u16,
-                                        w: pw as u16,
-                                        h: (s1 - s0) as u16,
-                                        color,
-                                        alpha: 0,
-                                        color2: color,
-                                        alpha2: 0,
-                                    });
-                            }
-                        }
+                        crate::scroll_motion::push_pill_quads(
+                            &mut ws.fx.cursor_mut().glow_scratch,
+                            (x, pw),
+                            (top, bot),
+                            (goy, ch, rows),
+                            color,
+                        );
                         fp = (u64::from(alpha) << 48)
                             | (u64::from(y) << 24)
                             | u64::from(len)

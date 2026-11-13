@@ -7,7 +7,7 @@ const CAPTURE: &str = "I committed the parser locally and kept notes in wip-note
                        - [ ] update the changelog\n\
                        The migration is 80% done.\n\
                        Nothing left: the follow-up PR for the docs is still open.\n\
-                       NEEDS YOU: rotate the deploy key";
+                       NEEDS YOU: rotate the deploy nod";
 
 fn saids(found: &[Found]) -> Vec<&str> {
     found.iter().map(|f| f.said.as_str()).collect()
@@ -268,9 +268,9 @@ fn the_phrase_is_the_agents_own_text() {
         ),
         // A question names its mark.
         (
-            "Nothing left: is the deploy key rotated?",
+            "Nothing left: is the deploy nod rotated?",
             QUESTION,
-            "Is the deploy key rotated?",
+            "Is the deploy nod rotated?",
             "?",
         ),
         // A quote mark, a curly apostrophe and a box on the line.

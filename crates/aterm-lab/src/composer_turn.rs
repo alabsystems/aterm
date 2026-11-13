@@ -118,35 +118,89 @@ impl Turned {
 
 /// What stands on `screen` for `agent` ([`Stand`]): its composer's first row
 /// ([`crate::screen::composer_at`]), an editor holding the tab ([`crate::screen::editor_row`]), or
-/// neither (still starting: a banner, a folder-trust dialog). `ctl text` cannot tell a placeholder
-/// no one typed (Claude Code's grey suggestion, Codex's hint, Muse Code's prompt hint) from typed
-/// text, so a composer that holds text is read again by its first glyph's cell, the harness's own
-/// rule ([`aterm_agent::supervise::screen::composer_glyph_cell`],
-/// [`aterm_agent::supervise::screen::cell_is_placeholder`] over the agent's reader's hint colour,
-/// [`aterm_phase::ScreenReader::placeholder_fg`]): drawn dim, or in that hint colour (Muse Code's
-/// `676c74`, no `dim` attribute), it stands empty; drawn otherwise, it holds that text; a cell
-/// that says neither (`cell(row, col)`, that row's `ctl cell` reply, gave none, or an unfinished
-/// frame's) is no evidence yet ([`Stand::Unknown`]).
+/// neither (still starting: a banner, a folder-trust dialog).
+///
+/// `ctl text` cannot tell a placeholder no one typed from typed text, so a composer that holds
+/// text is read by the rule its program's text is read by ([`Placeholder::of`]):
+/// * where `agent`'s reader declares a placeholder ([`aterm_phase::ScreenReader::placeholder`]:
+///   Claude Code's grey suggestion, Muse Code's prompt hint), by the harness's own rule (its loop's
+///   `composer_draft`): the cell of the composer's first glyph at column 2, or of the glyph past a
+///   caret the program draws over it ([`aterm_agent::supervise::screen::composer_glyph_cell`]),
+///   read by [`aterm_agent::supervise::screen::cell_is_placeholder`] over the reader's hint colour
+///   ([`aterm_phase::ScreenReader::placeholder_fg`]: Muse Code's `676c74`, no `dim` attribute).
+///   Drawn plain, the composer holds that text. Drawn grey, it stands empty only with the cursor
+///   home on that glyph ([`aterm_agent::supervise::screen::cursor_home`], `cursor`: the `ctl
+///   cursor` reply's caret, read only then); with the cursor anywhere else, or unread, grey says
+///   neither, a frame read before its program placed the cursor or a person's text drawn grey;
+/// * Codex, whose composer the harness never reads (its reader reads none) and the lab reads by
+///   its own row ([`crate::screen::composer_at`]), by that glyph's cell alone, dim its hint: its
+///   cursor over the hint is unmeasured;
+/// * any other (Kimi Code, agy, Grok: their readers declare no placeholder, so the harness reads
+///   their text as typed and asks no cell), as the text it holds, with no cell read: Kimi Code's
+///   column 2 is the blank inside its box (` │ > text`), never a glyph.
+///
+/// A cell that says neither (`cell(row, col)`, that row's `ctl cell` reply, gave none, or an
+/// unfinished frame's) is no evidence yet ([`Stand::Unknown`]).
 pub(crate) fn stand_of(
     agent: &str,
     screen: &str,
     mut cell: impl FnMut(usize, usize) -> Option<String>,
+    cursor: impl FnOnce() -> Option<(usize, usize)>,
 ) -> Stand {
-    use aterm_agent::supervise::screen::{cell_is_placeholder, composer_glyph_cell};
-    match crate::screen::composer_at(agent, screen) {
-        Some((_, text)) if text.is_empty() => Stand::Composer(text),
-        Some((row, text)) => {
-            let hint = aterm_phase::program_of(agent).and_then(|p| p.reader().placeholder_fg());
-            match composer_glyph_cell(|col| cell(row, col))
-                .and_then(|c| cell_is_placeholder(&c, hint))
-            {
-                Some(true) => Stand::Composer(String::new()),
-                Some(false) => Stand::Composer(text),
-                None => Stand::Unknown,
+    use aterm_agent::supervise::screen::{cell_is_placeholder, composer_glyph_cell, cursor_home};
+    let Some((row, lines)) = crate::screen::composer_lines_at(agent, screen) else {
+        return crate::screen::editor_row(screen).map_or(Stand::Starting, Stand::Editor);
+    };
+    let text = lines.first().cloned().unwrap_or_default();
+    if text.is_empty() {
+        return Stand::Composer(text);
+    }
+    let (hint, gate) = match Placeholder::of(agent) {
+        Placeholder::None => return Stand::Composer(text),
+        Placeholder::Harness(hint) => (hint, true),
+        Placeholder::Codex => (None, false),
+    };
+    match composer_glyph_cell(|col| cell(row, col)).and_then(|c| cell_is_placeholder(&c, hint)) {
+        Some(false) => Stand::Composer(text),
+        Some(true) => {
+            if !gate || cursor_home(cursor(), row, &lines) {
+                Stand::Composer(String::new())
+            } else {
+                Stand::Unknown
             }
         }
-        None => crate::screen::editor_row(screen).map_or(Stand::Starting, Stand::Editor),
+        None => Stand::Unknown,
     }
+}
+
+/// WHERE A COMPOSER'S TEXT MAY BE A PLACEHOLDER NO ONE TYPED ([`stand_of`]), by `agent`'s rule.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Placeholder {
+    /// It draws none: any text in its composer is typed.
+    None,
+    /// Its reader declares one, drawn dim or in this hint colour: the harness's rule.
+    Harness(Option<&'static str>),
+    /// Codex's dim hint, read by the lab alone.
+    Codex,
+}
+
+impl Placeholder {
+    /// `agent`'s rule.
+    pub(crate) fn of(agent: &str) -> Self {
+        if agent == "codex" {
+            return Self::Codex;
+        }
+        aterm_phase::program_of(agent)
+            .map(|p| p.reader())
+            .filter(|r| r.placeholder())
+            .map_or(Self::None, |r| Self::Harness(r.placeholder_fg()))
+    }
+}
+
+/// The caret a `ctl cursor` reply names, `(row, col)` on the screen `ctl text` gives, or `None`
+/// where the reply is not one or its frame is still open ([`crate::trail_keys::caret`]).
+pub(crate) fn caret_of(reply: &str) -> Option<(usize, usize)> {
+    crate::trail_keys::caret(reply).map(|(row, col)| (usize::from(row), usize::from(col)))
 }
 
 /// The last row of `screen` that is not blank, trimmed.
@@ -286,9 +340,12 @@ impl<'d, 'r> Target<'d, 'r> {
 impl Steps for Target<'_, '_> {
     fn look(&self) -> Look {
         let screen = self.read(&["text"])?;
-        let stand = stand_of(self.agent, &screen, |row, col| {
-            self.read(&["cell", &row.to_string(), &col.to_string()])
-        });
+        let stand = stand_of(
+            self.agent,
+            &screen,
+            |row, col| self.read(&["cell", &row.to_string(), &col.to_string()]),
+            || self.read(&["cursor"]).as_deref().and_then(caret_of),
+        );
         Some((screen, stand))
     }
 

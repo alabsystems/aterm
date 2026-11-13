@@ -12,11 +12,11 @@ use aterm_types::land_trailer::Rechecked;
 /// The Markdown the worlds below share, eight lines each: a name no live tree holds, so this
 /// file names no live no-reach path in code and never stops its own landing's compose
 /// ([`the_live_tree_names_the_known_issues_in_no_code`]).
-const DOC: &str = "docs/FIXTURE.md";
+pub(super) const DOC: &str = "docs/FIXTURE.md";
 
 /// A file a world's main also holds: its path, its text ([`SHARED`] where `None`) and whether it
 /// is executable.
-type File<'a> = (&'a str, Option<&'a str>, bool);
+pub(super) type File<'a> = (&'a str, Option<&'a str>, bool);
 
 /// A case of a shared path the rule judges in full: its name, the files main gains first, the
 /// paths both sides then change, and whether one side renames them instead.
@@ -26,7 +26,7 @@ type Case<'a> = (&'a str, Vec<File<'a>>, Vec<&'a str>, bool);
 /// executable), all of [`SHARED`]'s eight lines unless given, Rust files that name `DOC` only
 /// where a no-reach Markdown file may be named (a comment, and census's own guards), and the
 /// no-reach rule this land runs at its path. The work branch starts from it.
-fn markdown_world(files: &[File<'_>]) -> World {
+pub(super) fn markdown_world(files: &[File<'_>]) -> World {
     let world = world();
     git(&world.rival, &["fetch", "-q", "origin"]);
     git(
@@ -71,7 +71,7 @@ fn markdown_world(files: &[File<'_>]) -> World {
 }
 
 /// `file` in `dir` with its 1-based `line` replaced by `text`, committed: the commit.
-fn edit_line(dir: &Path, file: &str, line: usize, text: &str) -> String {
+pub(super) fn edit_line(dir: &Path, file: &str, line: usize, text: &str) -> String {
     let now = std::fs::read_to_string(dir.join(file)).expect("the file");
     let mut lines: Vec<&str> = now.lines().collect();
     lines[line - 1] = text;
@@ -79,7 +79,7 @@ fn edit_line(dir: &Path, file: &str, line: usize, text: &str) -> String {
 }
 
 /// Move origin's main from the rival clone by `edit` of the rival's fresh main: the new tip.
-fn rival_does(world: &World, edit: impl FnOnce(&Path)) -> String {
+pub(super) fn rival_does(world: &World, edit: impl FnOnce(&Path)) -> String {
     git(&world.rival, &["fetch", "-q", "origin"]);
     git(
         &world.rival,
@@ -91,7 +91,7 @@ fn rival_does(world: &World, edit: impl FnOnce(&Path)) -> String {
 }
 
 /// A recheck that ran the source readers and passed.
-fn rechecked() -> Judged {
+pub(super) fn rechecked() -> Judged {
     ran(
         exit::PASS,
         RECHECKS.into_iter().map(|check| row(check, "ok")).collect(),
@@ -525,9 +525,11 @@ fn a_merge_unlike_the_tested_tree_is_judged_in_full() {
     let judged = std::cell::Cell::new(0);
     let code = land(
         &world.work,
+        &own(),
         &mut Seams {
             git: &seam,
-            judge: &mut |_: &Path, _: &str, _: Poll<'_>| {
+            verifier: &mut |_: &Path| Ok(own_image()),
+            judge: &mut |_: &Path, _: &Path, _: &str, _: Poll<'_>| {
                 if judged.replace(judged.get() + 1) == 0 {
                     rival_does(&world, |rival| drop(edit_line(rival, DOC, 8, "eight")));
                 }
@@ -535,7 +537,10 @@ fn a_merge_unlike_the_tested_tree_is_judged_in_full() {
             },
             branch: &mut |_: &Path, _: &str| crates(&["a"]),
             lane: &mut |_: &Path, _: &str| Lane::Pass,
-            recheck: &mut |_: &Path, _: &str| panic!("a merge unlike the tested tree is judged"),
+            recheck: &mut |_: &Path, _: &Path, _: &str| {
+                panic!("a merge unlike the tested tree is judged")
+            },
+            hand_over: &mut |_: &Image, _: &Path, _: &Path| panic!("no handoff was expected"),
             say: &mut |line: &str| {
                 // The rule has tested the plumbing's tree: only the worktree merge after it
                 // sees the attribute.
@@ -544,6 +549,8 @@ fn a_merge_unlike_the_tested_tree_is_judged_in_full() {
                 }
                 said.borrow_mut().push(line.to_owned());
             },
+            remote: &crate::remote::run,
+            pause: &no_retry,
         },
     );
     let said = said.into_inner();

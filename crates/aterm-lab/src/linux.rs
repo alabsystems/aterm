@@ -22,10 +22,67 @@ use crate::{Fail, LAB, Res};
 /// The VM's lima name.
 pub const VM: &str = "aterm-linux";
 
-/// What the VM is made with (`limactl create`), the same size on every host.
+/// What the VM is made with (`limactl create`), the same size on every host; `--memory`
+/// boots it with less memory ([`memory_gib`]).
 pub const CPUS: u32 = 8;
 pub const MEMORY_GIB: u32 = 16;
 pub const DISK_GIB: u32 = 60;
+
+/// The least memory `--memory` boots the guest with, GiB: Ubuntu, the guest's toolchain and one
+/// crate's build, which pages into the guest's swap ([`crate::linux_guest`]) past it.
+pub const MEMORY_MIN_GIB: u32 = 4;
+
+/// `--memory GIB`, when this process named it.
+static MEMORY: OnceLock<u32> = OnceLock::new();
+
+/// The memory this run boots lima's VM with, GiB: `--memory`'s, else [`MEMORY_GIB`].
+#[must_use]
+pub fn memory_gib() -> u32 {
+    MEMORY.get().copied().unwrap_or(MEMORY_GIB)
+}
+
+/// `--memory`'s word: whole GiB from [`MEMORY_MIN_GIB`] to [`MEMORY_GIB`].
+/// # Errors
+/// Anything else (usage).
+pub fn parse_memory(word: &str) -> Result<u32, Fail> {
+    match word.parse::<u32>() {
+        Ok(gib) if (MEMORY_MIN_GIB..=MEMORY_GIB).contains(&gib) => Ok(gib),
+        _ => Err(Fail::usage(format!(
+            "linux --memory needs whole GiB from {MEMORY_MIN_GIB} to {MEMORY_GIB}, not '{word}' ({LAB} linux help)"
+        ))),
+    }
+}
+
+/// `--memory`'s word into `cell`, this run's guest size: the first holds, and a later one that
+/// names another size is refused, as a second `--driver` is.
+/// # Errors
+/// A word [`parse_memory`] refuses, or another size than `cell` holds (usage).
+pub fn memory_in(cell: &OnceLock<u32>, word: &str) -> Result<u32, Fail> {
+    let gib = parse_memory(word)?;
+    let held = *cell.get_or_init(|| gib);
+    if held == gib {
+        Ok(gib)
+    } else {
+        Err(Fail::usage(format!(
+            "linux --memory {gib}: this run's guest is {held} GiB (an earlier --memory) ({LAB} linux help)"
+        )))
+    }
+}
+
+/// `limactl edit`'s arguments that give the stopped VM `name` (as `state` reports it)
+/// `gib` GiB of memory, or `None` when it has that already or is running: a running VM is
+/// adopted at the size it booted with, and a run that adopts one claims no memory for it.
+#[must_use]
+pub fn memory_edit_args(name: &str, state: &VmState, gib: u32) -> Option<Vec<String>> {
+    (state.status != "Running" && state.memory != u64::from(gib) << 30).then(|| {
+        vec![
+            "edit".into(),
+            "--tty=false".into(),
+            name.into(),
+            format!("--memory={gib}"),
+        ]
+    })
+}
 
 /// lima's template for the guest image (the image digest is pinned by the lima release that ships the template).
 pub const TEMPLATE: &str = "template:ubuntu-24.04";
@@ -45,7 +102,7 @@ pub const NOT_RUN: i32 = 3;
 
 /// The verbs, as `linux help` prints them.
 pub const USAGE: &str = "\
-targo --unverified lab linux [--driver lima|vz] [--gpu] [--no-wait] [--admit wait|now] <verb> — the Linux runtime lane: an
+targo --unverified lab linux [--driver lima|vz] [--gpu] [--memory GIB] [--no-wait] [--admit wait|now] <verb> — the Linux runtime lane: an
 Ubuntu 24.04 aarch64 VM (Rosetta for x86_64), lima's by default; --driver vz or LAB_LINUX_DRIVER=vz runs every verb on the
 lane's own VM instead (aterm-vz-host, the guest agent, the state in LAB_VZ_STATE or ~/Library/Caches/aterm/vz.noindex; it
 needs a console session, since the framework's VM process opens a WindowServer connection at each boot); --gpu runs every
@@ -61,7 +118,9 @@ less what the VM's directory holds) and waits for room before it waits for the l
 holders; once it holds the lane, the boot claims the guest's 16 GiB and 8 vCPUs in this Mac's capacity ledger (`aterm pkg
 capacity`) and waits while they do not fit with 8 GiB to spare beside them, naming the claims that hold the room once a
 minute (NOT RUN at once only on a Mac too small for them); --admit now boots at once, saying what it lacks or would have
-waited for. The guest's builds run as many jobs as cores the claim was granted (CARGO_BUILD_JOBS), and it keeps 16 GiB of swap, which a compile's peak pages into. A lima VM still running
+waited for. --memory GIB (4 to 16, lima's VM without --gpu) boots the guest with that much memory instead, and the boot
+claims that: a run whose crates build in less fits a Mac in use; each later boot without it gives the guest 16 GiB again,
+and a VM already up is adopted at the size it booted with. The guest's builds run as many jobs as cores the claim was granted (CARGO_BUILD_JOBS), and it keeps 16 GiB of swap, which a compile's peak pages into. A lima VM still running
 after the one-shot run that booted it died is stopped as `down` stops it, and booted afresh; one an `up` or a --keep-up run
 left is adopted. Lima uses ~/Library/Caches/aterm/lima.noindex (or explicit LIMA_HOME), with creation
 receipts for its namespace and each VM. An existing namespace or VM without matching receipts is
@@ -77,6 +136,7 @@ reserved guest directory; historical ~/aterm-lane directories are retained.
                            output is kept for the next `exec` under `up`, else removed when CMD ends
   proof [--arch A]... [--display D]... [--weston-renderer gl|pixman] [--keep-build] [--keep-up]
                            the lane's proof: aterm-uds, aterm-pty, aterm-libc and amacs-files's tests,
+                           the system readers' (aterm-sysprobe, aterm-vitals, aterm-diskwalk),
                            aterm-render's library tests, the libc oracle's conformance cells, and the windowing crates' and
                            the winit fork's tests with the displays up, on each arch; then aterm-gui under each
                            display (and --headless):
@@ -211,6 +271,15 @@ pub fn cmd_linux(args: &[String]) -> Res {
                 crate::linux_gpu::choose();
                 args = rest;
             }
+            [flag, word, rest @ ..] if flag == "--memory" => {
+                memory_in(&MEMORY, word)?;
+                args = rest;
+            }
+            [flag] if flag == "--memory" => {
+                return Err(Fail::usage(format!(
+                    "linux --memory needs GiB ({LAB} linux help)"
+                )));
+            }
             [flag, rest @ ..] if flag == "--no-wait" => {
                 wait = Wait::No;
                 args = rest;
@@ -225,6 +294,15 @@ pub fn cmd_linux(args: &[String]) -> Res {
     }
     let verb = args.first().map_or("help", String::as_str);
     let rest = args.get(1..).unwrap_or_default();
+    if MEMORY.get().is_some()
+        && (crate::linux_gpu::on()
+            || verb == "vz-smoke"
+            || crate::linux_driver::kind()? == Kind::Vz)
+    {
+        return Err(Fail::usage(
+            "linux --memory sizes lima's VM; the GPU instance and the vz arm boot at their own size",
+        ));
+    }
     let gpu = if crate::linux_gpu::on() { " --gpu" } else { "" };
     name_run(format!("lab linux{gpu} {verb}"), wait, admit);
     match verb {
@@ -480,7 +558,7 @@ pub fn create_args() -> Vec<String> {
         "--rosetta".into(),
         "--arch=aarch64".into(),
         format!("--cpus={CPUS}"),
-        format!("--memory={MEMORY_GIB}"),
+        format!("--memory={}", memory_gib()),
         format!("--disk={DISK_GIB}"),
         "--containerd=none".into(),
         "--mount-none".into(),
@@ -1761,7 +1839,8 @@ fn bring_up_vz(repo: &str, lane: &mut LaneLock) -> Result<Brought, Fail> {
     ))
 }
 
-/// lima's `create`, `edit` (the mounts), and `start`, behind the driver: a running VM a dead
+/// lima's `create`, `edit` (the mounts, then a stopped VM's memory to this run's size:
+/// [`memory_edit_args`]), and `start`, behind the driver: a running VM a dead
 /// one-shot run left is stopped first, as `down` stops it, and a boot is admitted
 /// ([`crate::vm_admit`]) and recorded before `start`; the VM up, its processes are named in
 /// `lane`'s record.
@@ -1773,7 +1852,8 @@ fn bring_up_lima(repo: &str, lane: &mut LaneLock) -> Result<Brought, Fail> {
     let mut state = lima.state().map_err(not_run)?;
     if state.is_none() {
         println!(
-            "linux: making {vm_name} ({CPUS} CPUs, {MEMORY_GIB} GiB, disk <= {DISK_GIB} GiB, {TEMPLATE}) …"
+            "linux: making {vm_name} ({CPUS} CPUs, {} GiB, disk <= {DISK_GIB} GiB, {TEMPLATE}) …",
+            memory_gib()
         );
         let out = lima.run(&if crate::linux_gpu::on() {
             crate::linux_gpu::create_args()
@@ -1835,8 +1915,28 @@ fn bring_up_lima(repo: &str, lane: &mut LaneLock) -> Result<Brought, Fail> {
             .map_err(not_run)?
             .ok_or_else(|| not_run("the VM went away"))?;
     }
+    let gpu = crate::linux_gpu::on();
+    let gib = if gpu { MEMORY_GIB } else { memory_gib() };
+    if let Some(edit) = (!gpu)
+        .then(|| memory_edit_args(vm_name, &vm, gib))
+        .flatten()
+    {
+        println!("linux: giving {vm_name} {gib} GiB of memory for this boot …");
+        let out = lima.run(&edit);
+        if !out.ok() {
+            return Err(not_run(format!(
+                "limactl edit (the memory) failed: {}",
+                out.tail(5)
+            )));
+        }
+        vm = lima
+            .state()
+            .map_err(not_run)?
+            .ok_or_else(|| not_run("the VM went away"))?;
+    }
     let booted_here = vm.status != "Running";
-    let mut admitted = crate::vm_admit::admit(&crate::vm_admit::Guest::lima(vm_name), booted_here)?;
+    let mut admitted =
+        crate::vm_admit::admit(&crate::vm_admit::Guest::lima(vm_name, gib), booted_here)?;
     let mut recorded = None;
     if booted_here {
         recorded = crate::vm_admit::record_boot("linux", &booter);

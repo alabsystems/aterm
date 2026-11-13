@@ -324,6 +324,7 @@ fn an_explicit_managed_producer_refuses_unknown_output_but_queries_and_defaults_
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(true),
     };
     let words = |command: &str| {
@@ -501,6 +502,7 @@ fn only_a_workspace_atpkg_manages_owes_custody_of_its_explicit_target() {
         cwd: Some(&src),
         env: &env,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(true),
     };
     let build = |manifest: Option<&Path>| {
@@ -715,6 +717,7 @@ fn producer_machine(world: &World) -> super::super::super::Machine<'_> {
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(true),
     }
 }
@@ -836,6 +839,7 @@ fn placed_argv_and_config_changes_cannot_bypass_selected_owned_preparation() {
         assert!(world.admit().unwrap());
         let machine = super::super::super::Machine {
             read: &super::super::super::read_config,
+            read_manifest: &super::super::super::read_manifest,
             ..producer_machine(&world)
         };
         let mut args = build_into(&world, &world.target);

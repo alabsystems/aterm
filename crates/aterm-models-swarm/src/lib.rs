@@ -34,6 +34,7 @@ mod models_fabric_routing;
 mod models_gap_heal;
 mod models_join_phrase;
 mod models_journal_append;
+mod models_journal_group_custody;
 mod models_journal_open;
 mod models_journal_read_guard;
 mod models_keyed_epochs;
@@ -65,6 +66,7 @@ pub use models_fabric_routing::{
 pub use models_gap_heal::gap_heal_model;
 pub use models_join_phrase::join_phrase_model;
 pub use models_journal_append::journal_append_model;
+pub use models_journal_group_custody::journal_group_custody_model;
 pub use models_journal_open::journal_open_model;
 pub use models_journal_read_guard::journal_read_guard_model;
 pub use models_keyed_epochs::keyed_epochs_model;

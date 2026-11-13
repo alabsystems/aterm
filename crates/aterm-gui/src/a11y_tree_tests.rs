@@ -1395,9 +1395,8 @@ fn the_light_the_switch_and_the_title_slot_have_ids_of_their_own() {
         HarnessChip::Title,
         HarnessChip::Context,
         HarnessChip::Account,
-        HarnessChip::Link(crate::claude_card::GlassLink::Notice),
-        HarnessChip::Link(crate::claude_card::GlassLink::Line),
-        HarnessChip::Link(crate::claude_card::GlassLink::Announcement),
+        HarnessChip::Mark,
+        HarnessChip::CardMark,
         HarnessChip::Upgrade,
     ];
     let mut ids = std::collections::HashSet::new();
@@ -1429,21 +1428,8 @@ fn the_light_the_switch_and_the_title_slot_have_ids_of_their_own() {
     let chips = [
         at(HarnessChip::Mode, "Permission mode: yolo off.", 2),
         at(HarnessChip::Title, "plan mode on \u{b7} click: yolo", 8),
-        at(
-            HarnessChip::Link(crate::claude_card::GlassLink::Notice),
-            "https://alab.systems",
-            28,
-        ),
-        at(
-            HarnessChip::Link(crate::claude_card::GlassLink::Line),
-            "alab.systems",
-            34,
-        ),
-        at(
-            HarnessChip::Link(crate::claude_card::GlassLink::Announcement),
-            "https://alab.systems",
-            14,
-        ),
+        at(HarnessChip::Mark, "ALab, alab.systems", 28),
+        at(HarnessChip::CardMark, "ALab", 34),
         at(HarnessChip::Upgrade, "Update Claude Code to 2.1.310", 22),
     ];
     let update = grid_tree(
@@ -1459,7 +1445,7 @@ fn the_light_the_switch_and_the_title_slot_have_ids_of_their_own() {
         let title = chip.chip == HarnessChip::Title;
         let role = match chip.chip {
             HarnessChip::Title => Role::Status,
-            HarnessChip::Link(_) => Role::Link,
+            HarnessChip::Mark | HarnessChip::CardMark => Role::Link,
             _ => Role::Button,
         };
         assert_eq!(n.role(), role, "{:?}", chip.chip);

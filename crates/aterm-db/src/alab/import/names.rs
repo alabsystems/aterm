@@ -32,8 +32,8 @@
 //! (`register::pick`'s rule): a host finds it no row, and a name it answers is a finding.
 
 use super::{
-    Coord, Dump, Finding, Kind, KnownMac, Label, Planner, ReadNow, Sheet, SheetKind, guard, json,
-    keys, source_row,
+    Births, Coord, Dump, Finding, Kind, KnownMac, Label, Planner, ReadNow, Sheet, SheetKind, guard,
+    json, keys, source_row,
 };
 use crate::{
     alab::{
@@ -202,14 +202,16 @@ impl NameLinks {
     }
 }
 
-/// Every name `row` goes by: each candidate of its label, and each alias.
+/// Every canonical name `row` goes by, and each alias. Raw fixtures retain label candidates.
 fn row_names(row: &cell::Row) -> BTreeSet<&str> {
     let mut names: BTreeSet<&str> = row
         .fields
         .get("aliases")
         .map(|field| field.members().into_iter().collect())
         .unwrap_or_default();
-    if let Some(field) = row.fields.get("label") {
+    if let Some(canonical) = row.claims.get("label") {
+        names.extend(canonical.as_ref().and_then(Value::as_str));
+    } else if let Some(field) = row.fields.get("label") {
         names.extend(field.candidates_x().into_iter().filter_map(Value::as_str));
     }
     names
@@ -811,7 +813,8 @@ impl Planner<'_> {
     }
 
     /// The row a machine name means: a row answering it or a name linked to it; else the known Mac
-    /// it names, born as the roster says; else a planned placeholder keyed by the label
+    /// it names, born as the roster says (a source names it now); else a planned placeholder keyed
+    /// by the label
     /// ([`keys::planned_machine_pk`]: a retired row holding that key leaves it, and the placeholder
     /// takes the first free `<label>/<n>`, as `add machine` keys it, so the old row's history stays
     /// apart). `None` when two rows answer, or births are off and nothing matched.
@@ -824,8 +827,8 @@ impl Planner<'_> {
                 return None;
             }
             Named::Row(pk) => pk,
-            Named::Known(mac) => self.known_row(&mac)?,
-            Named::Free if self.input.births => {
+            Named::Known(mac) => self.known_row(&mac, true)?,
+            Named::Free if self.input.births != Births::None => {
                 let rows = &self.current[MACHINE.name].rows;
                 let pk = keys::planned_machine_pk(&stored, |pk| rows.contains_key(pk))?;
                 self.want(&MACHINE, &pk, "label", json!(stored), at);
@@ -959,15 +962,16 @@ impl Planner<'_> {
         Some(json!([host]))
     }
 
-    /// The row of a known Mac: by node, then host, then its label or an alias; else, with births on,
-    /// a new row keyed by its node (or its label). Its values come from the roster, so they carry
-    /// the roster's coordinate, whichever sheet label led here. Its `node` cell is the Mac's own to
-    /// publish (`register`), so the roster's word for it matches a row and writes nothing.
+    /// The row of a known Mac: by node, then host, then its label or an alias; else, where this run
+    /// births it ([`Births`]: `named` is that a source of the run names it), a new row keyed by its
+    /// node (or its label); else none, which `adopt` reports (`unadopted`). Its values come from the
+    /// roster, so they carry the roster's coordinate, whichever sheet label led here. Its `node`
+    /// cell is the Mac's own to publish (`register`), so the roster's word for it matches a row and
+    /// writes nothing.
     ///
-    /// The roster lists a member before its Mac has joined this registry, so a row an import births
-    /// is `planned`, which the Mac can adopt (`register::pick` adopts only that by name), and only a
-    /// row its Mac published its principal on is `active` on the roster's word.
-    fn known_row(&mut self, mac: &KnownMac) -> Option<String> {
+    /// A row born here is `planned`, which the Mac can adopt (`register::pick` adopts only that by
+    /// name), and only a row its Mac published its principal on is `active` on the roster's word.
+    fn known_row(&mut self, mac: &KnownMac, named: bool) -> Option<String> {
         let label = mac.label.as_ref().map(Label::canonical);
         let place = self
             .input
@@ -1014,12 +1018,21 @@ impl Planner<'_> {
             Some(_) => None,
         };
         let found = found.map(|(pk, _)| pk);
+        let born = match self.input.births {
+            Births::None => false,
+            Births::Named => named,
+            Births::Listed => true,
+        };
         let pk = match found {
             Some(pk) => pk,
-            None if self.input.births => {
+            None if born => {
                 let rows = &self.current[MACHINE.name].rows;
                 known_birth(mac, |pk| rows.contains_key(pk))?
             }
+            // An import says nothing of a seat none of its sources names: the seat is no
+            // defect of theirs, and most such seats never register, so the count would stand
+            // on every Mac for good. `adopt --findings` is the reader that lists them.
+            None if self.input.births != Births::None => return None,
             None => {
                 self.findings.insert(Finding {
                     kind: Kind::Unadopted,
@@ -1118,9 +1131,10 @@ impl Planner<'_> {
     }
 
     pub(super) fn known_macs(&mut self) {
+        // The sheets were read first, so a Mac one of them named has its row in this plan.
         for mac in self.input.macs {
             if mac.label.is_some() || valid_node(mac).is_some() || valid_transport(mac).is_some() {
-                self.known_row(mac);
+                self.known_row(mac, false);
             }
         }
         // Each pass lands what the last one's moves freed. A label another row still holds at the end

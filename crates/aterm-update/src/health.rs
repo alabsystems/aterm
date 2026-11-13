@@ -90,15 +90,32 @@ pub struct Health {
     /// Build number that was running when [`Self::last_apply_refusal`] was recorded.
     #[serde(default)]
     pub last_apply_refusal_build: u64,
-    /// Reason [`Self::trial_proof_failure_build`]'s boot trial remains unconfirmed.
+    /// Where the automatic apply lane stands after it stopped retrying an artifact
+    /// ([`Self::record_apply_lane`]): a journal record, never a request of a person.
     #[serde(default)]
-    pub trial_proof_failure: String,
-    /// RFC3339 UTC timestamp when [`Self::trial_proof_failure`] was first recorded.
+    pub apply_lane: String,
+    /// The build [`Self::apply_lane`] is about.
     #[serde(default)]
-    pub trial_proof_failure_at: String,
-    /// Build number whose trial [`Self::trial_proof_failure`] describes.
+    pub apply_lane_target_build: u64,
+    /// The failure the lane stopped on, as a stable signature (`<shape>/<cause key>`).
     #[serde(default)]
-    pub trial_proof_failure_build: u64,
+    pub apply_failure_signature: String,
+    /// What aterm does next by itself about [`Self::apply_lane_target_build`].
+    #[serde(default)]
+    pub apply_next_action: String,
+    /// RFC3339 UTC timestamp of [`Self::apply_lane`].
+    #[serde(default)]
+    pub apply_lane_at: String,
+    /// Build number that was running when [`Self::apply_lane`] was recorded.
+    #[serde(default)]
+    pub apply_lane_build: u64,
+    /// Pid of the process that wrote [`Self::apply_lane`] ([`crate::LaneWriter`]).
+    #[serde(default)]
+    pub apply_lane_writer_pid: u32,
+    /// Kernel birth of the process that wrote [`Self::apply_lane`]; with the pid it names the
+    /// writer, whose latch the record reports.
+    #[serde(default)]
+    pub apply_lane_writer_birth: u64,
     /// Newer build number currently waiting to be applied.
     #[serde(default)]
     pub pending_build: u64,
@@ -496,37 +513,88 @@ impl Health {
         !self.last_apply_refusal.is_empty() && self.last_apply_refusal_build == current_build
     }
 
-    /// Record that `build`'s boot trial recovery proof failed with `words`.
-    pub fn record_trial_proof_failure(path: &Path, build: u64, words: &str) -> bool {
+    /// Record where `writer`'s automatic apply lane stands after it stopped retrying
+    /// `record.target_build` under `current_build`, replacing any earlier record.
+    pub fn record_apply_lane(
+        path: &Path,
+        current_build: u64,
+        writer: crate::LaneWriter,
+        record: &crate::ApplyLaneRecord,
+    ) {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
-        let words = capped_error(words);
-        if h.trial_proof_failure_build == build && h.trial_proof_failure == words {
-            return false;
-        }
-        h.trial_proof_failure = words;
-        h.trial_proof_failure_at = crate::install::now_rfc3339();
-        h.trial_proof_failure_build = build;
+        h.apply_lane = capped_error(&record.lane);
+        h.apply_lane_target_build = record.target_build;
+        h.apply_failure_signature = capped_error(&record.failure_signature);
+        h.apply_next_action = capped_error(&record.next_action);
+        h.apply_lane_at = crate::install::now_rfc3339();
+        h.apply_lane_build = current_build;
+        h.apply_lane_writer_pid = writer.pid;
+        h.apply_lane_writer_birth = writer.birth;
         h.write(path);
-        true
     }
 
-    /// Record that the trial whose proof was refused was settled at its bound without it
-    /// (`install::settle_trial_at_bound`): the refusal no longer stands. Nothing else moves;
-    /// an unproven settle is no apply success, and the failure counters are not its to clear.
-    pub(crate) fn record_trial_settled_unproven(path: &Path) {
+    /// The automatic apply lane's record, when `reader` wrote it under `current_build`. A record
+    /// another process wrote, an earlier one of the same build included, reads as none: it
+    /// reports that process's latch, which this one does not hold.
+    #[must_use]
+    pub fn apply_lane_for(
+        &self,
+        current_build: u64,
+        reader: crate::LaneWriter,
+    ) -> Option<crate::ApplyLaneRecord> {
+        (!self.apply_lane.is_empty()
+            && self.apply_lane_build == current_build
+            && self.apply_lane_writer() == reader)
+            .then(|| crate::ApplyLaneRecord {
+                lane: self.apply_lane.clone(),
+                target_build: self.apply_lane_target_build,
+                failure_signature: self.apply_failure_signature.clone(),
+                next_action: self.apply_next_action.clone(),
+                at: self.apply_lane_at.clone(),
+            })
+    }
+
+    const fn apply_lane_writer(&self) -> crate::LaneWriter {
+        crate::LaneWriter {
+            pid: self.apply_lane_writer_pid,
+            birth: self.apply_lane_writer_birth,
+        }
+    }
+
+    /// Whether the stopped lane's record is a running process's: its writer, this process
+    /// included, still runs ([`crate::LaneWriter::runs`]). That record reports its writer's
+    /// latch, which no landed apply ends (the node job's, a successor's, or this process's own
+    /// trial settling), so only its writer withdraws it ([`Self::withdraw_apply_lane`]). A record
+    /// whose writer has exited reports no latch any process holds.
+    fn apply_lane_writer_runs(&self) -> bool {
+        self.apply_lane_writer().runs()
+    }
+
+    /// Withdraw `writer`'s record about `target_build`: the latch it reported is gone. A record
+    /// another process wrote, or one about another build, stays.
+    pub fn withdraw_apply_lane(path: &Path, writer: crate::LaneWriter, target_build: u64) {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
-        if h.trial_proof_failure.is_empty()
-            && h.trial_proof_failure_at.is_empty()
-            && h.trial_proof_failure_build == 0
+        if h.apply_lane.is_empty()
+            || h.apply_lane_writer() != writer
+            || h.apply_lane_target_build != target_build
         {
             return;
         }
-        h.trial_proof_failure = String::new();
-        h.trial_proof_failure_at = String::new();
-        h.trial_proof_failure_build = 0;
+        h.clear_apply_lane();
         h.write(path);
+    }
+
+    fn clear_apply_lane(&mut self) {
+        self.apply_lane = String::new();
+        self.apply_lane_target_build = 0;
+        self.apply_failure_signature = String::new();
+        self.apply_next_action = String::new();
+        self.apply_lane_at = String::new();
+        self.apply_lane_build = 0;
+        self.apply_lane_writer_pid = 0;
+        self.apply_lane_writer_birth = 0;
     }
 
     fn clear_apply_refusal(&mut self) {
@@ -548,22 +616,24 @@ impl Health {
         h
     }
 
-    /// Record that an update apply succeeded, clearing `apply` failure, refusal, and trial-proof state.
+    /// Record that an update apply succeeded, clearing `apply` failure and refusal state, and the
+    /// stopped lane's record where its writer no longer runs ([`Self::apply_lane_writer_runs`]).
     pub fn record_apply_success(path: &Path) -> Self {
         let _lock = Self::lock(path);
         let mut h = Self::read(path);
+        let lane_ends = !h.apply_lane.is_empty() && !h.apply_lane_writer_runs();
         if h.apply_failures == 0
             && h.apply_failures_for_target == 0
             && h.last_apply_refusal.is_empty()
             && h.last_apply_refusal_detail.is_empty()
-            && h.trial_proof_failure.is_empty()
+            && !lane_ends
         {
             return h;
         }
         h.clear_apply_refusal();
-        h.trial_proof_failure = String::new();
-        h.trial_proof_failure_at = String::new();
-        h.trial_proof_failure_build = 0;
+        if lane_ends {
+            h.clear_apply_lane();
+        }
         h.apply_failures_for_target = 0;
         h.last_apply_failure_target_build = 0;
         if h.apply_failures > 0 {

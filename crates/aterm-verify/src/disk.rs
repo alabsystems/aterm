@@ -40,10 +40,16 @@
 //! ([`Disk::Covered`], [`aterm_capacity::covering_disk`]): it walks nothing (no measure before it
 //! builds, no meter while it does, no look at its end), claims nothing and keeps nothing, since
 //! one walk of a release clone's build directory reads every file of hundreds of GiB. Every run
-//! says at its end how its disk was held and how many walks it made ([`event`]). A release run
-//! over the whole workspace that passed keeps the record of what its test compile used of the
-//! build directory, and when it began ([`keep_used`]), which the cache's daily bound reads to take
-//! the units of the workspace's own it superseded (`atpkg::build_cache::stale::USED`).
+//! says at its end how its disk was held and how many walks it made ([`event`]). A run whose
+//! compile calls into a build directory completed keeps, at that directory's top, what they used
+//! of it and when the run began, as its scope's run ([`note_call`], [`close`], [`keep_used`];
+//! `atpkg::build_cache::stale::USED`): the record holds the newest run of each scope, and a unit
+//! they stopped using is what the cache takes (`atpkg::build_cache::stale::decide`). Where the
+//! run's record retired units, the run trims that directory itself before it exits, within a
+//! bound on its time ([`trim_used`], `atpkg::build_cache::trim_run_end`), so a checkout's build
+//! directory holds the builds its last runs use and not the ones they replaced: on 2026-11-12
+//! one session's landing checks grew a build directory from 7 to 64 GiB in six hours, and
+//! nothing took what they had replaced.
 
 use std::path::{Path, PathBuf};
 
@@ -456,24 +462,88 @@ fn main_leaf(ctx: &Ctx) -> Result<Option<MainLeaf>, String> {
     }))
 }
 
-/// Note what a call of the test compile used of the main lane's build directory
-/// ([`crate::shape::Run::used`]): the packages it built tests of (the workspace's own), and the
-/// unit each artifact's file and each build script's run (`script_runs`, their `out_dir`s) is of,
-/// fresh or built. A file cargo copied out of the build directory into the target (a bin a test
-/// needs) is read as the unit it is a copy of, by its package and the profile it lies under in
-/// the target ([`atpkg::build_cache::stale::Used::add_uplifted`]).
-pub fn note_used(ctx: &Ctx, artifacts: &[crate::shape::Artifact], script_runs: &[String]) {
-    let Ok(Some(leaf)) = main_leaf(ctx) else {
+/// A build directory a run's compile calls build into, which [`crate::shape::Run::used`] keeps
+/// what they reported by.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Dir {
+    /// The main lane's, resolved when it is read ([`main_leaf`]): the build directory of the
+    /// run's own target ([`Ctx::target_dir`]).
+    Main,
+    /// A side lane's, by its path: the lane's target directory, which holds its intermediates
+    /// too (`crate::plan::lane_dir`).
+    Side(PathBuf),
+}
+
+/// The build directory `cmd` builds into, by the last `CARGO_TARGET_DIR` among its own variables
+/// ([`crate::exec::Cmd::envs`]): the main lane's where it names none (every child is handed the
+/// run's target, [`Ctx::child_env_add`]) or names the run's target; the lint lane's where it
+/// names that lane's directory; `None` for any other (a directory no record is kept of).
+fn dir_of(ctx: &Ctx, cmd: &crate::exec::Cmd) -> Option<Dir> {
+    let Some((_, target)) = cmd
+        .envs
+        .iter()
+        .rev()
+        .find(|(name, _)| name.as_os_str() == "CARGO_TARGET_DIR")
+    else {
+        return Some(Dir::Main);
+    };
+    let target = Path::new(target);
+    if target == ctx.target_dir.as_path() {
+        return Some(Dir::Main);
+    }
+    crate::plan::lane_dir(ctx, crate::plan::Lane::TippyTarget)
+        .filter(|lane| lane.as_path() == target)
+        .map(Dir::Side)
+}
+
+/// Note what the compile call `cmd` used of the build directory it builds into ([`dir_of`],
+/// [`note_used`]): the artifacts and build script runs its `stdout` reports (Cargo's messages,
+/// `None` where they could not be read), and whether it passed (`ok`). A call whose messages
+/// could not be read is noted as one that did not pass: what it used is not known.
+pub fn note_call(ctx: &Ctx, cmd: &crate::exec::Cmd, stdout: Option<&str>, ok: bool) {
+    let Some(dir) = dir_of(ctx, cmd) else {
         return;
     };
-    let Ok(leaf) = leaf.path() else {
-        return;
+    let artifacts = stdout.map(crate::shape::artifacts).unwrap_or_default();
+    let script_runs = stdout.map(crate::shape::script_runs).unwrap_or_default();
+    note_used(ctx, &dir, &artifacts, &script_runs, ok && stdout.is_some());
+}
+
+/// Note what a compile call used of the build directory `dir` ([`crate::shape::Run::used`]): the
+/// packages it built tests of (the workspace's own), and the unit each artifact's file and each
+/// build script's run (`script_runs`, their `out_dir`s) is of, fresh or built. For the main
+/// lane's, a file cargo copied out of the build directory into the target (a bin a test needs)
+/// is read as the unit it is a copy of, by its package and the profile it lies under in the
+/// target ([`atpkg::build_cache::stale::Used::add_uplifted`]). A call that did not pass (`ok`
+/// false), or one into a main lane whose build directory cannot be resolved, marks the
+/// directory's note failed ([`crate::shape::Noted::failed`]), so the run keeps nothing of it.
+pub fn note_used(
+    ctx: &Ctx,
+    dir: &Dir,
+    artifacts: &[crate::shape::Artifact],
+    script_runs: &[String],
+    ok: bool,
+) {
+    // `main_leaf` takes the run's lock itself: resolve before taking it here.
+    let leaf = match dir {
+        Dir::Main => main_leaf(ctx)
+            .ok()
+            .flatten()
+            .and_then(|leaf| leaf.path().ok().map(Path::to_path_buf)),
+        Dir::Side(dir) => Some(dir.clone()),
     };
     let mut run = ctx
         .shape_run
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let used = &mut run.used;
+    let noted = run.used.entry(dir.clone()).or_default();
+    noted.failed |= !ok;
+    let Some(leaf) = leaf else {
+        noted.failed = true;
+        return;
+    };
+    let leaf = leaf.as_path();
+    let used = &mut noted.used;
     for artifact in artifacts {
         if artifact.test
             && let Some(package) = &artifact.package
@@ -483,8 +553,9 @@ pub fn note_used(ctx: &Ctx, artifacts: &[crate::shape::Artifact], script_runs: &
         for file in artifact.filenames.iter().map(Path::new) {
             if file.starts_with(leaf) {
                 used.add(leaf, file);
-            } else if let (Some(package), Some(profile)) =
-                (artifact.package.as_deref(), uplift_profile(ctx, file))
+            } else if matches!(dir, Dir::Main)
+                && let (Some(package), Some(profile)) =
+                    (artifact.package.as_deref(), uplift_profile(ctx, file))
             {
                 used.add_uplifted(leaf, &profile, package, file);
             }
@@ -493,6 +564,35 @@ pub fn note_used(ctx: &Ctx, artifacts: &[crate::shape::Artifact], script_runs: &
     for out in script_runs {
         used.add(leaf, Path::new(out));
     }
+}
+
+/// The call that completes what the run builds into `dir` passed ([`crate::shape::Noted::closed`]):
+/// for the main lane's, the test compile's whole or closing call; for the lint lane's, the last
+/// of a dev run's lint passes over its selection, all of which passed. Without it the run keeps
+/// nothing of `dir`: a run that never made that call (a check that builds no tests, a test
+/// compile that failed before or in it, a release's lint, which lints package by package)
+/// reported only some of what its scope uses.
+pub fn close(ctx: &Ctx, dir: &Dir) {
+    ctx.shape_run
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .used
+        .entry(dir.clone())
+        .or_default()
+        .closed = true;
+}
+
+/// The run skipped, as it ran, a stage that builds into the main lane's build directory, named
+/// by `stage` (a windowed check behind a locked console: no flag of the run says it, so no word
+/// of its selection does). What the run reports of that directory leaves that stage's units out,
+/// so the run is kept under a scope of its own ([`run_key`]) and replaces no run that built
+/// them: under the same scope its record would retire every unit only that stage reported.
+pub fn note_skipped(ctx: &Ctx, stage: &'static str) {
+    ctx.shape_run
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .skipped
+        .insert(stage);
 }
 
 /// The profile a file cargo copied into the run's target lies under: `debug` for
@@ -514,50 +614,257 @@ fn uplift_profile(ctx: &Ctx, file: &Path) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// Keep, for a release run (`release`, or `--as-release`: [`Ctx::checkers_in_tests`]) over the
-/// whole workspace that `passed`, the record of what its test compile used ([`note_used`]) and
-/// when it began ([`Ctx::began`]) at the top of its build directory
-/// (`atpkg::build_cache::stale::USED`), which the cache's daily bound reads to take what it
-/// superseded: the line its log says, or `None` where nothing is kept (another run; one over less
-/// than the workspace, whose graph builds its crates under other features than the release's, so
-/// its record would not name the release's units; one that failed; one whose test compile reported
-/// no unit of a build directory verify places).
+/// What a run's record of the units it used is kept by, in the record at the top of a build
+/// directory (`atpkg::build_cache::stale::Kept::runs`): its checkout, the work it does as the
+/// machine's record spells it ([`selection_of`]: the checks that build, `as-release`, and what
+/// narrows them, `--compile-only` and `--no-windows` among them), its packages or the whole
+/// workspace, and each stage that builds into the main lane's build directory which it skipped
+/// as it ran ([`note_skipped`]: so it is the key of a run that has ended, and read at its end).
+/// Two runs that build the same units under the same features spell it alike, so the later
+/// replaces the earlier and retires what it stopped using; a run that builds other units (other
+/// packages, another check, a narrowed one, one that skipped a stage that builds) keeps a run of
+/// its own beside it.
 #[must_use]
-pub fn keep_used(ctx: &Ctx, passed: bool) -> Option<String> {
-    if !passed || !ctx.checkers_in_tests || !ctx.scope.is_workspace() {
-        return None;
+pub fn run_key(ctx: &Ctx) -> String {
+    let selection = selection_of(ctx);
+    let mut key = format!("verify {} {}", ctx.root.display(), selection.work);
+    match selection.crates {
+        Some(crates) => {
+            for name in crates {
+                key.push_str(" -p ");
+                key.push_str(&name);
+            }
+        }
+        None => key.push_str(" --workspace"),
     }
-    let binding = main_leaf(ctx).ok()??;
-    let mut used = ctx
+    let run = ctx
+        .shape_run
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for stage in &run.skipped {
+        key.push_str(" --skipped=");
+        key.push_str(stage);
+    }
+    key
+}
+
+/// One build directory a run kept its record in ([`keep_used`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptDir {
+    /// Which of the run's build directories it is.
+    pub of: Dir,
+    /// The build directory, whose top holds the record.
+    pub dir: PathBuf,
+    /// What the run's log says of it.
+    pub line: String,
+    /// How many units the record says this run retired
+    /// (`atpkg::build_cache::stale::Kept::end`); 0 where the record was not written.
+    pub retired: usize,
+    /// The directory the record was written in, by its device and inode as they were read once
+    /// it was (the path's own, never a link's target): what [`trim_used`] trims, and nothing
+    /// else that later stands at the path. `None` where the record was not written, or the
+    /// directory could not be read: nothing of it is trimmed.
+    pub bound: Option<(u64, u64)>,
+}
+
+/// Keep, for each build directory the run's compile calls completed in (its closing call
+/// passed, [`close`], and no call into it failed, [`note_used`]), what they used of it and when
+/// the run began ([`Ctx::began`]) as its scope's run ([`run_key`]) in the record at the
+/// directory's top (`atpkg::build_cache::stale::USED`), which replaces the scope's run before
+/// and retires what the kept runs no longer use: one entry for each directory written or tried,
+/// with the line the run's log says and, where the record was written, the directory it was
+/// written in ([`KeptDir::bound`]). Nothing where the main lane's build directory cannot be
+/// read (an error, or one replaced under the run), and no entry for a directory whose calls did
+/// not complete or reported no unit of it; a run of any check, selection or tier keeps its own.
+#[must_use]
+pub fn keep_used(ctx: &Ctx) -> Vec<KeptDir> {
+    let Ok(main) = main_leaf(ctx) else {
+        return Vec::new();
+    };
+    let noted: Vec<(Dir, atpkg::build_cache::stale::Used)> = ctx
         .shape_run
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .used
-        .clone();
-    used.began_ms = ctx
+        .iter()
+        .filter(|(_, noted)| noted.closed && !noted.failed)
+        .map(|(dir, noted)| (dir.clone(), noted.used.clone()))
+        .collect();
+    let began_ms = ctx
         .began
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
-    let units: usize = used
-        .profiles
-        .values()
-        .map(std::collections::BTreeSet::len)
-        .sum();
-    if units == 0 {
-        return None;
+    let key = run_key(ctx);
+    let mut out = Vec::new();
+    for (of, mut used) in noted {
+        let leaf = match &of {
+            Dir::Main => match main.as_ref().map(MainLeaf::path) {
+                Some(Ok(leaf)) => leaf.to_path_buf(),
+                _ => continue,
+            },
+            Dir::Side(dir) => dir.clone(),
+        };
+        used.began_ms = began_ms;
+        let units: usize = used
+            .profiles
+            .values()
+            .map(std::collections::BTreeSet::len)
+            .sum();
+        if units == 0 {
+            continue;
+        }
+        let mut kept = atpkg::build_cache::stale::Kept::read(&leaf);
+        let retired = kept.end(&key, used);
+        let record = leaf.join(atpkg::build_cache::stale::USED);
+        let (line, retired, bound) = match kept.keep(&leaf) {
+            Ok(()) => (
+                format!(
+                    "disk: kept the {units} unit(s) this run used in {}, {retired} unit(s) its \
+                     kept runs stopped using retired",
+                    record.display()
+                ),
+                retired,
+                identity(&leaf),
+            ),
+            Err(e) => (
+                format!(
+                    "disk: the {units} unit(s) this run used were not kept in {} ({e}); the \
+                     record before stands",
+                    record.display()
+                ),
+                0,
+                None,
+            ),
+        };
+        out.push(KeptDir {
+            of,
+            dir: leaf,
+            line,
+            retired,
+            bound,
+        });
     }
-    let leaf = binding.path().ok()?;
-    Some(match used.keep(leaf) {
-        Ok(()) => format!(
-            "disk: kept the {units} unit(s) this release run used as {}, which the cache's \
-             bound reads to take what it superseded",
-            leaf.join(atpkg::build_cache::stale::USED).display()
-        ),
-        Err(e) => format!(
-            "disk: the {units} unit(s) this release run used were not kept ({e}); the cache's \
-             bound reads the record before"
-        ),
+    out
+}
+
+/// The real directory at `dir`, by its device and inode; `None` where nothing stands there, it
+/// cannot be read, or it is no directory (a link is not followed).
+fn identity(dir: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::symlink_metadata(dir)
+        .ok()
+        .filter(std::fs::Metadata::is_dir)
+        .map(|meta| (meta.dev(), meta.ino()))
+}
+
+/// The most of a run's end its trim takes ([`trim_used`]), over all its build directories: the
+/// verdict is decided and said by then, and what waits on the run's exit (the landing's push,
+/// whoever awaits the run) waits no longer than this for it. What a trim had moved aside when
+/// its time ran out stays staged in the build directory, and the next run to end there finishes
+/// it.
+const TRIM_WITHIN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// TRIM, AT THE RUN'S END, EACH BUILD DIRECTORY IT KEPT ITS RECORD IN (`kept`, [`keep_used`];
+/// `atpkg::build_cache::trim_run_end`): a trim an earlier run left staged there is finished
+/// (nothing else finishes one: the cache's pass never looks inside a build directory for a
+/// stage), and, where this run's record retired units, the units no kept run uses go through the
+/// cache's own fences (cargo's locks held, the process check, custody, staged aside, then
+/// removed). All of it is held to [`TRIM_WITHIN`] and stops once an interrupt is ending the run
+/// ([`crate::stopping`]). One line for the run's log for each directory there is something to
+/// say of: what went and the bytes freed; that the trim stopped with what it took still staged,
+/// which the next run to end there finishes; or why nothing retired went (a build holds the
+/// directory's locks, a process uses it, nothing retired met the rule). Retired units a trim
+/// did not take are not retired again by the next run's record
+/// (`atpkg::build_cache::stale::Kept::retired` is computed at each end): they wait out the stale
+/// window like any unit no kept run names, and go in a pass of the cache (the main lane's) or in
+/// a later trim that retires something there (a side lane's, whose record no pass reads). A
+/// directory is trimmed only while the directory its record was written in still stands at its
+/// path ([`KeptDir::bound`]: the same device and inode, no link), and the main lane's only
+/// while it still resolves to that path; one replaced under the run is left alone, and so is
+/// one whose record was not written.
+#[must_use]
+pub fn trim_used(ctx: &Ctx, kept: &[KeptDir]) -> Vec<String> {
+    let until = std::time::Instant::now() + TRIM_WITHIN;
+    let within = || !crate::stopping() && std::time::Instant::now() < until;
+    trim_used_with(ctx, kept, &|dir| {
+        atpkg::build_cache::trim_run_end(dir, std::time::SystemTime::now(), &within)
     })
+}
+
+/// [`trim_used`], each directory trimmed by `trim`.
+fn trim_used_with(
+    ctx: &Ctx,
+    kept: &[KeptDir],
+    trim: &dyn Fn(&Path) -> atpkg::build_cache::Trimmed,
+) -> Vec<String> {
+    use atpkg::build_cache::Unused;
+    let mut said = Vec::new();
+    for one in kept {
+        let Some(bound) = one.bound else {
+            continue;
+        };
+        let dir = one.dir.as_path();
+        let resolves = one.of != Dir::Main
+            || main_leaf(ctx)
+                .ok()
+                .flatten()
+                .is_some_and(|leaf| leaf.path().is_ok_and(|path| path == dir));
+        if !resolves || identity(dir) != Some(bound) {
+            said.push(format!(
+                "disk: {} was not trimmed (the build directory was replaced under the run)",
+                dir.display()
+            ));
+            continue;
+        }
+        let trimmed = trim(dir);
+        // What went: the units the trim took whole, the stages an earlier trim left that it
+        // finished, and the stages that stay for the next trim (stopped, or holding an entry
+        // that would not go).
+        let (mut units, mut finished, mut staged) = (0_usize, 0_usize, 0_usize);
+        for (_, why) in &trimmed.went {
+            match why {
+                Unused::Stale { superseded, .. } => units += *superseded,
+                Unused::Unfinished => finished += 1,
+                Unused::Stayed { .. } | Unused::Revoked { .. } | Unused::Refused { .. } => {
+                    staged += 1;
+                }
+                _ => {}
+            }
+        }
+        let why = trimmed
+            .kept
+            .as_deref()
+            .unwrap_or("its removal did not finish");
+        let freed = atpkg::admit_disk::size(trimmed.freed);
+        if units > 0 {
+            said.push(format!(
+                "disk: trimmed {units} unit(s) no kept run uses from {}, {freed} freed",
+                dir.display()
+            ));
+            continue;
+        }
+        if finished > 0 {
+            said.push(format!(
+                "disk: finished {finished} trim(s) an earlier run left staged in {}, {freed} freed",
+                dir.display()
+            ));
+        }
+        if staged > 0 {
+            said.push(format!(
+                "disk: the trim of {} stopped with what it had moved aside still staged there \
+                 ({why}); the next run to end there finishes it",
+                dir.display()
+            ));
+        } else if one.retired > 0 {
+            said.push(format!(
+                "disk: {} retired unit(s) in {} were not trimmed ({why}); they wait out the stale \
+                 window like any unit no kept run names",
+                one.retired,
+                dir.display()
+            ));
+        }
+    }
+    said
 }
 
 /// What the run does with its disk claim's answer: holds the claim while it builds; or, where no

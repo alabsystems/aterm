@@ -807,8 +807,8 @@ fn claude_com_authorize_origin_and_headless_cdp_oauth_complete_without_human_in_
         Some("849204")
     );
 
-    let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
-    let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
+    let (to_browser_r, to_browser_w) = aterm_uds::pipe().expect("pipe");
+    let (from_browser_r, mut from_browser_w) = aterm_uds::pipe().expect("pipe");
 
     let authorize_url = concat!(
         "https://claude.com/cai/oauth/authorize",
@@ -1613,8 +1613,8 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         Some(rfc_secret)
     );
 
-    let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe1");
-    let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe2");
+    let (to_browser_r, to_browser_w) = aterm_uds::pipe().expect("pipe1");
+    let (from_browser_r, mut from_browser_w) = aterm_uds::pipe().expect("pipe2");
 
     let authorize_url = "https://claude.com/cai/oauth/authorize?client_id=c1&redirect_uri=http%3A%2F%2F127.0.0.1%3A9123%2Fcallback&state=st_webmail_42";
 
@@ -1802,8 +1802,8 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         ]
     );
     // The Maildir polls below take a client whose browser is gone, as that one's now is.
-    let (_, to_browser_w) = std::io::pipe().expect("pipe1");
-    let (from_browser_r, _) = std::io::pipe().expect("pipe2");
+    let (_, to_browser_w) = aterm_uds::pipe().expect("pipe1");
+    let (from_browser_r, _) = aterm_uds::pipe().expect("pipe2");
     let mut cdp = CdpClient::new(to_browser_w, from_browser_r);
 
     fn poll_webmail_fixture(
@@ -1812,8 +1812,8 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         message: &str,
         seen_otps: &mut std::collections::BTreeSet<String>,
     ) -> Result<MailboxCredential, &'static str> {
-        let (to_browser_r, to_browser_w) = std::io::pipe().unwrap();
-        let (from_browser_r, mut from_browser_w) = std::io::pipe().unwrap();
+        let (to_browser_r, to_browser_w) = aterm_uds::pipe().unwrap();
+        let (from_browser_r, mut from_browser_w) = aterm_uds::pipe().unwrap();
         let message = message.to_owned();
         let browser = std::thread::spawn(move || {
             let mut reader = to_browser_r;
@@ -1952,8 +1952,8 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
     );
 
     {
-        let (to_browser_r, to_browser_w) = std::io::pipe().unwrap();
-        let (from_browser_r, mut from_browser_w) = std::io::pipe().unwrap();
+        let (to_browser_r, to_browser_w) = aterm_uds::pipe().unwrap();
+        let (from_browser_r, mut from_browser_w) = aterm_uds::pipe().unwrap();
         let browser = std::thread::spawn(move || {
             let mut reader = to_browser_r;
             let mut pending = Vec::new();
@@ -2432,8 +2432,8 @@ totp_secret = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ" # gitleaks:allow
         assert!(step_js.contains("switched_account"));
         assert!(step_js.contains("wrong_account"));
 
-        let (to_r, to_w) = std::io::pipe().expect("pipe1");
-        let (from_r, mut from_w) = std::io::pipe().expect("pipe2");
+        let (to_r, to_w) = aterm_uds::pipe().expect("pipe1");
+        let (from_r, mut from_w) = aterm_uds::pipe().expect("pipe2");
         let wrong_thread = std::thread::spawn(move || {
             let mut reader = to_r;
             let mut pending = Vec::new();
@@ -3230,8 +3230,8 @@ fn recovered_callbacks_require_delivery_but_reached_callbacks_allow_duplicates()
         Observation::ReachedPage,
     ] {
         for delivery in [Ok(200), Ok(500), Err("callback delivery failed")] {
-            let (to_r, to_w) = std::io::pipe().expect("pipe1");
-            let (from_r, mut from_w) = std::io::pipe().expect("pipe2");
+            let (to_r, to_w) = aterm_uds::pipe().expect("pipe1");
+            let (from_r, mut from_w) = aterm_uds::pipe().expect("pipe2");
             let browser_thread = std::thread::spawn(move || {
                 let mut reader = to_r;
                 let mut pending = Vec::new();
@@ -5428,8 +5428,8 @@ fn scripted_oauth_replies(
     std::thread::JoinHandle<usize>,
 ) {
     use super::super::headless_oauth::{CdpClient, split_nul_messages};
-    let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
-    let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
+    let (to_browser_r, to_browser_w) = aterm_uds::pipe().expect("pipe");
+    let (from_browser_r, mut from_browser_w) = aterm_uds::pipe().expect("pipe");
     let browser = std::thread::spawn(move || {
         let mut reader = to_browser_r;
         let mut pending = Vec::new();
@@ -5523,8 +5523,8 @@ fn oauth_control_eof_records_a_hostless_outcome_before_the_first_page() {
     use super::super::headless_oauth::{
         CdpClient, drive_cdp_oauth_within, split_nul_messages, take_met,
     };
-    let (mut commands, to_browser) = std::io::pipe().unwrap();
-    let (from_browser, events) = std::io::pipe().unwrap();
+    let (mut commands, to_browser) = aterm_uds::pipe().unwrap();
+    let (from_browser, events) = aterm_uds::pipe().unwrap();
     drop(events);
     let mut cdp = CdpClient::new(to_browser, from_browser);
     let result = drive_cdp_oauth_within(

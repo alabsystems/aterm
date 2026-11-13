@@ -38,6 +38,8 @@
 //! A measured binary retains at least the initial four-thread width, narrowed by its test
 //! count, caller ceiling and measured CPU demand. A whole-run target cannot turn an isolated
 //! concurrent suite into a serial one merely because unrelated suites take longer.
+//! This minimum belongs to the preferred plan. A smaller positive ledger grant caps the
+//! admitted binary's execution charge and width, as pool tokens do.
 //! The plan has a target `T`: each binary runs at the narrowest remaining width whose predicted wall is
 //! within `T` (its widest where none is), so the long poles get the width they need and the rest
 //! leave the share to each other. A binary's widest is `min(S, n, ceiling)`, and no wider than
@@ -313,7 +315,9 @@ pub enum Phase {
 /// the next binary locally fits once nothing runs. Under fair completion and external admission,
 /// every queued binary starts unless the run halts. Ledger/FIFO controls cover external refusal
 /// and rollback separately; the local model does not promise global resource availability.
-#[derive(Clone, Debug, PartialEq)]
+/// A smaller positive external grant returns the ungranted core charge through
+/// [`Dispatcher::limit_charge`], preserving the memory peak until completion.
+#[derive(Clone, Debug)]
 pub struct Dispatcher {
     share: u32,
     memory: Option<u64>,
@@ -325,6 +329,22 @@ pub struct Dispatcher {
     held: u32,
     held_bytes: u64,
     halted: bool,
+    generation: u64,
+}
+
+impl PartialEq for Dispatcher {
+    fn eq(&self, other: &Self) -> bool {
+        // An observation generation does not change the dispatcher's semantic state.
+        self.share == other.share
+            && self.memory == other.memory
+            && self.order == other.order
+            && self.at == other.at
+            && self.phase == other.phase
+            && self.next == other.next
+            && self.held == other.held
+            && self.held_bytes == other.held_bytes
+            && self.halted == other.halted
+    }
 }
 
 /// The unchanged dispatch limits at a rejected local start attempt.
@@ -372,6 +392,7 @@ impl Dispatcher {
             held: 0,
             held_bytes: 0,
             halted: false,
+            generation: 0,
         }
     }
 
@@ -387,8 +408,8 @@ impl Dispatcher {
             && (!running || live + f64::from(b.charge) <= f64::from(self.share) + 1.0)
     }
 
-    /// Start the first fitting queued binary of the plan: it then holds its charge and its
-    /// peak until [`Dispatcher::finish`].
+    /// Start the first fitting queued binary of the plan. Its peak stays held until
+    /// [`Dispatcher::finish`]; [`Dispatcher::limit_charge`] can return ungranted cores earlier.
     pub fn next(&mut self, live: f64) -> Option<Planned> {
         self.next_with(live, &mut |_| true)
     }
@@ -433,7 +454,50 @@ impl Dispatcher {
         self.phase[b.index] = Phase::Running;
         self.held += b.charge;
         self.held_bytes = self.held_bytes.saturating_add(b.peak);
+        self.generation = self.generation.wrapping_add(1);
         Some(b)
+    }
+
+    /// Changes whenever a dispatch transition can invalidate an external rejection probe.
+    pub(crate) const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Return the ungranted part of a running binary's core charge. Its memory stays held.
+    /// The caller retains the external grant that bounds the binary's execution width.
+    /// # Errors
+    /// The binary is not running, or `granted` is zero or exceeds its current charge.
+    pub fn limit_charge(&mut self, index: usize, granted: u32) -> Result<(), &'static str> {
+        if self.phase.get(index) != Some(&Phase::Running) {
+            return Err("that binary is not running");
+        }
+        let b = self
+            .at
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|place| self.order.get_mut(place))
+            .ok_or("that binary is not in the plan")?;
+        if granted == 0 || granted > b.charge {
+            return Err("a grant must retain at least one core without increasing its charge");
+        }
+        if granted < b.charge {
+            self.held -= b.charge - granted;
+            b.charge = granted;
+            self.generation = self.generation.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// This binary's preferred charge, reduced to its actual grant once reconciled.
+    #[must_use]
+    pub fn charge(&self, index: usize) -> Option<u32> {
+        self.at
+            .get(index)
+            .copied()
+            .flatten()
+            .and_then(|place| self.order.get(place))
+            .map(|binary| binary.charge)
     }
 
     /// Binary `index` ended: its charge and its peak go back.
@@ -454,11 +518,15 @@ impl Dispatcher {
         self.phase[index] = Phase::Done;
         self.held -= b.charge;
         self.held_bytes = self.held_bytes.saturating_sub(b.peak);
+        self.generation = self.generation.wrapping_add(1);
         Ok(())
     }
 
     /// Start nothing more.
     pub fn halt(&mut self) {
+        if !self.halted {
+            self.generation = self.generation.wrapping_add(1);
+        }
         self.halted = true;
     }
 

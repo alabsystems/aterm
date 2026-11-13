@@ -82,7 +82,7 @@ fn switch_off_during_idle(in_step: bool) {
             if sid == "off" && in_step {
                 release_after_edit(&release, &entered_tx);
             }
-            "wait:point".to_string()
+            UpgradeStep::unknown("wait:point")
         })
     };
     let host = HostHandle::start(on(), false, false, h);
@@ -159,7 +159,7 @@ fn revoke_exit_read(commit: bool) {
     };
     h.acts.carry = {
         let carries = Arc::clone(&carries);
-        Arc::new(move |_, _, _, _, _| {
+        Arc::new(move |_, _, _, _, _, _| {
             carries.fetch_add(1, Ordering::SeqCst);
             "done".to_string()
         })

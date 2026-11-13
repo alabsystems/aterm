@@ -666,6 +666,7 @@ pub fn processes(bytes: &[u8], base: u64) -> Sweep {
                     version: None,
                     birth_ms: start.and_then(crate::procs::birth_of_filetime),
                     reaps_unwaited: None,
+                    threads: None,
                 },
                 i64_at(rec, offset_of!(ProcessInformation64, create_time)).unwrap_or(0),
             ));

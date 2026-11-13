@@ -29,8 +29,10 @@ pub(crate) fn push_grid_quad(
     if w <= 0 || h <= 0 || (premul == 0 && alpha == 0) {
         return;
     }
-    let gw = (geom.cols * geom.cw) as i32;
-    let gh = (geom.rows * geom.ch) as i32;
+    // The grid inside the overlay pixel space: every narrowing below is then exact.
+    let space = crate::cursor_glow::OVERLAY_PX_MAX;
+    let gw = ((geom.cols * geom.cw) as i32).min(space);
+    let gh = ((geom.rows * geom.ch) as i32).min(space);
     let x0 = x.max(0);
     let x1 = (x + w).min(gw);
     let y0 = y.max(0);
@@ -237,14 +239,13 @@ pub(crate) fn push_fx_ramp(
         right.1 == 0,
         "a quad's blend mode is per quad, never per end"
     );
-    debug_assert!(
-        geom.fx_right() <= i32::from(u16::MAX) && geom.fx_bot() <= i32::from(u16::MAX),
-        "effects-box pixel extent exceeds u16 GlowQuad range"
-    );
+    // The effects box inside the overlay pixel space: every narrowing below is then exact, and
+    // a ramp cut at the space's edge ends on its colour there.
+    let space = crate::cursor_glow::OVERLAY_PX_MAX;
     let x0 = x.max(geom.fx_left());
-    let x1 = (x + w).min(geom.fx_right());
+    let x1 = (x + w).min(geom.fx_right()).min(space);
     let y0 = y.max(geom.fx_top());
-    let y1 = (y + h).min(geom.fx_bot());
+    let y1 = (y + h).min(geom.fx_bot()).min(space);
     if x1 <= x0 || y1 <= y0 {
         return;
     }

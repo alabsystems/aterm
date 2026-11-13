@@ -401,6 +401,14 @@ pub(crate) enum StyleRef {
     Chip,
     /// A note under a row or an item: Caption, in the readable secondary ink.
     Note,
+    /// Plain words dimmed: Body, in the tertiary ink (a writer known only by its short id).
+    Faint,
+    /// A note dimmed: Caption, in the tertiary ink.
+    FaintNote,
+    /// "Not written" and only that ([`crate::native_appearance::NOT_WRITTEN`]): a group is
+    /// washed in it with a mark down its leading edge, words are set in its ink, a button is a
+    /// Primary one in it.
+    Unwritten,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -491,7 +499,8 @@ impl GroupSpec {
 
     /// The backdrop the group paints, as its audit line names it (`surface=`): `page` (an
     /// application's ground), `navigation` (a sidebar), `hero` and `card` (an elevated card, the
-    /// hero tinted with the accent), `code` (a code block), or `none`.
+    /// hero tinted with the accent), `code` (a code block), `unwritten` (a change not yet
+    /// written), or `none`.
     pub(crate) const fn backdrop(&self) -> &'static str {
         match (self.role, self.style) {
             (SemanticRole::Application, _) => "page",
@@ -499,6 +508,7 @@ impl GroupSpec {
             (_, StyleRef::Primary) => "hero",
             (_, StyleRef::Secondary) => "card",
             (_, StyleRef::Code) => "code",
+            (_, StyleRef::Unwritten) => "unwritten",
             _ => "none",
         }
     }
@@ -3116,7 +3126,7 @@ impl UiTree {
         };
         fn find_default(node: &UiNode) -> Option<(UiKey, ActionId)> {
             if let UiContent::Button(control) = &node.content
-                && control.style == StyleRef::Primary
+                && matches!(control.style, StyleRef::Primary | StyleRef::Unwritten)
                 && control.state.enabled
             {
                 return Some((node.key.clone(), control.action.clone()));
@@ -4374,6 +4384,23 @@ impl CompiledUi {
             }
         }
         failures
+    }
+
+    /// What each painted node draws under `roles`, by its key.
+    #[cfg(all(test, unix))]
+    pub(crate) fn painted(
+        &self,
+        roles: crate::settings::Roles,
+    ) -> Vec<(UiKey, Vec<crate::widget::DrawPrim>)> {
+        let theme = aterm_render::Theme::default();
+        self.paint
+            .iter()
+            .map(|node| {
+                let mut prims = Vec::new();
+                paint_compiled_node(&mut prims, node, roles, theme, 14.0);
+                (node.key.clone(), prims)
+            })
+            .collect()
     }
 
     /// Every line of words or icon a clip edge slices through (a faded bottom edge aside), as
@@ -5977,7 +6004,9 @@ fn text_typography_for(role: SemanticRole, style: StyleRef) -> (TypeStep, crate:
         _ if style == StyleRef::Code => (TypeStep::Body, TextFace::Mono),
         SemanticRole::Status if style == StyleRef::Primary => (TypeStep::Body, TextFace::Ui),
         SemanticRole::Status => (TypeStep::Caption, TextFace::Ui),
-        _ if style == StyleRef::Note => (TypeStep::Caption, TextFace::Ui),
+        _ if matches!(style, StyleRef::Note | StyleRef::FaintNote) => {
+            (TypeStep::Caption, TextFace::Ui)
+        }
         _ => (TypeStep::Body, TextFace::Ui),
     }
 }
@@ -6117,6 +6146,30 @@ fn paint_compiled_node_at(
                 if joined {
                     prims.push(DrawPrim::ClipPop);
                 }
+            } else if spec.style == StyleRef::Unwritten {
+                prims.push(DrawPrim::Panel {
+                    x: rect.x,
+                    y: rect.y,
+                    w: rect.width,
+                    h: rect.height,
+                    radius: 4.0,
+                    fill: rgba(
+                        mix_rgb(
+                            roles.elevated,
+                            roles.unwritten,
+                            crate::native_appearance::UNWRITTEN_WASH,
+                        ),
+                        255,
+                    ),
+                });
+                prims.push(DrawPrim::Panel {
+                    x: rect.x,
+                    y: rect.y,
+                    w: 3.0_f32.min(rect.width),
+                    h: rect.height,
+                    radius: 1.5,
+                    fill: rgba(roles.unwritten, 255),
+                });
             } else if spec.style == StyleRef::Code {
                 let (rect, joined) = open_box(prims, rect, node.joins, 10.0);
                 prims.push(DrawPrim::Panel {
@@ -6185,7 +6238,8 @@ fn paint_compiled_node_at(
         }
         UiContent::Button(control) => {
             let style = button_paint_style(control);
-            let primary = style == StyleRef::Primary;
+            let unwritten = style == StyleRef::Unwritten;
+            let primary = style == StyleRef::Primary || unwritten;
             let danger = style == StyleRef::Danger;
             let selected = control.state.selected;
             let navigation = style == StyleRef::Navigation;
@@ -6203,6 +6257,8 @@ fn paint_compiled_node_at(
             let idle = control.state.muted && control.state.enabled;
             let mark = if idle {
                 roles.text_tertiary
+            } else if unwritten {
+                roles.unwritten
             } else {
                 roles.accent
             };
@@ -9562,6 +9618,8 @@ fn style_text_color(style: StyleRef, roles: &crate::settings::Roles) -> [u8; 3] 
     match style {
         StyleRef::Hero | StyleRef::Primary => roles.text_primary,
         StyleRef::Accent => roles.accent_ink,
+        StyleRef::Unwritten => roles.unwritten_ink,
+        StyleRef::Faint | StyleRef::FaintNote => roles.text_tertiary,
         StyleRef::Success => roles.success,
         StyleRef::Danger | StyleRef::DangerCompact => roles.danger,
         StyleRef::Quiet => quiet_text(roles),

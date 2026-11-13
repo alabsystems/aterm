@@ -30,6 +30,18 @@ pub(crate) use produced::RegistrationPending;
 
 pub(super) const PRIMARY_TARGET: i32 = 6;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootPurpose {
+    Workload,
+    NativeJob,
+}
+
+pub(super) fn native_job_request(request: &aterm_types::resource_admission::Submission) -> bool {
+    request.argv.get(1).is_some_and(|word| {
+        word == trust_resource_controller::native_job::STARTUP_ARGUMENT.as_bytes()
+    })
+}
+
 pub(super) fn compiler_input(
     sdk: &sdk::Keeper,
     root_deadline: Instant,
@@ -47,6 +59,7 @@ pub(super) fn purpose(request: &aterm_types::resource_admission::Submission) -> 
         .argv
         .get(1)
         .is_some_and(|word| word == wire::WORKLOAD_STARTUP_ARGUMENT.as_bytes())
+        || native_job_request(request)
 }
 pub(super) fn closed_request(request: &aterm_types::resource_admission::Submission) -> bool {
     request.cpu_units > 0
@@ -57,7 +70,8 @@ pub(super) fn closed_request(request: &aterm_types::resource_admission::Submissi
                     .checked_add(Duration::from_millis(ms))
                     .is_some()
         })
-        && matches!(request.argv.as_slice(), [_, entry] if entry == wire::WORKLOAD_STARTUP_ARGUMENT.as_bytes())
+        && matches!(request.argv.as_slice(), [_, entry] if entry == wire::WORKLOAD_STARTUP_ARGUMENT.as_bytes()
+            || entry == trust_resource_controller::native_job::STARTUP_ARGUMENT.as_bytes())
 }
 
 pub(super) struct Primary {
@@ -195,10 +209,31 @@ impl Primary {
     }
 }
 
+struct PreparedRootReady {
+    context: trust_resource_controller::ContextReply,
+    owner: Arc<Primary>,
+    deadline: Instant,
+    sha256: [u8; 32],
+    set: Vec<host::PrimaryCpu>,
+}
+
 pub(crate) struct ReadyCustody {
     pub(crate) reply: host::ReadyReply,
     owner: Arc<Primary>,
     deadline: Instant,
+}
+pub(crate) struct NativeReadyCustody {
+    pub(crate) reply: trust_resource_controller::native_job::host::ReadyReply,
+    owner: Arc<Primary>,
+    deadline: Instant,
+}
+impl NativeReadyCustody {
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    pub(crate) fn descriptions(&self) -> io::Result<Vec<std::os::fd::OwnedFd>> {
+        self.owner.descriptions()
+    }
 }
 impl ReadyCustody {
     pub(crate) fn deadline(&self) -> Instant {
@@ -221,6 +256,7 @@ impl MemberOriginalCustody {
 }
 
 pub(super) struct State {
+    purpose: RootPurpose,
     pub(super) primary: Arc<Primary>,
     cwd: Vec<u8>,
     environment: Vec<(Vec<u8>, Vec<u8>)>,
@@ -258,11 +294,43 @@ pub(super) struct Census {
     pub(super) refused: bool,
 }
 struct Ready {
-    invocation: wire::WorkloadInvocation,
+    invocation: Invocation,
     sha256: [u8; 32],
     root_attempt: [u8; 16],
     // These are opaque live original owners, not reconstructed observations.
     _output: Arc<trust_resource_provenance::program::produced::HeldOutputRoot>,
+}
+enum Invocation {
+    Workload(wire::WorkloadInvocation),
+    NativeJob(trust_resource_controller::native_job::Plan),
+}
+impl Invocation {
+    fn purpose(&self) -> RootPurpose {
+        match self {
+            Self::Workload(_) => RootPurpose::Workload,
+            Self::NativeJob(_) => RootPurpose::NativeJob,
+        }
+    }
+    fn header(&self) -> trust_resource_controller::native_job::RootHeader<'_> {
+        match self {
+            Self::Workload(value) => {
+                trust_resource_controller::native_job::RootHeader::workload(value)
+            }
+            Self::NativeJob(value) => value.header(),
+        }
+    }
+    fn workload(&self) -> Option<&wire::WorkloadInvocation> {
+        match self {
+            Self::Workload(value) => Some(value),
+            Self::NativeJob(_) => None,
+        }
+    }
+    fn digest(&self) -> io::Result<[u8; 32]> {
+        match self {
+            Self::Workload(value) => Ok(aterm_digest::Sha256::digest(&value.encode()?)),
+            Self::NativeJob(value) => Ok(aterm_digest::Sha256::digest(&value.binding_preimage()?)),
+        }
+    }
 }
 impl State {
     pub(super) fn registration_preparing(&self) -> bool {
@@ -301,6 +369,11 @@ impl State {
             .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()))
             .collect();
         Self {
+            purpose: if matches!(recipe.kind, recipe::Kind::NativeJob) {
+                RootPurpose::NativeJob
+            } else {
+                RootPurpose::Workload
+            },
             primary,
             cwd,
             environment,
@@ -415,11 +488,12 @@ impl State {
     }
     pub(super) fn query_matches(&self, command: &[u8], environment: &[(Vec<u8>, Vec<u8>)]) -> bool {
         self.ready.as_ref().is_some_and(|ready| {
-            command == ready.invocation.compiler.path
+            let header = ready.invocation.header();
+            command == header.compiler.path
                 && environment.iter().all(|(key, value)| match key.as_slice() {
-                    b"CARGO" => value == &ready.invocation.program.path,
-                    b"RUSTC" => value == &ready.invocation.compiler.path,
-                    b"CARGO_HOME" => value == &ready.invocation.cargo_home,
+                    b"CARGO" => value == &header.program.path,
+                    b"RUSTC" => value == &header.compiler.path,
+                    b"CARGO_HOME" => value == header.cargo_home,
                     b"CARGO_CACHE_RUSTC_INFO" => value == b"0",
                     b"LANG" | b"LC_ALL" => value == b"C",
                     _ => false,
@@ -430,9 +504,42 @@ impl State {
         self.cooperative_dispatch()
             && query.validate().is_ok()
             && self.ready.as_ref().is_some_and(|ready| {
-                query.root == ready.invocation.root
-                    && query.program_sha256 == ready.invocation.compiler.sha256
+                let Some(invocation) = ready.invocation.workload() else {
+                    return false;
+                };
+                query.root == invocation.root
+                    && query.program_sha256 == invocation.compiler.sha256
                     && query.member.command.cwd == self.cwd
+                    && self.query_matches(
+                        &query.member.command.program,
+                        &query.member.command.environment,
+                    )
+                    && query.member.command.environment.len() == self.environment.len()
+                    && self
+                        .environment
+                        .iter()
+                        .all(|entry| query.member.command.environment.contains(entry))
+            })
+    }
+    pub(super) fn authorizes_native_query(
+        &self,
+        query: &trust_resource_controller::native_job::query::CompilerQuery,
+    ) -> bool {
+        self.purpose == RootPurpose::NativeJob
+            && self.cooperative_dispatch()
+            && query.validate().is_ok()
+            && self.ready.as_ref().is_some_and(|ready| {
+                let Invocation::NativeJob(plan) = &ready.invocation else {
+                    return false;
+                };
+                query.plan_sha256 == ready.sha256
+                    && query.sdk_root == plan.inputs.sdk_root
+                    && query.compiler == plan.inputs.compiler
+                    && (query.member.command.cwd == self.cwd
+                        || plan
+                            .sources
+                            .iter()
+                            .any(|source| source.root == query.member.command.cwd))
                     && self.query_matches(
                         &query.member.command.program,
                         &query.member.command.environment,
@@ -559,13 +666,68 @@ impl Owner {
         request: &host::ReadyRequest,
     ) -> io::Result<ReadyCustody> {
         request.validate()?;
-        let context = self.context(peer, &request.query)?;
+        let PreparedRootReady {
+            context,
+            owner,
+            deadline,
+            sha256,
+            mut set,
+        } = self.prepare_root_ready(
+            peer,
+            &request.query,
+            Invocation::Workload(request.invocation.clone()),
+        )?;
+        let primary = set.remove(0);
+        Ok(ReadyCustody {
+            reply: host::ReadyReply {
+                context,
+                invocation_sha256: sha256,
+                primary,
+                supplementary: set,
+            },
+            owner,
+            deadline,
+        })
+    }
+    pub(in super::super) fn native_job_ready(
+        &mut self,
+        peer: Peer,
+        request: &trust_resource_controller::native_job::host::ReadyRequest,
+    ) -> io::Result<NativeReadyCustody> {
+        request.validate()?;
+        let PreparedRootReady {
+            context,
+            owner,
+            deadline,
+            sha256,
+            mut set,
+        } = self.prepare_root_ready(
+            peer,
+            &request.query,
+            Invocation::NativeJob(request.plan.clone()),
+        )?;
+        let primary = set.remove(0);
+        Ok(NativeReadyCustody {
+            reply: trust_resource_controller::native_job::host::ReadyReply {
+                context,
+                invocation_sha256: sha256,
+                primary,
+                supplementary: set,
+            },
+            owner,
+            deadline,
+        })
+    }
+    fn prepare_root_ready(
+        &mut self,
+        peer: Peer,
+        query: &trust_resource_controller::ContextQuery,
+        invocation: Invocation,
+    ) -> io::Result<PreparedRootReady> {
+        let context = self.context(peer, query)?;
         let job = self
             .jobs
-            .get_mut(&(
-                request.query.binding.session.clone(),
-                request.query.binding.root_attempt,
-            ))
+            .get_mut(&(query.binding.session.clone(), query.binding.root_attempt))
             .ok_or_else(|| refused("original workload root is unavailable"))?;
         let state = job
             .workload
@@ -575,26 +737,38 @@ impl Owner {
             .metadata_sdk
             .as_ref()
             .ok_or_else(|| refused("original workload SDK missing"))?;
-        let invocation = &request.invocation;
+        let header = invocation.header();
         if state.ready.is_some()
+            || state.purpose != invocation.purpose()
             || !job.members.is_empty()
             || !job.loans.is_empty()
             || !matches!(job.custody, Custody::Cooperative(_))
             || peer.pid != job.child.child_mut().id()
             || peer.birth != job.root_birth
-            || invocation.root != sdk.execution().as_os_str().as_bytes()
-            || invocation.program.path != job.program.as_os_str().as_bytes()
-            || invocation.cwd != state.cwd
+            || header.root != sdk.execution().as_os_str().as_bytes()
+            || header.program.path != job.program.as_os_str().as_bytes()
+            || header.cwd != &state.cwd
             || !state
                 .environment
-                .contains(&(b"CARGO_HOME".to_vec(), invocation.cargo_home.clone()))
+                .contains(&(b"CARGO_HOME".to_vec(), header.cargo_home.clone()))
             || job
                 .timeout
-                .is_none_or(|timeout| u128::from(invocation.timeout_ns) > timeout.as_nanos())
-            || invocation.program.sha256 != sdk.program_sha256()?
+                .is_none_or(|timeout| u128::from(header.timeout_ns) > timeout.as_nanos())
+            || header.program.sha256 != sdk.program_sha256()?
         {
             return Err(refused(
                 "workload readiness differs from its actual original owner",
+            ));
+        }
+        if let Invocation::NativeJob(plan) = &invocation
+            && (plan.inputs.environment.len() != state.environment.len()
+                || !state
+                    .environment
+                    .iter()
+                    .all(|entry| plan.inputs.environment.contains(entry)))
+        {
+            return Err(refused(
+                "native job semantic environment differs from actual original root",
             ));
         }
         sdk.validate_loaded(peer.pid)?;
@@ -607,36 +781,31 @@ impl Owner {
         if !aterm_codec::hex::decode_into(
             compiler.observation().executable.sha256.as_bytes(),
             &mut compiler_sha,
-        ) || compiler_sha != invocation.compiler.sha256
+        ) || compiler_sha != header.compiler.sha256
         {
             return Err(refused(
                 "workload compiler differs from the original pre-GO SDK inputs",
             ));
         }
-        let output_path =
-            std::path::Path::new(std::ffi::OsStr::from_bytes(&invocation.output_root));
+        let output_path = std::path::Path::new(std::ffi::OsStr::from_bytes(header.output_root));
         let output = trust_resource_provenance::program::produced::HeldOutputRoot::open(
             output_path,
             deadline,
         )?;
-        let sha256 = aterm_digest::Sha256::digest(&invocation.encode()?);
-        let mut set = state.primary.observations()?;
-        let primary = set.remove(0);
+        let sha256 = invocation.digest()?;
+        let set = state.primary.observations()?;
         state.ready = Some(Ready {
-            invocation: invocation.clone(),
+            invocation,
             sha256,
-            root_attempt: request.query.binding.root_attempt,
+            root_attempt: query.binding.root_attempt,
             _output: Arc::new(output),
         });
-        Ok(ReadyCustody {
-            reply: host::ReadyReply {
-                context,
-                invocation_sha256: state.ready_digest()?,
-                primary,
-                supplementary: set,
-            },
+        Ok(PreparedRootReady {
+            context,
             owner: Arc::clone(&state.primary),
             deadline: root_deadline,
+            sha256,
+            set,
         })
     }
 }

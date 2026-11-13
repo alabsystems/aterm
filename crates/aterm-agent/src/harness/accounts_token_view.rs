@@ -12,7 +12,8 @@
 //!   table and the clock make each account's [`TokenState`] (§5.1), its login half, and the offer
 //!   where one stands on a host whose verb makes a token ([`Places::offers`]).
 //! - **The offer** is a pair, the token state and the login state (`ok`, `ending` under
-//!   [`ENDING_S`] left, `ended`; `-` while a token is in use), each with the date it began. It
+//!   [`ENDING_S`] left, `ended`; `-` while a token is in use; `none` for a roster row with no
+//!   login on this Mac, [`LoginHere`]), each with the date it began. It
 //!   stands for an account a session here is logged into, in a state [`TokenState::offer`] offers
 //!   for, while no write of this Mac's of the token waits. [`note_offers`] journals
 //!   `token-offered` once per pair, so a re-read journals nothing and no timer offers again.
@@ -21,7 +22,7 @@
 //!
 //! Nothing here reads, holds or prints a token: the vault's standings are value-free.
 
-pub use super::account_card::{ENDING_S, LoginHalf};
+pub use super::account_card::{ENDING_S, LoginHalf, LoginHere};
 use super::accounts::{self, Cli, Store, TokenEntry};
 use super::accounts_step::Step;
 use super::accounts_tokens::{
@@ -45,8 +46,8 @@ pub struct Covered {
     pub label: Option<String>,
     /// A session on this Mac is logged into it.
     pub logged_in: bool,
-    /// Its stored login's half here.
-    pub login: LoginHalf,
+    /// Its stored login here.
+    pub login: LoginHere,
 }
 
 /// The offer standing for an account (§5.9).
@@ -80,8 +81,9 @@ pub struct AccountToken {
     pub pending: Option<bool>,
     /// A session on this Mac is logged into it.
     pub logged_in: bool,
-    /// The offer pair's login half.
-    pub login: LoginHalf,
+    /// The offer pair's login half: [`Covered::login`], or [`LoginHalf::InUse`] while a token is
+    /// in use.
+    pub login: LoginHere,
     /// The offer, where one stands.
     pub offer: Option<Offer>,
 }
@@ -178,8 +180,8 @@ impl AccountToken {
     pub fn phrase(&self, now: i64) -> Option<String> {
         self.offer.as_ref()?;
         let token = format!("token: {}", self.state.word());
-        Some(match self.login {
-            LoginHalf::Ending { end } => {
+        Some(match self.login.half() {
+            Some(LoginHalf::Ending { end }) => {
                 let days = (end - now).max(0) / 86_400;
                 match days {
                     0 => format!("login ends today; {token}"),
@@ -187,8 +189,8 @@ impl AccountToken {
                     n => format!("login ends in {n} days; {token}"),
                 }
             }
-            LoginHalf::Ended { .. } => format!("login ended; {token}"),
-            LoginHalf::InUse | LoginHalf::Ok => token,
+            Some(LoginHalf::Ended { .. }) => format!("login ended; {token}"),
+            Some(LoginHalf::InUse | LoginHalf::Ok) | None => token,
         })
     }
 
@@ -247,8 +249,12 @@ impl AccountToken {
                 parts.push(peers.words(row));
             }
         }
-        if self.login != LoginHalf::InUse && self.label.is_some() {
-            parts.push(format!("login {}", self.login.word()));
+        if self.label.is_some() {
+            match self.login {
+                LoginHere::Half(LoginHalf::InUse) | LoginHere::Unread => {}
+                LoginHere::Half(half) => parts.push(format!("login {}", half.word())),
+                LoginHere::Absent => parts.push("no login here".to_owned()),
+            }
         }
         let mut line = format!("  {} ({}): {}", self.named(), self.email, parts.join("; "));
         if let Some(offer) = &self.offer {
@@ -351,7 +357,7 @@ pub fn account(
 ) -> AccountToken {
     let state = TokenState::of(found, row.as_ref(), now);
     let login = if state.in_use() {
-        LoginHalf::InUse
+        LoginHere::Half(LoginHalf::InUse)
     } else {
         covered.login
     };
@@ -368,7 +374,7 @@ pub fn account(
         state.word(),
         since_word(token_since.and_then(|at| i64::try_from(at).ok())),
         login.word(),
-        since_word(login.since()),
+        since_word(login.half().and_then(LoginHalf::since)),
     );
     let named = covered.label.as_deref().unwrap_or(&covered.email);
     let offer = covered
@@ -425,6 +431,7 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
             .any(|login| accounts::email_matches(&login.email, email))
     };
     if let Some(records) = &records {
+        let enrolled = places.store.enrolled_here(&records.roster);
         for row in &records.roster.rows {
             let (Some(email), Some(entry)) =
                 (row.expected_identity_email(), TokenEntry::of_row(row))
@@ -437,15 +444,24 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
             if out.iter().any(|seen| seen.key == key) {
                 continue;
             }
+            let logged_in = places
+                .logins
+                .iter()
+                .any(|login| row.matches_email(&login.email));
+            // A login of the row's account is on this Mac where a session's login record names
+            // it (the default login's among them) or the row's own directory holds one. A row
+            // on the default login has no directory, and every such row counts as enrolled, so
+            // only a login record says whether the default login is its account's.
+            let holds = logged_in || (row.dir.is_some() && enrolled.contains(&row.label));
             out.push(Covered {
                 key,
                 email: email.to_owned(),
                 label: Some(row.label.clone()),
-                logged_in: places
-                    .logins
-                    .iter()
-                    .any(|login| row.matches_email(&login.email)),
-                login: LoginHalf::of_row(row, &records.logins, &records.state, places.now),
+                logged_in,
+                login: LoginHere::of_row(
+                    LoginHalf::of_row(row, &records.logins, &records.state, places.now),
+                    holds,
+                ),
             });
         }
     }
@@ -463,7 +479,7 @@ pub fn covered(places: &Places<'_>) -> Vec<Covered> {
             email: login.email.clone(),
             label: None,
             logged_in: logged_in(&login.email),
-            login: LoginHalf::Ok,
+            login: LoginHere::Half(LoginHalf::Ok),
         });
     }
     out
@@ -487,7 +503,7 @@ pub fn view(places: &Places<'_>, vault: &dyn TokenVault) -> Vec<AccountToken> {
             email: row.email.clone(),
             label: row.label.clone(),
             logged_in: false,
-            login: LoginHalf::Ok,
+            login: LoginHere::Unread,
         });
     }
     let listed = vault.listed().unwrap_or(Lookup::Unknown);

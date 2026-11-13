@@ -14,6 +14,12 @@ use crate::{App, WindowId, term_lock};
 #[path = "autopilot_menu_viewport_tests.rs"]
 mod viewport_tests;
 
+#[path = "autopilot_menu_wash_tests.rs"]
+mod wash_tests;
+
+#[path = "autopilot_menu_gallery_tests.rs"]
+mod gallery_tests;
+
 fn keys(rows: &[MenuRow]) -> Vec<Option<String>> {
     rows.iter()
         .map(|r| match r {
@@ -239,7 +245,7 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
     );
     let lent = place(&rows, (28, 4), (25..30, 0..100), (100, 30), 1).unwrap();
     assert_eq!((lent.row, lent.h), (28 - want, want), "lent the frame");
-    // A title of 29 cells: as wide as a pane of 31 leaves it, border to border.
+    // A title of 29 cells: as wide as a pane of 31 leaves it, edge to edge.
     const TITLE: &str = "Workspace \u{b7} tab 1, right pane";
     assert_eq!(display_cells(TITLE), 29);
     let named = |cols: usize| {
@@ -264,7 +270,7 @@ fn the_card_keeps_to_its_panes_rows_and_gives_up_its_padding_first() {
         .iter()
         .map(|r| text(r))
         .collect();
-    assert_eq!(painted[1], format!("\u{2502}{TITLE}\u{2502}"));
+    assert_eq!(painted[1], format!(" {TITLE} "));
     assert!(
         painted.iter().any(|row| row.contains("Copy branch name")),
         "{painted:#?}"
@@ -372,7 +378,39 @@ fn the_card_paints_its_rect_its_check_and_its_disabled_rows() {
         '\u{25cf}',
         "the check, flush right"
     );
-    assert_ne!(painted[3][3].bg, painted[2][3].bg, "the highlight's ground");
+    // The highlighted row keeps the card's ground and its weight and takes the hover ink; its
+    // wash is the card's pill, half a cell in from each edge.
+    let c = CardInks::of(theme, None);
+    assert_eq!(
+        (painted[3][3].fg, painted[3][3].bg, painted[3][3].bold),
+        (c.sel_fg, c.ground, false),
+        "the highlighted row"
+    );
+    assert_eq!(
+        (painted[2][3].fg, painted[2][3].bg),
+        (c.item(), c.ground),
+        "a row at rest"
+    );
+    assert_ne!(c.sel_fg, c.item(), "the hover ink is not the ink at rest");
+    let pill = wash_pill(
+        rect,
+        &rows,
+        MenuViewport::default(),
+        (2, None),
+        &c,
+        c.wash.1,
+    );
+    assert_eq!(
+        pill,
+        Some(PlatePill {
+            row: 3,
+            from: 1,
+            to: u16::try_from(2 * rect.w - 1).unwrap(),
+            shape: PillShape::Wash,
+            rgb: [0xE0; 3],
+            alpha: WASH_ALPHA,
+        })
+    );
     let off = card(false);
     let rect = place(&off, (30, 4), (0..40, 0..120), (120, 40), 1).unwrap();
     let painted = paint(rect, &off, MenuViewport::default(), None, theme, None);
@@ -536,9 +574,11 @@ fn a_sliders_stops_span_its_row_and_a_cell_snaps_to_the_nearer() {
 }
 
 /// THE SLIDER IS DRAWN AS ITS STOPS: a filled mark and bold word where the thumb stands, a
-/// hollow mark at every other stop, the track between them, the rested stop alone on the
-/// highlight's ground and a stop not offered in the disabled ink. Control: with the row not
-/// selected nothing stands on the highlight's ground.
+/// hollow mark at every other stop, the rested stop alone in the hover ink and a stop not
+/// offered in the disabled ink, every cell on the card's ground. Its track is the frame's
+/// pills ([`plate_pills`]), a capsule in each gap in the lit ink up to the thumb and the track
+/// ink after; the rested stop's wash is the card's one pill ([`wash_pill`]) over its span.
+/// Control: with the row not selected nothing takes the hover ink.
 #[test]
 fn the_slider_paints_its_thumb_its_track_and_its_rested_stop() {
     let theme = aterm_render::Theme {
@@ -575,24 +615,66 @@ fn the_slider_paints_its_thumb_its_track_and_its_rested_stop() {
         ["\u{25cb} medium", "\u{25cf} high", "\u{25cb} xhigh"]
     );
     assert!(at(1).bold && !at(0).bold, "the thumb's word is bold");
-    let card_bg = line[text_start + spans[0].end].bg;
-    assert_ne!(at(0).bg, card_bg, "the rested stop stands on the highlight");
-    assert_eq!(at(1).bg, card_bg, "the thumb's own stop does not");
-    assert_ne!(at(2).fg, at(1).fg, "a stop not offered reads as one");
-    let track: String = (spans[0].end..spans[1].start)
-        .map(|col| line[text_start + col].ch)
-        .collect();
-    assert_eq!(
-        track
-            .trim_matches(' ')
-            .chars()
-            .collect::<std::collections::BTreeSet<_>>(),
-        ['\u{2500}'].into(),
-        "the track between two stops: {track:?}"
+    let c = CardInks::of(theme, None);
+    assert!(
+        line.iter().all(|cell| cell.bg == c.ground),
+        "no cell of the row is the highlight's ground"
     );
+    assert_eq!(
+        (at(0).fg, at(1).fg),
+        (c.sel_fg, c.item()),
+        "the rested stop takes the hover ink; the thumb's own stop does not"
+    );
+    assert_ne!(at(2).fg, at(1).fg, "a stop not offered reads as one");
+    assert!(
+        (spans[0].end..spans[1].start).all(|col| line[text_start + col].ch == ' '),
+        "the cells between two stops are blank: the track is the frame's"
+    );
+    // The track: a capsule in each gap, a blank either side, lit up to the thumb.
+    let half = |cells: usize| u16::try_from(2 * (text_start + cells)).unwrap();
+    let track = |j: usize, ink: u32| PlatePill {
+        row: 3,
+        from: half(spans[j].end + 1),
+        to: half(spans[j + 1].start - 1),
+        shape: PillShape::Track,
+        rgb: unpack(ink),
+        alpha: 255,
+    };
+    let mut pills = Vec::new();
+    plate_pills(rect, &rows, MenuViewport::default(), &c, &mut pills);
+    assert_eq!(
+        pills,
+        [track(0, c.glass.lit()), track(1, c.glass.track())],
+        "the track is lit up to the thumb"
+    );
+    assert_ne!(c.glass.lit(), c.glass.track());
+    // The rested stop's wash: its span and half a cell either side, the row's own pill.
+    let washed = |stop| {
+        wash_pill(
+            rect,
+            &rows,
+            MenuViewport::default(),
+            (2, stop),
+            &c,
+            c.wash.1,
+        )
+    };
+    assert_eq!(
+        washed(Some(0)),
+        Some(PlatePill {
+            row: 3,
+            from: half(spans[0].start) - 1,
+            to: half(spans[0].end) + 1,
+            shape: PillShape::Wash,
+            rgb: c.wash.0,
+            alpha: WASH_ALPHA,
+        })
+    );
+    assert_eq!(washed(None), None, "a slider with no stop rested on");
+    assert_eq!(washed(Some(2)), None, "a stop that cannot be picked");
     let unlit = paint(rect, &rows, MenuViewport::default(), Some(4), theme, None);
     assert!(
-        unlit[1 + 2][1..rect.w - 1].iter().all(|c| c.bg == card_bg),
+        unlit[1 + 2].iter().all(|cell| cell.fg != c.sel_fg),
         "control: no rest is drawn on a row the highlight left"
     );
 }
@@ -2449,15 +2531,17 @@ fn a_regrid_between_a_double_clicks_presses_moves_no_pixel_of_it() {
     }
 }
 
-/// THE CARD BORDER IS THE STATIC ARC (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4):
-/// a fact card under a palette paints each border cell, the corners and both sides included, in
-/// [`GlassInks::border`] at its place round the perimeter (the launch card's border, held
-/// still), and draws its rules inside the border so the arc runs whole; the same card painted
-/// again paints the same border. With no palette the border is the card's rule ink and a rule
-/// meets it (`├─┤`). Negative controls: a border in the card's rule ink (the card before S6) is
-/// one colour; a border hued by column alone paints each side one colour down its height.
+/// THE CARD'S FRAME IS NOT CELLS (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4):
+/// under every palette and none, the card's first and last row and its first and last column
+/// are blanks on the card's ground, a rule's row is blank whole, and no cell of the card is a
+/// box-drawing glyph; the rules are the frame's hairlines over the text's span on the rows the
+/// card lays them on ([`plate_rules`]), the rows in view alone on a scrolled card. The frame's
+/// line ([`plate_key`]) is the static arc of the glass under a palette, and the glass's track,
+/// one ink, with no palette and in Serious Mode; under an OS-forced palette it is the system's
+/// ink on the system's ground with no shadow. Negative control: the card before the frame was
+/// drawn in pixels held a box-drawing cell at each corner.
 #[test]
-fn the_card_border_is_the_static_arc() {
+fn the_cards_frame_is_the_plates_and_its_ring_is_blank_cells() {
     let theme = aterm_render::Theme {
         fg: 0x00E0_E0E0,
         bg: 0x0018_1818,
@@ -2480,73 +2564,345 @@ fn the_card_border_is_the_static_arc() {
         w: 36,
         h: rows.len() + 2,
     };
-    let c = crate::tab_menu::glass_menu_colors(theme);
     let (w, h) = (rect.w, rect.h);
-    let border = |r: usize, col: usize| r == 0 || r + 1 == h || col == 0 || col + 1 == w;
-    for palette in [CardPalette::Cruise, CardPalette::Land, CardPalette::Off] {
-        let glass = GlassInks::of(Some(palette), pack(c.card_bg), theme.fg, pack(c.rule));
-        let painted = paint(
-            rect,
-            &rows,
-            MenuViewport::default(),
-            None,
-            theme,
-            Some(palette),
-        );
+    let ring = |r: usize, col: usize| r == 0 || r + 1 == h || col == 0 || col + 1 == w;
+    let boxed = |cell: &RenderCell| ('\u{2500}'..='\u{257f}').contains(&cell.ch);
+    let (text_start, text_end) = text_span(w, &rows);
+    let short = |v: usize| u16::try_from(v).expect("a card's cell");
+    let rule = |row: usize| PlateRule {
+        row: short(row),
+        from: short(text_start),
+        to: short(text_end),
+    };
+    for palette in [
+        None,
+        Some(CardPalette::Cruise),
+        Some(CardPalette::Land),
+        Some(CardPalette::Off),
+    ] {
+        let c = CardInks::of(theme, palette);
+        let painted = paint(rect, &rows, MenuViewport::default(), None, theme, palette);
         assert_eq!(painted.len(), h);
-        let mut inks = std::collections::BTreeSet::new();
         for (r, line) in painted.iter().enumerate() {
-            for (col, cell) in line.iter().enumerate().filter(|(col, _)| border(r, *col)) {
-                let want = unpack(glass.border(r, col, h, w));
-                assert_eq!(cell.fg, want, "{palette:?}: ({r}, {col}) {:?}", cell.ch);
-                inks.insert(cell.fg);
+            for (col, cell) in line.iter().enumerate().filter(|(col, _)| ring(r, *col)) {
+                assert_eq!(
+                    (cell.ch, cell.bg),
+                    (' ', c.ground),
+                    "{palette:?}: ({r}, {col})"
+                );
             }
-        }
-        if palette != CardPalette::Off {
-            assert!(
-                inks.len() > 4,
-                "{palette:?}: the arc, not one ink: {inks:?}"
-            );
-            for col in [0, w - 1] {
-                let side: std::collections::BTreeSet<_> =
-                    (1..h - 1).map(|r| painted[r][col].fg).collect();
-                assert!(side.len() > 1, "{palette:?}: column {col} keeps one ink");
-            }
+            assert!(!line.iter().any(boxed), "{palette:?}: row {r} draws a box");
         }
         for r in [3, 7] {
-            assert_eq!(
-                painted[r][0].ch, '\u{2502}',
-                "{palette:?}: a rule inside the border"
-            );
-            assert_eq!(painted[r][w - 1].ch, '\u{2502}');
             assert!(
-                painted[r][1..w - 1]
-                    .iter()
-                    .any(|cell| cell.ch == '\u{2500}' && cell.fg == c.rule),
-                "{palette:?}: the rule in the card's rule ink"
+                painted[r].iter().all(|cell| cell.ch == ' '),
+                "{palette:?}: a rule's row is blank"
             );
         }
-        let again = paint(
-            rect,
-            &rows,
-            MenuViewport::default(),
-            None,
-            theme,
-            Some(palette),
+        let mut rules = Vec::new();
+        plate_rules(rect, &rows, MenuViewport::default(), &mut rules);
+        assert_eq!(rules, [rule(3), rule(7)], "{palette:?}");
+
+        let key = plate_key(rect, &c, (7, 16), 2.0, false);
+        assert_eq!((key.cells, key.cell), ((36, 10), (7, 16)));
+        assert_eq!(key.ground, pack(c.ground));
+        assert!(key.shadow, "{palette:?}");
+        let flat = PlateLine::Flat(c.glass.track());
+        match palette {
+            Some(_) => assert_eq!(key.line, PlateLine::Arc(c.glass), "{palette:?}"),
+            None => assert_eq!(key.line, flat, "no palette: the track"),
+        }
+        assert_eq!(
+            plate_key(rect, &c, (7, 16), 2.0, true).line,
+            flat,
+            "{palette:?}: Serious Mode wears no arc"
         );
-        assert_eq!(painted, again, "{palette:?}: a static border");
     }
-    let plain = paint(rect, &rows, MenuViewport::default(), None, theme, None);
-    let rule = crate::tab_menu::menu_colors(theme).rule;
-    for (r, line) in plain.iter().enumerate() {
-        for (col, cell) in line.iter().enumerate().filter(|(col, _)| border(r, *col)) {
-            assert_eq!(cell.fg, rule, "no palette: ({r}, {col})");
+
+    // A card too short for its rows: the rules in view, on the rows they are laid on.
+    let short_rect = MenuRect { h: 6, ..rect };
+    let mut viewport = MenuViewport::default();
+    assert!(viewport.scroll(rows.len(), 4, 3));
+    let mut rules = Vec::new();
+    plate_rules(short_rect, &rows, viewport, &mut rules);
+    assert_eq!(rules, [rule(4)], "rows 3..7 in view: the second rule");
+    let scrolled = paint(short_rect, &rows, viewport, None, theme, None);
+    assert_eq!(
+        (scrolled[0][w - 2].ch, scrolled[0][0].ch),
+        ('\u{2191}', ' '),
+        "the scroll cue keeps its cell"
+    );
+
+    // A group heading's hairline runs from one blank after its title.
+    let grouped = vec![
+        MenuRow::Header("Account".to_string()),
+        MenuRow::Section("Budget".to_string()),
+        MenuRow::note("61% left"),
+    ];
+    let grouped_rect = MenuRect { h: 5, ..rect };
+    let (from, to) = text_span(w, &grouped);
+    let mut rules = Vec::new();
+    plate_rules(grouped_rect, &grouped, MenuViewport::default(), &mut rules);
+    assert_eq!(
+        rules,
+        [PlateRule {
+            row: 2,
+            from: short(from + "Budget".len() + 1),
+            to: short(to),
+        }]
+    );
+    let heading = &paint(
+        grouped_rect,
+        &grouped,
+        MenuViewport::default(),
+        None,
+        theme,
+        None,
+    )[2];
+    assert!(heading[from + "Budget".len()..].iter().all(|c| c.ch == ' '));
+
+    let hc = crate::chrome_band::ForcedChrome {
+        window: [0, 0, 0],
+        window_text: [255, 255, 255],
+        highlight: [26, 235, 255],
+        highlight_text: [0, 0, 0],
+        btn_face: [0, 0, 0],
+    };
+    crate::chrome_band::install_forced_chrome(Some(hc));
+    let c = CardInks::of(theme, Some(CardPalette::Cruise));
+    let key = plate_key(rect, &c, (7, 16), 1.0, false);
+    crate::chrome_band::install_forced_chrome(None);
+    assert!(c.forced);
+    assert_eq!(
+        (c.ground, c.sel_bg(), c.sel_fg),
+        ([0; 3], [26, 235, 255], [0; 3])
+    );
+    assert_eq!(key.line, PlateLine::Flat(0x00FF_FFFF), "the system's ink");
+    assert!(!key.shadow, "a forced palette casts no shadow");
+
+    assert!(
+        !boxed(&crate::chrome_band::cell(' ', [0; 3], [0; 3], false, false))
+            && boxed(&crate::chrome_band::cell(
+                '\u{250c}', [0; 3], [0; 3], false, false
+            )),
+        "CONTROL: the old corner cell passes for a blank"
+    );
+}
+
+/// A CARD'S FRAME IS ONE LAYER WHILE IT IS OPEN AND COSTS NOTHING AT REST (§1.4): an open
+/// card lays one fx layer under its glyphs at its top left corner, of the key its place, its
+/// inks and the window give ([`plate_key`]), with a hairline for each rule in view; its ring
+/// cells are blanks and its corner cells the pane's own ground. The layer stands on the card
+/// (its chrome is the occluder the card pushed, which is on the frame), so the renderer's
+/// slicing through the frame's occluders draws the line inside the card; chrome laid over the
+/// card afterwards cuts the frame where it covers it. A frame at rest, and one that only moves
+/// the highlight, hands on the same content and builds no art; a closed card leaves no layer.
+/// Negative controls: with no card there is no layer; a layer standing on no chrome is cut
+/// away inside the card by the card's own occluder.
+#[test]
+fn a_cards_frame_is_one_layer_while_it_is_open_and_costs_nothing_at_rest() {
+    use aterm_core::render::{FxBlend, FxItem, FxLayer, FxSlot, FxSpace, PxRect};
+    let (mut app, wid, session, host) = claude_app();
+    let _host = MenuTestHost(host);
+    frame(&mut app, wid);
+    let id = crate::claude_footer::quota::card_plate_id(session);
+    let ours = |app: &App| -> Vec<FxLayer> {
+        app.windows[&wid]
+            .input_scratch
+            .fx_layers
+            .iter()
+            .filter(|l| l.id == id)
+            .cloned()
+            .collect()
+    };
+    assert!(ours(&app).is_empty(), "CONTROL: a frame with no card");
+    open_card(&mut app);
+    frame(&mut app, wid);
+    let first = ours(&app);
+    assert_eq!(first.len(), 1, "one layer");
+    let layer = &first[0];
+    let menu = app.autopilot_menu.as_ref().expect("open");
+    let rect = menu.rect.expect("painted");
+    let (cw, ch) = app
+        .glass_grid(wid)
+        .map_or_else(|| app.win_cell_size(wid), |g| g.cell());
+    let px = |cells: usize, side: usize| i32::try_from(cells * side).expect("px");
+    assert_eq!(layer.offset, (px(rect.col, cw), px(rect.row, ch)));
+    assert_eq!(
+        (layer.slot, layer.space, layer.blend),
+        (FxSlot::Under, FxSpace::Grid, FxBlend::Exact)
+    );
+    let theme = app.overlay_card_theme(wid);
+    let inks = CardInks::of(theme, app.card_palette(session));
+    let key = plate_key(
+        rect,
+        &inks,
+        (cw, ch),
+        app.windows[&wid].scale,
+        app.serious_mode_enabled(),
+    );
+    assert_eq!(
+        layer.clip,
+        key.extent().translate(layer.offset.0, layer.offset.1)
+    );
+    let mut rules = Vec::new();
+    plate_rules(rect, &menu.rows, menu.viewport, &mut rules);
+    // The layer's rects: the card's ground between its first and last row, one rect on a card
+    // with no drawn row, and a hairline, a line tall, for each rule in view.
+    let rects: Vec<_> = layer
+        .content
+        .items()
+        .iter()
+        .filter_map(|item| match item {
+            FxItem::Rect(rect) => Some(*rect),
+            _ => None,
+        })
+        .collect();
+    let line = u16::try_from(key.line_px()).expect("a line");
+    let hairlines = rects.iter().filter(|r| r.h == line).count();
+    assert_eq!(hairlines, rules.len(), "a hairline for each rule in view");
+    assert_eq!(rects.len(), rules.len() + 1, "and the card's ground");
+    let body = rects.iter().find(|r| r.h != line).expect("the ground");
+    assert_eq!(
+        (body.y, usize::from(body.h)),
+        (px(1, ch), (rect.h - 2) * ch),
+        "from under the card's first row to its last"
+    );
+    assert!(
+        layer
+            .content
+            .items()
+            .iter()
+            .any(|item| matches!(item, FxItem::Sprite(_))),
+        "the line's strips"
+    );
+
+    let scratch = &app.windows[&wid].input_scratch;
+    let ground = crate::tab_menu::ground_cell(theme, scratch.default_bg);
+    let (top, bottom) = (rect.row, rect.row + rect.h - 1);
+    let (left, right) = (rect.col, rect.col + rect.w - 1);
+    for (row, col) in [(top, left), (top, right), (bottom, left), (bottom, right)] {
+        assert_eq!(scratch.cells[row][col], ground, "corner ({row}, {col})");
+    }
+    assert!(
+        scratch.cells[bottom][left..=right]
+            .iter()
+            .all(|cell| cell.ch == ' '),
+        "the ring is blank"
+    );
+    for line in &scratch.cells[top..=bottom] {
+        assert_eq!((line[left].ch, line[right].ch), (' ', ' '));
+    }
+
+    let occluder = layer.chrome.expect("the frame stands on the card");
+    assert!(
+        scratch.fx_occluders.contains(&occluder),
+        "the card's own occluder, {occluder:?}, in {:?}",
+        scratch.fx_occluders
+    );
+    let (pad, grid_top) = (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid));
+    let fx = aterm_render::FxFrame {
+        w: 2 * pad + scratch.cols * cw,
+        h: grid_top + scratch.cells.len() * ch + pad,
+        pad,
+        grid_top,
+        cell_h: ch,
+        rows: scratch.cells.len(),
+    };
+    let on = |b: PxRect, &(x, y): &(usize, usize)| {
+        let (x, y) = (i32::try_from(x).expect("x"), i32::try_from(y).expect("y"));
+        (b.x0..b.x1).contains(&x) && (b.y0..b.y1).contains(&y)
+    };
+    let drawn = sliced(&fx, layer, &scratch.fx_occluders);
+    let line = (
+        pad + rect.col * cw + rect.w * cw / 2,
+        grid_top + rect.row * ch,
+    );
+    assert!(on(occluder, &line) && drawn.contains(&line), "the top line");
+    let bare = FxLayer {
+        chrome: None,
+        ..layer.clone()
+    };
+    assert!(
+        !sliced(&fx, &bare, &scratch.fx_occluders)
+            .iter()
+            .any(|p| on(occluder, p)),
+        "CONTROL: on no chrome, the card's occluder cuts the frame inside the card"
+    );
+    let over = PxRect::new(i32::MIN, occluder.y0, i32::MAX, occluder.y0 + px(1, ch));
+    let mut cuts = scratch.fx_occluders.clone();
+    cuts.push(over);
+    let cut = sliced(&fx, layer, &cuts);
+    assert!(
+        !cut.iter().any(|p| on(over, p)),
+        "chrome over the card cuts"
+    );
+    assert!(
+        cut.iter().any(|p| on(occluder, p)),
+        "and only where it lies"
+    );
+
+    let _ = aterm_render::test_counters::take_art_builds();
+    frame(&mut app, wid);
+    let again = ours(&app);
+    assert_eq!(again.len(), 1, "still one layer");
+    assert!(
+        std::sync::Arc::ptr_eq(&again[0].content, &layer.content),
+        "a frame at rest seals no new content"
+    );
+    assert!(app.autopilot_menu_nav(wid, MenuKey::Down));
+    frame(&mut app, wid);
+    let moved = ours(&app);
+    assert!(
+        moved.len() == 1 && std::sync::Arc::ptr_eq(&moved[0].content, &layer.content),
+        "a moved highlight keeps the frame"
+    );
+    assert_eq!(
+        aterm_render::test_counters::take_art_builds(),
+        0,
+        "and no frame of the open card builds an art"
+    );
+    assert!(app.close_autopilot_menu(), "closed");
+    frame(&mut app, wid);
+    assert!(ours(&app).is_empty(), "no frame once the card is gone");
+}
+
+/// The window pixels the renderer's slicing draws of `layer` in `fx` through `occluders`.
+fn sliced(
+    fx: &aterm_render::FxFrame,
+    layer: &aterm_core::render::FxLayer,
+    occluders: &[aterm_core::render::PxRect],
+) -> std::collections::BTreeSet<(usize, usize)> {
+    struct Px<'o>(&'o mut std::collections::BTreeSet<(usize, usize)>);
+    impl<'a> aterm_render::FxSliceSink<'a> for Px<'_> {
+        fn item(
+            &mut self,
+            _: &'a aterm_core::render::FxLayer,
+            _: &'a aterm_core::render::FxItem,
+            _: (i64, i64),
+        ) -> bool {
+            true
+        }
+
+        fn slice(&mut self, s: aterm_render::FxSlice, _: usize) {
+            for y in s.y0..s.y1 {
+                for x in s.x0..s.x1 {
+                    self.0.insert((x, y));
+                }
+            }
         }
     }
-    assert_eq!(
-        plain[3][0].ch, '\u{251c}',
-        "no palette: a rule meets the border"
+    let mut out = std::collections::BTreeSet::new();
+    aterm_render::slice_layers(
+        fx,
+        std::slice::from_ref(layer),
+        occluders,
+        |_| true,
+        |_| true,
+        &mut aterm_render::FxSlicer::default(),
+        &mut Px(&mut out),
     );
+    out
 }
 
 /// A ROW'S WIDTH IS ITS TEXT'S, COUNTED WITHOUT BUILDING IT: over rows of every kind (a card's
@@ -2670,9 +3026,68 @@ fn every_shipped_theme() -> Vec<(String, aterm_render::Theme)> {
         .collect()
 }
 
-/// A GROUP HEADING AND A NAMED FACT ON THE CELL CARD. A heading is its title, bold in the value
-/// ink, a blank, then the rule to the text's end, inside the border on a glass card and a plain
-/// one alike. A fact is its name in the label ink from the first text cell and its value from
+/// ONE LOOK ON EVERY THEME ([`CardInks`], `docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+/// §1.4, §4.1): on every shipped theme, under every palette and none, a card stands on the
+/// pane's own ground and its inks hold the glass's floors there: its words (the head, the quiet
+/// notes, the warn ink) 4.5:1, its figures 7:1 (or the most the ground gives white or black),
+/// its marks (the track, the accent, a level at every column) 3:1, and words on a wash (the
+/// highlighted row's, a warn cell's) 4.5:1 on the wash. Negative control: a rule's ink, a
+/// decoration with no floor, reads under a word's floor on some theme.
+#[test]
+fn card_inks_hold_their_floors_on_every_theme() {
+    let reads = crate::native_appearance::contrast_ratio;
+    let themes = every_shipped_theme();
+    assert!(themes.len() > 37, "{} themes swept", themes.len());
+    let mut faint_rules = 0usize;
+    for (name, theme) in themes {
+        for palette in [
+            None,
+            Some(CardPalette::Cruise),
+            Some(CardPalette::Land),
+            Some(CardPalette::Off),
+        ] {
+            let at = format!("{name} {palette:?}");
+            let c = CardInks::of(theme, palette);
+            assert_eq!(c.ground, unpack(theme.bg), "{at}: the pane's own ground");
+            assert!(!c.forced, "{at}");
+            for (what, ink) in [("head", c.head()), ("quiet", c.quiet()), ("warn", c.warn())] {
+                assert!(reads(ink, c.ground) >= 4.5, "{at}: {what} {ink:?}");
+            }
+            let most = reads([255; 3], c.ground).max(reads([0; 3], c.ground));
+            assert!(
+                reads(c.item(), c.ground) >= 7.0f32.min(most) - 0.01,
+                "{at}: a figure {:?}",
+                c.item()
+            );
+            for (what, ink) in [("track", unpack(c.glass.track())), ("accent", c.accent)] {
+                assert!(reads(ink, c.ground) >= 3.0, "{at}: {what} {ink:?}");
+            }
+            for col in 0..44 {
+                let mark = unpack(c.glass.mark(field(col, 44)));
+                assert!(
+                    reads(mark, c.ground) >= 3.0,
+                    "{at}: a level at column {col}"
+                );
+            }
+            assert!(
+                reads(c.sel_fg, c.sel_bg()) >= 4.5,
+                "{at}: the highlighted row"
+            );
+            if let Some((wash, ink)) = warn_wash(&c) {
+                assert!(reads(ink, wash) >= 4.5, "{at}: a stop on its wash");
+            }
+            faint_rules += usize::from(reads(c.rule, c.ground) < 4.5);
+        }
+    }
+    assert!(
+        faint_rules > 0,
+        "CONTROL: a rule's ink holds a word's floor"
+    );
+}
+
+/// A GROUP HEADING AND A NAMED FACT ON THE CELL CARD. A heading is its title, bold in the head's
+/// ink, a blank, then the frame's hairline to the text's end ([`plate_rules`]), on a glass card
+/// and a plain one alike. A fact is its name in the quiet ink from the first text cell and its value from
 /// the name column's end ([`FACT_LABEL_CELLS`]) in its tone's ink, the warn one bold; a row that
 /// continues a fact leaves the name column blank. On every shipped theme and every glass the
 /// name's ink reads at 4.5:1 on the card.
@@ -2699,12 +3114,12 @@ fn a_group_heading_and_a_fact_paint_their_title_rule_and_two_columns() {
             Some(CardPalette::Off),
         ] {
             let at = format!("{name} {palette:?}");
-            let (c, inks) = card_inks(theme, palette);
+            let c = CardInks::of(theme, palette);
             let painted = paint(rect, &rows, MenuViewport::default(), None, theme, palette);
             assert_eq!(painted.len(), rect.h, "{at}");
             let line = |i: usize| &painted[1 + i];
             assert!(
-                crate::native_appearance::contrast_ratio(c.band.label, c.card_bg) >= 4.5,
+                crate::native_appearance::contrast_ratio(c.quiet(), c.ground) >= 4.5,
                 "{at}: a fact's name reads on the card"
             );
 
@@ -2713,45 +3128,45 @@ fn a_group_heading_and_a_fact_paint_their_title_rule_and_two_columns() {
             let rule_from = text_start + title.len() + 1;
             assert_eq!(said(&heading[text_start..rule_from - 1]), title, "{at}");
             for cell in &heading[text_start..rule_from - 1] {
-                assert_eq!((cell.fg, cell.bold), (c.band.value, true), "{at}");
+                assert_eq!((cell.fg, cell.bold), (c.head(), true), "{at}");
             }
-            assert_eq!(heading[rule_from - 1].ch, ' ', "{at}: one blank");
-            for cell in &heading[rule_from..text_end] {
-                assert_eq!((cell.ch, cell.fg), ('\u{2500}', c.rule), "{at}");
-            }
-            assert_eq!(
-                (heading[0].ch, heading[rect.w - 1].ch, heading[text_end].ch),
-                ('\u{2502}', '\u{2502}', ' '),
-                "{at}: the rule stays inside the border"
+            assert!(
+                heading[rule_from - 1..].iter().all(|cell| cell.ch == ' '),
+                "{at}: blanks after the title, under the frame's hairline"
+            );
+            let mut rules = Vec::new();
+            plate_rules(rect, &rows, MenuViewport::default(), &mut rules);
+            let short = |v: usize| u16::try_from(v).expect("a card's cell");
+            assert!(
+                rules.contains(&PlateRule {
+                    row: short(1 + GROUP_HEADING),
+                    from: short(rule_from),
+                    to: short(text_end),
+                }),
+                "{at}: the hairline from one blank after the title to the text's end"
             );
 
             for (i, label, value, ink, bold) in [
-                (
-                    GROUP_TOKEN,
-                    "Token",
-                    "none in the vault",
-                    c.band.value,
-                    false,
-                ),
+                (GROUP_TOKEN, "Token", "none in the vault", c.item(), false),
                 (
                     GROUP_BUDGET,
                     "Budget",
                     "out until Sat 10:00",
-                    unpack(inks.warn()),
+                    c.warn(),
                     true,
                 ),
                 (
                     GROUP_MACHINE,
                     "Machine",
                     "use there not known:",
-                    c.band.label,
+                    c.quiet(),
                     false,
                 ),
                 (
                     GROUP_CONTINUED,
                     "",
                     "no other Mac is read",
-                    c.band.label,
+                    c.quiet(),
                     false,
                 ),
             ] {
@@ -2762,21 +3177,21 @@ fn a_group_heading_and_a_fact_paint_their_title_rule_and_two_columns() {
                     "{at}: the name column"
                 );
                 for cell in &cells[text_start..text_start + label.len()] {
-                    assert_eq!((cell.fg, cell.bold), (c.band.label, false), "{at} {label}");
+                    assert_eq!((cell.fg, cell.bold), (c.quiet(), false), "{at} {label}");
                 }
                 let end = value_at + value.len();
                 assert_eq!(said(&cells[value_at..end]), value, "{at}");
                 for cell in &cells[value_at..end] {
                     assert_eq!((cell.fg, cell.bold), (ink, bold), "{at} {label}");
                 }
-                assert!(cells.iter().all(|cell| cell.bg == c.card_bg), "{at}");
+                assert!(cells.iter().all(|cell| cell.bg == c.ground), "{at}");
             }
         }
     }
 }
 
 /// AN ITEM'S TRAILING WORDS: right-aligned to one edge, the cell a check begins at, on a
-/// checked row and an unchecked one alike, in the row's own ink: the selection's on the
+/// checked row and an unchecked one alike, in the row's own ink: the hover ink on the
 /// highlighted row, the disabled ink on a row that cannot be chosen. In a card too narrow for
 /// both, the label gives way and the trail stays whole.
 #[test]
@@ -2797,7 +3212,7 @@ fn an_items_trail_ends_where_a_check_begins_in_the_rows_own_ink() {
     };
     let (text_start, text_end) = text_span(rect.w, &rows);
     let edge = text_end - CHECK_CELLS;
-    let (c, _) = card_inks(theme, Some(CardPalette::Cruise));
+    let c = CardInks::of(theme, Some(CardPalette::Cruise));
     let painted = paint(
         rect,
         &rows,
@@ -2811,19 +3226,19 @@ fn an_items_trail_ends_where_a_check_begins_in_the_rows_own_ink() {
             GROUP_CHECKED,
             "\u{2386}  alpha@example.test",
             "61% left",
-            (c.band.value, c.card_bg, false),
+            (c.item(), c.ground, false),
         ),
         (
             GROUP_PLAIN,
             "\u{2386}  beta@example.test",
             "\u{2264}88% left",
-            (c.sel_fg, c.sel_bg, true),
+            (c.sel_fg, c.ground, false),
         ),
         (
             GROUP_DISABLED,
             "\u{2386}  gamma@example.test",
             "not signed in",
-            (c.disabled, c.card_bg, false),
+            (c.quiet(), c.ground, false),
         ),
     ] {
         let cells = &painted[1 + i];

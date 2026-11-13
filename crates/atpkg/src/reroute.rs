@@ -577,10 +577,23 @@ enum Unrunnable {
 }
 
 impl Unrunnable {
-    fn refusal(self, upstream: &str, branded: &str, program: &str) -> String {
-        match self {
-            Self::Absent => not_installed_message(upstream, branded, program),
-            Self::ShimLost => lost_shim_message(upstream, branded),
+    /// Why nothing ran, and the act that puts `branded` here: its install where `program` has a
+    /// build for this machine, else `local`, the local build this row's own resolution runs
+    /// (`unserved`, the `unavailable on <target>` state [`unserved_here`] reads).
+    fn refusal(
+        self,
+        upstream: &str,
+        branded: &str,
+        program: &str,
+        unserved: Option<&str>,
+        local: &str,
+    ) -> String {
+        match (self, unserved) {
+            (Self::Absent, None) => not_installed_message(upstream, branded, program),
+            (Self::Absent, Some(state)) => {
+                unserved_message(upstream, branded, program, state, local)
+            }
+            (Self::ShimLost, _) => lost_shim_message(upstream, branded),
         }
     }
 
@@ -622,6 +635,11 @@ pub const EXPLICIT_LANE_VERBS: &[&str] = &["trust", "--unverified"];
 /// The program `aterm pkg install` names for `targo`, the tool an explicit lane runs.
 pub const EXPLICIT_LANE_PROGRAM: &str = "trust";
 
+/// The local build an explicit lane runs where no Trust build serves this machine: a dev link,
+/// or the `TRUST_STAGE2_BIN` [`lane_targo`] takes in place of any other. Every other row runs
+/// only the store's copy, and says [`crate::serving::local_remedy`].
+pub const EXPLICIT_LANE_LOCAL_REMEDY: &str = crate::trust_lock::LOCAL_SYSROOT_OR_STAGE2_REMEDY;
+
 /// Cargo queries that take no lane: an installed `targo` answers them with no line. This steers
 /// lane choice only; which verbs owe no build cache ownership is a separate list, judged by what
 /// each writes (`build_cache::registered`, `docs/DECISION-atpkg-output-free-verbs-2026-11-06.md`).
@@ -633,11 +651,48 @@ pub fn explicit_lane_note(upstream: &str, branded: &str) -> String {
     format!("aterm: running {branded}, Trust's '{upstream}'.")
 }
 
+/// An explicit lane whose store holds no `targo` and whose `TRUST_STAGE2_BIN` was refused
+/// (`refused`, [`lane_targo`]'s `Err`): the override is never fallen back from, as toolchain
+/// discovery holds it.
+fn stage2_refused_message(upstream: &str, branded: &str, refused: &str) -> String {
+    format!(
+        "aterm: '{upstream}' did not run — {branded} is not installed, and {refused}, which is \
+         never fallen back from; name a Trust toolchain's bin there, or unset it."
+    )
+}
+
+/// [`explicit_lane_note`] for a `targo` from outside the store ([`lane_targo`]), named by path.
+#[must_use]
+pub fn explicit_lane_found_note(upstream: &str, branded: &str, found: &Path) -> String {
+    format!(
+        "aterm: running {branded} at {} (Trust, by its -vV; the store holds none), Trust's \
+         '{upstream}'.",
+        found.display()
+    )
+}
+
 /// A branded tool that is not installed: nothing ran, and the one command that installs it.
 #[must_use]
 pub fn not_installed_message(upstream: &str, branded: &str, program: &str) -> String {
     format!(
         "aterm: '{upstream}' did not run — {branded} is not installed; `aterm pkg install {program}` installs it."
+    )
+}
+
+/// A branded tool whose program has no build for this machine (`state`, the
+/// `unavailable on <target>` state): nothing ran, and `local`, the local build that puts it
+/// here for the row that says it.
+#[must_use]
+pub fn unserved_message(
+    upstream: &str,
+    branded: &str,
+    program: &str,
+    state: &str,
+    local: &str,
+) -> String {
+    format!(
+        "aterm: '{upstream}' did not run — {branded} is not installed, and {program} has no \
+         build for this machine ({state}); {local}."
     )
 }
 
@@ -1432,6 +1487,9 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
         aterm_types::dirs::home_dir().as_deref(),
     );
     let identity_cache = layout.prefix.join(crate::upstream_identity::CACHE_FILE);
+    let stage2 = std::env::var_os(STAGE2_ENV)
+        .filter(|bin| !bin.is_empty())
+        .map(PathBuf::from);
     let unserved = std::cell::OnceCell::new();
     let machine = Machine {
         passthrough: engaged(std::env::var(PASSTHROUGH_ENV).ok().as_deref()),
@@ -1445,6 +1503,24 @@ pub fn run(layout: &Layout, upstream: &str, args: &[String]) -> ExitCode {
         strict: &|| crate::config::cached_reroute().strict(),
         upstream: &|| upstream_on_path(layout, upstream, path_var.as_deref()),
         branded: &|branded, program| installed(layout, branded, program),
+        lane_targo: &|| {
+            lane_targo(
+                layout,
+                stage2.as_deref(),
+                path_var.as_deref(),
+                rustup_home.as_deref(),
+                &|target| {
+                    is_trust_targo(
+                        target,
+                        cwd.as_deref(),
+                        env_toolchain.as_deref(),
+                        rustup_home.as_deref(),
+                        Some(&identity_cache),
+                    )
+                },
+            )
+        },
+        unserved: &|branded, program| unserved_here(layout, branded, program),
         pin: &|| Pin::for_dir(cwd.as_deref(), env_toolchain.as_deref()),
         resolve: &|target, toolchain| {
             crate::upstream_identity::resolve(&crate::upstream_identity::Ask {
@@ -1623,6 +1699,11 @@ struct Machine<'a> {
     strict: &'a dyn Fn() -> bool,
     upstream: &'a dyn Fn() -> Option<PathBuf>,
     branded: &'a dyn Fn(&str, &str) -> Install,
+    /// A Trust `targo` outside the store for an explicit lane ([`lane_targo`]); `Err` names the
+    /// `TRUST_STAGE2_BIN` it refused.
+    lane_targo: &'a dyn Fn() -> Result<Option<Managed>, String>,
+    /// [`unserved_here`] for `(branded, program)`.
+    unserved: &'a dyn Fn(&str, &str) -> Option<String>,
     pin: &'a dyn Fn() -> Option<Pin>,
     resolve: &'a dyn Fn(&Path, Option<&str>) -> Resolved,
     trust_checkout: &'a dyn Fn() -> Option<PathBuf>,
@@ -1641,19 +1722,105 @@ enum Install {
     Absent,
 }
 
-/// Why `branded`, one of the tools `program` ships, cannot be had on this machine.
+/// Why `branded`, one of the tools `program` ships, cannot be had on this machine: it is not
+/// installed and the store's signed manifests say no build of `program` serves this target
+/// ([`crate::serving::here`]), as the `unavailable on <target>` state.
 #[must_use]
 pub fn unserved_here(layout: &Layout, branded: &str, program: &str) -> Option<String> {
+    unserved_judged(layout, branded, program, &|| {
+        crate::serving::here(layout, program)
+    })
+}
+
+/// [`unserved_here`] with the store's word on `program` read through `verdict`, asked only once
+/// nothing here runs `branded`.
+fn unserved_judged(
+    layout: &Layout,
+    branded: &str,
+    program: &str,
+    verdict: &dyn Fn() -> crate::serving::Serving,
+) -> Option<String> {
     if !matches!(
         installed(layout, branded, program),
         Install::Pending(_) | Install::Absent
     ) {
         return None;
     }
-    let state = crate::status::read(layout)?.programs.remove(program)?.state;
-    state
-        .starts_with(crate::state::UNAVAILABLE_PREFIX)
-        .then_some(state)
+    match verdict() {
+        crate::serving::Serving::Unserved(state) => Some(state),
+        crate::serving::Serving::Served | crate::serving::Serving::Unknown => None,
+    }
+}
+
+/// The variable that names a Trust toolchain's `bin` ahead of every other, as toolchain discovery
+/// reads it (`aterm_toolchain::discovery`).
+const STAGE2_ENV: &str = "TRUST_STAGE2_BIN";
+
+/// THE `targo` AN EXPLICIT LANE RUNS WHEN THE STORE HOLDS NONE: `stage2`'s (`$TRUST_STAGE2_BIN`)
+/// where it is set, and as toolchain discovery holds that override, nothing else: `Err` says why
+/// its `targo` does not count. Unset, the first `targo` on `path_var` outside the store and the
+/// reroute directories ([`upstream_on_path`]), the one a bare `targo` runs (`aterm help rust`'s
+/// `targo on PATH`); else the one in rustup's `trust` toolchain. Each counts only once its own
+/// `-vV` says it is Trust ([`crate::upstream_identity::Identity::is_trust`]), and a pending stub
+/// is never asked.
+fn lane_targo(
+    layout: &Layout,
+    stage2: Option<&Path>,
+    path_var: Option<&OsStr>,
+    rustup_home: Option<&Path>,
+    trust: &dyn Fn(&Path) -> bool,
+) -> Result<Option<Managed>, String> {
+    let managed = |target| Managed {
+        target,
+        env: crate::shim_env::ShimEnv::NONE,
+    };
+    if let Some(bin) = stage2 {
+        let file = bin.join(crate::toolchain::tool_file("targo"));
+        if !crate::toolchain::is_executable_file(&file) || crate::stub::is_pending_stub(&file) {
+            return Err(format!("{STAGE2_ENV}={} holds no targo", bin.display()));
+        }
+        if !trust(&file) {
+            return Err(format!(
+                "{STAGE2_ENV}={}'s targo is not Trust by its -vV",
+                bin.display()
+            ));
+        }
+        return Ok(Some(managed(file)));
+    }
+    let rustup = rustup_home
+        .map(|home| {
+            home.join("toolchains")
+                .join(crate::seam::DEFAULT_SEAM)
+                .join("bin")
+                .join(crate::toolchain::tool_file("targo"))
+        })
+        .filter(|file| crate::toolchain::is_executable_file(file));
+    Ok(upstream_on_path(layout, "targo", path_var)
+        .into_iter()
+        .chain(rustup)
+        .find(|candidate| trust(candidate))
+        .map(managed))
+}
+
+/// Whether the `targo` at `target` is Trust by its own `-vV`
+/// ([`crate::upstream_identity::resolve`]), the check [`lane_targo`] holds each candidate to.
+fn is_trust_targo(
+    target: &Path,
+    cwd: Option<&Path>,
+    env_toolchain: Option<&str>,
+    rustup_home: Option<&Path>,
+    cache: Option<&Path>,
+) -> bool {
+    crate::upstream_identity::resolve(&crate::upstream_identity::Ask {
+        name: "targo",
+        target,
+        toolchain: None,
+        cwd,
+        env_toolchain,
+        rustup_home,
+        cache,
+    })
+    .is_trust()
 }
 
 use crate::ops::Managed;
@@ -1811,7 +1978,13 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
             })
             .unwrap_or_else(|why| {
                 let refusal = || Plan::Missing {
-                    say: why.refusal(upstream, branded, program),
+                    say: why.refusal(
+                        upstream,
+                        branded,
+                        program,
+                        (machine.unserved)(branded, program).as_deref(),
+                        &crate::serving::local_remedy(program),
+                    ),
                 };
                 if (machine.strict)() {
                     return refusal();
@@ -1849,8 +2022,25 @@ fn plan(row: &Row, args: &[String], machine: &Machine<'_>) -> Plan {
                     shown.to_vec(),
                     &|| explicit_lane_note(upstream, branded),
                 )
+                .or_else(|why| match (why, (machine.lane_targo)()) {
+                    (Unrunnable::Absent, Ok(Some(copy))) => Ok(Plan::Branded {
+                        say: explicit_lane_found_note(upstream, branded, &copy.target),
+                        copy,
+                        args: shown.to_vec(),
+                    }),
+                    (Unrunnable::Absent, Err(refused)) => Ok(Plan::Missing {
+                        say: stage2_refused_message(upstream, branded, &refused),
+                    }),
+                    (why, _) => Err(why),
+                })
                 .unwrap_or_else(|why| Plan::Missing {
-                    say: why.refusal(upstream, branded, EXPLICIT_LANE_PROGRAM),
+                    say: why.refusal(
+                        upstream,
+                        branded,
+                        EXPLICIT_LANE_PROGRAM,
+                        (machine.unserved)(branded, EXPLICIT_LANE_PROGRAM).as_deref(),
+                        EXPLICIT_LANE_LOCAL_REMEDY,
+                    ),
                 });
             }
             match (machine.upstream)() {
@@ -2019,6 +2209,8 @@ pub fn run_storeless(upstream: &str, args: &[String]) -> ExitCode {
         strict: &|| reroute.strict(),
         upstream: &|| upstream_on_path_in(None, upstream, path_var.as_deref()),
         branded: &|_, _| Install::Absent,
+        lane_targo: &|| Ok(None),
+        unserved: &|_, _| None,
         pin: &|| None,
         resolve: &|target, toolchain| {
             crate::upstream_identity::resolve(&crate::upstream_identity::Ask {

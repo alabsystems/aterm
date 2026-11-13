@@ -181,8 +181,8 @@ pub use remove::{
     NodePassSaid, RemovedNote, RemovedNotes, TableCuts, UndoOffer, UndoShare, cut_own_removals,
     epoch_convergence_environment, gap_heal_environment, member_list, node_pass_receipt,
     on_table_cuts, read_after_cutoff_lines, remove_member, remove_seat, removed_notes,
-    removes_by_log, reseal_waits, revoke_by_log, run_node_pass, tend_epochs, tend_epochs_at,
-    undo_offers, undo_removals, vault_admin_named, vault_pass_at,
+    removes_by_log, reseal_waits, revoke_by_log, run_node_pass, seats_ever, tend_epochs,
+    tend_epochs_at, undo_offers, undo_removals, vault_admin_named, vault_pass_at,
 };
 pub(crate) use remove::{recipient_label, seat_label};
 #[cfg(any(test, debug_assertions))]
@@ -216,9 +216,9 @@ pub(crate) use steward::{AlabRoleContext, AlabRoleObservation, observe_alab_role
 pub use steward::{
     StewardLease, StewardRevoke, StewardStandbyServer, Stewardship,
     local_recipient_denial_observed, local_recipient_denied_in_roster, no_admin_key,
-    steward_alab_policy_role, steward_ensure_lease, steward_ensure_standby_server,
-    steward_finish_revokes, steward_lease_check, steward_revoke_check,
-    steward_standby_server_check, stewardship,
+    retire_stale_member_server, stale_member_server, steward_alab_policy_role,
+    steward_ensure_lease, steward_ensure_standby_server, steward_finish_revokes,
+    steward_lease_check, steward_revoke_check, steward_standby_server_check, stewardship,
 };
 pub use subscriber::mend_subscriber;
 #[cfg(any(test, debug_assertions))]
@@ -1516,19 +1516,26 @@ impl StateLock {
     }
 
     fn observe_until(paths: &Paths, deadline: Instant) -> crate::Result<Option<StateLock>> {
+        match Self::observe_classified_until(paths, deadline)? {
+            StateObservation::Held(lock) => Ok(Some(lock)),
+            StateObservation::Absent | StateObservation::Busy => Ok(None),
+        }
+    }
+
+    /// [`Self::observe_classified`], waiting until `deadline` while a writer holds the lock:
+    /// `Busy` only where one still held it then.
+    fn observe_classified_until(
+        paths: &Paths,
+        deadline: Instant,
+    ) -> crate::Result<StateObservation> {
         let mut backoff = Duration::from_millis(1);
         loop {
-            if let Some(lock) = Self::observe(paths)? {
-                return Ok(Some(lock));
-            }
-            if !paths.lock_file().exists() {
-                return Ok(None);
-            }
+            let observation = Self::observe_classified(paths)?;
             let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                return Ok(None);
+            if !matches!(observation, StateObservation::Busy) || remaining.is_zero() {
+                return Ok(observation);
             }
-            #[cfg(test)]
+            #[cfg(any(test, debug_assertions))]
             OBSERVE_BLOCKED.with(|hook| {
                 if let Some(hook) = hook.borrow_mut().as_mut() {
                     hook();
@@ -1537,6 +1544,16 @@ impl StateLock {
             std::thread::sleep(backoff.min(remaining));
             backoff = (backoff * 2).min(Duration::from_millis(50));
         }
+    }
+
+    /// The observation of a reader that judges what the vault's state holds (whether a snapshot
+    /// is still current, what the applied copy carries): a writer holding the lock is waited
+    /// for, up to [`CURRENT_WAIT`], since a busy lock says nothing either way. Writers hold it
+    /// for milliseconds as a rule (the subscriber takes it for its pass over every long-poll
+    /// answer, an unchanged one included). `Busy` only where one still held it at the end, which
+    /// the reader words as that ([`writer_outlasted_wait`]), never as a change.
+    fn observe_judging(paths: &Paths) -> crate::Result<StateObservation> {
+        Self::observe_classified_until(paths, Instant::now() + current_wait())
     }
 }
 
@@ -1597,12 +1614,41 @@ pub(crate) fn lock_judgements_of(paths: &Paths) -> usize {
     lock_uses_of(LockUse::Judged, paths)
 }
 
-#[cfg(test)]
+#[cfg(any(test, debug_assertions))]
 std::thread_local! {
-    /// A test's action on each blocked try of [`StateLock::observe_until`] that will try again,
+    /// A test's action on each blocked try of [`StateLock::observe_classified_until`] (and so of
+    /// [`StateLock::observe_until`] and [`StateLock::observe_judging`]) that will try again,
     /// run in the waiting thread, so a hold can end exactly while a reader waits on it.
     pub(crate) static OBSERVE_BLOCKED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// Run `read` with `blocked` as this thread's action on each try of a waiting reader that finds
+/// a writer holding the state lock and will try again ([`OBSERVE_BLOCKED`]), so a hold (a
+/// fixture's [`test_hold_state_lock`]) ends exactly while the reader waits on it; and count
+/// those tries. This observes contention; it does not change whether the reader waits.
+#[cfg(any(test, debug_assertions))]
+pub fn test_while_state_lock_held<T>(
+    mut blocked: impl FnMut() + 'static,
+    read: impl FnOnce() -> T,
+) -> (T, usize) {
+    struct Restore(Option<Box<dyn FnMut()>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVE_BLOCKED.with(|hook| *hook.borrow_mut() = self.0.take());
+        }
+    }
+    let tries = std::rc::Rc::new(std::cell::Cell::new(0));
+    let counted = std::rc::Rc::clone(&tries);
+    let restore = Restore(OBSERVE_BLOCKED.with(|hook| {
+        hook.replace(Some(Box::new(move || {
+            counted.set(counted.get() + 1);
+            blocked();
+        })))
+    }));
+    let read = read();
+    drop(restore);
+    (read, tries.get())
 }
 
 impl Drop for StateLock {
@@ -3237,6 +3283,13 @@ pub fn read_verdict_within_admitted(
 }
 
 /// Whether an admitted vault applied the current selected entries and its tracked files match.
+/// A writer holding the state lock (an apply, or the subscriber's pass over a long-poll answer)
+/// is waited for, as [`MaterializationSnapshot::is_current`] waits for one, so a reader deciding
+/// whether to act never reads that pass as a vault not ready. A status read that answers at once
+/// is [`observe_materialization`].
+/// # Errors
+/// The local configuration or state cannot be safely read, or a writer held the state lock past
+/// the wait ([`crate::ErrorKind::VaultBusy`]).
 pub fn materialization_ready(paths: &Paths) -> crate::Result<bool> {
     materialization_ready_with(paths, None, local_files_intact)
 }
@@ -3255,7 +3308,10 @@ pub fn materialization_ready_for_setup(paths: &Paths) -> crate::Result<bool> {
     ready
 }
 
-/// Observe readiness only while `expected` is still configured.
+/// [`materialization_ready`] only while `expected` is still configured, waiting for a writer as
+/// it does.
+/// # Errors
+/// As [`materialization_ready`]'s.
 pub fn materialization_ready_for(paths: &Paths, expected: &Config) -> crate::Result<bool> {
     materialization_ready_with(paths, Some(expected), local_files_intact)
 }
@@ -3363,8 +3419,13 @@ mod materialization_scope_tests;
 /// These reasons reveal no entry names, credentials, paths or source payloads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MaterializationBlocker {
-    /// A shared observation lock could not be taken; it may be busy or absent.
-    LockUnavailable,
+    /// A writer (a vault pass on this machine) holds the state lock, which says nothing either
+    /// way. Only a status observation ([`observe_materialization`]) answers this: a reader that
+    /// gates work waits the writer out ([`StateLock::observe_judging`]) and errs where it outlasts
+    /// the wait ([`writer_outlasted_wait`]).
+    WriterBusy,
+    /// No state lock file is there to observe: nothing was applied here, or it was removed.
+    LockMissing,
     /// No vault source is configured under the observation lock.
     Unconfigured,
     /// The configured source no longer equals the caller's expected source.
@@ -3395,11 +3456,56 @@ pub enum MaterializationObservation<T> {
     Blocked(MaterializationBlocker),
 }
 
-/// How long [`MaterializationSnapshot::is_current`] waits for a writer holding the state lock.
+/// How long a reader that judges the vault's state waits for a writer holding the state lock
+/// ([`StateLock::observe_judging`]).
 const CURRENT_WAIT: Duration = Duration::from_secs(30);
 
-/// How often [`MaterializationSnapshot::is_current`] looks again while a writer holds the lock.
-const CURRENT_LOOK: Duration = Duration::from_millis(100);
+#[cfg(test)]
+std::thread_local! {
+    /// A test's own [`CURRENT_WAIT`] on this thread ([`with_current_wait`]).
+    static TEST_CURRENT_WAIT: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// [`CURRENT_WAIT`], or a test's own on this thread.
+fn current_wait() -> Duration {
+    #[cfg(test)]
+    if let Some(wait) = TEST_CURRENT_WAIT.with(std::cell::Cell::get) {
+        return wait;
+    }
+    CURRENT_WAIT
+}
+
+/// Run `read` with `wait` in place of [`CURRENT_WAIT`] on this thread, so a test of a writer
+/// that outlasts the wait ends in a moment.
+#[cfg(test)]
+pub(crate) fn with_current_wait<T>(wait: Duration, read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_CURRENT_WAIT.with(|wait| wait.set(self.0));
+        }
+    }
+    let _restore = Restore(TEST_CURRENT_WAIT.with(|old| old.replace(Some(wait))));
+    read()
+}
+
+/// What a reader that judges the vault's state says where a writer still held the state lock
+/// at the end of its wait ([`StateLock::observe_judging`]): a vault pass that long, not a change,
+/// for nothing was read. `then` says what reads it once that pass ends.
+pub(crate) fn writer_outlasted_wait(then: &str) -> Error {
+    Error::of_kind(
+        crate::ErrorKind::VaultBusy,
+        format!(
+            "a vault pass on this machine has held the vault's state lock for over {} s: {then}",
+            CURRENT_WAIT.as_secs()
+        ),
+    )
+}
+
+/// [`writer_outlasted_wait`] for a read of the materialized vault.
+fn materialization_writer_busy() -> Error {
+    writer_outlasted_wait("the vault is read again once it ends")
+}
 
 impl MaterializationSnapshot {
     /// The historical materialized version admitted beside the captured local inputs.
@@ -3443,7 +3549,8 @@ impl MaterializationSnapshot {
     }
 
     /// Hold the ordinary readiness guard while using this exact source/version, rather
-    /// than the looser scoped-file currency that permits unrelated later versions.
+    /// than the looser scoped-file currency that permits unrelated later versions. A writer
+    /// holding the state lock is waited for, as [`Self::is_current`] waits for one.
     pub(crate) fn at_current_version<T>(
         &self,
         paths: &Paths,
@@ -3469,6 +3576,7 @@ impl MaterializationSnapshot {
             local_files_intact,
             None,
             Some(&self.selection),
+            OnWriter::Wait,
             |now| {
                 if now.seq != self.seq || now.digest != self.digest || !now.holds_the_files_of(self)
                 {
@@ -3495,66 +3603,46 @@ impl MaterializationSnapshot {
     /// open vault every join publishes) leaves it current, and one that changes, adds or
     /// removes a file does not. An entry-scoped observation compares only its named inputs,
     /// while still requiring the whole current materialization to be ready and intact.
-    /// A writer holding the state lock (an apply now) is waited for,
-    /// up to [`CURRENT_WAIT`], since a busy lock says nothing either way.
-    /// This is a point-in-time check, not a lease over later effects.
+    /// A writer holding the state lock (an apply, or the subscriber's pass over a long-poll
+    /// answer) is waited for, up to [`CURRENT_WAIT`], since a busy lock says nothing either way
+    /// ([`StateLock::observe_judging`]); one that outlasts the wait is an error saying so,
+    /// never `false`. This is a point-in-time check, not a lease over later effects.
     /// # Errors
-    /// The local configuration or state cannot be safely read.
+    /// The local configuration or state cannot be safely read, or a writer held the state lock
+    /// past the wait ([`crate::ErrorKind::VaultBusy`]).
     pub fn is_current(&self, paths: &Paths) -> crate::Result<bool> {
-        let until = Instant::now() + CURRENT_WAIT;
-        let mut looked_again = false;
-        loop {
-            match self.observe_current(paths)? {
+        Ok(
+            match with_ready_state_reusing(
+                paths,
+                Some(&self.config),
+                local_files_intact,
+                None,
+                Some(&self.selection),
+                OnWriter::Wait,
+                |_| Ok(()),
+            )? {
                 MaterializationObservation::Ready(current) => {
-                    return Ok(current.snapshot.holds_the_files_of(self));
+                    current.snapshot.holds_the_files_of(self)
                 }
-                // A writer may have let go between the read and this look: one more read
-                // settles it, and a busy lock is waited for.
-                MaterializationObservation::Blocked(_)
-                    if (!looked_again || state_lock_busy(paths)?) && Instant::now() < until =>
-                {
-                    looked_again = true;
-                    std::thread::sleep(CURRENT_LOOK);
-                }
-                MaterializationObservation::Blocked(_) => return Ok(false),
-            }
-        }
-    }
-
-    /// The full readiness check of [`Self::is_current`], without waiting for a writer.
-    /// A busy or missing state lock returns `false`. This is a point-in-time admission
-    /// check, not a lease over later effects.
-    /// # Errors
-    /// The local configuration or state cannot be safely read.
-    pub fn is_current_now(&self, paths: &Paths) -> crate::Result<bool> {
-        Ok(match self.observe_current(paths)? {
-            MaterializationObservation::Ready(current) => current.snapshot.holds_the_files_of(self),
-            MaterializationObservation::Blocked(_) => false,
-        })
-    }
-
-    fn observe_current(&self, paths: &Paths) -> crate::Result<MaterializationObservation<()>> {
-        with_ready_state_reusing(
-            paths,
-            Some(&self.config),
-            local_files_intact,
-            None,
-            Some(&self.selection),
-            |_| Ok(()),
+                MaterializationObservation::Blocked(_) => false,
+            },
         )
     }
 
     /// Whether the captured source's recorded membership and input digests still hold.
-    /// Observes the state lock once; a busy or missing lock returns `false`. This is only
-    /// a cancellation check for work admitted by a full readiness check: it does not
-    /// verify cached authority, the membership log, or file contents, and must never
-    /// admit an effect or report materialization ready. Call [`Self::is_current_now`]
-    /// again at effect boundaries.
+    /// Observes the state lock once, without waiting: a writer holding it says nothing either
+    /// way, so the work goes on (`true`) and the next check reads again; a missing lock returns
+    /// `false`. This is only a cancellation check for work admitted by a full readiness check:
+    /// it does not verify cached authority, the membership log, or file contents, and must never
+    /// admit an effect or report materialization ready. Call [`Self::is_current`] again at
+    /// effect boundaries.
     /// # Errors
     /// The local configuration or state cannot be safely read.
     pub fn source_continues(&self, paths: &Paths) -> crate::Result<bool> {
-        let Some(observation) = StateLock::observe(paths)? else {
-            return Ok(false);
+        let observation = match StateLock::observe_classified(paths)? {
+            StateObservation::Held(lock) => lock,
+            StateObservation::Busy => return Ok(true),
+            StateObservation::Absent => return Ok(false),
         };
         let Ok((_, state)) = materialization_source_state(paths, Some(&self.config), &observation)?
         else {
@@ -3581,28 +3669,26 @@ impl MaterializationSnapshot {
     }
 }
 
-/// Whether a writer holds the state lock now: the lock file is there and a shared take of it
-/// would wait.
-fn state_lock_busy(paths: &Paths) -> crate::Result<bool> {
-    Ok(
-        StateLock::observe(paths)?.is_none()
-            && fsx::kind(&paths.lock_file())? != fsx::Kind::Missing,
-    )
-}
-
 /// Read local inputs under the ready vault's shared state lock, releasing it on return.
-/// `read` must do local reads only: no network, subprocess or other effects.
+/// `read` must do local reads only: no network, subprocess or other effects. A writer holding
+/// the state lock is waited for, as [`MaterializationSnapshot::is_current`] waits for one.
 /// # Errors
-/// The local configuration/state or the supplied input reader fails.
+/// The local configuration/state or the supplied input reader fails, or a writer held the
+/// state lock past the wait ([`crate::ErrorKind::VaultBusy`]).
 pub fn with_materialization_ready<T>(
     paths: &Paths,
     expected: &Config,
     read: impl FnOnce() -> crate::Result<T>,
 ) -> crate::Result<Option<Materialized<T>>> {
-    observe_materialization(paths, expected, read).map(|observation| match observation {
-        MaterializationObservation::Ready(inputs) => Some(*inputs),
-        MaterializationObservation::Blocked(_) => None,
-    })
+    with_ready_state(
+        paths,
+        Some(expected),
+        local_files_intact,
+        None,
+        OnWriter::Wait,
+        |_| read(),
+    )
+    .map(MaterializationObservation::ready)
 }
 
 /// Capture local inputs under the complete ready vault's shared state lock, retaining only
@@ -3610,9 +3696,11 @@ pub fn with_materialization_ready<T>(
 /// entry updates may leave that snapshot current; incomplete materialization, changed source,
 /// revoked membership, or a missing or changed named entry may not. `read` must do local reads
 /// only, with no network, subprocesses or effects. Missing entries return `None` before `read`.
+/// A writer holding the state lock is waited for, as [`with_materialization_ready`] waits.
 ///
 /// # Errors
-/// The entry set is empty, local configuration/state cannot be read, or the input reader fails.
+/// The entry set is empty, local configuration/state cannot be read, the input reader fails,
+/// or a writer held the state lock past the wait ([`crate::ErrorKind::VaultBusy`]).
 pub fn with_materialization_ready_for_entries<T>(
     paths: &Paths,
     expected: &Config,
@@ -3629,18 +3717,18 @@ pub fn with_materialization_ready_for_entries<T>(
         Some(expected),
         local_files_intact,
         Some(entries),
+        OnWriter::Wait,
         |_| read(),
     )
-    .map(|observation| match observation {
-        MaterializationObservation::Ready(inputs) => Some(*inputs),
-        MaterializationObservation::Blocked(_) => None,
-    })
+    .map(MaterializationObservation::ready)
 }
 
 /// Observe readiness and read local inputs under one shared state lock.
 /// `read` runs only when the configured vault still equals `expected` and its
 /// materialization passes the ordinary readiness guard. It must perform only
-/// local reads, with no network, subprocesses or other effects.
+/// local reads, with no network, subprocesses or other effects. This is a status
+/// observation: a writer holding the state lock is its answer at once
+/// ([`MaterializationBlocker::WriterBusy`]), not waited for.
 /// # Errors
 /// The local configuration/state or the supplied input reader fails.
 pub fn observe_materialization<T>(
@@ -3648,7 +3736,14 @@ pub fn observe_materialization<T>(
     expected: &Config,
     read: impl FnOnce() -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
-    with_ready_state(paths, Some(expected), local_files_intact, None, |_| read())
+    with_ready_state(
+        paths,
+        Some(expected),
+        local_files_intact,
+        None,
+        OnWriter::Answer,
+        |_| read(),
+    )
 }
 
 fn materialization_ready_with(
@@ -3657,9 +3752,29 @@ fn materialization_ready_with(
     intact: impl FnOnce(&Paths, &State) -> bool,
 ) -> crate::Result<bool> {
     Ok(matches!(
-        with_ready_state(paths, expected, intact, None, |_| Ok(()))?,
+        with_ready_state(paths, expected, intact, None, OnWriter::Wait, |_| Ok(()))?,
         MaterializationObservation::Ready(_)
     ))
+}
+
+impl<T> MaterializationObservation<T> {
+    /// The inputs a ready observation read; `None` where it was blocked.
+    fn ready(self) -> Option<Materialized<T>> {
+        match self {
+            Self::Ready(inputs) => Some(*inputs),
+            Self::Blocked(_) => None,
+        }
+    }
+}
+
+/// How a readiness read meets a writer holding the state lock.
+#[derive(Clone, Copy)]
+enum OnWriter {
+    /// A status observation answers [`MaterializationBlocker::WriterBusy`] at once.
+    Answer,
+    /// A reader that gates work waits it out ([`StateLock::observe_judging`]) and errs where it
+    /// outlasts the wait ([`writer_outlasted_wait`]).
+    Wait,
 }
 
 /// The common recorded source checks, with the caller holding the state lock.
@@ -3705,9 +3820,10 @@ fn with_ready_state<T>(
     expected: Option<&Config>,
     intact: impl FnOnce(&Paths, &State) -> bool,
     entries: Option<&[&str]>,
+    on_writer: OnWriter,
     read: impl FnOnce(&MaterializationSnapshot) -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
-    with_ready_state_reusing(paths, expected, intact, entries, None, read)
+    with_ready_state_reusing(paths, expected, intact, entries, None, on_writer, read)
 }
 
 #[cfg_attr(
@@ -3732,12 +3848,20 @@ fn with_ready_state_reusing<T>(
     intact: impl FnOnce(&Paths, &State) -> bool,
     entries: Option<&[&str]>,
     prior: Option<&std::sync::Arc<materialization_selection::Fact>>,
+    on_writer: OnWriter,
     read: impl FnOnce(&MaterializationSnapshot) -> crate::Result<T>,
 ) -> crate::Result<MaterializationObservation<T>> {
     use MaterializationBlocker as Blocker;
     let blocked = |why| Ok(MaterializationObservation::Blocked(why));
-    let Some(observation) = StateLock::observe(paths)? else {
-        return blocked(Blocker::LockUnavailable);
+    let observation = match on_writer {
+        OnWriter::Answer => StateLock::observe_classified(paths)?,
+        OnWriter::Wait => StateLock::observe_judging(paths)?,
+    };
+    let observation = match (observation, on_writer) {
+        (StateObservation::Held(lock), _) => lock,
+        (StateObservation::Absent, _) => return blocked(Blocker::LockMissing),
+        (StateObservation::Busy, OnWriter::Answer) => return blocked(Blocker::WriterBusy),
+        (StateObservation::Busy, OnWriter::Wait) => return Err(materialization_writer_busy()),
     };
     let (config, state) = match materialization_source_state(paths, expected, &observation)? {
         Ok(ready) => ready,
@@ -3936,7 +4060,6 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
                 host,
                 seq: state.seq,
                 signer: pin,
-                hidden: opened.hidden_epochs,
                 held,
             }));
         }
@@ -3967,7 +4090,6 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
     if !log_entries::applied_log_available(&state, seeded.as_ref().map(|(_, digest)| *digest)) {
         return Ok(None);
     }
-    let mut hidden = false;
     let mut held = BTreeSet::new();
     let mut accepted_log = None;
     if steward::local_recipient_denied_in_roster(paths) {
@@ -3992,7 +4114,6 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
         let Some(opened) = log.open_entry_set(&identity)? else {
             return Ok(None);
         };
-        hidden = opened.hidden_epochs;
         held.extend(opened.entries.into_iter().map(|entry| entry.name));
     } else {
         for locker in envelope
@@ -4003,10 +4124,7 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
             let plain =
                 match age::decrypt(std::slice::from_ref(&identity), locker.armored.as_bytes()) {
                     Ok(plain) => plain,
-                    Err(age::AgeError::NoMatch) => {
-                        hidden = true;
-                        continue;
-                    }
+                    Err(age::AgeError::NoMatch) => continue,
                     Err(error) => {
                         return Err(Error::new(format!("locker {}: {error}", locker.label)));
                     }
@@ -4036,7 +4154,6 @@ pub(crate) fn sight(paths: &Paths) -> crate::Result<Option<crate::need::Sight>> 
         host: config.host,
         seq: state.seq,
         signer: envelope.signer,
-        hidden,
         held,
     }))
 }

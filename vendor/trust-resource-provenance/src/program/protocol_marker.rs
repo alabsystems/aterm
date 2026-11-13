@@ -11,6 +11,7 @@ pub(super) enum Profile {
     Workload,
     WorkloadMember,
     PairedQualification,
+    NativeJob,
     BootstrapFixed,
     BootstrapGraph,
 }
@@ -21,6 +22,7 @@ impl Profile {
             Self::Workload => b"__trust_workload",
             Self::WorkloadMember => b"__trust_member\0\0",
             Self::PairedQualification => b"__trust_pairqual",
+            Self::NativeJob => b"__trust_jobroot\0",
             Self::BootstrapFixed => b"__trust_btfix\0\0\0",
             Self::BootstrapGraph => b"__trust_bgraph\0\0",
         }
@@ -31,6 +33,7 @@ impl Profile {
             Self::Workload => b"TRUSTWORKLOAD001",
             Self::WorkloadMember => b"TRUSTMEMBER00002",
             Self::PairedQualification => b"TRUSTPAIRQUAL002",
+            Self::NativeJob => b"TRUSTNATIVEJOB01",
             Self::BootstrapFixed => b"TRUSTBTFIX000001",
             Self::BootstrapGraph => b"TRUSTBGRAPH00002",
         }
@@ -41,6 +44,7 @@ impl Profile {
             Self::Workload => [3, 6, 7, 40, 48, 1],
             Self::WorkloadMember => [3, 2, 50, 56, 57, 58],
             Self::PairedQualification => [3, 6, 7, 60, 48, 2],
+            Self::NativeJob => [3, 6, 7, 106, 48, 3],
             Self::BootstrapFixed => [1, 1, 1, 1, 0, 0],
             Self::BootstrapGraph => [3, 71, 72, 73, 74, 2],
         }
@@ -66,7 +70,9 @@ fn wide(bytes: &[u8], offset: usize) -> io::Result<u64> {
     ))
 }
 fn range(start: u64, length: u64, bound: u64) -> io::Result<std::ops::Range<u64>> {
-    let end = start.checked_add(length).ok_or_else(|| refused("protocol Mach-O range overflow"))?;
+    let end = start
+        .checked_add(length)
+        .ok_or_else(|| refused("protocol Mach-O range overflow"))?;
     if end > bound {
         return Err(refused("protocol Mach-O range exceeds original image"));
     }
@@ -92,7 +98,9 @@ fn read(file: &File, output: &mut [u8], offset: u64, deadline: Instant) -> io::R
 fn marker_offset(header: &[u8], file_length: u64, profile: Profile) -> io::Result<u64> {
     if word(header, 0)? != 0xfeed_facf || word(header, 4)? != 0x0100_000c || word(header, 12)? != 2
     {
-        return Err(refused("protocol marker requires a thin arm64 Mach-O executable"));
+        return Err(refused(
+            "protocol marker requires a thin arm64 Mach-O executable",
+        ));
     }
     let count = word(header, 16)? as usize;
     let bytes = word(header, 20)? as usize;
@@ -116,8 +124,9 @@ fn marker_offset(header: &[u8], file_length: u64, profile: Profile) -> io::Resul
         if length < 8 || length % 8 != 0 {
             return Err(refused("invalid protocol Mach-O command size"));
         }
-        let next =
-            cursor.checked_add(length).ok_or_else(|| refused("protocol command overflow"))?;
+        let next = cursor
+            .checked_add(length)
+            .ok_or_else(|| refused("protocol command overflow"))?;
         let command = header
             .get(cursor..next)
             .ok_or_else(|| refused("protocol command extends beyond header"))?;
@@ -135,8 +144,9 @@ fn marker_offset(header: &[u8], file_length: u64, profile: Profile) -> io::Resul
             let vmsize = wide(command, 32)?;
             let fileoff = wide(command, 40)?;
             let filesize = wide(command, 48)?;
-            let vmend =
-                vm.checked_add(vmsize).ok_or_else(|| refused("protocol VM range overflow"))?;
+            let vmend = vm
+                .checked_add(vmsize)
+                .ok_or_else(|| refused("protocol VM range overflow"))?;
             let file = range(fileoff, filesize, file_length)?;
             if !file.is_empty() {
                 segments.push(file.clone());
@@ -202,7 +212,10 @@ fn marker_offset(header: &[u8], file_length: u64, profile: Profile) -> io::Resul
     }
     for ranges in [&segments, &sections] {
         for (index, left) in ranges.iter().enumerate() {
-            if ranges[index + 1..].iter().any(|right| overlaps(left, right)) {
+            if ranges[index + 1..]
+                .iter()
+                .any(|right| overlaps(left, right))
+            {
                 return Err(refused("protocol image ranges overlap"));
             }
         }
@@ -316,11 +329,20 @@ mod tests {
                 &expected(Profile::PairedQualification),
                 deadline,
             );
-            assert_eq!(observed.is_ok(), matches!(profile, Profile::PairedQualification));
+            assert_eq!(
+                observed.is_ok(),
+                matches!(profile, Profile::PairedQualification)
+            );
         }
         let mut paired = tempfile::tempfile().unwrap();
-        paired.write_all(&image(Profile::PairedQualification)).unwrap();
-        for old in [Profile::Resolver, Profile::Workload, Profile::WorkloadMember] {
+        paired
+            .write_all(&image(Profile::PairedQualification))
+            .unwrap();
+        for old in [
+            Profile::Resolver,
+            Profile::Workload,
+            Profile::WorkloadMember,
+        ] {
             assert!(require(&paired, old, &expected(old), deadline).is_err());
         }
     }
@@ -381,15 +403,24 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&bytes).unwrap();
         assert!(
-            require(&file, Profile::WorkloadMember, &expected(Profile::WorkloadMember), deadline)
-                .is_err()
+            require(
+                &file,
+                Profile::WorkloadMember,
+                &expected(Profile::WorkloadMember),
+                deadline
+            )
+            .is_err()
         );
     }
     #[test]
     fn compiler_member_declaration_cannot_be_an_old_root_or_resolver_protocol() {
         use std::io::Write as _;
         let deadline = required_deadline(Instant::now());
-        for profile in [Profile::Resolver, Profile::Workload, Profile::WorkloadMember] {
+        for profile in [
+            Profile::Resolver,
+            Profile::Workload,
+            Profile::WorkloadMember,
+        ] {
             let mut file = tempfile::tempfile().unwrap();
             file.write_all(&image(profile)).unwrap();
             let observed = require(
@@ -422,23 +453,55 @@ mod tests {
         let deadline = required_deadline(Instant::now());
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&image(Profile::Workload)).unwrap();
-        assert!(require(&file, Profile::Workload, &expected(Profile::Workload), deadline).is_ok());
-        assert!(require(&file, Profile::Resolver, &expected(Profile::Resolver), deadline).is_err());
+        assert!(
+            require(
+                &file,
+                Profile::Workload,
+                &expected(Profile::Workload),
+                deadline
+            )
+            .is_ok()
+        );
+        assert!(
+            require(
+                &file,
+                Profile::Resolver,
+                &expected(Profile::Resolver),
+                deadline
+            )
+            .is_err()
+        );
         let mut wrong = expected(Profile::Workload);
         wrong[31] = 5;
         assert!(require(&file, Profile::Workload, &wrong, deadline).is_err());
         let mut resolver = tempfile::tempfile().unwrap();
         resolver.write_all(&image(Profile::Resolver)).unwrap();
         assert!(
-            require(&resolver, Profile::Workload, &expected(Profile::Workload), deadline).is_err()
+            require(
+                &resolver,
+                Profile::Workload,
+                &expected(Profile::Workload),
+                deadline
+            )
+            .is_err()
         );
         for offset in [88, 92, 152, 156, 160, 164, 168, 176] {
             let mut altered = image(Profile::Workload);
-            put(&mut altered, offset, if offset == 88 || offset == 92 { 7 } else { 1 });
+            put(
+                &mut altered,
+                offset,
+                if offset == 88 || offset == 92 { 7 } else { 1 },
+            );
             let mut file = tempfile::tempfile().unwrap();
             file.write_all(&altered).unwrap();
             assert!(
-                require(&file, Profile::Workload, &expected(Profile::Workload), deadline).is_err(),
+                require(
+                    &file,
+                    Profile::Workload,
+                    &expected(Profile::Workload),
+                    deadline
+                )
+                .is_err(),
                 "offset {offset}"
             );
         }
@@ -528,7 +591,8 @@ mod tests {
             Profile::Resolver,
             &expected(Profile::Resolver),
             required_deadline(started),
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -542,7 +606,8 @@ mod tests {
             Profile::BootstrapFixed,
             &expected(Profile::BootstrapFixed),
             required_deadline(started),
-        ).unwrap();
+        )
+        .unwrap();
     }
     #[test]
     fn same_magic_in_arbitrary_bytes_or_mutable_data_is_no_support_declaration() {
@@ -567,7 +632,10 @@ mod tests {
         std::fs::write(&path, image(Profile::Resolver)).unwrap();
         let original = File::open(&path).unwrap();
         std::fs::rename(&path, dir.path().join("held")).unwrap();
-        File::create(&path).unwrap().write_all(b"replacement").unwrap();
+        File::create(&path)
+            .unwrap()
+            .write_all(b"replacement")
+            .unwrap();
         assert!(
             require(
                 &original,
@@ -602,8 +670,13 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(&old).unwrap();
         assert!(
-            require(&file, Profile::BootstrapGraph, &expected(Profile::BootstrapGraph), deadline)
-                .is_err()
+            require(
+                &file,
+                Profile::BootstrapGraph,
+                &expected(Profile::BootstrapGraph),
+                deadline
+            )
+            .is_err()
         );
         for profile in [
             Profile::Resolver,

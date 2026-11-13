@@ -11,7 +11,9 @@
 //! 0.80; two opposing turns are a flash; a pixel is over the bound with more than six turns in
 //! a second less one frame step. A pixel is the trail's own when fewer than half the turns of
 //! its busiest second fell in the pet's drawn box, the flying head's, the caret's cell or a
-//! word icon's box: those are other laws' to hold (the pet's gait frames, the icon's pop).
+//! word icon's box: those are other laws' to hold (the pet's gait frames, the icon's pop). A
+//! body's box holds the turns on the frame after it held the pixel too: a sprite moving off a
+//! pixel turns it on the first frame its box no longer holds it.
 
 use crate::trail_film::{Take, film_replay};
 use crate::trail_letters_read::*;
@@ -77,11 +79,12 @@ fn trail_flashes(style: &str, take: Take, look: Look, caret: &[u8]) -> Read {
     let mut zig: Vec<Option<Zig>> = Vec::new();
     let mut turns: HashMap<usize, Vec<u64>> = HashMap::new();
     // Each frame's boxes (px, end exclusive): the pet's body, the flying head, the caret's
-    // cell and the word icons.
+    // cell and the word icons; and its bodies alone, which hold the frame after theirs too.
     let mut boxes: HashMap<u64, Vec<(i32, i32, i32, i32)>> = HashMap::new();
+    let mut bodies: HashMap<u64, Vec<(i32, i32, i32, i32)>> = HashMap::new();
     let mut width = 1;
     let mut seen = 0;
-    let (width, turns, boxes, seen) = std::thread::scope(|s| {
+    let (width, turns, boxes, bodies, seen) = std::thread::scope(|s| {
         let reader = s.spawn(move || {
             for k in kept.iter() {
                 width = k.w;
@@ -95,6 +98,7 @@ fn trail_flashes(style: &str, take: Take, look: Look, caret: &[u8]) -> Read {
                 );
                 let g = &k.glass;
                 let mut here: Vec<_> = g.pet_body.into_iter().chain(g.head_body).collect();
+                bodies.insert(k.ms, here.clone());
                 here.push(caret);
                 here.extend(g.word_icons.iter().copied());
                 boxes.insert(k.ms, here);
@@ -105,7 +109,7 @@ fn trail_flashes(style: &str, take: Take, look: Look, caret: &[u8]) -> Read {
                 }
                 seen += 1;
             }
-            (width, turns, boxes, seen)
+            (width, turns, boxes, bodies, seen)
         });
         // The replay runs on the caller's thread: a negative control's seam is that thread's.
         let mut r = film_replay(style, look, rows, cols);
@@ -124,13 +128,17 @@ fn trail_flashes(style: &str, take: Take, look: Look, caret: &[u8]) -> Read {
     for (&i, times) in &turns {
         let (x, y) = ((i % width) as i32, (i / width) as i32);
         let (n, from) = most_within(times, 1_000);
+        let holds = |b: &Vec<(i32, i32, i32, i32)>| {
+            b.iter()
+                .any(|&(x0, x1, y0, y1)| x0 <= x && x < x1 && y0 <= y && y < y1)
+        };
         let boxed = times[from..from + n]
             .iter()
-            .filter(|t| {
-                boxes.get(t).is_some_and(|b| {
-                    b.iter()
-                        .any(|&(x0, x1, y0, y1)| x0 <= x && x < x1 && y0 <= y && y < y1)
-                })
+            .filter(|&&t| {
+                boxes.get(&t).is_some_and(holds)
+                    || t.checked_sub(STEP_MS)
+                        .and_then(|was| bodies.get(&was))
+                        .is_some_and(holds)
             })
             .count();
         if 2 * boxed >= n {

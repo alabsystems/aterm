@@ -50,6 +50,31 @@ impl Error {
         Self::CannotRun(format!("{what}: {error}"))
     }
 
+    /// This error with `note` after its message, keeping its kind and exit code: a fault
+    /// found beside it that the error alone would hide. A published-but-unconfirmed index
+    /// carries the note on its cause.
+    #[must_use]
+    pub(crate) fn with_note(self, note: &str) -> Self {
+        match self {
+            Self::Refused(m) => Self::Refused(format!("{m}; {note}")),
+            Self::Usage(m) => Self::Usage(format!("{m}; {note}")),
+            Self::CannotRun(m) => Self::CannotRun(format!("{m}; {note}")),
+            Self::ChildExit { code, message } => Self::ChildExit {
+                code,
+                message: format!("{message}; {note}"),
+            },
+            Self::PublishedUnconfirmed {
+                index_build,
+                directory,
+                cause,
+            } => Self::PublishedUnconfirmed {
+                index_build,
+                directory,
+                cause: Box::new(cause.with_note(note)),
+            },
+        }
+    }
+
     /// The process exit code this error is.
     #[must_use]
     pub fn exit_code(&self) -> u8 {

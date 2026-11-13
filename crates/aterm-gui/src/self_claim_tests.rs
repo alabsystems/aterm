@@ -62,6 +62,7 @@ fn a_live_snapshot_copy_requires_its_current_proven_claim() {
 fn copy_of(pid: u32, start: &str, seen: self_claimed::Seen) -> Copy {
     Copy {
         pid,
+        lifetime: None,
         start: start.to_string(),
         home: std::path::PathBuf::from("/private/tmp/x/codex-home"),
         seen,
@@ -440,6 +441,7 @@ fn record_reads_cannot_publish_after_handback_or_over_a_new_claim() {
     let now = crate::metrics::now_us();
     let copy = |seen| Copy {
         pid: proven.pid,
+        lifetime: None,
         start: proven.start.clone(),
         home: "/test/.codex".into(),
         seen,

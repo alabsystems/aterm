@@ -30,6 +30,10 @@ fn exact_owner_and_bounded_pid_free_grammar() {
         parse("attach-accounted-original-store-v1"),
         Some(Command::AttachAccountedExpected)
     );
+    assert_eq!(
+        parse("attach-accounted-native-job-original-store-v1"),
+        Some(Command::AttachNativeExpected)
+    );
     assert_eq!(parse("capabilities"), Some(Command::Capabilities));
     let nonce = "a".repeat(64);
     assert_eq!(
@@ -40,6 +44,7 @@ fn exact_owner_and_bounded_pid_free_grammar() {
         "",
         "attach session=s-a",
         "attach-accounted-original-store-v1 path=/foreign",
+        "attach-accounted-native-job-original-store-v1 path=/foreign",
         "inspect pid=2",
         "inspect session=s-a cpu_units=1",
         "inspect session=s-A",

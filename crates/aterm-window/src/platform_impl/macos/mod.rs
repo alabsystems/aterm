@@ -31,7 +31,8 @@ mod window_delegate;
 
 use std::fmt;
 
-pub(crate) use self::app_state::set_quit_confirm_hook;
+pub use self::app_state::AppKitLaunchStage;
+pub(crate) use self::app_state::{appkit_launch_stage, set_quit_confirm_hook};
 pub(crate) use self::event::{option_only_character, KeyEventExtra};
 pub(crate) use self::event_loop::{
     ActiveEventLoop, EventLoop, EventLoopProxy, PlatformSpecificEventLoopAttributes,

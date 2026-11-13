@@ -76,13 +76,18 @@ fn the_built_aterm_is_the_binary_cargo_reports() {
 fn bench_output_environment_keeps_os_paths() {
     let keeps = |path: &Path| {
         let mut command = crate::exec::check_command("not-executed");
-        set_bench_environment(&mut command, "KNOBS", "samples=3", ("OUTPUT", path));
+        command.env("ATERM_TEST_EXECUTABLE", "inherited-unrelated-artifact");
+        set_bench_environment(&mut command, "KNOBS", "samples=3", ("OUTPUT", path), path);
         let vars: Vec<_> = command.get_envs().collect();
         assert!(vars.contains(&(
             std::ffi::OsStr::new("KNOBS"),
             Some(std::ffi::OsStr::new("samples=3"))
         )));
         assert!(vars.contains(&(std::ffi::OsStr::new("OUTPUT"), Some(path.as_os_str()))));
+        assert!(vars.contains(&(
+            std::ffi::OsStr::new("ATERM_TEST_EXECUTABLE"),
+            Some(path.as_os_str())
+        )));
     };
     keeps(Path::new("/scratch/with spaces"));
     #[cfg(unix)]
@@ -225,7 +230,7 @@ fn a_second_run_on_one_day_gets_its_own_entry() {
 fn the_entry_head_carries_every_provenance_field() {
     let p = Provenance {
         heading: "Fabric: post -> deliver, burst",
-        protocol: "docs/measured/fabric/README.md",
+        protocol: "crates/aterm-verify/src/perf/fabric.rs",
         date: "2026-10-16",
         machine: "Apple M5 Max",
         macos: "27.0",

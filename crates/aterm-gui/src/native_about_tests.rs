@@ -121,7 +121,6 @@ fn about_actions_have_typed_replies_and_duplicate_or_late_completions_are_inert(
         .find_map(|effect| match effect {
             AppEffect::OpenExternal { request, reply } => {
                 assert_eq!(request.uri, "https://example.test/about");
-                assert!(request.user_initiated);
                 Some(reply.operation)
             }
             _ => None,

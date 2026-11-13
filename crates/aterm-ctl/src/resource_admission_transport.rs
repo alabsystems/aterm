@@ -13,6 +13,8 @@ use std::{
     time::Instant,
 };
 
+#[path = "resource_admission_native_store.rs"]
+pub mod native_store;
 #[path = "resource_admission_store_expectation.rs"]
 pub mod store_expectation;
 

@@ -11,8 +11,12 @@ pub const MAX_ITEMS: usize = 4096;
 pub const MAX_FENCES: usize = 127;
 /// Default private helper entry for fixed-FD fixtures. Production formats its
 /// held socket numbers with HelperFds::arguments; neither carries a grant.
-pub const HELPER_ARGUMENTS: [&str; 4] =
-    ["__resource-member-v3", "--protocol=3", "--control-fd=3", "--producer-fd=4"];
+pub const HELPER_ARGUMENTS: [&str; 4] = [
+    "__resource-member-v3",
+    "--protocol=3",
+    "--control-fd=3",
+    "--producer-fd=4",
+];
 /// The helper's private control endpoint; never inherited by the target.
 pub const CONTROL_FD: u32 = 3;
 /// The helper's producer-proof endpoint; never inherited by the target.
@@ -36,6 +40,37 @@ pub struct CommandSpec {
     pub environment: Vec<(Vec<u8>, Vec<u8>)>,
     pub cwd: Vec<u8>,
 }
+impl CommandSpec {
+    /// Capacity retained by this DATA snapshot, including unused collection
+    /// capacity. This is memory accounting, never command or resource authority.
+    pub fn retained_bytes(&self) -> Option<usize> {
+        let mut bytes = std::mem::size_of::<Self>()
+            .checked_add(self.program.capacity())?
+            .checked_add(self.cwd.capacity())?
+            .checked_add(
+                self.args
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<Vec<u8>>())?,
+            )?
+            .checked_add(
+                self.environment
+                    .capacity()
+                    .checked_mul(std::mem::size_of::<(Vec<u8>, Vec<u8>)>())?,
+            )?;
+        if let Some(arg0) = &self.arg0 {
+            bytes = bytes.checked_add(arg0.capacity())?;
+        }
+        for arg in &self.args {
+            bytes = bytes.checked_add(arg.capacity())?;
+        }
+        for (name, value) in &self.environment {
+            bytes = bytes
+                .checked_add(name.capacity())?
+                .checked_add(value.capacity())?;
+        }
+        Some(bytes)
+    }
+}
 
 /// Helper source and future target descriptors inhabit different namespaces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,8 +82,17 @@ pub struct Descriptor {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GnuTransport {
     None,
-    NumericPipe { read: Descriptor, write: Descriptor },
-    NamedFifo { locator: Vec<u8>, device: u64, inode: u64, read: Descriptor, write: Descriptor },
+    NumericPipe {
+        read: Descriptor,
+        write: Descriptor,
+    },
+    NamedFifo {
+        locator: Vec<u8>,
+        device: u64,
+        inode: u64,
+        read: Descriptor,
+        write: Descriptor,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -96,6 +140,10 @@ pub enum Role {
     /// A live registered UnitOutput under the original exclusive queue phase.
     /// Only workload::host::produced::ProducedRequest may carry this role.
     WorkloadProduced,
+    /// Actual registered produced coordinator's single existing primary is
+    /// lent before ARM, then returned only after native compiler retirement.
+    /// The Host independently proves the parent, source/output and SDK owners.
+    CoordinatorCompiler([u8; 16]),
 }
 impl Role {
     /// The original producer-proof proxy has a closed purpose set. New direct
@@ -103,7 +151,11 @@ impl Role {
     pub fn is_proxy_member(self) -> bool {
         matches!(
             self,
-            Self::MetadataVersion | Self::Compile | Self::MetadataProbe | Self::MachOLinker(_)
+            Self::MetadataVersion
+                | Self::Compile
+                | Self::MetadataProbe
+                | Self::MachOLinker(_)
+                | Self::CoordinatorCompiler(_)
         )
     }
 }
@@ -162,9 +214,18 @@ pub enum CompletionCause {
 pub enum Status {
     Attached,
     Started(Started),
-    Finished { outcome: Outcome, cause: CompletionCause, runtime_ns: u64 },
-    Refused { reason: String },
-    Unknown { reason: String, started: Option<Started> },
+    Finished {
+        outcome: Outcome,
+        cause: CompletionCause,
+        runtime_ns: u64,
+    },
+    Refused {
+        reason: String,
+    },
+    Unknown {
+        reason: String,
+        started: Option<Started>,
+    },
 }
 
 /// Frames bind every fact/cancellation to the same original and member attempt.

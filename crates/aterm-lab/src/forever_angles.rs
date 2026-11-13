@@ -24,11 +24,15 @@ pub const CHECKS: usize = DONE_ANGLES.len();
 /// How many it judges: a seventh, where the watch saw one, is the first again.
 const JUDGED: usize = CHECKS + 1;
 
-/// The reply to the first prompt: real work, then a done claim.
+/// The reply to the first prompt: real work, then a done claim, the token line an older primer
+/// taught (`turn_end::FINISHED`), a claim that is no defense.
+/// This chain specifically covers claims without a defense (its test asserts that premise).
+/// The current primer's defense is exercised by [`super::CLEAN`] in the other forever chains.
 pub const FIRST: &str = "Implemented the parser module for this repository together with its \
      unit tests and a small fuzz harness, checked every suite on the branch, merged the branch \
      into main and pushed it to origin/main, where the whole parser now lives with its tests \
-     beside it, and the readme now says how to run them and what each one covers. All done.";
+     beside it, and the readme now says how to run them and what each one covers. All done.\n\n\
+     ATERM-TASK-DONE";
 
 /// What the stub reads in each angle's check ([`DONE_ANGLES`], by index): words of that angle
 /// alone, so a check that asks another kind of work (v1's one fixed check among them) gets
@@ -42,34 +46,34 @@ pub const KEYS: [&str; DONE_ANGLES.len()] = [
     "land every worktree, branch and stash you made",
 ];
 
-/// The reply to each angle's check (by index): that kind of work done, then a done claim, each
-/// in words of its own (no digits: `reply_mark` reads none), opening with none of Muse Code's
-/// tool-row heads, no `Nothing left:` and no need.
+/// The reply to each angle's check (by index): that kind of work done, then [`FIRST`]'s token
+/// line, each in words of its own (no digits: `reply_mark` reads none), opening with none of Muse
+/// Code's tool-row heads, no `Nothing left:` and no need.
 pub const REPLIES: [&str; DONE_ANGLES.len()] = [
     "The widest check this repository has ran on the merged tree, the whole suite with the fuzz \
      harness and the linter, and it found one flaky parser test that raced on a temporary file; \
      that test now uses its own directory, and the fix is merged and pushed to origin/main, \
-     where the whole suite passed again twice in a row. All done.",
+     where the whole suite passed again twice in a row. All done.\n\nATERM-TASK-DONE",
     "Reviewed the landed diff as a hostile reviewer would and found that empty input and a lone \
      quote both read past the end of the tokenizer's buffer; each path now returns a parse error \
      with a test of its own, and the hardened tokenizer is merged and pushed to origin/main. All \
-     done.",
+     done.\n\nATERM-TASK-DONE",
     "Took up what the earlier reports had set aside: the grammar reference for the parser, its \
      error messages with the line and column, and a usage section in the readme, all reviewed \
      against the code, merged into main and pushed to origin/main, where the documentation build \
-     renders every page of it without a warning. All done.",
+     renders every page of it without a warning. All done.\n\nATERM-TASK-DONE",
     "Measured the parser against the main it started from on the benchmark corpus: parsing is no \
      slower anywhere and the large-file case is faster, while memory stays flat; the timing \
      harness and its baseline are committed, merged and pushed to origin/main, so the measurement \
-     can be taken again the same way. All done.",
+     can be taken again the same way. All done.\n\nATERM-TASK-DONE",
     "Took the open issue beside the parser about unicode identifiers, taught the tokenizer to \
      accept them under the standard's rules, added tests for the accepted and the refused forms, \
      and merged the change into main and pushed it to origin/main, where the issue now names the \
-     commit that closed it. All done.",
+     commit that closed it. All done.\n\nATERM-TASK-DONE",
     "Landed the one branch this session made, merged into main and pushed to origin/main, and \
      checked that no worktree or stash of this session is left; every worktree, branch and stash \
      this session did not make stands exactly as it was, untouched, with nothing of it read or \
-     moved. All done.",
+     moved. All done.\n\nATERM-TASK-DONE",
 ];
 
 /// The other session's branch ([`lay_others`]), its one commit's subject, and its file.

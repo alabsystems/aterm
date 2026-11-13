@@ -354,7 +354,12 @@ fn every_update_row_carries_an_admitted_glyph_and_a_capped_title() {
         staged("0.48.0", 7, Some(ApplyPosture::Automatic)),
         staged("0.48.0", 7, Some(ApplyPosture::ManualByConfig)),
         download_postponed("later"),
-        download_withheld("0.48.0", "held: build 7 is quarantined"),
+        download_withheld(
+            "0.48.0",
+            // As `aterm_update::hold::refusal` writes it, behind the stage lane's "held: ".
+            "held: build 7 (0.48.0) is held until 18:40 (it did not start cleanly 3 times, try \
+             1): a newer build, `aterm update retry` or that time ends the hold",
+        ),
         download_failed("0.48.0", "zip sha256 mismatch"),
         installing("0.48.0"),
         finishing("0.48.0"),

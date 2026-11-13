@@ -41,10 +41,41 @@ pub fn tree_root(root: &Path) -> io::Result<String> {
 /// # Errors
 /// The walk's I/O errors, and the fail-closed refusal of a non-file, non-dir, non-link entry.
 pub fn tree_root_declared(root: &Path, modes: &DeclaredModes) -> io::Result<String> {
-    let mut entries: Vec<Vec<u8>> = Vec::new();
+    let mut entries = EntryLines::default();
     let mut buf = vec![0u8; 64 * 1024];
     walk(root, root, modes, &mut entries, &mut buf)?;
-    Ok(root_of_entry_lines(entries))
+    Ok(root_of_entry_lines(entries.source))
+}
+
+/// The same package bytes under source permissions and under the pack's safe modes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackTreeRoots {
+    pub source: String,
+    pub payload: String,
+}
+
+/// Hash a source package once, retaining its exact identity and the identity after
+/// the extractor's mode normalization. Neither walk nor projection changes the source.
+/// # Errors
+/// Unreadable input or a link/special entry, which a release payload cannot contain.
+pub fn tree_roots_for_pack(root: &Path) -> io::Result<PackTreeRoots> {
+    let mut entries = EntryLines {
+        for_pack: true,
+        ..EntryLines::default()
+    };
+    let mut buf = vec![0u8; 64 * 1024];
+    walk(root, root, &DeclaredModes::new(), &mut entries, &mut buf)?;
+    Ok(PackTreeRoots {
+        source: root_of_entry_lines(entries.source),
+        payload: root_of_entry_lines(entries.payload),
+    })
+}
+
+#[derive(Default)]
+struct EntryLines {
+    source: Vec<Vec<u8>>,
+    payload: Vec<Vec<u8>>,
+    for_pack: bool,
 }
 
 /// Fold a set of canonical entry lines ([`entry_line`]) into the tree root: sort, concatenate, SHA-256, lowercase hex.
@@ -106,7 +137,7 @@ fn walk(
     root: &Path,
     dir: &Path,
     modes: &DeclaredModes,
-    out: &mut Vec<Vec<u8>>,
+    out: &mut EntryLines,
     buf: &mut [u8],
 ) -> io::Result<()> {
     let mut children: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<Vec<_>, _>>()?;
@@ -115,13 +146,20 @@ fn walk(
         let path = child.path();
         let ft = child.file_type()?;
         if ft.is_symlink() {
+            if out.for_pack {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "release payload contains a symlink",
+                ));
+            }
             let rel = path.strip_prefix(root).map_err(|_| {
                 io::Error::new(io::ErrorKind::InvalidData, "path escaped tree root")
             })?;
             let target = std::fs::read_link(&path)?;
             let rel_bytes = rel_line_bytes(rel);
             let target_bytes = crate::platform::os_str_bytes(target.as_os_str());
-            out.push(symlink_line(&rel_bytes, &symlink_target_sha(target_bytes)));
+            out.source
+                .push(symlink_line(&rel_bytes, &symlink_target_sha(target_bytes)));
         } else if ft.is_dir() {
             walk(root, &path, modes, out, buf)?;
         } else if ft.is_file() {
@@ -136,7 +174,15 @@ fn walk(
                 modes.get(&rel_bytes).copied().unwrap_or(0) & 0o7777
             };
             // Descriptor fstat from file_sha256_and_meta avoids a separate lstat per file.
-            out.push(entry_line(&rel_bytes, mode, &fsha));
+            out.source.push(entry_line(&rel_bytes, mode, &fsha));
+            if out.for_pack {
+                let safe = if crate::platform::HAS_POSIX_MODES {
+                    crate::extract::safe_mode(mode, false)
+                } else {
+                    0o644
+                };
+                out.payload.push(entry_line(&rel_bytes, safe, &fsha));
+            }
         } else {
             // device / fifo / socket — must not be in an extracted bundle.
             return Err(io::Error::new(

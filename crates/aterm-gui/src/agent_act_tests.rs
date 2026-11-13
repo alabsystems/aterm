@@ -15,6 +15,8 @@ struct Proc {
     start_us: Option<u64>,
     team: Option<String>,
     script: Option<PathBuf>,
+    /// The leader's pid version ([`Kernel::version`]): `None` reads as a kernel that keeps none.
+    version: Option<i32>,
 }
 
 #[cfg(unix)]
@@ -51,6 +53,7 @@ const FAKE: Kernel = Kernel {
         PROC.with_borrow(|p| p.team.clone())
     },
     script: |_| PROC.with_borrow(|p| p.script.clone()),
+    version: |_| PROC.with_borrow(|p| p.version),
 };
 
 /// A scratch machine: Claude Code's versions directory, an install in it, a copy of `sleep` and
@@ -518,7 +521,7 @@ fn each_claim_of_a_session_is_told_its_act_again() {
 
 /// A key the kernel gave no start or no image identity for stands for no later read: each read
 /// reads the image again, so an exec or a new process can never hide behind it. NEGATIVE CONTROL
-/// (run): with `Key::stands` ignored, the second read of each row is the kept verdict.
+/// (run): with `Key::stands_for` ignored, the second read of each row is the kept verdict.
 #[cfg(unix)]
 #[test]
 fn a_key_without_a_start_or_an_image_identity_is_read_afresh() {
@@ -617,4 +620,273 @@ fn a_developer_id_process_names_its_team_through_its_certificate() {
     };
     assert_eq!(named.as_deref(), Some(team.as_str()));
     assert!(!other, "another team's requirement is not met");
+}
+
+/// AN UNLINKED IMAGE KEEPS THE VERDICT ITS LIVE READ EARNED (H6-R3): a confirmed agent whose
+/// image no longer stats keeps its verdict per process, its start and pid version, over every
+/// roster pass, with no `codesign` run (the team's read, counted through the kernel seam) and no
+/// flip to observe; so does one whose path names no file. Unlinked, macOS's `proc_pidpath` names
+/// no path (measured on 27.0: a copy of `sleep` read `0` bytes once unlinked, its pid version and
+/// executable UUID unchanged), where Linux's `/proc/<pid>/exe` keeps the inode. An exec moves the
+/// pid version (measured: `exec sleep` from `sh` moved it) and is read again: an exec into an
+/// unlinked image is observed. NEGATIVE CONTROL (run): with `Key::stands_for` back to the file's
+/// identity alone, each unlinked pass reads the team again and observes.
+#[cfg(unix)]
+#[test]
+fn an_unlinked_confirmed_image_keeps_its_verdict_until_an_exec() {
+    const PASSES: usize = 8;
+    let w = World::new();
+    let places = w.places();
+    let s = sid("unlinked");
+    let team = || Some(agent_image::CLAUDE_TEAM.to_string());
+    set(Proc {
+        team: team(),
+        version: Some(7),
+        ..w.running(&w.sleep, 80)
+    });
+    TEAM_READS.set(0);
+    VERDICTS.set(0);
+    assert_eq!(
+        read_with(&s, Program::Claude, GROUP, &FAKE, &places),
+        Verdict {
+            act: Act::On,
+            proof: Some(Proof::Team)
+        },
+        "the live read confirms it by its team"
+    );
+    assert_eq!(TEAM_READS.get(), 1);
+    let gone = w.sleep.with_file_name("sleep-gone");
+    for (name, exe) in [("no path", None), ("a path naming no file", Some(gone))] {
+        set(Proc {
+            exe,
+            start_us: Some(80),
+            team: team(),
+            version: Some(7),
+            script: None,
+        });
+        for pass in 0..PASSES {
+            assert_eq!(
+                read_with(&s, Program::Claude, GROUP, &FAKE, &places).act,
+                Act::On,
+                "{name}: pass {pass}"
+            );
+        }
+        assert_eq!(
+            TEAM_READS.get(),
+            1,
+            "{name}: no codesign over {PASSES} passes"
+        );
+        assert_eq!(VERDICTS.get(), 1, "{name}: never read again");
+        assert_eq!(cached(&s, GROUP), Some(Act::On), "{name}");
+    }
+    set(Proc {
+        exe: None,
+        start_us: Some(80),
+        team: team(),
+        version: Some(8),
+        script: None,
+    });
+    assert_eq!(
+        read_with(&s, Program::Claude, GROUP, &FAKE, &places).act,
+        Act::Observe,
+        "an exec into an image that does not stat is read again: observed"
+    );
+    set(Proc {
+        team: team(),
+        version: Some(9),
+        ..w.running(&w.sleep, 80)
+    });
+    assert_eq!(
+        read_with(&s, Program::Claude, GROUP, &FAKE, &places).act,
+        Act::On,
+        "an exec into a file that stats is read again"
+    );
+    assert_eq!(TEAM_READS.get(), 2, "the exec's own read");
+}
+
+/// A SEAMLESS UPDATE CARRIES A CONFIRMATION ITS IMAGE CANNOT EARN AGAIN (RV1, the review of
+/// H6-R3): a Claude Code confirmed by its team, its image unlinked since its exec, stays
+/// confirmed in the successor, which has no kept verdict of its own and cannot read the image
+/// (macOS 27.0, measured 2026-11-08 on a Developer ID copy of aterm: unlinked, `proc_pidpath`
+/// read 0 bytes and `codesign --verify -R=<team> <pid>` failed `No such file or directory`, while
+/// `csops` still read the team), with no `codesign` run, over every pass, while the kernel gives
+/// the same start and pid version. Without the carry it is observed. An exec in the handoff's
+/// window (the pid version moved), another process at the group (another start), and an image
+/// that still stats (read afresh under the successor's own rules) each take no carried verdict;
+/// an observed agent and a key without a pid version carry nothing; a row that does not read
+/// keeps nothing. NEGATIVE CONTROL (run): with `adopt_carried` keeping nothing, the carried
+/// passes observe.
+#[cfg(unix)]
+#[test]
+fn a_successor_keeps_a_carried_confirmation_of_an_unlinked_image_until_an_exec() {
+    const PASSES: usize = 8;
+    let w = World::new();
+    let places = w.places();
+    let s = sid("carried");
+    let team = || Some(agent_image::CLAUDE_TEAM.to_string());
+    set(Proc {
+        team: team(),
+        version: Some(7),
+        ..w.running(&w.sleep, 80)
+    });
+    TEAM_READS.set(0);
+    assert_eq!(
+        read_with(&s, Program::Claude, GROUP, &FAKE, &places).act,
+        Act::On,
+        "the outgoing process's live read confirms it by its team"
+    );
+    let row = carry_row(&s).expect("a confirmation to carry");
+    assert_eq!(
+        row,
+        format!("group={GROUP} start=80 version=7 agent=claude proof=team")
+    );
+    let unlinked = Proc {
+        exe: None,
+        start_us: Some(80),
+        team: team(),
+        version: Some(7),
+        script: None,
+    };
+    let successor = |carried: bool| {
+        forget_kept_for_test(&s);
+        if carried {
+            assert!(adopt_carried(&s, &row), "{row}");
+        }
+    };
+    successor(false);
+    set(unlinked.clone());
+    assert_eq!(
+        read_with(&s, Program::Claude, GROUP, &FAKE, &places).act,
+        Act::Observe,
+        "without the carry the successor cannot confirm an unlinked image"
+    );
+    successor(true);
+    assert_eq!(cached(&s, GROUP), Some(Act::On), "status reads it at once");
+    TEAM_READS.set(0);
+    for pass in 0..PASSES {
+        assert_eq!(
+            read_with(&s, Program::Claude, GROUP, &FAKE, &places),
+            Verdict {
+                act: Act::On,
+                proof: Some(Proof::Team)
+            },
+            "carried: pass {pass}"
+        );
+    }
+    assert_eq!(TEAM_READS.get(), 0, "no codesign over {PASSES} passes");
+    for (what, moved) in [
+        (
+            "an exec in the handoff's window",
+            Proc {
+                version: Some(8),
+                ..unlinked.clone()
+            },
+        ),
+        (
+            "another process at the group",
+            Proc {
+                start_us: Some(81),
+                ..unlinked.clone()
+            },
+        ),
+    ] {
+        successor(true);
+        set(moved);
+        assert_eq!(
+            read_with(&s, Program::Claude, GROUP, &FAKE, &places).act,
+            Act::Observe,
+            "{what}"
+        );
+    }
+    successor(true);
+    set(Proc {
+        version: Some(7),
+        ..w.running(&w.sleep, 80)
+    });
+    TEAM_READS.set(0);
+    assert_eq!(
+        read_with(&s, Program::Claude, GROUP, &FAKE, &places).act,
+        Act::Observe,
+        "an image that stats is read afresh: a copy of sleep with no team is observed"
+    );
+    assert_eq!(TEAM_READS.get(), 1, "the successor's own read");
+    assert_eq!(carry_row(&s), None, "an observed agent carries nothing");
+    forget_kept_for_test(&s);
+    set(Proc {
+        team: team(),
+        version: None,
+        ..w.running(&w.sleep, 80)
+    });
+    assert_eq!(
+        read_with(&s, Program::Claude, GROUP, &FAKE, &places).act,
+        Act::On
+    );
+    assert_eq!(
+        carry_row(&s),
+        None,
+        "no pid version: nothing proves no exec"
+    );
+    for bad in [
+        String::new(),
+        format!("group={GROUP} start=80 version=7 agent=claude"),
+        format!("group={GROUP} start=80 version=7 agent=claude proof=team proof=team"),
+        "group=1 start=80 version=7 agent=claude proof=team".to_string(),
+        format!("group={GROUP} start=80 version=7 agent=vim proof=team"),
+        format!("group={GROUP} start=80 version=7 agent=claude proof=team script=1"),
+        format!("group={GROUP} start=80 version=7 agent=claude proof=team stray"),
+    ] {
+        forget_kept_for_test(&s);
+        assert!(!adopt_carried(&s, &bad), "{bad:?}");
+        assert_eq!(cached(&s, GROUP), None, "{bad:?} keeps nothing");
+    }
+    assert!(
+        adopt_carried(
+            &s,
+            &format!("group={GROUP} start=80 version=7 agent=claude proof=team later=1")
+        ),
+        "a later build's field is passed over"
+    );
+}
+
+/// The handoff's record of a session carries its confirmation ([`carry_row`] in
+/// `SessionHandoff::from_store`), and a record round-trips it. NEGATIVE CONTROL (run): with the
+/// record's `agent_act` left unset, the record carries none.
+#[cfg(unix)]
+#[test]
+fn a_handoff_record_carries_the_sessions_confirmation() {
+    let w = World::new();
+    let places = w.places();
+    let store = crate::session_store::new_store();
+    let h = crate::session_store::test_handle(7660);
+    store.write().unwrap().register(h.clone());
+    let s = h.ctx.self_id.as_str().to_string();
+    set(Proc {
+        team: Some(agent_image::CLAUDE_TEAM.to_string()),
+        version: Some(7),
+        ..w.running(&w.sleep, 80)
+    });
+    assert_eq!(
+        read_with(&s, Program::Claude, GROUP, &FAKE, &places).act,
+        Act::On
+    );
+    let manifest = crate::session_store::SessionHandoff::from_store(&store.read().unwrap());
+    let record = manifest
+        .sessions
+        .iter()
+        .find(|r| r.sid == s)
+        .expect("the session's record");
+    assert_eq!(record.agent_act, carry_row(&s));
+    assert!(record.agent_act.is_some());
+    let read = crate::session_store::SessionHandoff::from_toml(
+        &manifest.to_toml().expect("the manifest's TOML"),
+    )
+    .expect("it reads back");
+    assert_eq!(
+        read.sessions
+            .iter()
+            .find(|r| r.sid == s)
+            .and_then(|r| r.agent_act.clone()),
+        record.agent_act
+    );
+    forget_kept_for_test(&s);
 }

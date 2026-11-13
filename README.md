@@ -212,7 +212,7 @@ instance hosting your terminal, else the newest one.
 ## Fun is a feature
 
 The default cursor is the **rainbow kitty**: a full-body cat that walks,
-runs and pounces along your line over a rainbow line, with a typing sound on
+runs and pounces along your line over a rainbow band, with a typing sound on
 macOS. It cheers a green build, sulks at a failed one and chases your mouse.
 Type `sit`, `kitty jump` or `good kitty` and a space, and the cat does it
 (`aterm help kitty`).

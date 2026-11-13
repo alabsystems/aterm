@@ -168,7 +168,13 @@ pub(crate) fn reply_serving(
         line.push_str(&format!(" contract={served}"));
     }
     if facts.codex_rotation {
-        line.push_str(" codex_rotation=1");
+        // The bound a five-hour handoff is judged by (`codex_rotation::walled_window`), in
+        // seconds: a codex-alab ends its turn at a five-hour wall for this host to move only
+        // where that wall's reset is further away. It reads the roster itself.
+        line.push_str(&format!(
+            " codex_rotation=1 codex_rotation_five_hour={}",
+            aterm_agent::harness::accounts::RESET_SOON_S
+        ));
     }
     for (key, value) in facts.policy.texts() {
         let value = if key == "continue_text" {

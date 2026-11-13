@@ -204,7 +204,7 @@ fn a_check_a_person_asks_for_passes_a_full_disks_memo() {
     let now = crate::install::unix_now_secs();
     let held = stage_backoff(&staging, &manifest, running, now, Asked::Schedule)
         .expect("PRECONDITION: a disk that stays full throttles the schedule");
-    assert!(held.moment, "{held:?}");
+    assert!(held.hold.is_none(), "a moment is no hold: {held:?}");
     assert!(
         stage_backoff(&staging, &manifest, running, now, Asked::Person).is_none(),
         "the person who freed the space and asked must get the download, not: {}",
@@ -214,35 +214,75 @@ fn a_check_a_person_asks_for_passes_a_full_disks_memo() {
     let verdict = "codesign --verify (team-pinned requirement) failed: code object is not \
                    signed at all";
     let _ = book_stage_failure(&staging, running, &manifest, verdict, now);
+    let backoff = stage_backoff(&staging, &manifest, running, now, Asked::Schedule)
+        .expect("a verdict holds the artifact against the schedule");
+    assert!(backoff.hold.is_some(), "{backoff:?}");
     assert!(
-        stage_backoff(&staging, &manifest, running, now, Asked::Person).is_some(),
-        "a verdict is a finding about the build; a person asking changes nothing"
+        stage_backoff(&staging, &manifest, running, now, Asked::Person).is_none(),
+        "a person asking ends the hold and tries now"
     );
-    crate::manifest::FailedMark::clear_backoff(&staging.failed());
-    crate::manifest::quarantine_artifact(
+    let record = crate::hold::load(&staging);
+    assert_eq!(
+        record.last.map(|last| last.how),
+        Some(crate::update_record::EndHow::Person)
+    );
+    assert!(
+        stage_backoff(&staging, &manifest, running, now, Asked::Schedule)
+            .is_none_or(|left| left.hold.is_none()),
+        "the ended hold no longer throttles the schedule (the disk's moment may)"
+    );
+    let _ = std::fs::remove_dir_all(&staging.root);
+}
+
+/// A check that is offered a build newer than the held one ends the hold
+/// (`Ending::Newer`), and records the build that runs, unproven, where no trial of it is under
+/// way: finding it running proves nothing. An offer the floors withdraw (`None`) is no offer.
+#[test]
+fn a_newer_offer_ends_the_hold_and_the_running_build_is_noted() {
+    let staging = Staging::scratch("newer-offer-ends-hold");
+    let manifest = candidate_manifest();
+    let running = manifest.build_number - 1;
+    let now = crate::install::unix_now_secs();
+    crate::hold::stage_failed(
         &staging,
         manifest.build_number,
+        &manifest.version,
         &manifest.sha256,
-        aterm_durable::Flush::Durable,
+        "it did not verify",
+        now,
+    )
+    .expect("PRECONDITION: held");
+
+    note_offer(&staging, running, Some(manifest.build_number), now);
+    assert!(
+        crate::hold::held(&staging, manifest.build_number, &manifest.sha256, now).is_some(),
+        "an offer of the held build itself ends nothing"
     );
-    for _ in 0..3 {
-        let _ = crate::manifest::FailedMark::record_stage_moment(
-            &staging.failed(),
-            manifest.build_number,
-            &manifest.sha256,
-            now,
-        );
-    }
-    let quarantined = stage_backoff(&staging, &manifest, running, now, Asked::Person)
-        .expect("a quarantine holds against a person");
-    assert!(quarantined.quarantined, "{quarantined:?}");
+    let record = crate::hold::load(&staging);
+    assert_eq!(record.running, running);
+    assert!(!record.proven, "found running is not proven");
+    assert_eq!(record.offered, Some(manifest.build_number));
+
+    note_offer(&staging, running, None, now + 1);
+    assert_eq!(
+        crate::hold::load(&staging).offered,
+        Some(manifest.build_number),
+        "a withdrawn release is no offer"
+    );
+    note_offer(&staging, running, Some(manifest.build_number + 1), now + 1);
+    assert!(
+        crate::hold::held(&staging, manifest.build_number, &manifest.sha256, now + 1).is_none(),
+        "a newer build ends the hold"
+    );
+    assert_eq!(
+        crate::hold::load(&staging).last.map(|last| last.how),
+        Some(crate::update_record::EndHow::Newer)
+    );
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
 #[test]
 fn the_hash_step_books_a_moment_as_a_moment_and_a_mismatch_as_a_verdict() {
-    use crate::manifest::FailedMark;
-
     let manifest = candidate_manifest();
     let running = manifest.build_number - 1;
     let digest_of = |answer: Result<String, String>| {
@@ -286,7 +326,14 @@ fn the_hash_step_books_a_moment_as_a_moment_and_a_mismatch_as_a_verdict() {
             .is_none(),
             "a moment books no backoff against the build: {error}"
         );
-        assert!(FailedMark::read(&staging.failed()).is_some_and(|memo| memo.moment));
+        assert!(
+            booked_moment(&staging).is_some(),
+            "a moment is booked in memory"
+        );
+        assert!(
+            crate::hold::load(&staging).hold.is_none(),
+            "and holds nothing"
+        );
         let _ = std::fs::remove_dir_all(&staging.root);
     }
     let unreadable = aterm_update_core::sha256_file(std::path::Path::new("/nonexistent/container"));
@@ -295,8 +342,10 @@ fn the_hash_step_books_a_moment_as_a_moment_and_a_mismatch_as_a_verdict() {
         let (staging, end, _) = digest_of(verdict);
         let error = end.expect("the check ends").expect_err("as a failure");
         assert!(!crate::is_passing_refusal(&error), "{error}");
-        let memo = FailedMark::read(&staging.failed()).expect("a verdict is memoized");
-        assert!(!memo.moment, "{memo:?}");
+        let hold = crate::hold::load(&staging)
+            .hold
+            .expect("a verdict holds the artifact");
+        assert_eq!(hold.cause, crate::update_record::Cause::Stage, "{hold:?}");
         assert!(
             stage_backoff(
                 &staging,
@@ -311,7 +360,8 @@ fn the_hash_step_books_a_moment_as_a_moment_and_a_mismatch_as_a_verdict() {
     }
     let (staging, end, reclaimed) = digest_of(Ok(manifest.sha256.to_ascii_uppercase()));
     assert!(end.is_none() && !reclaimed);
-    assert!(FailedMark::read(&staging.failed()).is_none());
+    assert!(crate::hold::load(&staging).hold.is_none());
+    assert!(booked_moment(&staging).is_none());
     let _ = std::fs::remove_dir_all(&staging.root);
 }
 
@@ -353,22 +403,25 @@ fn a_release_withdrawn_while_it_downloaded_ends_the_check_held() {
     let staging = m11_revoked("stage-withdrawn");
     let end = end_failed_stage(&staging, running, &manifest, refused.into());
     assert_eq!(end, Ok(None), "a hold is a healthy end");
-    assert!(crate::manifest::FailedMark::read(&staging.failed()).is_none());
+    assert!(crate::hold::load(&staging).hold.is_none());
     assert_eq!(
         crate::health::Health::read(&staging.health()).total_failures(),
         0
     );
     let _ = std::fs::remove_dir_all(&staging.root);
 
-    let staging = Staging::scratch("stage-quarantined");
-    crate::manifest::quarantine_artifact(
+    let staging = Staging::scratch("stage-held");
+    crate::hold::stage_failed(
         &staging,
         7,
+        "0.0.7",
         &manifest.sha256,
-        aterm_durable::Flush::Durable,
-    );
+        "it did not start",
+        crate::install::unix_now_secs(),
+    )
+    .expect("held");
     let end = end_failed_stage(&staging, running, &manifest, "stage refused".into());
-    assert_eq!(end, Ok(None));
+    assert_eq!(end, Ok(None), "a held build ends the check held");
     let _ = std::fs::remove_dir_all(&staging.root);
 
     let staging = Staging::scratch("stage-not-withdrawn");
@@ -399,7 +452,6 @@ fn another_check_ending_held_leaves_this_checks_download_begun() {
 
 #[test]
 fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
-    use crate::manifest::FailedMark;
     use std::os::unix::process::ExitStatusExt as _;
 
     let manifest = candidate_manifest();
@@ -452,11 +504,15 @@ fn a_full_disk_is_charged_to_neither_the_release_nor_the_download_host() {
         for _ in 1..crate::PERSISTENT_AFTER {
             book(&staging, lane);
         }
-        let memo = FailedMark::read(&staging.failed()).unwrap_or_else(|| panic!("{lane}: counted"));
-        assert!(memo.moment, "{lane}: {memo:?}");
+        let memo = booked_moment(&staging).unwrap_or_else(|| panic!("{lane}: counted"));
         assert!(
-            memo.retry_in_secs(crate::install::unix_now_secs())
-                <= *crate::manifest::MOMENT_BACKOFF_SECS.last().unwrap(),
+            crate::hold::load(&staging).hold.is_none(),
+            "{lane}: no hold"
+        );
+        assert!(
+            memo.retry_after
+                .saturating_sub(crate::install::unix_now_secs())
+                <= *MOMENT_BACKOFF_SECS.last().unwrap(),
             "{lane}: {memo:?}"
         );
         crate::health::backdate_streaks(&staging.health(), crate::PERSISTENT_SPAN);
@@ -598,7 +654,7 @@ fn a_stage_lock_held_by_a_hung_check_in_a_running_aterm_is_booked() {
 
 #[test]
 fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
-    use crate::manifest::{FailedMark, RETRY_BACKOFF_SECS};
+    use crate::update_record::STAGE_SPANS;
 
     let staging = Staging::scratch("stage-backoff-vs-apply");
     let manifest = candidate_manifest();
@@ -606,19 +662,25 @@ fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
     let running = manifest.build_number - 1;
     const NOW: u64 = 1_000_000;
 
+    let mut at = NOW;
     for _ in 0..4 {
-        FailedMark::record_stage_failure(
-            &staging.failed(),
+        let hold = crate::hold::stage_failed(
+            &staging,
             manifest.build_number,
+            &manifest.version,
             &manifest.sha256,
-            NOW,
-        );
+            "it did not verify",
+            at,
+        )
+        .expect("held");
+        at = hold.until;
     }
+    let now = at - STAGE_SPANS[3];
 
     let backoff =
-        stage_backoff(&staging, &manifest, running, NOW, Asked::Schedule).expect("window open");
+        stage_backoff(&staging, &manifest, running, now, Asked::Schedule).expect("window open");
     assert_eq!(backoff.attempts, 4);
-    assert_eq!(backoff.retry_in_secs, RETRY_BACKOFF_SECS[3]);
+    assert_eq!(backoff.retry_in_secs, STAGE_SPANS[3]);
     assert!(backoff.applicable.is_none());
 
     write_ready(
@@ -633,7 +695,7 @@ fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
         "the staged digest is not the manifest's, so the re-stage is genuinely due"
     );
     let backoff =
-        stage_backoff(&staging, &manifest, running, NOW, Asked::Schedule).expect("window open");
+        stage_backoff(&staging, &manifest, running, now, Asked::Schedule).expect("window open");
     let applicable = backoff.applicable.as_ref().expect("apply is not gated");
     assert_eq!(applicable.build_number, manifest.build_number);
 
@@ -641,7 +703,7 @@ fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
         &staging,
         &manifest,
         manifest.build_number,
-        NOW,
+        now,
         Asked::Schedule,
     );
     assert!(
@@ -649,7 +711,7 @@ fn a_stage_backoff_throttles_the_restage_never_an_already_staged_newer_build() {
         "a marker for the running build is not an applicable update"
     );
 
-    let past_deadline = NOW + RETRY_BACKOFF_SECS[3];
+    let past_deadline = now + STAGE_SPANS[3];
     assert!(
         stage_backoff(&staging, &manifest, running, past_deadline, Asked::Schedule).is_none(),
         "an expired window throttles nothing"
@@ -1430,12 +1492,15 @@ fn a_yanked_or_revoked_stage_is_announced_nowhere_and_retired_by_the_check() {
     let mut manifest = candidate_manifest();
     manifest.build_number = 30;
     let now = 1_000_000;
-    crate::manifest::FailedMark::record_stage_failure(
-        &staging.failed(),
+    crate::hold::stage_failed(
+        &staging,
         manifest.build_number,
+        &manifest.version,
         &manifest.sha256,
+        "it did not verify",
         now,
-    );
+    )
+    .expect("held");
     assert_eq!(applicable_stage(&staging, 10), Some("0.0.20".to_string()));
     let backoff = stage_backoff(&staging, &manifest, 10, now, Asked::Schedule).expect("suppressed");
     assert!(backoff.applicable.is_some());

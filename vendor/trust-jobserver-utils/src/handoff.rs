@@ -14,6 +14,10 @@ mod tests;
 #[path = "tests/scoped_handoff.rs"]
 mod scoped_tests;
 
+#[cfg(test)]
+#[path = "tests/fixed_handoff.rs"]
+mod fixed_tests;
+
 use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::mem::{size_of, size_of_val};
@@ -39,6 +43,11 @@ const NAMED_FIFO_MAGIC: &[u8; 8] = b"TGNUNAM1";
 const CPU_MAGIC: &[u8; 8] = b"TCPULEA1";
 const CPU_BUNDLE_MAGIC: &[u8; 8] = b"TCPUBND2";
 const MAX_CPU_FILES: usize = 128;
+const FIXED_CLAIM_MAGIC: &[u8; 8] = b"TFIXCLM1";
+// Complete original fixed claim: 65536 slots, worktree, admission and packet.
+// Each actual SCM message stays within the existing 128-rights transport bound.
+const MAX_FIXED_FILES: usize = 65_539;
+const FIXED_FILES_PER_MESSAGE: usize = 128;
 
 #[derive(Clone, Copy)]
 enum Role {
@@ -46,6 +55,7 @@ enum Role {
     NamedFifo,
     CpuLease,
     CpuBundle,
+    FixedClaim,
 }
 
 impl Role {
@@ -53,6 +63,7 @@ impl Role {
         match self {
             Self::CpuBundle => "cpu2",
             Self::NamedFifo => "fifo1",
+            Self::FixedClaim => "fixed1",
             _ => "v1",
         }
     }
@@ -62,12 +73,14 @@ impl Role {
             Self::NamedFifo => NAMED_FIFO_MAGIC,
             Self::CpuLease => CPU_MAGIC,
             Self::CpuBundle => CPU_BUNDLE_MAGIC,
+            Self::FixedClaim => FIXED_CLAIM_MAGIC,
         }
     }
     fn environment(self) -> &'static str {
         match self {
             Self::Jobserver | Self::NamedFifo => ENV,
             Self::CpuLease | Self::CpuBundle => super::CPU_HANDOFF_ENV,
+            Self::FixedClaim => super::FIXED_CLAIM_HANDOFF_ENV,
         }
     }
 }
@@ -345,6 +358,8 @@ impl Advertisement {
                 pair != [2, 0]
             } else if matches!(role, Role::CpuBundle) {
                 pair[0] < 1 || pair[0] as usize > MAX_CPU_FILES || pair[1] != 0
+            } else if matches!(role, Role::FixedClaim) {
+                pair[0] < 2 || pair[0] as usize > MAX_FIXED_FILES || pair[1] != 0
             } else {
                 pair[0] <= 2 || pair[1] <= 2 || pair[0] == pair[1]
             }
@@ -371,13 +386,14 @@ impl Drop for Directory {
         }
         if let (Ok(owned), Ok(named)) =
             (self.file.metadata(), std::fs::symlink_metadata(&self.path))
+            && named.is_dir()
+            && owned.dev() == named.dev()
+            && owned.ino() == named.ino()
         {
-            if named.is_dir() && owned.dev() == named.dev() && owned.ino() == named.ino() {
-                // rmdir does not follow a final symlink and cannot delete a
-                // nonempty substituted directory. Socket removal above never
-                // traverses this mutable pathname.
-                let _ = std::fs::remove_dir(&self.path);
-            }
+            // rmdir does not follow a final symlink and cannot delete a
+            // nonempty substituted directory. Socket removal above never
+            // traverses this mutable pathname.
+            let _ = std::fs::remove_dir(&self.path);
         }
     }
 }
@@ -542,6 +558,71 @@ pub fn recover_cpu_resources(advertisement: &OsStr) -> io::Result<(OwnedFd, Vec<
     let mut handles = recover_handles(advertisement, Role::CpuBundle)?.into_iter();
     let primary = handles.next().ok_or_else(|| refused("CPU handoff has no primary lease"))?;
     Ok((primary, handles.collect()))
+}
+
+/// Live ancestor courier for an already retained original fixed claim. The
+/// packet and files are transferred as the same open descriptions; no token,
+/// CPU reservation, SDK custody or fixed-claim authority is created here.
+#[derive(Debug)]
+pub struct FixedClaimHandoff(Arc<Endpoint>);
+
+impl FixedClaimHandoff {
+    pub fn new(packet: OwnedFd, originals: Vec<OwnedFd>) -> io::Result<Self> {
+        let mut handles = Vec::with_capacity(originals.len() + 1);
+        handles.push(packet);
+        handles.extend(originals);
+        validate_fixed_files(&handles)?;
+        let count = handles.len() as libc::c_int;
+        Ok(Self(Arc::new(Endpoint::new_resources(
+            Arc::new(handles),
+            [count, 0],
+            &std::env::temp_dir(),
+            Role::FixedClaim,
+        )?)))
+    }
+
+    /// Routing data only. Keep this actual endpoint through descendant waits.
+    pub fn advertisement(&self) -> &OsStr {
+        &self.0.advertisement
+    }
+}
+
+/// Recover only fresh SCM rights from the actual live ancestor, never an
+/// advertised local FD number. The domain reader must check the complete
+/// packet/file identities, original locks, fingerprint, budget and pool.
+pub fn recover_fixed_claim(advertisement: &OsStr) -> io::Result<(OwnedFd, Vec<OwnedFd>)> {
+    let ad = Advertisement::parse_role(advertisement, Role::FixedClaim)?;
+    let mut handles = recover_handles(ad, Role::FixedClaim)?.into_iter();
+    let packet = handles.next().ok_or_else(|| refused("fixed handoff has no packet"))?;
+    Ok((packet, handles.collect()))
+}
+
+fn validate_fixed_files(handles: &[OwnedFd]) -> io::Result<()> {
+    if !(2..=MAX_FIXED_FILES).contains(&handles.len()) {
+        return Err(refused("fixed handoff file population is invalid"));
+    }
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: an owned descriptor and complete writable native stat storage.
+    if unsafe { libc::fstat(handles[0].as_raw_fd(), metadata.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful fstat initialized the complete result.
+    let metadata = unsafe { metadata.assume_init() };
+    let flags = unsafe { libc::fcntl(handles[0].as_raw_fd(), libc::F_GETFL) };
+    if metadata.st_mode & libc::S_IFMT != libc::S_IFREG
+        || metadata.st_uid != unsafe { libc::geteuid() }
+        || metadata.st_mode & 0o077 != 0
+        || metadata.st_size <= 0
+        || metadata.st_size > 8 * 1024 * 1024
+        || flags < 0
+        || flags & libc::O_ACCMODE == libc::O_WRONLY
+    {
+        return Err(refused("fixed handoff packet is not a private readable bounded file"));
+    }
+    for fd in &handles[1..] {
+        validate_fence_file(fd)?;
+    }
+    Ok(())
 }
 
 /// Recover the original named FIFO witness descriptions from the authenticated
@@ -776,7 +857,13 @@ fn serve_scoped_role(
     ensure_chain(&chain)?;
     root.ensure_unchanged()?;
     ensure_chain(&member_chain)?;
-    send_handles(&stream, pipe, deadline)?;
+    if matches!(role, Role::FixedClaim) {
+        for chunk in pipe.chunks(FIXED_FILES_PER_MESSAGE) {
+            send_handles(&stream, chunk, deadline)?;
+        }
+    } else {
+        send_handles(&stream, pipe, deadline)?;
+    }
     write_frame(&mut stream, &request[40..72], deadline)?;
     ensure_chain(&chain)?;
     ensure_chain(&member_chain)?;
@@ -808,7 +895,11 @@ fn recover_role(advertisement: Advertisement, role: Role) -> io::Result<Arc<[Own
 }
 
 fn recover_handles(advertisement: Advertisement, role: Role) -> io::Result<Vec<OwnedFd>> {
-    let count = if matches!(role, Role::CpuBundle) { advertisement.pair[0] as usize } else { 2 };
+    let count = if matches!(role, Role::CpuBundle | Role::FixedClaim) {
+        advertisement.pair[0] as usize
+    } else {
+        2
+    };
     let deadline = Instant::now() + TIMEOUT;
     let mut stream = connect(&advertisement.path, deadline)?;
     let owner = Process::peer(&stream)?;
@@ -825,15 +916,36 @@ fn recover_handles(advertisement: Advertisement, role: Role) -> io::Result<Vec<O
     request[76..80].copy_from_slice(&advertisement.pair[1].to_be_bytes());
     write_frame(&mut stream, &request, deadline)?;
     stream.shutdown(std::net::Shutdown::Write)?;
-    let pipe = receive_handles(&stream, deadline, role, count)?;
-    let mut response = [0; 32];
-    read_frame(&mut stream, &mut response, deadline)?;
-    if response != challenge {
-        return Err(refused("jobserver handoff challenge mismatch"));
-    }
-    expect_end(&mut stream, deadline)?;
+    let pipe = receive_role_response(&mut stream, deadline, role, count, &challenge)?;
     owner.ensure_unchanged()?;
     ensure_chain(&chain)?;
+    Ok(pipe)
+}
+
+fn receive_role_response(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    role: Role,
+    count: usize,
+    challenge: &[u8; 32],
+) -> io::Result<Vec<OwnedFd>> {
+    let pipe = if matches!(role, Role::FixedClaim) {
+        let mut all = Vec::with_capacity(count);
+        while all.len() < count {
+            let expected = (count - all.len()).min(FIXED_FILES_PER_MESSAGE);
+            all.extend(receive_handles(stream, deadline, role, expected)?);
+        }
+        validate_fixed_files(&all)?;
+        all
+    } else {
+        receive_handles(stream, deadline, role, count)?
+    };
+    let mut response = [0; 32];
+    read_frame(stream, &mut response, deadline)?;
+    if &response != challenge {
+        return Err(refused("jobserver handoff challenge mismatch"));
+    }
+    expect_end(stream, deadline)?;
     Ok(pipe)
 }
 
@@ -931,8 +1043,8 @@ fn receive_handles(
                 // Own every complete delivered prefix fd before rejecting it;
                 // never inspect bytes outside the actual supplied buffer.
                 let payload = length.min(remaining) - base;
-                valid &= (length - base) % size_of::<libc::c_int>() == 0
-                    && payload % size_of::<libc::c_int>() == 0;
+                valid &= (length - base).is_multiple_of(size_of::<libc::c_int>())
+                    && payload.is_multiple_of(size_of::<libc::c_int>());
                 let data = libc::CMSG_DATA(header).cast::<libc::c_int>();
                 for index in 0..payload / size_of::<libc::c_int>() {
                     descriptors.push(OwnedFd::from_raw_fd(data.add(index).read_unaligned()));

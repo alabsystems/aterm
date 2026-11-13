@@ -20,6 +20,196 @@ fn fixture_loan(shares: &BranchShares) -> FixtureShare<'_> {
 }
 
 #[test]
+fn shared_tree_lending_preserves_live_tokens_and_half_the_build_allocation() {
+    for slots in 2..=18 {
+        for export in 0..=slots {
+            for serial in [false, true] {
+                for live_limit in [0, 1, u32::MAX] {
+                    let dir = aterm_tempfile::tempdir().unwrap();
+                    let shares =
+                        BranchShares::new(&dir.path().join("jobs"), slots, export, [true, true])
+                            .unwrap();
+                    let barrier = shares.reserve_initial().unwrap();
+                    assert!(!shares.compiler_branches_active());
+                    assert_eq!(shares.lend_free_build_to_admitted_tree().unwrap(), 0);
+                    if serial {
+                        barrier.release_to_build().unwrap();
+                    } else {
+                        drop(barrier);
+                    }
+                    let before = shares.qualify_allocations.lock().unwrap().allocated;
+                    let live_count = before[0].min(live_limit);
+                    let live: Vec<_> = (0..live_count)
+                        .map(|_| shares.pool(false).try_acquire().unwrap().unwrap())
+                        .collect();
+                    let floor = (slots - export).div_ceil(2).max(1);
+                    let expected = before[0].saturating_sub(floor).min(before[0] - live_count);
+                    assert_eq!(shares.lend_free_build_to_admitted_tree().unwrap(), expected);
+                    let after = shares.qualify_allocations.lock().unwrap().allocated;
+                    assert_eq!(after, [before[0] - expected, before[1] + expected, export]);
+                    assert_eq!(
+                        take(shares.pool(false)).len()
+                            + take(shares.pool(true)).len()
+                            + live.len()
+                            + export as usize,
+                        slots as usize
+                    );
+                    assert_eq!(shares.lend_free_build_to_admitted_tree().unwrap(), 0);
+                    drop(live);
+                    shares.build_compilers_drained();
+                    assert!(!shares.compiler_branches_active());
+                    assert_eq!(shares.lend_free_build_to_admitted_tree().unwrap(), 0);
+                    for branch in [0, 1, 2] {
+                        shares.finish(branch);
+                    }
+                    assert_eq!(take(shares.pool(true)).len(), slots as usize);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn export_returns_can_expand_a_shared_tree_loan_without_stealing_live_build_work() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let shares = BranchShares::new(&dir.path().join("jobs"), 18, 4, [true, true]).unwrap();
+    let live_build = [
+        shares.pool(false).try_acquire().unwrap().unwrap(),
+        shares.pool(false).try_acquire().unwrap().unwrap(),
+    ];
+    let mut live_tree = take(shares.pool(true));
+    assert_eq!(shares.lend_free_build_to_admitted_tree().unwrap(), 6);
+    live_tree.extend(take(shares.pool(true)));
+    assert_eq!(live_tree.len(), 7);
+    shares.finish(2);
+    assert_eq!(shares.lend_free_build_to_admitted_tree().unwrap(), 2);
+    live_tree.extend(take(shares.pool(true)));
+    assert_eq!(live_tree.len(), 9);
+    assert_eq!(take(shares.pool(false)).len() + live_build.len(), 9);
+    drop(live_tree);
+    shares.finish(1);
+    assert_eq!(take(shares.pool(false)).len() + live_build.len(), 18);
+    assert_eq!(shares.lend_free_build_to_admitted_tree().unwrap(), 0);
+    drop(live_build);
+    shares.build_compilers_drained();
+    shares.finish(0);
+    assert_eq!(take(shares.pool(true)).len(), 18);
+}
+
+#[test]
+fn resuming_an_admitted_tree_moves_a_free_token_without_reminting_live_build_work() {
+    for slots in 2..=18 {
+        for export in 0..=slots - 2 {
+            for order in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                let dir = aterm_tempfile::tempdir().unwrap();
+                let shares =
+                    BranchShares::new(&dir.path().join("jobs"), slots, export, [true, true])
+                        .unwrap();
+                let barrier = shares.reserve_initial().unwrap();
+                assert!(!shares.serial_tree_waiting());
+                assert!(!shares.resume_admitted_tree().unwrap());
+                barrier.release_to_build().unwrap();
+                let mut live_build = take(shares.pool(false));
+                assert!(shares.serial_tree_waiting());
+                assert!(!shares.resume_admitted_tree().unwrap());
+                // One compiler returns its byte; every other client remains live. Recovering
+                // the whole branch here would duplicate those clients' outstanding tokens.
+                drop(live_build.pop().unwrap());
+                assert!(shares.resume_admitted_tree().unwrap());
+                let tree = take(shares.pool(true));
+                assert_eq!(tree.len(), 1);
+                assert!(take(shares.pool(false)).is_empty());
+                assert_eq!(
+                    live_build.len() + tree.len() + export as usize,
+                    slots as usize
+                );
+                assert!(!shares.serial_tree_waiting());
+                assert!(!shares.resume_admitted_tree().unwrap());
+                drop(live_build);
+                drop(tree);
+                shares.build_compilers_drained();
+                assert_eq!(take(shares.pool(true)).len(), (slots - export) as usize);
+                for branch in order {
+                    shares.finish(branch);
+                    let state = shares.qualify_allocations.lock().unwrap();
+                    assert_eq!(
+                        take(shares.pool(false)).len()
+                            + take(shares.pool(true)).len()
+                            + state.allocated[2] as usize,
+                        slots as usize
+                    );
+                }
+                assert_eq!(take(shares.pool(true)).len(), slots as usize);
+            }
+        }
+    }
+}
+
+#[test]
+fn a_resumed_tree_preserves_the_last_build_slot_and_normal_shares() {
+    for slots in 1..=2 {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let export = slots - 1;
+        let shares =
+            BranchShares::new(&dir.path().join("jobs"), slots, export, [true, true]).unwrap();
+        shares
+            .reserve_initial()
+            .unwrap()
+            .release_to_build()
+            .unwrap();
+        assert_eq!(take(shares.pool(false)).len(), 1);
+        assert!(!shares.resume_admitted_tree().unwrap());
+        assert!(take(shares.pool(true)).is_empty());
+        shares.finish(2);
+        assert_eq!(shares.resume_admitted_tree().unwrap(), slots > 1);
+        assert_eq!(take(shares.pool(false)).len(), 1);
+        assert_eq!(take(shares.pool(true)).len(), (slots - 1) as usize);
+        shares.build_compilers_drained();
+        assert!(!shares.serial_tree_waiting());
+        assert!(!shares.resume_admitted_tree().unwrap());
+        assert_eq!(take(shares.pool(true)).len(), slots as usize);
+    }
+
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let shares = BranchShares::new(&dir.path().join("jobs"), 18, 4, [true, true]).unwrap();
+    assert!(!shares.resume_admitted_tree().unwrap());
+    assert_eq!(take(shares.pool(false)).len(), 13);
+    assert_eq!(take(shares.pool(true)).len(), 1);
+}
+
+#[test]
+fn a_resumed_tree_can_finish_while_build_clients_still_hold_their_tokens() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let shares = BranchShares::new(&dir.path().join("jobs"), 18, 4, [true, true]).unwrap();
+    shares
+        .reserve_initial()
+        .unwrap()
+        .release_to_build()
+        .unwrap();
+    let live = [
+        shares.pool(false).try_acquire().unwrap().unwrap(),
+        shares.pool(false).try_acquire().unwrap().unwrap(),
+    ];
+    assert!(shares.resume_admitted_tree().unwrap());
+    shares.finish(1);
+    assert_eq!(take(shares.pool(false)).len() + live.len() + 4, 18);
+    assert!(!shares.serial_tree_waiting());
+    shares.finish(2);
+    assert_eq!(take(shares.pool(false)).len() + live.len(), 18);
+    drop(live);
+    shares.build_compilers_drained();
+    shares.finish(0);
+    assert_eq!(take(shares.pool(true)).len(), 18);
+}
+
+#[test]
 fn drained_compilers_return_idle_tokens_and_fixture_loans_survive_every_end_order() {
     for slots in 3..=18 {
         for export in 0..=slots - 2 {

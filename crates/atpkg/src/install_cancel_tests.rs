@@ -59,7 +59,7 @@ fn cancelled_replacement(budget: bool) {
     let layout = crate::store::Layout {
         prefix: dir.path().to_path_buf(),
     };
-    let (reader, writer) = aterm_uds::kept_out(std::io::pipe).unwrap();
+    let (reader, writer) = aterm_uds::pipe().unwrap();
     let mut writer = Some(writer);
     let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().unwrap());
     let test = if budget {

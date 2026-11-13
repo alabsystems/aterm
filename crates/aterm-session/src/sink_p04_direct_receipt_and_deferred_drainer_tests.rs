@@ -191,7 +191,7 @@ fn the_drainer_never_parks_in_its_write_under_the_spill_mutex() {
 fn the_guarded_writes_rest_defers_its_drainer_to_the_arranger() {
     static POKES: AtomicUsize = AtomicUsize::new(0);
     for arranged in [true, false] {
-        let (read_end, write_end) = std::io::pipe().expect("pipe");
+        let (read_end, write_end) = aterm_uds::pipe().expect("pipe");
         let (read_end, write_end): (OwnedFd, OwnedFd) = (read_end.into(), write_end.into());
         aterm_pty::set_nonblocking(write_end.as_raw_fd(), true).expect("nonblocking");
         let mut filled = 0_usize;

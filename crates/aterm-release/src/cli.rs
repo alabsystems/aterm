@@ -19,14 +19,14 @@ USAGE
       Judge unreceipted source inputs with the release's per-check records.
       No release, credentials, build of the product or publication.
   targo --unverified ship qualify-pilot --verify PATH --mode alone|shared|chain|tree|series|matched|export|fixtures \
-      [--tree-work compile-lint|release] [--export-seconds N | --export-work real] [--plant-red test] [--slice-cache warm|cold] [--tree-cache warm|cold] [--build-return early|retained|matched]
+      [--tree-work compile-lint|release] [--export-seconds N | --export-work real] [--plant-red test] [--slice-cache warm|cold] [--tree-cache warm|cold] [--build-return early|retained|matched] [--cores N]
       Concurrent release slices, optionally beside test compilation and lint,
       in one bounded Release allocation partitioned into private build/tree FIFOs
       plus an export reservation, with one-second descendant CPU/QoS/core samples.
       tree-work=release runs the full release tree and holds the measured export share
       for 763 seconds without publishing; export-seconds overrides that surrogate wall.
       chain lowers tree CPU priority; tree starts the tree child first as an ordering probe.
-      tree-cache=cold uses a dedicated owned target and clears native, lint and libc artifacts
+      tree-cache=cold clears dedicated native and libc targets, with fresh lint targets
       before each real take; keep both measurement images outside that target.
       The retained pre-change binary, not tree mode, is the old-memory-order control.
       series requires --before-verify PATH and runs alone/shared/chain/chain/shared/tree
@@ -51,7 +51,24 @@ USAGE
       indexed fixture producer, including any fallback compiler. build-return=retained
       preserves the old handoff for measurement; matched uses retained/early/early/retained
       with the same verifier in both arms. Takes then measure a serial local export
-      revalidation. No staging push is performed. plant-red=test records an opt-in failing test on the clean
+      revalidation. queued-tree-share=lend (default) lends free build CPU to an exact held
+      shared tree claim, keeping at least half the non-export allocation for build. It never
+      takes a live compiler's token or changes memory admission. lend-matched compares
+      resume/lend/lend/resume with the same verifier and workload.
+      lend-compare interleaves before/current/lent/lent/current/before: before uses the
+      historical verifier with retained CPU; current and lent share the current verifier,
+      respectively resuming one queued-tree token and lending free build tokens.
+      queued-tree-share=resume restores one free build core when the exact
+      queued shared-memory claim becomes held; retained preserves the serial latch.
+      queued-tree-share=matched interleaves retained/resume/resume/retained with one verifier.
+      queued-tree-share=compare runs before/current/resumed/resumed/current/before:
+      before uses the old verifier, current and resumed the new verifier; only resumed
+      returns a core after queued memory admission. All retain early build return.
+      cores=N requires that exact admitted pool before any take starts; it does not
+      override admission. Real takes use fresh side targets and preserve the native cache.
+      warmup=full runs a complete green control before the timed takes under the same
+      held grant, excluded from their results. No staging push is performed.
+      plant-red=test records an opt-in failing test on the clean
       candidate; only that named red is accepted as an expected-red take, never a pass.
   targo --unverified ship qualify-summary RETAINED-TAKE-DIRECTORY
   targo --unverified ship slice-memory [--takes 1|2]
@@ -103,6 +120,66 @@ USAGE
       A normal release starts this automatically after READY. For standalone work,
       invoke the previous cutter.toml's tool.path with `release --prefreeze`:
       the ship alias can compile before parsing this flag.
+
+  targo --unverified ship release --open-next [--dry-run] [--verbose]
+      Open the next version on main without starting its line: the commit `--bump`
+      writes (the version in Cargo.toml and every lock, each owed harness version and
+      its announcement), on origin/main's tip, pushed as a compare-and-swap, by the
+      cutter frozen from that tip. Refused unless main declares a version a release
+      has used and the tip holds that release's handoff fixtures. This clone's
+      release journal is neither read nor changed, so it runs beside an unfinished
+      after-cut. Ends OPENED aterm X.Y.0 at <commit>; then `ship release --commit
+      <commit>` starts its line. Exit codes as `ship release`.
+
+  targo --unverified ship release --pump [--adopt] [--once] [--dry-run]
+                 [--mac-only | --linux-artifacts …]
+                 [--release-credentials <profile.toml>] [--engine DIRECTORY] [--verbose]
+      Keep this clone releasing: a loop over the verbs above and below. Each cycle
+      reads origin/main, this clone's release journal and its repair record, then
+      runs one verb or waits:
+        main declares a cut version whose fixtures its tip holds  → --open-next
+        an open version with no fleet line                         → --prepare --commit
+                                                                     <the commit that opened it>
+        a fleet line and no journal here                           → waits, naming its holder;
+                                                                     with --adopt: --prepare
+                                                                     (adopts it, or exit 4
+                                                                     names its live holder)
+        this clone's unfinished line                               → --prepare (resume)
+        a journal here of a version another clone cut              → waits: a session runs
+                                                                     --forget
+        a red whose repair worker ended `FIX <commit>` the line
+        admits                                                     → --prepare --fix <commit>
+        a red whose worker is on it, ended without a fix, or
+        named a commit the line refuses                            → waits, naming the newest
+                                                                     judged pass past the head
+                                                                     as a supersede candidate
+        PREPARED, and publish/config.sh on main says
+        PUMP_PUBLISH_DEFAULT=\"1\"                                  → the bare run (publish,
+                                                                     cut, after-cut, check)
+        PREPARED without it                                        → waits: a session publishes
+        a refusal no worker is on                                  → waits until the journal
+                                                                     or main changes
+        exit 3 (could not run)                                     → the same verb, with backoff
+        exit 4 (another live holder)                               → waits; no second line
+      A run that completes no row for max(30 min, twice its step's p95) while its
+      processes do nothing for as long is STALLED: it is said, and a --prepare is
+      interrupted and resumed (a publish is only said).
+      It never runs --forget, --bump, --supersede or --abandon. A line it starts
+      takes the Linux declaration given here, else PUMP_LINUX_DEFAULT in main's
+      publish/config.sh. --once runs one cycle; --dry-run prints the decision and
+      runs nothing. One pump per clone; its memory is .git/aterm-release/pump.toml.
+        --adopt            also take over a fleet line this clone holds no journal
+                           of, through the release's own selection, once its
+                           holder is dead or stalled; without it such a line is
+                           left to its holder
+        --install          keep it up on this Mac: copy this executable to an
+                           immutable folder and load a per-user launchd agent
+                           (systems.alab.aterm-release-pump, KeepAlive, ProcessType
+                           Interactive) that runs `release --pump` in this clone
+                           with the flags given here; it logs to
+                           .git/aterm-release/pump.log
+        --uninstall        remove that agent's property list and unload it; a pump
+                           mid-run takes up to two minutes to end
 
   targo --unverified ship release [--bump | --commit REV [--supersede] | --fix COMMIT...]
                  (--mac-only | --linux-artifacts DIRECTORY [--linux-target aarch64|x86_64]...
@@ -348,8 +425,9 @@ USAGE
                            whose sources (its reader in crates/aterm-phase/src and
                            its files in crates/aterm-agent/src/harness/)
                            changed since the previous public release under an
-                           unchanged HARNESS_VER gets its minor raised by one, and
-                           CHANGELOG [Unreleased] a line naming it. A harness
+                           unchanged HARNESS_VER gets its minor raised by one; it
+                           writes only those version files, and the release derives
+                           the changelog line naming the raised versions. A harness
                            version is MAJOR.MINOR, never a third part; one bump per
                            release window covers every change in it. `ship release
                            --bump` writes the same bumps into its version commit
@@ -651,6 +729,19 @@ pub fn run() -> i32 {
                     1
                 }
             },
+            (Ok(root), None) if opts.pump_install || opts.pump_uninstall => {
+                match crate::release_pump::service(&root, opts) {
+                    Ok(said) => {
+                        println!("{said}");
+                        0
+                    }
+                    Err(why) => {
+                        eprintln!("release pump: {why}");
+                        1
+                    }
+                }
+            }
+            (Ok(root), None) if opts.pump => crate::release_pump::run(&root, opts),
             (Ok(root), None) => crate::release_steps::run(&root, opts),
             (Err(e), _) => {
                 eprintln!("aterm-release release: {e}");
@@ -1082,6 +1173,12 @@ fn parse_release<'a>(
     while let Some(flag) = it.next() {
         match flag {
             "--prefreeze" => opts.prefreeze = true,
+            "--open-next" => opts.open_next = true,
+            "--pump" => opts.pump = true,
+            "--once" => opts.pump_once = true,
+            "--install" => opts.pump_install = true,
+            "--uninstall" => opts.pump_uninstall = true,
+            "--adopt" => opts.pump_adopt = true,
             "--bump" => opts.bump = true,
             "--supersede" => opts.supersede = true,
             "--commit" => {
@@ -1151,6 +1248,69 @@ fn parse_release<'a>(
             || opts.release_credentials.is_some())
     {
         return Err("--prefreeze builds only the clean origin/main cutter and takes no cut or credential flags".into());
+    }
+    if (opts.pump_once || opts.pump_install || opts.pump_uninstall || opts.pump_adopt) && !opts.pump
+    {
+        return Err("--once, --adopt, --install and --uninstall are --pump's".into());
+    }
+    if opts.pump_install && (opts.pump_once || opts.dry_run || opts.pump_uninstall) {
+        return Err(
+            "--pump --install keeps the pump up: it takes no --once, --dry-run or --uninstall"
+                .into(),
+        );
+    }
+    if opts.pump_uninstall
+        && (opts.pump_once
+            || opts.pump_adopt
+            || opts.dry_run
+            || opts.verbose
+            || opts.linux.declared()
+            || opts.engine.is_some()
+            || opts.release_credentials.is_some())
+    {
+        return Err(
+            "--pump --uninstall removes the pump's launchd agent and takes no other flag".into(),
+        );
+    }
+    if opts.pump
+        && (opts.prefreeze
+            || opts.open_next
+            || opts.bump
+            || opts.commit.is_some()
+            || opts.supersede
+            || !opts.fix.is_empty()
+            || opts.prepare
+            || opts.qualify
+            || opts.forget
+            || opts.abandon.is_some())
+    {
+        return Err(
+            "--pump runs the release's verbs itself: it takes only the Linux declaration of \
+             the lines it starts, --adopt, --once, --dry-run, --verbose, --engine and \
+             --release-credentials"
+                .into(),
+        );
+    }
+    if opts.open_next
+        && (opts.prefreeze
+            || opts.bump
+            || opts.commit.is_some()
+            || opts.supersede
+            || !opts.fix.is_empty()
+            || opts.prepare
+            || opts.qualify
+            || opts.forget
+            || opts.abandon.is_some()
+            || opts.linux.declared()
+            || !opts.linux.workers.is_empty()
+            || !opts.linux.targets.is_empty()
+            || opts.release_credentials.is_some())
+    {
+        return Err(
+            "--open-next commits the next version on main and starts no line: it takes only \
+             --dry-run, --verbose and --engine"
+                .into(),
+        );
     }
     if opts.abandon.is_some()
         && (opts.bump

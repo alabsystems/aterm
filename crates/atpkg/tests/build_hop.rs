@@ -877,8 +877,12 @@ fn a_held_lock_bounds_the_wait_only_of_a_front_in_its_holders_session() {
             "--nocapture",
         ])
         .env(ISOLATED_ENV, "1");
-        let out = aterm_uds::deadline::output_within(&mut cmd, MUST_HAPPEN)
-            .expect("isolated ordinary-ancestor process");
+        let out = aterm_uds::deadline::output_while_process_progressing(
+            &mut cmd,
+            MUST_HAPPEN,
+            "isolated ordinary-ancestor process",
+        )
+        .expect("isolated ordinary-ancestor process");
         assert!(
             out.status.success(),
             "isolated ordinary-ancestor run failed ({}):\n{}\n{}",
@@ -1128,29 +1132,36 @@ fn an_idle_survivor_lets_a_killed_builds_claim_go() {
 
 /// A BUILD KEEPS THE SIGNALS ITS FRONT WAS STARTED IGNORING, through the real binary (linked with
 /// chained fixups on Apple silicon, as the shipped image is: `build.rs`): a front a shell started
-/// ignoring SIGPIPE and SIGINT claims, hands off and execs, and its build, sending itself each,
-/// lives to say so. NEGATIVE CONTROL (by hand: the load-time read's constructor section dropped,
-/// so nothing is put back and std's exec runs, which sets SIGPIPE to its default): the build dies
-/// of the SIGPIPE it sends itself.
+/// ignoring SIGPIPE and SIGINT execs, and its build, sending itself each, lives to say so.
+/// The non-compiling request avoids admission and its holder: neither determines the
+/// constructor's signal snapshot. The default-disposition control dies of SIGPIPE through
+/// this same binary, so a broken snapshot that always ignores it cannot pass.
 #[test]
 fn a_build_keeps_the_signals_its_front_was_started_ignoring() {
-    let s = Scratch::new();
-    let child = s.front_ignoring(
-        Some("PIPE INT"),
-        &["--unverified", "build"],
-        &[("HOP_PROBE", "signals")],
-    );
-    assert!(s.seen().held.is_some(), "claimed");
-    let (status, err) = finish(child);
-    assert!(status.success(), "{status} {err}");
-    let mut said = s.out().into_os_string();
-    said.push(".signals");
-    assert_eq!(
-        std::fs::read_to_string(said)
-            .expect("the build's word")
-            .trim(),
-        "survived"
-    );
+    use std::os::unix::process::ExitStatusExt as _;
+    for ignored in [None, Some("PIPE INT")] {
+        let s = Scratch::new();
+        let child = s.front_ignoring(ignored, &["--version"], &[("HOP_PROBE", "signals")]);
+        assert!(s.seen().held.is_none(), "this probe needs no admission");
+        let (status, err) = finish(child);
+        let mut said = s.out().into_os_string();
+        said.push(".signals");
+        if ignored.is_some() {
+            assert!(status.success(), "{status} {err}");
+            assert_eq!(
+                std::fs::read_to_string(said)
+                    .expect("the build's word")
+                    .trim(),
+                "survived"
+            );
+        } else {
+            assert_eq!(status.signal(), Some(libc::SIGPIPE), "{status} {err}");
+            assert!(
+                !Path::new(&said).exists(),
+                "the control cannot report survival"
+            );
+        }
+    }
 }
 
 /// A complete store build `build` under `prefix` (its ready marker beside it) whose `targo` writes

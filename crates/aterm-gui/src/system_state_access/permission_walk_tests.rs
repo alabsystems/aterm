@@ -211,6 +211,9 @@ fn walk_app_with_parts(
     SETTINGS_QUIT.with(|quit| quit.set(false));
     RECORDS.with(|records| records.borrow_mut().clear());
     let mut app = new_mac(devtools, fda);
+    // The person is looking at aterm: a walk that starts by itself, and macOS's Automation
+    // question, come up only over an aterm window holding keyboard focus (`StartFacts::in_front`).
+    focus(&mut app, true);
     // A walk page is a person's stage: its time and its grant reads count while they are at the
     // Mac (`App::count_walk_page_time`). A test that models them away says so.
     app.user_input_recent = |_| true;
@@ -1821,8 +1824,6 @@ fn later_process(cold: bool) -> App {
     );
     if cold {
         app.devtools_helper.note_cold_start();
-    } else {
-        app.permission_walk.note_successor();
     }
     app
 }
@@ -1891,15 +1892,16 @@ fn the_walk_record_follows_the_walk_from_page_to_page() {
 
 /// An update's Commit ends the predecessor mid-walk with nothing of the quit path run
 /// (`seamless::commit_and_exit`, `clean_exit_now`): its first walk, which started by itself,
-/// kept the pages it had still to show as it started, so the successor
-/// (`WalkLane::note_successor`), on a Mac whose Full Disk Access page came up before
-/// (`App::fresh_mac` false), walks on from them by itself, its Full Disk Access page step 1 of 2
-/// again. A crash, a logout or a person's quit and the cold launch after it do the same.
-/// NEGATIVE CONTROLS: a predecessor whose walk ended by the close box, or that walked nothing,
-/// leaves the successor nothing to walk; a successor that reads each kept page's grant on
-/// starts none, and the line goes.
+/// kept the pages it had still to show as it started. The successor, which the person did not
+/// start, brings none of them up by itself (owner ruling 2026-11-09): the line stays for the
+/// next launch of theirs, which, on a Mac whose Full Disk Access page came up before
+/// (`App::fresh_mac` false), walks on from them, its Full Disk Access page step 1 of 2 again. A
+/// crash, a logout or a person's quit and the cold launch after it do the same. NEGATIVE
+/// CONTROLS: a predecessor whose walk ended by the close box, or that walked nothing, leaves
+/// the next launch nothing to walk; one that reads each kept page's grant on starts none, and
+/// the line goes.
 #[test]
-fn an_update_commit_mid_walk_leaves_the_successor_its_pages() {
+fn an_update_commit_mid_walk_leaves_its_pages_for_the_persons_next_launch() {
     fn predecessor(t0: Instant) -> App {
         let mut app = walk_app();
         app.devtools_helper.note_cold_start();
@@ -1921,8 +1923,23 @@ fn an_update_commit_mid_walk_leaves_the_successor_its_pages() {
     for cold in [false, true] {
         drop(predecessor(t0));
         assert_eq!(kept_pages(dir.path()), LEFT, "kept as it started");
-        let mut app = later_process(cold);
         let fda_opens = test_arms::fda_counts().0;
+        if !cold {
+            let mut successor = later_process(false);
+            successor.tick_permission_walk(t1);
+            assert!(
+                !successor.permission_walk.active(),
+                "an update's successor walks on from nothing by itself"
+            );
+            assert_eq!(test_arms::fda_counts().0, fda_opens, "no page comes up");
+            assert_eq!(
+                kept_pages(dir.path()),
+                LEFT,
+                "the line stays for the person"
+            );
+            continue;
+        }
+        let mut app = later_process(cold);
         app.tick_permission_walk(t1);
         assert_eq!(walking(&app), Some(LEFT.to_vec()), "cold {cold}: walks on");
         assert_eq!(
@@ -1950,12 +1967,12 @@ fn an_update_commit_mid_walk_leaves_the_successor_its_pages() {
     idle.tick_permission_walk(t0);
     assert!(!idle.permission_walk.active(), "a lane that starts none");
     drop(idle);
-    let mut app = later_process(false);
+    let mut app = later_process(true);
     app.tick_permission_walk(t1);
     assert!(!app.permission_walk.active(), "nothing was walked");
 
     drop(predecessor(t0));
-    let mut app = later_process(false);
+    let mut app = later_process(true);
     grant_fda(&mut app);
     app.devtools_helper.note_reading(
         test_arms::reading(DevToolGrant::Granted, test_arms::on()),

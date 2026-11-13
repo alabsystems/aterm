@@ -18,6 +18,8 @@ use crate::release::{
 };
 use crate::release_steps::Real;
 
+mod host_fit;
+mod open_next;
 mod qualify_model;
 mod sign_model;
 
@@ -43,6 +45,8 @@ fn passed_binary(spec: &str, executable: &str) -> Binary {
         input_reason: None,
         json: Some(false),
         execution_s: 1.25,
+        key_parts: std::collections::BTreeMap::new(),
+        origin_run: None,
     }
 }
 
@@ -108,6 +112,8 @@ struct World {
     gate_revision: bool,
     /// What step 1's release-input judgment finds.
     input_finding: Option<InputFinding>,
+    /// A new engine policy's answer, installed by Sync for the next input judgment.
+    sync_input_finding: Option<InputFinding>,
     fleet_refusal: Option<String>,
     fleet_panics: bool,
     supersede_preflight_refusal: Option<Refusal>,
@@ -121,7 +127,11 @@ struct World {
     existing_fleet_line: Option<Line>,
     supersession: Option<crate::line::Supersession>,
     fleet_audit_refusal: bool,
+    /// The line's lease is taken by another cutter while this run sleeps.
+    fleet_lost_in_sleep: bool,
     fleet_audits: usize,
+    /// How many calls had been made at each fleet audit.
+    fleet_audited_after: Vec<usize>,
     dir: aterm_tempfile::TempDir,
     now: u64,
     out: Vec<String>,
@@ -182,6 +192,14 @@ struct World {
     validation_tools: Result<String, Refusal>,
     /// The preflight's own blocks: R's commit-only gates and the engine's readiness.
     blocks: Vec<Refusal>,
+    /// What the commit-gate record binds beside R's commit: a stand-in for the build-inputs
+    /// seal and origin's advertised release tags. A test moves it to change an input.
+    gate_inputs: String,
+    /// The record a passed real preflight wrote: R's commit and version, and the inputs it
+    /// was judged on.
+    gates_judged: Option<(String, String, String)>,
+    /// What the gates no record answers (prerequisites, engine readiness) find on a carry.
+    standing_blocks: Vec<Refusal>,
     /// The preflight's note of a candidate whose bump is still to be written: the harness
     /// versions the bump commit writes.
     bump_writes: Option<String>,
@@ -365,6 +383,16 @@ struct World {
     resigned: usize,
     /// The repair workers the cut's reds open ([`Backend::repair`]).
     repairs: Repairs,
+    /// Whether origin/main's tip holds the handoff fixtures of the release main declares
+    /// ([`Backend::fixtures_at`]), which `--open-next` asks.
+    predecessor_fixtures: Result<bool, Refusal>,
+    /// Why this Mac cannot hold the release ([`Backend::host_fit`]).
+    host_unfit: Option<Refusal>,
+    /// How many times the host's fitness was asked.
+    host_asked: usize,
+    /// The fleet claim `existing_fleet_line` stands for is held by another Mac
+    /// ([`Backend::fleet_held_elsewhere`]).
+    fleet_elsewhere: bool,
 }
 
 /// The world's repair spawner, inside an aterm session unless `outside`: every failure the cut
@@ -416,6 +444,7 @@ impl World {
             gate_repo: None,
             gate_revision: false,
             input_finding: None,
+            sync_input_finding: None,
             fleet_refusal: None,
             fleet_panics: false,
             supersede_preflight_refusal: None,
@@ -429,7 +458,9 @@ impl World {
             existing_fleet_line: None,
             supersession: None,
             fleet_audit_refusal: false,
+            fleet_lost_in_sleep: false,
             fleet_audits: 0,
+            fleet_audited_after: Vec::new(),
             dir: aterm_tempfile::tempdir().unwrap(),
             now: 1_000_000,
             out: Vec::new(),
@@ -478,6 +509,9 @@ impl World {
             main_at_next_fetch: None,
             validation_tools: Ok("pinned tools ready".into()),
             blocks: Vec::new(),
+            gate_inputs: "seal-and-tags".into(),
+            gates_judged: None,
+            standing_blocks: Vec::new(),
             bump_writes: None,
             said_at_bump: None,
             audits: VecDeque::new(),
@@ -577,6 +611,10 @@ impl World {
             adopted: 0,
             resigned: 0,
             repairs: Repairs::default(),
+            predecessor_fixtures: Ok(true),
+            host_unfit: None,
+            host_asked: 0,
+            fleet_elsewhere: false,
         }
     }
 
@@ -1567,6 +1605,9 @@ impl Backend for World {
     fn fleet_holder(&mut self, _head: &str) -> Option<String> {
         Some("m3 (node fixture-m3, session cut-193, pid 193, boot fixture, start 123)".into())
     }
+    fn fleet_held_elsewhere(&mut self) -> bool {
+        self.fleet_elsewhere && self.existing_fleet_line.is_some()
+    }
     fn main_past_line(&mut self, head: &str, main: &str) -> Option<(usize, usize)> {
         let count = self.pos(main)?.checked_sub(self.pos(head)?)?;
         Some((count, count))
@@ -1589,6 +1630,7 @@ impl Backend for World {
     }
     fn fleet_audit(&mut self) -> Result<(), String> {
         self.fleet_audits += 1;
+        self.fleet_audited_after.push(self.calls.len());
         if self.fleet_audit_refusal {
             Err("fleet line was adopted".into())
         } else {
@@ -1612,6 +1654,9 @@ impl Backend for World {
     }
     fn sleep(&mut self, secs: u64) {
         self.calls.push(format!("sleep {secs}"));
+        if self.fleet_lost_in_sleep {
+            self.fleet_audit_refusal = true;
+        }
         self.now += secs;
         if let Some(then) = self.after_sleep.take() {
             then(self);
@@ -1793,6 +1838,17 @@ impl Backend for World {
     fn is_dir(&mut self, _path: &Path) -> bool {
         true
     }
+    fn host_fit(&mut self) -> Result<String, Refusal> {
+        self.host_asked += 1;
+        self.host_unfit
+            .clone()
+            .map_or_else(|| Ok("host: 256 GiB of memory, 36 cores".into()), Err)
+    }
+    fn fixtures_at(&mut self, rev: &str, version: &str) -> Result<bool, Refusal> {
+        self.calls
+            .push(format!("fixtures-at {} v{version}", &rev[..4]));
+        self.predecessor_fixtures.clone()
+    }
     fn tree_has(&mut self, rev: &str, path: &str) -> Result<bool, Refusal> {
         assert_eq!(path, crate::release::LINE_SOURCE);
         if self.tree_unread {
@@ -1915,6 +1971,9 @@ impl Backend for World {
     }
     fn sync(&mut self) -> Result<String, Refusal> {
         self.calls.push("sync".into());
+        if let Some(finding) = self.sync_input_finding.take() {
+            self.input_finding = Some(finding);
+        }
         Ok("engine synced".into())
     }
     fn preview_bump(&mut self, c: &Candidate, _prover: &Prover) -> Result<String, Refusal> {
@@ -2101,6 +2160,13 @@ impl Backend for World {
                 );
             }
         }
+        if !dry && found.is_empty() {
+            self.gates_judged = Some((
+                c.commit.clone(),
+                c.version.clone(),
+                self.gate_inputs.clone(),
+            ));
+        }
         Preflight {
             notes: c
                 .bump_from
@@ -2110,6 +2176,16 @@ impl Backend for World {
                 .collect(),
             found,
         }
+    }
+    fn commit_gates_standing(&mut self, c: &Candidate) -> Option<(String, Vec<Refusal>)> {
+        self.calls.push("commit-gates-standing".into());
+        (self.gates_judged
+            == Some((
+                c.commit.clone(),
+                c.version.clone(),
+                self.gate_inputs.clone(),
+            )))
+        .then(|| ("20261112T171324-27178".into(), self.standing_blocks.clone()))
     }
     fn can_check_commit(&mut self, _c: &Candidate) -> bool {
         self.preview_own
@@ -2208,6 +2284,9 @@ impl Backend for World {
             commit: format!("e{}", &c.commit[1..]),
             line: format!("{build} {}", c.version),
         })
+    }
+    fn preview_roll(&mut self, _c: &Candidate) -> Result<String, Refusal> {
+        Ok(crate::changelog::roll_words(1, 0))
     }
     fn qualify_begin(&mut self, _prover: &Prover, branches: &[Branch]) -> Result<String, Refusal> {
         if self.stop_at_qualify {
@@ -2488,6 +2567,41 @@ fn fleet_line_excludes_a_second_cut_and_rechecks_before_publication() {
     let (code, last) = owner.run(bump());
     assert_eq!(code, 0, "{last}");
     assert!(owner.fleet_audits >= 2);
+}
+
+/// An owner wait before the publish renews nothing, so another cutter may take the line's
+/// lapsed lease meanwhile: the run owns the line again after the wait, right before it publishes
+/// or signs, and stops without either when it no longer does.
+/// NEGATIVE CONTROL: the same wait with the line still owned publishes, its last ownership audit
+/// after the wait.
+#[test]
+fn a_line_taken_during_an_owner_wait_is_neither_published_nor_signed() {
+    let mut lost = World::new();
+    lost.audits = VecDeque::from([owner_gap(), owner_gap(), passes()]);
+    lost.fleet_lost_in_sleep = true;
+    let (code, last) = lost.run(bump());
+    assert_eq!(code, 3, "{last}");
+    assert!(
+        last.contains("resume on the fleet line's current holder"),
+        "{last}"
+    );
+    assert_eq!(lost.count("publish"), 0, "{:?}", lost.calls);
+    assert_eq!(lost.count("cut --sign"), 0, "{:?}", lost.calls);
+
+    let mut kept = World::new();
+    kept.audits = VecDeque::from([owner_gap(), owner_gap(), passes()]);
+    let (code, last) = kept.run(bump());
+    assert_eq!(code, 0, "{last}");
+    let waited = kept.calls.iter().rposition(|c| c == "sleep 600").unwrap();
+    let published = kept.calls.iter().position(|c| c == "publish").unwrap();
+    assert!(
+        kept.fleet_audited_after
+            .iter()
+            .any(|&at| waited < at && at <= published),
+        "{:?} {:?}",
+        kept.fleet_audited_after,
+        kept.calls
+    );
 }
 
 #[test]
@@ -3503,6 +3617,7 @@ fn a_bump_runs_every_step_in_order_and_ends_released() {
             "commit-gates",
             input.as_str(),
             "sync",
+            input.as_str(),
             "validation-tools",
             "verify appkit",
             "disk-claim 30",
@@ -4092,6 +4207,170 @@ fn a_run_stopped_at_any_step_resumes_there_and_repeats_nothing_done() {
     }
 }
 
+/// A line stopped after its preflight passed, as a failed stage leaves it: R is made and
+/// journaled, and the first run's calls are forgotten.
+fn stopped_after_the_preflight() -> World {
+    let mut w = World::new();
+    w.preview_own = true;
+    w.stage_stages = false;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    // NEGATIVE CONTROL: a first run has no verdict to carry, so it asks every gate, once.
+    assert_eq!(w.count("commit-gates"), 1, "{:?}", w.calls);
+    assert_eq!(w.count("commit-gates-standing"), 0, "{:?}", w.calls);
+    assert!(
+        !w.out
+            .iter()
+            .any(|line| line.contains("is carried from run")),
+        "{:#?}",
+        w.out
+    );
+    assert!(w.journal().unwrap().has(crate::release::COMMIT_GATES));
+    w.stage_stages = true;
+    w.calls.clear();
+    w.out.clear();
+    w
+}
+
+/// R13: A RESUME REPEATS NO GATE ITS JOURNAL HOLDS. The resumed line's journal holds R's
+/// passed preflight and the record's inputs (the seal, origin's tags) are what they were, so
+/// neither the launch prelude nor step 1 runs a commit-only gate again; step 1 says the
+/// verdict was carried and from which run.
+/// NEGATIVE CONTROL: before the carry every resume ran the gates twice (`commit-gates-dry` in
+/// the prelude, `commit-gates` in step 1), which `stopped_after_the_preflight` counts on a
+/// first run; `a_changed_input_runs_the_commit_gates_again` holds the other side.
+#[test]
+fn a_resumed_line_runs_no_commit_gate_its_journal_holds() {
+    let mut w = stopped_after_the_preflight();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(last.starts_with("RELEASED aterm 0.6.0"), "{last}");
+    assert_eq!(
+        w.count("commit-gates") + w.count("commit-gates-dry"),
+        0,
+        "{:?}",
+        w.calls
+    );
+    assert!(w.count("commit-gates-standing") >= 1, "{:?}", w.calls);
+    assert!(
+        w.out
+            .iter()
+            .any(|line| line.contains("the preflight is carried from run 20261112T171324-27178")),
+        "the step line names the run: {:#?}",
+        w.out
+    );
+}
+
+/// A changed input (another seal, another advertised tag set) leaves no record standing: the
+/// resumed step 1 asks every gate again, once, and says nothing was carried.
+#[test]
+fn a_changed_input_runs_the_commit_gates_again() {
+    let mut w = stopped_after_the_preflight();
+    w.gate_inputs = "another-seal-or-tag-set".into();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("commit-gates"), 1, "{:?}", w.calls);
+    assert_eq!(w.count("commit-gates-dry"), 0, "{:?}", w.calls);
+    assert!(
+        !w.out
+            .iter()
+            .any(|line| line.contains("is carried from run")),
+        "{:#?}",
+        w.out
+    );
+    // The fresh judgment is the record the next resume carries.
+    assert_eq!(
+        w.gates_judged
+            .as_ref()
+            .map(|(_, _, inputs)| inputs.as_str()),
+        Some("another-seal-or-tag-set")
+    );
+}
+
+/// What no record answers is asked on every run: a carried preflight still refuses on this
+/// machine's prerequisites or the engine's readiness, and runs no commit-only gate to say so.
+#[test]
+fn a_carried_preflight_still_asks_this_machine_and_the_engine() {
+    let mut w = stopped_after_the_preflight();
+    w.standing_blocks = vec![Refusal::new(
+        "prerequisites — the signed scanner is not installed",
+        "install it",
+    )];
+    let (code, last) = w.run(mac());
+    assert_ne!(code, 0, "{last}\n{:#?}", w.out);
+    assert!(
+        w.out
+            .iter()
+            .any(|line| line.contains("the signed scanner is not installed")),
+        "{:#?}",
+        w.out
+    );
+    assert_eq!(
+        w.count("commit-gates") + w.count("commit-gates-dry"),
+        0,
+        "{:?}",
+        w.calls
+    );
+    assert_eq!(
+        w.count("stage"),
+        0,
+        "refused before the stage: {:?}",
+        w.calls
+    );
+}
+
+/// A claimed cut is past step 1's gates, so its resume asked them in the launch prelude alone,
+/// every time. Its record answers there now: an unchanged claimed cut asks no commit-only
+/// gate, and says which run it carries.
+/// NEGATIVE CONTROL: `a_claimed_cuts_source_finding_names_its_withdrawal_before_the_next_version`
+/// moves an input, and the same resume asks every gate and refuses on its finding.
+#[test]
+fn a_claimed_cut_resumes_on_its_recorded_preflight() {
+    let mut w = World::new();
+    w.preview_own = true;
+    w.cut_finishes = false;
+    w.cut_code = 1;
+    let (code, last) = w.run(bump());
+    assert_eq!(code, 1, "{last}\n{:#?}", w.out);
+    assert!(
+        w.cut.as_ref().is_some_and(|cut| !cut.finished),
+        "{:?}",
+        w.cut
+    );
+    w.cut_finishes = true;
+    w.cut_code = 0;
+    w.calls.clear();
+    w.out.clear();
+    let (code, last) = w.run(mac());
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(
+        w.count("commit-gates") + w.count("commit-gates-dry"),
+        0,
+        "{:?}",
+        w.calls
+    );
+    assert_eq!(w.count("commit-gates-standing"), 1, "{:?}", w.calls);
+    assert!(
+        w.out.iter().any(|line| line
+            .contains("the claimed cut's preflight is carried from run 20261112T171324-27178")),
+        "{:#?}",
+        w.out
+    );
+}
+
+/// A dry run of a journaled line asks every gate: it carries nothing and records nothing.
+#[test]
+fn a_dry_run_of_a_journaled_line_carries_no_preflight() {
+    let mut w = stopped_after_the_preflight();
+    let (code, last) = w.run(ReleaseOptions {
+        dry_run: true,
+        ..mac()
+    });
+    assert_eq!(code, 0, "{last}\n{:#?}", w.out);
+    assert_eq!(w.count("commit-gates-standing"), 0, "{:?}", w.calls);
+    assert!(w.count("commit-gates-dry") >= 1, "{:?}", w.calls);
+}
+
 #[test]
 fn a_dry_run_changes_nothing_and_asks_nobody() {
     let mut w = World::new();
@@ -4508,6 +4787,65 @@ fn unchecked_input_refuses_at_step_one_including_a_dry_run() {
     assert_eq!(code, 0, "{last}");
     assert!(last.contains("would go ahead"), "{last}");
     assert!(w.calls.iter().any(|call| call.starts_with("input-checks ")));
+}
+
+/// A passing preflight cannot authorize Commit under a policy selected by Sync that
+/// rejects or cannot judge those inputs. The clean control reaches the normal release path.
+#[test]
+fn a_new_engine_policy_is_judged_after_sync_before_any_commit_or_qualification() {
+    for finding in [
+        InputFinding::Failed("synced policy rejects the source".into()),
+        InputFinding::Unanswered("synced policy is unavailable".into()),
+    ] {
+        let mut w = World::new();
+        w.versions.insert(TIP.into(), "0.6.0".into());
+        w.sync_input_finding = Some(finding);
+        let (code, last) = w.run(mac());
+        assert_ne!(code, 0, "{last}\n{:?}", w.out);
+        assert!(
+            w.out.iter().any(|line| line.contains("synced policy")),
+            "{:?}",
+            w.out
+        );
+        let inputs: Vec<_> = w
+            .calls
+            .iter()
+            .enumerate()
+            .filter(|(_, call)| call.starts_with("input-checks "))
+            .map(|(i, _)| i)
+            .collect();
+        let sync = w.calls.iter().position(|call| call == "sync").unwrap();
+        assert_eq!(inputs.len(), 2, "{:?}", w.calls);
+        assert!(inputs[0] < sync && sync < inputs[1], "{:?}", w.calls);
+        for forbidden in [
+            "move ",
+            "bump",
+            "reserve",
+            "build",
+            "verify --tree",
+            "stage",
+            "publish",
+        ] {
+            assert!(
+                !w.calls.iter().any(|call| call.starts_with(forbidden)),
+                "{forbidden}: {:?}",
+                w.calls
+            );
+        }
+    }
+    let mut clean = World::new();
+    clean.versions.insert(TIP.into(), "0.6.0".into());
+    let (code, last) = clean.run(mac());
+    assert_eq!(code, 0, "{last}\n{:?}", clean.out);
+    assert_eq!(
+        clean
+            .calls
+            .iter()
+            .filter(|call| call.starts_with("input-checks "))
+            .count(),
+        2
+    );
+    assert!(clean.calls.iter().any(|call| call.starts_with("build")));
 }
 
 /// Real Git objects and the production changelog gate; only release authority and
@@ -6015,6 +6353,10 @@ fn a_claimed_cuts_source_finding_names_its_withdrawal_before_the_next_version() 
     // The claim's ledger line.
     w.ledger.push("0.6.0".into());
     w.preview_own = true;
+    // R's preflight passed before the claim, and R is immutable: a source gate can only turn
+    // red on an input that moved (here origin's release tags), which leaves no record
+    // standing, so the resume asks every gate again.
+    w.gate_inputs = "origin's tags moved".into();
     w.blocks = vec![Refusal::new(
         "changelog — CHANGELOG.md has no 0.6.0 section",
         "add it on main",
@@ -9819,6 +10161,43 @@ fn a_check_that_could_not_run_keeps_the_ask_open() {
     );
 }
 
+/// A credential ask an older build journaled is resolved when a credential gap now refuses
+/// the run. NEGATIVE CONTROL: refusing before settling leaves `release.channel` open on the
+/// owner's aterm.
+#[test]
+fn a_superseded_credential_ask_is_resolved_when_its_gap_refuses() {
+    let mut w = World::new();
+    w.audits = VecDeque::from([owner_gap(), owner_gap(), machine_gap()]);
+    let _ = w.run(bump());
+    assert_eq!(w.journal().unwrap().asks, ["release.notary"]);
+    assert!(w.resolved.is_empty(), "the agreement ask stays open");
+    let release = w.release_dir().join(JOURNAL_FILE);
+    let mut journal = w.journal().unwrap();
+    journal.asks.push("release.channel".into());
+    journal.save(&release).unwrap();
+    let channel_gap = vec![Finding {
+        label: "channel",
+        state: Audited::Gap {
+            what: "this Mac holds no release-org token".into(),
+            fix: "filed `aterm secrets need gh:release` with the lab".into(),
+            owner: false,
+        },
+    }];
+    w.audits = VecDeque::from([channel_gap]);
+    let (code, last) = w.run(mac());
+    assert_ne!(code, 0, "{last}");
+    assert_eq!(w.resolved, ["release.channel"], "{last}");
+    let current = Journal::load(&w.release_dir().join(SELECTION_FILE))
+        .unwrap()
+        .or_else(|| w.journal())
+        .unwrap();
+    assert_eq!(
+        current.asks,
+        ["release.notary"],
+        "the agreement ask stays open"
+    );
+}
+
 #[test]
 fn asks_are_carried_over_each_new_head_and_withdrawn_by_forget() {
     let mut w = World::new();
@@ -11448,7 +11827,9 @@ fn a_killed_run_that_failed_a_test_is_refused_never_resumed() {
 /// and after, under one seal, keeps one record per check its events file says finished, a FAIL
 /// included, never what its output says; a moved clone or a changed seal keeps nothing, its
 /// `began` record withdrawn, and could not run. Negative control: records read from the log
-/// take its decoy FAIL.
+/// take its decoy FAIL. A cut an interrupt ended cannot walk the seal again; where the seal it
+/// holds stands by status it records what its verifier finished, each row under the run that
+/// executed it. Negative control: a held seal that does not stand keeps nothing of that run.
 #[cfg(unix)]
 #[test]
 fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check() {
@@ -11490,8 +11871,10 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
              echo 'aterm-verify tool 1'; exit 0; fi\necho \"$PWD $*\" > '{said}'\n\
              out=; prev=\nfor a in \"$@\"; do \
              [ \"$prev\" = --events ] && out=$a; prev=$a; done\ncase \"$(cat '{mode}')\" in\n  \
-             dirty) echo stray > stray.txt ;;\n  move) git checkout -q --detach {other} ;;\nesac\n\
+             dirty) echo stray > stray.txt ;;\n  move) git checkout -q --detach {other} ;;\n  \
+             interrupt) : > '{interrupted}' ;;\nesac\n\
              cat '{events}' >> \"$out\"\necho '{decoy}'\nexit \"$(cat '{code}')\"\n",
+            interrupted = dir.path().join("interrupted").display(),
             said = said.display(),
             mode = mode.display(),
             events = events.display(),
@@ -11716,11 +12099,73 @@ fn the_real_verify_step_runs_the_verify_cli_in_the_clone_and_records_each_check(
         "{}",
         judged.line()
     );
+    let killed_run = Path::new(&events_file)
+        .parent()
+        .and_then(Path::file_name)
+        .and_then(std::ffi::OsStr::to_str)
+        .expect("the events file sits in its run's log directory")
+        .to_owned();
+    let passed_in_killed_run = Binary {
+        origin_run: Some(killed_run.clone()),
+        ..passed_binary("-p a --lib", &"aa".repeat(32))
+    };
     assert_eq!(
         judged.run(Half::Tree).passed_binaries,
-        [passed_binary("-p a --lib", &"aa".repeat(32))],
-        "the test record of the killed run lists what passed"
+        std::slice::from_ref(&passed_in_killed_run),
+        "the test record of the killed run lists what passed, under the run that executed it"
     );
+
+    // AN INTERRUPTED CUT. The interrupt that stops the verifier also ends the seal's own walk,
+    // so the cut cannot read the seal again after the run.
+    static INTERRUPTED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    fn interrupted_inputs() -> Result<String, String> {
+        if INTERRUPTED.get().is_some_and(|marker| marker.exists()) {
+            Err("build input walk interrupted".into())
+        } else {
+            Ok("fixture inputs".into())
+        }
+    }
+    let interrupted = INTERRUPTED.get_or_init(|| dir.path().join("interrupted"));
+    real.build_inputs = interrupted_inputs;
+    let interrupted_events = format!(
+        "verify-event: {}\n{}",
+        aterm_json::json!({"schema":1,"event":"test-binary-finished","test":"-p a --lib",
+            "outcome":"ok","exe_sha256":"aa".repeat(32),"content_key":"cc".repeat(32),
+            "inputs_bounded":true,"input_reason":null,"recorded_execution_s":1.25,
+            "json":false,"carried":true,"carried_from":"an-earlier-run"}),
+        binary("-p c --lib", &"ee".repeat(32), "ok")
+    );
+    real.inputs_held = |_| false;
+    set("143", "interrupt", &interrupted_events);
+    let refused = verify(&mut real, Step::Qualify, &resume).expect_err("the held seal moved");
+    assert!(refused.could_not_run, "{refused:?}");
+    assert_eq!(
+        judge(&r).run(Half::Tree).passed_binaries,
+        std::slice::from_ref(&passed_in_killed_run),
+        "a seal that does not stand keeps nothing of the interrupted run"
+    );
+    std::fs::remove_file(interrupted).unwrap();
+    real.inputs_held = |seal| seal == "fixture inputs";
+    set("143", "interrupt", &interrupted_events);
+    let ran = verify(&mut real, Step::Qualify, &resume).expect("the interrupted run is kept");
+    assert_eq!(ran.code, 143);
+    assert_eq!(
+        judge(&r).run(Half::Tree).passed_binaries,
+        [
+            Binary {
+                origin_run: Some("an-earlier-run".into()),
+                ..passed_binary("-p a --lib", &"aa".repeat(32))
+            },
+            Binary {
+                origin_run: Some(killed_run),
+                ..passed_binary("-p c --lib", &"ee".repeat(32))
+            },
+        ],
+        "the interrupted run's rows are recorded: the carried one under the run that executed \
+         it, the one it ran under this release run"
+    );
+    std::fs::remove_file(interrupted).unwrap();
+    real.build_inputs = || Ok("fixture inputs".into());
 
     set("0", "", &finished(&all_ok));
     let ran = verify(&mut real, Step::Qualify, &every(Half::Tree)).expect("it ran");
@@ -12074,7 +12519,18 @@ fn bump_dry_run_judges_the_private_tree_without_changing_refs_or_journals() {
                 assert!(
                     tree_file("crates/aterm-phase/src/phase.rs").contains("new(0, 2, \"0.2\")")
                 );
-                assert!(tree_file("CHANGELOG.md").contains("harness 0.2"));
+                // T-R11: the bump writes no changelog line and no entry file; the release
+                // derives the announcement from the version files.
+                let base = git_ok(&git, &["show", &format!("{commit}^:CHANGELOG.md")])
+                    .unwrap()
+                    .stdout_utf8();
+                assert_eq!(tree_file("CHANGELOG.md"), base);
+                assert!(
+                    git_ok(&git, &["ls-tree", &commit, "changes"])
+                        .unwrap()
+                        .stdout_utf8()
+                        .is_empty()
+                );
             }
             assert_eq!(
                 fixture.preview(c)?,

@@ -37,6 +37,7 @@ fn original(case: i64) -> Snapshot {
         launch_env,
         tab: "s-restore-auth".into(),
         pid: 42,
+        lifetime: None,
         start: "Thu Nov 05 01:00:00 2026".into(),
         shell: 41,
         program: "/fixture/claude".into(),

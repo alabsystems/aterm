@@ -57,7 +57,10 @@ impl<'a> Pass<'a> {
             updated_at: &status.updated_at,
             record,
             took_lock,
-            install: status.linux.as_ref().map(Install::of),
+            install: status
+                .linux
+                .as_ref()
+                .map(|linux| Install::of(linux, status.hold.as_ref())),
             trial_ends,
         }
     }
@@ -74,20 +77,23 @@ pub(crate) struct Install<'a> {
     pub(crate) starts: u32,
     /// Whether a start finished the installed build's trial (it is healthy).
     pub(crate) started: bool,
-    /// Whether the copy refuses a newer build it rolled back from.
+    /// Whether the update record holds a newer build this copy rolled back (until its hold
+    /// lapses).
     pub(crate) rolled_back: bool,
 }
 
 impl<'a> Install<'a> {
     #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
-    fn of(linux: &'a crate::LinuxUpdateStatus) -> Self {
+    fn of(linux: &'a crate::LinuxUpdateStatus, hold: Option<&crate::HoldView>) -> Self {
         let trial_installed = linux.trial_phase.as_deref() == Some("Installed");
         Self {
             version: &linux.installed_version,
             awaiting_start: trial_installed && !linux.trial_healthy,
             starts: linux.trial_starts,
             started: linux.trial_phase.is_some() && linux.trial_healthy,
-            rolled_back: linux.refused_newer,
+            rolled_back: hold.is_some_and(|hold| {
+                hold.live && hold.cause == crate::update_record::Cause::LinuxRollback
+            }),
         }
     }
 }
@@ -301,7 +307,7 @@ fn start_wait_body(version: &str, starts: u32) -> String {
 pub(crate) fn rollback_body(failed: &str, restored: &str) -> String {
     format!(
         "aterm {failed} didn\u{2019}t start properly, so {restored} is back and aterm \
-         {failed} won\u{2019}t install again."
+         {failed} is held a while before it is tried again."
     )
 }
 

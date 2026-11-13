@@ -12,6 +12,7 @@ pub struct ContainedProducedMember {
     pending: Option<ProducedResult>,
     final_failure: Option<String>,
     compacted: Option<CompletedOriginal>,
+    coordinator_bound: bool,
 }
 
 /// One-use result of the actual accepted contained operation. This value
@@ -20,8 +21,22 @@ pub struct ContainedProducedMember {
 /// It is not CPU/SDK admission, a generic protected-scope close or a grant to
 /// run another process. There is no constructor or deserializer from DATA.
 pub struct CompletedProducedOperation {
-    original: CompletedOriginal,
+    original: std::sync::Arc<CompletedOriginal>,
     observation: Option<ProducedResult>,
+}
+
+/// Retains the SAME completed native original after its private, untouched
+/// observation established a successful exit and complete bounded output.
+/// This is execution evidence, not CPU admission or a proof/correctness grade.
+/// Public observation DATA cannot construct or change this owner.
+pub struct SuccessfulProducedCompletion {
+    original: std::sync::Arc<CompletedOriginal>,
+}
+impl SuccessfulProducedCompletion {
+    pub fn matches_registration(&self, registered: &RegisteredOutput) -> bool {
+        self.original.request.produced.validate_registered(registered.registration()).is_ok()
+            && registered.matches_pin(&self.original.pin)
+    }
 }
 // Created only by consuming the original validated, actually completed member.
 // Keep its original accepted-derived pin. Event/control duplicates and original pipe
@@ -61,8 +76,10 @@ impl CompletedOriginal {
             }
         };
         let MetadataMember { pin, streams, request, .. } = original.inner;
-        let NativeQueryRequest::ContainedProduced(request, _) = request else {
-            unreachable!("private completed member has contained purpose")
+        let request = match request {
+            NativeQueryRequest::ContainedProduced(request, _) => request,
+            NativeQueryRequest::Coordinator(request, _) => request.contained,
+            _ => unreachable!("private completed member has contained purpose"),
         };
         Ok(Self {
             accepted,
@@ -80,6 +97,27 @@ impl CompletedProducedOperation {
     pub fn matches_registration(&self, registered: &RegisteredOutput) -> bool {
         self.request().produced.validate_registered(registered.registration()).is_ok()
             && registered.matches_pin(&self.original.pin)
+    }
+    /// Inspect only the still-private native observation. Taking its DATA
+    /// first permanently prevents this operation from issuing a success owner.
+    pub fn successful_completion(&self) -> io::Result<SuccessfulProducedCompletion> {
+        let result = self
+            .observation
+            .as_ref()
+            .ok_or_else(|| invalid("native completion observation already delivered"))?;
+        if result.output_limit_exceeded
+            || !matches!(
+                result.completion.completed.finished.status,
+                crate::Status::Finished {
+                    outcome: crate::Outcome::Exit(0),
+                    cause: crate::CompletionCause::Exited,
+                    ..
+                }
+            )
+        {
+            return Err(invalid("native operation did not complete successfully"));
+        }
+        Ok(SuccessfulProducedCompletion { original: self.original.clone() })
     }
     /// Move the separate output DATA once while retaining this opaque native
     /// operation owner in the original artifact/phase capsule.
@@ -120,6 +158,60 @@ impl std::fmt::Display for ContainedProducedError {
 impl std::error::Error for ContainedProducedError {}
 
 impl Client {
+    /// Execute only an actually registered produced coordinator with the SAME
+    /// parent-bank primary and parent-prepared Layout originals.
+    /// # Safety
+    /// The trusted parent retains its actual registered image/source/SDK,
+    /// primary loan and original close-only output capsule through known native
+    /// retirement, all physical stream EOF and independent result validation.
+    /// Neither selected request bytes nor candidate reports satisfy this.
+    pub unsafe fn workload_coordinator(
+        &self,
+        registered: &RegisteredOutput,
+        request: &crate::workload::host::coordinator::Request,
+        primary: std::os::fd::BorrowedFd<'_>,
+        broker: std::os::fd::BorrowedFd<'_>,
+        outputs: &[std::os::fd::BorrowedFd<'_>],
+        io: MetadataIo,
+        deadline: Instant,
+    ) -> Result<ContainedProducedMember, ContainedProducedError> {
+        let prepare = || -> io::Result<_> {
+            request.validate()?;
+            request.contained.produced.validate_registered(registered.registration())?;
+            if !registered.matches(self)
+                || !io.descriptions.is_empty()
+                || request.primary.source != primary.as_raw_fd() as u32
+                || request.broker.source != broker.as_raw_fd() as u32
+                || outputs.len() != request.outputs.locks.len()
+            {
+                return Err(invalid("coordinator differs from actual original parent inputs"));
+            }
+            let primary = primary.try_clone_to_owned()?;
+            let mut request = request.clone();
+            request.primary.source = primary.as_raw_fd() as u32;
+            let broker = broker.try_clone_to_owned()?;
+            request.broker.source = broker.as_raw_fd() as u32;
+            let mut descriptions = vec![primary, broker];
+            for output in outputs {
+                descriptions.push(output.try_clone_to_owned()?);
+            }
+            Ok((
+                NativeQueryRequest::Coordinator(request, registered.observation().clone()),
+                MetadataIo { descriptions },
+            ))
+        };
+        let (native, io) = prepare().map_err(ContainedProducedError::BeforeRequest)?;
+        self.native_query(&native, io, deadline)
+            .map(ContainedProducedMember::from_original)
+            .map_err(|error| match error {
+                MetadataError::BeforeRequest(error) => ContainedProducedError::BeforeRequest(error),
+                MetadataError::Refused => ContainedProducedError::Refused,
+                MetadataError::Unknown { member, error } => ContainedProducedError::Unknown {
+                    member: Box::new(ContainedProducedMember::from_original(*member)),
+                    error,
+                },
+            })
+    }
     pub fn workload_contained_produced(
         &self,
         registered: &RegisteredOutput,
@@ -154,12 +246,96 @@ impl Client {
 }
 
 impl ContainedProducedMember {
+    /// Request DATA borrowed from this actual admitted coordinator member.
+    /// It cannot construct the member or replace its original descriptions.
+    pub fn coordinator_request(&self) -> io::Result<&crate::workload::host::coordinator::Request> {
+        self.original
+            .as_ref()
+            .and_then(|original| original.inner.request.coordinator())
+            .ok_or_else(|| invalid("not a live original coordinator member"))
+    }
+
+    /// A coordinator refusal additionally requires its SAME actual control
+    /// stream to close. Output/event EOF alone cannot retire its parent's
+    /// separately held original primary. Retain this member with the result.
+    pub fn coordinator_refusal(
+        &mut self,
+        deadline: Instant,
+    ) -> io::Result<Option<&crate::StatusFrame>> {
+        self.coordinator_request()?;
+        let original = self.original.as_mut().expect("original coordinator checked above");
+        if original.workload_refusal(deadline)?.is_none()
+            || !control_finished(&original.inner.control, deadline)?
+        {
+            return Ok(None);
+        }
+        original.workload_refusal(deadline)
+    }
+
+    pub fn coordinator_prepared(
+        &mut self,
+        deadline: Instant,
+    ) -> io::Result<Option<crate::workload::host::coordinator::Prepared>> {
+        let original = self
+            .original
+            .as_mut()
+            .ok_or_else(|| invalid("original coordinator already consumed"))?;
+        let inner = &mut original.inner;
+        if inner.request.coordinator().is_none() {
+            return Err(invalid("not an original coordinator member"));
+        }
+        inner.pin.validate(deadline)?;
+        inner.streams.poll_inner(&inner.request, deadline, &mut None)?;
+        inner.pin.validate(deadline)?;
+        Ok(inner.streams.state.coordinator_prepared.clone())
+    }
+    pub fn bind_coordinator(
+        &mut self,
+        selection: &crate::workload::host::coordinator::SemanticSelection,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        use sha2::{Digest as _, Sha256};
+        if self.coordinator_bound {
+            return Err(invalid("coordinator selection already delivered"));
+        }
+        let original = self
+            .original
+            .as_mut()
+            .ok_or_else(|| invalid("original coordinator already consumed"))?;
+        let inner = &mut original.inner;
+        let request = inner
+            .request
+            .coordinator()
+            .ok_or_else(|| invalid("not an original coordinator member"))?;
+        let prepared = inner
+            .streams
+            .state
+            .coordinator_prepared
+            .as_ref()
+            .ok_or_else(|| invalid("original coordinator preparation not observed"))?;
+        let digest: [u8; 32] = Sha256::digest(prepared.encode()?).into();
+        if selection.root_attempt != request.contained.produced.key.root_attempt
+            || selection.member_attempt != request.contained.produced.member.member_attempt
+            || selection.prepared_sha256 != digest
+            || inner.streams.failed
+            || inner.streams.state.started.is_some()
+        {
+            return Err(invalid("coordinator selection differs from original native preparation"));
+        }
+        inner.pin.validate(deadline)?;
+        // A partial write is still delivery. Never retry or replace this
+        // selection, even if subsequent native-pin validation fails.
+        self.coordinator_bound = true;
+        inner.streams.events.send(&selection.encode()?, deadline)?;
+        inner.pin.validate(deadline)
+    }
     fn from_original(original: MetadataMember) -> Self {
         Self {
             original: Some(ProducedMember { inner: original }),
             pending: None,
             final_failure: None,
             compacted: None,
+            coordinator_bound: false,
         }
     }
     pub fn cancel(&mut self, deadline: Instant) -> io::Result<()> {
@@ -255,7 +431,7 @@ impl ContainedProducedMember {
             return Err(io::ErrorKind::TimedOut.into());
         }
         Ok(Some(CompletedProducedOperation {
-            original: compacted,
+            original: std::sync::Arc::new(compacted),
             observation: self.pending.take(),
         }))
     }

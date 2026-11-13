@@ -46,7 +46,7 @@ fn account_targets_wait_for_a_writer_instead_of_admitting_a_denied_peer() {
 }
 
 pub(crate) use super::fixture::{
-    Lab, NETWORK, repair_between, repair_commons, repair_commons_among_first, repair_commons_at,
+    Lab, NETWORK, repair_commons, repair_commons_among_first, repair_commons_at,
     repair_commons_first, repair_commons_reports,
 };
 
@@ -510,6 +510,8 @@ fn admitted_session_reuses_the_fresh_control_lock_and_refuses_foreign_custody() 
     .unwrap()
     .unwrap();
     let expected = bootstrap.request().unwrap().binding().actor();
+    // A deadline already reached makes one lock attempt: a held writer refuses at once, where
+    // `open_existing` would wait out its minute hang detector to say the same.
     let error =
         Journal::open_existing_until(bootstrap.journal_dir(), bootstrap.trust(), Instant::now())
             .err()

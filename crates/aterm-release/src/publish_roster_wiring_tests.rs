@@ -52,6 +52,64 @@ fn a_recovery_verifies_under_the_release_key_and_signs_under_its_own() {
     );
 }
 
+/// T-R8. EVERY CUT MODE WRITES THE RELEASE COMMIT'S ROLLED SECTION AS ITS NOTES, read from the
+/// commit's objects: a real cut, a dry run and a draft over the same release commit write the
+/// same `notes-<v>.md`.
+/// NEGATIVE CONTROL: the working tree's own `[Unreleased]` holds another entry, which none of
+/// them ships.
+#[test]
+fn every_cut_mode_writes_the_release_commits_notes() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let repo = dir.path().to_path_buf();
+    crate::ledger::testing::init(
+        &repo,
+        &[
+            ("user.name", "Test"),
+            ("user.email", "test@example.invalid"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
+    let git = |args: &[&str]| {
+        let out = crate::ledger::testing::git()
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    fs::write(
+        repo.join("CHANGELOG.md"),
+        "## [Unreleased]\n\n## [0.5.0] - 2026-11-12\n\n### Fixed\n\n- **Shipped.** In C.\n",
+    )
+    .unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "release: v0.5.0"]);
+    let commit = git(&["rev-parse", "HEAD"]);
+    fs::write(
+        repo.join("CHANGELOG.md"),
+        "## [Unreleased]\n\n### Fixed\n\n- **Tree.** Not shipped.\n",
+    )
+    .unwrap();
+    fs::create_dir(repo.join("dist")).unwrap();
+    for kind in [CutKind::Real, CutKind::DryRun, CutKind::Draft] {
+        let mut cut = ctx(None);
+        cut.repo.clone_from(&repo);
+        cut.tree.clone_from(&repo);
+        cut.dist = repo.join("dist");
+        cut.commit.clone_from(&commit);
+        cut.kind = kind;
+        write_release_notes(&cut).unwrap();
+        assert_eq!(
+            fs::read_to_string(cut.notes_path()).unwrap(),
+            changelog::release_notes_document("0.5.0", "### Fixed\n\n- **Shipped.** In C."),
+            "{kind:?}"
+        );
+        fs::remove_file(cut.notes_path()).unwrap();
+    }
+}
+
 fn ctx(machine_id: Option<&str>) -> CutCtx {
     CutCtx {
         credentials: None,
@@ -84,7 +142,6 @@ fn ctx(machine_id: Option<&str>) -> CutCtx {
         fence: None,
         journal: None,
         adopted: false,
-        notes_section: "0.5.0".to_string(),
     }
 }
 

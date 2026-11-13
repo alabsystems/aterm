@@ -235,7 +235,7 @@ impl<'a> Run<'a> {
                     Step::End | Step::Again => ran_then_ended(&format!(
                         "Stage {i} of the parser is in; the lexer is next."
                     )),
-                    Step::Done => ran_then_ended("Fixed the parser; all done."),
+                    Step::Done => ran_then_ended("Fixed the parser; all done.\n\nATERM-TASK-DONE"),
                     Step::Look => s.ctl.m.screens[0].clone(),
                 };
                 let (rows, stands) = match sent.iter().flatten().last() {

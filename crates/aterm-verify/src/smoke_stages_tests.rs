@@ -54,6 +54,7 @@ fn summary(frames: u64, max_input: &str, retries: u64, drops: u64, sync: u64) ->
     format!(
         "OK backend=gpu rows=24 cols=80 scrollback_truncated_lines=0 frames={frames} \
          last_input_present_ms=6.10 max_input_present_ms={max_input} n_input=30 \
+         max_key_write_ms=60.00 \
          sync_armed=0 sync_rel_end=0 sync_rel_timeout={sync} sync_holding=0 \
          perf_reduced=0 shed_transitions=0 wake_heals=0 redraw_retry_gated={retries} \
          fx_under_frames=0 present_drops={drops} deadline_arms_by_owner=cursor_effect:0/0 "
@@ -62,6 +63,40 @@ fn summary(frames: u64, max_input: &str, retries: u64, drops: u64, sync: u64) ->
 
 fn hv(reply: &str) -> Result<String, Miss> {
     hardware_key_verdict(30, &summary(41, "8.90", 0, 0, 0), reply)
+}
+
+#[test]
+fn a_key_write_bucket_crossing_needs_a_measured_breach() {
+    let reply = percentiles(30, "41.943040", "0.10", "1.00", "10.00");
+    let measured = |maximum: &str| {
+        hardware_key_verdict(
+            30,
+            &summary(41, "8.90", 0, 0, 0).replace(
+                "max_key_write_ms=60.00",
+                &format!("max_key_write_ms={maximum}"),
+            ),
+            &reply,
+        )
+    };
+    assert!(
+        measured("39.89").is_ok(),
+        "the retained VM burst was below 40 ms"
+    );
+    assert!(measured("40.00").is_ok());
+    assert!(matches!(measured("40.01"), Err(Miss::Breach(_))));
+    for unreadable in ["NaN", "inf", "-1", ""] {
+        assert!(matches!(measured(unreadable), Err(Miss::Fail(_))));
+    }
+    assert!(matches!(
+        hardware_key_verdict(
+            30,
+            "OK frames=41 max_input_present_ms=8.90 redraw_retry_gated=0 present_drops=0 sync_rel_timeout=0",
+            &reply
+        ),
+        Err(Miss::Fail(_))
+    ));
+    let fractional = reply.replace("key_write_p99_ms=41.943040", "key_write_p99_ms=40.01");
+    assert!(matches!(hv(&fractional), Err(Miss::Breach(_))));
 }
 
 /// A busy CPU window and load, as a loaded admission or entry reads them.

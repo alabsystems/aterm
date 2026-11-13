@@ -70,3 +70,22 @@ fn an_owed_batch_takes_the_queue_armed_or_not_but_never_inside_a_batch() {
     pending.finish_batch();
     assert!(pending.can_run_inline());
 }
+
+/// A LAUNCH STAGE ONLY MOVES ON: a launch watch reading it from another thread names the furthest
+/// point the launch reached, so a later `-run` entry (the loop's run after `prepare_launch`) cannot
+/// take a finished launch back to `Running`. NEGATIVE CONTROL: a plain store in
+/// `advance_launch_stage` fails "a finished launch stays finished".
+#[test]
+fn a_launch_stage_only_moves_on() {
+    use super::{advance_launch_stage, AppKitLaunchStage as Stage};
+    use std::sync::atomic::{AtomicU8, Ordering};
+    let cell = AtomicU8::new(Stage::NotRun as u8);
+    let read = |cell: &AtomicU8| Stage::from_u8(cell.load(Ordering::Acquire));
+    for stage in [Stage::Running, Stage::DidFinish, Stage::Finished] {
+        advance_launch_stage(&cell, stage);
+        assert_eq!(read(&cell), stage);
+    }
+    advance_launch_stage(&cell, Stage::Running);
+    assert_eq!(read(&cell), Stage::Finished, "a finished launch stays finished");
+    assert_eq!(Stage::from_u8(200), Stage::Finished);
+}

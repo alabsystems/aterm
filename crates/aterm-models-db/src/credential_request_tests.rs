@@ -54,10 +54,6 @@ fn each_honest_guard_bears_its_law() {
     let honest = [
         ("Publish", is("auth", 1), "NoUnauthorizedValue"),
         ("Widen", is("auth", 1), "NoUnauthorizedValue"),
-        ("Give", is("auth", 1), "NoUnauthorizedValue"),
-        ("NeedsPerson", is("held", 0), "NoNeedlessAsk"),
-        ("NeedsPerson", is("swept", 1), "NoNeedlessAsk"),
-        ("Absent", is("hidden", 0), "NoNeedlessAsk"),
         (
             "Reraise",
             or_(gt(var("gen"), var("atgen")), gt(var("atgen"), var("gen"))),
@@ -73,8 +69,7 @@ fn each_honest_guard_bears_its_law() {
             .any(|state| !weakened.check_invariant(law, state));
         assert!(broken, "{action} without {clause:?} breaks no {law}");
     }
-    // Revision 1's negative controls: `NotHeld` without its sweep, `Unauthorized` that
-    // keeps the NEEDS YOU up.
+    // Revision 1's negative control: `NotHeld` without its sweep.
     let unswept = without(&model, "NotHeld", &is("swept", 1));
     assert!(
         aterm_spec::interp::reachable_states(&unswept)

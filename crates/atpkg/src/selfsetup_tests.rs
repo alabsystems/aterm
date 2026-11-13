@@ -2936,8 +2936,9 @@ fn an_uninstall_keeps_a_bundle_whose_program_has_not_answered() {
         assert!(
             err.contains(&format!(
                 "SKIPPED {} — kept: `{} --version` did not answer within {hang:?}, so macOS may \
-                 still be checking its first start, and removing the bundle now can stall every \
-                 program start until a restart — uninstall again in 10 minutes, or after a restart",
+                 still be checking its first start, and removing the bundle now can strand every \
+                 program start then waiting on that check — uninstall again in 10 minutes, or \
+                 after a restart",
                 app.display(),
                 stand_in.display()
             )),

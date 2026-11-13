@@ -215,6 +215,7 @@ fn calls() -> Vec<String> {
 /// Apply's receipt waits in [`APPLY_RECEIPTS`] for the test to answer.
 fn handlers() -> InitialSetupHandlers {
     InitialSetupHandlers {
+        launch_history: || None,
         apply: |_, _, _, receipt| {
             APPLY_RECEIPTS.with(|receipts| receipts.borrow_mut().push(receipt));
             true
@@ -6457,7 +6458,7 @@ fn timed_read_page() -> App {
     });
     let (_, instance, _) = page(&mut app);
     assert!(!app.system_state_shown_views(instance).is_empty());
-    app.publish_system_state(fixture_status("github-sign-in").unwrap());
+    app.publish_system_state(fixture_status("github-account").unwrap());
     app.publish_access_opt_outs();
     app.system_state_host.next_status = None;
     app.system_state_host.observed_plan = app.system_state_host.latest_status.plan.clone();

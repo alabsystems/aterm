@@ -4,12 +4,13 @@
 //! `spawn_session` seeds a seamless update's carried rows onto the adopted session it returns:
 //! the broadcast opt-ins, the standing halt and the fabric counters, the supervisor's claim and
 //! the attention lines, the task record, the Autopilot end, the book of declared wakes, the
-//! render debt and the fallback title (`SessionRecord`). An adopted shell forks nothing, so these
+//! host's confirmation of its agent, the render debt and the fallback title (`SessionRecord`). An adopted shell forks nothing, so these
 //! tests run the product function itself, on a real PTY master and a pid no teardown signals.
 
 use std::sync::Arc;
 
 use aterm_agent::harness::acts::TaskFace;
+use aterm_agent::harness::agent_image::Act;
 use aterm_core::terminal::{RenderDebt, TerminalCheckpoint};
 use aterm_session::{LaunchNonce, SessionId};
 
@@ -23,6 +24,13 @@ use crate::{App, WindowId};
 /// A worker's task record as the park writes it (`TaskRecord::carry_row`).
 const TASK_ROW: &str =
     "rev=3 state=done from=ctl since=1000 result_bytes=12 attention=0 why=marker";
+
+/// The process group whose leader the carried confirmation names.
+const CONFIRMED_GROUP: i32 = 4242;
+
+/// The host's confirmation of a Claude Code by its team, as the park carries it
+/// (`agent_act::carry_row`).
+const AGENT_ACT_ROW: &str = "group=4242 start=80 version=7 agent=claude proof=team";
 
 /// When the carried end's task landed, unix ms.
 const LANDED_AT_MS: i64 = 1_792_000_000_000;
@@ -46,6 +54,7 @@ struct Rows {
     task: Option<String>,
     end: Option<String>,
     wakes: Option<String>,
+    agent_act: Option<String>,
     screen: Option<TerminalCheckpoint>,
     render_debt: Option<RenderDebt>,
     title: String,
@@ -54,7 +63,8 @@ struct Rows {
 /// What the adopted session came up holding: its broadcast opt-ins (topic, since), standing
 /// halts and newest inbox row id; its supervisor's holder and attention line; its task record
 /// (rev, state, why, result bytes), the time its timeline holds a landed face from, and its
-/// book's `status` fields; its engine's render debt and window title.
+/// book's `status` fields; the act the host keeps for the carried group's leader; its engine's
+/// render debt and window title.
 #[derive(Debug, PartialEq, Eq)]
 struct Seeded {
     topics: Vec<(String, String)>,
@@ -65,6 +75,7 @@ struct Seeded {
     task: Option<(u64, TaskState, Option<&'static str>, u64)>,
     landed_at: Option<i64>,
     waits: String,
+    act: Option<Act>,
     render_debt: RenderDebt,
     title: String,
 }
@@ -80,6 +91,7 @@ fn nothing() -> Seeded {
         task: None,
         landed_at: None,
         waits: "waits=0 waits_ready=0".to_string(),
+        act: None,
         render_debt: RenderDebt::default(),
         title: String::new(),
     }
@@ -172,6 +184,7 @@ fn handed(master: i32, rows: Rows) -> Adopted {
         task: rows.task,
         autopilot_end: rows.end,
         wakes: rows.wakes,
+        agent_act: rows.agent_act,
     }
 }
 
@@ -227,6 +240,8 @@ fn adopt(rows: Rows) -> Seeded {
     };
     let waits = crate::occupancy_wakes::status_fields(Some(&sid));
     crate::occupancy_wakes::forget(&sid);
+    let act = crate::agent_act::cached(&sid, CONFIRMED_GROUP);
+    crate::agent_act::forget_kept_for_test(&sid);
     let (render_debt, title) = {
         let engine = crate::term_lock(&session.term);
         (engine.render_debt(), engine.title().to_string())
@@ -243,6 +258,7 @@ fn adopt(rows: Rows) -> Seeded {
         task,
         landed_at,
         waits,
+        act,
         render_debt,
         title,
     }
@@ -251,7 +267,8 @@ fn adopt(rows: Rows) -> Seeded {
 /// EACH CARRIED ROW COMES UP ON THE ADOPTED SESSION, and only its own: the opt-ins, halt and
 /// counters on its fabric, the claim and the attention line on its meta, the task record on its
 /// timeline, the landed end held for the loop to restate, the book open where its agent lives,
-/// the debt on its restored alternate screen and the title on its engine.
+/// the agent's confirmation kept by the host, the debt on its restored alternate screen and the
+/// title on its engine.
 /// NEGATIVE CONTROLS: an alternate screen carried with no debt comes up owing none, and a shell
 /// that carried no row comes up with none of them.
 #[test]
@@ -337,6 +354,17 @@ fn an_adopted_shell_comes_up_holding_each_row_it_carried() {
             },
             Seeded {
                 landed_at: Some(LANDED_AT_MS),
+                ..nothing()
+            },
+        ),
+        (
+            "the host's confirmation of its agent",
+            Rows {
+                agent_act: Some(AGENT_ACT_ROW.to_string()),
+                ..Rows::default()
+            },
+            Seeded {
+                act: Some(Act::On),
                 ..nothing()
             },
         ),

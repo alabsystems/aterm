@@ -902,8 +902,10 @@ fn a_spawns_autopilot_word_is_its_workers_word_and_fact_line() {
 
 #[cfg(unix)]
 fn pipe() -> [i32; 2] {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    use std::os::fd::IntoRawFd;
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(

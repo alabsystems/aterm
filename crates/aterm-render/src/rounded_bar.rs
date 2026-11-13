@@ -43,7 +43,7 @@ pub struct RoundedBar {
 
 /// The cap arts a host has built, by `(w, h')` ([`cap_key`]): a bar that
 /// keeps its width keeps its art, so a moving or fading bar builds none.
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct CapArts {
     arts: Vec<((u32, u32), Arc<FxArt>)>,
 }

@@ -330,3 +330,97 @@ fn gate_refuses_git_conflict_markers_with_the_file_line_number() {
     let outside = "## [Unreleased]\n\n### Fixed\n- clean entry\n\n## [0.25] - x\n>>>>>>> origin/main\n- old\n";
     assert!(changelog::gate_unreleased(outside).is_ok());
 }
+
+/// A live-shaped window: entries of the 0.199.0 window as written by hand, the harness line in
+/// the middle of `### Changed` (a committed copy, never the live file).
+const LIVE: &str = include_str!("../fixtures/changelog/live-window.txt");
+
+/// `LIVE`'s `[Unreleased]` split as a writer would: each entry its own file under its kind,
+/// named so name order is file order, and the harness line apart (the release derives it).
+fn live_split() -> (String, Vec<changelog::Fragment>, String) {
+    let lines: Vec<&str> = LIVE.lines().collect();
+    let start = lines.iter().position(|l| *l == "## [Unreleased]").unwrap();
+    let end = start
+        + 1
+        + lines[start + 1..]
+            .iter()
+            .position(|l| l.starts_with("## ["))
+            .unwrap();
+    let (mut kind, mut files, mut harness) = ("", Vec::new(), String::new());
+    let mut entry: Vec<&str> = Vec::new();
+    let flush = |kind: &str, entry: &mut Vec<&str>, files: &mut Vec<changelog::Fragment>| {
+        while entry.last() == Some(&"") {
+            entry.pop();
+        }
+        if !entry.is_empty() {
+            files.push(changelog::Fragment {
+                path: format!("changes/{kind}/e{:03}.md", files.len()),
+                text: format!("{}\n", entry.join("\n")),
+            });
+        }
+        entry.clear();
+    };
+    for line in &lines[start + 1..end] {
+        if let Some(k) = line.strip_prefix("### ") {
+            flush(&kind.to_lowercase(), &mut entry, &mut files);
+            kind = k;
+        } else if line.starts_with(changelog::HARNESS_ENTRY_HEAD) {
+            flush(&kind.to_lowercase(), &mut entry, &mut files);
+            harness = (*line).to_string();
+        } else if line.starts_with("- ") {
+            flush(&kind.to_lowercase(), &mut entry, &mut files);
+            entry.push(line);
+        } else if !entry.is_empty() {
+            entry.push(line);
+        }
+    }
+    flush(&kind.to_lowercase(), &mut entry, &mut files);
+    let scaffold = format!(
+        "{}\n\n{}\n",
+        lines[..=start].join("\n"),
+        lines[end..].join("\n")
+    );
+    (scaffold, files, harness)
+}
+
+/// T-R1. THE ROLL OF FRAGMENTS EQUALS TODAY'S BYTE FOR BYTE, apart from where the harness line
+/// stands: the live-shaped window written as files and rolled, and the same window left raw (the
+/// drain) and rolled, are the hand-laid window rolled with its harness line leading `### Changed`
+/// (the place the release derives it), in the changelog, the section a release ships and the
+/// notes document. NEGATIVE CONTROL: the hand-laid roll itself differs only by that line's place.
+#[test]
+fn the_roll_of_fragments_equals_todays_byte_for_byte() {
+    let (scaffold, files, harness) = live_split();
+    assert!(files.len() >= 8 && harness.starts_with(changelog::HARNESS_ENTRY_HEAD));
+    let moved = LIVE.replace(&format!("{harness}\n\n"), "").replacen(
+        "### Changed\n\n",
+        &format!("### Changed\n\n{harness}\n\n"),
+        1,
+    );
+    assert_ne!(moved, LIVE, "the live line stands mid-Changed");
+    let today = changelog::roll(&moved, "0.199.0", "2026-11-12").unwrap();
+    let assembled =
+        aterm_verify::changelog_fragments::assemble(&scaffold, &files, Some(&harness)).unwrap();
+    let from_files = changelog::roll(&assembled, "0.199.0", "2026-11-12").unwrap();
+    let drained = aterm_verify::changelog_fragments::assemble(LIVE, &[], Some(&harness)).unwrap();
+    let from_raw = changelog::roll(&drained, "0.199.0", "2026-11-12").unwrap();
+    for rolled in [&from_files, &from_raw] {
+        assert_eq!(rolled, &today);
+        let body = changelog::rolled_body(rolled, "0.199.0").unwrap();
+        assert_eq!(body, changelog::rolled_body(&today, "0.199.0").unwrap());
+        assert_eq!(
+            changelog::release_notes_document("0.199.0", &body),
+            changelog::release_notes_document(
+                "0.199.0",
+                &changelog::rolled_body(&today, "0.199.0").unwrap()
+            )
+        );
+    }
+    let hand = changelog::roll(LIVE, "0.199.0", "2026-11-12").unwrap();
+    assert_ne!(hand, today);
+    assert_eq!(
+        hand.replace(&format!("{harness}\n\n"), ""),
+        today.replace(&format!("{harness}\n\n"), ""),
+        "only the harness line's place differs"
+    );
+}

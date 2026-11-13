@@ -4,15 +4,17 @@
 //! A nonblocking listener configured before the kernel may answer a SYN.
 
 use super::{
-    Attachment, Connection, Scope, local_attachments, native, ready, refuse, same_subnet,
-    unambiguous, unicast,
+    Attachment, Connection, Scope, attachments_clock, forget_attachments, local_attachments,
+    native, ready, refuse, same_subnet, unambiguous, unheard_look, unicast,
 };
+use crate::slots::ACCEPT_POLL;
 use aterm_uds::stop::Stop;
 use std::{
     io,
     net::{IpAddr, SocketAddr, SocketAddrV6, TcpListener},
     os::fd::BorrowedFd,
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
+    time::Instant,
 };
 
 /// A socket bound to one observed LAN attachment, or explicitly to loopback.
@@ -25,6 +27,9 @@ pub struct Listener {
     attachment: Option<Attachment>,
     withdrawn: Arc<Stop>,
     changes: Option<native::RouteChanges>,
+    /// The one more look a heard change is owed ([`Listener::drain_changes`]), until a recheck
+    /// at or after it gives it.
+    settle: Mutex<Option<Instant>>,
 }
 impl std::os::fd::AsFd for Listener {
     /// Borrow readiness only: [`Listener::accept`] still rechecks the attachment.
@@ -191,6 +196,7 @@ impl Listener {
             attachment,
             withdrawn: Arc::new(Stop::new()),
             changes,
+            settle: Mutex::new(None),
         };
         listener.recheck()?;
         Ok(listener)
@@ -212,17 +218,65 @@ impl Listener {
         self.changes.as_ref().map(native::RouteChanges::fd)
     }
 
-    /// Drain notifications without waiting. Lookup-only traffic does not ask for another
-    /// recheck; losing this listener's event source withdraws it rather than leaving it asleep.
+    /// Drain notifications without waiting, and say whether the server must recheck. Lookup-only
+    /// traffic does not ask for another recheck; losing this listener's event source withdraws
+    /// it rather than leaving it asleep. A heard change is what wakes an idle listener, which
+    /// keeps no timer of its own. One that can change an attachment (an interface or address
+    /// message, or so much queued that the kernel may have dropped one) has the recheck that
+    /// follows read the attachments afresh ([`forget_attachments`]) and owes one more look
+    /// [`ACCEPT_POLL`] later ([`Listener::validity_deadline`]), should the message have come
+    /// before the state it announces. A change of the route table alone asks for the recheck
+    /// and no more: [`Listener::recheck`] judges no route, and no interface or address moved, so
+    /// the read it keeps stands, as it does under the interface generation the same types leave
+    /// still.
     pub(crate) fn drain_changes(&self) -> io::Result<bool> {
-        let result = self
+        let heard = self
             .changes
             .as_ref()
-            .map_or(Ok(false), native::RouteChanges::drain);
-        if result.is_err() {
-            let _ = self.withdrawn.set();
+            .map_or(Ok(native::Heard::Nothing), native::RouteChanges::drain);
+        match heard {
+            Err(_) => {
+                let _ = self.withdrawn.set();
+            }
+            Ok(native::Heard::Attachments) => {
+                forget_attachments();
+                let owed = attachments_clock() + ACCEPT_POLL;
+                *self.settle.lock().unwrap_or_else(PoisonError::into_inner) = Some(owed);
+            }
+            Ok(native::Heard::Routes | native::Heard::Nothing) => {}
         }
-        result
+        heard.map(|heard| heard != native::Heard::Nothing)
+    }
+
+    /// When a server that has heard nothing more must run [`Listener::recheck`] again: the look
+    /// a heard change is still owed, and where the kernel can lose a change silently the instant
+    /// the attachments this listener judges by are read again ([`unheard_look`]). `None` is no
+    /// timer: a loopback listener has no attachment to lose, and a listener's withdrawal bell
+    /// and change descriptor wake its server for everything else.
+    pub(crate) fn validity_deadline(&self) -> Option<Instant> {
+        let settle = *self.settle.lock().unwrap_or_else(PoisonError::into_inner);
+        let unheard = self
+            .attachment
+            .as_ref()
+            .and_then(|_| unheard_look(self.local));
+        match (settle, unheard) {
+            (Some(settle), Some(unheard)) => Some(settle.min(unheard)),
+            (settle, unheard) => settle.or(unheard),
+        }
+    }
+
+    /// This listener hearing its changes from `socket`, a datagram socket a test delivers the
+    /// kernel's routing messages to.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn hearing(self, socket: std::os::fd::OwnedFd) -> Self {
+        self.hearing_in(socket, 64 * 1024)
+    }
+
+    /// [`Listener::hearing`], the socket's receive room taken as `room` bytes.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn hearing_in(mut self, socket: std::os::fd::OwnedFd, room: usize) -> Self {
+        self.changes = Some(native::RouteChanges::over(socket, room));
+        self
     }
 
     pub(crate) fn witness(&self) -> Witness {
@@ -238,6 +292,17 @@ impl Listener {
     pub fn recheck(&self) -> io::Result<()> {
         if self.withdrawn.is_set() {
             return Err(refuse("listener was withdrawn; bind again"));
+        }
+        let now = attachments_clock();
+        if self
+            .settle
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_if(|at| now >= *at)
+            .is_some()
+        {
+            // The look a heard change was owed: by what the OS says now.
+            forget_attachments();
         }
         let result = (|| {
             if self.tcp.local_addr()? != self.local {

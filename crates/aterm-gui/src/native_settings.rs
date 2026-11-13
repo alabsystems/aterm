@@ -6015,10 +6015,7 @@ impl SettingsApp {
             }
             "about/open-site" => {
                 if let Some(uri) = crate::about::site_url(&view.about) {
-                    let operation = cx.open_external(ExternalOpenRequest {
-                        uri,
-                        user_initiated: true,
-                    });
+                    let operation = cx.open_external(ExternalOpenRequest { uri });
                     view.pending.insert(operation, PendingAction::External);
                     view.feedback = Some("Opening project site…".to_string());
                 }
@@ -7931,11 +7928,18 @@ fn theme_value_words(themes: &crate::app_config::ThemeCatalog, raw: Option<&str>
             .meta(name)
             .map_or_else(|| name.to_string(), |meta| meta.display_name),
         raw => {
-            let (dark, light) = prefs::theme_slots(raw, themes);
-            let shown = |id: String| themes.meta(&id).map_or(id, |meta| meta.display_name);
-            theme_pair_words(&shown(dark), &shown(light))
+            let (dark, light) = theme_pair_display_names(themes, prefs::theme_slots(raw, themes));
+            theme_pair_words(&dark, &light)
         }
     }
+}
+
+fn theme_pair_display_names(
+    themes: &crate::app_config::ThemeCatalog,
+    (dark, light): (String, String),
+) -> (String, String) {
+    let shown = |id: String| themes.meta(&id).map_or(id, |meta| meta.display_name);
+    (shown(dark), shown(light))
 }
 
 fn theme_pair_words(dark: &str, light: &str) -> String {
@@ -9815,13 +9819,25 @@ fn regular_choice_control_width() -> f32 {
     270.0 * settings_text_scale().min(1.25)
 }
 
-fn theme_pair_fitted(key: &str, value: &str, words: &str) -> String {
+fn theme_pair_fitted(
+    themes: &crate::app_config::ThemeCatalog,
+    key: &str,
+    value: &str,
+    words: &str,
+) -> String {
     if key != prefs::EDIT_THEME {
         return words.to_string();
     }
     let room = regular_choice_control_width() - 52.0;
-    match prefs::theme_pair_short_label(value) {
-        Some(short) if crate::native_ui::native_button_label_width(words) > room => short,
+    match prefs::theme_pair_names(value) {
+        Some(names) if crate::native_ui::native_button_label_width(words) > room => {
+            let (dark, light) = theme_pair_display_names(themes, names);
+            if dark == light {
+                dark
+            } else {
+                format!("{dark} / {light}")
+            }
+        }
         _ => words.to_string(),
     }
 }
@@ -35445,7 +35461,12 @@ fn setting_row_parts(
             Control::new(
                 ButtonSpec {
                     label: format!("{}: {choice_words}{semantic_facts}", field.label),
-                    visual_label: Some(theme_pair_fitted(field.key, &value, &choice_words)),
+                    visual_label: Some(theme_pair_fitted(
+                        &state.assets.themes,
+                        field.key,
+                        &value,
+                        &choice_words,
+                    )),
                     visual_icon: None,
                     trailing_icon: Some(if field.key == prefs::EDIT_CURSOR_TRAIL_STYLE {
                         ButtonIcon::Forward
@@ -37857,6 +37878,8 @@ pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
             "Off"
         } else if update.linux_attention {
             "Needs attention"
+        } else if update.held.is_some() {
+            "Held"
         } else if update
             .linux
             .as_ref()
@@ -37883,6 +37906,8 @@ pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
             "None staged"
         }
         .to_string()
+    } else if update.held.is_some() {
+        "Held".to_string()
     } else if update.staged_on_hold {
         "On hold".to_string()
     } else if not_applying(update) {
@@ -37901,6 +37926,8 @@ pub(crate) fn compact_update_headline(update: &UpdateProjection) -> String {
         "No updater".to_string()
     } else if update.check_unanswered {
         "No answer".to_string()
+    } else if update.behind {
+        "Newer out".to_string()
     } else if !update.automatic_checks {
         "Checks off".to_string()
     } else {
@@ -37918,6 +37945,8 @@ pub(crate) fn compact_update_detail(update: &UpdateProjection) -> String {
             .detail
             .clone()
             .unwrap_or_else(|| "Run `aterm update status`.".to_string())
+    } else if let Some(held) = update.held.as_ref() {
+        format!("Held \u{b7} tries again {}.", held.when())
     } else if let Some(trouble) = update.apply_trouble.as_ref() {
         trouble.compact()
     } else if update.staged_on_hold {
@@ -37939,6 +37968,8 @@ pub(crate) fn compact_update_detail(update: &UpdateProjection) -> String {
         "Install aterm to get updates.".to_string()
     } else if update.channel_unreadable {
         "The release channel can\u{2019}t be read.".to_string()
+    } else if update.behind {
+        "A newer version is out; the next check downloads it.".to_string()
     } else if update.enabled {
         update_checked_sentence(update)
     } else {
@@ -37959,6 +37990,9 @@ pub(crate) fn compact_update_detail_minimum(update: &UpdateProjection) -> String
             ""
         }
         .to_string();
+    }
+    if update.held.is_some() && !update.checking {
+        return "Held.".to_string();
     }
     if let Some(trouble) = update.apply_trouble.as_ref().filter(|_| !update.checking) {
         return trouble.micro();
@@ -37987,6 +38021,8 @@ pub(crate) fn compact_update_detail_minimum(update: &UpdateProjection) -> String
         "Unavailable."
     } else if update.check_unanswered {
         "No answer."
+    } else if update.behind {
+        "Newer out."
     } else if !update.automatic_checks {
         "Manual checks."
     } else {
@@ -38021,6 +38057,8 @@ fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
         "Reading this copy\u{2026}"
     } else if update.linux_host {
         "See terminal status"
+    } else if update.held.is_some() {
+        "Held"
     } else if update.staged_on_hold {
         "On hold"
     } else if not_applying(update) {
@@ -38041,6 +38079,8 @@ fn compact_update_summary_detail(update: &UpdateProjection) -> &'static str {
         "Unavailable"
     } else if update.check_unanswered {
         "Check didn\u{2019}t answer"
+    } else if update.behind {
+        "Newer version out"
     } else if !update.automatic_checks {
         "Manual checks"
     } else {
@@ -38476,8 +38516,19 @@ fn update_action_label(room: f32) -> &'static str {
     }
 }
 
+/// The page's one action button on a held build: it ends the hold and tries the build now
+/// (`updates/retry`, `UpdateRequest::Retry`).
+const UPDATE_TRY_NOW: &str = "Try Now";
+
+/// Whether the page's action is Try Now: a held build on a copy whose updater this page drives.
+const fn update_action_tries_held(update: &UpdateProjection) -> bool {
+    update.held.is_some() && !update.linux_host
+}
+
 fn update_action_words(update: &UpdateProjection, room: f32) -> Option<String> {
-    let (full, short): (&str, &[&str]) = if update.linux_host {
+    let (full, short): (&str, &[&str]) = if update_action_tries_held(update) {
+        (UPDATE_TRY_NOW, &[])
+    } else if update.linux_host {
         ("Install in a terminal", &[])
     } else {
         (update_action_label(room), &["Update"])
@@ -38491,6 +38542,9 @@ const UPDATE_UNOBSERVED_FEEDBACK: &str =
     "Still checking whether this copy of aterm can update itself.";
 
 fn update_action_node(update: &UpdateProjection, height: f32, room: f32) -> UiNode {
+    if update_action_tries_held(update) {
+        return try_held_update_node(update, height, room);
+    }
     let installable = update.installable.is_installable() || update.linux_host;
     let semantic_label = if update.linux_host {
         "Install in a terminal: run aterm update apply"
@@ -38535,6 +38589,44 @@ fn update_action_node(update: &UpdateProjection, height: f32, room: f32) -> UiNo
                 room
             } else {
                 page_button_width(visual_label, room)
+            }))
+            .height(Length::Fixed(
+                crate::native_ui::native_button_height_for_lines(lines, height),
+            )),
+    )
+}
+
+/// Try Now on a held build: the hold ends and the build is tried at once.
+fn try_held_update_node(update: &UpdateProjection, height: f32, room: f32) -> UiNode {
+    let (visual_label, lines) = button_words(UPDATE_TRY_NOW, &[], room);
+    let mut spec =
+        ButtonSpec::new("Try Now: try the held update again").visual_label(&visual_label);
+    spec.description = update.held.as_ref().map(|held| {
+        format!(
+            "Version {} is held: {}. aterm tries it again by itself {}.",
+            held.name,
+            held.why,
+            held.when()
+        )
+    });
+    UiNode::new(
+        "updates/retry",
+        UiContent::Button(
+            Control::new(spec, ActionId::new("updates/retry"))
+                .state(ControlState {
+                    enabled: update.enabled && !update.checking,
+                    busy: update.checking,
+                    ..ControlState::default()
+                })
+                .style(StyleRef::Primary),
+        ),
+    )
+    .layout(
+        Layout::default()
+            .width(Length::Fixed(if lines > 1 {
+                room
+            } else {
+                page_button_width(&visual_label, room)
             }))
             .height(Length::Fixed(
                 crate::native_ui::native_button_height_for_lines(lines, height),

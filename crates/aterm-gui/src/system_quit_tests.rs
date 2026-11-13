@@ -236,3 +236,44 @@ fn only_a_dead_display_ends_the_run_as_a_logout() {
         assert!(line.starts_with("the event loop failed ("), "{line}");
     }
 }
+
+/// A RUN WHOSE FIRST SURFACE FAILED ENDS WITH ITS OWN STATUS: a successor whose first window
+/// surface could not be created ended its loop and exited 0, the status of its ordinary refusal,
+/// so the handoff parent that launched it marked nothing against those bytes. The event loop's
+/// answer to a failed attach (`App::first_surface_attached`, all `resumed` does with it) now marks
+/// the run, and the status `main_entry_with_network` exits with (`App::end_status`) is
+/// `EXIT_FIRST_SURFACE_FAILED`, a failing exit the parent books; a failed loop's own status still
+/// wins, and a run whose surface was attached ends 0 and goes on.
+/// NEGATIVE CONTROL: an attach failure that leaves the run unmarked, or an end status that reads
+/// 0 for it, fails "THE SURFACE".
+#[test]
+fn a_run_whose_first_surface_failed_ends_with_its_own_status() {
+    let mut app = crate::App::headless_for_test();
+    assert_eq!(
+        app.first_surface_attached(true),
+        FirstSurface::Attached,
+        "CONTROL: an attached surface goes on"
+    );
+    assert_eq!(
+        app.end_status(None),
+        0,
+        "CONTROL: a run that failed nothing"
+    );
+    assert_ne!(
+        app.first_surface_attached(false),
+        FirstSurface::Attached,
+        "a failed attach ends the loop, now or once the accounts drain"
+    );
+    assert_eq!(
+        app.end_status(None),
+        EXIT_FIRST_SURFACE_FAILED,
+        "THE SURFACE: a run whose first surface could not be created says so in its status"
+    );
+    for failed in [EXIT_WINDOW_SYSTEM_GONE, EXIT_EVENT_LOOP_FAILED] {
+        assert_eq!(
+            app.end_status(Some(failed)),
+            failed,
+            "CONTROL: a failed event loop's own status wins"
+        );
+    }
+}

@@ -125,3 +125,77 @@ fn the_machine_section_reads_this_machine_at_the_call() {
         assert!(text.contains(&word), "{name}={word}: {text}");
     }
 }
+
+/// The jobs section's `finding` rows are the kinds the jobs view prints, each once: the
+/// kinds are read off `Findings::wire_lines` over a reading with every list filled, so a
+/// kind the engine gains cannot go unlisted, and a row cannot name one it does not print.
+/// The literal names every field, so a new one does not compile until it is filled here.
+#[test]
+fn the_jobs_section_names_every_finding_kind_the_view_prints() {
+    use aterm_vitals::jobs::{Findings, Named, StoppedUnstarted, ZombieParent};
+    let named = Named {
+        pid: 1,
+        exec_version: None,
+        name: "x".to_owned(),
+        tab: None,
+        job: None,
+        for_ms: 0,
+    };
+    let reading = Findings {
+        stopped: vec![named.clone()],
+        zombies: vec![ZombieParent {
+            ppid: 1,
+            name: "x".to_owned(),
+            count: 1,
+            per_min_deci: 0,
+            tab: None,
+        }],
+        d_state: vec![named.clone()],
+        busy_orphans: vec![named.clone()],
+        program_check: vec![named.clone()],
+        program_check_aterm: (1, 0),
+        program_check_after_grant: 1,
+        program_check_stranded: vec![named.clone()],
+        program_check_daemon: Some(1),
+        program_check_judged: true,
+        program_check_episode: None,
+        program_check_drained: None,
+        translating: vec![named.clone()],
+        not_started: vec![named.clone()],
+        stopped_unstarted: vec![StoppedUnstarted {
+            named: named.clone(),
+            stopped: true,
+            traced: false,
+        }],
+        probably_program_check: vec![named],
+        own_procs: 1,
+        process_limit: Some(1),
+    };
+    let mut printed: Vec<String> = reading
+        .wire_lines()
+        .iter()
+        .filter_map(|l| l.strip_prefix("finding kind="))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .map(str::to_owned)
+        .collect();
+    printed.sort();
+    printed.dedup();
+
+    // The rows under `finding`: each line indented twelve columns, up to the next line that
+    // is not (a row's meaning wraps deeper, the next LINES entry starts shallower).
+    let text = jobs_body();
+    let mut lines = text.lines().skip_while(|l| !l.starts_with("  finding   "));
+    assert!(lines.next().is_some(), "no finding entry: {text}");
+    let indent = " ".repeat(12);
+    let mut listed: Vec<String> = lines
+        .take_while(|l| l.starts_with(&indent))
+        .filter(|l| !l[indent.len()..].starts_with(' '))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_owned)
+        .collect();
+    let rows = listed.len();
+    listed.sort();
+    listed.dedup();
+    assert_eq!(rows, listed.len(), "a kind listed twice: {text}");
+    assert_eq!(listed, printed, "{text}");
+}

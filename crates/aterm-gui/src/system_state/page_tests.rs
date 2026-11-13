@@ -195,7 +195,7 @@ fn required_dependency_fixture_keeps_zero_ready_visibly_unfinished_without_a_tok
         }
     );
     assert_eq!(row.chip, Some(Chip::NeedsYou));
-    assert!(!row.copy_command && !row.install_tools);
+    assert!(!row.install_tools);
     assert!(
         row.note
             .as_deref()
@@ -239,7 +239,7 @@ fn what_needs_you_is_pinned_in_the_card_once_and_the_headline_says_so() {
             .find(|row| row.subject == item)
             .unwrap_or_else(|| panic!("{item:?} is in the card and gone from its line"));
         assert!(
-            row.note.is_none() && !row.turn_on_sync && !row.install_tools && !row.copy_command,
+            row.note.is_none() && !row.turn_on_sync && !row.install_tools,
             "{item:?}'s words and buttons are the card's: {row:?}"
         );
         assert!(
@@ -427,7 +427,7 @@ fn a_check_says_checking_this_mac_and_nothing_moves() {
     assert_eq!(held.chip, Some(Chip::LastKnown));
     assert!(!held.settled(), "history supplies no current readiness");
     assert!(held.label.contains("Last read:"));
-    assert!(!held.install_tools && !held.turn_on_sync && !held.copy_command);
+    assert!(!held.install_tools && !held.turn_on_sync);
 
     checking.observing.clear();
     app.publish(checking.clone());
@@ -1392,7 +1392,7 @@ fn a_card_reason_is_heard_once() {
         "walk",
         "needs-you",
         "failed",
-        "github-sign-in",
+        "github-account",
         "clt-recovered",
         "vault-approve",
     ] {

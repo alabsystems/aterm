@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 use aterm_json::Value;
 
 use super::accounts;
+use super::agent_image::Lane;
 use super::token_route;
 use super::upgrade::{self, Dialect, SessionFile, Version};
 #[cfg(test)]
 use super::upgrade_drive::state_dir;
 use super::upgrade_drive::{
-    Client, Hand, Job, Kernel, Live, Opts, Records, Report, SAME_PROGRAM, Screen,
-    SessionRosterCache, St, TAIL_BYTES, Targets, Terminated, Typed, WhereWritten, alive,
+    Client, HUNG_EXIT_AFTER_S, Hand, Job, Kernel, Live, Opts, Records, Report, SAME_PROGRAM,
+    Screen, SessionRosterCache, St, TAIL_BYTES, Targets, Terminated, Typed, WhereWritten, alive,
     composer_clear, composer_empty, connect, continuation_composer_empty, conversation_live,
     conversation_typed_by, cwd_of, earlier_tabs, exe_of, finished_where_written, first_word,
     foreground_shell, held, home_carried, host_roster, ids, is_our_ancestor, kept_move,
@@ -37,6 +38,7 @@ pub use checked::{CheckedRelaunch, CheckedRelaunchStep, RelaunchAuthorizer};
 #[cfg(all(unix, any(test, debug_assertions)))]
 #[path = "relaunch_checked_fixture.rs"]
 pub mod checked_fixture;
+pub use super::process_lifetime::{ProcessLifetime, ProcessLiveness};
 use crate::supervise::screen::HumanInput;
 
 #[cfg(all(test, unix))]
@@ -1522,7 +1524,7 @@ pub(super) fn expired(st: &St, now: u64) -> Option<(&'static str, String)> {
         Phase::Exiting { at_s }
             if now.saturating_sub(exit_clock(at_s, st.exited_at, st.hand_seen_s)) > STALE_S =>
         {
-            Some(("stale-exit", stale_exit_line(st, "the agent", now)))
+            Some((STALE_EXIT, stale_exit_line(st, "the agent", now)))
         }
         Phase::Exiting { .. } if st.shell == 0 || !alive(st.shell) => Some((
             "shell-gone",
@@ -2128,6 +2130,7 @@ fn relaunch_held(
         }
     };
     let block = line_block(c, &tab);
+    let lane = st.lane();
     let typed = type_relaunch_line_admitted(
         opts,
         &st.agent_records(&opts.home),
@@ -2140,6 +2143,7 @@ fn relaunch_held(
         PromptLook::of(st),
         |c, pid, tab| process_in_tab(c, pid, tab, None, None),
         native.as_ref().map(|binding| (binding, native_phase)),
+        lane,
     );
     drop(legacy_account_guard);
     match typed {
@@ -2233,7 +2237,18 @@ pub(super) fn type_relaunch_line(
     tab_probe: impl FnMut(&mut Client, u32, &str) -> bool,
 ) -> Result<(), RelaunchLineError> {
     type_relaunch_line_admitted(
-        opts, records, c, shell, tab, session, line, dialect, look, tab_probe, None,
+        opts,
+        records,
+        c,
+        shell,
+        tab,
+        session,
+        line,
+        dialect,
+        look,
+        tab_probe,
+        None,
+        Lane::Relaunch,
     )
 }
 
@@ -2250,6 +2265,7 @@ fn type_relaunch_line_admitted(
     look: PromptLook<'_>,
     tab_probe: impl FnMut(&mut Client, u32, &str) -> bool,
     native: Option<(&super::native_act::Binding, super::native_act::ImagePhase)>,
+    lane: Lane,
 ) -> Result<(), RelaunchLineError> {
     type_relaunch_line_admitted_with(
         opts,
@@ -2266,6 +2282,7 @@ fn type_relaunch_line_admitted(
         },
         tab_probe,
         native,
+        lane,
     )
 }
 
@@ -2313,7 +2330,7 @@ pub(super) fn end_asked_at(st: &St) -> u64 {
     }
 }
 
-/// The one relaunch line, whichever agent it resumes.
+/// The one relaunch line, whichever agent it resumes, named as `lane`'s write.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn type_relaunch_line_with(
     opts: &Opts,
@@ -2325,6 +2342,7 @@ pub(super) fn type_relaunch_line_with(
     look: PromptLook<'_>,
     owner_clear: impl FnOnce() -> bool,
     tab_probe: impl FnMut(&mut Client, u32, &str) -> bool,
+    lane: Lane,
 ) -> Result<(), RelaunchLineError> {
     type_relaunch_line_admitted_with(
         opts,
@@ -2337,6 +2355,7 @@ pub(super) fn type_relaunch_line_with(
         owner_clear,
         tab_probe,
         None,
+        lane,
     )
 }
 
@@ -2352,6 +2371,7 @@ fn type_relaunch_line_admitted_with(
     owner_clear: impl FnOnce() -> bool,
     mut tab_probe: impl FnMut(&mut Client, u32, &str) -> bool,
     native: Option<(&super::native_act::Binding, super::native_act::ImagePhase)>,
+    lane: Lane,
 ) -> Result<(), RelaunchLineError> {
     let PromptLook {
         mark,
@@ -2429,6 +2449,7 @@ fn type_relaunch_line_admitted_with(
         opts.timings.fence_every,
         accepted_seq,
         native,
+        lane,
     );
     if typed.is_err() && healed.is_some() {
         withdraw_rekey(c, tab);
@@ -2497,6 +2518,7 @@ fn type_at_prompt(
         super::native_act::ImagePhase,
         u64,
     )>,
+    lane: Lane,
 ) -> Result<(), RelaunchLineError> {
     if let Some((binding, phase, human_seq)) = native {
         let scr = screen(c, tab);
@@ -2533,7 +2555,14 @@ fn type_at_prompt(
             if accepted_input.is_some() && accepted_input != human {
                 return Err(RelaunchLineError::Wait("held"));
             }
-            match turn_fenced(c, tab, line, Some(&generation), accepted_input.or(human)) {
+            match turn_fenced(
+                c,
+                tab,
+                line,
+                Some(&generation),
+                accepted_input.or(human),
+                lane,
+            ) {
                 Ok(()) => return Ok(()),
                 Err(Typed::Changed) => pause(fence_every),
                 Err(Typed::Yielded) => return Err(RelaunchLineError::Wait("yield")),
@@ -2554,9 +2583,9 @@ fn type_at_prompt(
         return Err(RelaunchLineError::Wait("held"));
     }
     let typed = if bash && accepted_input.is_none() {
-        type_line(c, tab, line)
+        type_line(c, tab, line, lane)
     } else {
-        turn_fenced(c, tab, line, None, accepted_input.or(human))
+        turn_fenced(c, tab, line, None, accepted_input.or(human), lane)
     };
     match typed {
         Ok(()) => Ok(()),
@@ -3622,6 +3651,13 @@ fn carry_on_once(
     let Some(current) = continuation_session(&records, new.pid, key) else {
         return said(r, "wait:conversation-changed");
     };
+    super::upgrade_drive::observed_build_start(opts, &r, st, &current, now_s(), || {
+        current.pid == new.pid
+            && records.unique_owner(&current).is_ok()
+            && squash(&current.proc_start) == squash(&new.proc_start)
+            && kernel_start(new.pid).as_deref() == Some(squash(&new.proc_start).as_str())
+            && tab_probe(c, new.pid, tab)
+    });
     let owes_ended = owes_ended(st);
     if !owes_ended && resumes_quietly(st) {
         return done_quietly(opts, r, st, key, &current.version, new.pid);
@@ -3699,6 +3735,11 @@ fn carry_on_once(
         let work = st.ended_work.clone().unwrap_or_default();
         let ended = if !st.ended_waits.is_empty() {
             upgrade::Ended::Waits(&st.ended_waits)
+        } else if st.ended_work.is_some() && st.ended_held_s != 0 {
+            upgrade::Ended::Outlasted {
+                held_s: st.ended_held_s,
+                list: &work,
+            }
         } else if st.ended_work.is_some() {
             upgrade::Ended::Work {
                 told_s: now_s().saturating_sub(st.told_at),
@@ -3727,8 +3768,9 @@ fn carry_on_once(
                     return said(r, "wait:held");
                 };
                 let text = carried_text(text, claim, hour);
+                let lane = st.lane();
                 let Some(typed) = under_hand(c, tab, hand, |c| {
-                    type_continuation(c, tab, &text, opts.timings.fence_every)
+                    type_continuation(c, tab, &text, opts.timings.fence_every, lane)
                 }) else {
                     return said(r, "wait:held");
                 };
@@ -3775,6 +3817,7 @@ fn carry_on_once(
     // The line that carries them is typed: nothing of what the restart ended is owed now.
     st.ended_waits.clear();
     st.ended_work = None;
+    st.ended_held_s = 0;
     save(opts, key, st);
     let r = said(r, continued_word(said_done));
     ledger(
@@ -3928,7 +3971,14 @@ pub(super) enum Continued {
     Unanswered,
 }
 
-fn type_continuation(c: &mut Client, tab: &str, text: &str, fence_every: Duration) -> Continued {
+/// Type the continuation `text` into tab `tab`, named as `lane`'s write.
+fn type_continuation(
+    c: &mut Client,
+    tab: &str,
+    text: &str,
+    fence_every: Duration,
+    lane: Lane,
+) -> Continued {
     for _ in 0..CONTINUE_FENCE_TRIES {
         let (generation, human) = match typing_fence(c, tab) {
             Ok(fenced) => fenced,
@@ -3940,24 +3990,51 @@ fn type_continuation(c: &mut Client, tab: &str, text: &str, fence_every: Duratio
             Err("box") => return Continued::Stands("wait:box"),
             Err(_) => return Continued::Not,
         };
-        match turn_fenced(c, tab, text, generation.as_deref(), human) {
+        match turn_fenced(c, tab, text, generation.as_deref(), human, lane) {
             Ok(()) => return Continued::Typed,
             Err(Typed::Changed | Typed::Yielded) => pause(fence_every),
             // The person's gesture since the read: their grace is the carry's next step's to wait
             // out, never a retry's a moment on.
             Err(Typed::Person) => return Continued::Stands("wait:held"),
-            Err(Typed::Cut(_) | Typed::Refused(_)) => return Continued::Not,
+            Err(Typed::Cut(_)) => {
+                cut_taken_back(c, tab, text, human, fence_every, lane);
+                return Continued::Not;
+            }
+            Err(Typed::Refused(_)) => return Continued::Not,
             Err(Typed::Unanswered) => return Continued::Unanswered,
         }
     }
     let Some(clear) = composer_clear(c, tab) else {
         return Continued::Stands("wait:draft");
     };
-    match turn_fenced(c, tab, text, None, clear.human_seq) {
+    match turn_fenced(c, tab, text, None, clear.human_seq, lane) {
         Ok(()) => Continued::Typed,
         Err(Typed::Person) => Continued::Stands("wait:held"),
         Err(Typed::Unanswered) => Continued::Unanswered,
+        Err(Typed::Cut(_)) => {
+            cut_taken_back(c, tab, text, clear.human_seq, fence_every, lane);
+            Continued::Not
+        }
         Err(_) => Continued::Not,
+    }
+}
+
+/// What a continuation's turn the host stopped after its paste left in the composer is taken
+/// back at once ([`super::upgrade_drive::take_back`]), on the count of the person's input the
+/// turn itself was fenced on (`human`): the carry-on is given up either way, and none of it
+/// stays in the person's prompt as a draft nobody sends. The backspaces are `lane`'s, the
+/// continuation's own.
+fn cut_taken_back(
+    c: &mut Client,
+    tab: &str,
+    text: &str,
+    human: Option<u64>,
+    every: Duration,
+    lane: Lane,
+) {
+    if let Some(fenced) = human {
+        let proof = super::upgrade_drive::Unkeyed::Since(fenced);
+        let _ = super::upgrade_drive::take_back(c, tab, text, proof, None, every, lane);
     }
 }
 
@@ -4285,8 +4362,9 @@ fn restore_line(
         return Err("wait:held");
     }
     let text = upgrade::restore_prompt(Version::parse(&st.resumed_on).as_ref(), st.is_upgrade());
+    let lane = st.lane();
     let typed = match under_hand(c, tab, None, |c| {
-        type_continuation(c, tab, &text, opts.timings.fence_every)
+        type_continuation(c, tab, &text, opts.timings.fence_every, lane)
     }) {
         None => return Err("wait:held"),
         Some(Continued::Typed) => true,
@@ -5347,6 +5425,7 @@ pub(super) fn restart_fenced(
 ) -> Restarted {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
     let r = Report {
+        rung: None,
         pid: 0,
         tab,
         session: "-".to_string(),
@@ -6375,6 +6454,9 @@ pub(super) fn model_argv(argv: &[String], model: Option<&str>) -> Vec<String> {
 /// What a relaunch needs, read while the agent runs (argv, parent and start time go with the process).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
+    /// Precise lifetime captured while this agent ran, retained after it ends; never inferred
+    /// from the whole-second `start` hint on a later restore.
+    pub lifetime: Option<ProcessLifetime>,
     /// The tab (`s-<hex>`).
     pub tab: String,
     /// The agent: the tab's foreground job.
@@ -6418,6 +6500,13 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    fn with_live_lifetime(mut self, before: Option<ProcessLifetime>, k: &dyn Kernel) -> Self {
+        self.lifetime = before.filter(|captured| {
+            captured.pid() == self.pid && k.process_lifetime(self.pid).as_ref() == Some(captured)
+        });
+        self
+    }
+
     /// The process's start in Unix seconds, only while its kernel identity still
     /// matches this snapshot. Reads the process table; call from a background worker.
     #[must_use]
@@ -6442,6 +6531,7 @@ impl Snapshot {
     pub fn same_auth_context(&self, other: &Self) -> bool {
         // Classify every field: metadata and job-control observations may advance independently.
         let Self {
+            lifetime: _,
             tab,
             pid,
             start,
@@ -6958,6 +7048,7 @@ pub fn snapshot_of_copy(
     dialect: Option<Dialect>,
 ) -> Snapshot {
     Snapshot {
+        lifetime: copy.lifetime.clone(),
         tab: tab.to_string(),
         pid: copy.pid,
         start: copy.start.clone(),
@@ -7007,6 +7098,7 @@ fn snapshot_with_claimed(
         return Err("tab-ambiguous");
     }
     let pid = u32::try_from(group).map_err(|_| "no-foreground")?;
+    let lifetime = k.process_lifetime(pid);
     let shell = match k.job(pid) {
         Some((Job::NoJobControl, _)) => return Err("not-a-shell-job"),
         Some((Job::TabProgram { .. }, _)) => NO_SHELL,
@@ -7036,13 +7128,16 @@ fn snapshot_with_claimed(
         SnapshotLane::CodexAlab => {
             return super::upgrade_drive::codex_alab_snapshot_with_claim(
                 opts, tab, pid, start, shell, &args, claim,
-            );
+            )
+            .map(|snapshot| snapshot.with_live_lifetime(lifetime, k));
         }
         SnapshotLane::Muse => {
-            return super::upgrade_drive::muse_snapshot(opts, tab, pid, start, shell, &args);
+            return super::upgrade_drive::muse_snapshot(opts, tab, pid, start, shell, &args)
+                .map(|snapshot| snapshot.with_live_lifetime(lifetime, k));
         }
         SnapshotLane::Agy => {
-            return super::upgrade_drive::agy_snapshot(opts, tab, pid, start, shell, &args);
+            return super::upgrade_drive::agy_snapshot(opts, tab, pid, start, shell, &args)
+                .map(|snapshot| snapshot.with_live_lifetime(lifetime, k));
         }
         SnapshotLane::None => return Err(NO_LANE),
         SnapshotLane::Claude => {}
@@ -7072,6 +7167,7 @@ fn snapshot_with_claimed(
         .or_else(|| cwd_of(pid))
         .unwrap_or_default();
     Ok(Snapshot {
+        lifetime: None,
         tab: tab.to_string(),
         pid,
         start,
@@ -7093,7 +7189,8 @@ fn snapshot_with_claimed(
         auth_observed: !args.env.is_empty(),
         profile: records.billing_context(&opts.home, &args),
         launch_env: accounts::LaunchEnv::of_exec_env(&args.env),
-    })
+    }
+    .with_live_lifetime(lifetime, k))
 }
 
 /// Where the tab's foreground job stands against a [`Snapshot`].
@@ -7640,6 +7737,7 @@ fn after_exit_as(
                 return super::upgrade_drive::self_claimed_relaunch(opts, snap, resume, cause);
             }
             let r = Report {
+                rung: None,
                 pid: snap.pid,
                 tab: snap.tab.clone(),
                 session: snap.session.clone().unwrap_or_else(|| "-".to_string()),
@@ -7658,6 +7756,7 @@ fn after_exit_as(
         AgentRun::Claude => {}
     }
     let mut r = Report {
+        rung: None,
         pid: snap.pid,
         tab: snap.tab.clone(),
         session: snap.session.clone().unwrap_or_else(|| "-".to_string()),
@@ -8334,6 +8433,8 @@ fn restart_of(st: &St, agent: upgrade::Agent, tab: &str, pid: u32) -> bool {
 }
 
 /// Whether `st` records a harness restart that ended agent `pid` (of `agent`'s lane) that left tab `tab` at `now` ([`restart_of`]) and is still that exit's.
+/// A restart in flight is not, once its signalled agent outlived the signal's own deadline
+/// before any carrier saw it gone ([`exit_past_signal`]).
 pub(super) fn ended_by_restart(
     st: &St,
     agent: upgrade::Agent,
@@ -8344,7 +8445,7 @@ pub(super) fn ended_by_restart(
     restart_of(st, agent, tab, pid)
         && match agent {
             upgrade::Agent::Claude | upgrade::Agent::Muse | upgrade::Agent::Agy => {
-                st.in_flight()
+                (st.in_flight() && !exit_past_signal(st, now))
                     || (matches!(st.phase, upgrade::Phase::Failed(_))
                         && st.exited_at != 0
                         && now.saturating_sub(exit_clock(0, st.exited_at, st.hand_seen_s))
@@ -8353,6 +8454,109 @@ pub(super) fn ended_by_restart(
             upgrade::Agent::Codex => false,
         }
 }
+
+/// Whether the agent a restart signalled (`st` Exiting, its exit not yet seen by any carrier:
+/// [`St::exited_at`] unstamped) is read at `now` past the signal's own deadline
+/// ([`HUNG_EXIT_AFTER_S`], past which `--status` says the agent is down and interrupts its
+/// owner). An agent that outlived its restart's signal by that long was not ended by it: its end
+/// is its own or a person's (one who turned `[harness] upgrade` off and kept working in it, then
+/// typed `/exit`), and the restart owns neither its relaunch line nor its carry-on. An exit the
+/// host saw inside the deadline is stamped with that sight ([`see_exit`]), so a carry a hand or a
+/// busy lock holds past it is still the restart's. A native retirement not issued keeps its own
+/// clock.
+pub(super) fn exit_past_signal(st: &St, now: u64) -> bool {
+    match st.phase {
+        upgrade::Phase::Exiting { at_s } => {
+            !st.native_retired_unissued
+                && st.exited_at == 0
+                && now.saturating_sub(exit_clock(at_s, 0, st.hand_seen_s)) > HUNG_EXIT_AFTER_S
+        }
+        _ => false,
+    }
+}
+
+/// The first sight of the exit of agent `pid` (of `agent`'s lane) in tab `opts.only_sid`, which
+/// the host read at `seen`, under the sweep lock its caller holds at `now`: the record of the
+/// restart that signalled it, its exit not yet stamped, is stamped with `seen` where its agent is
+/// proven gone and `seen` is inside the signal's deadline, so every later read judges the exit by
+/// when it was seen, however long a busy lock or a hand kept its carrier from it. Past that
+/// deadline ([`exit_past_signal`]) the record is settled instead ([`settle_past_signal`]). An
+/// agent not proven gone (alive, or its start unread) is left as it lay, as is every record
+/// already stamped.
+fn see_exit(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>, seen: u64, now: u64) {
+    let (Some(tab), Some(pid)) = (opts.only_sid.as_deref(), pid) else {
+        return;
+    };
+    if opts.dry_run {
+        return;
+    }
+    let Some((session, mut st)) = record_where(opts, |st| exit_unseen(st, agent, tab, pid)) else {
+        return;
+    };
+    if st.agent_exit() != AgentExit::Gone {
+        return;
+    }
+    if exit_past_signal(&st, seen) {
+        let r = Report {
+            pid,
+            tab: tab.to_string(),
+            session: session.clone(),
+            from: st.from.clone(),
+            to: format!("{}({})", st.to, st.source),
+            step: String::new(),
+            rung: None,
+        };
+        settle_past_signal(opts, r, &mut st, &session, now);
+    } else if st.seen_gone(seen) {
+        save(opts, &session, &st);
+    }
+}
+
+/// Settles `st`, session `session`'s record of a restart whose signalled agent is proven gone and
+/// whose exit came past the signal's own deadline ([`exit_past_signal`]), at `now`, its step said
+/// on `r`: stopped `stale-exit`, its exit left unstamped (a stamp would let the stopped record's
+/// own window claim the person's exit) and its ledger saying why, so nothing is relaunched or
+/// typed for it. Every carrier settles such a record before it stamps the exit or a hand's sight
+/// ([`St::seen_gone`], [`St::saw_hand`], either of which restarts the deadline's clock): the host
+/// at the exit's first sight ([`see_exit`]) and the sweep's orphans pass, whichever reads it
+/// first. A dry run says it would (`would-fail:stale-exit`) and changes nothing.
+pub(super) fn settle_past_signal(
+    opts: &Opts,
+    r: Report,
+    st: &mut St,
+    session: &str,
+    now: u64,
+) -> Report {
+    if opts.dry_run {
+        return said(r, format!("would-fail:{STALE_EXIT}"));
+    }
+    st.stop(STALE_EXIT, now);
+    let r = said(r, format!("failed:{STALE_EXIT}"));
+    ledger(
+        opts,
+        &r,
+        &format!(
+            "the agent outlived its restart's signal by over {} minutes and then ended: that \
+             end is its own or a person's, and nothing is relaunched for it",
+            HUNG_EXIT_AFTER_S / 60
+        ),
+    );
+    save(opts, session, st);
+    r
+}
+
+/// Whether `st` is the record of a restart that signalled agent `pid` in tab `tab` and saw no
+/// exit of it yet ([`see_exit`]).
+fn exit_unseen(st: &St, agent: upgrade::Agent, tab: &str, pid: u32) -> bool {
+    restart_of(st, agent, tab, pid)
+        && matches!(st.phase, upgrade::Phase::Exiting { .. })
+        && !st.native_retired_unissued
+        && st.exited_at == 0
+}
+
+/// The word a restart stops with whose agent was not relaunched in time ([`expired`],
+/// [`settle_past_signal`]).
+const STALE_EXIT: &str = "stale-exit";
 
 fn restart_record(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> Option<(String, St)> {
     let tab = opts.only_sid.as_deref()?;
@@ -8415,9 +8619,19 @@ fn adopted_holds(opts: &Opts, st: &St, session: &str) -> bool {
 }
 
 /// Whether the harness's own restart (the upgrade's, or a restart in place) ended the agent that
-/// left tab `opts.only_sid`, with its record still owning that exit.
+/// left tab `opts.only_sid`, with its record still owning that exit. The host asks it as it reads
+/// the agent's exit, so it is that exit's first sight ([`see_exit`], where the sweep lock is
+/// free): the restart's record is stamped with it, or settled where the exit came past the
+/// signal's own deadline ([`exit_past_signal`]), which no restart owns.
 #[must_use]
 pub fn restarted(opts: &Opts, agent: upgrade::Agent, pid: Option<u32>) -> bool {
+    let unseen = opts.only_sid.as_deref().zip(pid).is_some_and(|(tab, pid)| {
+        record_where(opts, |st| exit_unseen(st, agent, tab, pid)).is_some()
+    });
+    if unseen && let Ok(_held) = sweep_lock(opts) {
+        let now = now_s();
+        see_exit(opts, agent, pid, now, now);
+    }
     restart_record(opts, agent, pid).is_some()
 }
 
@@ -8469,16 +8683,19 @@ pub fn account_restart(opts: &Opts, pid: u32) -> Option<String> {
         .and_then(|(_, st)| st.cause.strip_prefix(CAUSE_ACCOUNT).map(str::to_owned))
 }
 
-/// The restart [`restarted`] found, carried on for its agent's exit.
+/// The restart [`restarted`] found, carried on for its agent's exit, which the host read at
+/// `seen_s` ([`see_exit`] judges the exit by it, where [`restarted`] found the sweep lock busy).
 #[must_use]
 pub fn carry_restart(
     opts: &Opts,
     agent: upgrade::Agent,
     pid: Option<u32>,
     through_hand: bool,
+    seen_s: u64,
 ) -> Report {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
     let r = Report {
+        rung: None,
         pid: pid.unwrap_or(0),
         tab: tab.clone(),
         session: "-".to_string(),
@@ -8490,6 +8707,7 @@ pub fn carry_restart(
         Ok(lock) => lock,
         Err(why) => return said(r, format!("busy:{why}")),
     };
+    see_exit(opts, agent, pid, seen_s.min(now_s()), now_s());
     let Some((session, mut st)) = restart_record(opts, agent, pid) else {
         let found = pid.and_then(|pid| match agent {
             upgrade::Agent::Codex => None,
@@ -9044,14 +9262,17 @@ const END_HELD: Ending = (
 
 /// [`resume_as`], and the kind of the row owed to an agent it adopted that no step had adopted
 /// ([`unadopted`]): `upgrade` for an upgrade, else `carry-on`; `None` when it adopted no such
-/// agent. Under an `ended` the report is then that [`Ending`]'s, the adoption under it.
+/// agent. Under an `ended` the report is then that [`Ending`]'s, the adoption under it, and the
+/// ending it settled on is returned: none where the relaunch owes the line that says what its
+/// restart ended ([`owes_ended`]), which no ending settles with nothing typed.
 fn resume_adopting(
     opts: &Opts,
     ended: Option<Ending>,
     only: Option<upgrade::Agent>,
-) -> (Report, Option<&'static str>) {
+) -> (Report, Option<&'static str>, Option<Ending>) {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
     let r = Report {
+        rung: None,
         pid: 0,
         tab: tab.clone(),
         session: "-".to_string(),
@@ -9061,11 +9282,16 @@ fn resume_adopting(
     };
     let _held = match sweep_lock(opts) {
         Ok(lock) => lock,
-        Err(why) => return (said(r, format!("busy:{why}")), None),
+        Err(why) => return (said(r, format!("busy:{why}")), None, ended),
     };
     let Some((session, mut st)) = owed_record(opts, only) else {
-        return (said(r, "current"), None);
+        return (said(r, "current"), None, ended);
     };
+    // What the restart ended is owed its line whatever else holds of the conversation: a task
+    // done under Land or the stop settles nothing over it, or the work it ended is lost with
+    // nobody told. The carry-on's own fences (a person's draft, box or hold, the tab's
+    // Autopilot off) still hold that line.
+    let ended = ended.filter(|_| !owes_ended(&st));
     let mut r = Report {
         session: session.clone(),
         from: st.from.clone(),
@@ -9086,11 +9312,11 @@ fn resume_adopting(
                 |c, pid, tab| process_in_tab(c, pid, tab, None, None),
             )
             .unwrap_or_else(|| said(r, "wait:restore"));
-            return (looked, None);
+            return (looked, None, ended);
         }
         let confirmed =
             confirm(opts, &r, &mut st, &session, now_s()).unwrap_or_else(|| said(r, "wait:model"));
-        return (confirmed, None);
+        return (confirmed, None, ended);
     }
     let owed = unadopted(&st).then_some(if st.is_upgrade() {
         "upgrade"
@@ -9110,9 +9336,9 @@ fn resume_adopting(
     if let Some(end) = ended
         && r.step == "adopted"
     {
-        return (carried_done(opts, r, &session, end), adopted);
+        return (carried_done(opts, r, &session, end), adopted, ended);
     }
-    (r, adopted)
+    (r, adopted, ended)
 }
 
 /// The options [`resume_as`] carries `st` on with at the tab's loop's idle point. It hands the
@@ -9169,7 +9395,7 @@ fn resume_ending_at_point(
     only: Option<upgrade::Agent>,
     mut row: impl FnMut(&str, &Report),
 ) -> Report {
-    let (r, adopted) = resume_adopting(opts, ended, only);
+    let (r, adopted, ended) = resume_adopting(opts, ended, only);
     let Some(kind) = adopted else {
         if r.is_act() {
             row("carry-on", &r);
@@ -9225,6 +9451,7 @@ fn carried_done(opts: &Opts, r: Report, session: &str, (word, why): (&str, &str)
 pub fn settle(opts: &Opts) -> Report {
     let tab = opts.only_sid.clone().unwrap_or_else(|| "-".to_string());
     let r = Report {
+        rung: None,
         pid: 0,
         tab: tab.clone(),
         session: "-".to_string(),

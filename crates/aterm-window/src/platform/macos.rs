@@ -43,7 +43,18 @@ use crate::keyboard::ModifiersState;
 use crate::monitor::MonitorHandle;
 use crate::window::Window;
 
-pub use crate::platform_impl::{ReplyWait, TerminateAnswer};
+pub use crate::platform_impl::{AppKitLaunchStage, ReplyWait, TerminateAnswer};
+
+/// How far AppKit's launch of this process has come, from any thread: before
+/// `-[NSApplication run]`, inside it before `applicationDidFinishLaunching:`, inside that
+/// delegate method, or past it.
+///
+/// LOCAL PATCH (aterm): a launch watch reads it from another thread to name where a launch
+/// stopped.
+#[inline]
+pub fn appkit_launch_stage() -> AppKitLaunchStage {
+    crate::platform_impl::appkit_launch_stage()
+}
 
 /// Complete AppKit launch before entering the application's event loop.
 ///

@@ -553,17 +553,17 @@ fn scope<'c>(sys: &dyn System, ctx: &'c Ctx, holds: &Holds) -> Result<Scope<'c>,
 }
 
 /// [`scope`] once `tops` holds a clone: the git that reads them, kept from fetching what a
-/// partial clone lacks as this git keeps a read from it ([`NoLazyFetch::of`], asked once, before
-/// any clone is read); or, where it does neither (a git before 2.44 that ignores
+/// partial clone lacks as this git keeps a read from it ([`checkout::lazy_fetch::of`], asked once, before
+/// any clone is read); or, where it does neither (a git before 2.45 that ignores
 /// `GIT_NO_LAZY_FETCH`), why no clone is in scope, in the words of [`System::machine`].
 ///
 /// # Errors
-/// Git could not be asked ([`NoLazyFetch::of`]).
+/// Git could not be asked ([`checkout::lazy_fetch::of`]).
 fn guarded<'c>(sys: &dyn System, user: &'c User, tops: Vec<PathBuf>) -> Result<Scope<'c>, String> {
-    let Some(off) = NoLazyFetch::of(sys, user)? else {
+    let Some(off) = checkout::lazy_fetch::of(sys, user)? else {
         let machine = sys.machine();
         return Ok(Scope::Out(format!(
-            "this {machine}'s git neither takes --no-lazy-fetch (git 2.44 has it) nor obeys \
+            "this {machine}'s git neither takes --no-lazy-fetch (git 2.45 has it) nor obeys \
              GIT_NO_LAZY_FETCH (the 2.39.4 security release has it), one of which keeps aterm's \
              reads of a clone on this {machine}"
         )));
@@ -585,9 +585,9 @@ struct Git<'u> {
 impl Git<'_> {
     /// [`checkout::git`] in `path` that never fetches an object a partial clone lacks: its
     /// `GIT_NO_LAZY_FETCH`, and `--no-lazy-fetch` where this git takes it
-    /// ([`NoLazyFetch::git`]), never an option it refuses.
+    /// ([`checkout::lazy_fetch::guarded`]), never an option it refuses.
     fn local(self, sys: &dyn System, path: Option<&Path>) -> Cmd {
-        self.off.git(sys, self.user, path)
+        checkout::lazy_fetch::guarded(self.off, sys, self.user, path)
     }
 }
 

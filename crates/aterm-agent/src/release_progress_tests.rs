@@ -19,6 +19,109 @@ fn survey_checks_kernel_identity_instead_of_trusting_a_recent_record() {
     assert!(survey(dir.path())[0].starts_with("release_line alive=0 "));
 }
 
+/// Each kind of positive kernel evidence reads dead, and only an exact identity reads alive.
+/// NEGATIVE CONTROLS: a malformed pid (0, launchd's or init's 1, or one past `i32::MAX`) is
+/// unknown, never dead, where the previous `kill(pid, 0)` rule called 0 and `u32::MAX` dead
+/// with no kernel read at all.
+#[test]
+fn judge_needs_positive_kernel_evidence_for_death() {
+    let pid = std::process::id();
+    let (boot, start) = identity(pid).unwrap();
+    assert_eq!(judge(pid, &boot, start), Judged::Alive);
+    assert_eq!(judge(pid, &boot, start.wrapping_add(1)), Judged::Dead);
+    let other_boot = if boot.starts_with('0') { "1" } else { "0" };
+    assert_eq!(judge(pid, other_boot, start), Judged::Dead);
+    // A reaped child: its pid is absent, or names a later process with another start.
+    let mut child = aterm_uds::spawnfd::command("/bin/sleep")
+        .arg("60")
+        .spawn()
+        .unwrap();
+    let child_pid = child.id();
+    let child_start = identity(child_pid).map(|(_, start)| start);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let child_start = child_start.unwrap();
+    assert_eq!(judge(child_pid, &boot, child_start), Judged::Dead);
+    for malformed in [0, 1, u32::MAX] {
+        assert_eq!(
+            judge(malformed, &boot, start),
+            Judged::Unknown,
+            "{malformed}"
+        );
+    }
+}
+
+/// A kernel read that fails or is refused is unknown, never death, for a pid that passes the
+/// pid filter: an unreadable boot id, an unknown presence, and a present process whose start
+/// cannot be read (another user's, or a zombie).
+/// NEGATIVE CONTROLS: the same reads answering prove death (another boot, an absent pid, a
+/// different start) and life (the same start).
+#[test]
+fn a_failed_kernel_read_is_unknown_and_never_death() {
+    use aterm_uds::process::ProcessPresence;
+    let judged = |boot: Option<&str>, presence: ProcessPresence, start: Option<u64>| {
+        judge_with(
+            4242,
+            "b",
+            7,
+            &Kernel {
+                boot_id: &|| boot.map(str::to_owned),
+                presence: &|pid| {
+                    assert_eq!(pid, 4242);
+                    presence
+                },
+                start_of: &|_| start,
+            },
+        )
+    };
+    assert_eq!(judged(None, ProcessPresence::Absent, None), Judged::Unknown);
+    assert_eq!(
+        judged(Some("b"), ProcessPresence::Unknown, Some(8)),
+        Judged::Unknown
+    );
+    assert_eq!(
+        judged(Some("b"), ProcessPresence::Present, None),
+        Judged::Unknown
+    );
+    assert_eq!(
+        judged(Some("c"), ProcessPresence::Present, Some(7)),
+        Judged::Dead
+    );
+    assert_eq!(
+        judged(Some("b"), ProcessPresence::Absent, None),
+        Judged::Dead
+    );
+    assert_eq!(
+        judged(Some("b"), ProcessPresence::Exited, None),
+        Judged::Dead
+    );
+    assert_eq!(
+        judged(Some("b"), ProcessPresence::Present, Some(8)),
+        Judged::Dead
+    );
+    assert_eq!(
+        judged(Some("b"), ProcessPresence::Present, Some(7)),
+        Judged::Alive
+    );
+}
+
+/// The row answering a holder query is this kernel's judgement of exactly that identity.
+#[test]
+fn a_holder_row_judges_exactly_the_identity_asked() {
+    use aterm_ctl::release_holder::Identity;
+    let pid = std::process::id();
+    let (boot, start) = identity(pid).unwrap();
+    let me = Identity { pid, boot, start };
+    assert_eq!(me.read(&holder_row(&me)), Some(Some(true)));
+    let reused = Identity {
+        start: start.wrapping_add(1),
+        ..me.clone()
+    };
+    assert_eq!(reused.read(&holder_row(&reused)), Some(Some(false)));
+    // NEGATIVE CONTROL: the row about one identity says nothing of another.
+    assert_eq!(me.read(&holder_row(&reused)), None);
+}
+
 fn current_record(padding: usize) -> String {
     let pid = std::process::id();
     let (boot, start) = identity(pid).unwrap();

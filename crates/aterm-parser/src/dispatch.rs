@@ -367,15 +367,10 @@ impl Parser {
                 }
                 remaining = tail;
 
-                if byte == 0x1B && remaining.first() == Some(&b'[') {
-                    remaining = remaining.get(1..).unwrap_or(&[]);
-                    if let Some(consumed) = self.try_parse_csi_fast(remaining, sink) {
-                        remaining = remaining.get(consumed..).unwrap_or(&[]);
-                        continue;
-                    }
-                    self.state = State::Escape;
-                    self.clear();
-                    self.process_byte_inner(b'[', sink);
+                if byte == 0x1B
+                    && let Some(after) = self.try_advance_ground_esc(remaining, sink)
+                {
+                    remaining = after;
                     continue;
                 }
 
@@ -426,6 +421,46 @@ impl Parser {
             }
         }
         remaining
+    }
+
+    /// Fast-path `ESC` sequences encountered directly in `State::Ground`.
+    #[inline]
+    fn try_advance_ground_esc<'a, S: ActionSink>(
+        &mut self,
+        remaining: &'a [u8],
+        sink: &mut S,
+    ) -> Option<&'a [u8]> {
+        if remaining.first() == Some(&b'[') {
+            let after_bracket = remaining.get(1..).unwrap_or(&[]);
+            self.osc_data.clear();
+            if let Some(consumed) = self.try_parse_csi_fast(after_bracket, sink) {
+                return Some(after_bracket.get(consumed..).unwrap_or(&[]));
+            }
+            self.state = State::Escape;
+            self.clear();
+            self.process_byte_inner(b'[', sink);
+            return Some(after_bracket);
+        }
+        if let &[inter @ 0x20..=0x2F, fin @ 0x30..=0x7E, ref rest @ ..] = remaining {
+            self.params.clear();
+            self.intermediates.set_single(inter);
+            self.osc_data.clear();
+            self.current_param = 0;
+            self.param_started = false;
+            self.subparam_mask = 0;
+            self.last_was_colon = false;
+            sink.esc_dispatch(pty_wrap_ref(self.intermediates.as_slice()), fin);
+            self.state = State::Ground;
+            return Some(rest);
+        }
+        if let &[fin @ 0x30..=0x4F, ref rest @ ..] = remaining {
+            self.clear();
+            self.osc_data.clear();
+            sink.esc_dispatch(pty_wrap_ref(self.intermediates.as_slice()), fin);
+            self.state = State::Ground;
+            return Some(rest);
+        }
+        None
     }
 
     /// Process a single byte through the state machine (inner implementation).

@@ -86,8 +86,9 @@ impl Store {
                 .ok_or_else(|| Error::new("recovery proof disappeared"))?;
             self.ingest_conflict(session, &wire)?;
         }
+        source.require_membership_evidence()?;
         for record in source.records.values() {
-            if record.quarantine.is_some() {
+            if record.payload.quarantine().is_some() {
                 return Err(Error::new("recovery liability evidence is quarantined"));
             }
             self.ingest(session, &record.wire)?;
@@ -153,7 +154,7 @@ impl Store {
         for (id, stored) in std::mem::take(&mut primary.records) {
             if let Some(existing) = self.records.get(&id) {
                 if existing.wire.as_slice() != stored.wire.as_slice()
-                    || existing.quarantine != stored.quarantine
+                    || existing.payload != stored.payload
                 {
                     return Err(Error::new(
                         "local table replicas disagree on retained evidence",
@@ -162,9 +163,11 @@ impl Store {
                 continue;
             }
             self.admit(&stored.header, stored.wire.len())?;
-            index
-                .insert(stored.header.clone())
-                .map_err(|_| Error::new("combined table index exceeds its bound"))?;
+            if !stored.payload.awaiting_membership() {
+                index
+                    .insert(stored.header.clone())
+                    .map_err(|_| Error::new("combined table index exceeds its bound"))?;
+            }
             self.operation_bytes += stored.wire.len();
             self.hold(id, stored);
         }

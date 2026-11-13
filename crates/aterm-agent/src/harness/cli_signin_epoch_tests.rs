@@ -265,7 +265,7 @@ fn exercise(browser: bool, provider: i64, case: i64) -> (bool, bool, bool, i64) 
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let status = if browser {
-        run_accounts_browser_with(cli, &bed.env, &host, "main", &mut out, &mut err, None)
+        run_accounts_browser(cli, &bed.env, &host, "main", &mut out, &mut err)
     } else {
         run_accounts_login(&bed.env, &host, "main", &mut out, &mut err)
     };
@@ -473,9 +473,7 @@ fn unbound_rows_keep_the_conservative_global_counter_guard() {
                 };
                 let (mut out, mut err) = (Vec::new(), Vec::new());
                 let status = if browser {
-                    run_accounts_browser_with(
-                        cli, &bed.env, &host, "main", &mut out, &mut err, None,
-                    )
+                    run_accounts_browser(cli, &bed.env, &host, "main", &mut out, &mut err)
                 } else {
                     run_accounts_login(&bed.env, &host, "main", &mut out, &mut err)
                 };
@@ -531,15 +529,7 @@ fn a_windows_sign_in_makes_the_rows_folder_a_profile() {
             session,
         };
         let (mut out, mut err) = (Vec::new(), Vec::new());
-        let status = run_accounts_browser_with(
-            Cli::Claude,
-            &bed.env,
-            &host,
-            "main",
-            &mut out,
-            &mut err,
-            None,
-        );
+        let status = run_accounts_browser(Cli::Claude, &bed.env, &host, "main", &mut out, &mut err);
         assert_eq!(host.opened.get(), 1, "{}", String::from_utf8_lossy(&err));
         let signed_in = if profile_after {
             ExitCode::SUCCESS
@@ -576,15 +566,7 @@ fn a_recorded_windows_sign_in_survives_and_reports_profile_adoption_failure() {
         session: Some(true),
     };
     let (mut out, mut err) = (Vec::new(), Vec::new());
-    let got = run_accounts_browser_with(
-        Cli::Claude,
-        &bed.env,
-        &host,
-        "main",
-        &mut out,
-        &mut err,
-        None,
-    );
+    let got = run_accounts_browser(Cli::Claude, &bed.env, &host, "main", &mut out, &mut err);
     assert_eq!(got, ExitCode::SUCCESS);
     assert_eq!(host.opened.get(), 1);
     assert_eq!(host.tidied.get(), 1);

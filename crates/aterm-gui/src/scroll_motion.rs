@@ -299,6 +299,47 @@ pub(crate) fn pill_geometry(
     Some((y, len))
 }
 
+/// The scroll pill's thumb as additive [`aterm_render::GlowQuad`]s in window px: the `pw`-wide
+/// pill at `x`, thumb `[top, bot)`, sliced into one quad per cell-row band
+/// `origin_y + r * cell_h` of the `rows`-row grid it crosses.
+///
+/// A quad stores `u16` pixels. A pill past that space (4096 columns of 16 px put its left edge
+/// at 65,537, and 2,100 rows of 32 px its bottom past 65,535) is clipped at the space's edge or
+/// dropped: narrowed with a bare `as u16` it was drawn at `x mod 65,536`, the far side of the
+/// frame.
+pub(crate) fn push_pill_quads(
+    out: &mut Vec<aterm_render::GlowQuad>,
+    (x, pw): (usize, usize),
+    (top, bot): (usize, usize),
+    (origin_y, cell_h, rows): (usize, usize, usize),
+    color: u32,
+) {
+    let space = usize::from(u16::MAX);
+    let (x0, x1) = (x.min(space), x.saturating_add(pw).min(space));
+    if x1 <= x0 {
+        return;
+    }
+    for r in 0..rows {
+        let b0 = origin_y.saturating_add(r.saturating_mul(cell_h));
+        if b0 >= space {
+            break;
+        }
+        let (s0, s1) = (top.max(b0), bot.min(b0.saturating_add(cell_h)).min(space));
+        if s0 < s1 {
+            // Every value is inside the space by the clips above, so each narrowing is exact.
+            out.push(aterm_render::GlowQuad::flat(
+                r as u16,
+                x0 as u16,
+                s0 as u16,
+                (x1 - x0) as u16,
+                (s1 - s0) as u16,
+                color,
+                0,
+            ));
+        }
+    }
+}
+
 /// The pill's alpha `since_touch_ms` after the last scroll activity.
 #[must_use]
 pub(crate) const fn pill_alpha(since_touch_ms: u64, animated: bool) -> u8 {

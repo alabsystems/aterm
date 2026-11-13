@@ -865,7 +865,7 @@ fn a_bounded_stream_reads_a_pipe_within_its_bound_and_refuses_a_directory() {
     use std::io::Write as _;
     use std::os::fd::AsRawFd as _;
     let piped = |bytes: &'static [u8], max: u64| {
-        let (reader, mut writer) = std::io::pipe().expect("pipe");
+        let (reader, mut writer) = crate::pipe().expect("pipe");
         let feeder = std::thread::spawn(move || {
             // The reader may stop at its bound and close before every byte is taken.
             let _ = writer.write_all(bytes);

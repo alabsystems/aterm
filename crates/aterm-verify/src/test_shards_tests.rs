@@ -109,6 +109,7 @@ fn long_observed_partitions_expand_without_starting_an_executable() {
         exe_sha256: Some("ab".repeat(32)),
         content_key: Some("cd".repeat(32)),
         reason: None,
+        parts: crate::test_content::KeyParts::new(),
     };
     let prior_spec = format!("{} -- --skip prior::", binary.spec);
     let mut passed = Passed::new();

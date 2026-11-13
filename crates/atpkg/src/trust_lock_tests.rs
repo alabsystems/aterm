@@ -279,11 +279,48 @@ fn a_locked_tree_never_falls_back_to_the_laid_build() {
     );
 }
 
+/// A LOCKED BUILD NO PUBLISHED INSTALL SERVES IS REFUSED, NOT INSTALLED: where the store's signed
+/// manifests say the lock's build has no pack for this machine, the hop attempts no install and
+/// names the local sysroot that takes the lock's place, a dev link, never the TRUST_STAGE2_BIN
+/// the hop does not read; where they say nothing, it installs. NEGATIVE CONTROLS: with the hop's
+/// `found.unpublished.is_none()` condition removed, `no_install` panicked ("no install was due")
+/// (2026-11-11); with the hop's refusal passing `LOCAL_SYSROOT_OR_STAGE2_REMEDY`, it named
+/// TRUST_STAGE2_BIN (2026-11-12).
+#[cfg(unix)]
+#[test]
+fn a_locked_build_no_published_install_serves_is_refused_not_installed() {
+    let scratch = crate::testdir::dir("atpkg-lock-unpublished-");
+    let prefix = scratch.join("pkg");
+    store_build(&prefix, 16500);
+    let tree = scratch.join("checkout");
+    let laid = build_dir(&prefix, 16500).join("bin/targo");
+    write_lock(&tree, &lock_of(16387, &"d".repeat(64)));
+    let why = crate::state::unavailable("aarch64-unknown-linux-gnu", "");
+    let refused =
+        shim_target_with(&laid, &tree, &|_, _| Some(why.clone()), &mut no_install).unwrap_err();
+    assert!(
+        refused.contains(&format!(
+            "which this machine's store does not hold: no published install of it serves this \
+             machine ({why}); {LOCAL_SYSROOT_REMEDY}"
+        )),
+        "{refused}"
+    );
+    assert!(!refused.contains("TRUST_STAGE2_BIN"), "{refused}");
+    let mut installs = 0;
+    let failed = shim_target_with(&laid, &tree, &|_, _| None, &mut |_, _| {
+        installs += 1;
+        Err("offline".to_string())
+    })
+    .unwrap_err();
+    assert_eq!(installs, 1, "{failed}");
+}
+
 #[test]
 fn a_laid_shim_disagreeing_with_the_lock_is_said_and_agreeing_is_not() {
     let found = Found {
         path: PathBuf::from("/c/trust.lock"),
         lock: Ok(lock_of(83, &"d".repeat(64))),
+        unpublished: None,
     };
     let lock = found.lock.clone().unwrap();
     let laid = |build| ShimAnswer::Laid {

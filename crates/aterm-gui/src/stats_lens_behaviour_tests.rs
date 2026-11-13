@@ -22,6 +22,14 @@ use crate::stats_paint::{Bar, Hit, Instrument};
 use crate::stats_plan::DeckForm;
 use crate::{App, WindowId, term_lock};
 
+fn present_input(app: &App, wid: WindowId, capture: bool) -> crate::metrics::PresentInput {
+    crate::metrics::PresentInput::read(
+        &app.present_observer,
+        app.windows.get(&wid).map(|window| &window.present_metrics),
+        capture,
+    )
+}
+
 fn observer() -> (UnixStream, Arc<SinkWriter>) {
     let (reader, writer) = UnixStream::pair().expect("private input observer");
     reader.set_nonblocking(true).unwrap();
@@ -1263,7 +1271,8 @@ fn network_input_rig() -> Rig {
     );
     let paint = compose_lens_input(&mut r);
     assert!(paint.is_some(), "the initial lens is composed visibly");
-    r.app.stats_lens_presented(r.wid, paint, true, false);
+    r.app
+        .stats_lens_presented(r.wid, paint, true, present_input(&r.app, r.wid, false));
     r
 }
 
@@ -1280,7 +1289,12 @@ fn tab_input_rig() -> Rig {
     r.app
         .open_stats_lens(r.wid, Instrument::Cpu, Bar::Tab, Opened::Keyboard);
     let paint = compose_lens_input(&mut r).expect("visible resource lens");
-    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+    r.app.stats_lens_presented(
+        r.wid,
+        Some(paint),
+        true,
+        present_input(&r.app, r.wid, false),
+    );
     r
 }
 
@@ -1319,16 +1333,30 @@ fn another_tabs_frame_cannot_pay_a_resource_arrow_from_the_previous_tab() {
     let paint = compose_lens_input(&mut r).expect("visible on the second tab");
     assert_eq!(paint.selection.unwrap().tab, Some(current));
     assert_eq!(paint.input, None, "the other tab is not this key's answer");
-    r.app
-        .stats_lens_presented(r.wid, Some(old_paint), true, false);
+    r.app.stats_lens_presented(
+        r.wid,
+        Some(old_paint),
+        true,
+        present_input(&r.app, r.wid, false),
+    );
     assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
-    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+    r.app.stats_lens_presented(
+        r.wid,
+        Some(paint),
+        true,
+        present_input(&r.app, r.wid, false),
+    );
 
     r.named(KeyCode::ArrowRight, NamedKey::ArrowRight);
     let fresh = compose_lens_input(&mut r).expect("new second-tab answer");
     assert_eq!(fresh.selection.unwrap().tab, Some(current));
     assert!(fresh.input.is_some_and(|token| token != old));
-    r.app.stats_lens_presented(r.wid, Some(fresh), true, false);
+    r.app.stats_lens_presented(
+        r.wid,
+        Some(fresh),
+        true,
+        present_input(&r.app, r.wid, false),
+    );
 
     r.app.switch_tab_in(r.wid, 0);
     let (desired, presented) = lens_readback_selections(&r);
@@ -1337,7 +1365,12 @@ fn another_tabs_frame_cannot_pay_a_resource_arrow_from_the_previous_tab() {
         "the same lens now names a different tab"
     );
     let paint = compose_lens_input(&mut r).expect("returned tab painted");
-    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+    r.app.stats_lens_presented(
+        r.wid,
+        Some(paint),
+        true,
+        present_input(&r.app, r.wid, false),
+    );
     let (desired, presented) = lens_readback_selections(&r);
     assert_eq!(desired, presented, "the own frame acknowledged this scope");
 }
@@ -1361,7 +1394,12 @@ fn returning_to_a_tab_without_painting_cannot_revive_its_pending_arrow() {
     assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
     let paint = compose_lens_input(&mut r).expect("returned resource lens");
     assert_eq!(paint.input, None, "returning does not revive the old key");
-    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+    r.app.stats_lens_presented(
+        r.wid,
+        Some(paint),
+        true,
+        present_input(&r.app, r.wid, false),
+    );
 
     r.named(KeyCode::ArrowLeft, NamedKey::ArrowLeft);
     assert!(
@@ -1410,7 +1448,8 @@ fn lens_arrows_wait_for_their_own_paint_and_superseded_selections_have_no_sample
     assert_ne!(latest, first);
     let paint = compose_lens_input(&mut r);
     assert_eq!(paint.unwrap().input, Some(latest));
-    r.app.stats_lens_presented(r.wid, paint, true, false);
+    r.app
+        .stats_lens_presented(r.wid, paint, true, present_input(&r.app, r.wid, false));
     assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
     assert_eq!(r.sent(), "", "navigation sends no program input");
 }
@@ -1438,7 +1477,8 @@ fn covered_captured_and_unseen_lens_frames_do_not_acknowledge_keys() {
         let shown = r.app.windows[&r.wid].stats_lens.presented_selection;
         r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
         let paint = compose_lens_input(&mut r);
-        r.app.stats_lens_presented(r.wid, paint, visible, capture);
+        r.app
+            .stats_lens_presented(r.wid, paint, visible, present_input(&r.app, r.wid, capture));
         assert_eq!(r.app.windows[&r.wid].stats_lens.presented_selection, shown);
         assert_eq!(r.app.windows[&r.wid].stats_lens.input.token(), None);
     }
@@ -1499,7 +1539,12 @@ fn a_stacked_lens_frame_acknowledges_its_keys() {
         Some(token),
         "the stacked frame carries the key's token"
     );
-    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+    r.app.stats_lens_presented(
+        r.wid,
+        Some(paint),
+        true,
+        present_input(&r.app, r.wid, false),
+    );
     assert_eq!(
         r.app.windows[&r.wid].stats_lens.presented_selection,
         Some(paint.selection),
@@ -1541,11 +1586,17 @@ fn lens_copy_modifiers_and_pointer_displacement_do_not_create_navigation_samples
 #[test]
 fn unknown_or_clipped_glass_requires_a_new_visible_baseline() {
     let mut r = network_input_rig();
-    r.app.stats_lens_presented(r.wid, None, true, false);
+    r.app
+        .stats_lens_presented(r.wid, None, true, present_input(&r.app, r.wid, false));
     r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
     let paint = compose_lens_input(&mut r).expect("visible baseline");
     assert_eq!(paint.input, None);
-    r.app.stats_lens_presented(r.wid, Some(paint), true, false);
+    r.app.stats_lens_presented(
+        r.wid,
+        Some(paint),
+        true,
+        present_input(&r.app, r.wid, false),
+    );
     r.named(KeyCode::ArrowDown, NamedKey::ArrowDown);
     assert!(compose_lens_input(&mut r).unwrap().input.is_some());
     r.app.windows.get_mut(&r.wid).unwrap().win_px =

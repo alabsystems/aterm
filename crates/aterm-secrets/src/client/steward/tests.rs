@@ -129,7 +129,7 @@ fn a_legacy_reserved_host_gets_an_admitted_discovery_name_without_reconfiguratio
         assert_eq!(decide(&mut role).as_deref(), Some(expected.as_str()));
         assert!(
             matches!(
-                observe_alab_member_with(&lab.m1, false, || {}),
+                observe_alab_member_with(&lab.m1, false, OnWriter::Wait, || {}).unwrap(),
                 AlabRoleObservation::Allowed {
                     own_label: None,
                     ..
@@ -284,9 +284,10 @@ fn server_role_survives_only_same_context_transient_reads() {
         save_config(&m2, &original).unwrap();
 
         assert!(matches!(
-            observe_alab_member_with(&m2, false, || {
+            observe_alab_member_with(&m2, false, OnWriter::Wait, || {
                 save_config(&m2, &changed).unwrap();
-            }),
+            })
+            .unwrap(),
             AlabRoleObservation::Unavailable(None)
         ));
         save_config(&m2, &original).unwrap();
@@ -472,25 +473,58 @@ fn only_the_alab_vaults_admin_is_its_steward() {
     assert_eq!(lab.published(), before, "a read writes nothing");
 }
 
-/// A vault pass applying on this Mac now (holding its state lock) leaves the steward's read for
-/// the next pass, which reads it once that pass ends: no error, so the converge pass waits.
-/// NEGATIVE CONTROL: a `stewardship` that errs while the lock is held fails the pass's row.
+/// A vault pass holding this Mac's state lock says nothing of the vault (the subscriber takes it
+/// for its pass over every long-poll answer): the steward's reads wait it out and read the copy.
+/// Only a pass that outlasts the wait leaves the read for the next converge pass, said as what it
+/// is: `stewardship` and every steward step err of the busy kind, so none reads the copy or goes
+/// on as a steward. NEGATIVE CONTROLS: with `StateLock::observe_judging` observing once
+/// (2026-11-11), the read that races a pass released within the wait is busy; with `steward_copy`
+/// reading on without its observation where the pass outlasts the wait (2026-11-12), every read
+/// and step reads the copy (the lease check and step as `Idle`).
 #[test]
 fn a_steward_read_waits_for_a_vault_pass_applying_now() {
+    const NOW: u64 = 1_760_000_000;
     let lab = lab("steward-busy");
     lab.as_alab(|| {
+        let mut held = Some(StateLock::take(&lab.m1).unwrap());
+        let (read, tries) =
+            test_while_state_lock_held(move || drop(held.take()), || stewardship(&lab.m1).unwrap());
+        assert_eq!(read, Stewardship::Steward { fleet_code: false });
+        assert!(tries >= 1, "the read met the held pass and waited");
+        let settled = steward_revoke_check(&lab.m1).unwrap();
+        let mut held = Some(StateLock::take(&lab.m1).unwrap());
+        let (check, tries) =
+            test_while_state_lock_held(move || drop(held.take()), || steward_revoke_check(&lab.m1));
+        assert_eq!(check.unwrap(), settled);
+        assert!(tries >= 1, "the check met the held pass and waited");
+        let settled = steward_lease_check(&lab.m1, Some("net-alab"), NOW).unwrap();
+        let mut held = Some(StateLock::take(&lab.m1).unwrap());
+        let (check, tries) = test_while_state_lock_held(
+            move || drop(held.take()),
+            || steward_lease_check(&lab.m1, Some("net-alab"), NOW),
+        );
+        assert_eq!(check.unwrap(), settled);
+        assert!(tries >= 1, "the lease check met the held pass and waited");
+
+        let before = lab.published();
         let held = StateLock::take(&lab.m1).unwrap();
-        let read = stewardship(&lab.m1).unwrap();
-        assert!(
-            matches!(&read, Stewardship::Busy(why) if why.contains("applying")),
-            "{read:?}"
-        );
-        let revoke_err = steward_finish_revokes(&lab.m1).unwrap_err();
-        assert!(
-            revoke_err.to_string().contains("applying"),
-            "{revoke_err:?}"
-        );
+        with_current_wait(Duration::from_millis(50), || {
+            let busy = Some(crate::ErrorKind::VaultBusy);
+            let kind = |error: Option<crate::Error>| error.map(|error| error.kind());
+            assert_eq!(
+                [
+                    kind(stewardship(&lab.m1).err()),
+                    kind(steward_revoke_check(&lab.m1).err()),
+                    kind(steward_lease_check(&lab.m1, Some("net-alab"), NOW).err()),
+                    kind(steward_finish_revokes(&lab.m1).err()),
+                    kind(steward_ensure_lease(&lab.m1, Some("net-alab"), NOW).err()),
+                ],
+                [busy; 5],
+                "stewardship, the revoke and lease checks, and their steps"
+            );
+        });
         drop(held);
+        assert_eq!(lab.published(), before, "a busy step publishes nothing");
         assert_eq!(
             stewardship(&lab.m1).unwrap(),
             Stewardship::Steward { fleet_code: false }
@@ -1038,4 +1072,97 @@ fn denied_roster_and_log_excluded_admins_cannot_serve_or_claim_steward_lease() {
             "active roster member m1 must still read reserved entries when config.host is stale"
         );
     });
+}
+
+/// Off macOS the server step removes the member server an earlier release installed, in each
+/// shape a release wrote, and leaves a person's server (any other shape, or one a pin record
+/// names) as it is. It takes the job's decision lock only once there is one to remove.
+#[test]
+fn the_member_server_a_release_installed_goes_and_a_persons_stays() {
+    use crate::service::{Job, unit_file};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let program = root.path().join("aterm");
+    std::fs::write(&program, b"").unwrap();
+    let unit = unit_file(&home, Job::Server);
+    let write = |args: &[String]| {
+        if cfg!(target_os = "macos") {
+            crate::service::write_plist(&home, Job::Server, &program, args)
+        } else {
+            crate::service::write_unit(&home, Job::Server, &program, args)
+        }
+        .unwrap();
+    };
+    let removed = std::cell::Cell::new(0);
+    let retire = || {
+        crate::service::retire_server_with(&home, &member_server_installed, || {
+            removed.set(removed.get() + 1);
+            std::fs::remove_file(&unit).unwrap();
+            Ok(true)
+        })
+        .unwrap()
+    };
+    let words = |words: &[&str]| -> Vec<String> { words.iter().map(|w| (*w).to_owned()).collect() };
+    let alab_pin = format!("{}={}", crate::ALAB_VAULT, crate::ALAB_SIGNER);
+    let removed_line = format!("removed {}", unit.display());
+
+    assert_eq!(retire(), None, "no server job");
+    assert!(
+        !home.join(".config/aterm/secrets/server.lock").exists(),
+        "no lock taken where there is nothing to remove"
+    );
+    let earlier = words(&[
+        "secrets",
+        "serve",
+        "--advertise",
+        "m221",
+        "--pin",
+        &alab_pin,
+    ]);
+    for installed in [member_server_args("m221".to_owned()), earlier] {
+        write(&installed);
+        assert_eq!(retire(), Some(removed_line.clone()), "{installed:?}");
+        assert!(!unit.exists(), "{installed:?}");
+    }
+    let mut elsewhere = member_server_args("m221".to_owned());
+    elsewhere.extend(words(&["--store", "elsewhere"]));
+    for persons in [
+        words(&["secrets", "serve"]),
+        words(&["secrets", "serve", "--no-keep-awake"]),
+        elsewhere,
+        words(&[
+            "secrets",
+            "serve",
+            "--advertise",
+            "m221",
+            "--pin",
+            "team=a",
+            "--no-keep-awake",
+        ]),
+        words(&[
+            "secrets",
+            "serve",
+            "--listen",
+            "0.0.0.0:7485",
+            "--advertise",
+            "m221",
+            "--pin",
+            &alab_pin,
+        ]),
+    ] {
+        write(&persons);
+        assert_eq!(retire(), None, "{persons:?}");
+        assert!(unit.exists(), "{persons:?}");
+    }
+    write(&member_server_args("m221".to_owned()));
+    crate::service::record_pin(&home, Job::Server, &program).unwrap();
+    assert_eq!(retire(), None, "a pinned job is a person's");
+    assert!(unit.exists());
+    crate::service::clear_pin(&home, Job::Server).unwrap();
+    assert!(retire().is_some());
+    assert_eq!(
+        removed.get(),
+        3,
+        "removed only the three the step installed"
+    );
 }

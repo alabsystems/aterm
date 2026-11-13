@@ -86,6 +86,12 @@ const GENERIC: (&str, &str) = ("it did not finish installing", "didn\u{2019}t fi
 pub(crate) const TABS_OVER_HANDOVER: &str =
     "too many tabs were open to move to the new version at once";
 
+/// What the launched lane's reason says of a successor it had to stop after the whole dial bound
+/// (`app_update_handoff::file_undialled_retire`, booked `Stalled`): it ran its own code and hung
+/// before claiming the handoff.
+pub(crate) const PRE_DIAL_STALL: &str =
+    "it was still running past the dial bound and the self-exit grace, so it was stopped";
+
 /// The apply outcomes this program can name, as `(a substring of a real ledger reason, full
 /// clause, short clause)`.
 const CAUSES: &[(&str, &str, &str)] = &[
@@ -98,6 +104,11 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "handoff proof ended TimedOut",
         "the new version did not finish starting in time",
         "too slow to start",
+    ),
+    (
+        "handoff proof ended Stalled",
+        "the new version stopped partway through starting",
+        "stopped starting",
     ),
     (
         "handoff proof ended AdoptionMismatch",
@@ -120,7 +131,17 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "terminal too busy",
     ),
     (
+        PRE_DIAL_STALL,
+        "the new version stopped partway through starting",
+        "stopped starting",
+    ),
+    (
         "never claimed the handoff",
+        "the new version did not finish starting in time",
+        "too slow to start",
+    ),
+    (
+        "no rendezvous dialer was admitted",
         "the new version did not finish starting in time",
         "too slow to start",
     ),
@@ -271,9 +292,9 @@ const CAUSES: &[(&str, &str, &str)] = &[
         "couldn\u{2019}t capture a session",
     ),
     (
-        "disarmed the boot sentinel",
-        "the new version would not run and aterm went back to this one",
-        "rolled back",
+        "was unrecoverable across",
+        "an earlier update\u{2019}s start check never finished, so aterm cleared it",
+        "start check cleared",
     ),
 ];
 
@@ -293,11 +314,18 @@ pub(crate) fn named_clause(reason: &str) -> Option<&'static str> {
 /// and [`ApplyTrouble::cause_is_named`], so "which clause do we say" and "did we
 /// recognise it" can never answer differently.
 fn named_cause(reason: &str) -> Option<(&'static str, &'static str)> {
+    cause_row(reason).map(|(_, full, short)| (*full, *short))
+}
+
+/// The ledger words a reason's [`CAUSES`] row matched on, a stable key for the failure it names
+/// (a stopped lane's `failure_signature`), or `None` for a reason no row names.
+pub(crate) fn cause_key(reason: &str) -> Option<&'static str> {
+    cause_row(reason).map(|(token, _, _)| *token)
+}
+
+fn cause_row(reason: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
     let reason = reason.trim();
-    CAUSES
-        .iter()
-        .find(|(token, _, _)| reason.contains(token))
-        .map(|(_, full, short)| (*full, *short))
+    CAUSES.iter().find(|(token, _, _)| reason.contains(token))
 }
 
 /// "6 h" / "30 min" / "a minute" — a wait a sentence can contain, at the

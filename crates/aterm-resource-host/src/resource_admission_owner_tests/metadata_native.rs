@@ -60,6 +60,18 @@ fn store_progress(path: &std::path::Path) -> u64 {
 /// `trustc -vV` stand-in is that image's own role, not a no-fork target here.
 pub(super) fn early_role() {
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args == [OsString::from("-vV")] && std::env::var_os("ATERM_SDK_LEASE_V3").is_some() {
+        // The distinct cooperative query keeps its SAME original SDK lease.
+        // Fixed metadata below continues to refuse any leaked root authority.
+        let result = std::panic::catch_unwind(|| {
+            let pending = control::client::sdk::snapshot_sdk_lease().unwrap();
+            unsafe { control::client::sdk::capture_sdk_lease(pending) }.unwrap();
+            assert!(crate::metadata_prelude::no_fork(std::process::id()).unwrap());
+            assert!(std::env::var_os("ATERM_RESOURCE_JOB_V3").is_none());
+            println!("actual original-SDK cooperative query ran");
+        });
+        std::process::exit(if result.is_ok() { 0 } else { 101 });
+    }
     let operation = if args == control::METADATA_CAPABILITY_QUERY.map(OsString::from) {
         Some(0)
     } else if args == [OsString::from(control::METADATA_STARTUP_ARGUMENT)] {
@@ -172,17 +184,18 @@ fn actual_fixed_metadata_owner_preserves_original_resources_and_drains() {
     if let Some(case) = std::env::var_os(CASE) {
         command.env(CASE, case);
     }
-    let output = if std::env::var(CASE).as_deref() == Ok("service") {
-        deadline::output_while_progressing_until(
-            &mut command,
-            HANG,
-            Instant::now() + QUALIFICATION_LIFETIME,
-            &mut || store_progress(&store_path),
-        )
-    } else {
-        deadline::output_within(&mut command, HANG)
-    }
-    .unwrap();
+    let output = match deadline::output_while_progressing_until(
+        &mut command,
+        HANG,
+        Instant::now() + QUALIFICATION_LIFETIME,
+        &mut || store_progress(&store_path),
+    ) {
+        Ok(output) => output,
+        Err(error) => panic!(
+            "actual private metadata Owner did not complete; preserved {}: {error:?}",
+            scratch.keep().display()
+        ),
+    };
     if std::env::var(CASE).as_deref() == Ok("service") {
         print!("{}", String::from_utf8_lossy(&output.stdout));
     }
@@ -344,7 +357,7 @@ fn host() {
         fs::write(&filename, batch.encode().unwrap()).unwrap();
         (File::open(filename).unwrap().into(), None)
     } else {
-        let (reader, mut input) = io::pipe().unwrap();
+        let (reader, mut input) = aterm_uds::pipe().unwrap();
         input
             .write_all(&(bytes.len() as u32).to_be_bytes())
             .unwrap();

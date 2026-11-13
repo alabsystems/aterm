@@ -15,11 +15,10 @@ use std::time::Duration;
 use atpkg_publish::api::{Lineage, PackRequest, Signing};
 use atpkg_publish::artifact::pack::{self, ExposeMode, Metadata};
 use atpkg_publish::artifact::{pkgdoc, sign, upload};
-use atpkg_publish::ctx::Ctx;
+use atpkg_publish::ctx::{Ctx, HostChoice};
 use atpkg_publish::error::Error;
 use atpkg_publish::host::fake::{FakeHost, FakeRelease};
-use atpkg_publish::host::rest::STAGED;
-use atpkg_publish::host::{ReleaseHost as _, Slug};
+use atpkg_publish::host::{ReleaseHost as _, STAGED, Slug};
 use atpkg_publish::testkit::Keys;
 use atpkg_publish::triple::{
     AARCH64_APPLE_DARWIN, Triple, X86_64_APPLE_DARWIN, X86_64_UNKNOWN_LINUX_GNU,
@@ -28,7 +27,8 @@ use atpkg_publish::triple::{
 use super::fixture::{
     Answer, CPU_ARM64, CPU_X86_64, DORMANT_LEDGER, EM_AARCH64, EM_X86_64, FakeTools, MINTED_LEDGER,
     bare_origin, checkout as fixture_checkout, client_verifies, elf, macho, push_from_elsewhere,
-    put, put_exe, ran, scratch, seed_mint, toolchain as fixture_toolchain, trust_repo,
+    put, put_exe, ran, scratch, seed_mint, toolchain as fixture_toolchain, trust_origin,
+    trust_repo,
 };
 
 #[path = "pack_build_diagnostics.rs"]
@@ -53,14 +53,16 @@ fn world(label: &str) -> World {
     let home = root.join("home");
     let keys = Keys::mint("m3", &[]);
     let host = Arc::new(FakeHost::new());
-    let ctx = keys.ctx(&home, host.clone());
+    let ctx = keys
+        .ctx(&home, host.clone())
+        .with_host_choice(HostChoice::Agh);
     keys.publish_quad(
         &host,
         &ctx.index_slug(),
         41,
         &keys.index_toml(41, &[("ay", "ay")], &[("ay", 8)]),
     );
-    trust_repo(&home.join("trust"), DORMANT_LEDGER);
+    trust_repo(&home.join("trust"), DORMANT_LEDGER, &ctx, &host);
     let bin = fixture_toolchain(&root.join("seal"));
     let checkout = root.join("ay");
     fixture_checkout(&checkout, &[("Cargo.toml", b"[package]\nname = \"ay\"\n")]);
@@ -87,6 +89,7 @@ impl World {
             signing: Signing::MachineKey,
             upload: false,
             env: Vec::new(),
+            build_within: None,
         }
     }
 
@@ -879,6 +882,47 @@ fn a_failed_build_is_refused_quoting_its_tail() {
 }
 
 #[test]
+fn a_bounded_build_is_ended_at_its_bound_and_nothing_of_it_is_signed() {
+    let w = world("pack-build-bound");
+    let within = Duration::from_secs(3600);
+    let bounded = PackRequest {
+        build_within: Some(within),
+        ..w.request(X86_64_UNKNOWN_LINUX_GNU)
+    };
+    // The bound is the build child's own deadline; a pack that names none builds unbounded.
+    let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
+    pack::pack_with(&w.ctx, &w.request(X86_64_UNKNOWN_LINUX_GNU), &t).expect("packed");
+    pack::pack_with(&w.ctx, &bounded, &t).expect("packed within its bound");
+    assert_eq!(
+        t.runs_of("build")
+            .iter()
+            .map(|run| run.deadline)
+            .collect::<Vec<_>>(),
+        [None, Some(within)]
+    );
+
+    // A build still running at its bound is ended: a refusal of that build, and no asset,
+    // manifest or signature of it exists.
+    let w = world("pack-build-overrun");
+    let mut hung = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
+    hung.overruns = Some("build");
+    let bounded = PackRequest {
+        build_within: Some(within),
+        ..w.request(X86_64_UNKNOWN_LINUX_GNU)
+    };
+    let err = pack::pack_with(&w.ctx, &bounded, &hung).expect_err("the build overran");
+    assert!(matches!(err, Error::Refused(_)), "{err:?}");
+    assert!(
+        err.to_string()
+            .contains("did not finish within its bound of 3600 s and was ended"),
+        "{err}"
+    );
+    for suffix in [".tar.zst", ".toml", ".sig"] {
+        assert!(w.written(suffix).is_empty(), "{:?}", w.written(suffix));
+    }
+}
+
+#[test]
 fn a_payload_carrying_a_stock_std_path_is_refused_before_anything_is_tarred() {
     let w = world("pack-scan");
     let stock = bin_bytes(
@@ -906,8 +950,8 @@ fn a_payload_carrying_a_stock_std_path_is_refused_before_anything_is_tarred() {
 fn a_live_switch_refuses_a_receiptless_compiler_before_the_checkout_is_read() {
     let w = world("pack-live");
     std::fs::remove_dir_all(w.ctx.home.join("trust")).expect("rm");
-    std::fs::remove_dir_all(w.ctx.home.join("trust.git")).expect("rm");
-    trust_repo(&w.ctx.home.join("trust"), MINTED_LEDGER);
+    std::fs::remove_dir_all(w.ctx.home.join("trust.origin")).expect("rm");
+    trust_repo(&w.ctx.home.join("trust"), MINTED_LEDGER, &w.ctx, &w.host);
     let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
     let err = pack::pack_with(&w.ctx, &w.request(X86_64_UNKNOWN_LINUX_GNU), &t)
         .expect_err("no receipt, switch live");
@@ -933,7 +977,7 @@ fn a_live_switch_refuses_a_receiptless_compiler_before_the_checkout_is_read() {
 #[test]
 fn an_unproven_row_is_not_signed_once_the_mint_lands_mid_pack() {
     let w = world("pack-mint-mid-pack");
-    let bare = w.ctx.home.join("trust.git");
+    let bare = trust_origin(&w.ctx.home.join("trust"), &w.ctx.accounts.staging);
     let pusher = w.root.join("minter");
     std::fs::create_dir_all(&pusher).expect("mkdir");
     let inner = cargo(&w.checkout, declared(&w), linux_ay(), false);
@@ -1300,8 +1344,8 @@ fn preflight_refuses_bytes_that_no_longer_match_the_signed_row() {
 fn a_receipt_carrying_compiler_packs_under_a_live_switch_and_says_so() {
     let w = world("pack-seed-mint");
     std::fs::remove_dir_all(w.ctx.home.join("trust")).expect("rm");
-    std::fs::remove_dir_all(w.ctx.home.join("trust.git")).expect("rm");
-    trust_repo(&w.ctx.home.join("trust"), MINTED_LEDGER);
+    std::fs::remove_dir_all(w.ctx.home.join("trust.origin")).expect("rm");
+    trust_repo(&w.ctx.home.join("trust"), MINTED_LEDGER, &w.ctx, &w.host);
     seed_mint(
         w.bin.parent().expect("the toolchain root"),
         super::fixture::COMMIT,
@@ -1321,7 +1365,7 @@ fn a_receipt_carrying_compiler_packs_under_a_live_switch_and_says_so() {
 fn the_switch_is_read_from_the_trust_repo_the_context_names_start_and_finish() {
     let w = world("pack-trust-repo");
     std::fs::remove_dir_all(w.ctx.home.join("trust")).expect("rm");
-    std::fs::remove_dir_all(w.ctx.home.join("trust.git")).expect("rm");
+    std::fs::remove_dir_all(w.ctx.home.join("trust.origin")).expect("rm");
     let t = tools(&w, "aarch64-apple-darwin", declared(&w), linux_ay());
     let err = pack::pack_with(&w.ctx, &w.request(X86_64_UNKNOWN_LINUX_GNU), &t)
         .expect_err("no $HOME/trust: the receipt is required");
@@ -1334,7 +1378,7 @@ fn the_switch_is_read_from_the_trust_repo_the_context_names_start_and_finish() {
 
     let mut ctx = w.ctx.clone();
     ctx.trust_repo = w.root.join("src/trust");
-    trust_repo(&ctx.trust_repo, DORMANT_LEDGER);
+    trust_repo(&ctx.trust_repo, DORMANT_LEDGER, &ctx, &w.host);
     let out = pack::pack_with(&ctx, &w.request(X86_64_UNKNOWN_LINUX_GNU), &t)
         .expect("dormant where the context points");
     assert_eq!(out.lineage, Lineage::Unproven);
@@ -1410,11 +1454,15 @@ fn an_out_whose_stage_holds_the_checkout_is_refused_and_the_checkout_survives() 
 }
 
 /// A `--upload` pack on a box without the staging token is refused before it builds:
-/// its uploads never go anonymously.
+/// its uploads never go anonymously. The `gh` arm's token check, said outright; under agh the
+/// staging writer is asked instead (`channel::agh_write_contract`'s
+/// `pre_claim_checks_ask_the_host_under_agh`).
 #[test]
 fn an_upload_without_the_staging_token_is_refused_before_anything_is_built() {
     let tmp = scratch("token-preflight");
-    let ctx = Keys::mint("m3", &[]).ctx(tmp.path(), Arc::new(FakeHost::new()));
+    let ctx = Keys::mint("m3", &[])
+        .ctx(tmp.path(), Arc::new(FakeHost::new()))
+        .with_host_choice(HostChoice::Gh);
     let e = upload::token_preflight(&ctx).expect_err("no token file");
     assert!(
         e.to_string()

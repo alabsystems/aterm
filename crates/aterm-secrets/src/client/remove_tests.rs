@@ -4969,3 +4969,23 @@ fn a_vault_revocation_cuts_the_revoked_seats_tables_before_its_remove() {
     );
     macs.server.stop();
 }
+
+/// A removed Mac's seat is still listed, with the machine its binding named and its label: the
+/// records it signed while a member still name it.
+/// NEGATIVE CONTROL: with `seats_ever` listing only `members()`, m40 is missing and the assertion
+/// fails.
+#[test]
+fn every_seat_ever_held_is_listed_a_removed_one_included() {
+    let macs = two_macs(&[(Audience::Everyone, "shared", b"everyone-v1".as_slice())]);
+    let (_m40, actor40, _) = let_in(&macs, "m40", "m40");
+    let before = log_of(&macs.m7);
+    let seat = before.membership().get(&actor40).unwrap().clone();
+    remove_member(&macs.m7, &seat.label, false).expect("m7 removes m40");
+    let after = log_of(&macs.m7);
+    assert!(after.membership().removal(&actor40).is_some());
+    assert!(
+        seats_ever(&after).contains(&(actor40, *seat.binding.machine(), seat.label.clone())),
+        "{:?}",
+        seats_ever(&after)
+    );
+}

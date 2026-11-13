@@ -275,6 +275,25 @@ fn visit_at(
     targets: &Targets,
     fg: usize,
 ) -> Visited {
+    visit_at_with(label, session, st, transcript, screen, targets, fg, false)
+}
+
+/// [`visit_at`], a dry look (the watch's) where `dry`.
+#[cfg(unix)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "visit_at's rig and the look's kind"
+)]
+fn visit_at_with(
+    label: &str,
+    session: &str,
+    st: impl FnOnce(&SessionFile, u64) -> St,
+    transcript: &str,
+    screen: String,
+    targets: &Targets,
+    fg: usize,
+    dry: bool,
+) -> Visited {
     let dir = scratch(&format!("login-wall-{label}"));
     let (sock, asked) = instance_with(
         &dir,
@@ -285,6 +304,7 @@ fn visit_at(
     );
     let opts = Opts {
         sock: Some(sock),
+        dry_run: dry,
         ..drive(&dir)
     };
     let mut agent = stand_in().spawn().expect("agent");
@@ -718,12 +738,341 @@ fn a_session_at_the_login_wall_is_never_asked_and_no_clock_runs() {
     assert_eq!(ready_since(50, true, &free, 90), 50);
 }
 
-/// The recorded session through the real visit ([`visit_at`]): at the wall nothing is typed, and a
-/// pending upgrade, one whose window ran out, and one whose screen no longer shows the wall (the
-/// transcript still does) all wait `login`.
+/// A login wall nobody at the session lifts holds the round [`upgrade::LOGIN_WALL_S`] and no
+/// longer ([`upgrade::login_holds`]): past it, in the quiet flow and the ask flow alike, pending or
+/// asked, the round moves at an idle point with nothing of the agent's own running, gated as
+/// there (a person's keys, box, draft or hold, a usage limit, a queued turn, a running turn, the
+/// agent's own work and a break all still hold it), and nothing is announced into the wall.
+/// NEGATIVE CONTROL: the same wall a second short of the bound waits `login` in every flow.
+#[test]
+fn a_login_wall_nobody_lifts_holds_the_round_only_for_its_bound() {
+    use crate::harness::upgrade::{LOGIN_WALL_S, login_holds};
+    let aged = Facts {
+        login: true,
+        login_s: LOGIN_WALL_S,
+        ..idle()
+    };
+    let fresh = Facts {
+        login_s: LOGIN_WALL_S - 1,
+        ..aged.clone()
+    };
+    assert!(login_holds(&fresh) && !login_holds(&aged));
+    let t0 = LEDGER[0].0;
+    let asked = Phase::Announced { at_s: t0, asks: 1 };
+    let later = t0 + 4 * REASK_S;
+    for quiet in [false, true] {
+        for (phase, ready) in [(&Phase::Pending, false), (&asked, false), (&asked, true)] {
+            let at = |f: &Facts| next_step(phase, &Facts { quiet, ..f.clone() }, ready, later);
+            let case = format!("quiet={quiet} {phase:?} ready={ready}");
+            assert_eq!(at(&fresh), Step::Wait("login"), "{case}: within its bound");
+            assert_eq!(at(&aged), Step::Terminate, "{case}: past it, nobody there");
+            for (why, f) in [
+                (
+                    "their keys",
+                    Facts {
+                        typing: true,
+                        ..aged.clone()
+                    },
+                ),
+                (
+                    "a key within grace",
+                    Facts {
+                        attended: true,
+                        ..aged.clone()
+                    },
+                ),
+                (
+                    "their box",
+                    Facts {
+                        approval_box: true,
+                        ..aged.clone()
+                    },
+                ),
+                (
+                    "their draft",
+                    Facts {
+                        composer_empty: false,
+                        ..aged.clone()
+                    },
+                ),
+                (
+                    "a held session",
+                    Facts {
+                        held: true,
+                        ..aged.clone()
+                    },
+                ),
+                (
+                    "a usage limit",
+                    Facts {
+                        limited: true,
+                        ..aged.clone()
+                    },
+                ),
+                (
+                    "a queued turn",
+                    Facts {
+                        queued: true,
+                        ..aged.clone()
+                    },
+                ),
+                (
+                    "a running turn",
+                    Facts {
+                        busy_footer: true,
+                        ..aged.clone()
+                    },
+                ),
+                (
+                    "its own work",
+                    Facts {
+                        background: vec!["zsh".into()],
+                        status: "shell".into(),
+                        ..aged.clone()
+                    },
+                ),
+                (
+                    "a break",
+                    Facts {
+                        background_point: true,
+                        status: "busy".into(),
+                        ..aged.clone()
+                    },
+                ),
+            ] {
+                assert_ne!(at(&f), Step::Terminate, "{case}: {why}");
+            }
+        }
+    }
+    assert_eq!(
+        next_step(
+            &Phase::Pending,
+            &Facts {
+                taskless: true,
+                ..aged.clone()
+            },
+            false,
+            later
+        ),
+        Step::Fresh,
+        "a session with no task is restarted afresh"
+    );
+    assert_eq!(
+        gate_announce(&aged),
+        Gate::Wait("login"),
+        "nothing announced into it"
+    );
+    assert_eq!(
+        next_step(&Phase::Failed(GAVE_UP.to_string()), &aged, true, later),
+        Step::Wait("login"),
+        "a given-up round's late answer is no move at the wall"
+    );
+}
+
+/// The login wall's age ([`wall_age`]): from the first row of the wall its transcript stands at
+/// ([`upgrade::LoginScan::since`], every later row the same wall), or a key of the person's since,
+/// or the start of the host's serving where its key record spans only that ([`HandAt::Since`]);
+/// keys unread, a person at the session, no wall and a wall no row dates never age it.
+#[test]
+fn the_login_walls_age_runs_from_its_first_row_and_restarts_at_a_person() {
+    let wall = || Facts {
+        login: true,
+        ..idle()
+    };
+    let now = 1_800_000_000;
+    let first = now - 2_000;
+    let rows = [
+        auth_wall_row(&ts(first), SESSION),
+        auth_wall_row(&ts(now - 60), SESSION),
+    ]
+    .join("\n");
+    let scan = upgrade::LoginScan::of(&rows);
+    assert_eq!(scan.since(), Some(first), "the wall's first row");
+    let lifted = format!(
+        "{rows}\n{}\n{}",
+        model_row(&ts(now - 30), SESSION, "Done.", "end_turn"),
+        auth_wall_row(&ts(now - 10), SESSION)
+    );
+    assert_eq!(
+        upgrade::LoginScan::of(&lifted).since(),
+        Some(now - 10),
+        "a wall after a lift is a new one"
+    );
+    let gone = format!(
+        "{rows}\n{}",
+        model_row(&ts(now - 30), SESSION, "Done.", "end_turn")
+    );
+    assert_eq!(
+        upgrade::LoginScan::of(&gone).since(),
+        None,
+        "no wall stands"
+    );
+    assert_eq!(
+        wall_age(true, &wall(), Some(first), HandAt::Never, now),
+        2_000
+    );
+    let key = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(60))
+        .expect("an instant");
+    assert!(
+        (58..=62).contains(&wall_age(true, &wall(), Some(first), HandAt::At(key), now)),
+        "restarted at the key"
+    );
+    // A key record that spans only the host's serving (aterm began serving the session a minute
+    // ago) dates the wall from that start, never from the wall's first row before it.
+    let served = HandAt::of(HumanInput::NeverFor(60_000));
+    assert!(matches!(served, HandAt::Since(_)), "{served:?}");
+    assert!(
+        (58..=62).contains(&wall_age(true, &wall(), Some(first), served, now)),
+        "from the serving's start"
+    );
+    assert_eq!(
+        wall_age(
+            true,
+            &wall(),
+            Some(first),
+            HandAt::of(HumanInput::Never),
+            now
+        ),
+        2_000,
+        "no span reported: from the wall's first row"
+    );
+    assert_eq!(
+        wall_age(true, &wall(), Some(first), HandAt::Unknown, now),
+        0,
+        "keys unread"
+    );
+    assert_eq!(
+        wall_age(true, &wall(), None, HandAt::Never, now),
+        0,
+        "undated"
+    );
+    assert_eq!(
+        wall_age(
+            true,
+            &Facts {
+                approval_box: true,
+                ..wall()
+            },
+            Some(first),
+            HandAt::Never,
+            now
+        ),
+        0,
+        "a person at the session"
+    );
+    assert_eq!(
+        wall_age(false, &idle(), Some(first), HandAt::Never, now),
+        0,
+        "no wall"
+    );
+}
+
+/// A session at a login wall nobody lifted for [`upgrade::LOGIN_WALL_S`] moves quietly through
+/// the real visit: the agent is signalled, nothing is typed into it, and the new build starts on
+/// the same login. Within the bound, after a key of the person's, and with the `/login` dialog
+/// standing (the person's or the login lane's), it waits and nothing is signalled.
+#[cfg(unix)]
+#[test]
+fn a_login_wall_nobody_lifts_moves_quietly_past_its_bound() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let walled = |human: &str, rows: Vec<String>| {
+        screen_json(&rows).replace("\"human_ms\":null", &format!("\"human_ms\":{human}"))
+    };
+    let expired =
+        || aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_EXPIRED);
+    let rig = |name: &str, screen: String, since: u64| {
+        let st = St {
+            pending_since: now_s() - 600,
+            ..settled()
+        };
+        let h = quietly(|| {
+            Parked::new(
+                name,
+                Answers {
+                    screen,
+                    ..Answers::default()
+                },
+                st,
+                3600,
+            )
+        });
+        let project = h.opts.home.join(".claude/projects/p");
+        let task = r#"{"type":"user","message":{"role":"user","content":"port the parser"}}"#;
+        std::fs::write(
+            project.join(format!("{SESSION}.jsonl")),
+            format!(
+                "{task}\n{}\n{}\n",
+                auth_wall_row(&ts(since), SESSION),
+                auth_wall_row(&ts(now_s() - 30), SESSION)
+            ),
+        )
+        .expect("transcript");
+        h
+    };
+    let aged = now_s() - upgrade::LOGIN_WALL_S - 1;
+    for (name, screen, since) in [
+        ("login-young", walled("null", expired()), now_s() - 60),
+        ("login-keyed", walled("600000", expired()), aged),
+        (
+            "login-dialog",
+            walled(
+                "null",
+                aterm_phase::prompt::fixtures::screen(aterm_phase::prompt::fixtures::LOGIN_PICKER),
+            ),
+            aged,
+        ),
+    ] {
+        let mut h = rig(name, screen, since);
+        h.opts.dry_run = true;
+        let dry = h.visit();
+        h.opts.dry_run = false;
+        assert!(
+            dry.step.starts_with("wait:"),
+            "{name}: the watch's look: {dry:?}"
+        );
+        let r = h.visit();
+        assert!(r.step.starts_with("wait:"), "{name}: {r:?}");
+        assert!(h.details("terminated").is_empty(), "{name}: not signalled");
+        assert!(h.typed().is_empty(), "{name}: {:?}", h.typed());
+    }
+    let mut h = rig("login-aged", walled("null", expired()), aged);
+    // The watch's own dry look reads the same age from the transcript, so its record says the
+    // aged wall's own move waits for the loop's next point (`upgrade_drive::wall_due`).
+    h.opts.dry_run = true;
+    let dry = h.visit();
+    h.opts.dry_run = false;
+    assert_eq!(dry.step, WALL_RESTART, "{dry:?}");
+    assert!(
+        h.details("terminated").is_empty(),
+        "a dry look signals nothing"
+    );
+    let _ran = probe_finds(build_start::Probe::Starts);
+    let ended = h.reaped();
+    let r = h.visit();
+    assert_eq!(r.step, "wait:shell-prompt", "moved: {r:?}");
+    let status = ended.recv_timeout(HANG_DETECTOR).expect("the agent ended");
+    assert_eq!(status.signal(), Some(libc::SIGTERM), "{r:?}");
+    assert_eq!(
+        h.details("terminated"),
+        ["SIGTERM (idle: nothing asked or typed; resumed as it was)"]
+    );
+    assert!(h.typed().is_empty(), "nothing typed: {:?}", h.typed());
+    assert!(
+        load(&h.opts, SESSION).expect("state").quiet,
+        "resumed as it was"
+    );
+}
+
+/// The recorded session through the real visit ([`visit_at`]): at the wall nothing is typed, and,
+/// with the person's key ten minutes back holding the wall within its bound
+/// ([`upgrade::LOGIN_WALL_S`]), a pending upgrade, one whose window ran out, and one whose screen
+/// no longer shows the wall (the transcript still does) all wait `login`. The same pending
+/// upgrade with nobody's key since the wall's first row, nine hours back, is past the wall.
 #[cfg(unix)]
 #[test]
 fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
+    let keyed = |json: String| json.replace("\"human_ms\":null", "\"human_ms\":600000");
     let window_out = |asks: u32| Phase::Announced {
         at_s: now_s() - REASK_S - 1,
         asks,
@@ -733,7 +1082,7 @@ fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
         INCIDENT_SESSION,
         incident_state(Phase::Pending, 0),
         &incident(INCIDENT_SESSION, 0, false),
-        walled_screen_json(),
+        keyed(walled_screen_json()),
         &to_2_1_283(),
         usize::MAX,
     );
@@ -741,12 +1090,23 @@ fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
         (pending.step.as_str(), pending.typed.len()),
         ("wait:login", 0)
     );
+    let unkeyed = visit_at(
+        "unkeyed",
+        INCIDENT_SESSION,
+        incident_state(Phase::Pending, 0),
+        &incident(INCIDENT_SESSION, 0, false),
+        walled_screen_json(),
+        &to_2_1_283(),
+        usize::MAX,
+    );
+    assert_ne!(unkeyed.step, "wait:login", "{unkeyed:?}");
+    assert!(unkeyed.typed.is_empty(), "{:?}", unkeyed.typed);
     let asked = visit_at(
         "asked",
         INCIDENT_SESSION,
         incident_state(window_out(1), 1),
         &incident(INCIDENT_SESSION, 1, false),
-        walled_screen_json(),
+        keyed(walled_screen_json()),
         &to_2_1_283(),
         usize::MAX,
     );
@@ -767,7 +1127,7 @@ fn the_incident_is_waited_out_and_its_last_notice_asked_again() {
             ],
         );
         assert!(aterm_phase::wall(&rows).is_none());
-        screen_json(&rows)
+        keyed(screen_json(&rows))
     };
     let off_screen = visit_at(
         "off-screen",
@@ -918,7 +1278,8 @@ fn a_ready_to_the_current_marker_restarts_under_every_gate() {
         "typed",
     ));
     walled.push('\n');
-    walled.push_str(&auth_wall_row("2026-09-27T14:42:00.050Z", INCIDENT_SESSION));
+    // A wall written a minute ago, within its bound ([`upgrade::LOGIN_WALL_S`]).
+    walled.push_str(&auth_wall_row(&ts(now_s() - 60), INCIDENT_SESSION));
     walled.push('\n');
     let at_wall = visit_at(
         "wall",

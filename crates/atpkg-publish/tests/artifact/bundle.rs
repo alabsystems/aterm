@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use atpkg_publish::api::{BundleRequest, HelloGate, Signing};
 use atpkg_publish::artifact::bundle::{self, HelloPlan, OneCompiler, RETIRED_BINS};
-use atpkg_publish::ctx::Ctx;
+use atpkg_publish::ctx::{Ctx, HostChoice};
 use atpkg_publish::error::Error;
 use atpkg_publish::host::Slug;
 use atpkg_publish::host::fake::FakeHost;
@@ -61,14 +61,16 @@ fn world(label: &str) -> World {
     let home = root.join("home");
     let keys = Keys::mint("m3", &[]);
     let host = Arc::new(FakeHost::new());
-    let ctx = keys.ctx(&home, host.clone());
+    let ctx = keys
+        .ctx(&home, host.clone())
+        .with_host_choice(HostChoice::Agh);
     keys.publish_quad(
         &host,
         &ctx.index_slug(),
         41,
         &keys.index_toml(41, &[("trust", "trust")], &[("trust", 1)]),
     );
-    trust_repo(&home.join("trust"), DORMANT_LEDGER);
+    trust_repo(&home.join("trust"), DORMANT_LEDGER, &ctx, &host);
     let (seal, private) = seal_fixture(&root);
     std::fs::hard_link(seal.join("bin/trustc"), seal.join("bin/rustc")).expect("rustc");
     put_exe(&seal.join("bin/trustdoc"), &native("trustdoc"));
@@ -275,8 +277,8 @@ fn relative_output_paths_keep_the_staged_toolchain_reachable_from_the_hello_crat
 fn a_refused_compiler_or_closure_stops_the_pack_before_relocation() {
     let w = world("bundle-refused");
     std::fs::remove_dir_all(w.ctx.home.join("trust")).expect("rm");
-    std::fs::remove_dir_all(w.ctx.home.join("trust.git")).expect("rm");
-    trust_repo(&w.ctx.home.join("trust"), MINTED_LEDGER);
+    std::fs::remove_dir_all(w.ctx.home.join("trust.origin")).expect("rm");
+    trust_repo(&w.ctx.home.join("trust"), MINTED_LEDGER, &w.ctx, &w.host);
     let t = tools();
     let err = bundle::pack_bundle_with(&w.ctx, &w.request(), &t).expect_err("live, no receipt");
     assert!(
@@ -1079,8 +1081,8 @@ fn a_donor_that_is_no_trust_toolchain_and_a_relocator_refusal_stop_the_pack() {
 
 fn live_switch(w: &World) {
     std::fs::remove_dir_all(w.ctx.home.join("trust")).expect("rm");
-    std::fs::remove_dir_all(w.ctx.home.join("trust.git")).expect("rm");
-    trust_repo(&w.ctx.home.join("trust"), MINTED_LEDGER);
+    std::fs::remove_dir_all(w.ctx.home.join("trust.origin")).expect("rm");
+    trust_repo(&w.ctx.home.join("trust"), MINTED_LEDGER, &w.ctx, &w.host);
 }
 
 /// A seed-mint seal under a live switch: admitted by its receipt, `LINEAGE` stamped over
@@ -1224,7 +1226,7 @@ fn a_sysroot_link_repointed_after_admission_still_packs_the_admitted_build() {
 fn the_switch_is_read_from_the_trust_repo_the_context_names() {
     let w = world("bundle-trust-repo");
     std::fs::remove_dir_all(w.ctx.home.join("trust")).expect("rm");
-    std::fs::remove_dir_all(w.ctx.home.join("trust.git")).expect("rm");
+    std::fs::remove_dir_all(w.ctx.home.join("trust.origin")).expect("rm");
     let err = bundle::pack_bundle_with(&w.ctx, &w.request(), &tools())
         .expect_err("no $HOME/trust: the receipt is required");
     assert!(
@@ -1233,7 +1235,7 @@ fn the_switch_is_read_from_the_trust_repo_the_context_names() {
     );
     let mut ctx = w.ctx.clone();
     ctx.trust_repo = w.root.join("src/trust");
-    trust_repo(&ctx.trust_repo, DORMANT_LEDGER);
+    trust_repo(&ctx.trust_repo, DORMANT_LEDGER, &ctx, &w.host);
     let out = bundle::pack_bundle_with(&ctx, &w.request(), &tools()).expect("dormant there");
     assert_eq!(out.lineage, atpkg_publish::api::Lineage::Unproven);
 }

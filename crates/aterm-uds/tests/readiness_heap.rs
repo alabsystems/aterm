@@ -48,7 +48,7 @@ fn measured<T>(work: impl FnOnce() -> T) -> (T, usize) {
 fn small_readiness_sets_allocate_only_the_ready_result() {
     use aterm_uds::ready::{self, Interest, Watch};
 
-    let (mut reader, mut writer) = std::io::pipe().unwrap();
+    let (mut reader, mut writer) = aterm_uds::pipe().unwrap();
     for size in [1, 2, 8] {
         let fds = vec![reader.as_fd(); size];
         let interests = vec![Watch::new(reader.as_fd(), Interest::Read); size];

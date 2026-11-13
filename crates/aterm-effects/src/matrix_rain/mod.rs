@@ -1662,9 +1662,13 @@ impl MatrixRain {
     #[inline]
     fn emit_column(&mut self, ctx: &EmitCtx<'_>, col: u16, quads: &mut Vec<RainCell>) -> bool {
         let cw = u32::from(ctx.geom.cell_w);
-        let rows = u32::from(ctx.geom.rows);
+        // Only the cells wholly inside the `u16` pixel space a rain cell stores its rect in are
+        // drawn: a column past it draws nothing, and a grid taller than 65,535 px draws the rows
+        // that fit (a cell's `y` is `row * cell_h`, which wraps past it).
+        let space = u32::from(u16::MAX);
+        let rows = u32::from(ctx.geom.rows).min(space / u32::from(ctx.geom.cell_h).max(1));
         let x0 = u32::from(col) * cw;
-        if x0 + cw > u32::from(u16::MAX) {
+        if x0 + cw > space {
             return true;
         }
         let x = x0 as u16;
@@ -2149,13 +2153,15 @@ impl MatrixRain {
         if cw <= 0 || ch <= 0 {
             return;
         }
-        let grid_w = i32::from(ctx.geom.cols) * cw;
-        let grid_h = i32::from(ctx.geom.rows) * ch;
+        // The grid inside the `u16` pixel space a halo stores its rect in: every narrowing
+        // below is then exact.
+        let cap = i32::from(u16::MAX);
+        let grid_w = (i32::from(ctx.geom.cols) * cw).min(cap);
+        let grid_h = (i32::from(ctx.geom.rows) * ch).min(cap);
         let premul = premul_rgb(ctx.ramp[15], self.head_alpha / 2);
         if premul == 0 {
             return;
         }
-        let cap = i32::from(u16::MAX);
         let rx = cw.clamp(1, cap) as u16;
         let ry = ch.clamp(1, cap) as u16;
         let half_cw = cw / 2;

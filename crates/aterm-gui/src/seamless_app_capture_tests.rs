@@ -3,7 +3,7 @@
 
 //! Whole-app capture property.
 
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _, OwnedFd};
 use std::sync::PoisonError;
 
 use aterm_core::terminal::TerminalCheckpoint;
@@ -11,8 +11,7 @@ use aterm_window::dpi::PhysicalSize;
 
 use super::ladder_tests::{assert_only_over_cap_links_dropped, hostile_walk_step, xorshift};
 use super::tests::{
-    ScratchEnv, child_proof_from, env_alone_with_ptys as env_alone, pipe_pair, restore_env,
-    run_in_children,
+    ScratchEnv, child_proof_from, env_alone_with_ptys as env_alone, restore_env, run_in_children,
 };
 use super::*;
 use crate::WindowId;
@@ -355,8 +354,10 @@ fn hand_over_as(
     )
     .expect("the parent's expectation");
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     publish_successor_env(&outgoing, &layout_path, ready_write, commit_read, build);
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(
@@ -1251,8 +1252,10 @@ fn hand_over_held(
         &adoption,
     )
     .expect("the parent's expectation");
-    let (_ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, _commit_write) = pipe_pair("commit");
+    let (_ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (_ready_read, ready_write) = (_ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, _commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, _commit_write) = (commit_read.into_raw_fd(), _commit_write.into_raw_fd());
     publish_successor_env(&outgoing, &layout_path, ready_write, commit_read, build);
     let incoming = take_incoming_as(shape);
     (parked, incoming, nonce, expected)
@@ -1896,8 +1899,10 @@ fn an_older_producers_held_pane_is_still_its_placeholder() {
         &adoption,
     )
     .expect("the parent's expectation");
-    let (_ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, _commit_write) = pipe_pair("commit");
+    let (_ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (_ready_read, ready_write) = (_ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, _commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, _commit_write) = (commit_read.into_raw_fd(), _commit_write.into_raw_fd());
     publish_successor_env(
         &outgoing,
         &layout_path,

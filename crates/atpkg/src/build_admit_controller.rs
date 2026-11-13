@@ -3,6 +3,12 @@
 
 //! Cooperative controller lifetime, independent of nested compiler capacity reservations.
 
+#[cfg(target_os = "macos")]
+#[path = "build_admit_controller_until.rs"]
+mod until;
+#[cfg(target_os = "macos")]
+pub use until::{ControllerDeadline, supervise_controller_until};
+
 /// Root status and cancellation after the original native group is conclusively drained.
 #[derive(Debug)]
 pub struct ControllerOutcome {
@@ -50,8 +56,11 @@ fn supervise_unix(
         std::io::Error::other("native controller signal forwarding could not be armed")
     })?;
     let attempt = aterm_uds::spawnfd::BirthAttempt::new()?;
-    let mut spawned = match command.spawn_cohort(attempt) {
-        Ok(spawned) => spawned,
+    let (mut spawned, observation_error) = match command.spawn_cohort(attempt) {
+        Ok(spawned) => (spawned, None),
+        Err(aterm_uds::spawnfd::SpawnFailure::Unbound { spawned, error }) => {
+            (*spawned, Some(error))
+        }
         Err(aterm_uds::spawnfd::SpawnFailure::NotSpawned(proof)) => {
             front.never();
             return Err(proof.into_error());
@@ -116,7 +125,14 @@ fn supervise_unix(
         }
     }
     let signal = front.disarm_observed();
-    status.map(|root| ControllerOutcome { root, signal })
+    match (observation_error, status) {
+        (Some(observation), Err(wait)) => Err(std::io::Error::new(
+            observation.kind(),
+            ControllerObservationAndWaitError { observation, wait },
+        )),
+        (Some(error), Ok(_)) => Err(error),
+        (None, status) => status.map(|root| ControllerOutcome { root, signal }),
+    }
 }
 
 #[cfg(unix)]
@@ -124,4 +140,30 @@ fn pause() {
     // Native group absence has no waitable descriptor. Keep borrowed resources during
     // paced kernel lifetime queries.
     std::thread::sleep(std::time::Duration::from_millis(50));
+}
+
+/// Both original native diagnostics, returned only after the captured cohort drained.
+#[cfg(unix)]
+#[derive(Debug)]
+struct ControllerObservationAndWaitError {
+    observation: std::io::Error,
+    wait: std::io::Error,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for ControllerObservationAndWaitError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}; original child wait also failed: {}",
+            self.observation, self.wait
+        )
+    }
+}
+
+#[cfg(unix)]
+impl std::error::Error for ControllerObservationAndWaitError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.observation)
+    }
 }

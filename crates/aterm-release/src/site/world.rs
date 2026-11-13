@@ -168,7 +168,7 @@ fn streamed(
     out: &mut dyn Write,
     drain: std::time::Duration,
 ) -> Result<Ran, String> {
-    let (reader, writer) = std::io::pipe().map_err(|e| format!("cannot make a pipe: {e}"))?;
+    let (reader, writer) = aterm_uds::pipe().map_err(|e| format!("cannot make a pipe: {e}"))?;
     let second = writer
         .try_clone()
         .map_err(|e| format!("cannot make a pipe: {e}"))?;

@@ -1008,7 +1008,11 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
     let root = aterm_tempfile::tempdir().unwrap();
     let bare = repo(root.path(), "remote.git", true);
     let source = repo(root.path(), "source", false);
+    let older = commit(&source, "earlier release\n");
     let commit = commit(&source, "tagged release\n");
+    let old_blob = git(&source, &["rev-parse", &format!("{older}:line.toml")]);
+    let blob = git(&source, &["rev-parse", &format!("{commit}:line.toml")]);
+    git(&source, &["tag", "blob-only", &blob]);
     git(&source, &["tag", "-a", "v1", "-m", "release", &commit]);
     let token = git(&source, &["rev-parse", "refs/tags/v1"]);
     git(&source, &["update-ref", "refs/tags/alias", &token]);
@@ -1040,19 +1044,192 @@ fn a_complete_tag_catalog_needs_no_main_and_tag_commits_refuse_noncommits() {
     std::fs::write(gitdir.join("FETCH_HEAD"), "preserve this observation\n").unwrap();
     let names = ["HEAD", "index", "config", "FETCH_HEAD"];
     let before = names.map(|name| std::fs::read(gitdir.join(name)).unwrap());
-    let remote = local(&target, &bare);
+    let effects = Arc::new(agh::Fx::simulated(agh::Fx::live().wall_secs().unwrap()));
+    let client = GithubBuilder::new(Router::empty())
+        .fx(effects.clone())
+        .git_remote_for_tests("fixture/app", &bare)
+        .build();
+    let remote = Remote::new(client, Slug::parse("fixture/app").unwrap(), &target).unwrap();
+    let imported_since = |first| {
+        effects.children_run()[first..]
+            .iter()
+            .any(|child| child.args.iter().any(|arg| arg == "fetch"))
+    };
     assert_eq!(remote.get("refs/heads/main").unwrap(), None);
+    let first = effects.children_run().len();
     let catalog = parse_tags(&remote.tag_catalog().unwrap()).unwrap();
+    assert!(
+        imported_since(first),
+        "the first catalog must import its objects"
+    );
     assert_eq!(catalog.get("refs/tags/v1"), Some(&token));
     assert_eq!(catalog.get("refs/tags/v1^{}"), Some(&commit));
     assert_eq!(catalog.get("refs/tags/alias^{}"), Some(&commit));
+    let first = effects.children_run().len();
+    assert_eq!(parse_tags(&remote.tag_catalog().unwrap()).unwrap(), catalog);
+    let children = effects.children_run();
+    assert!(
+        !imported_since(first),
+        "an identical catalog need not be imported again"
+    );
+    assert_eq!(
+        children[first..]
+            .iter()
+            .filter(|child| child.args.iter().any(|arg| arg == "ls-remote"))
+            .count(),
+        1,
+        "a cached catalog still needs a fresh advertisement"
+    );
+    assert!(
+        children[first..]
+            .iter()
+            .any(|child| child.args.iter().any(|arg| arg == "--git-common-dir")),
+        "a cached catalog still admits the source"
+    );
+    // An annotated tag can move while its peeled commit remains unchanged.
+    git(
+        &source,
+        &["tag", "-a", "replacement", "-m", "new tag body", &commit],
+    );
+    let replacement = git(&source, &["rev-parse", "refs/tags/replacement"]);
+    git(
+        &source,
+        &[
+            "push",
+            "-q",
+            bare.to_str().unwrap(),
+            "refs/tags/replacement",
+        ],
+    );
+    git(&bare, &["update-ref", "refs/tags/v1", &replacement]);
+    git(&bare, &["update-ref", "-d", "refs/tags/replacement"]);
+    let first = effects.children_run().len();
+    let moved = parse_tags(&remote.tag_catalog().unwrap()).unwrap();
+    assert_eq!(moved.get("refs/tags/v1"), Some(&replacement));
+    assert_eq!(moved.get("refs/tags/v1^{}"), Some(&commit));
+    assert!(imported_since(first), "a changed tag body must be imported");
+    // Make the tiny imported fixture loose so each loss removes exactly one object, not a
+    // whole pack. The retired packs remain owned by this temporary directory until unpacked.
+    let remove_object = |oid: &str| {
+        let packs = gitdir.join("objects/pack");
+        let retired = aterm_tempfile::Builder::new()
+            .tempdir_in(root.path())
+            .unwrap();
+        let saved = retired.path().join("pack");
+        std::fs::rename(&packs, &saved).unwrap();
+        std::fs::create_dir(&packs).unwrap();
+        for entry in std::fs::read_dir(saved).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "pack") {
+                let bytes = std::fs::read(path).unwrap();
+                let unpacked = GitCli::new(&target)
+                    .git_input(&["unpack-objects"], &bytes)
+                    .unwrap();
+                assert!(unpacked.success(), "{}", unpacked.stderr_utf8());
+            }
+        }
+        std::fs::remove_file(gitdir.join("objects").join(&oid[..2]).join(&oid[2..])).unwrap();
+        assert!(
+            !GitCli::new(&target)
+                .git(&["cat-file", "-e", oid])
+                .unwrap()
+                .success()
+        );
+    };
+    remove_object(&old_blob);
+    let first = effects.children_run().len();
+    assert_eq!(parse_tags(&remote.tag_catalog().unwrap()).unwrap(), moved);
+    assert!(
+        imported_since(first),
+        "missing historical content must be imported again"
+    );
+    assert_eq!(
+        git(&target, &["show", &format!("{older}:line.toml")]),
+        "earlier release"
+    );
+    for boundary in ["info/grafts", "shallow"] {
+        remove_object(&older);
+        let cutoff = gitdir.join(boundary);
+        std::fs::write(&cutoff, format!("{commit}\n")).unwrap();
+        let masked = remote
+            .local(&[
+                "-c",
+                "core.commitGraph=false",
+                "rev-list",
+                "--objects",
+                "--quiet",
+                "--missing=print",
+                &commit,
+                "--",
+            ])
+            .unwrap();
+        assert!(
+            masked.status.success() && masked.stdout.is_empty(),
+            "the boundary must hide the missing parent from an ordinary walk"
+        );
+        assert!(
+            !remote.catalog_present(&moved),
+            "local history cutoffs cannot prove residency"
+        );
+        let first = effects.children_run().len();
+        let repaired = remote.tag_catalog();
+        std::fs::remove_file(cutoff).unwrap();
+        assert_eq!(parse_tags(&repaired.unwrap()).unwrap(), moved);
+        assert!(
+            imported_since(first),
+            "missing parent history must be imported again"
+        );
+        assert_eq!(
+            git(&target, &["show", &format!("{older}:line.toml")]),
+            "earlier release"
+        );
+    }
     assert_eq!(remote.tag_commit("v1").unwrap(), Some(commit));
     assert_eq!(remote.tag_commit("absent").unwrap(), None);
     assert!(remote.tag_commit("tree-only").is_err());
+    assert!(remote.tag_commit("blob-only").is_err());
     assert_eq!(git(&target, &["rev-parse", "HEAD"]), head);
     assert_eq!(
         before,
         names.map(|name| std::fs::read(gitdir.join(name)).unwrap())
+    );
+    git(
+        &target,
+        &[
+            "config",
+            "url.https://other.invalid/.insteadOf",
+            "https://github.com/",
+        ],
+    );
+    let first = effects.children_run().len();
+    assert!(
+        remote.tag_catalog().is_err(),
+        "a cached catalog cannot bypass source configuration"
+    );
+    assert!(effects.children_run()[first..].iter().all(|child| {
+        !child
+            .args
+            .iter()
+            .any(|arg| arg == "ls-remote" || arg == "fetch")
+    }));
+    std::fs::write(gitdir.join("config"), &before[2]).unwrap();
+    // A failed first observation does not poison a later successful catalog.
+    let retry = Remote::new(remote.client.clone(), remote.slug.clone(), &target).unwrap();
+    let offline = root.path().join("offline.git");
+    std::fs::rename(&bare, &offline).unwrap();
+    let cached_unavailable = remote.tag_catalog();
+    let unavailable = retry.tag_catalog();
+    std::fs::rename(&offline, &bare).unwrap();
+    assert!(
+        cached_unavailable.is_err(),
+        "a cached catalog is no current advertisement"
+    );
+    assert!(unavailable.is_err());
+    let first = effects.children_run().len();
+    assert_eq!(parse_tags(&retry.tag_catalog().unwrap()).unwrap(), moved);
+    assert!(
+        imported_since(first),
+        "a failed first observation is not a cached answer"
     );
     git(
         &target,

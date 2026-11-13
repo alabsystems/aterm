@@ -983,6 +983,7 @@ fn emergency_reap_and_report(
             detail,
             input_drain_spins: 0,
             child_death: crate::ChildDeathEvidence::Unobserved,
+            successor_start: SuccessorStart::Unlaunched,
         },
     ));
 }
@@ -997,28 +998,6 @@ impl HandoffWorkerCleanup {
             crate::control_auth::publish_latest_link(latest_link, socket_path);
         }
     }
-}
-
-#[cfg(unix)]
-fn make_cloexec_pipe() -> Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
-    use std::os::fd::{AsRawFd as _, FromRawFd as _};
-    aterm_uds::kept_out(|| {
-        let mut raw = [0i32; 2];
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let created = unsafe { libc::pipe2(raw.as_mut_ptr(), libc::O_CLOEXEC) };
-        #[cfg(not(any(target_os = "linux", target_os = "android")))]
-        let created = unsafe { libc::pipe(raw.as_mut_ptr()) };
-        if created != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: fresh pipe fds, exclusively owned from here.
-        let rd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw[0]) };
-        let wr = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw[1]) };
-        aterm_pty::set_cloexec(rd.as_raw_fd(), true)?;
-        aterm_pty::set_cloexec(wr.as_raw_fd(), true)?;
-        Ok((rd, wr))
-    })
-    .ok()
 }
 
 #[cfg(unix)]
@@ -1165,6 +1144,51 @@ fn handoff_candidate_terminated(candidate: HandoffCandidate) -> bool {
         return true;
     }
     candidate.identity() == HandoffCandidateIdentity::Recycled
+}
+
+/// Whether a candidate this process cannot `waitid` has ended: its pid fell vacant or names another
+/// process ([`handoff_candidate_terminated`]), or the kernel shows it exiting or exited and not yet
+/// reaped ([`handoff_candidate_exiting`]). `kill` answers for a zombie as for a live process
+/// (POSIX), so the first alone reads a launched candidate that ended moments ago, before launchd
+/// reaped it, as one still running.
+#[cfg(unix)]
+#[must_use]
+fn handoff_candidate_ended(candidate: HandoffCandidate) -> bool {
+    handoff_candidate_terminated(candidate) || handoff_candidate_exiting(candidate)
+}
+
+/// Whether the kernel shows this very candidate (its birth matching, where one was captured) in
+/// `exit()` or exited and not yet reaped: positive evidence only, so a record the kernel does not
+/// give says nothing.
+#[cfg(target_os = "macos")]
+#[must_use]
+fn handoff_candidate_exiting(candidate: HandoffCandidate) -> bool {
+    /// `<sys/proc_info.h>`: the process is working its way in `exit()`.
+    const PROC_FLAG_INEXIT: u32 = 4;
+    let Ok(pid) = libc::pid_t::try_from(candidate.pid) else {
+        return false;
+    };
+    if pid <= 1 {
+        return false;
+    }
+    let Some(info) = crate::quit_safety::pid_bsdinfo_unreaped_too(pid) else {
+        return false;
+    };
+    let this_one = candidate.birth.is_none_or(|birth| {
+        birth
+            == HandoffCandidateBirth {
+                seconds: info.pbi_start_tvsec,
+                microseconds: info.pbi_start_tvusec,
+            }
+    });
+    this_one && (info.pbi_status == libc::SZOMB || info.pbi_flags & PROC_FLAG_INEXIT != 0)
+}
+
+/// See the macOS twin: no reader here.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[must_use]
+const fn handoff_candidate_exiting(_candidate: HandoffCandidate) -> bool {
+    false
 }
 
 /// Whether this process leads its own process group, so a rejecting parent's `kill` reaches the updater helpers a candidate forks.
@@ -1400,9 +1424,9 @@ impl HandoffCandidateHandle {
                 libc::pid_t::try_from(candidate.pid)
                     .is_ok_and(|pid| probe_handoff_candidate(pid) == HandoffCandidateProbe::Exited)
             }
-            Self::Forked(_) => handoff_candidate_terminated(candidate),
+            Self::Forked(_) => handoff_candidate_ended(candidate),
             #[cfg(target_os = "macos")]
-            Self::Launched(_) => handoff_candidate_terminated(candidate),
+            Self::Launched(_) => handoff_candidate_ended(candidate),
         }
     }
 }
@@ -1979,12 +2003,19 @@ impl crate::UpdateHandoffCompletion {
             detail: detail.into(),
             input_drain_spins: 0,
             child_death: crate::ChildDeathEvidence::Unobserved,
+            successor_start: SuccessorStart::Unlaunched,
         }
     }
 
     #[must_use]
     const fn with_child_death(mut self, death: crate::ChildDeathEvidence) -> Self {
         self.child_death = death;
+        self
+    }
+
+    #[must_use]
+    const fn with_successor_start(mut self, start: SuccessorStart) -> Self {
+        self.successor_start = start;
         self
     }
 }
@@ -2032,7 +2063,13 @@ fn send_post_failure_reconcile_facts(
     }
 }
 
+/// `start`: how far the proof wait's progress reports said the successor got through its start
+/// ([`SuccessorProgress::start`]).
 #[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the worker's custody of the candidate, plus what the proof wait heard of it"
+)]
 fn worker_reject_and_reap_handoff_child(
     job: &HandoffWorkerJob,
     proxy: &aterm_window::event_loop::EventLoopProxy<Wake>,
@@ -2041,6 +2078,7 @@ fn worker_reject_and_reap_handoff_child(
     nonce: &str,
     outcome: crate::UpdateHandoffOutcome,
     detail: String,
+    start: SuccessorStart,
 ) -> bool {
     if !worker_claim_handoff_reaper(&job.arbiter) {
         return false;
@@ -2069,7 +2107,8 @@ fn worker_reject_and_reap_handoff_child(
             outcome,
             detail,
         )
-        .with_child_death(child_death),
+        .with_child_death(child_death)
+        .with_successor_start(start),
     );
     if forgives_the_counted_trial_launch(child_death, job.current_build, job.target_build) {
         forgive_candidate_trial_launch(job, candidate);
@@ -2078,6 +2117,66 @@ fn worker_reject_and_reap_handoff_child(
         send_post_failure_reconcile_facts(&job.cleanup, proxy, job.current_build);
     }
     true
+}
+
+/// The bytes a handoff launched its successor from, as the window names them to
+/// `aterm_update`'s window-start failure record.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchedBytes {
+    /// A downloaded artifact, by its build and DMG digest: the pre-launch swap installs exactly
+    /// these, so the trial and the receipt key them by the same digest.
+    Download { build: u64, dmg_sha256: [u8; 32] },
+    /// The build already installed in this window's place (an installed activation). Its
+    /// attempt's digest is made up for the activation and matches no artifact, so the record
+    /// keys it by the installed receipt's digest for that build, or not at all.
+    Installed { build: u64 },
+}
+
+#[cfg(unix)]
+impl LaunchedBytes {
+    /// The build these bytes are.
+    pub(crate) const fn build(self) -> u64 {
+        match self {
+            Self::Download { build, .. } | Self::Installed { build } => build,
+        }
+    }
+
+    /// These bytes as `aterm_update` names them, a download's digest spelled into `hex`.
+    pub(crate) fn as_failed_start(self, hex: &mut String) -> aterm_update::FailedStartBytes<'_> {
+        match self {
+            Self::Download { build, dmg_sha256 } => {
+                *hex = aterm_codec::hex::encode_lower(&dmg_sha256);
+                aterm_update::FailedStartBytes::Download {
+                    build,
+                    dmg_sha256: hex.as_str(),
+                }
+            }
+            Self::Installed { build } => aterm_update::FailedStartBytes::Installed { build },
+        }
+    }
+}
+
+/// The bytes a handoff launched its successor from: none for a same-image successor
+/// (`same_image`), which ran this image and not the target's, nor for an attempt that names no
+/// artifact. An installed activation names the installed build, never its made-up digest.
+#[cfg(unix)]
+fn launched_target_bytes(
+    same_image: bool,
+    apply_attempt: Option<&crate::native_updater_service::ApplyAttemptTicket>,
+) -> Option<LaunchedBytes> {
+    if same_image {
+        return None;
+    }
+    let attempt = apply_attempt?;
+    let build = attempt.target_build();
+    if attempt.is_installed_activation() {
+        return Some(LaunchedBytes::Installed { build });
+    }
+    Some(LaunchedBytes::Download {
+        build,
+        dmg_sha256: crate::app_native::decode_dmg_sha256(attempt.target_dmg_sha256())?,
+    })
 }
 
 #[cfg(unix)]
@@ -2099,9 +2198,12 @@ fn observe_candidate_death(
         return (reaped.warrant, crate::ChildDeathEvidence::Unobserved);
     }
     let witnessed_before_the_kill = handle.witnessed_exit_status();
-    let died_before_we_signalled = witnessed_before_the_kill.is_some()
-        || libc::pid_t::try_from(candidate.pid)
-            .is_ok_and(|pid| probe_handoff_candidate(pid) == HandoffCandidateProbe::Exited);
+    // Our own fork child is probed without consuming its status; a launched one, which is not our
+    // child, is read as gone once its pid falls vacant or names another process, or the kernel
+    // shows it exiting or a zombie (`handoff_candidate_ended`), so one that ended unwatched before
+    // launchd reaped it is not called ours.
+    let died_before_we_signalled =
+        witnessed_before_the_kill.is_some() || handle.candidate_gone(candidate);
     let reaped = kill_and_reap_handoff_child(candidate, handle);
     let status = witnessed_before_the_kill
         .or(reaped.status)
@@ -2131,18 +2233,23 @@ fn handoff_child_death(
     status: Option<std::process::ExitStatus>,
 ) -> crate::ChildDeathEvidence {
     use std::os::unix::process::ExitStatusExt as _;
-    let Some(status) = status else {
-        return crate::ChildDeathEvidence::Unobserved;
-    };
-    if let Some(code) = status.code() {
-        return crate::ChildDeathEvidence::Exited { code };
+    if let Some(status) = status {
+        if let Some(code) = status.code() {
+            return crate::ChildDeathEvidence::Exited { code };
+        }
+        if let Some(signal) = status.signal()
+            && (died_before_we_signalled || signal != libc::SIGKILL)
+        {
+            return crate::ChildDeathEvidence::Signalled { signal };
+        }
     }
-    if let Some(signal) = status.signal()
-        && (died_before_we_signalled || signal != libc::SIGKILL)
-    {
-        return crate::ChildDeathEvidence::Signalled { signal };
+    // Neither its own exit nor a signal another sent: a candidate seen running when this process
+    // moved to end it ended by this process's hand, whatever status (its SIGKILL, or none) followed.
+    if died_before_we_signalled {
+        crate::ChildDeathEvidence::Unobserved
+    } else {
+        crate::ChildDeathEvidence::EndedHere
     }
-    crate::ChildDeathEvidence::Unobserved
 }
 
 #[cfg(unix)]
@@ -2370,13 +2477,43 @@ unsafe fn fork_lane_child_holds(
     Ok(())
 }
 
+/// Make the fork lane's successor, before its `exec`, lead a process group of its own, keep
+/// nothing else this process holds, and keep each of `handed` open across the `exec`
+/// ([`fork_lane_child_holds`]): its spawn fails where one of them is not in the forked child.
+#[cfg(unix)]
+fn hand_to_fork_lane_child(
+    command: &mut aterm_uds::spawnfd::StdCommand,
+    handed: Vec<std::os::fd::RawFd>,
+) {
+    use std::os::unix::process::CommandExt as _;
+    let strip = aterm_uds::spawnfd::InheritStrip::prepare();
+    // SAFETY: pre-exec closure calls only async-signal-safe functions (`setpgid`, `fcntl`, `InheritStrip::apply`) on captured integers.
+    unsafe {
+        command.pre_exec(move || fork_lane_child_holds(strip, &handed));
+    }
+}
+
+/// Spawn the fork lane's successor, whose `command` keeps `handed` ([`hand_to_fork_lane_child`]).
+#[cfg(unix)]
+fn spawn_fork_lane_successor(
+    command: &mut aterm_uds::spawnfd::StdCommand,
+    handed: &[std::os::fd::RawFd],
+) -> std::io::Result<std::process::Child> {
+    // The fork the spawn makes keeps what the child holds (`fork_lane_child_holds`): the proof
+    // and Commit ends are kept out of children (`aterm_uds::pipe`, `FD_CLOFORK`), so each
+    // handed descriptor loses its mark for this fork alone, or the fork closes it in the child.
+    let spawning = aterm_uds::spawn_lock::handing(handed);
+    let spawned = command.spawn();
+    drop(spawning);
+    spawned
+}
+
 #[cfg(unix)]
 fn run_handoff_worker(
     mut job: HandoffWorkerJob,
     proxy: aterm_window::event_loop::EventLoopProxy<Wake>,
 ) {
     use std::os::fd::AsRawFd as _;
-    use std::os::unix::process::CommandExt as _;
 
     if handoff_preparation_cancelled(&job, &proxy, None) {
         return;
@@ -2485,12 +2622,7 @@ fn run_handoff_worker(
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
     child_inherit.extend(crate::lab_window_custody::descriptors());
     let handed = child_inherit.clone();
-    let strip = aterm_uds::spawnfd::InheritStrip::prepare();
-    // SAFETY: pre-exec closure calls only async-signal-safe functions (`setpgid`, `fcntl`, `InheritStrip::apply`) on captured integers.
-    unsafe {
-        job.command
-            .pre_exec(move || fork_lane_child_holds(strip, &child_inherit));
-    }
+    hand_to_fork_lane_child(&mut job.command, child_inherit);
     crate::descriptor_limit::start_older_image_at_its_limit(
         &mut job.command,
         job.target_build,
@@ -2500,10 +2632,7 @@ fn run_handoff_worker(
     if handoff_preparation_cancelled(&job, &proxy, Some(nonce.clone())) {
         return;
     }
-    let spawning = aterm_uds::spawn_lock::spawning();
-    let spawned = job.command.spawn();
-    drop(spawning);
-    let child = match spawned {
+    let child = match spawn_fork_lane_successor(&mut job.command, &handed) {
         Ok(child) => child,
         Err(error) => {
             send_handoff_producer_failure(
@@ -2559,23 +2688,23 @@ struct AttemptPipes {
 #[cfg(unix)]
 impl AttemptPipes {
     fn make() -> Result<Self, String> {
-        let Some((proof_rd, proof_wr)) = make_cloexec_pipe() else {
-            let kind = std::io::Error::last_os_error().kind();
-            return Err(format!(
-                "could not create the adoption-proof channel ({kind})"
-            ));
-        };
-        let Some((commit_rd, commit_wr)) = make_cloexec_pipe() else {
-            let kind = std::io::Error::last_os_error().kind();
-            return Err(format!(
-                "could not create the handoff-commit channel ({kind})"
-            ));
-        };
+        let (proof_rd, proof_wr) = aterm_uds::pipe().map_err(|error| {
+            format!(
+                "could not create the adoption-proof channel ({})",
+                error.kind()
+            )
+        })?;
+        let (commit_rd, commit_wr) = aterm_uds::pipe().map_err(|error| {
+            format!(
+                "could not create the handoff-commit channel ({})",
+                error.kind()
+            )
+        })?;
         Ok(Self {
-            proof_rd,
-            proof_wr,
-            commit_rd,
-            commit_wr,
+            proof_rd: proof_rd.into(),
+            proof_wr: proof_wr.into(),
+            commit_rd: commit_rd.into(),
+            commit_wr: commit_wr.into(),
         })
     }
 }
@@ -3806,6 +3935,7 @@ fn run_prelaunched_handoff(
                 &lane.nonce,
                 crate::UpdateHandoffOutcome::Rejected,
                 format!("the handoff descriptors were delivered but the grant was not: {error}"),
+                SuccessorStart::Unlaunched,
             );
             debug_assert!(rejected, "Commit is unreachable before the grant body");
             return Prelaunched::Finished;
@@ -3939,17 +4069,32 @@ fn run_handoff_decision(
     #[cfg(target_os = "macos")] corroboration: Option<LaunchCorroboration<'_>>,
 ) {
     let live = job.capture().live.clone();
-    let proof_outcome = wait_handoff_ready(
+    let ProofWaitEnd {
+        outcome: proof_outcome,
+        progress,
+    } = wait_handoff_ready(
         proof_rd,
         expected,
         &job.cancel,
         &live.iter().map(|(_, fd, _)| *fd).collect::<Vec<_>>(),
         deadline,
+        PROGRESS_SILENCE_BOUND,
+        &mut || SuccessorWork::of(candidate.pid),
         &mut || handle.candidate_gone(candidate),
         #[cfg(target_os = "macos")]
         corroboration,
     );
     if proof_outcome != crate::UpdateHandoffOutcome::ProofReady {
+        if matches!(
+            proof_outcome,
+            crate::UpdateHandoffOutcome::Stalled | crate::UpdateHandoffOutcome::TimedOut
+        ) {
+            aterm_log::warn!(
+                "update apply: candidate {} ended {proof_outcome:?} — {progress}; every parked \
+                 session resumes in this process",
+                candidate.pid
+            );
+        }
         // A refusing, crashed or starved successor all close the readiness channel alike;
         // the successor logs its own refusal and the reject path adds what this process
         // saw.
@@ -3970,7 +4115,8 @@ fn run_handoff_decision(
             candidate,
             nonce,
             proof_outcome,
-            format!("handoff proof ended {proof_outcome:?}"),
+            format!("handoff proof ended {proof_outcome:?} ({progress})"),
+            progress.start(),
         );
         debug_assert!(rejected, "Commit is unreachable before ProofReady");
         return;
@@ -3989,6 +4135,7 @@ fn run_handoff_decision(
         detail: "child painted and proved exact readerless adoption".to_string(),
         input_drain_spins: 0,
         child_death: crate::ChildDeathEvidence::Unobserved,
+        successor_start: progress.start(),
     });
     if proxy.send_event(ready).is_err() {
         let rejected = worker_reject_and_reap_handoff_child(
@@ -3999,6 +4146,7 @@ fn run_handoff_decision(
             nonce,
             crate::UpdateHandoffOutcome::Rejected,
             "event loop closed before final handoff admission".to_string(),
+            progress.start(),
         );
         debug_assert!(rejected, "Commit is unreachable after a failed ready wake");
         return;
@@ -4018,6 +4166,7 @@ fn run_handoff_decision(
                 nonce,
                 crate::UpdateHandoffOutcome::ActivityRevoked,
                 "structural activity revoked handoff before Commit".to_string(),
+                progress.start(),
             )
         {
             return;
@@ -4031,6 +4180,7 @@ fn run_handoff_decision(
                 nonce,
                 crate::UpdateHandoffOutcome::ActivityRevoked,
                 "a handed-off PTY session closed before Commit".to_string(),
+                progress.start(),
             )
         {
             return;
@@ -4045,6 +4195,7 @@ fn run_handoff_decision(
                     nonce,
                     crate::UpdateHandoffOutcome::Rejected,
                     "final handoff admission rejected before Commit".to_string(),
+                    progress.start(),
                 ) {
                     return;
                 }
@@ -4060,6 +4211,7 @@ fn run_handoff_decision(
                 nonce,
                 crate::UpdateHandoffOutcome::Rejected,
                 "the successor ended after proving adoption, before Commit".to_string(),
+                progress.start(),
             )
         {
             return;
@@ -4073,6 +4225,7 @@ fn run_handoff_decision(
                 nonce,
                 crate::UpdateHandoffOutcome::Rejected,
                 "main-thread final handoff decision timed out".to_string(),
+                progress.start(),
             )
         {
             return;
@@ -4642,9 +4795,26 @@ impl App {
                 ));
             }
         };
-        if let Some(hold) = self.system_state_handoff_hold() {
+        // aterm's own Mac Setup tab that cannot travel holds the handoff while its program runs.
+        // One that sits at its password prompt nobody has touched for its backstop is stopped, on
+        // the sheet's terms: only by an update's apply, and only once nothing else checked here
+        // holds this attempt.
+        #[cfg(target_os = "macos")]
+        let stop_prompts = match self.system_state_handoff_hold() {
+            Some(crate::native_update_lane_hold::LaneHold::DeveloperTools)
+                if apply_attempt.is_some() =>
+            {
+                self.developer_tools_prompts_untouched(crate::metrics::now_us())
+            }
+            _ => None,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let stop_prompts: Option<Vec<u64>> = None;
+        if let Some(hold) = self.system_state_handoff_hold()
+            && stop_prompts.is_none()
+        {
             let words = if hold == crate::native_update_lane_hold::LaneHold::DeveloperTools {
-                "a Command Line Tools install's tab is still running"
+                "a Mac Setup tab is still running"
             } else {
                 "a System State Apply or Restore is still pending"
             };
@@ -4671,6 +4841,11 @@ impl App {
                 "a new tab is still starting",
             ));
         }
+        // The stopping attempt still holds on the tab, so its program's end is read before the
+        // next attempt parks, never in the middle of a handoff.
+        #[cfg(target_os = "macos")]
+        let stopped_prompt =
+            stop_prompts.map(|sessions| self.stop_untouched_developer_tools_prompts(&sessions) > 0);
         // The refusing attempt still holds on the sheet, so the `sudo` that asked settles before
         // the next attempt parks, never in the middle of a handoff.
         #[cfg(target_os = "macos")]
@@ -4681,6 +4856,18 @@ impl App {
                     "an untouched sudo password prompt was refused; the next attempt goes on"
                 } else {
                     "a sudo password prompt is still open"
+                },
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        if let Some(stopped) = stopped_prompt {
+            return Err(crate::UpdateHandoffStartError::activity(
+                crate::native_update_lane_hold::LaneHold::DeveloperTools,
+                if stopped {
+                    "an untouched Mac Setup password prompt was stopped; the next \
+                     attempt goes on"
+                } else {
+                    "a Mac Setup tab is still running"
                 },
             ));
         }
@@ -7849,6 +8036,51 @@ impl App {
         outcome
     }
 
+    /// A successor launched from `bytes` started here (`how`: it presented its first window, or
+    /// proved exact adoption), whatever then happened to its attempt (a stall or a timeout after
+    /// its first frame, or a Commit that activity refused, keeping the intent). The record that a
+    /// window here saw those exact bytes fail to start is withdrawn, so the windowless lanes may
+    /// install them again (`aterm_update::withdraw_window_start_failure`); a record of other bytes
+    /// stays.
+    #[cfg(unix)]
+    fn forget_failed_start_of(bytes: LaunchedBytes, how: &str) {
+        let mut hex = String::new();
+        if aterm_update::withdraw_window_start_failure(bytes.as_failed_start(&mut hex)) {
+            aterm_log::info!(
+                "update apply: build {}'s successor {how} here, so the record that a window here \
+                 saw those bytes fail to start is withdrawn",
+                bytes.build()
+            );
+        }
+    }
+
+    /// A successor launched from `bytes` failed to start (`signature` says how, in diagnostic
+    /// words): booked durably in `aterm_update`'s window-start failure record, which outlives this
+    /// window, so no windowless lane installs those exact bytes nor settles a trial of them as
+    /// proven. Written on the event loop once the returned handoff gave back its parked sessions
+    /// (a durable write that may wait on its lock), as the ledger's failure is, so a later
+    /// withdraw of the same bytes comes after it.
+    #[cfg(unix)]
+    fn record_failed_start_of(bytes: LaunchedBytes, signature: &str) {
+        let mut hex = String::new();
+        match aterm_update::record_window_start_failure(
+            crate::running_build_number(),
+            bytes.as_failed_start(&mut hex),
+            signature,
+        ) {
+            Ok(()) => aterm_log::info!(
+                "update apply: build {}'s successor failed to start here ({signature}): booked, so \
+                 no windowless start installs those bytes or settles them as proven",
+                bytes.build()
+            ),
+            Err(error) => aterm_log::warn!(
+                "update apply: build {}'s successor failed to start here ({signature}), but that \
+                 could not be booked: {error}",
+                bytes.build()
+            ),
+        }
+    }
+
     #[cfg(unix)]
     fn finish_proven_handoff(&mut self, completion: crate::UpdateHandoffCompletion) {
         let first_proof = {
@@ -7862,6 +8094,15 @@ impl App {
             pending.child_pid = completion.child_pid;
             pending.proof_ready_at.is_none()
         };
+        // Once per attempt: the drain gate below reposts this completion every few milliseconds
+        // until its fence holds, and a respin has nothing new to say of the bytes.
+        if first_proof
+            && let Some(proven) = self.pending_update_handoff.as_ref().and_then(|pending| {
+                launched_target_bytes(pending.same_image.is_some(), pending.apply_attempt.as_ref())
+            })
+        {
+            Self::forget_failed_start_of(proven, "proved exact adoption");
+        }
         if first_proof && let Some(title) = self.publish_handoff_target_to_menu_bar() {
             aterm_log::info!("update apply: Version menu now reads the successor's {title}");
         }
@@ -7916,6 +8157,7 @@ impl App {
             detail: _detail,
             input_drain_spins: _input_drain_spins,
             child_death: _child_death,
+            successor_start,
         } = completion;
         let admitted = commit_admitted && commit_fd.is_some() && proof.is_some();
         let claim = claimed || (admitted && arbiter.try_begin_commit());
@@ -7949,6 +8191,7 @@ impl App {
                     detail: _detail,
                     input_drain_spins: 0,
                     child_death: _child_death,
+                    successor_start,
                 });
                 return;
             }
@@ -8627,10 +8870,13 @@ impl App {
                     .as_millis()
             ),
             crate::HeldPersonApplyGate::BootHealth => aterm_log::info!(
-                "update apply: a person's Install is held for build {} until this aterm \
-                 confirms the running build's boot health; its row stays up and the \
-                 confirmation event runs it",
-                held.target_build
+                "update apply: a person's Install is held for build {} until this aterm's \
+                 boot-health gate opens: an answer that settles the running build's trial, {} \
+                 asks in a row nothing answers, or {} s of answers that the trial is pending; \
+                 its row stays up and the gate's opening runs it through the durable trial gate",
+                held.target_build,
+                crate::BOOT_HEALTH_UNANSWERED_TRIES,
+                crate::BOOT_HEALTH_PENDING_PATIENCE.as_secs()
             ),
         }
         self.begin_update_installing(true);
@@ -8678,7 +8924,9 @@ impl App {
         self.record_update_switch_stopped(false, HELD_PRESS_SUPERSEDED);
     }
 
-    /// The event loop's next look at a held press.
+    /// The event loop's next look at a held press: its read's end, or the boot-health gate's
+    /// next look, which is its next ask or the instant its patience with Pending answers runs
+    /// out, whichever is first. Every gate the press waits on ends on a clock, so the press does.
     #[cfg(unix)]
     #[must_use]
     pub(crate) fn held_person_apply_deadline(
@@ -8689,9 +8937,7 @@ impl App {
             crate::HeldPersonApplyGate::Preverify { until } => {
                 until.min(now + crate::app_native::PREVERIFY_READ_POLL)
             }
-            crate::HeldPersonApplyGate::BootHealth => self
-                .boot_health_confirmation_retry_at
-                .unwrap_or(now + crate::BOOT_HEALTH_RETRY_MIN),
+            crate::HeldPersonApplyGate::BootHealth => self.boot_health_next_look(now),
         })
     }
 
@@ -9119,6 +9365,7 @@ impl App {
             detail,
             input_drain_spins: _input_drain_spins,
             child_death,
+            successor_start,
         } = completion;
         let parked = self
             .pending_update_handoff
@@ -9180,6 +9427,32 @@ impl App {
         self.release_window_closes_the_teardown_dropped(&teardown);
         if let Some(live) = pending.parked_live.as_deref() {
             self.rollback_overlap(nonce.as_deref(), live);
+        }
+        // Whatever lane it books and whoever asked for it, a successor launched from the target's
+        // bytes is evidence about those bytes: one that failed to start marks them, and one that
+        // presented its first window shows they start here, whatever ended its attempt after.
+        // Booked once the parked sessions are given back, so their readers never wait on the
+        // record's durable write or its lock, and still on this loop before any later completion
+        // can withdraw the same bytes.
+        if let Some(bytes) =
+            launched_target_bytes(pending.same_image.is_some(), pending.apply_attempt.as_ref())
+        {
+            if crate::app_native::PhysicalFailureShape::successor_failed_to_start(
+                outcome,
+                child_death,
+                successor_start,
+            ) {
+                Self::record_failed_start_of(
+                    bytes,
+                    &crate::app_native::PhysicalFailureShape::failed_start_signature(
+                        outcome,
+                        child_death,
+                        successor_start,
+                    ),
+                );
+            } else if successor_start == SuccessorStart::Presented {
+                Self::forget_failed_start_of(bytes, "presented its first window");
+            }
         }
         self.drive_owed_document_journals();
         self.retire_update_installing();
@@ -10678,24 +10951,42 @@ fn file_undialled_retire(
     grace: std::time::Duration,
     patience: std::time::Duration,
 ) -> UndialledRetire {
-    let (outcome, detail) = match end {
+    let (missed_the_dial, mut detail) = match end {
+        LaunchedDialEnd::Rendezvous(
+            error @ crate::handoff_rendezvous::RendezvousError::PeerCode { .. },
+        ) => (
+            false,
+            format!("no rendezvous dialer was admitted before the dial deadline: {error}"),
+        ),
         LaunchedDialEnd::Rendezvous(error) => (
-            crate::UpdateHandoffOutcome::TimedOut,
-            if matches!(
-                error,
-                crate::handoff_rendezvous::RendezvousError::PeerCode { .. }
-            ) {
-                format!("no rendezvous dialer was admitted before the dial deadline: {error}")
-            } else {
-                format!("the launched successor never claimed the handoff: {error}")
-            },
+            *error == crate::handoff_rendezvous::RendezvousError::Deadline,
+            format!("the launched successor never claimed the handoff: {error}"),
         ),
         _ => (
-            crate::UpdateHandoffOutcome::ActivityRevoked,
+            false,
             "structural activity revoked the handoff before the successor dialled".to_string(),
         ),
     };
     let stood = stand_down_undialled_successor(rendezvous, in_flight, named, grace, patience);
+    // A successor this process had to kill was running its own code (LaunchServices or its own
+    // launch stamp named it) through the whole dial bound, the naming patience and the
+    // self-exit grace without dialling: hung before the dial (an AppKit launch held by an alert
+    // nobody sees, a deadlock), which is evidence against its image like a granted successor's
+    // silence. One that exited by itself, or that nothing named, says nothing of the kind.
+    let outlived_the_dial = missed_the_dial
+        && matches!(
+            &stood,
+            UndialledStandDown::Gone { steps, .. } if steps.contains(&StandDownStep::Kill)
+        );
+    let outcome = if outlived_the_dial {
+        detail.push_str("; ");
+        detail.push_str(crate::update_apply_trouble::PRE_DIAL_STALL);
+        crate::UpdateHandoffOutcome::Stalled
+    } else if matches!(end, LaunchedDialEnd::Rendezvous(_)) {
+        crate::UpdateHandoffOutcome::TimedOut
+    } else {
+        crate::UpdateHandoffOutcome::ActivityRevoked
+    };
     let (named, death) = match &stood {
         UndialledStandDown::Gone {
             named,
@@ -11028,13 +11319,408 @@ impl LaunchCorroboration<'_> {
     }
 }
 
+/// How long a granted successor that reports progress may go without a new report, and without
+/// working ([`SuccessorWork`]), before the outgoing process ends the attempt and resumes every
+/// parked session ([`ProgressWatch`]).
+///
+/// Healthy successors measured on one Mac (m16, an M5 Max: 25 handoffs) proved 161, 186 and 387
+/// ms (min, median, max) after their claim, and their reports came at most about 245 ms apart
+/// (between `resumed` and `first_present`). Three seconds is twelve times that worst gap and a
+/// twentieth of the hang detector a silent successor used to hold every session for. Reports are
+/// events, not a heartbeat, and no slower or loaded Mac has been measured, so silence alone never
+/// ends an attempt: at the bound the successor's own CPU time and page-ins are read, and one
+/// still working gets another bound. A slow successor that keeps reporting or working is never
+/// ended by it; only [`HANDOFF_HANG_DETECTOR_MS`] bounds the whole wait.
 #[cfg(unix)]
+pub(crate) const PROGRESS_SILENCE_BOUND: std::time::Duration = std::time::Duration::from_secs(3);
+
+#[cfg(unix)]
+const _: () = assert!(PROGRESS_SILENCE_BOUND.as_millis() * 10 <= HANDOFF_HANG_DETECTOR_MS as u128);
+
+/// The share of one core, in percent, a silent successor must have used across a silence to count
+/// as working: 150 ms of CPU in three seconds. A main thread doing startup work takes far more,
+/// even on a contended machine. A deadlocked process, or a run loop idling under a modal alert,
+/// wakes only background threads: idle AppKit processes on m16 used 0 to 0.8% of a core over ten
+/// seconds (Dock and SystemUIServer 0, Finder 0.8%).
+#[cfg(unix)]
+const WORKING_CPU_PERCENT: u128 = 5;
+
+/// Page-ins across a silence that count as working: 64 pages, 1 MiB of 16 KiB pages read back, is
+/// a successor faulting its working set in under swap while its CPU waits on the disk. A process
+/// whose threads all block touches no pages, and an idle run loop touches a few hot ones; this
+/// floor is reasoned from that, not measured on a hung successor (the stall warning records the
+/// numbers it saw).
+#[cfg(unix)]
+const WORKING_PAGEINS: u64 = 64;
+
+/// What the kernel says a successor has done so far, read without its cooperation: its CPU time
+/// and its page-ins. A successor stuck in one long step that is still working (computing, or
+/// reading its pages back under swap) moves one of them; one that is hung (deadlocked, or waiting
+/// on a modal alert nobody sees) moves neither.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SuccessorWork {
+    /// User plus system CPU time, in nanoseconds.
+    pub(crate) cpu_ns: u64,
+    /// Pages read in from backing store.
+    pub(crate) pageins: u64,
+}
+
+#[cfg(unix)]
+impl SuccessorWork {
+    /// `pid`'s work so far, or `None` where the kernel does not say (another platform, a process
+    /// gone or not this user's).
+    #[must_use]
+    pub(crate) fn of(pid: u32) -> Option<Self> {
+        #[cfg(target_os = "macos")]
+        {
+            let pid = libc::pid_t::try_from(pid).ok()?;
+            let info = crate::input_stall::pid_task_info(pid)?;
+            let (numer, denom) = aterm_sysprobe::procs::kernel_timebase()?;
+            let ticks = u128::from(info.pti_total_user) + u128::from(info.pti_total_system);
+            Some(Self {
+                cpu_ns: u64::try_from(ticks * u128::from(numer) / u128::from(denom.max(1))).ok()?,
+                pageins: u64::try_from(info.pti_pageins).unwrap_or(0),
+            })
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let pid = libc::pid_t::try_from(pid).ok()?;
+            Some(Self {
+                cpu_ns: crate::input_stall::pid_cpu_ns(pid)?,
+                pageins: crate::input_stall::pid_major_faults(pid)?,
+            })
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = pid;
+            None
+        }
+    }
+}
+
+/// The work a successor did across one silence.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WorkWindow {
+    pub(crate) cpu: std::time::Duration,
+    pub(crate) pageins: u64,
+    pub(crate) wall: std::time::Duration,
+}
+
+#[cfg(unix)]
+impl WorkWindow {
+    #[must_use]
+    pub(crate) fn between(
+        earlier: SuccessorWork,
+        later: SuccessorWork,
+        wall: std::time::Duration,
+    ) -> Self {
+        Self {
+            cpu: std::time::Duration::from_nanos(later.cpu_ns.saturating_sub(earlier.cpu_ns)),
+            pageins: later.pageins.saturating_sub(earlier.pageins),
+            wall,
+        }
+    }
+
+    /// Whether the successor was working across this window ([`WORKING_CPU_PERCENT`],
+    /// [`WORKING_PAGEINS`]).
+    #[must_use]
+    pub(crate) fn working(self) -> bool {
+        self.pageins >= WORKING_PAGEINS
+            || (!self.wall.is_zero()
+                && self.cpu.as_nanos() * 100 >= self.wall.as_nanos() * WORKING_CPU_PERCENT)
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for WorkWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ms CPU and {} page-in(s) in {} ms",
+            self.cpu.as_millis(),
+            self.pageins,
+            self.wall.as_millis()
+        )
+    }
+}
+
+/// What the outgoing process heard from a granted successor before its wait ended.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SuccessorProgress {
+    /// Progress reports read.
+    pub(crate) reports: u32,
+    /// A report said the successor's native launch had finished.
+    pub(crate) launched: bool,
+    /// A report said the successor had presented its first window: its bytes start here.
+    pub(crate) presented: bool,
+    /// The last report read.
+    pub(crate) last: Option<crate::handoff_progress::Report>,
+    /// From the last report (or the wait's start, before any) to the end of the wait.
+    pub(crate) quiet_for: std::time::Duration,
+    /// Silences the successor's own work carried past the bound.
+    pub(crate) worked_through: u32,
+    /// Its work across the last silence judged, if one was.
+    pub(crate) last_window: Option<WorkWindow>,
+}
+
+#[cfg(unix)]
+impl SuccessorProgress {
+    /// How far its reports said it got through its start.
+    #[must_use]
+    pub(crate) const fn start(&self) -> SuccessorStart {
+        if self.presented {
+            SuccessorStart::Presented
+        } else if self.launched {
+            SuccessorStart::Launched
+        } else {
+            SuccessorStart::Unlaunched
+        }
+    }
+}
+
+/// How far a successor's progress reports said it got through its start before its wait ended
+/// ([`SuccessorProgress::start`]), the furthest report deciding.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SuccessorStart {
+    /// No report said its native launch had finished: it did not get that far, or no report was
+    /// read (a wait that ended before the grant reads none, and a successor too old to report
+    /// writes none).
+    Unlaunched,
+    /// A report said its native launch had finished (winit's first `resumed`), and none that it
+    /// had presented its first window: it was still making its first window, surface or frame.
+    Launched,
+    /// A report said it had presented its first window (`metrics::ClaimStamp::FirstPresent`):
+    /// its bytes start here.
+    Presented,
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for SuccessorProgress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let quiet = self.quiet_for.as_millis();
+        match self.last {
+            None => write!(
+                f,
+                "no progress report in {quiet} ms (a successor that does not report progress, or \
+                 one silent since its grant)"
+            )?,
+            Some(last) => write!(
+                f,
+                "{} progress report(s), the last `{}` {quiet} ms before the end; native launch \
+                 {}, first window {}",
+                self.reports,
+                last.label(),
+                if self.launched {
+                    "finished"
+                } else {
+                    "not finished"
+                },
+                if self.presented {
+                    "presented"
+                } else {
+                    "not presented"
+                }
+            )?,
+        }
+        if self.worked_through > 0 {
+            write!(
+                f,
+                "; its own work carried {} silence(s) past the bound",
+                self.worked_through
+            )?;
+        }
+        if let Some(window) = self.last_window {
+            write!(f, "; the last silence judged: {window}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The outgoing process's judge of a granted successor's progress while every reader is parked.
+///
+/// A successor that reports (it was offered `seamless::ENV_READY_CAPS` and wrote its first
+/// report) is ended as [`crate::UpdateHandoffOutcome::Stalled`] once [`PROGRESS_SILENCE_BOUND`]
+/// passes with neither another report nor work of its own ([`SuccessorWork`]); work it did across
+/// the silence starts another. One that never reports is judged by the hang detector alone. At the
+/// hang detector a successor whose native launch never finished is stalled too; one that launched
+/// timed out ([`crate::UpdateHandoffOutcome::TimedOut`]).
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProgressWatch {
+    reports: u32,
+    launched: bool,
+    presented: bool,
+    last: Option<crate::handoff_progress::Report>,
+    /// The last report, or the wait's start before any.
+    heard_at: std::time::Instant,
+    /// Where the current silence began: the last report, or the last silence its work carried.
+    silent_from: std::time::Instant,
+    silence: std::time::Duration,
+    /// The successor's work where the current silence began, read at the wait's first quiet turn
+    /// after it ([`Self::mark`]).
+    mark: Option<(SuccessorWork, std::time::Instant)>,
+    mark_due: bool,
+    worked_through: u32,
+    last_window: Option<WorkWindow>,
+}
+
+#[cfg(unix)]
+impl ProgressWatch {
+    #[must_use]
+    pub(crate) const fn new(started: std::time::Instant, silence: std::time::Duration) -> Self {
+        Self {
+            reports: 0,
+            launched: false,
+            presented: false,
+            last: None,
+            heard_at: started,
+            silent_from: started,
+            silence,
+            mark: None,
+            mark_due: false,
+            worked_through: 0,
+            last_window: None,
+        }
+    }
+
+    /// A report read at `at`: the silence starts over from it.
+    pub(crate) fn hear(&mut self, report: crate::handoff_progress::Report, at: std::time::Instant) {
+        self.reports = self.reports.saturating_add(1);
+        self.launched |= report.launched();
+        self.presented |= report.presented();
+        self.last = Some(report);
+        self.heard_at = at;
+        self.silent_from = at;
+        self.mark = None;
+        self.mark_due = true;
+    }
+
+    /// Whether the current silence still lacks its starting [`SuccessorWork`].
+    #[must_use]
+    pub(crate) const fn mark_due(&self) -> bool {
+        self.mark_due
+    }
+
+    /// The successor's work where the current silence began (`None`: the kernel did not say, and
+    /// this silence is judged by its length alone).
+    pub(crate) fn mark(&mut self, work: Option<SuccessorWork>, at: std::time::Instant) {
+        self.mark = work.map(|work| (work, at));
+        self.mark_due = false;
+    }
+
+    /// Whether a successor that reports has gone the progress bound without a report, or without
+    /// work that carried the last silence, by `now`.
+    #[must_use]
+    pub(crate) fn silent_at(&self, now: std::time::Instant) -> bool {
+        self.reports > 0 && now.saturating_duration_since(self.silent_from) >= self.silence
+    }
+
+    /// At the end of a silence: whether the successor worked across it ([`WorkWindow::working`]),
+    /// read against [`Self::mark`]. One that did starts a new silence at `now`; one that did not,
+    /// or whose work the kernel did not say, has stalled.
+    pub(crate) fn worked_through(
+        &mut self,
+        work: Option<SuccessorWork>,
+        now: std::time::Instant,
+    ) -> bool {
+        let (Some(work), Some((mark, at))) = (work, self.mark) else {
+            return false;
+        };
+        let window = WorkWindow::between(mark, work, now.saturating_duration_since(at));
+        self.last_window = Some(window);
+        if !window.working() {
+            return false;
+        }
+        self.worked_through = self.worked_through.saturating_add(1);
+        self.silent_from = now;
+        self.mark = Some((work, now));
+        true
+    }
+
+    /// What the hang detector's expiry says of this successor.
+    #[must_use]
+    pub(crate) const fn expired(&self) -> crate::UpdateHandoffOutcome {
+        if self.launched {
+            crate::UpdateHandoffOutcome::TimedOut
+        } else {
+            crate::UpdateHandoffOutcome::Stalled
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn heard(&self, now: std::time::Instant) -> SuccessorProgress {
+        SuccessorProgress {
+            reports: self.reports,
+            launched: self.launched,
+            presented: self.presented,
+            last: self.last,
+            quiet_for: now.saturating_duration_since(self.heard_at),
+            worked_through: self.worked_through,
+            last_window: self.last_window,
+        }
+    }
+}
+
+/// How a proof wait ended, and what the successor reported on the way.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ProofWaitEnd {
+    pub(crate) outcome: crate::UpdateHandoffOutcome,
+    pub(crate) progress: SuccessorProgress,
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the proof wait's channels and bounds, plus macOS's launch corroboration"
+)]
 fn wait_handoff_ready(
     rd: &std::os::fd::OwnedFd,
     expected: crate::seamless::AdoptionProof,
     cancel: &std::sync::mpsc::Receiver<()>,
     masters: &[i32],
     deadline: std::time::Instant,
+    silence: std::time::Duration,
+    work: &mut dyn FnMut() -> Option<SuccessorWork>,
+    candidate_gone: &mut dyn FnMut() -> bool,
+    #[cfg(target_os = "macos")] corroboration: Option<LaunchCorroboration<'_>>,
+) -> ProofWaitEnd {
+    let mut watch = ProgressWatch::new(std::time::Instant::now(), silence);
+    let outcome = wait_handoff_ready_watched(
+        rd,
+        expected,
+        cancel,
+        masters,
+        deadline,
+        &mut watch,
+        work,
+        candidate_gone,
+        #[cfg(target_os = "macos")]
+        corroboration,
+    );
+    ProofWaitEnd {
+        outcome,
+        progress: watch.heard(std::time::Instant::now()),
+    }
+}
+
+#[cfg(unix)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the proof wait's channels and judge, plus macOS's launch corroboration"
+)]
+fn wait_handoff_ready_watched(
+    rd: &std::os::fd::OwnedFd,
+    expected: crate::seamless::AdoptionProof,
+    cancel: &std::sync::mpsc::Receiver<()>,
+    masters: &[i32],
+    deadline: std::time::Instant,
+    watch: &mut ProgressWatch,
+    work: &mut dyn FnMut() -> Option<SuccessorWork>,
     candidate_gone: &mut dyn FnMut() -> bool,
     #[cfg(target_os = "macos")] mut corroboration: Option<LaunchCorroboration<'_>>,
 ) -> crate::UpdateHandoffOutcome {
@@ -11052,37 +11738,61 @@ fn wait_handoff_ready(
         events: libc::POLLIN,
         revents: 0,
     }));
-    loop {
+    // How the wait ended short of the proof; the hang detector's outcome is judged only once
+    // what is left in the channel has been heard.
+    let short = loop {
         if cancel.try_recv().is_ok() {
-            return crate::UpdateHandoffOutcome::ActivityRevoked;
+            break ShortOfProof::Ended(crate::UpdateHandoffOutcome::ActivityRevoked);
         }
         if std::time::Instant::now() >= deadline {
-            return crate::UpdateHandoffOutcome::TimedOut;
+            break ShortOfProof::HangDetector;
         }
         #[cfg(target_os = "macos")]
         if let Some(corroboration) = corroboration.as_mut()
             && corroboration.poll().is_err()
         {
-            return crate::UpdateHandoffOutcome::Rejected;
+            break ShortOfProof::Ended(crate::UpdateHandoffOutcome::Rejected);
         }
         if candidate_gone() {
-            return crate::UpdateHandoffOutcome::ChildDied;
+            break ShortOfProof::Ended(crate::UpdateHandoffOutcome::ChildDied);
         }
         for pfd in &mut pollfds {
             pfd.revents = 0;
         }
         // SAFETY: a stable initialized pollfd slice; 10 ms bounds death abort.
         let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 10) };
-        if n <= 0 {
-            continue; // timeout slice or EINTR — re-check the candidate + deadline (poll already blocked)
+        if n < 0 {
+            continue; // EINTR — re-check the candidate + deadline
         }
-        match classify_ready_poll(&pollfds) {
-            ReadyPollAction::SessionDied => return crate::UpdateHandoffOutcome::ActivityRevoked,
-            ReadyPollAction::NoProgress => {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                continue;
+        let quiet_turn = n == 0
+            || match classify_ready_poll(&pollfds) {
+                ReadyPollAction::SessionDied => {
+                    break ShortOfProof::Ended(crate::UpdateHandoffOutcome::ActivityRevoked);
+                }
+                ReadyPollAction::NoProgress => {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    true
+                }
+                ReadyPollAction::ReadProof => false,
+            };
+        if quiet_turn {
+            // Only a turn whose poll found the readiness channel empty and every handed session
+            // alive judges the silence: a report already written is read first, however late
+            // this thread ran, and a session that died as the silence expired is activity.
+            let now = std::time::Instant::now();
+            if watch.silent_at(now) {
+                // A revocation that came while the successor was silent is this process's own
+                // reason to stand down, and is never filed against the successor's image.
+                if cancel.try_recv().is_ok() {
+                    break ShortOfProof::Ended(crate::UpdateHandoffOutcome::ActivityRevoked);
+                }
+                if !watch.worked_through(work(), now) {
+                    break ShortOfProof::Ended(crate::UpdateHandoffOutcome::Stalled);
+                }
+            } else if watch.mark_due() {
+                watch.mark(work(), now);
             }
-            ReadyPollAction::ReadProof => {}
+            continue;
         }
         // SAFETY: bounded read into the unfilled suffix of a fixed local wire.
         let r = unsafe {
@@ -11098,6 +11808,11 @@ fn wait_handoff_ready(
                 if offset != wire.len() {
                     continue;
                 }
+                if let Some(report) = crate::handoff_progress::Report::from_wire(&wire) {
+                    watch.hear(report, std::time::Instant::now());
+                    offset = 0;
+                    continue;
+                }
                 if !readiness_proof_matches(expected, &wire) {
                     return crate::UpdateHandoffOutcome::AdoptionMismatch;
                 }
@@ -11106,8 +11821,97 @@ fn wait_handoff_ready(
                 }
                 return crate::UpdateHandoffOutcome::ProofReady;
             }
-            0 => return crate::UpdateHandoffOutcome::ChildDied,
+            0 => break ShortOfProof::Ended(crate::UpdateHandoffOutcome::ChildDied),
             _ => continue, // EINTR/EAGAIN — re-loop
+        }
+    };
+    // Every end short of the proof hears first each whole report the successor wrote before that
+    // end was seen and this thread had not yet read, however late it ran: nothing it wrote is
+    // lost to its own end, nor to a worker descheduled across the deadline or past a revocation,
+    // so the hang detector's outcome and whether the successor presented its first window are
+    // judged from all of it. A proof found behind them at the hang detector is the successor's
+    // proof all the same, judged as the loop judges one: the deadline detects a hang, and a
+    // successor that wrote its proof did not hang, however late this thread ran to read it. At
+    // any other end the proof decides nothing: a revocation, the successor's own end or a
+    // refused corroboration stands.
+    let proof_behind = hear_reports_left(rd, &mut wire, &mut offset, watch);
+    match short {
+        ShortOfProof::HangDetector if proof_behind => {
+            if !readiness_proof_matches(expected, &wire) {
+                return crate::UpdateHandoffOutcome::AdoptionMismatch;
+            }
+            if cancel.try_recv().is_ok() {
+                return crate::UpdateHandoffOutcome::ActivityRevoked;
+            }
+            crate::UpdateHandoffOutcome::ProofReady
+        }
+        ShortOfProof::HangDetector => watch.expired(),
+        ShortOfProof::Ended(outcome) => outcome,
+    }
+}
+
+/// Where a proof wait ended before it read the successor's proof.
+#[cfg(unix)]
+enum ShortOfProof {
+    /// The hang detector expired; what it says is judged once every report left is heard
+    /// ([`ProgressWatch::expired`]).
+    HangDetector,
+    /// It ended with this outcome.
+    Ended(crate::UpdateHandoffOutcome),
+}
+
+/// Hear every whole report still on the readiness channel `rd` once its wait has ended short of
+/// the proof, after the `offset` bytes of `wire` already read, without waiting: a read is made only
+/// once a poll shows bytes or the hang-up there. It stops at the channel's end, at an empty
+/// channel (a successor still running, or a stray writer, may hold it open) or at a whole wire
+/// that is no report, which it leaves in `wire` and answers `true` for: the proof, or what stands
+/// where the proof would, since nothing follows it.
+#[cfg(unix)]
+fn hear_reports_left(
+    rd: &std::os::fd::OwnedFd,
+    wire: &mut [u8; crate::seamless::READY_WIRE_LEN],
+    offset: &mut usize,
+    watch: &mut ProgressWatch,
+) -> bool {
+    use std::os::fd::AsRawFd as _;
+    loop {
+        let mut pfd = libc::pollfd {
+            fd: rd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd; a zero timeout never waits.
+        let n = unsafe { libc::poll(&raw mut pfd, 1, 0) };
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if n <= 0 || pfd.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            return false;
+        }
+        // SAFETY: bounded read into the unfilled suffix of the caller's fixed wire; the poll above
+        // showed bytes or the hang-up, so it does not wait.
+        let r = unsafe {
+            libc::read(
+                rd.as_raw_fd(),
+                wire[*offset..].as_mut_ptr().cast(),
+                wire.len() - *offset,
+            )
+        };
+        match r {
+            n if n > 0 => {
+                *offset += usize::try_from(n).unwrap_or(0);
+                if *offset != wire.len() {
+                    continue;
+                }
+                let Some(report) = crate::handoff_progress::Report::from_wire(wire) else {
+                    return true;
+                };
+                watch.hear(report, std::time::Instant::now());
+                *offset = 0;
+            }
+            0 => return false,
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
+            _ => return false,
         }
     }
 }
@@ -11211,6 +12015,10 @@ mod candidate_exit_watch_tests;
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_handoff_process_group_tests.rs"]
 mod handoff_process_group_tests;
+
+#[cfg(all(test, unix))]
+#[path = "app_update_handoff_progress_watch_tests.rs"]
+mod progress_watch_tests;
 
 #[cfg(all(test, unix))]
 #[path = "app_update_handoff_returned_handoff_completion_lane_tests.rs"]

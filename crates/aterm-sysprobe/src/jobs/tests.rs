@@ -1019,7 +1019,7 @@ fn a_linux_reading_is_aged_by_the_boot_clock() {
     assert_eq!(f.age_ms, Some(1_300_000 - 1_234_560), "{f:?}");
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_linux_arm_reads_a_fixture_tree() {
     let dir = aterm_tempfile::tempdir().expect("scratch root");
@@ -1035,11 +1035,15 @@ fn the_linux_arm_reads_a_fixture_tree() {
         "4711/io",
         "wchar: 36\nsyscr: 9\nsyscw: 3\nread_bytes: 0\nwrite_bytes: 4096\n",
     );
+    // The process's own `schedstat` is its leader thread's alone; the runnable time is the CPU
+    // time plus every thread's wait.
     write(r, "4711/schedstat", "2000000000 500000000 10\n");
     write(r, "4711/wchan", "pipe_read");
     write(r, "4711/task/4711/stat", STAT);
     write(r, "4711/task/4711/wchan", "pipe_read");
+    write(r, "4711/task/4711/schedstat", "1990000000 500000000 10\n");
     write(r, "4711/task/4715/stat", &STAT.replace(" S ", " D "));
+    write(r, "4711/task/4715/schedstat", "10000000 250000000 3\n");
     link(r, "4711/fd/0", "pipe:[555]");
     write(r, "4711/fdinfo/0", "pos:\t0\nflags:\t00\n");
     link(r, "4711/fd/1", "/tmp/claude/t/1.output");
@@ -1055,6 +1059,23 @@ fn the_linux_arm_reads_a_fixture_tree() {
     link(r, "4711/fd/5", "anon_inode:inotify");
     link(r, "4711/fd/6", "/dev/tty");
     write(r, "4711/fdinfo/6", "pos:\t0\nflags:\t0100001\n");
+    // A held directory and a named FIFO, links to real ones in the tree, and an output file the
+    // tree holds (its `fdinfo` names no inode).
+    std::fs::create_dir_all(r.join("held/dir")).unwrap();
+    let fifo = std::ffi::CString::new(r.join("held/fifo").to_str().unwrap()).unwrap();
+    // SAFETY: a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    write(r, "held/out.log", "a line\n");
+    link(r, "4711/fd/7", r.join("held/dir").to_str().unwrap());
+    write(
+        r,
+        "4711/fdinfo/7",
+        "pos:\t9007199254740991\nflags:\t0200000\n",
+    );
+    link(r, "4711/fd/8", r.join("held/fifo").to_str().unwrap());
+    write(r, "4711/fdinfo/8", "pos:\t0\nflags:\t02\n");
+    link(r, "4711/fd/9", r.join("held/out.log").to_str().unwrap());
+    write(r, "4711/fdinfo/9", "pos:\t7\nflags:\t02001\n");
     write(
         r,
         "4711/syscall",
@@ -1101,8 +1122,11 @@ fn the_linux_arm_reads_a_fixture_tree() {
     );
     assert_eq!(
         (c.disk_written, c.runnable_ns, c.pageins),
-        (Some(4096), Some(2_500_000_000), Some(3))
+        (Some(4096), Some(2_750_000_000), Some(3)),
+        "2 s of CPU and both threads' 0.75 s of wait, not the leader's file"
     );
+    assert_eq!(linux::threads_wait_ns(&r.join("4711")), Some(750_000_000));
+    assert_eq!(linux::threads_wait_ns(&r.join("4713")), None, "no task dir");
     let ts = f.threads.unwrap();
     assert_eq!(ts.len(), 2);
     assert_eq!(ts[1].state, RunState::Uninterruptible);
@@ -1168,6 +1192,28 @@ fn the_linux_arm_reads_a_fixture_tree() {
         })
     );
     assert_eq!(kind(5), Some(FdKind::Watch));
+    for fd in [7, 8] {
+        assert!(
+            matches!(kind(fd), Some(FdKind::File { regular: false, .. })),
+            "fd {fd}: {:?}",
+            kind(fd)
+        );
+    }
+    let out = std::fs::metadata(r.join("held/out.log")).unwrap();
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        assert_eq!(
+            kind(9),
+            Some(FdKind::File {
+                regular: true,
+                size: 7,
+                dev: out.dev(),
+                ino: out.ino(),
+                lf_tail: None,
+                fresh_dylib: false
+            })
+        );
+    }
 
     let z = linux::read(r, 4713, true, 100, &|| None).unwrap();
     assert_eq!(z.state, RunState::Zombie);
@@ -1387,13 +1433,12 @@ fn open_test_pty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
     (master, follower)
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn this_process_reads_itself_with_threads_counters_and_descriptors() {
-    use std::os::fd::AsRawFd;
-    let mut fds = [0 as std::ffi::c_int; 2];
-    // SAFETY: two writable descriptors' room.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    use std::os::fd::{AsRawFd, IntoRawFd as _};
+    let (read_end, write_end) = aterm_uds::pipe().expect("pipe");
+    let fds = [read_end.into_raw_fd(), write_end.into_raw_fd()];
     let (_master, follower) = open_test_pty();
     let mut reader = JobsReader::new();
     let me = std::process::id();
@@ -1409,9 +1454,13 @@ fn this_process_reads_itself_with_threads_counters_and_descriptors() {
         own.file_name().and_then(|n| n.to_str()),
         "{f:?}"
     );
+    // Linux counts CPU time in clock ticks (10 ms at `USER_HZ` 100), which a young test process
+    // may not have filled; `schedstat` counts its time waiting on a core in nanoseconds.
     assert!(
-        f.counters
-            .is_some_and(|c| c.cpu_ns > 0 && c.syscalls.is_some())
+        f.counters.is_some_and(
+            |c| (c.cpu_ns > 0 || c.runnable_ns.is_some_and(|r| r > 0)) && c.syscalls.is_some()
+        ),
+        "{f:?}"
     );
     let ts = f.threads.as_ref().expect("threads");
     assert!(!ts.is_empty());
@@ -1761,7 +1810,7 @@ fn both_lanes_self_check_on() {
 /// A stopped child reads `Stopped`, a zombie child `Zombie` with no
 /// counters, and the session leader of a new session leads it with no
 /// terminal.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_stopped_child_and_a_zombie_child_read_their_states() {
     let mut child = aterm_uds::spawnfd::command("/bin/sleep")
@@ -1869,8 +1918,9 @@ fn a_fork_that_kept_its_parents_program_ran_none_of_its_own() {
 /// The job probe's CPU times are nanoseconds: a spinning child, stopped so every reading counts
 /// the same CPU at any load, reads its counters and its threads' sum each within 2x of `wait4`'s.
 /// `proc_pid_rusage` counts Mach ticks and `PROC_PIDTHREADINFO` nanoseconds; thread times scaled
-/// as ticks read 125/3 too large (`docs/measured/rosetta-mac-2026-10-20.md` §3 (b)).
-#[cfg(target_os = "macos")]
+/// as ticks read 125/3 too large (`docs/measured/rosetta-mac-2026-10-20.md` §3 (b)). On Linux both
+/// come from `stat` files in clock ticks, scaled by `_SC_CLK_TCK`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() {
     use crate::procs::stopped_spinner::{read, within_2x};
@@ -1884,8 +1934,114 @@ fn a_stopped_childs_counters_and_threads_read_its_cpu_time_as_wait4_counts_it() 
     assert!(
         within_2x(counters, kernel) && within_2x(threads, kernel),
         "counters {counters} ns and threads {threads} ns; the reap's rusage for the same \
-         stopped child is {kernel} ns (timebase {:?})",
-        crate::procs::kernel_timebase()
+         stopped child is {kernel} ns ({})",
+        crate::procs::stopped_spinner::scale()
+    );
+}
+
+/// A directory and a named FIFO this process holds open are files that are not regular, as a
+/// regular file it holds is one, with the device and inode `stat` gives it: macOS reads the
+/// vnode's mode, Linux `statx`s through the `fd/` link (a path link alone names a directory and a
+/// FIFO as it names a file, and an ext4 directory's offset moves on every listing, so a walker's
+/// directory read as a growing output file). NEGATIVE CONTROL: the regular file.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn held_directories_and_fifos_are_not_regular_files() {
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::MetadataExt as _;
+    let scratch = aterm_tempfile::tempdir().expect("scratch");
+    let sub = scratch.path().join("sub");
+    std::fs::create_dir(&sub).expect("a directory");
+    let fifo = scratch.path().join("fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).expect("no NUL");
+    // SAFETY: a NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let file = scratch.path().join("out.log");
+    std::fs::write(&file, b"a line\n").expect("a file");
+    let dir_fd = std::fs::File::open(&sub).expect("the directory opens");
+    let fifo_fd = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&fifo)
+        .expect("the FIFO opens");
+    let file_fd = std::fs::File::open(&file).expect("the file opens");
+    let f = JobsReader::new()
+        .read(ReadReq {
+            pid: std::process::id(),
+            fds: true,
+        })
+        .expect("this process reads itself");
+    let list = f.fds.expect("descriptors");
+    let kind = |n: i32| list.iter().find(|d| d.fd == n).map(|d| d.kind.clone());
+    for (what, fd) in [
+        ("directory", dir_fd.as_raw_fd()),
+        ("FIFO", fifo_fd.as_raw_fd()),
+    ] {
+        assert!(
+            matches!(kind(fd), Some(FdKind::File { regular: false, .. })),
+            "the {what} on fd {fd}: {:?}",
+            kind(fd)
+        );
+    }
+    let meta = std::fs::metadata(&file).expect("the file's stat");
+    match kind(file_fd.as_raw_fd()) {
+        Some(FdKind::File {
+            regular: true,
+            dev,
+            ino,
+            ..
+        }) => assert_eq!((dev, ino), (meta.dev(), meta.ino())),
+        other => panic!("the regular file: {other:?}"),
+    }
+}
+
+/// A process's wait for a core is every thread's: with twice as many spinning threads as cores,
+/// the threads' summed `run_delay` must pass the leader's own (`/proc/self/schedstat`, the test
+/// harness's main thread, which waits on the test thread and spins nowhere), which is what the
+/// probe read before. NEGATIVE CONTROL: the leader's file alone, the old reading, fails the
+/// comparison.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_processs_wait_for_a_core_is_every_threads() {
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let spinners: Vec<_> = (0..cores * 2)
+        .map(|_| {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut n = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    n = std::hint::black_box(n.wrapping_add(1));
+                }
+            })
+        })
+        .collect();
+    let me = std::path::Path::new("/proc/self");
+    let leader = || {
+        std::fs::read_to_string(me.join("schedstat"))
+            .ok()
+            .and_then(|t| linux::parse_schedstat(&t))
+            .map(|(_, wait)| wait)
+            .expect("the leader's schedstat")
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let (sum, alone) = loop {
+        let sum = linux::threads_wait_ns(me).expect("every thread's schedstat");
+        let alone = leader();
+        if sum > alone.saturating_add(50_000_000) || std::time::Instant::now() > deadline {
+            break (sum, alone);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for s in spinners {
+        s.join().expect("a spinner");
+    }
+    assert!(
+        sum > alone.saturating_add(50_000_000),
+        "{} spinners on {cores} cores: threads' wait {sum} ns, leader's {alone} ns",
+        cores * 2
     );
 }
 

@@ -4722,7 +4722,9 @@ pub(crate) const PROGRAM_CHECK_EPISODE_KEY: &str = "program-check.episode";
 pub(crate) enum HeldEdge {
     /// It opened at this reading.
     Opened(aterm_vitals::jobs::HeldEpisode),
-    /// It closed: its second reading in a row found nothing held.
+    /// It closed: its second reading in a row found none of it held. A stranded program is no
+    /// part of it ([`aterm_vitals::jobs::HeldEpisode`]), so one can stand held after it closes;
+    /// its own record names it ([`stranded_record`]).
     Drained(aterm_vitals::jobs::HeldEpisode),
 }
 
@@ -4797,7 +4799,7 @@ pub(crate) fn program_check_after_grant(n: u32) -> Message {
     .key(PROGRAM_CHECK_AFTER_GRANT_KEY)
 }
 
-/// The key of the record naming this user's programs that have not started for a reason other than macOS's program check (leftover §5.1: Rosetta's translation, a volume not proven local, or one that reads stopped or traced).
+/// The key of the record naming this user's programs that have not started and that aterm does not call held at macOS's program check (leftover §5.1: Rosetta's translation, one with nothing read to say why (its volume not proven local, its user time unread, or no request evidence), or one that reads stopped or traced).
 pub(crate) const NOT_STARTED_KEY: &str = "program-check.not-started";
 
 /// Builds the record of the programs `rows` names that have not started, each with what keeps it (leftover §5.1, §6.5): "translating (Rosetta)", which aterm's Developer Tools grant does not reach, "has not started" with nothing read to say why, or "has not started" and what it reads of stopped and traced. It is posted when a view first names a row, so it gives no age: a row's age counts from that first sighting (`sys jobs` shows it growing). A fact for later, never an Entry or a Now: no step of aterm's moves either.
@@ -4822,8 +4824,8 @@ pub(crate) fn not_started_record(
                 "{who}: translating (Rosetta), which aterm's Developer Tools grant does not reach"
             ),
             StartWait::NotStarted | StartWait::ProgramCheck => format!(
-                "{who}: it has not started, and its program is on a volume aterm cannot prove \
-                 local, so nothing read says why"
+                "{who}: it has not started, and nothing aterm read says why; macOS's program \
+                 check may be holding it, which aterm cannot confirm"
             ),
             StartWait::StoppedUnstarted { stopped, traced } => {
                 let read = match (stopped, traced) {
@@ -4851,8 +4853,9 @@ pub(crate) const STRANDED_KEY: &str = "program-check.stranded";
 /// a syspolicyd that is no longer running. It is posted at a program's first verdict
 /// ([`crate::vitals_host::newly_stranded`]) and gives no age (`sys jobs` shows it growing); it
 /// names at most [`aterm_messages::DETAIL_LINES_CAP`] − 1 rows, so its last line stays, and its
-/// title counts every one. A fact for later, never an Entry or a Now, and aterm ends none of them:
-/// whether a held program ends on a signal is unmeasured (leftover U11), while new programs start.
+/// title counts every one. A fact for later, never a Now, and aterm ends none of them: whether a
+/// held program ends on a signal is unmeasured (leftover U11), while new programs start. The
+/// digest names those still stranded ten minutes on ([`stranded_entry`]).
 pub(crate) fn stranded_record(rows: &[&aterm_vitals::jobs::Named], daemon: u32) -> Message {
     let n = rows.len();
     let (title, rest) = if n == 1 {
@@ -4885,6 +4888,67 @@ pub(crate) fn stranded_record(rows: &[&aterm_vitals::jobs::Named], daemon: u32) 
         .line(rest)
         .record()
         .key(STRANDED_KEY)
+}
+
+/// Builds the digest entry for the programs `rows` names stranded at macOS's program check, each
+/// held at least [`aterm_uds::deadline::FIRST_EXEC_HANG`] since before `daemon`, the syspolicyd
+/// running now, started (leftover §5.1, §6.6): `vitals.stranded.programs.held`, one key whatever
+/// syspolicyd runs, so a relaunch restates it and a dismissal holds across one; a fact for later
+/// and never a Now, since new programs start and aterm ends no held program (leftover U11). Its
+/// title counts every row, and its details name the two held longest, each held past that bound
+/// (words that stay true while it stands), and the syspolicyd that checks new programs; its words
+/// move only with those, so each restatement is shown at once. `None` for no row.
+pub(crate) fn stranded_entry(rows: &[&aterm_vitals::jobs::Named], daemon: u32) -> Option<Entry> {
+    let oldest = rows.iter().map(|r| r.for_ms).max()?;
+    let n = rows.len();
+    let (what, reason, step) = if n == 1 {
+        (
+            "1 program stranded at macOS's check".to_owned(),
+            "its check went to a syspolicyd that is no longer running, and aterm ends no held \
+             program",
+            "Stop what started it, then run it again",
+        )
+    } else {
+        (
+            format!("{n} programs stranded at macOS's check"),
+            "their check went to a syspolicyd that is no longer running, and aterm ends no held \
+             program",
+            "Stop what started each, then run it again",
+        )
+    };
+    let mut entry = Entry::new(
+        Family::Stranded,
+        "programs",
+        "held",
+        &what,
+        Why::OnlyYou(Reason::new(reason)),
+        Then::step(step),
+    );
+    let bound = aterm_uds::process::held_age(
+        u64::try_from(aterm_uds::deadline::FIRST_EXEC_HANG.as_millis()).unwrap_or(u64::MAX),
+    );
+    let mut longest = rows.to_vec();
+    longest.sort_by_key(|r| (std::cmp::Reverse(r.for_ms), r.pid));
+    for r in longest
+        .iter()
+        .take(aterm_messages::exceptions::MORE_LINES - 1)
+    {
+        entry = entry.more(format!(
+            "pid {} {}: held {bound} or more",
+            r.pid,
+            aterm_vitals::jobs::wire::exe_word(&r.name),
+        ));
+    }
+    Some(
+        entry
+            .more(format!(
+                "The syspolicyd running now (pid {daemon}) checks new programs"
+            ))
+            .log_line(format!(
+                "program-check-stranded n={n} daemon={daemon} oldest_ms={oldest}"
+            ))
+            .restated_at_once(),
+    )
 }
 
 /// The key of each record of a leftover process `end` signalled (leftover §6.5's `proc.` stem). A
@@ -7373,7 +7437,7 @@ impl PackagesVerb {
     /// Banner title while the package action is running.
     pub(crate) const fn title(self) -> &'static str {
         match self {
-            Self::Check => "Checking ALab tools",
+            Self::Check => crate::toolchain_words::CHECKING_ALAB,
             Self::Install => crate::toolchain_words::INSTALLING_ALAB,
             Self::Remove => "Removing ALab tools",
         }

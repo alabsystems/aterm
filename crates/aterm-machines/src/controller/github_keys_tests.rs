@@ -59,8 +59,7 @@ fn paths() -> Paths {
     }
 }
 
-/// `token` in `paths`'s GitHub token file, a private file of `sys`'s account, as `aterm machines
-/// github login` leaves it.
+/// `token` in `paths`'s GitHub token file, a private file of `sys`'s account.
 pub(super) fn holds_token(sys: &Fake, paths: &Paths, token: &str) {
     let file = paths.github_token();
     let file = file.to_str().unwrap();
@@ -510,9 +509,9 @@ fn an_inline_token_of_another_login_sends_nothing() {
         &[reported("alice", &key("alice"))],
     )
     .unwrap_err();
-    // The stored token is replaced with the controller's verb; agh's own never sees it.
+    // The stored token is named as the controller's; agh's own never sees it.
     assert!(err.contains("fixture-ext-bot"), "{err}");
-    assert!(err.contains("aterm machines github login"), "{err}");
+    assert!(err.contains("stored GitHub token for"), "{err}");
     assert!(!err.contains("agh auth"), "{err}");
     assert!(!err.contains(&token), "{err}");
     assert_eq!(requests(&fake.seen()), ["GET /user"]);
@@ -520,13 +519,13 @@ fn an_inline_token_of_another_login_sends_nothing() {
 }
 
 #[test]
-fn an_inline_token_github_refuses_names_the_controllers_login_verb() {
+fn an_inline_token_github_refuses_names_the_controllers_token() {
     let fake = FakeGithub::start();
     let token = agh_fake::token("unknown");
     let sys = controller(&fake);
     holds_token(&sys, &paths(), &token);
     let err = revoke_via(&sys, &paths(), &row(KeysVia::AghInline), &[20_000]).unwrap_err();
-    assert!(err.contains("aterm machines github login"), "{err}");
+    assert!(err.contains("GitHub refuses the stored token"), "{err}");
     assert!(!err.contains("agh auth"), "{err}");
     assert!(!err.contains(&token), "{err}");
     assert!(
@@ -605,14 +604,14 @@ fn a_token_without_the_scope_names_it() {
     .unwrap_err();
     assert!(err.starts_with("GET /user/keys"), "{err}");
     assert!(err.contains("admin:public_key"), "{err}");
-    // The inline token lives in the controller's token file, so the line names the verb that
-    // stores the re-issued one, never agh's own.
-    assert!(err.contains("aterm machines github login"), "{err}");
+    // The inline token lives in the controller's token file, so the line names that token,
+    // never agh's own.
+    assert!(err.contains("stored token for"), "{err}");
     assert!(!err.contains("agh auth"), "{err}");
     let err = revoke_via(&sys, &paths(), &github, &[bob_id]).unwrap_err();
     assert!(err.starts_with("GET /user/keys"), "{err}");
     assert!(err.contains("admin:public_key"), "{err}");
-    assert!(err.contains("aterm machines github login"), "{err}");
+    assert!(err.contains("stored token for"), "{err}");
     assert!(
         !requests(&fake.seen())
             .iter()

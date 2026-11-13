@@ -285,19 +285,10 @@ fn install_touches_only_detected_agents_unless_forced() {
     );
 }
 
-/// THE RETIRED GEMINI CLI IS REFUSED BY NAME, agy named: its context file is agy's row,
-/// which agy loads, and its custom-command file is no longer written.
+/// AGY'S ROW PRIMES THE CONTEXT FILE AGY LOADS, and no custom-command file is written.
 #[test]
-fn the_retired_gemini_cli_is_refused_by_name_and_its_file_is_agys() {
+fn agys_row_primes_the_file_agy_loads_and_writes_no_command_file() {
     let home = aterm_tempfile::tempdir().unwrap();
-    for retired in ["gemini", "Gemini", "gemini-cli"] {
-        for verb in ["install", "remove", "primer"] {
-            let (out, code) = agents_report(home.path(), &[verb.to_string(), retired.to_string()]);
-            assert_ne!(code, 0, "{verb} {retired}: {out}");
-            assert!(out.contains("agy replaces it"), "{verb} {retired}: {out}");
-        }
-    }
-    assert!(!home.path().join(".gemini").exists(), "nothing written");
     let (out, code) = agents_report(home.path(), &["install".to_string(), "agy".to_string()]);
     assert_eq!(code, 0, "{out}");
     assert_eq!(
@@ -307,9 +298,9 @@ fn the_retired_gemini_cli_is_refused_by_name_and_its_file_is_agys() {
     );
     assert!(
         !home.path().join(".gemini/commands").exists(),
-        "no Gemini CLI command file"
+        "no command file"
     );
-    assert!(skills_for("agy").is_empty() && skills_for("gemini").is_empty());
+    assert!(skills_for("agy").is_empty());
 }
 
 /// THE GEMINI CLI COMMAND AN EARLIER ATERM WROTE IS DELETED by the automatic pass, `install`

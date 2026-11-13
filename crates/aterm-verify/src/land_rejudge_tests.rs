@@ -89,9 +89,11 @@ fn replay(scenario: &str) {
     let mut previous = String::new();
     let code = land(
         &world.work,
+        &own(),
         &mut Seams {
             git: &git_cmd,
-            judge: &mut |root, base, _| {
+            verifier: &mut |_| Ok(own_image()),
+            judge: &mut |root, _, base, _| {
                 if !judged.is_empty() && scenario == "wide" {
                     // Replay the old and new base choices on this exact merged checkout and
                     // stable target path. Warm the changed inputs before the ABBA takes.
@@ -175,8 +177,11 @@ fn replay(scenario: &str) {
             },
             branch: &mut |_, _| crates(&["a"]),
             lane: &mut |_, _| Lane::Pass,
-            recheck: &mut |_, _| panic!("a source edit is never rechecked"),
+            recheck: &mut |_, _, _| panic!("a source edit is never rechecked"),
+            hand_over: &mut |_, _, _| panic!("no handoff was expected"),
             say: &mut |line| said.push(line.to_owned()),
+            remote: &crate::remote::run,
+            pause: &no_retry,
         },
     );
     assert_eq!(judged.len(), 2, "{said:#?}");

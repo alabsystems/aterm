@@ -90,7 +90,7 @@ fn the_arguments_take_every_flag_and_refuse_a_stray_word() {
             "--standard-user",
             "--keep",
             "--record",
-            "docs/measured/n.md",
+            "runs/n.md",
             "--image",
             "other",
         ]),
@@ -104,7 +104,7 @@ fn the_arguments_take_every_flag_and_refuse_a_stray_word() {
     assert_eq!(
         ask.record,
         Some(PathBuf::from(format!(
-            "{}/docs/measured/n.md",
+            "{}/runs/n.md",
             crate::paths::caller_dir().trim_end_matches('/')
         )))
     );
@@ -260,16 +260,17 @@ fn the_base_flags_pick_a_base_a_count_and_a_dated_record() {
             "{refused:?}"
         );
     }
-    // `--record` alone appends to today's dated table, wherever it stands among the flags.
+    // `--record` alone appends to today's dated table in the lab's state, wherever it
+    // stands among the flags.
     let dated = format!(
-        "docs/measured/mac-nux-{}.md",
+        "mac-nux/mac-nux-{}.md",
         crate::util::ymd(crate::util::now_secs())
     );
     for alone in [&["--record"][..], &["--record", "--keep"]] {
         let ask = parse(&args(alone), golden.into()).unwrap();
         let file = ask.record.unwrap();
         assert!(file.ends_with(&dated), "{}", file.display());
-        assert!(file.starts_with(&paths().repo), "{}", file.display());
+        assert!(file.starts_with(&paths().state), "{}", file.display());
         assert_eq!(ask.keep, alone.len() == 2);
     }
 }

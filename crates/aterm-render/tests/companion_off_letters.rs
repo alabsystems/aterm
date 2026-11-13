@@ -18,9 +18,9 @@ use std::ops::RangeInclusive;
 
 /// The companion styles.
 pub const COMPANIONS: [&str; 4] = [
-    "tall rainbow + cat",
     "rainbow + cat",
-    "tall rainbow + dog",
+    "underline rainbow + cat",
+    "rainbow + dog",
     "flat rainbow + cat",
 ];
 
@@ -245,10 +245,7 @@ fn the_companion_keeps_off_the_letters_a_program_writes() {
         } else {
             enter
         };
-        for (style, look) in [
-            ("tall rainbow + cat", DARK),
-            ("tall rainbow + dog", SOLARIZED_DARK),
-        ] {
+        for (style, look) in [("rainbow + cat", DARK), ("rainbow + dog", SOLARIZED_DARK)] {
             let s = sum(&coats_driven(style, look, scene, &[], drive), enter);
             assert!(
                 s.frames > 20,
@@ -265,7 +262,7 @@ fn the_companion_keeps_off_the_letters_a_program_writes() {
         }
         let old = sum(
             &coats_driven(
-                "tall rainbow + cat",
+                "rainbow + cat",
                 DARK,
                 scene,
                 &[OldPath::WatchFromTheLine],
@@ -325,10 +322,7 @@ fn the_burst_never_lays_a_running_or_resting_companion_on_its_letters() {
             .count()
     };
     for drive in [Drive::Console, Drive::Ctl] {
-        for (style, look) in [
-            ("tall rainbow + cat", DARK),
-            ("tall rainbow + dog", SOLARIZED_DARK),
-        ] {
+        for (style, look) in [("rainbow + cat", DARK), ("rainbow + dog", SOLARIZED_DARK)] {
             let judged = coats_driven(style, look, Scene::Burst, &[], drive);
             assert!(
                 judged.iter().any(|j| !j.coat.icons.is_empty())
@@ -376,8 +370,7 @@ fn the_burst_never_lays_a_running_or_resting_companion_on_its_letters() {
                 );
             }
         }
-        let old =
-            |laws: &[OldPath]| coats_driven("tall rainbow + cat", DARK, Scene::Burst, laws, drive);
+        let old = |laws: &[OldPath]| coats_driven("rainbow + cat", DARK, Scene::Burst, laws, drive);
         let start = on_letters(
             &old(&[OldPath::FirstKeysAhead, OldPath::StillUnderWriting]),
             first_key,
@@ -410,7 +403,7 @@ fn margin_lets_the_writing_run_under(scene: Scene, drive: Drive) -> Vec<(&'stati
         .collect();
     let (first_key, last_key) = (keys[0], keys[keys.len() - 1]);
     let judged = coats_driven(
-        "tall rainbow + cat",
+        "rainbow + cat",
         DARK,
         scene,
         &[OldPath::MarginKeepsTheLine],
@@ -459,10 +452,7 @@ fn the_split_s_burst_never_lays_a_running_or_resting_companion_on_its_letters() 
     let end = last_key + tail;
     let rested = last_key + SAT_AND_HOPPED_MS;
     for drive in [Drive::Console, Drive::Ctl] {
-        for (style, look) in [
-            ("tall rainbow + cat", DARK),
-            ("tall rainbow + dog", SOLARIZED_DARK),
-        ] {
+        for (style, look) in [("rainbow + cat", DARK), ("rainbow + dog", SOLARIZED_DARK)] {
             let judged = coats_driven(style, look, scene, &[], drive);
             let rest: Vec<(i32, i32, i32, i32)> = judged
                 .iter()
@@ -745,9 +735,9 @@ fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
         (wide.as_str(), ""),
     ] {
         for (style, look) in [
-            ("tall rainbow + cat", DARK),
             ("rainbow + cat", DARK),
-            ("tall rainbow + dog", SOLARIZED_DARK),
+            ("underline rainbow + cat", DARK),
+            ("rainbow + dog", SOLARIZED_DARK),
         ] {
             let (judged, ch) = typed_under_a_lettered_row(style, look, 4, rows, &[], false);
             let s = sum(&past_the_first_keys(&judged, TYPING_FROM, 4), from);
@@ -762,12 +752,8 @@ fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
                 look.name
             );
         }
-        let old = typed_between_lettered_rows(
-            "tall rainbow + cat",
-            DARK,
-            rows,
-            &[OldPath::HeadUnderLetters],
-        );
+        let old =
+            typed_between_lettered_rows("rainbow + cat", DARK, rows, &[OldPath::HeadUnderLetters]);
         let old_boxed = boxes_on_glyphs(&old, from, 3..=3);
         assert!(
             old_boxed >= 10,
@@ -777,7 +763,7 @@ fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
         );
     }
     let (held, ch) = typed_under_a_lettered_row(
-        "tall rainbow + cat",
+        "rainbow + cat",
         DARK,
         4,
         (&wide, ""),
@@ -798,7 +784,7 @@ fn the_companion_keeps_off_a_lettered_row_above_the_prompt() {
     ] {
         let boxed = |old: &[OldPath]| {
             let (judged, _) =
-                typed_under_a_lettered_row("tall rainbow + cat", DARK, 4, (scene, ""), old, false);
+                typed_under_a_lettered_row("rainbow + cat", DARK, 4, (scene, ""), old, false);
             (boxes_on_glyphs(&judged, from, 3..=3), sum(&judged, from))
         };
         let (kept, s) = boxed(&[]);
@@ -835,8 +821,8 @@ fn the_companion_keeps_off_a_lettered_row_above_a_prompt_on_the_last_row() {
     let above = usize::from(last - 1);
     let mut runs: Vec<(&str, Look)> = COMPANIONS.iter().map(|&s| (s, DARK)).collect();
     runs.extend([
-        ("tall rainbow + dog", SOLARIZED_DARK),
-        ("tall rainbow + dog", GITHUB_LIGHT),
+        ("rainbow + dog", SOLARIZED_DARK),
+        ("rainbow + dog", GITHUB_LIGHT),
     ]);
     for rows in [(gj.as_str(), ""), (fox, "")] {
         for &(style, look) in &runs {
@@ -864,7 +850,7 @@ fn the_companion_keeps_off_a_lettered_row_above_a_prompt_on_the_last_row() {
         }
     }
     let (old, _) = typed_under_a_lettered_row(
-        "tall rainbow + dog",
+        "rainbow + dog",
         SOLARIZED_DARK,
         last,
         (&gj, ""),
@@ -960,7 +946,7 @@ fn the_companion_keeps_off_the_echo_over_a_return_at_the_last_row() {
         "negative control: the bound's box never met the output's letters two rows above"
     );
     let old = run(
-        "tall rainbow + cat",
+        "rainbow + cat",
         DARK,
         &[OldPath::ArcJudgedInTheAir],
         outputs[1],
@@ -976,7 +962,7 @@ fn the_companion_keeps_off_the_echo_over_a_return_at_the_last_row() {
         "negative control: the box never met the long line above the last row"
     );
     let old = run(
-        "tall rainbow + cat",
+        "rainbow + cat",
         DARK,
         &[OldPath::JudgedAsThePageChanges],
         outputs[3],
@@ -1170,7 +1156,7 @@ fn the_companion_keeps_off_lettered_rows_above_and_under_the_prompt() {
     aterm_spec::check::each(&STEAM_ROWS, |&rows| {
         let page = steam_page(rows, Steam::Deep);
         let (old, ch) = steamed_between_lettered_rows(
-            "tall rainbow + cat",
+            "rainbow + cat",
             DARK,
             &page,
             &[OldPath::RowFit],
@@ -1237,7 +1223,7 @@ fn a_whole_seat_in_reach_comes_before_the_fit() {
     });
     let page = steam_page(STEAM_ROWS[0], Steam::Gallery);
     let (old, ch) = steamed_between_lettered_rows(
-        "tall rainbow + cat",
+        "rainbow + cat",
         DARK,
         &page,
         &[OldPath::WholeSeatOverFit],
@@ -1293,10 +1279,7 @@ fn a_body_fitted_to_its_row_stays_fitted_along_it() {
             boxes_on_glyphs(&past_the_first_keys(&judged, TYPING_FROM, 4), 600, 0..=23),
         )
     };
-    for (style, look) in [
-        ("tall rainbow + cat", DARK),
-        ("tall rainbow + dog", SOLARIZED_DARK),
-    ] {
+    for (style, look) in [("rainbow + cat", DARK), ("rainbow + dog", SOLARIZED_DARK)] {
         let (fitted, whole, boxed) = whole_after_fit(style, look, &[]);
         assert_eq!(
             (fitted, whole, boxed),
@@ -1306,8 +1289,7 @@ fn a_body_fitted_to_its_row_stays_fitted_along_it() {
             look.name
         );
     }
-    let (fitted, whole, _) =
-        whole_after_fit("tall rainbow + cat", DARK, &[OldPath::FitHeldAlongTheRow]);
+    let (fitted, whole, _) = whole_after_fit("rainbow + cat", DARK, &[OldPath::FitHeldAlongTheRow]);
     assert!(
         fitted == 1 && whole > 0,
         "negative control: never drawn whole after its first fitted frame ({whole} frames)"
@@ -1380,10 +1362,7 @@ fn a_body_held_in_its_row_is_drawn_no_taller_than_its_fit() {
         (boxes_on_glyphs(&on, from, 0..=23), above)
     };
     for (scene, case) in scenes.iter().enumerate() {
-        for (style, look) in [
-            ("tall rainbow + cat", DARK),
-            ("tall rainbow + dog", SOLARIZED_DARK),
-        ] {
+        for (style, look) in [("rainbow + cat", DARK), ("rainbow + dog", SOLARIZED_DARK)] {
             assert_eq!(
                 run(style, look, scene, &[]),
                 (0, 0),
@@ -1405,7 +1384,7 @@ fn a_body_held_in_its_row_is_drawn_no_taller_than_its_fit() {
         ),
     ];
     for (old, bites) in controls {
-        let (_, above) = run("tall rainbow + cat", DARK, 2, old);
+        let (_, above) = run("rainbow + cat", DARK, 2, old);
         assert!(
             above >= bites,
             "negative control ({old:?}): stretched past its fit, the box met the row above's \
@@ -1603,14 +1582,11 @@ fn a_body_far_from_the_caret_reads_its_own_rows() {
             &[Drive::Console]
         };
         for &drive in drives {
-            for (style, look) in [
-                ("tall rainbow + cat", DARK),
-                ("tall rainbow + dog", SOLARIZED_DARK),
-            ] {
+            for (style, look) in [("rainbow + cat", DARK), ("rainbow + dog", SOLARIZED_DARK)] {
                 runs.push((leap, style, look, drive, true, false));
                 runs.push((leap, style, look, drive, false, false));
             }
-            runs.push((leap, "tall rainbow + cat", DARK, drive, true, true));
+            runs.push((leap, "rainbow + cat", DARK, drive, true, true));
         }
     }
     let seen = aterm_spec::check::each(&runs, |&(leap, style, look, drive, lettered, control)| {
@@ -1727,10 +1703,7 @@ fn a_full_screen_program_s_rows_under_its_line_are_its_own() {
     };
     let mut runs = Vec::new();
     for rows in STEAM_ROWS {
-        for (style, look) in [
-            ("tall rainbow + cat", DARK),
-            ("tall rainbow + dog", SOLARIZED_DARK),
-        ] {
+        for (style, look) in [("rainbow + cat", DARK), ("rainbow + dog", SOLARIZED_DARK)] {
             for drive in [Drive::Console, Drive::Ctl] {
                 runs.push((rows, style, look, drive));
             }
@@ -1759,7 +1732,7 @@ fn a_full_screen_program_s_rows_under_its_line_are_its_own() {
     for drive in [Drive::Console, Drive::Ctl] {
         let page = steam_page(STEAM_ROWS[0], Steam::FullScreen);
         let (old, ch) = steamed_between_lettered_rows(
-            "tall rainbow + cat",
+            "rainbow + cat",
             DARK,
             &page,
             &[OldPath::FullScreenKeepsItsRow],
@@ -1772,7 +1745,7 @@ fn a_full_screen_program_s_rows_under_its_line_are_its_own() {
              under in {past} frames and met its letters in {on}"
         );
         let (old, _) = steamed_between_lettered_rows(
-            "tall rainbow + cat",
+            "rainbow + cat",
             DARK,
             &page,
             &[OldPath::WayBeforeSettingOff],
@@ -1943,12 +1916,7 @@ fn a_seat_under_the_line_reads_its_own_row() {
             }
         }
     }
-    let old = context_unworded(
-        "tall rainbow + cat",
-        DARK,
-        true,
-        &[OldPath::SeatReadsItsOwnRow],
-    );
+    let old = context_unworded("rainbow + cat", DARK, true, &[OldPath::SeatReadsItsOwnRow]);
     let boxed = boxes_on_glyphs(&old, 600, under);
     assert!(
         boxed >= 10,
@@ -1966,7 +1934,7 @@ fn a_seat_under_the_line_reads_its_own_row() {
 /// cells with the deletes.
 fn fitted_then_past_the_line(old: &[OldPath], back: u64) -> (Vec<Judged>, i32) {
     let below = "Below: every glyph here must stay legible! pqgyj {braces} [ok] and more";
-    let mut r = Replay::new("tall rainbow + cat", DARK, TrailColor::Automatic);
+    let mut r = Replay::new("rainbow + cat", DARK, TrailColor::Automatic);
     r.coat = true;
     r.fx.set_sparkle_enabled(true);
     for &law in old {
@@ -2220,7 +2188,7 @@ fn a_companion_crossing_a_wrap_keeps_off_the_line() {
             look.name
         );
     }
-    let (.., through) = wrapped_coat("tall rainbow + cat", DARK, &[OldPath::MarginKeepsTheLine]);
+    let (.., through) = wrapped_coat("rainbow + cat", DARK, &[OldPath::MarginKeepsTheLine]);
     assert!(
         through > 0,
         "negative control: without the margin's slide the crossing kept off the first row"
@@ -2229,7 +2197,7 @@ fn a_companion_crossing_a_wrap_keeps_off_the_line() {
     // slide): kept, the caret coming into the body at the wall sends it off the line, and the
     // crossing never leaves from the first row.
     let (low, ch, ..) = wrapped_coat(
-        "tall rainbow + cat",
+        "rainbow + cat",
         DARK,
         &[
             OldPath::MarginKeepsTheLine,
@@ -2243,7 +2211,7 @@ fn a_companion_crossing_a_wrap_keeps_off_the_line() {
          the line ({:.2} rows into it)",
         f64::from(low - 4 * ch) / f64::from(ch)
     );
-    let (.., headed) = wrapped_coat("tall rainbow + cat", DARK, &[OldPath::HeadUnderLetters]);
+    let (.., headed) = wrapped_coat("rainbow + cat", DARK, &[OldPath::HeadUnderLetters]);
     assert!(
         headed > 0,
         "negative control: without the head law the companion kept its head off the first row"
@@ -2285,7 +2253,7 @@ fn on_a_full_screen_s_last_row_the_companion_stands_beside_the_caret() {
         .map_or(0, |(at, _)| *at);
     // The room past the line: the fitted body's, or the cells its widest box at rest there takes.
     let seated = last_row_cols(gallery_cell()) - last_row_line();
-    let widest = coats_driven("tall rainbow + cat", DARK, Scene::LastRow, &[], Drive::Ctl)
+    let widest = coats_driven("rainbow + cat", DARK, Scene::LastRow, &[], Drive::Ctl)
         .iter()
         .filter(|j| j.ms >= TYPING_FROM + FIRST_KEYS && j.ms < enter)
         .filter_map(|j| j.coat.pet)
@@ -2325,13 +2293,13 @@ fn on_a_full_screen_s_last_row_the_companion_stands_beside_the_caret() {
             );
         }
     }
-    let old = held("tall rainbow + cat", DARK, &[OldPath::FitCentredAtTheWall]);
+    let old = held("rainbow + cat", DARK, &[OldPath::FitCentredAtTheWall]);
     assert!(
         old.iter().filter(|f| !f.2).count() >= 250,
         "negative control: centred in its whole box the fitted body kept its seat at the wall"
     );
     let old = held(
-        "tall rainbow + cat",
+        "rainbow + cat",
         DARK,
         &[OldPath::FitCentredAtTheWall, OldPath::LettersCutTheFade],
     );
@@ -2729,7 +2697,7 @@ type WallRun = (
 fn a_last_row_that_holds_no_seat_hides_the_companion() {
     const ROOMS: [i16; 6] = [4, 3, 2, 1, 0, -1];
     const PAGES: [Look; 4] = [DARK, SOLARIZED_DARK, GITHUB_LIGHT, DEFAULT_LIGHT];
-    let cat = "tall rainbow + cat";
+    let cat = "rainbow + cat";
     let faces = wall_faces();
     let seated_at = |cell| i32::from(last_row_cols(cell)) - i32::from(last_row_line());
     let mut runs: Vec<WallRun> = Vec::new();
@@ -2742,7 +2710,7 @@ fn a_last_row_that_holds_no_seat_hides_the_companion() {
         let (styles, looks): (&[&str], &[Look]) = if window {
             (&COMPANIONS, &PAGES)
         } else {
-            (&[cat, "tall rainbow + dog"], &[DARK])
+            (&[cat, "rainbow + dog"], &[DARK])
         };
         let seats_judged = !window || lays_the_bundled_cell();
         for room in ROOMS {
@@ -3005,12 +2973,7 @@ fn the_margin_keeps_the_companion_off_the_line() {
                 );
             }
         }
-        let old = hits(
-            "tall rainbow + cat",
-            DARK,
-            scene,
-            &[OldPath::MarginKeepsTheLine],
-        );
+        let old = hits("rainbow + cat", DARK, scene, &[OldPath::MarginKeepsTheLine]);
         assert!(
             old.len() > 10,
             "negative control: {scene:?} without the margin's slide met the writing in {} frames",
@@ -3018,7 +2981,7 @@ fn the_margin_keeps_the_companion_off_the_line() {
         );
     }
     let old = hits(
-        "tall rainbow + cat",
+        "rainbow + cat",
         DARK,
         Scene::StatusWrap,
         &[OldPath::CrossingRisesIntoTheLine],
@@ -3281,7 +3244,7 @@ fn at_the_wall_the_caret_s_cell_is_no_seat() {
             }
             if cols < 72 {
                 let old = walled(
-                    ("tall rainbow + cat", DARK),
+                    ("rainbow + cat", DARK),
                     cols,
                     drive,
                     &scene,
@@ -3298,7 +3261,7 @@ fn at_the_wall_the_caret_s_cell_is_no_seat() {
                 );
                 let stayed = off_the_caret_and_letters(
                     &walled(
-                        ("tall rainbow + cat", DARK),
+                        ("rainbow + cat", DARK),
                         cols,
                         drive,
                         &scene,
@@ -3383,7 +3346,7 @@ fn a_watched_page_s_caret_takes_its_cell_back() {
                 }
             }
             let old = walled(
-                ("tall rainbow + cat", DARK),
+                ("rainbow + cat", DARK),
                 cols,
                 drive,
                 &scene,
@@ -3400,7 +3363,7 @@ fn a_watched_page_s_caret_takes_its_cell_back() {
             );
             if drive == Drive::Console {
                 let old = walled(
-                    ("tall rainbow + cat", DARK),
+                    ("rainbow + cat", DARK),
                     cols,
                     drive,
                     &scene,
@@ -3462,7 +3425,7 @@ fn the_wall_side_turns_in_the_row_s_last_cell() {
         );
     }
     let old = short(&walled(
-        ("tall rainbow + cat", DARK),
+        ("rainbow + cat", DARK),
         COLS,
         Drive::Console,
         &scene,
@@ -3571,7 +3534,7 @@ fn a_wall_over_blank_ground_is_no_seat_and_its_seat_rides_the_page() {
             }
             if cols < 72 {
                 let old = walled(
-                    ("tall rainbow + cat", DARK),
+                    ("rainbow + cat", DARK),
                     cols,
                     drive,
                     &scene,
@@ -3588,7 +3551,7 @@ fn a_wall_over_blank_ground_is_no_seat_and_its_seat_rides_the_page() {
                 );
                 let stayed = on_the_caret_or_letters(
                     &walled(
-                        ("tall rainbow + cat", DARK),
+                        ("rainbow + cat", DARK),
                         cols,
                         drive,
                         &scene,

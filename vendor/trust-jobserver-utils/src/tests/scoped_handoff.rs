@@ -143,6 +143,12 @@ fn scoped_members_with_age(age: Duration) {
             std::thread::sleep(Duration::from_millis(5));
         }
         endpoint.bind_child(member.id()).unwrap();
+        // A native transport witness retains this SAME endpoint through the
+        // actual member. Dropping the preparing wrapper must neither close it
+        // early nor create another bind attempt/pool.
+        let retained = endpoint.clone();
+        drop(endpoint);
+        let endpoint = retained;
         assert!(endpoint.bind_child(member.id()).is_err());
         assert!(child("sibling", &endpoint).status().unwrap().success());
         member.stdin.take().unwrap().write_all(b"g").unwrap();
@@ -173,8 +179,10 @@ fn scoped_members_with_age(age: Duration) {
 fn scoped_failed_bind_cannot_be_retried() {
     let endpoint = ScopedHandoff::jobserver(super::tests::pipe(), [900, 901]).unwrap();
     assert!(endpoint.bind_child(std::process::id()).is_err());
+    let retained = endpoint.clone();
+    drop(endpoint);
     let mut child = Command::new("/bin/sleep").arg("1").spawn().unwrap();
-    assert!(endpoint.bind_child(child.id()).is_err());
+    assert!(retained.bind_child(child.id()).is_err());
     child.kill().unwrap();
     child.wait().unwrap();
 }
@@ -192,12 +200,24 @@ fn exited_member_cannot_authorize_another_process() {
 
 #[test]
 fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
+    const NAMED: &str = "TRUST_SCOPED_NAMED_TEST";
+    const EXACT: &str = "handoff::scoped_tests::scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement";
+    #[cfg(feature = "client")]
+    if std::env::var_os(NAMED).as_deref() == Some(OsStr::new("leaf")) {
+        // SAFETY: this fresh descendant imports only the original named pool.
+        let inherited = unsafe { super::super::InheritedJobserver::from_env() }.unwrap();
+        assert!(inherited.is_present());
+        return;
+    }
     if std::env::var_os(NAMED).is_some() {
         let ad = std::env::var_os(ENV).unwrap();
         assert!(recover_named_fifo_resources(&ad).is_err(), "unbound member must refuse");
         #[cfg(feature = "client")]
         // SAFETY: this fixture advertises only named metadata, no reusable slots.
         assert!(unsafe { super::super::Jobserver::from_env_with_handoff() }.is_err());
+        #[cfg(feature = "client")]
+        // SAFETY: same fresh named-only fixture; the shim must check scope too.
+        assert!(unsafe { super::super::InheritedJobserver::from_env() }.is_err());
         std::fs::write(std::env::var_os("TRUST_SCOPED_READY").unwrap(), b"ready").unwrap();
         let mut go = [0];
         std::io::stdin().read_exact(&mut go).unwrap();
@@ -220,12 +240,31 @@ fn scoped_named_fifo_transport_preserves_inventory_and_refuses_replacement() {
                 unsafe { super::super::Jobserver::from_env_with_handoff() }.unwrap().unwrap();
             let token = server.client().acquire().unwrap();
             drop(token);
+            // SAFETY: only checked named witnesses are advertised in this child.
+            let inherited = unsafe { super::super::InheritedJobserver::from_env() }.unwrap();
+            assert!(inherited.is_present());
+            let mut next = Command::new(std::env::current_exe().unwrap());
+            inherited.configure(&mut next);
+            let exported = next.get_envs().find(|(key, _)| *key == "CARGO_MAKEFLAGS").unwrap();
+            let mut direct = Command::new("unused");
+            server.configure(&mut direct);
+            let expected = direct.get_envs().find(|(key, _)| *key == "CARGO_MAKEFLAGS").unwrap();
+            assert_eq!(exported.1, expected.1);
+            assert_eq!(
+                next.get_envs().find(|(key, _)| *key == ENV).unwrap().1,
+                Some(ad.as_os_str())
+            );
+            assert!(!format!("{inherited:?}").contains(ad.to_str().unwrap()));
+            assert!(next.args(["--exact", EXACT]).env(NAMED, "leaf").status().unwrap().success());
         }
         std::fs::write(std::env::var_os("TRUST_SCOPED_CONSUMED").unwrap(), b"done").unwrap();
         std::io::stdin().read_exact(&mut go).unwrap();
         #[cfg(feature = "client")]
         // SAFETY: named-only metadata as above, now pointing at a replaced node.
         assert!(unsafe { super::super::Jobserver::from_env_with_handoff() }.is_err());
+        #[cfg(feature = "client")]
+        // SAFETY: same fresh named-only fixture; the shim must check scope too.
+        assert!(unsafe { super::super::InheritedJobserver::from_env() }.is_err());
         return;
     }
     named_fifo_with_age(Duration::ZERO);

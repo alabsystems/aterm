@@ -1046,7 +1046,7 @@ struct Backlog {
     last_held_ms: u64,
     peak: u32,
     oldest_ms: u64,
-    /// Readings in a row that found nothing held.
+    /// Readings in a row that found none of it held (a stranded row is no part of it).
     empty: u8,
 }
 
@@ -1291,7 +1291,7 @@ impl Jobs {
         let children = children_of(&tick.sweep);
         self.note_zombies(at, &tick.sweep);
         self.note_d_state(at, &tick.sweep, &facts);
-        self.note_held(at, &tick.held);
+        self.note_held(tick);
         self.adopted
             .extend(tick.tabs.iter().filter(|t| t.adopted).map(|t| t.key));
         let flat_on_dylib = self.flat_on_a_fresh_dylib(&facts);
@@ -3044,13 +3044,19 @@ impl Jobs {
     /// backed up when a key held now was held at the reading before (its first sighting is kept)
     /// or [`HELD_AT_ONCE`] are held at once (a normal exec reads held for under 0.3 ms); the
     /// episode opens at the first backed-up reading and closes at the second reading in a row with
-    /// nothing held. A `Translating`, `NotStarted` or `StoppedUnstarted` row is no part of it:
-    /// its wait is not the check's.
-    fn note_held(&mut self, at: u64, held: &[HeldProc]) {
-        let all: BTreeSet<(u32, HeldExec, StartWait)> = held.iter().map(held_key).collect();
-        let keys: BTreeSet<&(u32, HeldExec, StartWait)> = all
+    /// none of it held. A `Translating`, `NotStarted` or `StoppedUnstarted` row is no part of it:
+    /// its wait is not the check's. Nor is a row the host judged [`stranded`], whose check went
+    /// to a syspolicyd no longer running, so it is in no line the running one answers; its held
+    /// time goes on. A row the host cannot judge, such as one it first read unrun after the
+    /// running syspolicyd started, stays part of it, since it may be in that line.
+    fn note_held(&mut self, tick: &JobTick) {
+        let at = tick.at_ms;
+        let all: BTreeSet<(u32, HeldExec, StartWait)> = tick.held.iter().map(held_key).collect();
+        let keys: BTreeSet<(u32, HeldExec, StartWait)> = tick
+            .held
             .iter()
-            .filter(|k| k.2 == StartWait::ProgramCheck)
+            .filter(|h| h.wait == StartWait::ProgramCheck && !stranded(h, tick))
+            .map(held_key)
             .collect();
         let backed_up =
             keys.len() >= HELD_AT_ONCE || keys.iter().any(|k| self.held_since.contains_key(k));
@@ -3162,7 +3168,7 @@ impl Jobs {
                 });
             }
             if tick.self_uid.is_some() && p.uid == tick.self_uid {
-                f.own_procs += 1;
+                f.own_procs += p.threads.map_or(1, u64::from);
             }
         }
         for (ppid, count) in self.zombies.piles(at) {
@@ -3255,7 +3261,7 @@ impl Jobs {
                     if after_grant(h, named.tab) {
                         f.program_check_after_grant += 1;
                     }
-                    if h.stranded && tick.program_check_daemon.is_some() {
+                    if stranded(h, tick) {
                         f.program_check_stranded.push(named.clone());
                     }
                     f.program_check.push(named);
@@ -3439,6 +3445,12 @@ impl Job {
             meter: JobMeter::default(),
         }
     }
+}
+
+/// Whether the host judged `h` stranded at the check: a row the check holds, flagged
+/// ([`HeldProc::stranded`]) while the tick names the syspolicyd it was judged against.
+const fn stranded(h: &HeldProc, tick: &JobTick) -> bool {
+    matches!(h.wait, StartWait::ProgramCheck) && h.stranded && tick.program_check_daemon.is_some()
 }
 
 /// An actual exec version is distinct from the birth or zero used when it was unavailable.

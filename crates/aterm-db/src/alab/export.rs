@@ -275,7 +275,7 @@ fn lab_now(paths: &Paths) -> Result<Option<(LabView, OwnedRead)>> {
         .owned
         .get(super::registry::MAILBOX_OBS.name)
         .unwrap_or(&empty);
-    let lab = LabView::read(&view.cells, &facts, obs, None);
+    let lab = LabView::read_view(&view, &facts, obs, None);
     Ok(Some((lab, facts)))
 }
 

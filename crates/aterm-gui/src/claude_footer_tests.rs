@@ -102,14 +102,39 @@ fn the_switch_and_the_label_give_words_up_in_order() {
     };
     assert_eq!(
         labels(known),
-        [format!("alab v{ver} (v2.1.305)"), format!("alab v{ver}")],
-        "the lockup names the CLI: the label never does"
+        [
+            format!("ALab v{ver} (v2.1.305)"),
+            format!("ALab v{ver}"),
+            "ALab".to_owned()
+        ],
+        "the lockup names the CLI: the label never does, and its narrowest is the mark alone"
     );
     assert_eq!(
         labels(paint(HarnessSwitch::On)),
-        [format!("alab v{ver}")],
+        [format!("ALab v{ver}"), "ALab".to_owned()],
         "an unknown CLI version is left out, never `(v?)`"
     );
+    for tier in 0..LABEL_TIERS {
+        let face = label_face(&known, tier).expect("a tier");
+        for &(ch, ink) in face.cells() {
+            let want = match ink {
+                LabelInk::Brand => "ALab".contains(ch),
+                LabelInk::Muted => ch != ' ',
+                LabelInk::Pad => ch == ' ',
+                LabelInk::Lit => false,
+            };
+            assert!(want, "tier {tier}: {ch:?} is {ink:?}");
+        }
+        assert_eq!(
+            face.cells()
+                .iter()
+                .filter(|(_, ink)| *ink == LabelInk::Brand)
+                .map(|(ch, _)| *ch)
+                .collect::<String>(),
+            "ALab",
+            "tier {tier}: the mark alone wears the brand's ink, both versions fine print"
+        );
+    }
     for (harness, raw, core) in [
         (CliHarness::Muse, "1.4.13-R6996.1", "1.4.13"),
         (CliHarness::Agy, "v1.4.0", "1.4.0"),
@@ -121,12 +146,12 @@ fn the_switch_and_the_label_give_words_up_in_order() {
         let wide = label_face(&p, 0).expect("the widest").text();
         assert_eq!(
             wide,
-            format!("alab v{} (v{core})", harness.version_str()),
+            format!("ALab v{} (v{core})", harness.version_str()),
             "{harness:?}: the numbers alone"
         );
         let bare = raw.strip_prefix('v').unwrap_or(raw);
         let whole = label_whole(&p, 0).map(|w| LabelFace::of_words(&w[0]).text());
-        let want = (bare != core).then(|| format!("alab v{} (v{bare})", harness.version_str()));
+        let want = (bare != core).then(|| format!("ALab v{} (v{bare})", harness.version_str()));
         assert_eq!(whole, want, "{harness:?}: the hover says the whole build");
     }
     assert_eq!(
@@ -146,6 +171,11 @@ fn the_switch_and_the_label_give_words_up_in_order() {
             .collect()),
         Some(vec!["claude v2.1.305".to_owned(), "v2.1.305".to_owned()]),
         "the last tier lays none of the build: the hover says it"
+    );
+    assert_eq!(
+        label_whole(&known, 1),
+        label_whole(&known, LABEL_TIERS - 1),
+        "nor does the tier with the harness's version alone"
     );
     let v = LabelFace::of_words(&[("v0.5".to_owned(), LabelInk::Lit)]);
     assert_eq!(
@@ -5110,8 +5140,8 @@ fn agy_launch_card_and_composer_footer_render_on_the_glass() {
     let card_line = text_of(&app.windows[&wid].input_scratch.cells[strip + 5]);
     assert!(
         card_line.contains(&format!(
-            "enhanced by alab agy harness v{}",
-            aterm_phase::CliHarness::Agy.version_str()
+            "enhanced by {} agy harness",
+            aterm_types::identity::COMPANY
         )) && !card_line.contains("autopilot"),
         "agy card line on row top+4: {card_line:?}"
     );
@@ -5341,8 +5371,8 @@ fn muse_launch_card_and_composer_footer_render_on_the_glass() {
     let card_line = text_of(&app.windows[&wid].input_scratch.cells[strip + 2]);
     assert!(
         card_line.contains(&format!(
-            "enhanced by alab muse harness v{} \u{00B7} alab.systems",
-            aterm_phase::CliHarness::Muse.version_str()
+            "enhanced by {} muse harness",
+            aterm_types::identity::COMPANY
         )) && !card_line.contains("autopilot"),
         "muse card line on row top+1: {card_line:?}"
     );
@@ -6291,9 +6321,9 @@ fn autopilot_off_keeps_the_harness_lit_in_white_for_claude_agy_and_muse() {
         let label = super::probe::harness_label(harness);
         let expected_switch = &format!("{} {label}", super::probe::LIT_SWITCH);
         let brand = format!(
-            "enhanced by alab {} harness v{}",
-            harness.cli(),
-            harness.version_str()
+            "enhanced by {} {} harness",
+            aterm_types::identity::COMPANY,
+            harness.cli()
         );
         let sid = app.pool.get(session).expect("session").ctx.self_id.clone();
         let chip_line = |app: &App| {

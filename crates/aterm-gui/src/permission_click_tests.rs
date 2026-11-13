@@ -155,3 +155,133 @@ fn a_standing_click_holds_the_loops_act_for_its_own_bound() {
     assert!(clicks.take_back("s-h").is_some());
     assert!(!clicks.holds("s-h", Instant::now()), "nothing stands");
 }
+
+fn default_of(mode: Resolved) -> PermissionDefault {
+    PermissionDefault {
+        mode,
+        bypass_disabled: None,
+    }
+}
+
+/// THE WINDOW READS A DEFAULT THE RESOLVER READ: a tab's default is due until it is read and
+/// again once it has stood the recheck; a read is held for the agent it was read for, and a
+/// relaunched agent's replaces it, so one process's settings never answer for another's; a hold
+/// says whether the default moved. The window asks for
+/// a read once while one is due, not on every frame. The table is bounded. NEGATIVE CONTROL:
+/// another tab, and the same tab's other agent, read nothing.
+#[test]
+fn a_default_is_held_for_its_agent_and_asked_for_once_while_due() {
+    let mut reads = DefaultReads::default();
+    let t0 = Instant::now();
+    assert!(reads.due("s-a", 10, t0), "never read");
+    assert_eq!(reads.get("s-a", 10), None);
+    assert!(reads.ask("s-a", 10, t0), "the first ask");
+    assert!(
+        !reads.ask("s-a", 10, t0 + DEFAULT_RECHECK / 2),
+        "asked lately"
+    );
+    assert!(
+        reads.hold("s-a", 10, t0, default_of(Resolved::Unset)),
+        "a first read moves it"
+    );
+    assert!(!reads.due("s-a", 10, t0 + DEFAULT_RECHECK / 2));
+    assert!(
+        !reads.ask("s-a", 10, t0 + DEFAULT_RECHECK / 2),
+        "nothing due"
+    );
+    assert_eq!(reads.get("s-a", 10), Some(default_of(Resolved::Unset)));
+    assert!(
+        reads.due("s-a", 10, t0 + DEFAULT_RECHECK),
+        "stood the recheck"
+    );
+    assert!(
+        reads.ask("s-a", 10, t0 + DEFAULT_RECHECK),
+        "asked again once due"
+    );
+    assert!(
+        !reads.hold("s-a", 10, t0 + DEFAULT_RECHECK, default_of(Resolved::Unset)),
+        "the same default read again moves nothing"
+    );
+    let plan = default_of(Resolved::Mode {
+        mode: aterm_agent::harness::lights::Mode::Plan,
+        source: "~/.claude/settings.json".to_owned(),
+    });
+    assert!(reads.hold("s-a", 10, t0 + DEFAULT_RECHECK * 2, plan.clone()));
+    assert_eq!(reads.get("s-a", 10), Some(plan.clone()));
+    assert_eq!(reads.get("s-b", 10), None, "NEGATIVE CONTROL: another tab");
+    assert_eq!(
+        reads.get("s-a", 11),
+        None,
+        "NEGATIVE CONTROL: another agent"
+    );
+    assert!(
+        reads.due("s-a", 11, t0),
+        "a relaunched agent is not read yet"
+    );
+    assert!(reads.hold("s-a", 11, t0, default_of(Resolved::Unset)));
+    assert_eq!(reads.get("s-a", 10), None, "the ended agent's read is gone");
+    assert_eq!(reads.0.len(), 1, "one agent a tab");
+    for n in 0..DEFAULT_READS_MAX * 2 {
+        reads.hold(&format!("s-{n}"), 1, t0, default_of(Resolved::Unset));
+    }
+    assert_eq!(reads.0.len(), DEFAULT_READS_MAX, "bounded");
+    let last = format!("s-{}", DEFAULT_READS_MAX * 2 - 1);
+    assert!(reads.get(&last, 1).is_some(), "the newest is kept");
+}
+
+/// THE WINDOW THREAD READS NO SETTINGS FILE FOR A CLICK: the production default of a tab whose
+/// agent a relaunch snapshot names is what the resolver last held for that agent, and before
+/// its first read the window holds none, rather than reading the
+/// agent's settings chain itself (the defect: a click read the agent's `.claude` files, its git
+/// worktree and the user and managed files on the window thread, which a dead network mount
+/// under the agent's directory froze). Once the resolver holds a read, the window answers it.
+#[test]
+fn the_window_answers_the_default_from_the_resolvers_read() {
+    let tab = "s-window-reads-no-file";
+    let pid = 4_000_123;
+    let mut snap = aterm_agent::harness::relaunch::Snapshot {
+        launch_env: None,
+        auth_observed: true,
+        route: aterm_agent::harness::accounts::AuthRoute::Outside,
+        profile: None,
+        tab: tab.to_owned(),
+        pid,
+        lifetime: None,
+        start: "Thu Sep 24 01:02:03 2026".to_owned(),
+        shell: 4242,
+        program: std::path::PathBuf::from("/opt/claude"),
+        argv: vec!["/opt/claude".to_owned()],
+        session: None,
+        cwd: "/".to_owned(),
+        version: Some("2.1.318".to_owned()),
+        run: aterm_agent::harness::relaunch::AgentRun::Claude,
+        dialect: None,
+        login: None,
+        home: None,
+        claude_dir: None,
+    };
+    crate::harness_host::publish_snapshot_for_test(tab, Some(&snap));
+    let defaults = live_defaults();
+    assert_eq!(
+        (defaults.0)(tab),
+        None,
+        "before the resolver's read the window reads nothing"
+    );
+    let plan = default_of(Resolved::Mode {
+        mode: aterm_agent::harness::lights::Mode::Plan,
+        source: "~/.claude/settings.json".to_owned(),
+    });
+    DEFAULT_READS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .hold(tab, pid, Instant::now(), plan.clone());
+    assert_eq!((defaults.0)(tab), Some(plan), "the resolver's read answers");
+    snap.pid = pid + 1;
+    crate::harness_host::publish_snapshot_for_test(tab, Some(&snap));
+    assert_eq!(
+        (defaults.0)(tab),
+        None,
+        "NEGATIVE CONTROL: a relaunched agent's default is not the ended one's"
+    );
+    crate::harness_host::publish_snapshot_for_test(tab, None);
+}

@@ -1564,6 +1564,8 @@ impl App {
             generation: 0,
             rest: PointerRest::at_open(px),
             told: None,
+            plate: Default::default(),
+            wash: Default::default(),
         });
         if fact == Fact::Account {
             self.account_menu_read

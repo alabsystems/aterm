@@ -848,8 +848,8 @@ fn a_scratch_whose_folder_denies_its_removal_is_removed_all_the_same() {
 
 /// A scratch dropped while its test fails is kept, programs and all: the run may have been cut
 /// off while macOS still checked a program's first start in it, and removing that file then can
-/// stall every program start on the Mac (install.sh's `showed_it_ran`). NEGATIVE CONTROL: a
-/// scratch dropped while no test fails goes, its program with it.
+/// strand every program start waiting on that check (install.sh's `showed_it_ran`). NEGATIVE
+/// CONTROL: a scratch dropped while no test fails goes, its program with it.
 #[test]
 fn a_failing_tests_scratch_keeps_its_programs() {
     let mut laid = None;

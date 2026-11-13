@@ -206,7 +206,7 @@ fn a_view_becomes_facts_and_records_its_offer_once() {
         row: None,
         pending: Some(false),
         logged_in: true,
-        login: LoginHalf::Ok,
+        login: LoginHere::Half(LoginHalf::Ok),
         offer: Some(Offer {
             pair: "none:-/ok:-".into(),
             step: Step::Token {
@@ -234,7 +234,7 @@ fn a_view_becomes_facts_and_records_its_offer_once() {
     };
     assert_eq!(shown.state, "none");
     assert_eq!(shown.kind, TokenState::None);
-    assert_eq!(shown.login, LoginHalf::Ok);
+    assert_eq!(shown.login, LoginHere::Half(LoginHalf::Ok));
     assert!(shown.logged_in && !shown.not_yet);
     assert_eq!(
         (shown.made_at, shown.ends_at, shown.made_on.as_deref()),
@@ -299,7 +299,7 @@ fn a_fact_keeps_the_views_typed_fields() {
         }),
         pending: Some(false),
         logged_in: false,
-        login: LoginHalf::Ending { end: 7_000 },
+        login: LoginHere::Half(LoginHalf::Ending { end: 7_000 }),
         offer: None,
     };
     let read = facts_of_view(dir.path(), Some(vec![account.clone()]), 100);
@@ -311,7 +311,10 @@ fn a_fact_keeps_the_views_typed_fields() {
     assert_eq!(shown.made_on.as_deref(), Some("m15"));
     assert_eq!(shown.verified_at, Some(1_500));
     assert!(shown.not_yet, "signed here, and no server took it yet");
-    assert_eq!(shown.login, LoginHalf::Ending { end: 7_000 });
+    assert_eq!(
+        shown.login,
+        LoginHere::Half(LoginHalf::Ending { end: 7_000 })
+    );
     assert!(!shown.logged_in);
     assert_eq!(shown.vault_words, account.vault_words());
     assert_eq!(shown.peers, ["m22"]);

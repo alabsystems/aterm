@@ -12,22 +12,36 @@
 //! `--key-shape press|built` selects the existing `hwkey` event constructor explicitly; the
 //! default is `press`. Before warm-up, the lane raises its private terminal and observes native
 //! focus. These gates do not establish that a posted event arrived: booking still must follow.
-//! A press waits out its quiet (`--min-quiet`, then until `trail status` says the pet sleeps
-//! deeply and the window rests exactly when its arm rests it, then a random `--settle` more, so
-//! the key meets the resting window's 5 s reading at any phase), reads the load, the memory
-//! pressure and aterm's footprint, waits 2 s, resets the metrics, presses `a` through the OS event
-//! path (`hwkey`), and reads `metrics` 600 ms later. A burst arm presses four more keys once the
-//! first is booked, each a random 100 to 250 ms after the one before, and books each of those four
-//! from its own booking as a row of its own (`burst` 2 to 5), compared with the first burst arm's.
+//! A press waits out its quiet (the longer of `--min-quiet` and its arm's rest plus 1 s, so an arm
+//! that rests longer than the state wait's minute is still measured rather than dropped; then
+//! until `trail status` says the pet sleeps deeply and the window rests exactly when its arm rests
+//! it; then a random `--settle` more, so the key meets the resting window's 5 s reading at any
+//! phase), reads the load, the memory pressure and aterm's footprint, waits 2 s, resets the
+//! metrics, presses `a` through the OS event path (`hwkey`), and reads `metrics` 600 ms later. A
+//! burst arm presses four more keys once the first is booked, each a random 100 to 250 ms after
+//! the one before, and books each of those four from its own booking as a row of its own (`burst`
+//! 2 to 5), compared with the first burst arm's.
 //! `key ctrl+u` then clears the shell's line, which starts the next quiet. A press whose window is
 //! not in its arm's state a minute past its quiet (a pointer crossed it, the focus came back to
 //! it, its tab printed) is dropped and counted, with its status in `<out>/dropped.tsv`.
 //!
 //! Every first-key press is a row of `<out>/presses.tsv` (a burst press four), written as it
 //! ends, with its `trail status`, `metrics` and `metrics percentiles` replies whole in
-//! `<out>/raw/<press>-<arm>.txt`; the summary (nearest-rank percentiles per arm, bootstrap
-//! intervals and one-sided exact tests against the first arm of its kind) is `<out>/summary.txt`, and `first-key summarize <presses.tsv>...` reads
-//! it again from rows. Exit 0 once every press ran or was dropped, 3 when the run could not: the
+//! `<out>/raw/<press>-<arm>.txt`. A row carries aterm's own counts of the press's slices booked in
+//! a present 2 s or more after the process's previous present (`n_input_cold`) and in a window's
+//! first present after a person woke it from a focused rest (`n_rest_wake_key`); a burst key's
+//! row carries its own key's. The summary is `<out>/summary.txt`, and `first-key summarize
+//! <presses.tsv>...` reads it again from rows: per arm, nearest-rank percentiles, the cold share
+//! (rows whose `present_idle_ms` is 2000 or more) beside the summed `n_input_cold` and the rows
+//! where the two disagree, the submit and the key's queue, the input and present percentiles of
+//! its cold keys (rows whose `n_input_cold` is above 0), and its presses by memory pressure; then
+//! each arm against its base, the arm of its kind (first keys or burst keys) whose row comes first
+//! (in a run, the first of its kind to press, which without `--fixed-order` is not always the
+//! first `--arm` given: an arm with fewer presses than the most skips the first round; pooled
+//! takes read in the order the files are named): bootstrap intervals of the input, present and
+//! worst-glass quantiles, and one-sided exact tests of the keys past the base's input and present
+//! quantiles.
+//! Exit 0 once every press ran or was dropped, 3 when the run could not: the
 //! instance did not come up, a control call was refused, or a key was not booked in a minute.
 
 use std::fmt::Write as _;
@@ -43,7 +57,10 @@ use crate::{Fail, Res, stop};
 const USAGE: &str = "usage: first-key [--aterm PATH] [--arm NAME=REST:PRESSES[:burst]]... \
      [--arm-toml NAME=LINE]... [--min-quiet SECS] [--settle LO..HI] [--no-pet] [--toml LINE]... \
      [--seed N] [--fixed-order] [--key-shape press|built] --out DIR\n       \
-     first-key summarize PRESSES.TSV...";
+     first-key summarize PRESSES.TSV...\n\
+     A press's quiet is the longer of --min-quiet (default 30) and its arm's REST plus 1 s. Each \
+     arm is compared with its base: the arm of its kind (first key or burst) whose row comes \
+     first, in press order and then in the order the files are named.";
 
 /// The columns of `presses.tsv`, in order.
 const COLUMNS: &[&str] = &[
@@ -59,6 +76,8 @@ const COLUMNS: &[&str] = &[
     "pet_deep",
     "focused",
     "n_input",
+    "n_input_cold",
+    "n_rest_wake_key",
     "input_ms",
     "max_input_ms",
     "n_present",
@@ -161,6 +180,14 @@ pub fn schedule(arms: &[Arm]) -> Vec<usize> {
         order.extend(this);
     }
     order
+}
+
+/// How long a press of `arm` waits after the last key before it reads the window's state: the
+/// longer of `min_quiet` and the arm's rest plus 1 s, so the state wait's minute (a hang detector,
+/// not part of the quiet) starts once the window should already rest, however long its arm rests.
+#[must_use]
+pub fn quiet_for(min_quiet: Duration, arm: &Arm) -> Duration {
+    min_quiet.max(Duration::from_secs(u64::from(arm.rest_secs) + 1))
 }
 
 /// A small deterministic generator (xorshift64*), for the settle and the burst gaps.
@@ -302,6 +329,41 @@ fn column(rows: &[&Row], key: &str) -> Vec<f64> {
     )
 }
 
+/// The `present_idle_ms` at or past which a row's present counts as cold: aterm's `COLD_GAP_NS`
+/// (`crates/aterm-gui/src/metrics.rs`), the 2 s by which the GPU driver has freed its block.
+const COLD_IDLE_MS: f64 = 2000.0;
+
+/// What `rows` say of their cold presents: `(rows whose present_idle_ms is read, of those the
+/// cold ones, the summed n_input_cold, the rows where a cold idle and a nonzero n_input_cold
+/// disagree)`, over the rows that carry both columns for the disagreement.
+fn cold_figures(rows: &[&Row]) -> (usize, usize, f64, usize) {
+    let read = |r: &Row, k: &str| r.get(k).and_then(|v| v.parse::<f64>().ok());
+    let idle: Vec<bool> = rows
+        .iter()
+        .filter_map(|r| read(r, "present_idle_ms").filter(|v| v.is_finite()))
+        .map(|v| v >= COLD_IDLE_MS)
+        .collect();
+    let counted: f64 = rows
+        .iter()
+        .filter_map(|r| read(r, "n_input_cold").filter(|v| v.is_finite()))
+        .sum();
+    let disagree = rows
+        .iter()
+        .filter_map(|r| {
+            let idle = read(r, "present_idle_ms").filter(|v| v.is_finite())?;
+            let cold = read(r, "n_input_cold").filter(|v| v.is_finite())?;
+            Some((idle >= COLD_IDLE_MS) != (cold > 0.0))
+        })
+        .filter(|&d| d)
+        .count();
+    (
+        idle.len(),
+        idle.iter().filter(|&&c| c).count(),
+        counted,
+        disagree,
+    )
+}
+
 /// Whether `row` books a burst press's key (`burst` 2 to 5) rather than a first key (0).
 fn is_burst(row: &Row) -> bool {
     row.get("burst")
@@ -309,8 +371,8 @@ fn is_burst(row: &Row) -> bool {
         .is_some_and(|k| k > 0)
 }
 
-/// The summary of `rows`: per arm, then each arm against the first arm (by first appearance) of
-/// its kind, first keys against first keys and burst keys against burst keys.
+/// The summary of `rows`: per arm, then each arm against its base, the first arm of its kind to
+/// appear in `rows` (first keys against first keys, burst keys against burst keys).
 #[must_use]
 pub fn summarize(rows: &[Row]) -> String {
     let mut names: Vec<String> = Vec::new();
@@ -357,6 +419,54 @@ pub fn summarize(rows: &[Row]) -> String {
             rank(&column(&rows, "load_1m"), 0.5),
         );
     }
+    let _ = writeln!(
+        out,
+        "\narm  cold share (present_idle_ms >= {COLD_IDLE_MS:.0})  n_input_cold  rows disagreeing  n_rest_wake_key  submit p50/p95 (ms)  key_queue p99"
+    );
+    for name in &names {
+        let rows = of(name);
+        let (read, cold, counted, disagree) = cold_figures(&rows);
+        let submit = column(&rows, "present_submit_ms");
+        let wakes: f64 = column(&rows, "n_rest_wake_key").iter().sum();
+        let _ = writeln!(
+            out,
+            "{name}  {cold} of {read} ({:.1}%)  {counted:.0}  {disagree}  {wakes:.0}  {:.2} / {:.2}  {:.2}",
+            100.0 * cold as f64 / read.max(1) as f64,
+            rank(&submit, 0.5),
+            rank(&submit, 0.95),
+            rank(&column(&rows, "key_queue_ms"), 0.99),
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\narm  cold keys (n_input_cold > 0)  input_cold p50/p95/p99 (ms)  present p50/p95/p99 of cold keys  pressure normal / warn / critical / unread"
+    );
+    for name in &names {
+        let rows = of(name);
+        let cold: Vec<&Row> = rows
+            .iter()
+            .copied()
+            .filter(|r| {
+                r.get("n_input_cold")
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .is_some_and(|n| n > 0.0)
+            })
+            .collect();
+        let level = |l: &str| {
+            rows.iter()
+                .filter(|r| r.get("pressure").is_some_and(|p| p == l))
+                .count()
+        };
+        let [normal, warn, critical] = ["normal", "warn", "critical"].map(level);
+        let _ = writeln!(
+            out,
+            "{name}  {}  {}  {}  {normal} / {warn} / {critical} / {}",
+            cold.len(),
+            q3(&column(&cold, "input_ms")),
+            q3(&column(&cold, "present_ms")),
+            rows.len() - normal - warn - critical,
+        );
+    }
     let burst = |name: &str| of(name).first().is_some_and(|r| is_burst(r));
     let above = |v: &[f64], t: f64| v.iter().filter(|&&x| x > t).count() as u64;
     let mut rng = Rng::new(0x5EED_F1E5);
@@ -369,6 +479,7 @@ pub fn summarize(rows: &[Row]) -> String {
         let b_present = column(&base_rows, "present_ms");
         let b_glass = column(&base_rows, "max_glass_ms");
         let (b95, b99) = (rank(&b_input, 0.95), rank(&b_input, 0.99));
+        let b_present95 = rank(&b_present, 0.95);
         let rows = of(name);
         let input = column(&rows, "input_ms");
         let present = column(&rows, "present_ms");
@@ -388,21 +499,35 @@ pub fn summarize(rows: &[Row]) -> String {
                 rank(&present, q) - rank(&b_present, q)
             );
         }
-        let _ = writeln!(
-            out,
-            "  present p99 {:+.2} ms; worst glass p95 {:+.2} ms",
-            rank(&present, 0.99) - rank(&b_present, 0.99),
-            rank(&glass, 0.95) - rank(&b_glass, 0.95)
-        );
-        for (t, label) in [(b95, "p95"), (b99, "p99")] {
-            let (a_hit, b_hit) = (above(&input, t), above(&b_input, t));
+        for (what, a, b) in [
+            ("present", &present, &b_present),
+            ("worst glass", &glass, &b_glass),
+        ] {
+            let (lo, hi) = bootstrap_diff(a, b, 0.95, 10_000, &mut rng);
             let _ = writeln!(
                 out,
-                "  above {base}'s input {label} ({t:.2} ms): {a_hit} of {} ({:.1}%) against {b_hit} of {}; one-sided Fisher p {:.4}",
-                input.len(),
-                100.0 * a_hit as f64 / input.len().max(1) as f64,
-                b_input.len(),
-                fisher_greater(a_hit, input.len() as u64, b_hit, b_input.len() as u64)
+                "  {what} p95 {:+.2} ms (95% bootstrap {lo:+.2} .. {hi:+.2})",
+                rank(a, 0.95) - rank(b, 0.95)
+            );
+        }
+        let _ = writeln!(
+            out,
+            "  present p99 {:+.2} ms",
+            rank(&present, 0.99) - rank(&b_present, 0.99)
+        );
+        for (what, a, b, t, label) in [
+            ("input", &input, &b_input, b95, "p95"),
+            ("input", &input, &b_input, b99, "p99"),
+            ("present", &present, &b_present, b_present95, "p95"),
+        ] {
+            let (a_hit, b_hit) = (above(a, t), above(b, t));
+            let _ = writeln!(
+                out,
+                "  above {base}'s {what} {label} ({t:.2} ms): {a_hit} of {} ({:.1}%) against {b_hit} of {}; one-sided Fisher p {:.4}",
+                a.len(),
+                100.0 * a_hit as f64 / a.len().max(1) as f64,
+                b.len(),
+                fisher_greater(a_hit, a.len() as u64, b_hit, b.len() as u64)
             );
         }
     }
@@ -742,7 +867,7 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
                 .map_err(|e| format!("cannot write {}: {e}", toml_path.display()))?;
             config_now = wanted;
         }
-        stop::sleep(o.min_quiet.saturating_sub(last_key.elapsed()))?;
+        stop::sleep(quiet_for(o.min_quiet, arm).saturating_sub(last_key.elapsed()))?;
         let mut status;
         let mut status_raw;
         let given_up = stop::deadline_after(Duration::from_secs(60));
@@ -799,7 +924,8 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
         let get = |f: &std::collections::BTreeMap<String, String>, k: &str| {
             num(f, k).map_or_else(|| "nan".to_string(), |v| format!("{v}"))
         };
-        // A burst press's keys 2 to 5, each `(input, present)` as its own booking read them.
+        // A burst press's keys 2 to 5, each `(input, present, cold, rest wake)` as its own
+        // booking read them; the two counts are that key's own, the step from the key before.
         let mut burst_keys = Vec::new();
         let mut expect = 1;
         if arm.burst {
@@ -808,15 +934,24 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
             let _ = booked(&mut conn, 1, press, arm)?;
             call(&mut conn, "metrics reset")?;
             let mut at = Duration::ZERO;
+            let mut counted = [Some(0.0); 2];
             for key in 1..=4 {
                 at += Duration::from_secs_f64(rng.between(0.100, 0.250));
                 stop::sleep(at.saturating_sub(t0.elapsed()))?;
                 call(&mut conn, &key_request)?;
                 let (k, _) = booked(&mut conn, key, press, arm)?;
+                let [cold, wake] = ["n_input_cold", "n_rest_wake_key"].map(|f| num(&k, f));
+                let step = |now: Option<f64>, before: Option<f64>| {
+                    now.zip(before)
+                        .map_or_else(|| "nan".to_string(), |(n, b)| format!("{}", n - b))
+                };
                 burst_keys.push((
                     get(&k, "last_input_present_ms"),
                     get(&k, "last_present_latency_ms"),
+                    step(cold, counted[0]),
+                    step(wake, counted[1]),
                 ));
+                counted = [cold, wake];
             }
             expect = 4;
             last_key = Instant::now();
@@ -869,6 +1004,8 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
             status.get("pet_deep").cloned().unwrap_or_default(),
             status.get("focused").cloned().unwrap_or_default(),
             get(&m, "n_input"),
+            get(&m, "n_input_cold"),
+            get(&m, "n_rest_wake_key"),
             input,
             get(&m, "max_input_present_ms"),
             get(&m, "n_present"),
@@ -924,11 +1061,13 @@ fn drive(o: &Opts) -> Result<(Vec<Row>, usize), Fail> {
         } else {
             (2_u8..)
                 .zip(burst_keys)
-                .map(|(key, (input, present))| {
+                .map(|(key, (input, present, cold, wake))| {
                     let mut v = values.clone();
                     v[col("burst")] = key.to_string();
                     v[col("input_ms")] = input;
                     v[col("present_ms")] = present;
+                    v[col("n_input_cold")] = cold;
+                    v[col("n_rest_wake_key")] = wake;
                     v
                 })
                 .collect()

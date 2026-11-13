@@ -76,8 +76,8 @@ fn google_observed_password_need_and_email_code_follow_distinct_paths() {
         let mut config = MailboxConfig::from_toml_str(text, None).unwrap();
         crate::harness::mailbox_needs::load_components(Some(&home), &mut config);
         assert!(google_credentials_config(&config, "me@gmail.com"));
-        let (commands, to_browser) = std::io::pipe().unwrap();
-        let (from_browser, mut replies) = std::io::pipe().unwrap();
+        let (commands, to_browser) = aterm_uds::pipe().unwrap();
+        let (from_browser, mut replies) = aterm_uds::pipe().unwrap();
         let browser = std::thread::spawn(move || {
             let mut commands = commands;
             let mut pending = Vec::new();
@@ -189,8 +189,8 @@ fn google_totp_step_up_uses_route_totp_without_password_and_records_no_spurious_
     crate::harness::mailbox_needs::load_components(Some(&home), &mut config);
     assert!(config.password_for(Some("me@gmail.com")).is_none());
     let callback_url = "http://127.0.0.1:9000/oauth/callback?state=nonce&code=stepup-ok";
-    let (commands, to_browser) = std::io::pipe().unwrap();
-    let (from_browser, mut replies) = std::io::pipe().unwrap();
+    let (commands, to_browser) = aterm_uds::pipe().unwrap();
+    let (from_browser, mut replies) = aterm_uds::pipe().unwrap();
     let browser = std::thread::spawn(move || {
         let mut commands = commands;
         let mut pending = Vec::new();
@@ -288,8 +288,8 @@ fn google_password_script_live_browser_enforces_origin_identity_and_one_submissi
     let browser =
         find_headless_browser(aterm_types::dirs::home_dir().as_deref()).expect("headless browser");
     let profile = aterm_tempfile::tempdir().unwrap();
-    let (command_read, command_write) = std::io::pipe().unwrap();
-    let (event_read, event_write) = std::io::pipe().unwrap();
+    let (command_read, command_write) = aterm_uds::pipe().unwrap();
+    let (event_read, event_write) = aterm_uds::pipe().unwrap();
     let command =
         headless_browser_command(&browser, profile.path(), &|name| std::env::var_os(name));
     let child = start_browser(

@@ -481,7 +481,7 @@ fn a_failed_dead_seen_write_stays_pending_until_it_is_recorded() {
     let recorded = tick(&mut pass, &fake, 2_000, true);
     assert_eq!(pass.records.list[0].1.dead_seen, Some(1600));
     assert_eq!(pass.records.list[0].1.dead_seen_ms, Some(2_000));
-    let records = aterm_uds::runs::read_records(dir.path()).unwrap();
+    let records = aterm_uds::runs::read_records(dir.path(), None).unwrap();
     assert_eq!(records[0].1.dead_seen, Some(1600));
     assert_eq!(records[0].1.dead_seen_ms, Some(2_000));
     assert!(
@@ -529,7 +529,7 @@ fn a_stale_dead_seen_cache_adopts_the_first_recorded_horizon() {
     pass.append_dead_seen(&*fake, SELF, &mut [stale], 2000);
     assert_eq!(pass.records.list[0].1.dead_seen, Some(1200));
     assert_eq!(pass.records.list[0].1.dead_seen_ms, Some(1500));
-    let records = aterm_uds::runs::read_records(dir.path()).unwrap();
+    let records = aterm_uds::runs::read_records(dir.path(), None).unwrap();
     assert_eq!(records[0].1.dead_seen, Some(1200));
     assert_eq!(records[0].1.dead_seen_ms, Some(1500));
     assert_eq!(
@@ -640,11 +640,11 @@ fn a_held_rows_age_is_told_on_by_the_carried_jobs_views_age() {
     );
 }
 
-/// A program outside every job that has not started for another reason than macOS's program
-/// check (translating, on a volume not proven local, or stopped or traced) is tied to the live tab
-/// its group-mate's environment names, as a held one is, for the jobs pass to name it by; one the
-/// jobs view does not name as unstarted is tied to none. NEGATIVE CONTROL: tie only the rows the
-/// view names held, and none is tied.
+/// A program outside every job that has not started but that aterm does not call held at macOS's
+/// program check (translating, with nothing read to say why, or stopped or traced) is tied to the
+/// live tab its group-mate's environment names, as a held one is, for the jobs pass to name it by;
+/// one the jobs view does not name as unstarted is tied to none. NEGATIVE CONTROL: tie only the
+/// rows the view names held, and none is tied.
 #[test]
 fn an_unstarted_programs_tie_is_handed_to_the_jobs_pass_whatever_keeps_it() {
     use aterm_vitals::jobs::{Findings, Named, StoppedUnstarted};

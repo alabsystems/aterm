@@ -1215,6 +1215,36 @@ fn an_owned_legacy_lock_and_absent_subscriber_are_repaired_only_by_apply() {
     assert!(ops.joins().is_empty());
 }
 
+/// A vault pass holding the state lock (the subscriber takes it for its pass over every long-poll
+/// answer) says nothing of whether the vault's files are written: `init.secrets` waits it out and
+/// reads the files as written, so neither its probe nor its apply syncs the vault again.
+/// NEGATIVE CONTROL (2026-11-12): with `aterm_secrets::client::materialization_ready` answering a
+/// held lock at once, the probe reads the files unwritten and plans a sync.
+#[test]
+fn a_vault_pass_holding_the_lock_leaves_the_files_written() {
+    use aterm_secrets::client::{test_hold_state_lock, test_while_state_lock_held};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let paths = Paths::for_home(&root.path().join("member"));
+    let source = root.path().join("team.vault");
+    aterm_secrets::client::create(&paths, source.to_str().unwrap(), None, Some("member")).unwrap();
+    let status = aterm_secrets::client::status(&paths).unwrap();
+    let ops = Scripted::new(vec![Ok(status)]);
+    *ops.local_home.lock().unwrap() = Some(paths.home.clone());
+    assert_eq!(run(&fake(), &ops, Mode::Apply)[0].outcome, Outcome::Changed);
+    assert_eq!(ops.installs(), 1);
+    for mode in [Mode::Plan, Mode::Apply] {
+        let mut held = Some(test_hold_state_lock(&paths).unwrap());
+        let (reports, tries) =
+            test_while_state_lock_held(move || drop(held.take()), || run(&fake(), &ops, mode));
+        assert_eq!(reports[0].outcome, Outcome::Ok, "{mode:?}: {reports:?}");
+        assert!(
+            tries >= 1,
+            "{mode:?}: the read met the held pass and waited"
+        );
+    }
+    assert_eq!(*ops.syncs.lock().unwrap(), 0);
+}
+
 #[test]
 fn legacy_lock_setup_preserves_off_and_refuses_hostile_locks() {
     use std::os::unix::fs::PermissionsExt;
@@ -2459,8 +2489,8 @@ fn with_git(github: Option<&[u8]>) -> Fake {
 /// the vault with no wait to name, and the apply exits 0. A running subscriber still finishes
 /// the join, so GitHub waits for it, and the apply exits 0 too. An init.toml `[github]` that
 /// names a `token_file` reads that file's own step, which says the file is not on this Mac
-/// yet and fails (exit 1); one that names only an account reads the vault's token file as
-/// the person's step, which needs them (exit 1).
+/// yet and fails (exit 1); one that names only an account reads the vault's token file, whose
+/// absence blocks the step (exit 1), never a person's step.
 /// NEGATIVE CONTROL: GitHub composed after the held vault whatever the subscriber (as it
 /// was) reads Blocked on it with no wait of its own, and the apply exits 1.
 #[test]
@@ -2519,7 +2549,7 @@ fn a_held_waiting_vault_with_its_subscriber_down_leaves_github_its_own_row() {
     let rows = applied(State::Absent, None, Some(b"[github]\naccount='octocat'\n"));
     assert_eq!(rows[0].outcome, Outcome::Deferred, "{rows:?}");
     let account = github(&rows);
-    assert_eq!(account.outcome, Outcome::Person, "{account:?}");
+    assert_eq!(account.outcome, Outcome::Blocked, "{account:?}");
     assert!(account.stood_aside.is_none(), "{account:?}");
     assert_eq!(crate::init::apply_status_for_test(&rows), 1, "{rows:?}");
 

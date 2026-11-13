@@ -20,6 +20,50 @@ pub(crate) const fn subparam_mask_fits(mask: u32, len: usize) -> bool {
     (mask & 1) == 0 && (past == 0 || (len == MAX_PARAMS && past == 1))
 }
 
+/// Parse 1..=3 ASCII decimal digits at the start of `bytes`, returning `(value, digits_read)`.
+#[inline]
+fn parse_u16_up_to_3(bytes: &[u8]) -> Option<(u16, usize)> {
+    let &b0 = bytes.first()?;
+    if !b0.is_ascii_digit() {
+        return None;
+    }
+    let mut val = u16::from(b0.saturating_sub(b'0'));
+    let mut pos = 1;
+    if let Some(&b1) = bytes.get(1)
+        && b1.is_ascii_digit()
+    {
+        val = val
+            .saturating_mul(10)
+            .saturating_add(u16::from(b1.saturating_sub(b'0')));
+        pos = 2;
+        if let Some(&b2) = bytes.get(2)
+            && b2.is_ascii_digit()
+        {
+            val = val
+                .saturating_mul(10)
+                .saturating_add(u16::from(b2.saturating_sub(b'0')));
+            pos = 3;
+        }
+    }
+    Some((val, pos))
+}
+
+/// Parse 1..=4 ASCII decimal digits at the start of `bytes`, returning `(value, digits_read)`.
+#[inline]
+fn parse_u16_up_to_4(bytes: &[u8]) -> Option<(u16, usize)> {
+    let (mut val, mut pos) = parse_u16_up_to_3(bytes)?;
+    if pos == 3
+        && let Some(&b3) = bytes.get(3)
+        && b3.is_ascii_digit()
+    {
+        val = val
+            .saturating_mul(10)
+            .saturating_add(u16::from(b3.saturating_sub(b'0')));
+        pos = 4;
+    }
+    Some((val, pos))
+}
+
 impl Parser {
     /// Finalize the current parameter (clamped to `u16`) and push it, setting
     /// its `subparam_mask` bit if `is_subparam`. Past `MAX_PARAMS` it is dropped,
@@ -52,6 +96,33 @@ impl Parser {
         }
     }
 
+    /// Dispatch a two-parameter CSI sequence with no intermediates or subparameters.
+    #[inline]
+    fn dispatch_csi_pair<S: ActionSink>(
+        &mut self,
+        sink: &mut S,
+        p0: u16,
+        p1: u16,
+        final_byte: u8,
+        consumed: usize,
+    ) -> usize {
+        self.params.clear();
+        self.params.push(p0);
+        self.params.push(p1);
+        self.intermediates.clear();
+        self.current_param = 0;
+        self.param_started = false;
+        self.subparam_mask = 0;
+        self.last_was_colon = false;
+        sink.csi_dispatch(
+            pty_wrap_ref(self.params.as_slice()),
+            pty_wrap_ref(self.intermediates.as_slice()),
+            final_byte,
+        );
+        self.state = State::Ground;
+        consumed
+    }
+
     /// Parse a CSI sequence on the fast path: the bytes consumed, or `None` to
     /// fall back to the byte path.
     #[inline]
@@ -60,10 +131,10 @@ impl Parser {
         input: &[u8],
         sink: &mut S,
     ) -> Option<usize> {
+        let &first = input.first()?;
+
         // Zero-parameter CSI (ESC[A, ESC[H, ESC[m): the first byte is the final.
-        if let Some(&first) = input.first()
-            && (0x40..=0x7E).contains(&first)
-        {
+        if (0x40..=0x7E).contains(&first) {
             self.params.clear();
             self.intermediates.clear();
             self.current_param = 0;
@@ -79,36 +150,11 @@ impl Parser {
             return Some(1);
         }
 
-        if let &[b0, b1, ..] = input
-            && b0.is_ascii_digit()
-        {
-            let d0 = u16::from(b0.saturating_sub(b'0'));
-            if (0x40..=0x7E).contains(&b1) {
-                self.params.set_single(d0);
-                self.intermediates.clear();
-                self.current_param = 0;
-                self.param_started = false;
-                self.subparam_mask = 0;
-                self.last_was_colon = false;
-                sink.csi_dispatch(
-                    pty_wrap_ref(self.params.as_slice()),
-                    pty_wrap_ref(self.intermediates.as_slice()),
-                    b1,
-                );
-                self.state = State::Ground;
-                return Some(2);
-            }
-            if b1 == b';' {
-                return self.parse_csi_after_first_param(input, sink, d0, 2);
-            }
-            if let &[_, _, b2, ..] = input
-                && b1.is_ascii_digit()
-            {
-                let p1 = d0
-                    .saturating_mul(10)
-                    .saturating_add(u16::from(b1.saturating_sub(b'0')));
-                if (0x40..=0x7E).contains(&b2) {
-                    self.params.set_single(p1);
+        // One- or two-parameter numeric CSI (1..=3 digits each, e.g. ESC[38m, ESC[100m, ESC[12;34H).
+        if let Some((p0, n0)) = parse_u16_up_to_3(input) {
+            if let Some(&next) = input.get(n0) {
+                if (0x40..=0x7E).contains(&next) {
+                    self.params.set_single(p0);
                     self.intermediates.clear();
                     self.current_param = 0;
                     self.param_started = false;
@@ -117,15 +163,66 @@ impl Parser {
                     sink.csi_dispatch(
                         pty_wrap_ref(self.params.as_slice()),
                         pty_wrap_ref(self.intermediates.as_slice()),
-                        b2,
+                        next,
                     );
                     self.state = State::Ground;
-                    return Some(3);
+                    return Some(n0 + 1);
                 }
-                if b2 == b';' {
-                    return self.parse_csi_after_first_param(input, sink, p1, 3);
+                if next == b';' {
+                    let after_semi = n0 + 1;
+                    if let Some(&b_after) = input.get(after_semi)
+                        && (0x40..=0x7E).contains(&b_after)
+                    {
+                        return Some(self.dispatch_csi_pair(sink, p0, 0, b_after, after_semi + 1));
+                    }
+                    if let Some((p1, n1)) = input.get(after_semi..).and_then(parse_u16_up_to_3)
+                        && let Some(&fin) = input.get(after_semi + n1)
+                        && (0x40..=0x7E).contains(&fin)
+                    {
+                        return Some(self.dispatch_csi_pair(
+                            sink,
+                            p0,
+                            p1,
+                            fin,
+                            after_semi + n1 + 1,
+                        ));
+                    }
+                    return self.parse_csi_after_first_param(input, sink, p0, after_semi);
                 }
             }
+        } else if first == b';' {
+            // Empty first parameter: ESC[;H or ESC[;12H.
+            if let Some(&b1) = input.get(1)
+                && (0x40..=0x7E).contains(&b1)
+            {
+                return Some(self.dispatch_csi_pair(sink, 0, 0, b1, 2));
+            }
+            if let Some((p1, n1)) = input.get(1..).and_then(parse_u16_up_to_3)
+                && let Some(&fin) = input.get(1 + n1)
+                && (0x40..=0x7E).contains(&fin)
+            {
+                return Some(self.dispatch_csi_pair(sink, 0, p1, fin, 2 + n1));
+            }
+            return self.parse_csi_after_first_param(input, sink, 0, 1);
+        } else if first == b'?'
+            && let Some((p0, n0)) = input.get(1..).and_then(parse_u16_up_to_4)
+            && let Some(&fin) = input.get(1 + n0)
+            && (0x40..=0x7E).contains(&fin)
+        {
+            // Single-parameter DEC private CSI (ESC[?25l, ESC[?1049h, ESC[?2026h/l).
+            self.params.set_single(p0);
+            self.intermediates.set_single(b'?');
+            self.current_param = 0;
+            self.param_started = false;
+            self.subparam_mask = 0;
+            self.last_was_colon = false;
+            sink.csi_dispatch(
+                pty_wrap_ref(self.params.as_slice()),
+                pty_wrap_ref(self.intermediates.as_slice()),
+                fin,
+            );
+            self.state = State::Ground;
+            return Some(2 + n0);
         }
 
         self.parse_csi_general(input, sink)

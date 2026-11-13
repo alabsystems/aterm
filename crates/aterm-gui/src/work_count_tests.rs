@@ -182,6 +182,190 @@ fn a_steady_title_gate_walks_no_tab() {
     );
 }
 
+/// Exercise the accepted OSC path with every cache warm, rather than measuring only
+/// the epoch gate. The counters cover drift walks, identity reads, title reads, retain membership
+/// calls and chrome-cache writes; they do not claim CPU time or total copied bytes.
+#[test]
+fn complete_title_refresh_has_bounded_cache_maintenance() {
+    for tabs in [1, 30, 200] {
+        let mut app = workspace(tabs, 1);
+        let wid = WindowId(0);
+        let sessions: Vec<_> = app.pool.iter().map(|s| s.id).collect();
+        let t0 = Instant::now();
+        for &sid in &sessions {
+            term_lock(&app.pool.get(sid).unwrap().term)
+                .process(format!("\x1b]2;label-{sid}\x07").as_bytes());
+            app.observe_title_drift(sid, t0);
+        }
+        let active = app.focused_session_id(wid).unwrap();
+        let ids: Vec<_> = app.windows[&wid]
+            .tab_set
+            .tabs()
+            .iter()
+            .map(|t| t.id)
+            .collect();
+        let ws = &app.windows[&wid];
+        assert_eq!(ws.tab_title_cache.len(), tabs);
+        assert_eq!(ws.tab_title_epochs.len(), tabs);
+        assert_eq!(ws.tab_chrome_titles.len(), tabs);
+        assert_eq!(ws.tab_chrome_titles_by_tab.len(), tabs);
+        let _ = work_counts::take_title_refresh();
+        term_lock(&app.pool.get(active).unwrap().term).process(b"\x1b]2;changed-label\x07");
+        let later = t0 + Duration::from_secs(1);
+        app.observe_title_drift(active, later);
+        let work = work_counts::take_title_refresh();
+        eprintln!("complete-title tabs={tabs} changed={work:?}");
+        assert!(work.drift_tabs > 0 && work.drift_tabs <= 3 * tabs);
+        assert!(work.drift_cache_probes > 0 && work.drift_cache_probes <= 4 * tabs);
+        assert!(work.eligibility_reads > 0 && work.eligibility_reads <= tabs);
+        assert!(work.identities > 0 && work.identities <= tabs);
+        assert!(work.reads > 0 && work.reads <= tabs);
+        assert!(work.cache_probes > 0 && work.cache_probes <= 4 * tabs);
+        assert!(work.cache_writes > 0 && work.cache_writes <= 2 * tabs);
+        let ws = &app.windows[&wid];
+        assert_eq!(ws.tab_title_cache[&active].title, "changed-label");
+        for (id, tab) in ids.iter().zip(ws.tab_set.tabs()) {
+            assert_eq!(*id, tab.id, "refresh preserves ordering and identity");
+            let sid = app
+                .view_store
+                .get(tab.focus)
+                .copied()
+                .unwrap()
+                .terminal_session()
+                .unwrap();
+            let expected = if sid == active {
+                "changed-label".to_owned()
+            } else {
+                format!("label-{sid}")
+            };
+            assert_eq!(ws.tab_chrome_titles[&sid], expected);
+            assert_eq!(ws.tab_chrome_titles_by_tab[id].0, Some(sid));
+            assert_eq!(ws.tab_chrome_titles_by_tab[id].1, expected);
+            assert_eq!(
+                ws.tab_title_epochs[&sid],
+                term_lock(&app.pool.get(sid).unwrap().term).title_epoch()
+            );
+        }
+        assert_eq!(
+            work.chrome_bytes,
+            2 * ws
+                .tab_chrome_titles
+                .values()
+                .map(String::len)
+                .sum::<usize>()
+        );
+        for tick in 1..=100 {
+            term_lock(&app.pool.get(active).unwrap().term).process(b"\x1b]2;changed-label\x07");
+            app.observe_title_drift(active, later + Duration::from_millis(tick));
+        }
+        let unchanged = work_counts::take_title_refresh();
+        eprintln!("complete-title tabs={tabs} unchanged-flood={unchanged:?}");
+        assert_eq!(unchanged, work_counts::TitleRefreshWork::default());
+        assert!(!app.title_drift.pending.contains(&active));
+    }
+}
+
+#[test]
+fn complete_title_refresh_preserves_shared_and_detached_identity() {
+    let mut app = workspace(3, 1);
+    let original = WindowId(0);
+    let sid = app.focused_session_id(original).unwrap();
+    term_lock(&app.pool.get(sid).unwrap().term).process(b"\x1b]2;before-detach\x07");
+    app.observe_title_drift(sid, Instant::now());
+    let tab = app.windows[&original].tab_set.active_id().unwrap();
+    let detached = app.detach_active_tab_logical().unwrap();
+    let shared = app.open_active_session_in_new_window_logical().unwrap();
+    for wid in [original, detached, shared] {
+        app.refresh_window_tabs(wid);
+    }
+    let unrelated = app.windows[&original].tab_chrome_titles_by_tab.clone();
+    let _ = work_counts::take_title_refresh();
+    term_lock(&app.pool.get(sid).unwrap().term).process(b"\x1b]2;after-detach\x07");
+    app.observe_title_drift(sid, Instant::now() + Duration::from_secs(1));
+    let work = work_counts::take_title_refresh();
+    eprintln!("complete-title shared-detached={work:?}");
+    assert_eq!(work.reads, 2, "only the two labeling windows refresh");
+    assert_eq!(app.windows[&original].tab_chrome_titles_by_tab, unrelated);
+    assert!(!app.windows[&original].tab_title_cache.contains_key(&sid));
+    assert!(
+        !app.windows[&original]
+            .tab_chrome_titles_by_tab
+            .contains_key(&tab)
+    );
+    for wid in [detached, shared] {
+        assert_eq!(app.windows[&wid].tab_chrome_titles[&sid], "after-detach");
+    }
+    app.pool
+        .get(sid)
+        .unwrap()
+        .ctx
+        .meta
+        .lock()
+        .unwrap()
+        .set("title", Some("pinned-label".into()));
+    app.refresh_meta_dependent_chrome(sid);
+    for wid in [detached, shared] {
+        assert_eq!(app.windows[&wid].tab_chrome_titles[&sid], "pinned-label");
+    }
+    app.close_window_logical(shared);
+    app.detach_rollback_logical(Some(original), detached);
+    app.refresh_window_tabs(original);
+    assert_eq!(
+        app.windows[&original].tab_chrome_titles_by_tab[&tab].0,
+        Some(sid)
+    );
+    assert_eq!(
+        app.windows[&original].tab_chrome_titles_by_tab[&tab].1,
+        "pinned-label"
+    );
+    assert!(app.structural_invariants_ok());
+}
+
+#[test]
+fn complete_title_refresh_keeps_parked_and_native_fallbacks() {
+    let mut app = workspace(2, 1);
+    let wid = WindowId(0);
+    let hidden = app.focused_session_id(wid).unwrap();
+    term_lock(&app.pool.get(hidden).unwrap().term).process(b"\x1b]2;hidden-terminal\x07");
+    app.refresh_window_tabs(wid);
+    let instance = app
+        .native_runtime
+        .insert_instance(crate::native_app::NativeApp::Allocation(Box::default()))
+        .unwrap();
+    let native = app
+        .split_active_with_native(
+            wid,
+            crate::tab_model::SplitAxis::Horizontal,
+            instance,
+            crate::native_app::AppViewState::Allocation(Box::default()),
+        )
+        .unwrap();
+    let parked = crate::app_workers_tests::land_worker(&mut app);
+    term_lock(&app.pool.get(parked).unwrap().term).process(b"\x1b]2;parked-label\x07");
+    app.refresh_window_tabs(wid);
+    assert!(!app.windows[&wid].tab_title_cache.contains_key(&hidden));
+    assert!(!app.windows[&wid].tab_chrome_titles.contains_key(&hidden));
+    let native_title = app.windows[&wid]
+        .tab_set
+        .tabs()
+        .iter()
+        .find(|t| t.focus == native)
+        .map(|t| app.windows[&wid].tab_chrome_titles_by_tab[&t.id].clone())
+        .unwrap();
+    assert_eq!(native_title.0, None);
+    app.observe_title_drift(parked, Instant::now() + Duration::from_secs(1));
+    let ws = &app.windows[&wid];
+    assert_eq!(ws.tab_chrome_titles[&parked], "parked-label");
+    assert_eq!(ws.tooltips_pushed.len(), ws.tab_set.shown_len());
+    assert!(ws.tab_set.tabs().len() > ws.tab_set.shown_len());
+    assert!(
+        ws.tab_chrome_titles_by_tab
+            .values()
+            .any(|v| v == &native_title)
+    );
+    assert!(app.structural_invariants_ok());
+}
+
 /// An idle `events` digest wake with saturated ledgers touches no retained record.
 #[test]
 fn an_idle_events_wake_touches_no_retained_record() {

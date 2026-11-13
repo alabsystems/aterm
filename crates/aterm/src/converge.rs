@@ -1208,27 +1208,60 @@ fn name_label(
         .map_err(|why| why.to_string())
 }
 
-/// A Mac name still to set, with the repair path the existing naming-rule reading admits.
+/// A Mac name still to set, with the repair path the existing naming-rule reading admits
+/// ([`aterm_machines::root_steps::name_rule_reading`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum MacNamePending {
-    /// The existing naming rule admits the next automatic repair attempt.
+    /// The existing naming rule is this build's for this account, so it admits the next
+    /// automatic repair attempt.
     ThroughRule(String),
-    /// Setup still needs its one elevation to leave the naming rule.
+    /// No naming rule is in place: setup's one elevation leaves it, as its password step owes
+    /// a missing rule ([`aterm_machines::root_steps::owed`]).
     Elevation(String),
-    /// Naming-rule metadata could not be read; no additional password is justified.
+    /// A naming rule of other bytes than this build's stands (an older build's, which may
+    /// refuse the generated names). Setup's password step owes a missing rule only, so only
+    /// setup the person asks for (`aterm init`) renews it; no automatic pass asks for that
+    /// password.
+    Renewal(String),
+    /// The naming rule could not be read (why, appended): one from before the rule was made
+    /// readable, which, as [`Self::Renewal`], only setup the person asks for renews. No
+    /// automatic pass asks for that password.
     Unread(String),
     /// macOS assigned a collision alias; retrying the same setter cannot resolve it.
     Collision(String),
 }
 
 impl MacNamePending {
-    fn with_rule(why: String, rule: Option<bool>) -> Self {
+    fn with_rule(
+        why: String,
+        rule: Result<aterm_machines::root_steps::NameRuleReading, String>,
+    ) -> Self {
+        use aterm_machines::root_steps::NameRuleReading;
         match rule {
-            Some(true) => Self::ThroughRule(why),
-            Some(false) => Self::Elevation(why),
-            None => Self::Unread(why),
+            Ok(NameRuleReading::Current) => Self::ThroughRule(why),
+            Ok(NameRuleReading::Missing) => Self::Elevation(why),
+            Ok(NameRuleReading::Other) => Self::Renewal(why),
+            Err(rule) => Self::Unread(format!("{why}; {rule}")),
         }
     }
+}
+
+/// What still names the Mac's own names against `names` ([`own_name_pending`]), with the
+/// repair path the naming permission `sys` reads admits ([`MacNamePending::with_rule`]).
+/// `None` where nothing is owed.
+fn mac_name_pending(
+    sys: &dyn aterm_machines::port::System,
+    target: &str,
+    names: &GeneratedNames,
+    own: &OwnNames,
+) -> Option<MacNamePending> {
+    own_name_pending(target, Some(names), own).map(|why| {
+        if own_name_repairable(target, Some(names), own) {
+            MacNamePending::with_rule(why, aterm_machines::root_steps::name_rule_reading(sys))
+        } else {
+            MacNamePending::Collision(why)
+        }
+    })
 }
 
 /// This Mac's one name as `aterm status` reads it ([`mac_names`]).
@@ -1292,18 +1325,7 @@ pub(crate) fn mac_names() -> Result<MacName, String> {
         .filter(|_| cfg!(target_os = "macos"))
         .and_then(|names| {
             let own = own.get_or_insert_with(own_names);
-            own_name_pending(&target, Some(names), own).map(|why| {
-                if own_name_repairable(&target, Some(names), own) {
-                    MacNamePending::with_rule(
-                        why,
-                        aterm_machines::root_steps::rule_in_place(
-                            &aterm_machines::port::Live::new(),
-                        ),
-                    )
-                } else {
-                    MacNamePending::Collision(why)
-                }
-            })
+            mac_name_pending(&aterm_machines::port::Live::new(), &target, names, own)
         });
     Ok(MacName::Named {
         target,
@@ -1356,8 +1378,9 @@ fn own_name_repairable(target: &str, names: Option<&GeneratedNames>, own: &OwnNa
 }
 
 /// `read` where the Mac's own names are still owed `label` and the rule that sets them with no
-/// password is in place (`by_rule`): a read that is current otherwise is due, so the pass's
-/// apply names the Mac ([`own_name_by_rule`]). Any other read stays as it is.
+/// password is this build's (`by_rule`, [`own_name_due_through`]): a read that is current
+/// otherwise is due, so the pass's apply names the Mac ([`own_name_by_rule`]). Any other read
+/// stays as it is.
 fn own_name_due(read: IdentityRead, label: Option<&str>, by_rule: bool) -> IdentityRead {
     match (read, label) {
         (IdentityRead::Current(now), Some(label)) if by_rule => IdentityRead::Due {
@@ -1368,28 +1391,83 @@ fn own_name_due(read: IdentityRead, label: Option<&str>, by_rule: bool) -> Ident
     }
 }
 
+/// The probe's [`own_name_due`]: due only where a name is still owed `names`, macOS can take it
+/// (no collision alias), and `sys` reads the naming permission as this build's
+/// ([`aterm_machines::root_steps::name_rule_current`]). A missing, older or unreadable rule
+/// leaves `read` as it is, its note naming the name still owed ([`with_fleet_name`]), and
+/// `aterm status` says setup renews the rule ([`mac_name_pending`]): an older rule's file
+/// stands while sudo refuses the generated names, and a pass that tried them would fail every
+/// time.
+fn own_name_due_through(
+    sys: &dyn aterm_machines::port::System,
+    read: IdentityRead,
+    target: &str,
+    names: Option<&GeneratedNames>,
+    own: &OwnNames,
+) -> IdentityRead {
+    let pending = own_name_repairable(target, names, own)
+        .then_some(names)
+        .flatten()
+        .map(GeneratedNames::computer_name);
+    let by_rule =
+        pending.is_some() && matches!(aterm_machines::root_steps::name_rule_current(sys), Ok(true));
+    own_name_due(read, pending, by_rule)
+}
+
 /// Name this Mac `label` through the rule setup's elevation left
 /// ([`aterm_machines::root_steps::name_by_rule`]), as this account, never asking for a password:
-/// what the pass's row says of it, `None` where no rule is in place or nothing changed.
+/// what the pass's row says of it, `None` where the rule is not this build's
+/// ([`own_name_due_through`] made nothing due) or nothing changed.
+///
+/// # Errors
+/// `sudo` or `scutil` refused a name, or `current` no longer admits this intent: the row fails
+/// with that reason, never an apply that reports success having changed nothing.
 #[cfg(any(target_os = "macos", test))]
 fn own_name_by_rule(
     sys: &dyn aterm_machines::port::System,
     names: &GeneratedNames,
     current: &dyn Fn() -> Result<(), String>,
-) -> Option<String> {
-    if aterm_machines::root_steps::rule_in_place(sys) != Some(true) {
-        return None;
+) -> Result<Option<String>, String> {
+    if !matches!(aterm_machines::root_steps::name_rule_current(sys), Ok(true)) {
+        return Ok(None);
     }
-    match aterm_machines::root_steps::name_by_rule(sys, names, current) {
-        Ok(set) if set.is_empty() => None,
-        Ok(set) => Some(format!(
+    let set = aterm_machines::root_steps::name_by_rule(sys, names, current)
+        .map_err(|why| format!("this Mac's own names left as they are: {why}"))?;
+    Ok((!set.is_empty()).then(|| {
+        format!(
             "this Mac's {} now follow {} / {}",
             set.join(", "),
             names.computer_name(),
             names.host_name()
-        )),
-        Err(why) => Some(format!("this Mac's own names left as they are: {why}")),
-    }
+        )
+    }))
+}
+
+/// `sync.identity`'s row once its keys and fleet name are `applied`: the Mac's own names (read
+/// by `own`, only where `generated` names apply) set through the naming rule where they are
+/// still owed ([`own_name_by_rule`]).
+///
+/// # Errors
+/// A refusal fails the row with its reason, which the read-back, answering the same owed name,
+/// would otherwise lose.
+#[cfg(any(target_os = "macos", test))]
+fn own_names_applied(
+    sys: &dyn aterm_machines::port::System,
+    applied: String,
+    target: &str,
+    generated: Option<&GeneratedNames>,
+    own: impl FnOnce() -> OwnNames,
+    current: &dyn Fn() -> Result<(), String>,
+) -> Result<String, String> {
+    let Some(generated) =
+        generated.filter(|generated| own_name_repairable(target, Some(generated), &own()))
+    else {
+        return Ok(applied);
+    };
+    Ok(match own_name_by_rule(sys, generated, current)? {
+        Some(named) => format!("{applied}; {named}"),
+        None => applied,
+    })
 }
 
 /// `read` (`sync.identity`'s `aterm.toml` keys) with the fleet name beside it (`fleet`, against
@@ -2015,18 +2093,15 @@ impl Ports for Live {
         };
         let read = with_fleet_name(read, &target, own, &fleet, names);
         // An admission after setup's one password: the rule it left names the Mac, so the
-        // pass is due while the Mac's own names are not yet the label.
-        let pending = own_name_repairable(&target, own, names)
-            .then_some(own)
-            .flatten()
-            .map(GeneratedNames::computer_name);
-        #[cfg(target_os = "macos")]
-        let by_rule = pending.is_some()
-            && aterm_machines::root_steps::rule_in_place(&aterm_machines::port::Live::new())
-                == Some(true);
-        #[cfg(not(target_os = "macos"))]
-        let by_rule = false;
-        Ok(own_name_due(read, pending, by_rule))
+        // pass is due while the Mac's own names are not yet the label, and only while that
+        // rule is this build's. Elsewhere `own` is none and nothing reads the rule.
+        Ok(own_name_due_through(
+            &aterm_machines::port::Live::new(),
+            read,
+            &target,
+            own,
+            names,
+        ))
     }
 
     fn init_name(
@@ -2105,15 +2180,22 @@ impl Ports for Live {
             &current,
         )?;
         current()?;
+        let applied = format!("{keys}; {fleet}");
         #[cfg(target_os = "macos")]
-        if let Some(generated) = projection.names.as_ref().filter(|generated| {
-            own_name_repairable(target, Some(generated), names.get_or_insert_with(own_names))
-        }) && let Some(named) =
-            own_name_by_rule(&aterm_machines::port::Live::new(), generated, &current)
         {
-            return Ok(format!("{keys}; {fleet}; {named}"));
+            own_names_applied(
+                &aterm_machines::port::Live::new(),
+                applied,
+                target,
+                projection.names.as_ref(),
+                || names.take().unwrap_or_else(own_names),
+                &current,
+            )
         }
-        Ok(format!("{keys}; {fleet}"))
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(applied)
+        }
     }
 
     fn fleet(&self) -> Result<FleetRead, String> {
@@ -2263,6 +2345,15 @@ impl Ports for Live {
         )
     }
 
+    fn stale_vault_server(&self) -> Result<Option<String>, String> {
+        aterm_secrets::client::stale_member_server(&vault_paths()?).map_err(|why| why.to_string())
+    }
+
+    fn retire_stale_vault_server(&self) -> Result<Option<String>, String> {
+        aterm_secrets::client::retire_stale_member_server(&vault_paths()?)
+            .map_err(|why| why.to_string())
+    }
+
     fn shared_data(&self) -> Result<SharedRead, String> {
         let config = aterm_types::dirs::aterm_config_path()
             .ok_or("no config path: neither $XDG_CONFIG_HOME nor $HOME is set")?;
@@ -2372,7 +2463,7 @@ impl Ports for Live {
                     || {
                         captured
                             .snapshot
-                            .is_current_now(&paths)
+                            .is_current(&paths)
                             .map_err(|why| why.to_string())
                     },
                     readback,
@@ -2481,7 +2572,7 @@ impl Ports for Live {
                 }
                 captured
                     .snapshot
-                    .is_current_now(&paths)
+                    .is_current(&paths)
                     .map_err(|why| why.to_string())
             },
         )

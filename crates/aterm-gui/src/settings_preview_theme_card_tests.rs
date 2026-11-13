@@ -193,7 +193,7 @@ fn the_row_slab_paints_the_cards_own_colours() {
             .collect();
         (fill, ink, dots)
     };
-    let picks = ["Aterm Night", "Aterm Day", "Dracula"];
+    let picks = ["aterm Night", "aterm Day", "Dracula"];
     for id in picks {
         let card = cards.iter().find(|card| card.id == id).expect("a built-in");
         let (fill, ink, dots) = painted(&card.slab_value(false));

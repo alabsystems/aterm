@@ -324,3 +324,123 @@ fn an_engine_origin_agh_child_is_progress_bounded() {
     );
     assert_eq!(git, "wall");
 }
+
+#[test]
+fn a_pinned_reader_keeps_its_commit_after_head_and_replacement_refs_move() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    origin(dir.path(), "original\n");
+    let work = dir.path().join("origin-work");
+    let original = git(&work, &["rev-parse", "HEAD"]);
+    let git_dir = work.join(".git");
+    let selected = Named::Pinned {
+        git_dir: git_dir.clone(),
+        commit: original.clone(),
+    };
+    let no_import =
+        |_: &Path, _: &Path| -> Result<String, String> { panic!("pinned readers must not import") };
+    let reader = Commit::read(&selected, &bounded, &no_import).unwrap();
+    let moved = advance(dir.path(), "successor\n");
+    git(&work, &["replace", &original, &moved]);
+    assert_eq!(reader.sha(), original);
+    assert_eq!(
+        reader.text("baseline/rows.txt", &bounded).unwrap(),
+        "original\n"
+    );
+    let reopened = Commit::read(&selected, &bounded, &no_import).unwrap();
+    assert_eq!(
+        reopened.text("baseline/rows.txt", &bounded).unwrap(),
+        "original\n"
+    );
+    let successor = Commit::read(
+        &Named::Pinned {
+            git_dir,
+            commit: moved,
+        },
+        &bounded,
+        &no_import,
+    )
+    .unwrap();
+    assert_eq!(
+        successor.text("baseline/rows.txt", &bounded).unwrap(),
+        "successor\n"
+    );
+}
+
+#[test]
+fn invalid_or_unavailable_pins_never_fall_back_to_a_readable_checkout() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    origin(dir.path(), "fallback must not be read\n");
+    let work = dir.path().join("origin-work");
+    let oid = git(&work, &["rev-parse", "HEAD"]);
+    let git_dir = work.join(".git");
+    for (repository, commit) in [
+        (Some(git_dir.as_os_str().to_owned()), None),
+        (None, Some(OsString::from(&oid))),
+        (Some(OsString::new()), Some(OsString::from(&oid))),
+        (Some(git_dir.as_os_str().to_owned()), Some(OsString::new())),
+        (
+            Some(git_dir.as_os_str().to_owned()),
+            Some(OsString::from("HEAD")),
+        ),
+        (
+            Some(git_dir.as_os_str().to_owned()),
+            Some(OsString::from(&oid[..12])),
+        ),
+    ] {
+        let vars = |name: &str| match name {
+            super::GIT_DIR_ENV => repository.clone(),
+            super::COMMIT_ENV => commit.clone(),
+            "PUBLICATION_ENGINE" => Some(work.as_os_str().to_owned()),
+            _ => None,
+        };
+        assert_eq!(named(dir.path(), &vars).unwrap_err().kind, Kind::Unread);
+    }
+    let no_import =
+        |_: &Path, _: &Path| -> Result<String, String> { panic!("invalid pins cannot fetch") };
+    for (repository, commit) in [
+        (git_dir.clone(), "0".repeat(40)),
+        (dir.path().join("absent.git"), oid),
+        (git_dir, git(&work, &["rev-parse", "HEAD^{tree}"])),
+    ] {
+        assert_eq!(
+            Commit::read(
+                &Named::Pinned {
+                    git_dir: repository,
+                    commit
+                },
+                &bounded,
+                &no_import
+            )
+            .err()
+            .unwrap()
+            .kind,
+            Kind::Unread
+        );
+    }
+}
+
+#[test]
+fn origin_snapshot_exposes_only_its_retained_repository_and_imported_identity() {
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let bare = origin(dir.path(), "snapshot\n");
+    let origin = bare.to_str().unwrap();
+    let main = super::OriginMain::fetch(origin, &dir.path().join("origin-work"), &bounded, &native)
+        .unwrap();
+    assert_eq!(main.origin(), origin);
+    let selected = Named::Pinned {
+        git_dir: main.git_dir(),
+        commit: main.commit().to_owned(),
+    };
+    let no_import =
+        |_: &Path, _: &Path| -> Result<String, String> { panic!("snapshot already imported") };
+    let reader = Commit::read(&selected, &bounded, &no_import).unwrap();
+    assert_eq!(
+        reader.text("baseline/rows.txt", &bounded).unwrap(),
+        "snapshot\n"
+    );
+    drop(main);
+    assert!(
+        reader.text("baseline/rows.txt", &bounded).is_err(),
+        "a pathname is not lifetime custody or a fallback grant"
+    );
+}

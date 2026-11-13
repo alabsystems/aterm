@@ -72,6 +72,7 @@ aterm-selection.workspace = true
 aterm-session.workspace = true
 aterm-types.workspace = true
 aterm-update.workspace = true
+aterm-update-core.workspace = true
 
 # Unix only, as the closure's `aterm_vz` items are (`#[cfg(unix)]`): its guest agent's library
 # is Linux's and the macOS seam's, and builds on no Windows host.

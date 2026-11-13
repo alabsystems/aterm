@@ -500,7 +500,10 @@ fn the_chips_are_buttons_a_screen_reader_can_press() {
         chips.len() > 2
             && chips[1].chip == HarnessChip::Mode
             && chips[2..].iter().all(|c| c.chip.fact().is_some()
-                || matches!(c.chip, HarnessChip::Switch | HarnessChip::Title)),
+                || matches!(
+                    c.chip,
+                    HarnessChip::Switch | HarnessChip::Mark | HarnessChip::Title
+                )),
         "{chips:?}"
     );
     assert_eq!(chips[1].label, "Permission mode: yolo on.");
@@ -819,8 +822,8 @@ fn the_mode_light_the_switch_and_the_title_slot_are_in_the_tree() {
     assert_eq!(switch.toggled, Some(aterm_a11y::model::Toggled::False));
     assert_eq!(
         chips.iter().map(|c| c.chip).collect::<Vec<_>>(),
-        [HarnessChip::Switch],
-        "under the switch off a reader meets the switch alone: {chips:?}"
+        [HarnessChip::Switch, HarnessChip::Mark],
+        "under the switch off a reader meets the switch and its mark alone: {chips:?}"
     );
 }
 

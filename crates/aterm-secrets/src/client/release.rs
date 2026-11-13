@@ -61,15 +61,12 @@ const NOTARY_FAILED_FILE: &str = "release-notary-failed";
 /// minute for is the network's; a dialog nobody answered is.
 const UNANSWERED: &str = "did not complete";
 
-/// The release-credentials profile, under the home (`~/.aterm/release-ring/`, with fallback to
-/// the 0.145 `~/.aterm/` location while an older vault has not yet rotated its path).
+/// The release-credentials profile, under the home. The 0.145 copies under `~/.aterm/` are
+/// duplicates recorded for retirement (ATERM-KI-1112-980): no code reads them.
 const RELEASE_PROFILE: &str = ".aterm/release-ring/release-credentials.toml";
-const LEGACY_RELEASE_PROFILE: &str = ".aterm/release-credentials.toml";
 
-/// The canonical roster is considered alongside the profile's named roster. The legacy
-/// location is read only when neither provides a pair.
+/// The canonical roster, considered alongside the profile's named roster.
 const VAULT_ROSTER: &str = ".aterm/release-ring/roster/aterm-machines.toml";
-const LEGACY_VAULT_ROSTER: &str = ".aterm/roster/aterm-machines.toml";
 
 /// The largest profile or roster read.
 const MAX_READ: usize = 64 * 1024;
@@ -427,14 +424,10 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
         None
     };
     let home = &paths.home;
-    let (profile, key_path) = match fsx::read_private(&home.join(RELEASE_PROFILE), MAX_READ) {
-        Ok(Some(profile)) => (profile, home.join(".aterm/release-ring/machine.key")),
-        Ok(None) => match fsx::read_private(&home.join(LEGACY_RELEASE_PROFILE), MAX_READ) {
-            Ok(Some(profile)) => (profile, home.join(".aterm/machine.key")),
-            Ok(None) | Err(_) => return false,
-        },
-        Err(_) => return false,
+    let Ok(Some(profile)) = fsx::read_private(&home.join(RELEASE_PROFILE), MAX_READ) else {
+        return false;
     };
+    let key_path = home.join(".aterm/release-ring/machine.key");
     let Ok(Some(key)) = fsx::read_private(&key_path, MAX_READ) else {
         return false;
     };
@@ -460,12 +453,6 @@ fn authorized_ring_check(paths: &Paths, anchors: &[&str], now: i64, advance: boo
             Ok(Some(pair)) => candidates.push(pair),
             Ok(None) => {}
             Err(_) => return false,
-        }
-    }
-    if candidates.is_empty() {
-        match read_pair(home.join(LEGACY_VAULT_ROSTER)) {
-            Ok(Some(pair)) => candidates.push(pair),
-            Ok(None) | Err(_) => return false,
         }
     }
     let Some((index, _)) = crate::release_ring::newest_roster(

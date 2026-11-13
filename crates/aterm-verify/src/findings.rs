@@ -263,6 +263,18 @@ pub fn excerpt(output: &str, max: usize) -> Vec<String> {
         // Reserve the causes before their context: even a one-line excerpt must
         // show a diagnostic, and nearby notes must not crowd out a later cause.
         let mut picked = anchors.clone();
+        // A compiler location identifies the cause; reserve it before optional
+        // context from earlier diagnostics can consume the remaining budget.
+        for &i in &anchors {
+            if picked.len() < max
+                && lines
+                    .get(i + 1)
+                    .is_some_and(|line| line.trim_start().starts_with("--> "))
+                && !picked.contains(&(i + 1))
+            {
+                picked.push(i + 1);
+            }
+        }
         for i in anchors {
             for (nearby, line) in lines
                 .iter()

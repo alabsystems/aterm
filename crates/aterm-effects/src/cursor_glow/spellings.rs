@@ -40,7 +40,7 @@ pub const TRAIL_STYLES: &[TrailStyleRow] = &[
         "rainbow",
         Some(GlowStyle::RainbowKitty),
         "Rainbow kitty",
-        "A thin rainbow line under what you type; keeps text clearest",
+        "A rainbow band behind what you type, a vivid line under it",
     ),
     row_of(
         "phaser",

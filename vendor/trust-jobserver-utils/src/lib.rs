@@ -28,10 +28,14 @@ pub const DESCENDANT_HANDOFF_ENV: &str = "CARGO_JOBSERVER_HANDOFF";
 /// Inert advertisement for recovering an actual ancestor-owned implicit CPU lease.
 pub const CPU_HANDOFF_ENV: &str = "TRUST_CPU_HANDOFF";
 
+/// Inert routing for a complete original fixed claim, a separate role from
+/// GNU transport and implicit CPU leases. The receiver still checks the claim.
+pub const FIXED_CLAIM_HANDOFF_ENV: &str = "TRUST_FIXED_CLAIM_HANDOFF_V1";
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use handoff::{
-    CpuLeaseHandoff, ScopedHandoff, recover_cpu_lease, recover_cpu_resources,
-    recover_named_fifo_resources,
+    CpuLeaseHandoff, FixedClaimHandoff, ScopedHandoff, recover_cpu_lease, recover_cpu_resources,
+    recover_fixed_claim, recover_named_fifo_resources,
 };
 
 /// The caller's checked scheduling authority, retained through the child wait.
@@ -45,10 +49,25 @@ pub use handoff::{
 #[cfg(feature = "client")]
 pub struct Jobserver {
     client: Client,
+    // Trust: a restricted descendant pool must also replace inherited GNU
+    // aliases, so unaware make children cannot reopen the larger ancestor.
+    propagate_make_flags: bool,
     #[cfg(unix)]
     pipe: Option<Arc<[OwnedFd; 2]>>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     handoff: Option<Arc<handoff::Endpoint>>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    named_scope: Option<Arc<NamedScope>>,
+}
+
+#[cfg(all(feature = "client", any(target_os = "linux", target_os = "macos")))]
+struct NamedScope(std::ffi::OsString);
+
+#[cfg(all(feature = "client", any(target_os = "linux", target_os = "macos")))]
+impl std::fmt::Debug for NamedScope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NamedScope(<redacted>)")
+    }
 }
 
 #[cfg(feature = "client")]
@@ -86,7 +105,11 @@ impl Jobserver {
     ) -> io::Result<Self> {
         use std::os::fd::AsFd;
         let [read, write] = recover_named_fifo_resources(advertisement)?;
-        Self::from_fifo_with_witnesses(path, read.as_fd(), write.as_fd())
+        let mut server = Self::from_fifo_with_witnesses(path, read.as_fd(), write.as_fd())?;
+        // Keep the authenticated scoped witness route through a shim exec.
+        // A pathname alone cannot bind a later opener to this original FIFO.
+        server.named_scope = Some(Arc::new(NamedScope(advertisement.to_owned())));
+        Ok(server)
     }
 
     /// Access this same server for in-process scheduling; do not re-import its
@@ -119,12 +142,22 @@ impl Jobserver {
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn enable_descendant_handoff_in(&mut self, directory: &std::path::Path) -> io::Result<()> {
-        if self.handoff.is_none() {
-            if let Some(pipe) = &self.pipe {
-                self.handoff = Some(Arc::new(handoff::Endpoint::new(Arc::clone(pipe), directory)?));
-            }
+        if self.handoff.is_none()
+            && let Some(pipe) = &self.pipe
+        {
+            self.handoff = Some(Arc::new(handoff::Endpoint::new(Arc::clone(pipe), directory)?));
         }
         Ok(())
+    }
+
+    /// Trust: retain the same scheduler and a recovery endpoint for an unaware
+    /// descendant. The returned owner must outlive that descendant's wait;
+    /// replacing the owning process with exec would destroy its endpoint.
+    /// This clones existing transport only: no token or resource credit is made.
+    pub fn for_descendant(&self) -> io::Result<Self> {
+        let mut selected = self.clone();
+        selected.enable_descendant_handoff()?;
+        Ok(selected)
     }
 
     /// Capture an inherited server without acquiring or creating any tokens.
@@ -137,17 +170,30 @@ impl Jobserver {
     /// has already reused an advertised descriptor number.
     pub unsafe fn from_env() -> io::Result<Option<Self>> {
         // SAFETY: the caller guarantees the early-import precondition above.
+        unsafe { Self::from_env_policy(false) }
+    }
+
+    // One importer owns both policies. Missing auth is not malformed auth:
+    // ordinary MAKEFLAGS such as -j8/-k legitimately contain no jobserver.
+    unsafe fn from_env_policy(checked_auth: bool) -> io::Result<Option<Self>> {
+        // SAFETY: the caller guarantees the early-import precondition above.
         let inherited = unsafe { Client::from_env_ext(true) };
         let client = match inherited.client {
             Ok(client) => client,
             Err(error)
                 if matches!(
                     error.kind(),
-                    FromEnvErrorKind::NoEnvVar
-                        | FromEnvErrorKind::NoJobserver
-                        | FromEnvErrorKind::NegativeFd
-                        | FromEnvErrorKind::Unsupported
+                    FromEnvErrorKind::NoEnvVar | FromEnvErrorKind::NoJobserver
                 ) =>
+            {
+                return Ok(None);
+            }
+            Err(error)
+                if !checked_auth
+                    && matches!(
+                        error.kind(),
+                        FromEnvErrorKind::NegativeFd | FromEnvErrorKind::Unsupported
+                    ) =>
             {
                 return Ok(None);
             }
@@ -169,17 +215,33 @@ impl Jobserver {
     ///
     /// The early-startup requirement of [`Jobserver::from_env`] applies.
     pub unsafe fn from_env_with_handoff() -> io::Result<Option<Self>> {
+        // SAFETY: the caller guarantees the documented early capture.
+        unsafe { Self::from_env_with_handoff_policy(false) }
+    }
+
+    /// Capture real inherited transport while retaining errors for actual
+    /// disabled/unsupported auth. Ordinary MAKEFLAGS without an auth option
+    /// still yields None. No tokens are created and no environment is changed.
+    ///
+    /// # Safety
+    /// The early-startup requirement of [`Jobserver::from_env`] applies.
+    pub unsafe fn from_env_with_handoff_checked() -> io::Result<Option<Self>> {
+        // SAFETY: the caller guarantees the documented early capture.
+        unsafe { Self::from_env_with_handoff_policy(true) }
+    }
+
+    unsafe fn from_env_with_handoff_policy(checked_auth: bool) -> io::Result<Option<Self>> {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if let Some(advertisement) = std::env::var_os(DESCENDANT_HANDOFF_ENV) {
-            if let Some(path) = Client::fifo_path_from_env()? {
-                // Authenticate the actual original FIFO witnesses BEFORE any
-                // pathname open. A malformed or mismatched role must not fall
-                // back to importing an unchecked ambient FIFO.
-                return Self::from_fifo_handoff(&path, &advertisement).map(Some);
-            }
+        if let Some(advertisement) = std::env::var_os(DESCENDANT_HANDOFF_ENV)
+            && let Some(path) = Client::fifo_path_from_env()?
+        {
+            // Authenticate the actual original FIFO witnesses BEFORE any
+            // pathname open. A malformed or mismatched role must not fall
+            // back to importing an unchecked ambient FIFO.
+            return Self::from_fifo_handoff(&path, &advertisement).map(Some);
         }
         // SAFETY: the caller guarantees capture before descriptor reuse.
-        match unsafe { Self::from_env() } {
+        match unsafe { Self::from_env_policy(checked_auth) } {
             Ok(server) => Ok(server),
             Err(original) => {
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -208,10 +270,13 @@ impl Jobserver {
         let pipe = Self::own_pipe(&client)?;
         Ok(Self {
             client,
+            propagate_make_flags: false,
             #[cfg(unix)]
             pipe,
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             handoff: None,
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            named_scope: None,
         })
     }
 
@@ -256,10 +321,27 @@ impl Jobserver {
             if let Some(handoff) = &self.handoff {
                 handoff.configure(command);
             }
+            if self.propagate_make_flags {
+                Self::configure_make_variables(command);
+            }
             return;
         }
         // FIFO paths and Windows semaphores use the library's transport.
         self.client.configure(command);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if let Some(scope) = &self.named_scope {
+            command.env(DESCENDANT_HANDOFF_ENV, &scope.0);
+        }
+        if self.propagate_make_flags {
+            Self::configure_make_variables(command);
+        }
+    }
+
+    /// Carry this actual server in every GNU variable for each configured
+    /// descendant, including unaware make clients. Clones retain the policy.
+    /// This grants no credits and changes no process-wide environment.
+    pub fn propagate_make_flags(&mut self) {
+        self.propagate_make_flags = true;
     }
 
     /// Configure GNU make with the same owned transport as other children.
@@ -267,6 +349,10 @@ impl Jobserver {
     /// the imported flags whose original descriptors may already be closed.
     pub fn configure_make(&self, command: &mut Command) {
         self.configure(command);
+        Self::configure_make_variables(command);
+    }
+
+    fn configure_make_variables(command: &mut Command) {
         let flags = command
             .get_envs()
             .find_map(|(key, value)| (key == "CARGO_MAKEFLAGS").then_some(value).flatten())
@@ -301,20 +387,16 @@ fn configure_pipe(pipe: &Arc<[OwnedFd; 2]>, command: &mut Command) {
     }
 }
 
-#[derive(Debug)]
-#[cfg(feature = "client")]
-enum InheritedTransport {
-    Client(Jobserver),
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    Recovered(Arc<[OwnedFd; 2]>),
-}
-
 /// An optional inherited scheduler, used by compiler/doc shims that do not
 /// create a scheduler when none was passed by their caller.
 #[derive(Debug)]
 #[must_use]
 #[cfg(feature = "client")]
-pub struct InheritedJobserver(Option<InheritedTransport>);
+pub struct InheritedJobserver(Option<Jobserver>);
+
+#[cfg(all(test, unix, feature = "client"))]
+#[path = "tests/transport_witnesses.rs"]
+mod transport_witness_tests;
 
 #[cfg(feature = "client")]
 impl InheritedJobserver {
@@ -324,25 +406,10 @@ impl InheritedJobserver {
     ///
     /// The early-startup requirement of [`Jobserver::from_env`] applies.
     pub unsafe fn from_env() -> io::Result<Self> {
-        // SAFETY: the caller guarantees the documented early capture.
-        match unsafe { Jobserver::from_env() } {
-            Ok(jobserver) => Ok(Self(jobserver.map(InheritedTransport::Client))),
-            Err(original) => {
-                #[cfg(any(target_os = "linux", target_os = "macos"))]
-                if let Some(advertisement) = std::env::var_os(DESCENDANT_HANDOFF_ENV) {
-                    let flags = std::env::var_os("CARGO_MAKEFLAGS").unwrap_or_default();
-                    return handoff::recover(&advertisement, &flags)
-                        .map(|pipe| Self(Some(InheritedTransport::Recovered(pipe))))
-                        .map_err(|error| {
-                            io::Error::new(
-                                error.kind(),
-                                format!("{original}; cannot recover inherited jobserver: {error}"),
-                            )
-                        });
-                }
-                Err(original)
-            }
-        }
+        // SAFETY: the caller guarantees the documented early capture. The
+        // checked importer authenticates scoped named witnesses before opening
+        // their locator and preserves numeric recovery's closed-target rule.
+        unsafe { Jobserver::from_env_with_handoff() }.map(Self)
     }
 
     /// Whether startup validated an actual inherited scheduler transport.
@@ -353,14 +420,16 @@ impl InheritedJobserver {
 
     /// Hand the same scheduler to this child, without creating a private one.
     pub fn configure(&self, command: &mut Command) {
-        match &self.0 {
-            Some(InheritedTransport::Client(jobserver)) => jobserver.configure(command),
-            #[cfg(any(target_os = "linux", target_os = "macos"))]
-            Some(InheritedTransport::Recovered(pipe)) => configure_pipe(pipe, command),
-            None => {}
+        if let Some(jobserver) = &self.0 {
+            jobserver.configure(command);
         }
-        // Leaf shim boundary: only the exact valid numeric descriptors pass
-        // to the real driver. Do not re-export a root binding after renumbering.
+        // Numeric transport has freshly owned descriptor numbers; its original
+        // binding cannot be reused. Named transport retains its checked scope
+        // so the next opener must authenticate the original FIFO witnesses.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if self.0.as_ref().is_some_and(|server| server.named_scope.is_some()) {
+            return;
+        }
         command.env_remove(DESCENDANT_HANDOFF_ENV);
     }
 }

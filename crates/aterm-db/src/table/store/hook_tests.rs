@@ -406,3 +406,128 @@ fn held_length_fails_where_the_claim_directory_cannot_be_listed() {
     assert!(held_lengths(paths).is_err());
     assert!(held_length(paths, table, false).is_err());
 }
+
+/// A listener hears each durable append to a store whose claim lives in the directory it named,
+/// from its registration until that drops, and no other custody's.
+///
+/// NEGATIVE CONTROL (2026-11-12): with `listeners::tell` not comparing the claim directory, the
+/// reader's listener heard the writer's commit, and both heard another test's append beside it
+/// (`the writer's custody alone hears its commit`: `left: [2, 2]`, `right: [1, 0]`).
+#[test]
+fn a_listener_hears_its_own_custodys_appends_until_it_drops() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let a = lab.bootstrap(0);
+    let b = lab.bootstrap(1);
+    let sa = Session::open(&a).unwrap();
+    let sb = Session::open(&b).unwrap();
+    let mut writer = Store::create(&sa, &lab._home.path().join("table-a")).unwrap();
+    let scope = writer.scope();
+    let mut reader = Store::join(&sb, &lab._home.path().join("table-b"), scope).unwrap();
+    let heard: [Arc<AtomicUsize>; 2] = Default::default();
+    let counting = |n: usize| {
+        let heard = heard[n].clone();
+        move |_: &Appended<'_>| {
+            heard.fetch_add(1, Ordering::Relaxed);
+        }
+    };
+    let hearing = listen(writer.claim_dir.clone(), counting(0)).expect("a free slot");
+    let _other = listen(reader.claim_dir.clone(), counting(1)).expect("a free slot");
+    let read = || [0, 1].map(|n| heard[n].load(Ordering::Relaxed));
+
+    let receipt = writer.commit_catalog(&sa, b"one row").unwrap();
+    assert_eq!(
+        read(),
+        [1, 0],
+        "the writer's custody alone hears its commit"
+    );
+    let wire = writer.wire(&sa, &receipt.id).unwrap().unwrap().to_vec();
+    reader.ingest(&sb, &wire).unwrap();
+    assert_eq!(
+        read(),
+        [1, 1],
+        "the reader's custody alone hears its ingest"
+    );
+    reader.ingest(&sb, &wire).unwrap();
+    assert_eq!(read(), [1, 1], "a duplicate appends nothing");
+
+    drop(hearing);
+    writer.commit_catalog(&sa, b"two rows").unwrap();
+    assert_eq!(read(), [1, 1], "a dropped registration hears nothing");
+}
+
+/// A listener that hears is told of every append, however many other listeners register and
+/// drop meanwhile: a registration locks only the slot it claimed, which holds no listener, so it
+/// never keeps an append from one that hears. One thread tells a listener of 100,000 appends
+/// (`listeners::tell`, what a store's append runs) while another registers and drops listeners
+/// sixteen at a time; the listener counts every one. Counted, never timed: the telling goes on
+/// until the other thread has registered and dropped at least a hundred times.
+///
+/// NEGATIVE CONTROL (2026-11-12): with [`listen`] taking each slot's write lock from the first
+/// to look for an empty one, as it did, the appends told while it held the hearing listener's
+/// slot passed that listener over (`every append reaches the listener that hears`: `left:
+/// 96327`, `right: 100000`; run alone five times, it failed each time, short by 3,288 to
+/// 3,739).
+#[test]
+fn a_listener_hears_every_append_while_others_register_and_drop() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
+    const APPENDS: usize = 100_000;
+    // No store's claims live here: `tell` compares the path alone.
+    let claims = PathBuf::from("/a-listener-law/hears");
+    let heard = Arc::new(AtomicUsize::new(0));
+    let counting = heard.clone();
+    let _hearing = listen(claims.clone(), move |_| {
+        counting.fetch_add(1, Ordering::Relaxed);
+    })
+    .expect("a free slot");
+    let (done, churned) = (
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicUsize::new(0)),
+    );
+    let churn = std::thread::spawn({
+        let (done, churned) = (done.clone(), churned.clone());
+        move || {
+            let other = PathBuf::from("/a-listener-law/comes-and-goes");
+            while !done.load(Ordering::Acquire) {
+                let batch: Vec<_> = (0..16)
+                    .filter_map(|_| listen(other.clone(), |_| {}))
+                    .collect();
+                assert!(!batch.is_empty(), "a free slot");
+                drop(batch);
+                churned.fetch_add(1, Ordering::Release);
+            }
+        }
+    });
+    let record = Appended {
+        table: [0; 32],
+        recovery: false,
+        kind: AppendKind::Operation,
+        offset: 0,
+        length: 1,
+        via: Via::Local,
+        wire: &[],
+    };
+    let started = std::time::Instant::now();
+    let mut told = 0;
+    while told < APPENDS || churned.load(Ordering::Acquire) < 100 {
+        listeners::tell(&record, &claims);
+        told += 1;
+        assert!(
+            started.elapsed() < aterm_spec::wait::MUST_HAPPEN,
+            "the registering thread makes no progress"
+        );
+    }
+    done.store(true, Ordering::Release);
+    churn.join().unwrap();
+    assert_eq!(
+        heard.load(Ordering::Relaxed),
+        told,
+        "every append reaches the listener that hears"
+    );
+}

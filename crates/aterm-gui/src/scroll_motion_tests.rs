@@ -360,6 +360,51 @@ fn pill_geometry_laws() {
     assert_eq!(pill_geometry(100, 8, 0, 50, 0), None);
 }
 
+/// The pill's quads are the thumb sliced into its row bands, inside the `u16` pixel space a
+/// quad stores. On an ordinary grid that is the whole thumb, one quad per band. 4096 columns
+/// of 16 px put the pill at x = 8 + 65,536 - 7 = 65,537, past the space: no quad (narrowed
+/// with `as u16` it was drawn at x = 1, the far left). On 2,100 rows of 32 px the thumb is
+/// clipped at 65,535 and no band past it is laid (a wrapped `y` sat at the top of the window).
+#[test]
+fn pill_quads_stay_in_their_bands_inside_the_u16_space() {
+    let pill = |cols: usize, rows: usize, (cw, ch): (usize, usize), (y, len): (usize, usize)| {
+        let (gox, goy, pw) = (8usize, 8usize, (cw / 3).clamp(2, 6));
+        let x = gox + (cols * cw).saturating_sub(pw + 2);
+        let (top, bot) = (goy + 2 + y, goy + 2 + y + len);
+        let mut out = Vec::new();
+        push_pill_quads(&mut out, (x, pw), (top, bot), (goy, ch, rows), 0x00A8_A8A8);
+        for q in &out {
+            let band = goy + usize::from(q.row) * ch;
+            let (qy, qh) = (usize::from(q.y), usize::from(q.h));
+            assert!(
+                qy >= band.max(top) && qy + qh <= (band + ch).min(bot),
+                "a quad outside its row band or the thumb: {q:?}"
+            );
+            assert!(
+                usize::from(q.x) == x && usize::from(q.x) + usize::from(q.w) <= 65_535,
+                "a quad off the pill or past the u16 space: {q:?}"
+            );
+        }
+        out
+    };
+    // Ordinary: 24 rows of 19 px, the thumb across rows 3..=9.
+    let ordinary = pill(80, 24, (10, 19), (60, 120));
+    let covered: usize = ordinary.iter().map(|q| usize::from(q.h)).sum();
+    assert_eq!(covered, 120, "the whole thumb, sliced");
+    assert_eq!(ordinary.len(), 7, "one quad per band crossed");
+    // 4096 columns of 16 px: the pill is past the space.
+    assert!(pill(4096, 3, (16, 32), (0, 40)).is_empty());
+    // 2,100 rows of 32 px, the thumb across the space's bottom edge (window y
+    // 65,000..66,000): clipped at 65,535, nothing below it.
+    let tall = pill(80, 2100, (10, 32), (64_990, 1_000));
+    let bottom = tall
+        .iter()
+        .map(|q| usize::from(q.y) + usize::from(q.h))
+        .max();
+    assert_eq!(bottom, Some(65_535), "clipped at the space's edge");
+    assert!(tall.iter().all(|q| q.row < 2048), "no band past the space");
+}
+
 /// Pill fade: opaque at touch, monotone non-increasing, zero by `HOLD+FADE`, and binary
 /// under Reduced motion.
 #[test]

@@ -59,6 +59,10 @@ aterm-uds = { workspace = true }
 # A private sibling staging directory keeps retried GitHub asset bytes off the destination until
 # one complete transfer can be atomically renamed into place.
 aterm-tempfile = { workspace = true }
+# The anchor attributes' registry (std-only): the update record's `#[cfg_attr(any(test,
+# debug_assertions), aterm_spec_anchor::refines(…))]` bindings to NativeUpdateHold expand in every
+# test and debug build; release strips them. Already in this crate's graph through aterm-types.
+aterm-spec-anchor = { workspace = true }
 
 # getuid(2), fsync(2), and the open flags and errno values std does not name.
 [target.'cfg(unix)'.dependencies]
@@ -69,6 +73,9 @@ libc = { workspace = true }
 aterm-digest = { workspace = true }
 
 [dev-dependencies]
+# The update record's conformance tests (src/update_record_tests.rs) hold it to NativeUpdateHold.
+aterm-spec = { workspace = true }
+aterm-models-update = { workspace = true }
 # The loopback GitHub the REST lane's tests run real curl against (src/github_rest_tests.rs).
 agh-fake = { workspace = true }
 # The roster tests sign synthetic fixtures, which needs ring's `alloc`; default features in

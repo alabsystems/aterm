@@ -2,11 +2,13 @@
 // Copyright 2026 Andrew Yates
 use super::*;
 use aterm_uds::{CtlListener, CtlStream, spawnfd};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::io::Write as _;
+use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 use std::time::Duration;
 
 const ACTOR: &str = "ATERM_PRODUCER_PROOF_FIXTURE";
 const SOURCE: &str = "ATERM_PRODUCER_PROOF_SOURCE";
+const CONNECTED: &str = "cached producer connected";
 fn deadline() -> Instant {
     crate::fixture_deadline(Instant::now())
 }
@@ -22,6 +24,8 @@ fn cached_helper_actor() {
     // SAFETY: this isolated actor owns the descriptor explicitly inherited by its parent.
     let proof = unsafe { OwnedFd::from_raw_fd(raw) };
     let channel = CtlStream::connect(path).unwrap();
+    println!("{CONNECTED}");
+    std::io::stdout().flush().unwrap();
     aterm_uds::fdpass::send_with_fds(&channel, b"R", &[proof.as_fd()]).unwrap();
     // The actual owner ends this helper through its owned Child, never a decoded PID.
     loop {
@@ -54,7 +58,6 @@ fn cached_helper_parent_challenge_and_stale_wrong_answer_refusals() {
     let path = root.join("proof");
     let listener = aterm_uds::kept_out(|| CtlListener::bind(&path)).unwrap();
     let (producer, proof) = UnixStream::pair().unwrap();
-    let raw = proof.as_raw_fd();
     let mut command = spawnfd::command(program.path());
     command
         .args([
@@ -63,13 +66,15 @@ fn cached_helper_parent_challenge_and_stale_wrong_answer_refusals() {
             "--nocapture",
         ])
         .env(ACTOR, &path)
-        .env(SOURCE, raw.to_string())
         .stdin(spawnfd::Stdio::null())
-        .stdout(spawnfd::Stdio::null())
-        .stderr(spawnfd::Stdio::null());
+        .stdout(spawnfd::Stdio::piped())
+        .stderr(spawnfd::Stdio::inherit());
     command.inherit_guards(vec![proof.into()]).unwrap();
+    let source = command.guard_targets().next().unwrap();
+    command.env(SOURCE, source.to_string());
     let mut helper = Helper(command.spawn().unwrap());
     drop(command);
+    aterm_uds::deadline::prints(&mut helper.0, CONNECTED, Duration::from_secs(60));
     let (channel, _) = aterm_uds::accept(
         &listener,
         aterm_uds::AcceptWait::Until(deadline()),

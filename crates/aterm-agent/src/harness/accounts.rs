@@ -262,6 +262,10 @@ pub const PCT_MAX: u32 = 1000;
 
 /// A wall that names its reset stands this long past it.
 pub const RESET_GRACE_S: i64 = 150;
+/// What follows the window in the reason of a [`Kind::Wall`] row that lifts the wall, where one
+/// observed standing has `until` or a comma: the row that wakes the sessions waiting on it
+/// ([`Event::wakes`]).
+pub const WALL_LIFTED: &str = " lifted: ";
 
 /// A wall observed after its own reset stands this long from the observation.
 pub const LATE_WALL_S: [i64; 2] = [10 * 60, 30 * 60];
@@ -5498,7 +5502,10 @@ pub struct Wall {
     pub cleared: bool,
 }
 
-fn rung(ladder: &[i64], attempts: u32) -> i64 {
+/// The wait `ladder` gives the `attempts`th try in a row: the rung of that number, its first for
+/// none and its last past its end, and `0` for a ladder with no rung.
+#[must_use]
+pub fn rung(ladder: &[i64], attempts: u32) -> i64 {
     let i = usize::try_from(attempts.saturating_sub(1)).unwrap_or(usize::MAX);
     ladder
         .get(i)
@@ -5748,8 +5755,9 @@ impl WindowSaid {
 }
 
 /// A model's week as Claude Code last said it on a session's screen, its wall or its warning
-/// ([`Account::weeks_said`], [`record_usage`]), or a limit reset on that week since: stats only,
-/// read by `accounts stats` and by no decision.
+/// ([`Account::weeks_said`], [`record_usage`]), or a limit reset on that week since: read by
+/// `accounts stats`, and by one decision alone: Fable's reset times the return of a session moved
+/// onto Opus at a Fable notice that named none (`IdleHost::fable_week`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WeekSaid {
     /// Whole percent used: 100 at its wall. `None` for a limit reset on the week at [`Self::at`]
@@ -6010,11 +6018,12 @@ pub struct Account {
     pub warned_session: Option<WindowSaid>,
     /// Observation: the same of its week ([`windows_full`], [`Self::week_low_until`]).
     pub warned_week: Option<WindowSaid>,
-    /// Stats only: each model's week as a session's screen last said it, by bucket id
+    /// For the stats: each model's week as a session's screen last said it, by bucket id
     /// ([`week_bucket`], [`WeekSaid`]), or a limit reset on that week since ([`reset_outcome`]).
-    /// No decision reads it: it is in neither [`Self::observed`], [`condition`],
+    /// No account decision reads it: it is in neither [`Self::observed`], [`condition`],
     /// [`Self::limited_until`], [`Self::low`] nor [`windows_full`] (the stats design's §8.2), and
-    /// a change to it alone is [`Recorded::Stats`].
+    /// a change to it alone is [`Recorded::Stats`]. Fable's alone times the return of a session
+    /// moved onto Opus at a Fable notice that named no reset (`IdleHost::fable_week`).
     pub weeks_said: BTreeMap<String, WeekSaid>,
     /// Observation: the account this label's readings were last read of, by its key.
     pub key: Option<super::profile::AccountKey>,
@@ -9754,8 +9763,9 @@ impl Event {
             | Kind::Renewed
             | Kind::SignedIn => true,
             Kind::Auth => self.why == Auth::Ok.as_str(),
-            Kind::Wall
-            | Kind::Sample
+            // A wall observed standing leaves every wait as it was; one lifted ends them.
+            Kind::Wall => self.why.contains(WALL_LIFTED),
+            Kind::Sample
             | Kind::Rotate
             | Kind::Move
             | Kind::Probe
@@ -9977,7 +9987,7 @@ pub fn note_room(state: &mut State, account: &str, sample: &Sample, now: i64) ->
             wall.attempts = 0;
             out.push(
                 Event::new(now, Kind::Wall, account)
-                    .because(&format!("{window} lifted: a read shows room")),
+                    .because(&format!("{window}{WALL_LIFTED}a read shows room")),
             );
         }
     }
@@ -10330,6 +10340,26 @@ pub fn note_reading_held(
             events.push(Event::new(now, Kind::Reset, account).because(&format!(
                 "{bucket} refilled inside its window (resets {})",
                 super::usage::rfc3339_utc(merged.as_ref().map_or(0, |m| m.reset))
+            )));
+        }
+        // The wall this window raised was observed of the allowance a refill replaced, so it ends
+        // at the refill and not at the reset it named. One observed at or after the refill
+        // stands. Read from the held figure, not from this reading's own refill, so a wall whose
+        // refill an earlier reading filed is lifted by the next one. The mark keeps an older
+        // observer from raising it again, as a read's clearing does ([`note_room`]).
+        if let Some(refilled) = merged.as_ref().and_then(|m| m.epoch_at)
+            && let Some(wall) = record
+                .walls
+                .get_mut(bucket)
+                .filter(|wall| !wall.cleared && wall.at < refilled)
+        {
+            wall.cleared = true;
+            wall.at = now;
+            wall.by = by.clone();
+            wall.attempts = 0;
+            changed = true;
+            events.push(Event::new(now, Kind::Wall, account).because(&format!(
+                "{bucket}{WALL_LIFTED}it refilled inside its window"
             )));
         }
         if merged.is_some() {

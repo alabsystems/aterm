@@ -2304,6 +2304,18 @@ fn apply_group_txn_inner(
         }
         Ok(None) => {}
     }
+    // Pin writes do not wait for downloads. Read them again at each effect boundary,
+    // including between flips so a newly held tuple rolls back members already moved.
+    let admitted = || {
+        current()?;
+        match decided
+            .pin_hold(layout)
+            .map_err(|error| error.to_string())?
+        {
+            Some(held) => Err(format!("local pins now hold {}", held.join(", "))),
+            None => Ok(()),
+        }
+    };
     let decisions = &decided.decisions;
     let (any_tombstone, all_current_valid) = (decided.any_tombstone, decided.all_current_valid);
 
@@ -2409,7 +2421,7 @@ fn apply_group_txn_inner(
             }
             crate::quiet::Verdict::Defer { since } => {
                 for m in &install_members {
-                    if let Err(why) = current() {
+                    if let Err(why) = admitted() {
                         return (
                             TxnOutcome::Aborted {
                                 failed: (*m).clone(),
@@ -2503,7 +2515,7 @@ fn apply_group_txn_inner(
     let outcome = transact_holding(
         decisions,
         &mut |m| {
-            current()?;
+            admitted()?;
             let mut why = String::new();
             match stage_member(
                 fetcher,
@@ -2553,7 +2565,7 @@ fn apply_group_txn_inner(
             .then(|| (busy.clause(), since))
         },
         &mut |m| {
-            current()?;
+            admitted()?;
             crate::progress::note_phase(m, crate::progress::Phase::Link);
             let check = ahead.borrow_mut().remove(m);
             let all = staged.borrow();

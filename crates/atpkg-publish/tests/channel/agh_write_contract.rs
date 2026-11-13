@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use agh::config::Dirs;
-use agh::fx::Fx;
+use agh::fx::{Fx, GitChildTiming};
 use agh::git::HelperCommand;
 use agh::identity::MapEnv;
 use agh::policy::Router;
@@ -237,6 +237,8 @@ pub(super) struct Setup {
     dev_anonymous: bool,
     /// Whether agh.toml grants atpkg-publish `alabsystems/aterm`.
     grant: bool,
+    /// Whether fixture-dev has a writer profile (its `[[owners]]` row's `write = "dev"`).
+    dev_writer: bool,
 }
 
 impl Setup {
@@ -246,6 +248,7 @@ impl Setup {
         dev_token: true,
         dev_anonymous: false,
         grant: false,
+        dev_writer: true,
     };
     pub(super) const RELEASE: Setup = Setup {
         slug: RELEASE_SLUG,
@@ -253,8 +256,13 @@ impl Setup {
         dev_token: true,
         dev_anonymous: false,
         grant: true,
+        dev_writer: true,
     };
 }
+
+/// What `AghWorld::build_observed` installs: given the world's root, the observer of each git
+/// child the client runs.
+type Observer = Box<dyn FnOnce(&Path) -> Box<dyn Fn(GitChildTiming) + Send + Sync>>;
 
 pub(super) struct AghWorld {
     pub(super) fake: FakeGithub,
@@ -267,21 +275,23 @@ pub(super) struct AghWorld {
     fx: Arc<Fx>,
 }
 
-/// The agh.toml of the write contract: a dev and a release profile, the two fixture owners,
-/// and, when `grant`, atpkg-publish's `[[writers]]` row.
-fn config_text(tokens: &Path, grant: bool, dev_anonymous: bool) -> String {
+/// The agh.toml of the write contract: a dev and a release profile, the two fixture owners
+/// (fixture-dev with the dev writer only when `dev_writer`), and, when `grant`,
+/// atpkg-publish's `[[writers]]` row.
+fn config_text(tokens: &Path, grant: bool, dev_anonymous: bool, dev_writer: bool) -> String {
     let tokens = toml_path(tokens);
     let dev_read = if dev_anonymous {
         "[\"dev\", \"anonymous\"]"
     } else {
         "[\"dev\"]"
     };
+    let dev_write = if dev_writer { "write = \"dev\"\n" } else { "" };
     let mut text = format!(
         "[profiles.dev]\ntoken_file = \"{tokens}/dev.token\"\ntier = \"dev\"\n\
          login = \"fixture-dev-bot\"\n\n\
          [profiles.release]\ntoken_file = \"{tokens}/release.token\"\ntier = \"release\"\n\
          login = \"fixture-release-bot\"\n\n\
-         [[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = {dev_read}\nwrite = \"dev\"\n\n\
+         [[owners]]\nname = \"fixture-dev\"\ntier = \"dev\"\nread = {dev_read}\n{dev_write}\n\
          [[owners]]\nname = \"alabsystems\"\ntier = \"release\"\nread = [\"dev\", \"anonymous\"]\n\
          write = \"release\"\n"
     );
@@ -309,13 +319,12 @@ impl AghWorld {
     }
 
     pub(super) fn build(setup: Setup) -> AghWorld {
-        Self::build_with_concurrent_clone_destination(setup, None)
+        Self::build_observed(setup, None)
     }
 
-    fn build_with_concurrent_clone_destination(
-        setup: Setup,
-        concurrent_clone_destination: Option<&'static str>,
-    ) -> AghWorld {
+    /// `build`, with `observer` (given the world's root) watching each git child the client
+    /// runs as it returns.
+    fn build_observed(setup: Setup, observer: Option<Observer>) -> AghWorld {
         let fake = FakeGithub::start();
         let root = scratch("write-contract-agh");
         let dirs = Dirs::under(root.path());
@@ -338,7 +347,7 @@ impl AghWorld {
         }
         let router = file_router(
             &dirs,
-            &config_text(&tokens, setup.grant, setup.dev_anonymous),
+            &config_text(&tokens, setup.grant, setup.dev_anonymous, setup.dev_writer),
         );
         let login = if setup.slug == RELEASE_SLUG {
             "fixture-release-bot"
@@ -360,13 +369,8 @@ impl AghWorld {
             .with("PATH", &path)
             .with("HOME", &home.to_string_lossy());
         let mut fx = Fx::simulated(SIM_START);
-        if let Some(relative) = concurrent_clone_destination {
-            let destination = root.path().join(relative);
-            fx = fx.with_git_child_observer_for_tests(move |_| {
-                std::fs::create_dir_all(&destination).expect("concurrent clone destination");
-                std::fs::write(destination.join("theirs"), b"keep")
-                    .expect("concurrent destination file");
-            });
+        if let Some(observer) = observer {
+            fx = fx.with_git_child_observer_for_tests(observer(root.path()));
         }
         let fx = Arc::new(fx);
         let github = agh::GithubBuilder::new(router)
@@ -659,6 +663,53 @@ fn create_makes_one_prerelease_never_latest_with_every_file_agh() {
     assert_eq!(releases[0].target_commitish, None);
     assert_eq!(w.posts(), 1);
     assert_eq!(w.fake.violations(), Vec::<String>::new());
+}
+
+#[test]
+fn created_intent_recovery_finishes_an_empty_draft_without_another_release_post_agh() {
+    let w = AghWorld::new();
+    let files = [file(w.root.path(), "a.bin", b"exact retained bytes")];
+    w.fake.fault(
+        Match::uploads(&format!("{}/", w.releases_path())).method("POST"),
+        Fault::Status {
+            status: 400,
+            body: "{\"message\":\"fixture stopped before first upload\"}".into(),
+            headers: vec![],
+        },
+    );
+    assert!(create(&w, "v1", &files).is_err());
+    let pending = w.read("v1");
+    assert_eq!(pending.len(), 1);
+    assert!(pending[0].draft);
+    assert!(pending[0].assets.is_empty());
+    let posts = w.posts();
+    assert!(
+        w.host
+            .complete_created(&w.slug(), "v1", "title", "notes", &files)
+            .unwrap()
+    );
+    assert_eq!(w.posts(), posts);
+    let completed = w.read("v1");
+    assert!(!completed[0].draft);
+    assert_eq!(completed[0].assets["a.bin"], b"exact retained bytes");
+    assert!(w.fake.violations().is_empty());
+}
+
+#[test]
+fn created_intent_recovery_refuses_an_unowned_empty_draft_without_writes_agh() {
+    let w = AghWorld::new();
+    w.lay("v1", true, &[]);
+    let files = [file(w.root.path(), "a.bin", b"retained")];
+    let before = w.writes();
+    assert!(
+        w.host
+            .complete_created(&w.slug(), "v1", "title", "notes", &files)
+            .is_err()
+    );
+    assert_eq!(w.writes(), before);
+    let pending = w.read("v1");
+    assert!(pending[0].draft);
+    assert!(pending[0].assets.is_empty());
 }
 
 fn case_a_create_over_an_existing_release_is_refused(w: &dyn WriteWorld) {
@@ -1172,7 +1223,17 @@ fn a_failed_lane_clone_leaves_no_directory_it_made() {
 /// its obsolete partial-clone cleanup by deleting that actor's files.
 #[test]
 fn a_failed_lane_clone_preserves_a_concurrent_destination() {
-    let w = AghWorld::build_with_concurrent_clone_destination(Setup::DEV, Some("raced"));
+    let w = AghWorld::build_observed(
+        Setup::DEV,
+        Some(Box::new(|root: &Path| {
+            let destination = root.join("raced");
+            Box::new(move |_| {
+                std::fs::create_dir_all(&destination).expect("concurrent clone destination");
+                std::fs::write(destination.join("theirs"), b"keep")
+                    .expect("concurrent destination file");
+            })
+        })),
+    );
     bare_repo(&w.dir().join("work"), &w.remote());
     let destination = w.dir().join("raced");
     let error = w
@@ -1335,6 +1396,100 @@ fn main_of_record_uses_git_even_when_rest_names_another_commit_without_rest_quot
     assert_eq!(w.fake.violations(), Vec::<String>::new());
 }
 
+/// `fetch_main` binds the record ref to the main Git advertised. When main moves between the
+/// `ls-remote` and the fetch, the fetched commit is not the observed one: the call is
+/// `Unreachable`, names both commits, and removes only the attempted record ref, leaving an
+/// unrelated ref and the checkout's remote-tracking ref as they were. An `ls-remote` that fails
+/// starts no fetch and leaves an existing record ref as it was. agh-fake's git is real Git over
+/// a local bare repository, and main moves there after the first Git child returns. NEGATIVE
+/// CONTROL: without the `update-ref -d`, the refused fetch's record ref is left behind.
+#[test]
+fn fetch_main_refuses_a_moved_main_and_drops_only_the_record_ref_agh() {
+    use atpkg_publish::artifact::package::MAIN_OF_RECORD;
+    let moving: Arc<std::sync::Mutex<Option<String>>> = Arc::default();
+    let armed = Arc::clone(&moving);
+    let w = AghWorld::build_observed(
+        Setup::DEV,
+        Some(Box::new(move |root: &Path| {
+            let remote = root.join("remote.git");
+            Box::new(move |_| {
+                let next = armed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(sha) = next {
+                    super::git(&remote, &["update-ref", "refs/heads/main", &sha]);
+                }
+            })
+        })),
+    );
+    let first = bare_repo(&w.dir().join("work"), &w.remote());
+    let checkout = source_checkout(&w);
+    let tree = super::git(&w.remote(), &["rev-parse", "main^{tree}"]);
+    let moved = super::git(
+        &w.remote(),
+        &["commit-tree", &tree, "-p", &first, "-m", "moved"],
+    );
+    super::git(
+        &checkout,
+        &["update-ref", "refs/atpkg-publish/unrelated", &first],
+    );
+    let tracking = super::git(&checkout, &["rev-parse", "refs/remotes/origin/main"]);
+    w.fake.clear_seen();
+    let fetches = || {
+        w.fx.children_run()
+            .iter()
+            .filter(|spec| spec.args.iter().any(|arg| arg == "fetch"))
+            .count()
+    };
+
+    *moving
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(moved.clone());
+    let err = w
+        .host
+        .fetch_main(&w.slug(), &checkout, MAIN_OF_RECORD)
+        .expect_err("a main that moved after its observation is no main of record");
+    assert!(matches!(err, HostError::Unreachable(_)), "{err:?}");
+    assert!(
+        err.to_string().contains(&first) && err.to_string().contains(&moved),
+        "{err}"
+    );
+    assert_eq!(
+        fetches(),
+        1,
+        "the fetch ran: main moved after the ls-remote"
+    );
+    assert_eq!(
+        super::git(
+            &checkout,
+            &["for-each-ref", "--format=%(refname)", "refs/atpkg-publish/"]
+        ),
+        "refs/atpkg-publish/unrelated",
+        "only the failed attempt's exact record ref is removed"
+    );
+    assert_eq!(
+        super::git(&checkout, &["rev-parse", "refs/remotes/origin/main"]),
+        tracking,
+        "the checkout's remote-tracking ref is untouched"
+    );
+
+    super::git(&checkout, &["update-ref", MAIN_OF_RECORD, &first]);
+    std::fs::rename(w.remote(), w.dir().join("remote.git.gone")).expect("the remote goes");
+    let err = w
+        .host
+        .fetch_main(&w.slug(), &checkout, MAIN_OF_RECORD)
+        .expect_err("an unreadable main is no main of record");
+    assert!(matches!(err, HostError::Unreachable(_)), "{err:?}");
+    assert_eq!(fetches(), 1, "no fetch starts after a failed ls-remote");
+    assert_eq!(
+        super::git(&checkout, &["rev-parse", MAIN_OF_RECORD]),
+        first,
+        "an existing record ref is left as it was"
+    );
+    assert!(w.fake.seen().is_empty(), "main of record reads no REST");
+}
+
 #[test]
 fn an_open_intent_never_posts_again_and_a_later_read_observes_it() {
     let w = AghWorld::new();
@@ -1365,6 +1520,44 @@ fn an_open_intent_never_posts_again_and_a_later_read_observes_it() {
     create(&w, "v1", &files).expect("the rerun");
     assert_eq!(w.posts(), 1);
     assert_eq!(w.read("v1"), vec![held(false, &[("a.bin", b"ay")])]);
+    assert_eq!(w.fake.violations(), Vec::<String>::new());
+}
+
+/// A write whose owner has no writer profile is refused before anything is sent: create, upload
+/// and publish_draft each take the owner's write permit first, and with no `write` row there is
+/// none, so agh-fake's request log stays empty and no journal intent is opened. NEGATIVE
+/// CONTROL: a read of the tag before `permit()` in create sends a request, which fails the
+/// empty log.
+#[test]
+fn a_write_without_a_writer_sends_nothing_agh() {
+    let w = AghWorld::build(Setup {
+        dev_writer: false,
+        ..Setup::DEV
+    });
+    let file = file(w.dir(), "a.bin", b"ay");
+    for r in [
+        w.host
+            .create(&slug(), "atpkg-ay-1", "t", "n", std::slice::from_ref(&file)),
+        w.host.upload(
+            &slug(),
+            "atpkg-ay-1",
+            std::slice::from_ref(&file),
+            Replace::Never,
+        ),
+        w.host.upload(
+            &slug(),
+            "atpkg-ay-1",
+            std::slice::from_ref(&file),
+            Replace::Clobber,
+        ),
+        w.host.publish_draft(&slug(), "atpkg-ay-1"),
+    ] {
+        assert!(
+            matches!(&r, Err(HostError::Refused(why)) if why.contains(OWNER)),
+            "{r:?}"
+        );
+    }
+    assert!(w.fake.seen().is_empty(), "{:?}", w.fake.seen());
     assert_eq!(w.fake.violations(), Vec::<String>::new());
 }
 
@@ -1595,11 +1788,14 @@ fn a_draft_seed_is_not_found() {
 }
 
 /// F5's call site: `channel::seed::publish_refusals` reads the seed release as published only,
-/// through the host of the owner the ledger names. A trust origin whose main carries the re-pin
-/// and whose ledger names `{ledger_owner}/trust` `SEED_TAG`, cloned into `trust`, with a seal
-/// receipt for it.
+/// through the host of the owner the ledger names. A trust origin, at a local path that names
+/// the staging owner's (`fixture-dev`) `trust`, whose main carries the re-pin and whose ledger
+/// names `{ledger_owner}/trust` `SEED_TAG`, cloned into `trust`, with a seal receipt for it.
+/// The origin is the staging host's clone source of `trust` to register: the rig is built for
+/// agh, whose staging host reads trust's main of record.
 struct SeedFixture {
     rig: Rig,
+    origin: PathBuf,
     trust: PathBuf,
     seal: PathBuf,
 }
@@ -1609,8 +1805,9 @@ const SEED_COMMIT: &str = "1234567890123456789012345678901234567890";
 
 fn seed_fixture(label: &str, ledger_owner: &str) -> SeedFixture {
     use atpkg_publish::channel::seed::{GENERATED_MARKER, LEDGER};
-    let rig = Rig::new(label);
-    let origin = rig.path("trust-origin");
+    let mut rig = Rig::new(label);
+    rig.ctx.accounts.staging = "fixture-dev".to_string();
+    let origin = rig.path(&format!("origin/{}", rig.ctx.staging_slug("trust")));
     std::fs::create_dir_all(origin.join("src")).expect("mkdir src");
     std::fs::create_dir_all(origin.join(Path::new(LEDGER).parent().expect("a parent")))
         .expect("mkdir ledger");
@@ -1650,7 +1847,12 @@ fn seed_fixture(label: &str, ledger_owner: &str) -> SeedFixture {
         ),
     )
     .expect("receipt");
-    SeedFixture { rig, trust, seal }
+    SeedFixture {
+        rig,
+        origin,
+        trust,
+        seal,
+    }
 }
 
 fn seed_release(draft: bool) -> FakeRelease {
@@ -1665,9 +1867,10 @@ fn seed_release(draft: bool) -> FakeRelease {
 #[test]
 fn a_draft_seed_refuses_the_publish_through_its_owners_host() {
     let mut f = seed_fixture("write-contract-f5", "fixture-ext");
-    f.rig.ctx.accounts.staging = "fixture-dev".to_string();
     f.rig.ctx.accounts.public = "fixture-ext".to_string();
     let staging = Arc::new(FakeHost::new());
+    let trust = f.rig.ctx.staging_slug("trust");
+    staging.add_clone_source(&trust, &f.origin);
     let channel = Arc::new(FakeHost::new());
     let seed = Slug::new("fixture-ext", "trust");
     channel.put(&seed, SEED_TAG, seed_release(true));
@@ -1680,7 +1883,11 @@ fn a_draft_seed_refuses_the_publish_through_its_owners_host() {
     assert!(refusals[0].contains(SEED_TAG), "{refusals:?}");
     let read = format!("release {seed} {SEED_TAG}");
     assert!(channel.calls().contains(&read), "{:?}", channel.calls());
-    assert!(staging.calls().is_empty(), "{:?}", staging.calls());
+    assert_eq!(
+        staging.calls(),
+        vec![format!("fetch-main {trust}")],
+        "the staging host reads trust's main of record alone, never the seed release"
+    );
 
     channel.put(&seed, SEED_TAG, seed_release(false));
     let refusals = atpkg_publish::channel::seed::publish_refusals(&f.rig.ctx, &f.trust, &f.seal);
@@ -1750,8 +1957,10 @@ fn pre_claim_checks_ask_the_host_under_agh() {
     assert!(why.contains("refused by the test"), "{why}");
     assert_eq!(rig.host.calls().last(), Some(&format!("preflight {trust}")));
 
+    // The `gh` arm's token check, said outright: the rig is built for agh.
     let rig = Rig::new("write-contract-f2-gh");
-    let e = upload::token_preflight(&rig.ctx).expect_err("no token file");
+    let gh = rig.ctx.clone().with_host_choice(HostChoice::Gh);
+    let e = upload::token_preflight(&gh).expect_err("no token file");
     assert!(e.to_string().contains("~/.secrets/gh_access_token"), "{e}");
     assert!(
         !rig.host.calls().iter().any(|c| c.starts_with("preflight ")),

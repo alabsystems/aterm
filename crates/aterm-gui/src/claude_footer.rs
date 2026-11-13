@@ -372,35 +372,12 @@ struct CachedPaneText {
     panel: std::cell::OnceCell<Option<Arc<crate::claude_panel::PanelRead>>>,
     /// The last reading's panel, until this rebuild's is taken.
     panel_before: std::cell::Cell<Option<Arc<crate::claude_panel::PanelRead>>>,
-    /// Claude Code's update notice and startup announcement under the card on `rows`, read
-    /// from the card's bottom row (`.0`) ([`PaneTextCache::harness_notices`]).
-    notice: std::cell::Cell<Option<(usize, Option<NoticeScans>)>>,
-    /// The startup announcement's rows as the last read under the card left them, kept across
-    /// rebuilds for the rows the card leaves when it scrolls off
-    /// ([`PaneTextCache::scrolled_announcement`]).
-    slot: std::cell::RefCell<Option<KeptSlot>>,
-    /// The startup announcement's rows still on `rows` after the card scrolled off
-    /// ([`PaneTextCache::scrolled_announcement`]).
-    slot_scrolled: std::cell::OnceCell<Option<aterm_phase::AnnouncementPlace>>,
     /// The engine's revisions of the rows `rows` were read from ([`RowStamps`],
     /// [`Self::rule_run`]).
     stamps: RowStamps,
     /// The kept runs' rows as they were read, where no revision vouches for
     /// them ([`KeptRows`]).
     kept_cells: std::cell::RefCell<KeptRows>,
-}
-
-/// Claude Code's update notice and startup announcement as one read of a pane's rows
-/// ([`PaneTextCache::harness_notices`]).
-type NoticeScans = (aterm_phase::NoticeScan, aterm_phase::AnnouncementScan);
-
-/// The rows from under the launch card through Claude Code's startup announcement's last row as
-/// a read under the card left them, and the announcement among them
-/// ([`aterm_phase::announcement_scrolled`]).
-#[derive(Debug)]
-struct KeptSlot {
-    rows: Box<[String]>,
-    place: aterm_phase::AnnouncementPlace,
 }
 
 /// The row revisions of the scratch a pane's rows were read from ([`StampLane`]).
@@ -755,8 +732,6 @@ impl PaneTextCache {
             drift,
             card,
             card_before,
-            notice,
-            slot,
             stamps,
             rule_run,
             panel_before,
@@ -838,16 +813,6 @@ impl PaneTextCache {
                         before.map(crate::claude_card::CardBefore::earlier),
                     ),
                 };
-                let notice = cached.notice.get().filter(|(_, scans)| {
-                    scans.is_some_and(|(scan, announcement)| {
-                        crate::reader_guard::read_or_none(session, "harness notice", &rows, || {
-                            aterm_phase::update_notice_unmoved(&rows, &scan, changed)
-                                && aterm_phase::announcement_unmoved(&rows, &announcement, changed)
-                        })
-                        .unwrap_or(false)
-                    })
-                });
-                let slot = cached.slot.into_inner();
                 let mut stamps = cached.stamps;
                 stamps.lane = lane;
                 stamps.revs.clear();
@@ -860,8 +825,6 @@ impl PaneTextCache {
                     drift,
                     card,
                     card_before,
-                    notice,
-                    slot,
                     stamps,
                     rule_run,
                     panel_before,
@@ -885,8 +848,6 @@ impl PaneTextCache {
                     readings,
                     None,
                     std::cell::OnceCell::new(),
-                    None,
-                    None,
                     None,
                     stamps,
                     None,
@@ -920,9 +881,6 @@ impl PaneTextCache {
             card_before: std::cell::Cell::new(card_before),
             panel: std::cell::OnceCell::new(),
             panel_before: std::cell::Cell::new(panel_before),
-            notice: std::cell::Cell::new(notice),
-            slot: std::cell::RefCell::new(slot),
-            slot_scrolled: std::cell::OnceCell::new(),
             stamps,
             kept_cells: std::cell::RefCell::new(kept_cells),
         });
@@ -1311,104 +1269,6 @@ impl PaneTextCache {
                 }
             })
             .clone()
-    }
-
-    /// Returns Claude Code's update notice and its startup announcement beneath the launch card
-    /// at `place` for `leaf_index`: the announcement read under the notice where one is placed.
-    /// Both are read together and kept together ([`aterm_phase::update_notice_unmoved`],
-    /// [`aterm_phase::announcement_unmoved`]).
-    pub(crate) fn harness_notices(
-        &self,
-        leaf_index: usize,
-        session: u64,
-        place: &aterm_phase::CardPlace,
-        cols: usize,
-    ) -> (
-        Option<aterm_phase::NoticePlace>,
-        Option<aterm_phase::AnnouncementPlace>,
-    ) {
-        let places = |scans: Option<NoticeScans>| {
-            scans.map_or((None, None), |(notice, announcement)| {
-                (notice.place, announcement.place)
-            })
-        };
-        let Some(cached) = self.panes.get(leaf_index).and_then(Option::as_ref) else {
-            return (None, None);
-        };
-        if cached.key.session != session {
-            return (None, None);
-        }
-        let from = place.top.saturating_add(place.rows);
-        if let Some((at, scans)) = cached.notice.get()
-            && at == from
-        {
-            return places(scans);
-        }
-        #[cfg(test)]
-        crate::work_counts::card_notice_read();
-        let scans =
-            crate::reader_guard::read_or_none(session, "harness notice", &cached.rows, || {
-                let notice = aterm_phase::update_notice_scan(&cached.rows, place, cols);
-                let announcement =
-                    aterm_phase::announcement_scan(&cached.rows, place, notice.place.as_ref());
-                (notice, announcement)
-            });
-        cached.notice.set(Some((from, scans)));
-        cached.keep_slot(from, scans.and_then(|(_, announcement)| announcement.place));
-        places(scans)
-    }
-
-    /// Returns the rows of Claude Code's startup announcement still on leaf `leaf_index`'s rows
-    /// once the launch card it was read under has scrolled off: while they open on the rows the
-    /// last read under the card ended with ([`aterm_phase::announcement_scrolled`]). The kept
-    /// rows go the first time they are not there, so a slot once gone stays the vendor's.
-    pub(crate) fn scrolled_announcement(
-        &self,
-        leaf_index: usize,
-        session: u64,
-    ) -> Option<aterm_phase::AnnouncementPlace> {
-        let cached = self.panes.get(leaf_index)?.as_ref()?;
-        if cached.key.session != session {
-            return None;
-        }
-        *cached.slot_scrolled.get_or_init(|| {
-            let mut slot = cached.slot.borrow_mut();
-            let kept = slot.as_ref()?;
-            let place =
-                crate::reader_guard::read_or_none(session, "harness notice", &cached.rows, || {
-                    aterm_phase::announcement_scrolled(&cached.rows, &kept.rows, &kept.place)
-                })
-                .flatten();
-            if place.is_none() {
-                *slot = None;
-            }
-            place
-        })
-    }
-}
-
-impl CachedPaneText {
-    /// Keep the rows from under the card (`from`) through the startup announcement at `place`,
-    /// the announcement counted from them ([`PaneTextCache::scrolled_announcement`]); none where
-    /// the read under the card placed none.
-    fn keep_slot(&self, from: usize, place: Option<aterm_phase::AnnouncementPlace>) {
-        let mut slot = self.slot.borrow_mut();
-        let kept = place.and_then(|place| {
-            let top = place.top.checked_sub(from)?;
-            let rows = self.rows.get(from..place.top + place.span())?;
-            let place = aterm_phase::AnnouncementPlace {
-                top,
-                hidden: place.hidden.map(|at| at - from),
-                ..place
-            };
-            Some((rows, place))
-        });
-        if slot.as_ref().map(|was| (&*was.rows, was.place)) != kept {
-            *slot = kept.map(|(rows, place)| KeptSlot {
-                rows: rows.into(),
-                place,
-            });
-        }
     }
 }
 
@@ -2893,7 +2753,8 @@ struct Asks {
 /// What a read asks of the usage tap ([`Asks::tap`]).
 #[derive(Clone, Copy)]
 struct TapAsks {
-    /// The window's seat ([`TapSeat`]), asked at each read whose profile passed its gate.
+    /// The window's seat ([`TapSeat`]), asked at each read whose profile passed its gate, and
+    /// at each read of a process that carries the tap, for its effort ([`own_tap_effort`]).
     seat: fn() -> TapSeat,
     /// Whether the settings chain a relaunch line of the process's argv in its directory reads
     /// admits the tap (`upgrade_drive::tap_settings_admit`), asked once per image beside
@@ -3021,6 +2882,11 @@ fn resolve_and_post(
         .claude_footer_shown()
         .and_then(|facts| facts.version);
     crate::claude_facts::note_catalog(version.as_deref(), std::time::Instant::now());
+    // The default permission mode of this agent's settings, which the permission chip's click
+    // and box read, is read here too, off the main thread.
+    if let Ok(pid) = u32::try_from(pgid) {
+        crate::permission_click::note_default(pid, std::time::Instant::now());
+    }
     if identity.dir.is_some() {
         known.insert(session, identity);
     }
@@ -3526,6 +3392,15 @@ fn resolve_facts_at_with_cwd(
     } else {
         None
     };
+    // What Claude Code says its session's effort is, now, outranks what the transcript says the
+    // turn's requests were sent with ([`own_tap_effort`]): the footer names the effort the
+    // session is set to, as Claude Code's own `/effort` does.
+    if let (Some(facts), Some(args)) = (facts.as_mut(), args.as_ref())
+        && let Some(level) = own_tap_effort(identity, args, asks, clock.now)
+    {
+        facts.effort = Some(level);
+        (facts.effort_open, facts.effort_for) = (false, None);
+    }
     // Observation beats belief (`docs/DESIGN-account-discovery-2026-11-09.md`): the login file
     // this process reads names its account, read afresh on every pass.
     let seen = match (args.as_ref(), identity.login.as_ref()) {
@@ -3872,6 +3747,42 @@ fn own_tap_reading(identity: &Identity, tab: &str, dir: &std::path::Path) -> Opt
     let pid = u32::try_from(identity.pid).ok()?;
     let started = i64::try_from(identity.started?).ok()?;
     tap::Reading::read(dir, tab, pid, started).map(|(reading, _)| reading)
+}
+
+/// THE EFFORT CLAUDE CODE SAYS THIS PROCESS'S SESSION IS SET TO, from its own usage tap: the
+/// `effort.level` of the status-line payload its tap last recorded ([`tap::Reading::effort`]),
+/// named as the footer names levels ([`footer::effort_level`]; a level a later build adds, as
+/// Claude Code spells it). Claude Code runs the tap with the level its own `/effort` shows at
+/// that moment: when that level changes (2.1.322 re-runs its status line 300 ms after one) and
+/// every [`tap::TAP_REFRESH_S`] seconds besides, so it follows a switch typed while a turn
+/// runs; the transcript names the effort that turn's requests are sent with, and records the
+/// switch only once the turn's reply lands.
+///
+/// Read for a process whose own line carries aterm's tap ([`tap::carried_by`]) in the tab its
+/// exec environment `args` names, from the file that tab and pid name, written since the
+/// process started ([`tap::Reading::read`]), and only while that file is heard
+/// ([`tap::SILENT_S`] of `now`, the bound [`tap::Silence`] judges a tap by). `None` otherwise
+/// (no tap, no reading yet, a tap gone silent, a build or model that names no effort), and the
+/// transcript's effort stands: never a level nothing reported.
+fn own_tap_effort(
+    identity: &Identity,
+    args: &atpkg::caller_shell::ProcArgs,
+    asks: Asks,
+    now: i64,
+) -> Option<String> {
+    if !tap::carried_by(&identity.argv) {
+        return None;
+    }
+    let tab = env_value(&args.env, aterm_types::domain::ENV_PARENT_SESSION_ID)?;
+    let dir = (asks.tap.seat)().dir?;
+    let pid = u32::try_from(identity.pid).ok()?;
+    let started = i64::try_from(identity.started?).ok()?;
+    let (reading, written) = tap::Reading::read(&dir, &tab, pid, started)?;
+    if now.saturating_sub(written) > tap::SILENT_S {
+        return None;
+    }
+    let level = reading.effort?;
+    Some(footer::effort_level(&level).map_or(level, str::to_owned))
 }
 
 /// This process's own usage-tap figure: the week of its tap's `reading` ([`own_tap_reading`]),
@@ -5273,7 +5184,7 @@ impl App {
                     term_row: key.term_row,
                     cols: laid.cols,
                     ink: laid.ink,
-                    label: laid.label.as_ref().map(|(cols, _)| cols.clone()),
+                    mark: laid.label.as_ref().map(|(cols, _)| cols.clone()),
                     arrow: laid.arrow.clone(),
                     session,
                     face: paint.face,
@@ -6220,10 +6131,10 @@ impl App {
         }
         self.compose_claude_cards(wid, cards);
         self.compose_claude_panels(wid, &mut lists.panels);
-        let lines = self.windows.get(&wid).is_some_and(|ws| {
-            ws.claude_card.lines().next().is_some()
-                || ws.claude_card.banner_edits().next().is_some()
-        });
+        let lines = self
+            .windows
+            .get(&wid)
+            .is_some_and(|ws| ws.claude_card.lines().next().is_some());
         if lists.panes.is_empty()
             && !lines
             && lists.agy_edits.is_empty()
@@ -6374,10 +6285,7 @@ impl App {
                 ..
             } = &mut **ws;
             let texts = claude_footer_texts.borrow();
-            let card_edits = claude_card
-                .lines()
-                .map(crate::claude_card::CardLine::edit)
-                .chain(claude_card.banner_edits());
+            let card_edits = claude_card.lines().map(crate::claude_card::CardLine::edit);
             let rules = lists.rules.iter().flat_map(|r| {
                 rule_edits(
                     r.frame_row,
@@ -7729,7 +7637,7 @@ pub(crate) struct SwitchPaint {
     pub(crate) face: crate::autopilot::HarnessSwitch,
     /// What the pointer or the keyboard is on.
     pub(crate) hover: HoverAt,
-    /// The harness ([`aterm_phase::CliHarness`]): its version names the label (`alab v0.13`);
+    /// The harness ([`aterm_phase::CliHarness`]): its version is in the label (`ALab v0.13`);
     /// `None` draws the switch with no label.
     pub(crate) harness: Option<aterm_phase::CliHarness>,
     /// The running CLI's version as its build states it ([`TopCli::ver`]): the label shows its
@@ -7919,23 +7827,23 @@ fn switch_face(paint: SwitchPaint) -> SwitchFace {
 enum LabelInk {
     /// A blank.
     Pad,
-    /// `alab`: the arc's end, bold.
+    /// The mark, `ALab`: the hero's ramp, bold.
     Brand,
-    /// The quiet words: `(v2.1.305)`.
+    /// The quiet words, fine print: the harness's version `v0.5` and the CLI's `(v2.1.305)`.
     Muted,
-    /// The harness's version, `v0.5`, and the build the ⬆️'s move goes to in its words: a
-    /// version, lit and bold.
+    /// The build the ⬆️'s move goes to in its words: a version, lit and bold.
     Lit,
 }
 
 /// The cells a label, or the words in its slot, may take: the widest label
-/// (`alab v0.5 (v<build>)`) or the widest build its hover shows alone (`claude v<build>`).
+/// (`ALab v0.5 (v<build>)`) or the widest build its hover shows alone (`claude v<build>`).
 const LABEL_MAX: usize = {
     let mut widest = 0;
     let mut i = 0;
     while i < aterm_phase::CliHarness::ALL.len() {
         let harness = aterm_phase::CliHarness::ALL[i];
-        let label = "alab v".len()
+        let label = aterm_types::identity::COMPANY.len()
+            + " v".len()
             + harness.version_str().len()
             + " (v".len()
             + CLI_VERSION_MAX
@@ -7950,13 +7858,23 @@ const LABEL_MAX: usize = {
     widest
 };
 
-/// How many forms a label has, widest first ([`label_face`]): `alab v0.5 (v2.1.305)`, then
-/// `alab v0.5`. The CLI is never named in it: the lockup at the rule's other end names it.
-const LABEL_TIERS: usize = 2;
+/// How many forms a label has, widest first ([`label_face`]): `ALab v0.5 (v2.1.305)`, then
+/// `ALab v0.5`, then the mark alone, `ALab`. The CLI is never named in it: the lockup at the
+/// rule's other end names it.
+const LABEL_TIERS: usize = 3;
 
-/// Whether the label laid at `tier` shows the running CLI's build (`(v2.1.305)`): every tier but
-/// the last ([`label_face`]).
+/// How many of the label's tiers show the running CLI's build: the widest alone.
+const LABEL_CLI_TIERS: usize = 1;
+
+/// Whether the label laid at `tier` shows the running CLI's build (`(v2.1.305)`): the widest
+/// tier alone ([`label_face`]).
 const fn label_says_cli(tier: usize) -> bool {
+    tier < LABEL_CLI_TIERS
+}
+
+/// Whether the label laid at `tier` shows the harness's version (`v0.5`): every tier but the
+/// last, which is the mark alone ([`label_face`]).
+const fn label_says_version(tier: usize) -> bool {
     tier + 1 < LABEL_TIERS
 }
 
@@ -8027,8 +7945,9 @@ impl LabelFace {
     }
 }
 
-/// The harness label at `tier` (`alab v0.5 (v2.1.305)`, then `alab v0.5`), `None` past its
-/// narrowest, where a tier says no more than the next, or for a paint with no harness. The
+/// The harness label at `tier` (`ALab v0.5 (v2.1.305)`, then `ALab v0.5`, then `ALab`), `None`
+/// past its narrowest, where a tier says no more than the next, or for a paint with no harness.
+/// The mark is the label's one bold word, in the hero's ramp; both versions are fine print. The
 /// running CLI's version is left out where it is not known: never `(v?)`. An asked move keeps
 /// it: the label never grows under the press.
 fn label_face(paint: &SwitchPaint, tier: usize) -> Option<LabelFace> {
@@ -8038,10 +7957,11 @@ fn label_face(paint: &SwitchPaint, tier: usize) -> Option<LabelFace> {
         return None;
     }
     let mut f = LabelFace::EMPTY;
-    f.push("alab", LabelInk::Brand);
-    f.push(" ", LabelInk::Pad);
-    f.push("v", LabelInk::Lit);
-    f.push(harness.version_str(), LabelInk::Lit);
+    f.push(aterm_types::identity::COMPANY, LabelInk::Brand);
+    if label_says_version(tier) {
+        f.push(" v", LabelInk::Muted);
+        f.push(harness.version_str(), LabelInk::Muted);
+    }
     if let Some(from) = cli.filter(|_| label_says_cli(tier)) {
         f.push(" (v", LabelInk::Muted);
         f.push(from, LabelInk::Muted);
@@ -8051,9 +7971,9 @@ fn label_face(paint: &SwitchPaint, tier: usize) -> Option<LabelFace> {
 }
 
 /// The label's forms with the CLI's whole build, in the label's own inks, as its hover shows
-/// them on a label laid at `tier`: `alab v0.5 (v1.4.13-R6996.1)`. A label laid without the CLI's
-/// build (the last tier, `alab v0.5`) shows the build alone instead, `claude v2.1.305` then
-/// `v2.1.305`, since the label with the build is the form the tier before would have laid had it
+/// them on a label laid at `tier`: `ALab v0.5 (v1.4.13-R6996.1)`. A label laid without the CLI's
+/// build (`ALab v0.5`, or the mark alone) shows the build alone instead, `claude v2.1.305` then
+/// `v2.1.305`, since the label with the build is the form the widest tier would have laid had it
 /// fitted. `None` where the label shows the build's numbers and the build says no more than them
 /// (`2.1.305`), or where the build is not known.
 fn label_whole(paint: &SwitchPaint, tier: usize) -> Option<Vec<Vec<(String, LabelInk)>>> {
@@ -8061,7 +7981,7 @@ fn label_whole(paint: &SwitchPaint, tier: usize) -> Option<Vec<Vec<(String, Labe
     let raw = paint.cli_ver.as_str().trim();
     let raw = raw.strip_prefix('v').unwrap_or(raw);
     let core = paint.cli_core()?;
-    if tier + 1 >= LABEL_TIERS {
+    if !label_says_cli(tier) {
         return Some(vec![
             vec![(format!("{} v{raw}", harness.cli()), LabelInk::Muted)],
             vec![(format!("v{raw}"), LabelInk::Muted)],
@@ -8069,9 +7989,8 @@ fn label_whole(paint: &SwitchPaint, tier: usize) -> Option<Vec<Vec<(String, Labe
     }
     (raw != core).then(|| {
         vec![vec![
-            ("alab".to_owned(), LabelInk::Brand),
-            (" ".to_owned(), LabelInk::Muted),
-            (format!("v{}", harness.version_str()), LabelInk::Lit),
+            (aterm_types::identity::COMPANY.to_owned(), LabelInk::Brand),
+            (format!(" v{}", harness.version_str()), LabelInk::Muted),
             (format!(" (v{raw})"), LabelInk::Muted),
         ]]
     })
@@ -8238,7 +8157,7 @@ fn up_forms(up: &TopUp, jobs: &str, press: Option<&'static str>) -> Option<SlotW
         forms.extend(bare.map(|bare| marked(vec![target.clone(), bare])));
     }
     // Every form that says when the move lands says what it must: the label's own cells are a
-    // short version (`alab v0.5 (v2.1.305)`), so a form with the when grows left into the
+    // short version (`ALab v0.5 (v2.1.305)`), so a form with the when grows left into the
     // rule's room before a form without it takes them.
     let whole = if forms.len() > 1 { forms.len() } else { 0 };
     let terse = (up.state == UpState::Held)
@@ -8342,7 +8261,7 @@ struct FaceInks {
     lit: [u8; 3],
     /// The switch at rest, the label's quiet words, and a held move's `↑`.
     muted: [u8; 3],
-    /// `alab`'s letters ([`Self::brand`]).
+    /// The mark's letters ([`Self::brand`]).
     glass: GlassInks,
 }
 
@@ -8356,7 +8275,7 @@ impl FaceInks {
         }
     }
 
-    /// `alab`'s letter at `k` across it (`0.0..=1.0`): the launch card's settled hero
+    /// The mark's letter at `k` across it (`0.0..=1.0`): the launch card's settled hero
     /// ([`GlassInks::hero`]); with the harness off the pane wears no palette, so the lit ink.
     fn brand(&self, k: f32) -> [u8; 3] {
         rgb_of(self.glass.hero(k))
@@ -8617,7 +8536,7 @@ fn ladder(
     // the running build stays beside the offer of the next one. With no build to keep, the name
     // stays as long as the label does.
     let named_tiers = if arrow > 0 && lockup.is_some() && paint.cli_core().is_some() {
-        LABEL_TIERS - 1
+        LABEL_CLI_TIERS
     } else {
         LABEL_TIERS
     };
@@ -9125,6 +9044,13 @@ fn compose_top(key: &TopKey, top: &mut ComposedTop, goal: Option<&str>, tail_cel
                 .filter(|(_, ink)| *ink == LabelInk::Brand)
                 .count();
             let mut nth = 0usize;
+            let lit = if paint.hover == HoverAt::Label && paint.refused.is_empty() {
+                let first = laid.iter().position(|(_, ink)| *ink != LabelInk::Pad);
+                let last = laid.iter().rposition(|(_, ink)| *ink != LabelInk::Pad);
+                first.zip(last).map_or(0..0, |(a, b)| a..b + 1)
+            } else {
+                0..0
+            };
             for (k, &(ch, ink)) in laid.iter().enumerate() {
                 let along = if brand > 1 {
                     nth as f32 / (brand - 1) as f32
@@ -9132,7 +9058,24 @@ fn compose_top(key: &TopKey, top: &mut ComposedTop, goal: Option<&str>, tail_cel
                     0.0
                 };
                 nth += usize::from(ink == LabelInk::Brand);
-                cells[at.start + k - lo] = label_cell(ch, ink, along, &inks, blank);
+                let cell = label_cell(ch, ink, along, &inks, blank);
+                cells[at.start + k - lo] = if lit.contains(&k) {
+                    // The mark is a click target, so under the pointer its inked cells wear
+                    // the glass's one hover (§1.5); the brand's letters keep the hero's ramp
+                    // over the underline, as a warning keeps its ink.
+                    let over =
+                        crate::claude_lights::hovered_cell(&inks.glass, cell, HoverPart::Text);
+                    if ink == LabelInk::Brand {
+                        RenderCell {
+                            fg: cell.fg,
+                            ..over
+                        }
+                    } else {
+                        over
+                    }
+                } else {
+                    cell
+                };
             }
         }
         if let (Some(at), Some(up)) = (&arrow_at, up) {
@@ -9530,13 +9473,13 @@ fn mark_layer(
 }
 
 /// Returns the accessibility label of border switch `b`: the label's widest words as the glass
-/// draws them (`alab v0.5 (v2.1.305)`, at every width, so every tier's visible words are in it)
+/// draws them (`ALab v0.5 (v2.1.305)`, at every width, so every tier's visible words are in it)
 /// where one is laid, then the switch's state.
 #[cfg(a11y_tree)]
 pub(crate) fn switch_words(b: &crate::claude_lights::BorderSwitch) -> String {
     let state = switch_face(b.paint).words();
     let lead = b
-        .label
+        .mark
         .as_ref()
         .and_then(|_| (0..LABEL_TIERS).find_map(|tier| label_face(&b.paint, tier)))
         .map(|face| face.text());

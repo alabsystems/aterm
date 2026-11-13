@@ -2,11 +2,20 @@
 // Copyright 2026 Andrew Yates
 //! Memory-only GUI facts for updater control requests and staged installed-bundle activation.
 
+use crate::app_update_handoff_boundary::GuardedItem;
 use crate::native_update_auto_intent::ApplyPhase;
+use crate::native_update_lane_hold::LaneHold;
 use crate::native_updater_service::{StagedUpdate, UpdaterPhase};
 use crate::update_words::ApplyPosture;
 use crate::{App, Wake};
 use aterm_types::MutexExt as _;
+
+#[derive(Clone, Copy, Debug)]
+struct HoldSnapshot {
+    hold: LaneHold,
+    elapsed_ms: u64,
+    boundary_item: Option<GuardedItem>,
+}
 
 pub(crate) struct Snapshot {
     /// Live automatic-checking preference, independent of platform support and install policy.
@@ -22,9 +31,8 @@ pub(crate) struct Snapshot {
     /// The restored agents' hold is holding the automatic lane
     /// (`HostHandle::restored_pending`).
     restored_hold: bool,
-    /// The hold the lane named for the staged build past its ladder
-    /// (`App::auto_apply_hold_token`).
-    lane_hold: Option<&'static str>,
+    /// The hold named for this exact staged artifact, observed with its age and boundary item.
+    lane_hold: Option<HoldSnapshot>,
     /// The accepted apply is waiting for its account-work epoch to retire.
     account_work_hold: bool,
     applying: bool,
@@ -38,8 +46,33 @@ impl Snapshot {
 
     /// [`Self::capture`] under the posture inputs `env` (the live ones, or a test's).
     pub(crate) fn capture_with(app: &App, env: crate::app_update_screen::ApplyPostureEnv) -> Self {
+        Self::capture_at(
+            app,
+            env,
+            std::time::Instant::now(),
+            crate::app_update_handoff_boundary::any_held(),
+        )
+    }
+
+    fn capture_at(
+        app: &App,
+        env: crate::app_update_screen::ApplyPostureEnv,
+        now: std::time::Instant,
+        boundary_item: Option<GuardedItem>,
+    ) -> Self {
         let updater = app.native_updater_service.snapshot();
-        let now = std::time::Instant::now();
+        let lane_hold = updater.staged.as_ref().and_then(|stage| {
+            let digest = crate::app_native::decode_dmg_sha256(&stage.dmg_sha256)?;
+            let held = app.auto_apply_hold(stage.build, digest)?;
+            Some(HoldSnapshot {
+                hold: held.hold,
+                elapsed_ms: u64::try_from(now.saturating_duration_since(held.since).as_millis())
+                    .unwrap_or(u64::MAX),
+                boundary_item: (held.hold == LaneHold::BoundaryItem)
+                    .then_some(boundary_item)
+                    .flatten(),
+            })
+        });
         Self {
             enabled: app
                 .config
@@ -68,10 +101,7 @@ impl Snapshot {
                 .harness
                 .as_ref()
                 .is_some_and(|host| host.restored_pending(now)),
-            lane_hold: updater
-                .staged
-                .as_ref()
-                .and_then(|s| app.auto_apply_hold_token(s.build)),
+            lane_hold,
             account_work_hold: app.account_drain_pending(),
             applying: updater.phase == UpdaterPhase::Applying,
             retry_scheduled: updater
@@ -104,9 +134,35 @@ impl Snapshot {
             "automatic" | "automatic-idle" if self.restored_hold => {
                 Some(crate::native_update_lane_hold::LaneHold::RestoredAgents.token())
             }
-            "automatic" | "automatic-idle" => self.lane_hold,
+            "automatic" | "automatic-idle" => self.lane_hold.map(|held| held.hold.token()),
             _ => None,
         }
+    }
+
+    /// On-demand wire fields from this same artifact and hold observation. A higher-priority
+    /// restored-agent or account-work hold has no age or boundary evidence in this snapshot.
+    pub(crate) fn apply_hold_fields(&self, status: &aterm_update::UpdateStatus) -> String {
+        use std::fmt::Write as _;
+        let Some(token) = self.apply_held(status) else {
+            return String::new();
+        };
+        let mut fields = format!(" apply_held={token}");
+        if !self.restored_hold
+            && matches!(self.apply_posture(status), "automatic" | "automatic-idle")
+            && let Some(held) = self.lane_hold
+        {
+            let _ = write!(fields, " apply_held_ms={}", held.elapsed_ms);
+            if let Some(item) = held.boundary_item {
+                let item = match item {
+                    GuardedItem::SignOutSequence => "sign-out-sequence",
+                    GuardedItem::ClonePublishRename => "clone-publish-rename",
+                    GuardedItem::LaunchdBootstrap => "launchd-bootstrap",
+                    GuardedItem::HarnessNativeMutation => "harness-native-mutation",
+                };
+                let _ = write!(fields, " apply_boundary_item={item}");
+            }
+        }
+        fields
     }
 
     /// The ledger and the GUI can observe different generations.

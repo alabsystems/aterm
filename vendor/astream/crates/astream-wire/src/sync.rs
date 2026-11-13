@@ -253,6 +253,80 @@ impl Index {
         }
     }
 
+    /// Check admission of a verified header without changing this index.
+    ///
+    /// `false` is an identical duplicate. This reserves no capacity: a later insertion
+    /// checks the then-current state again.
+    ///
+    /// # Errors
+    /// [`Refusal`] names malformed headers, digest collisions and exhausted capacity.
+    pub fn check_insert(&self, header: &Header) -> Result<bool, Refusal> {
+        if !header.is_shaped() {
+            return Err(Refusal::Shape);
+        }
+        Self::admit_shaped(
+            header,
+            self.records.get(&header.id),
+            self.records.len(),
+            self.capacity,
+        )
+    }
+
+    /// Check a sequence of verified headers against this index and earlier headers
+    /// in the sequence, without cloning retained history or reserving capacity.
+    /// Returns the number of distinct new headers. Duplicate identities are compared
+    /// with both retained and proposed headers, and consume no additional capacity.
+    /// Scratch space is proportional to distinct new headers, bounded by capacity.
+    /// Authentication and application policy remain the caller's obligations.
+    ///
+    /// # Errors
+    /// The first [`Refusal`] sequential insertion would produce; the index is unchanged
+    /// even when an earlier header would have been admitted. Actual insertion must
+    /// still check the then-current state.
+    pub fn check_insert_many<'h>(
+        &self,
+        headers: impl IntoIterator<Item = &'h Header>,
+    ) -> Result<usize, Refusal> {
+        let mut proposed = BTreeMap::<Digest, &Header>::new();
+        for header in headers {
+            if !header.is_shaped() {
+                return Err(Refusal::Shape);
+            }
+            let old = proposed
+                .get(&header.id)
+                .copied()
+                .or_else(|| self.records.get(&header.id));
+            if Self::admit_shaped(
+                header,
+                old,
+                self.records.len().saturating_add(proposed.len()),
+                self.capacity,
+            )? {
+                proposed.insert(header.id, header);
+            }
+        }
+        Ok(proposed.len())
+    }
+
+    fn admit_shaped(
+        header: &Header,
+        old: Option<&Header>,
+        retained: usize,
+        capacity: usize,
+    ) -> Result<bool, Refusal> {
+        if let Some(old) = old {
+            return if old == header {
+                Ok(false)
+            } else {
+                Err(Refusal::DigestCollision)
+            };
+        }
+        if !sync_within_capacity(retained as u64, capacity as u64) {
+            return Err(Refusal::Capacity);
+        }
+        Ok(true)
+    }
+
     /// Insert a verified header. `false` is an identical duplicate.
     ///
     /// # Errors
@@ -264,20 +338,17 @@ impl Index {
         // One search of `records`. The entry holds the map, so the retained count is read
         // first; a vacant entry left unfilled changes nothing.
         let retained = self.records.len();
+        let capacity = self.capacity;
         match self.records.entry(header.id) {
             Entry::Occupied(old) => {
-                if old.get() == &header {
-                    Ok(false)
-                } else {
-                    Err(Refusal::DigestCollision)
-                }
+                Self::admit_shaped(&header, Some(old.get()), retained, capacity)
             }
             Entry::Vacant(slot) => {
-                if !sync_within_capacity(retained as u64, self.capacity as u64) {
-                    return Err(Refusal::Capacity);
+                let accepted = Self::admit_shaped(&header, None, retained, capacity)?;
+                if accepted {
+                    slot.insert(header);
                 }
-                slot.insert(header);
-                Ok(true)
+                Ok(accepted)
             }
         }
     }
@@ -506,6 +577,10 @@ fn forks_by_actor(headers: &mut [&Header]) -> BTreeMap<Actor, Fork> {
     }
     out
 }
+
+#[cfg(test)]
+#[path = "sync_batch_tests.rs"]
+mod batch_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1073,6 +1148,23 @@ mod tests {
     }
 
     #[test]
+    fn admission_queries_leave_room_unreserved_and_recheck_changed_state() {
+        let mut index = Index::new(1);
+        let first = header(1, 1, 1, None, &[]);
+        let other = header(2, 2, 1, None, &[]);
+        for _ in 0..2 {
+            assert_eq!(index.check_insert(&first), Ok(true));
+            assert_eq!(index.inventory().count(), 0);
+        }
+        assert_eq!(index.insert(other.clone()), Ok(true));
+        assert_eq!(index.check_insert(&first), Err(Refusal::Capacity));
+        assert_eq!(index.insert(first), Err(Refusal::Capacity));
+        assert_eq!(index.check_insert(&other), Ok(false));
+        assert_eq!(index.inventory().count(), 1);
+        assert_eq!(index.get(&other.id), Some(&other));
+    }
+
+    #[test]
     fn a_refusal_leaves_the_whole_index_unchanged() {
         let mut index = Index::new(3);
         for h in [
@@ -1093,6 +1185,8 @@ mod tests {
         let before = state(&index);
         assert!(!before.1.is_empty() && !before.2.pending.is_empty());
         for (refused, why) in refused_headers() {
+            assert_eq!(index.check_insert(&refused), Err(why));
+            assert_eq!(state(&index), before, "{why:?} changed the queried index");
             assert_eq!(index.insert(refused), Err(why));
             assert_eq!(state(&index), before, "{why:?} changed the index");
         }

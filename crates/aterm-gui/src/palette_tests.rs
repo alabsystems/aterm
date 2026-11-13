@@ -3,6 +3,15 @@
 
 use super::*;
 
+/// Where a list overlay card's border is among its prims: its first stroke, drawn over the
+/// card's shadow and ground ([`overlay_card_frame`]).
+fn card_border(prims: &[DrawPrim]) -> usize {
+    prims
+        .iter()
+        .position(|p| matches!(p, DrawPrim::Stroke { .. }))
+        .expect("the card's border")
+}
+
 /// At 2 device pixels per point the palette is the 1x palette at twice the pixels: its
 /// corner radius cap, shadow offsets, border, row insets and selection ring are points.
 /// The query field alone keeps its device-pixel inset and line, so at 2x its box clears its
@@ -27,17 +36,18 @@ fn the_palette_wears_its_corners_shadow_and_ring_in_points() {
         }
         let mut one = palette_tray_in(&state, &at(1.0), theme(), false).prims;
         let mut two = palette_tray_in(&state, &at(2.0), theme(), false).prims;
-        let DrawPrim::Stroke { radius, .. } = one[3] else {
-            panic!("the card's border: {:?}", one[3]);
+        let border = card_border(&one);
+        let DrawPrim::Stroke { radius, .. } = one[border] else {
+            unreachable!()
         };
         assert_eq!(radius, 14.0, "the 1x radius is at its cap");
         // The query field is the first stroke after the title, on the card's second row.
         let query = |prims: &[DrawPrim]| {
             prims
                 .iter()
-                .skip(4)
+                .skip(border + 1)
                 .position(|p| matches!(p, DrawPrim::Stroke { .. }))
-                .map(|i| i + 4)
+                .map(|i| i + border + 1)
                 .expect("the query field")
         };
         let (q1, q2) = (query(&one), query(&two));
@@ -84,8 +94,8 @@ fn a_fluent_palette_wears_its_filter_box_pill_and_thumb_in_points() {
         }
         let draw = |k: f32| palette_tray_in(&state, &at(k), theme(), true).prims;
         let (mut one, mut two) = (draw(1.0), draw(2.0));
-        let DrawPrim::Stroke { radius, .. } = one[3] else {
-            panic!("the card's border: {:?}", one[3]);
+        let DrawPrim::Stroke { radius, .. } = one[card_border(&one)] else {
+            unreachable!()
         };
         assert_eq!(radius, 14.0, "the 1x radius is at its cap");
         let bars = |prims: &[DrawPrim], k: f32| {

@@ -1441,8 +1441,11 @@ fn flood_lights(presses: &[usize], rest_ms: u64, railed: bool) -> Vec<usize> {
 /// would is the first to differ, it keeps to the bound, and once the flood and the whole words' hold
 /// end a frame's lights match the railed lay again. The hold runs `WHOLE_WORDS_HOLD` from a
 /// refused try and no try is made while it holds, so it can end up to a hold past the last frame
-/// over the bound: the screen rests that long and two frames more. NEGATIVE CONTROL: the same
-/// screen typed by a typist, a key a frame, never comes near the bound.
+/// over the bound: the screen rests that long and two frames more, counted from that frame. The
+/// band behind each fresh row and the line under it keep a frame's lights over the bound past the
+/// flood's last key (on the glass, the frame 62 of 78 where a rest counted from the last key ended
+/// the film 15 frames on), so a railed film rested two holds finds that frame and is cut there.
+/// NEGATIVE CONTROL: the same screen typed by a typist, a key a frame, never comes near the bound.
 #[cfg(target_os = "macos")]
 #[test]
 fn flood_runs_the_word_yield_past_max_quads_and_it_takes_whole_words() {
@@ -1452,9 +1455,8 @@ fn flood_runs_the_word_yield_past_max_quads_and_it_takes_whole_words() {
     let (columns, _, _) = Scenario::Flood.grid();
     let presses = flood_frames(columns as usize, FLOOD_KEYS);
     let hold_ms = u64::try_from(WHOLE_WORDS_HOLD.as_millis()).expect("a hold of milliseconds");
-    let rest_ms = hold_ms + 2 * BURST_KEY_MS;
-    let railed = flood_lights(&presses, rest_ms, true);
-    let shipped = flood_lights(&presses, rest_ms, false);
+    // A film's frames do not depend on its rest: a longer one only adds frames after them.
+    let mut railed = flood_lights(&presses, 2 * hold_ms, true);
     let over: Vec<usize> = (0..railed.len())
         .filter(|&f| railed[f] > CursorGlow::MAX_QUADS)
         .collect();
@@ -1464,6 +1466,17 @@ fn flood_runs_the_word_yield_past_max_quads_and_it_takes_whole_words() {
         "the flood runs past the budget, at {over:?}, lights up to {}",
         railed.iter().max().unwrap()
     );
+    let frames = (last + 1 + (hold_ms / BURST_KEY_MS) as usize + 2).max(presses.len() + 2);
+    assert!(
+        frames <= railed.len(),
+        "the flood's lights fall under the bound a hold before two holds' rest ends: the last \
+         over it is {last} of {}",
+        railed.len()
+    );
+    railed.truncate(frames);
+    let rest_ms = (frames - presses.len()) as u64 * BURST_KEY_MS;
+    let shipped = flood_lights(&presses, rest_ms, false);
+    assert_eq!(shipped.len(), railed.len(), "the two films are one length");
     assert_eq!(railed[..first], shipped[..first], "railed until it passes");
     assert!(
         shipped.iter().all(|&l| l <= CursorGlow::MAX_QUADS),
@@ -1471,11 +1484,6 @@ fn flood_runs_the_word_yield_past_max_quads_and_it_takes_whole_words() {
     );
     assert!(shipped[first] < railed[first], "the first frame past it");
     assert!(last + 1 < railed.len(), "the ribbon outlasts the flood");
-    assert!(
-        (railed.len() - 1 - last) as u64 * BURST_KEY_MS >= hold_ms,
-        "the screen rests a hold past the last frame over the bound, {last} of {}",
-        railed.len()
-    );
     assert_ne!(railed.last(), Some(&0), "the ribbon outlasts the flood");
     assert_eq!(railed.last(), shipped.last(), "past the hold, the rail");
     let typist = flood_lights(&vec![1; 60], 0, true);

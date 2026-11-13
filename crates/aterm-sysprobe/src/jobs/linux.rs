@@ -364,19 +364,61 @@ fn ticks_ns(ticks: u64, hz: u64) -> u64 {
     u64::try_from(u128::from(ticks) * 1_000_000_000 / u128::from(hz.max(1))).unwrap_or(u64::MAX)
 }
 
-fn threads(dir: &Path, hz: u64) -> Option<(Vec<ThreadReading>, bool)> {
+/// At most this many threads' waits are summed per process
+/// ([`threads_wait_ns`]); past it the sum is the first ones', a lower bound.
+pub const MAX_WAIT_THREADS: usize = 4096;
+
+/// Every live thread's wait for a core, ns: the sum of each
+/// `task/<tid>/schedstat`'s second field (`run_delay`). The process's own
+/// `schedstat` is its group leader's alone: in the Linux lane's guest a
+/// process of four spinning threads read 16.7 ms on a core there against
+/// 3.0 s in its `stat`. A thread gone between the listing and its read is
+/// skipped; `None` where no thread's is read (no `task` directory, or a
+/// kernel without `CONFIG_SCHED_INFO`).
+///
+/// A process's runnable time is then its CPU time (`stat`, every thread's,
+/// living or ended) plus this, so runnable less CPU is exactly the live
+/// threads' wait; an ended thread's wait leaves the sum with it. [`read`]
+/// sums it in its one pass over `task/`, beside the threads' readings.
+#[must_use]
+pub fn threads_wait_ns(dir: &Path) -> Option<u64> {
+    wait_sum(&dir.join("task"), &task_ids(dir)?)
+}
+
+/// The thread ids in `dir`'s `task/`, ascending: the one listing [`read`]
+/// takes of them. `None` without a `task` directory.
+fn task_ids(dir: &Path) -> Option<Vec<u64>> {
     let mut tids: Vec<u64> = std::fs::read_dir(dir.join("task"))
         .ok()?
         .flatten()
         .filter_map(|e| crate::parse_uint(e.file_name().to_str()?))
         .collect();
     tids.sort_unstable();
-    let truncated = tids.len() > MAX_THREADS;
-    tids.truncate(MAX_THREADS);
+    Some(tids)
+}
+
+/// The waits of the first [`MAX_WAIT_THREADS`] of `tids` under `task`,
+/// summed ([`threads_wait_ns`]).
+fn wait_sum(task: &Path, tids: &[u64]) -> Option<u64> {
+    let mut sum = None::<u64>;
+    for tid in tids.iter().take(MAX_WAIT_THREADS) {
+        if let Some((_, wait)) = read_text(&task.join(tid.to_string()).join("schedstat"))
+            .and_then(|t| parse_schedstat(&t))
+        {
+            sum = Some(sum.unwrap_or(0).saturating_add(wait));
+        }
+    }
+    sum
+}
+
+/// The readings of the first [`MAX_THREADS`] of `tids` under `task`, and
+/// whether there were more.
+fn threads(task: &Path, tids: &[u64], hz: u64) -> (Vec<ThreadReading>, bool) {
     let out = tids
-        .into_iter()
-        .filter_map(|tid| {
-            let t = dir.join("task").join(tid.to_string());
+        .iter()
+        .take(MAX_THREADS)
+        .filter_map(|&tid| {
+            let t = task.join(tid.to_string());
             let stat = read_text(&t.join("stat")).and_then(|s| parse_stat(&s))?;
             Some(ThreadReading {
                 id: tid,
@@ -386,7 +428,111 @@ fn threads(dir: &Path, hz: u64) -> Option<(Vec<ThreadReading>, bool)> {
             })
         })
         .collect();
-    Some((out, truncated))
+    (out, tids.len() > MAX_THREADS)
+}
+
+/// What a descriptor's open file is, read through its `fd/<n>` link.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OpenFile {
+    /// A regular file: not a directory, a FIFO, a socket or a device.
+    regular: bool,
+    /// Its device, as `stat`'s `st_dev` spells it.
+    dev: u64,
+    /// Its inode.
+    ino: u64,
+}
+
+/// The open file behind `link` (a `/proc/<pid>/fd/<n>`), or `None` where
+/// it cannot be read (the process or descriptor is gone, or not ours); the
+/// caller then counts the descriptor a regular file, its offset the only
+/// growth there is to read.
+///
+/// A path link names directories and named FIFOs as well as files: a walker
+/// holds its directory open, a daemon reads a control FIFO. Neither is an
+/// output file, and a directory's offset on ext4 is a hash cookie that
+/// moves on every `getdents64`, which read as an appending writer's growth.
+///
+/// Linux asks `statx(STATX_TYPE | STATX_INO, AT_STATX_DONT_SYNC)` of the
+/// link itself, so the kernel follows it to the open file (no path is
+/// resolved again, a deleted file included) and asks no file server to
+/// revalidate: an NFS or FUSE file whose server hangs answers from the
+/// inode the kernel holds, never waits. Elsewhere (a fixture tree in a test)
+/// the link is followed by `std`.
+#[cfg(target_os = "linux")]
+fn open_file(link: &Path) -> Option<OpenFile> {
+    use std::os::unix::ffi::OsStrExt as _;
+    #[cfg(target_arch = "x86_64")]
+    const SYS_STATX: libc::c_long = 332;
+    #[cfg(target_arch = "aarch64")]
+    const SYS_STATX: libc::c_long = 291;
+    const AT_STATX_DONT_SYNC: libc::c_int = 0x4000;
+    const STATX_TYPE: u32 = 0x1;
+    const STATX_INO: u32 = 0x100;
+    const S_IFMT: u16 = 0o170_000;
+    const S_IFREG: u16 = 0o100_000;
+    /// `struct statx` (`<linux/stat.h>`), 256 bytes; only the fields read
+    /// are named.
+    #[repr(C)]
+    struct Statx {
+        mask: u32,
+        _blksize: u32,
+        _attributes: u64,
+        _nlink: u32,
+        _uid: u32,
+        _gid: u32,
+        mode: u16,
+        _spare0: u16,
+        ino: u64,
+        _rest: [u64; 11],
+        _rdev: [u32; 2],
+        dev_major: u32,
+        dev_minor: u32,
+        _spare2: [u64; 14],
+    }
+    const _: () = assert!(std::mem::size_of::<Statx>() == 256);
+    let path = std::ffi::CString::new(link.as_os_str().as_bytes()).ok()?;
+    let mut sx = std::mem::MaybeUninit::<Statx>::zeroed();
+    // SAFETY: a NUL-terminated path and a writable 256-byte `struct statx`;
+    // the syscall writes no more than its size.
+    let rc = unsafe {
+        libc::syscall(
+            SYS_STATX,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            AT_STATX_DONT_SYNC,
+            STATX_TYPE | STATX_INO,
+            sx.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    // SAFETY: zeroed, then filled by the successful call; every field is a
+    // plain integer.
+    let sx = unsafe { sx.assume_init() };
+    (sx.mask & STATX_TYPE != 0).then(|| OpenFile {
+        regular: sx.mode & S_IFMT == S_IFREG,
+        dev: libc::makedev(sx.dev_major, sx.dev_minor),
+        ino: sx.ino,
+    })
+}
+
+/// [`open_file`] off Linux: a fixture tree's link, followed by `std`.
+#[cfg(not(target_os = "linux"))]
+fn open_file(link: &Path) -> Option<OpenFile> {
+    let meta = std::fs::metadata(link).ok()?;
+    #[cfg(unix)]
+    let (dev, ino) = {
+        use std::os::unix::fs::MetadataExt as _;
+        (meta.dev(), meta.ino())
+    };
+    #[cfg(not(unix))]
+    let (dev, ino) = (0, 0);
+    Some(OpenFile {
+        regular: meta.is_file(),
+        dev,
+        ino,
+    })
 }
 
 /// `dir`'s descriptors. A socket is TCP when `tcp`'s dump names its inode: the newest dump, shared
@@ -489,11 +635,12 @@ fn fds(
             },
             FdLink::Path(_) => {
                 let i = info();
+                let open = open_file(&dir.join("fd").join(fd.to_string()));
                 FdKind::File {
-                    regular: true,
+                    regular: open.is_none_or(|o| o.regular),
                     size: i.pos,
-                    dev: 0,
-                    ino: i.ino.unwrap_or(0),
+                    dev: open.map_or(0, |o| o.dev),
+                    ino: i.ino.or(open.map(|o| o.ino)).unwrap_or(0),
                     lf_tail: None,
                     fresh_dylib: false,
                 }
@@ -539,10 +686,12 @@ pub fn read(
     if state == RunState::Zombie {
         return Some(facts);
     }
+    let tids = task_ids(&dir);
+    let task = dir.join("task");
     if let Some(io) = read_text(&dir.join("io")).map(|t| parse_io(&t)) {
-        let sched = read_text(&dir.join("schedstat")).and_then(|t| parse_schedstat(&t));
+        let cpu_ns = ticks_ns(stat.utime.saturating_add(stat.stime), hz);
         facts.counters = Some(Counters {
-            cpu_ns: ticks_ns(stat.utime.saturating_add(stat.stime), hz),
+            cpu_ns,
             child_cpu_ns: Some(ticks_ns(stat.cutime.saturating_add(stat.cstime), hz)),
             syscalls: io.syscr.zip(io.syscw).map(|(r, w)| r.saturating_add(w)),
             wakeups: None,
@@ -550,13 +699,17 @@ pub fn read(
             disk_read: io.read_bytes,
             disk_written: io.write_bytes,
             logical_writes: io.wchar,
-            runnable_ns: sched.map(|(run, wait)| run.saturating_add(wait)),
+            runnable_ns: tids
+                .as_deref()
+                .and_then(|tids| wait_sum(&task, tids))
+                .map(|wait| cpu_ns.saturating_add(wait)),
             pageins: Some(stat.majflt),
             peak_footprint: None,
         });
     }
     facts.wchan = read_text(&dir.join("wchan")).and_then(|w| parse_wchan(&w));
-    if let Some((ts, cut)) = threads(&dir, hz) {
+    if let Some(tids) = tids.as_deref() {
+        let (ts, cut) = threads(&task, tids, hz);
         facts.threads = Some(ts);
         facts.threads_truncated = cut;
     }

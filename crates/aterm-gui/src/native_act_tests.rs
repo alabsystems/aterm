@@ -1508,6 +1508,53 @@ fn native_queue_input_drain_transition_and_lost_ack_conform_to_model() {
     assert_eq!(facts.signals.load(Ordering::SeqCst), 0);
 }
 
+/// AN OWN-IMAGE MOVE WHOSE ACTOR IS GONE STOPS HOLDING THE UPDATE'S HANDOFF: every request on it
+/// must come from that actor's exact process, so with the actor dead it can start nothing more,
+/// though the child it moved runs on. Its input position stays until both have retired. A live
+/// actor whose connection dropped still holds it: it may recover its channel and go on.
+#[test]
+fn an_own_image_move_whose_actor_is_gone_lets_the_update_handoff_go_on() {
+    let h = crate::session_store::test_handle_on(7931, -1);
+    let ctx = &h.ctx;
+    install(ctx, 71, &[Scope::Upgrade]);
+    let facts = Facts::new();
+    let binding = admitted_binding(&run(
+        ctx,
+        &facts,
+        Request::prepare(plan(ctx, &facts)),
+        caller(),
+    ));
+    let operation = lookup(ctx, &binding).unwrap();
+    let guard = Arc::downgrade(
+        &operation
+            .lock()
+            .unwrap()
+            .custody
+            .as_ref()
+            .unwrap()
+            .handoff_guard()
+            .unwrap(),
+    );
+    connection_closed_by(ctx, 71, &facts);
+    reconcile_extinct_by(ctx, &facts);
+    assert!(
+        guard.upgrade().is_some(),
+        "CONTROL: a live actor whose connection dropped still holds the handoff"
+    );
+    facts.processes.lock().unwrap().remove(&4242);
+    reconcile_extinct_by(ctx, &facts);
+    assert!(
+        guard.upgrade().is_none(),
+        "with its actor gone the move lets the handoff go on"
+    );
+    let op = operation.lock().unwrap();
+    assert!(
+        !matches!(op.phase, Phase::Completed(_)),
+        "it is not retired while the child it moved runs"
+    );
+    assert!(op.custody.is_some(), "its input position stays");
+}
+
 #[test]
 fn native_history_preserves_independent_operator_and_legacy_rights() {
     let h = crate::session_store::test_handle_on(7912, -1);

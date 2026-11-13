@@ -8,7 +8,7 @@ use super::writers_gone;
 
 #[test]
 fn a_pipe_is_writer_less_once_its_last_writer_closes() {
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = crate::pipe().expect("pipe");
     assert!(!writers_gone(reader.as_fd()), "open and empty");
     writer.write_all(b"x").expect("write");
     assert!(!writers_gone(reader.as_fd()), "open with data");

@@ -23,16 +23,6 @@ pub enum CohortSignal {
     Kill,
 }
 
-impl CohortSignal {
-    const fn raw(self) -> i32 {
-        match self {
-            Self::Terminate => libc::SIGTERM,
-            Self::Continue => libc::SIGCONT,
-            Self::Kill => libc::SIGKILL,
-        }
-    }
-}
-
 /// An actual owned child whose exact birth was durably bound to its claim.
 /// This proves neither descendant containment nor permission to release capacity on exit.
 #[derive(Debug)]
@@ -85,19 +75,14 @@ impl CohortChild {
                 "group control requires its original current owner and unreaped dedicated birth",
             ));
         }
-        // SAFETY: only the original dedicated-group birth can construct this
-        // receipt. Its actual unreaped leader pins group > 1 against reuse, and
-        // the captured owner/host/boot/namespace are current. No arbitrary pid,
-        // decoded record, live-group guess or post-reap identity is accepted.
-        if unsafe { libc::kill(-group, signal.raw()) } == 0 {
-            return Ok(());
+        // Keep admission's original bound-cohort checks above. The native
+        // birth owner additionally checks its exact unreaped Child before the
+        // syscall; no observation or reservation creates signalling authority.
+        match signal {
+            CohortSignal::Terminate => self.spawned.terminate_group(),
+            CohortSignal::Continue => self.spawned.continue_group(),
+            CohortSignal::Kill => self.spawned.kill_group(),
         }
-        // A group of the ended is no refusal. A real one keeps the kernel's errno, which callers
-        // match to tell it from the custody refusals above.
-        let refused = io::Error::last_os_error();
-        let errno = refused.raw_os_error();
-        aterm_uds::process::settle_group_signal(group, refused)
-            .map_err(|settled| errno.map_or(settled, io::Error::from_raw_os_error))
     }
 
     /// Transfer the actual child receipt and bound cohort to the native controller.
@@ -116,7 +101,7 @@ pub enum LaunchError {
     /// [`Claim::cancel_cohort`] or [`Claim::cancel_subgroup`] for the corresponding launch
     /// before treating its durable ARM as cancelled.
     NotSpawned(Box<NotSpawned>),
-    /// The target actually started, but BIND did not complete. Keep the owned child,
+    /// Native birth occurred, but exec observation or BIND did not complete. Keep the owned child,
     /// retry its binding or supervise drain, and retain the original reservation.
     Unbound {
         /// The actual child and one-use birth receipt, never a caller-selected pid.
@@ -160,6 +145,7 @@ pub(crate) fn launch_with(
         .map_err(|failure| match failure {
             SpawnFailure::NotSpawned(proof) => LaunchError::NotSpawned(proof),
             SpawnFailure::Refused(error) => LaunchError::Refused(error),
+            SpawnFailure::Unbound { spawned, error } => LaunchError::Unbound { spawned, error },
         })?;
     match bind(claim, &mut spawned) {
         Ok(cohort) => Ok(CohortChild { spawned, cohort }),
@@ -203,6 +189,7 @@ pub(crate) fn launch_subgroup_with(
         .map_err(|failure| match failure {
             SpawnFailure::NotSpawned(proof) => LaunchError::NotSpawned(proof),
             SpawnFailure::Refused(error) => LaunchError::Refused(error),
+            SpawnFailure::Unbound { spawned, error } => LaunchError::Unbound { spawned, error },
         })?;
     match bind(claim, &mut spawned) {
         Ok(cohort) => Ok(CohortChild { spawned, cohort }),

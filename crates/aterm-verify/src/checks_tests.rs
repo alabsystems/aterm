@@ -225,12 +225,14 @@ fn a_selection_holding_a_web_module_runs_its_replay_with_its_tests() {
         };
         let sel = select(
             &[format!("crates/{changed}/src/lib.rs")],
+            &std::collections::BTreeSet::new(),
             &manifests,
             &members,
             &|| Some(Vec::new()),
             &dependents,
             &|_| Replan::Nothing,
             &|_, _| false,
+            &std::collections::BTreeMap::new,
         );
         assert!(
             matches!(sel, Selection::Narrowed { .. }),

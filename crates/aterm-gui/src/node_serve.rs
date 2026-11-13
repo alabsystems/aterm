@@ -565,8 +565,10 @@ pub(crate) enum WindowUpdateLane {
     /// Its automatic lane will not land the staged download by itself now. The in-session
     /// handoff cannot run here, the lane stood down for that build, or the kept image installs it
     /// only at the next launch. It holds nothing: the job installs the build on disk through the
-    /// same verification, under a boot trial of its own. A window that can hand off then
-    /// switches to it as an installed activation, and one that cannot runs it at its next launch.
+    /// same verification, under a boot trial of its own, unless those exact bytes are ones a
+    /// window here saw fail to start, which no windowless start installs (`aterm_update`'s
+    /// window-start failure record). A window that can hand off then switches to it as an
+    /// installed activation, and one that cannot runs it at its next launch.
     Leaves = 2,
     /// Its staged build is already installed in its place, so the job has nothing to install; what
     /// is left is this window's switch to it. That boot trial waits on this window's launch, so a
@@ -761,8 +763,8 @@ pub(crate) fn window_stops_applying() {
     WINDOW_APPLIES.stop();
 }
 
-/// Start the current window's `wf-<pid>.sock` relay inside `sock_dir` once `BRIDGE_CONTEXT` is
-/// published, so `aterm node serve` can forward `Survey` and `Drive` connections to this window.
+/// Start the current window's `wf-<pid>.sock` relay inside `sock_dir` after Commit and control
+/// activation, so `aterm node serve` can forward `Survey` and `Drive` connections to this window.
 /// `applies` is [`window_applies_updates`], read once for the process; what the relay answers
 /// within it is live ([`WindowApplies::answer`]).
 pub(crate) fn start_window_fleet_relay(sock_dir: &Path, applies: bool) {
@@ -802,42 +804,194 @@ fn run_window_fleet_relay() {
     let Some(dir) = dir else {
         return;
     };
+    let mut readiness = window_node_readiness(applies);
     let pid = std::process::id();
-    let hosts = |sid: &SessionId| crate::control::hosts_or_keeps(sid);
-    let _ = serve_window_relay_at(&dir, pid, None, hosts, move |header, stream| match header {
-        RelayHeader::Survey {
-            content,
-            drive,
-            peer,
-        } => crate::control::attach_fleet_connection(stream, (content, drive), peer),
-        RelayHeader::Drive {
-            driver,
-            key,
-            peer,
-            requester,
-            ..
-        } => {
-            if let Some(key) = key {
-                super::note_admitted_driver(&driver.node, key);
-            }
-            // Service repair is handled by the node before relay, where its configured
-            // vault and state can be checked. A later command on this relayed connection
-            // must not reinterpret a custom node context as the window's live context.
-            crate::control::attach_fleet_drive(
-                stream,
+    let attach = move |header: RelayHeader, stream: CtlStream| -> bool {
+        match header {
+            RelayHeader::Survey {
+                content,
+                drive,
                 peer,
+            } => crate::control::attach_fleet_connection(stream, (content, drive), peer),
+            RelayHeader::Drive {
                 driver,
                 key,
-                false,
-                crate::control::DriveRequester::Relayed(requester),
+                peer,
+                requester,
+                ..
+            } => {
+                if let Some(key) = key {
+                    super::note_admitted_driver(&driver.node, key);
+                }
+                // Service repair is handled by the node before relay, where its configured
+                // vault and state can be checked. A later command on this relayed connection
+                // must not reinterpret a custom node context as the window's live context.
+                crate::control::attach_fleet_drive(
+                    stream,
+                    peer,
+                    driver,
+                    key,
+                    false,
+                    crate::control::DriveRequester::Relayed(requester),
+                )
+            }
+            RelayHeader::Ask { peer } => crate::members_desk::attach_relayed(stream, peer),
+            RelayHeader::Applies => {
+                answer_applies(stream, WINDOW_APPLIES.answer(applies, Instant::now()))
+            }
+            RelayHeader::Needs => crate::control::attach_needs_stream(stream),
+        }
+    };
+    let attach = Arc::new(attach);
+    keep_window_relay(
+        || {
+            let attach = Arc::clone(&attach);
+            serve_window_relay_with(
+                &dir,
+                pid,
+                None,
+                |sid: &SessionId| crate::control::hosts_or_keeps(sid),
+                move |header, stream| attach(header, stream),
+                Some(&mut readiness),
+                |listener, wait| {
+                    aterm_uds::accept(listener, wait, aterm_uds::AcceptedMode::Blocking)
+                        .map(|(stream, _)| stream)
+                },
             )
+        },
+        std::thread::sleep,
+    );
+}
+
+/// Only the committed, installed account window renews its node. Raw isolation markers also
+/// stand aside in release builds, whose development state override is intentionally absent.
+fn window_node_upkeep_applies(installed: bool, own_account: bool, isolated: bool) -> bool {
+    installed && own_account && !isolated
+}
+
+/// The committed relay's readiness and maintenance, run by its owner only after it has bound.
+/// Keeping these together needs no second worker whose failed start could strand the gate.
+pub(crate) struct RelayReadiness {
+    ready: Arc<AtomicBool>,
+    maintain: Box<dyn FnMut()>,
+}
+
+/// Keep a committed relay present while its installed node catches up. Its admission gate
+/// opens only after a positive image observation; later reads make no further renewal attempt.
+/// A launchd refusal is recorded once and ordinary upkeep can still satisfy this wait later.
+fn window_node_readiness(applies: bool) -> RelayReadiness {
+    let coordinate = window_node_upkeep_applies(
+        applies && aterm_update::running_copy_installable() == Some(true),
+        aterm_types::dirs::not_own_account().is_none(),
+        node_run_updates_and_claims_nothing(),
+    );
+    let ready = Arc::new(AtomicBool::new(!coordinate));
+    let answer = Arc::clone(&ready);
+    let mut attempted = false;
+    let mut next = Instant::now();
+    let mut pause = Duration::from_secs(1);
+    let mut said = None;
+    let maintain = Box::new(move || {
+        if answer.load(Ordering::Acquire)
+            || Instant::now() < next
+            || WINDOW_APPLIES.stopped.load(Ordering::Acquire)
+        {
+            return;
         }
-        RelayHeader::Ask { peer } => crate::members_desk::attach_relayed(stream, peer),
-        RelayHeader::Applies => {
-            answer_applies(stream, WINDOW_APPLIES.answer(applies, Instant::now()))
+        use aterm_agent::node_service::{WindowNode, renew_for_window_with, window_node_with};
+        let read = match (
+            aterm_types::dirs::home_dir(),
+            aterm_types::dirs::state_dir(),
+            std::env::current_exe().and_then(|program| program.canonicalize()),
+        ) {
+            (Some(home), Some(state), Ok(program)) => {
+                let config = aterm_types::dirs::aterm_config_path();
+                let supervisor = aterm_agent::node_service::supervisor_here();
+                if !std::mem::replace(&mut attempted, true) {
+                    renew_for_window_with(
+                        &home,
+                        &state,
+                        config.as_deref(),
+                        &program,
+                        false,
+                        supervisor,
+                        |pause| {
+                            if WINDOW_APPLIES.stopped.load(Ordering::Acquire) {
+                                return false;
+                            }
+                            std::thread::sleep(pause);
+                            !WINDOW_APPLIES.stopped.load(Ordering::Acquire)
+                        },
+                    )
+                } else {
+                    // Only observe after the bounded attempt; ordinary upkeep owns retries.
+                    window_node_with(
+                        &home,
+                        &state,
+                        config.as_deref(),
+                        &program,
+                        false,
+                        supervisor,
+                    )
+                }
+            }
+            _ => Err("the installed node paths are unreadable".to_owned()),
+        };
+        if matches!(read, Ok(WindowNode::Ready | WindowNode::Unmanaged)) {
+            answer.store(true, Ordering::Release);
+            return;
         }
-        RelayHeader::Needs => crate::control::attach_needs_stream(stream),
+        if let Err(why) = read
+            && said.as_ref() != Some(&why)
+        {
+            aterm_log::warn!("window fleet relay: node readiness waits: {why}");
+            said = Some(why);
+        }
+        next = Instant::now() + pause;
+        pause = pause.saturating_mul(2).min(RELAY_BACKOFF_MAX);
     });
+    RelayReadiness { ready, maintain }
+}
+
+/// The longest pause between two binds of a window's relay ([`keep_window_relay`]), and between two
+/// accepts that met a fault that can pass ([`serve_window_relay_with`]).
+const RELAY_BACKOFF_MAX: Duration = Duration::from_secs(5);
+/// The first such pause.
+const RELAY_BACKOFF_FIRST: Duration = Duration::from_millis(50);
+
+/// The next pause after `pause`, doubled up to [`RELAY_BACKOFF_MAX`].
+fn relay_backoff(pause: Duration) -> Duration {
+    pause
+        .saturating_mul(2)
+        .clamp(RELAY_BACKOFF_FIRST, RELAY_BACKOFF_MAX)
+}
+
+/// Serve this window's relay for as long as the window lives: `serve` binds it and serves until it
+/// fails, which this says and binds again after a pause (`sleep`) that doubles up to
+/// [`RELAY_BACKOFF_MAX`]. A window whose relay ended without a word read as no window to the node
+/// job, which then installed an update beside it; one that serves again is seen again. Each fault
+/// is said once until another takes its place, so a relay that cannot bind for good (its folder
+/// gone, its path held) writes one line, not one each pause. It returns only where `serve` does
+/// without a fault: its stop was asked.
+fn keep_window_relay(
+    mut serve: impl FnMut() -> std::io::Result<()>,
+    mut sleep: impl FnMut(Duration),
+) {
+    let mut pause = Duration::ZERO;
+    let mut said: Option<String> = None;
+    while let Err(err) = serve() {
+        pause = relay_backoff(pause);
+        let fault = err.to_string();
+        if said.as_deref() != Some(fault.as_str()) {
+            aterm_log::warn!(
+                "window fleet relay: stopped serving ({fault}); it binds again after a pause of \
+                 up to {} s, and says no more until the fault changes",
+                RELAY_BACKOFF_MAX.as_secs()
+            );
+            said = Some(fault);
+        }
+        sleep(pause);
+    }
 }
 
 /// Answer [`RelayHeader::Applies`] on `stream`, ahead of the relay's `OK`, which the asker never
@@ -899,12 +1053,59 @@ fn relay_ask(
 /// header node serve hands over is `attach`ed, except a drive naming a session `hosts` says this
 /// window neither hosts nor keeps a retired worker's row of, which it answers `ELSEWHERE` so node
 /// serve asks the next window ([`handle_relay_accept`]).
+#[cfg(test)]
 pub(crate) fn serve_window_relay_at<H, F>(
     relay_dir: &Path,
     pid: u32,
     stop: Option<&AtomicBool>,
     hosts: H,
     attach: F,
+) -> std::io::Result<()>
+where
+    H: Fn(&SessionId) -> bool + Send + Sync + 'static,
+    F: Fn(RelayHeader, CtlStream) -> bool + Send + Sync + 'static,
+{
+    serve_window_relay_with(
+        relay_dir,
+        pid,
+        stop,
+        hosts,
+        attach,
+        None,
+        |listener, wait| {
+            aterm_uds::accept(listener, wait, aterm_uds::AcceptedMode::Blocking).map(|(s, _)| s)
+        },
+    )
+}
+
+/// Whether an accept that failed with `err` may pass while the relay keeps its socket: a connection
+/// its peer aborted before the accept, a process or system out of descriptors, buffers or memory
+/// for a moment, or a wait the call gave up. Each costs that connection at most; ending the relay
+/// for one cost the window its presence to the node job for the rest of its life.
+fn accept_fault_passes(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::OutOfMemory
+            | std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::Interrupted
+    ) || matches!(
+        err.raw_os_error(),
+        Some(libc::ECONNABORTED | libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM)
+    )
+}
+
+/// Serve the window's relay with its `accept`, which a test makes fail, and optional readiness.
+/// Readiness maintenance starts after bind; while it waits, the socket still proves a window
+/// exists, and hand-overs are refused before any header is interpreted or command served.
+pub(crate) fn serve_window_relay_with<H, F>(
+    relay_dir: &Path,
+    pid: u32,
+    stop: Option<&AtomicBool>,
+    hosts: H,
+    attach: F,
+    mut readiness: Option<&mut RelayReadiness>,
+    accept: impl Fn(&CtlListener, aterm_uds::AcceptWait) -> std::io::Result<CtlStream>,
 ) -> std::io::Result<()>
 where
     H: Fn(&SessionId) -> bool + Send + Sync + 'static,
@@ -930,37 +1131,74 @@ where
     let attach = Arc::new(attach);
     let hosts = Arc::new(hosts);
 
+    let mut pause = Duration::ZERO;
+    let mut fault_said = false;
     loop {
         if stop.is_some_and(|flag| flag.load(Ordering::Acquire)) {
             return Ok(());
         }
-        let accepted = aterm_uds::accept(
+        // The pending socket exists before any renewal. Even an old node sees a window
+        // here and reports Busy while this owner observes the node, never NoWindow.
+        if let Some(readiness) = readiness.as_mut() {
+            (readiness.maintain)();
+        }
+        let pending = readiness
+            .as_ref()
+            .is_some_and(|readiness| !readiness.ready.load(Ordering::Acquire));
+        let accepted = accept(
             &listener,
             if stop.is_some() {
                 aterm_uds::AcceptWait::Ready
+            } else if pending {
+                aterm_uds::AcceptWait::Until(Instant::now() + Duration::from_secs(1))
             } else {
                 aterm_uds::AcceptWait::Forever
             },
-            aterm_uds::AcceptedMode::Blocking,
         );
+        if accepted.is_ok() {
+            pause = Duration::ZERO;
+            fault_said = false;
+        }
         match accepted {
-            Ok((mut stream, _)) => {
+            Ok(mut stream) => {
                 if crate::control_auth::peer_check(&stream).is_err() {
                     aterm_uds::hangup::hang_up(&stream);
                     continue;
                 }
                 let attach = Arc::clone(&attach);
                 let hosts = Arc::clone(&hosts);
+                let ready = readiness
+                    .as_ref()
+                    .map(|readiness| Arc::clone(&readiness.ready));
                 let _ = std::thread::Builder::new()
                     .name("aterm-wf-admit".to_owned())
                     .spawn(move || {
-                        handle_relay_accept(&mut stream, &*hosts, &*attach);
+                        handle_relay_accept(
+                            &mut stream,
+                            &*hosts,
+                            &*attach,
+                            ready
+                                .as_ref()
+                                .is_none_or(|ready| ready.load(Ordering::Acquire)),
+                        );
                     });
             }
             Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(Duration::from_millis(15));
             }
+            Err(err) if pending && err.kind() == std::io::ErrorKind::TimedOut => {}
             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) if accept_fault_passes(&err) => {
+                pause = relay_backoff(pause);
+                if !std::mem::replace(&mut fault_said, true) {
+                    aterm_log::warn!(
+                        "window fleet relay: an accept failed ({err}); it keeps its socket and \
+                         accepts again within {} ms",
+                        RELAY_BACKOFF_MAX.as_millis()
+                    );
+                }
+                std::thread::sleep(pause);
+            }
             Err(err) => return Err(err),
         }
     }
@@ -970,6 +1208,7 @@ fn handle_relay_accept(
     stream: &mut CtlStream,
     hosts: &dyn Fn(&SessionId) -> bool,
     attach: &dyn Fn(RelayHeader, CtlStream) -> bool,
+    ready: bool,
 ) {
     let _ = stream.set_read_timeout(Some(RELAY_CONNECT_TIMEOUT));
     let _ = stream.set_write_timeout(Some(RELAY_CONNECT_TIMEOUT));
@@ -980,6 +1219,12 @@ fn handle_relay_accept(
             return;
         }
     };
+    if !ready {
+        let _ = stream.write_all(b"ERR fleet node updating\n");
+        let _ = stream.flush();
+        aterm_uds::hangup::hang_up(stream);
+        return;
+    }
     let header = match RelayHeader::parse(&line) {
         Ok(header) => header,
         Err(why) => {
@@ -1207,7 +1452,12 @@ fn relay_names(sid: &str) -> bool {
 
 /// Hand `wire` to the window whose relay is `path`, and read what it answered.
 fn hand_over(path: &Path, wire: &str) -> HandOver {
-    let deadline = Instant::now() + RELAY_CONNECT_TIMEOUT;
+    hand_over_within(path, wire, RELAY_CONNECT_TIMEOUT)
+}
+
+/// The same hand-over with its I/O budget supplied by the caller.
+fn hand_over_within(path: &Path, wire: &str, within: Duration) -> HandOver {
+    let deadline = Instant::now() + within;
     // Kept out of children from its creation (`aterm_uds::connect::until`).
     let Ok(mut stream) = aterm_uds::connect::until(path, deadline) else {
         return HandOver::Busy("its relay socket took no connection".to_owned());
@@ -1216,8 +1466,8 @@ fn hand_over(path: &Path, wire: &str) -> HandOver {
         aterm_uds::hangup::hang_up(&stream);
         return HandOver::Busy("its relay socket is not this account's".to_owned());
     }
-    let _ = stream.set_read_timeout(Some(RELAY_CONNECT_TIMEOUT));
-    let _ = stream.set_write_timeout(Some(RELAY_CONNECT_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(within));
+    let _ = stream.set_write_timeout(Some(within));
     if stream.write_all(wire.as_bytes()).is_err() || stream.flush().is_err() {
         aterm_uds::hangup::hang_up(&stream);
         return HandOver::Busy("it hung up on the hand-over".to_owned());
@@ -1247,13 +1497,21 @@ fn hand_over(path: &Path, wire: &str) -> HandOver {
 /// hosts or keeps every one; one that names none, a survey's and an ask's, by the first that
 /// answers.
 fn hand_over_in_order(windows: &WindowRelays, header: &RelayHeader) -> Result<CtlStream, Declined> {
+    hand_over_in_order_within(windows, header, RELAY_CONNECT_TIMEOUT)
+}
+
+fn hand_over_in_order_within(
+    windows: &WindowRelays,
+    header: &RelayHeader,
+    within: Duration,
+) -> Result<CtlStream, Declined> {
     let wire = header.encode();
     let mut declined = Declined {
         hosting: Vec::new(),
         busy: None,
     };
     for (_pid, path) in windows.in_order() {
-        match hand_over(&path, &wire) {
+        match hand_over_within(&path, &wire, within) {
             HandOver::Took(stream) => return Ok(stream),
             HandOver::Elsewhere(hosted) => declined.hosting.push((path, hosted)),
             HandOver::Busy(why) => declined.busy = Some(why),
@@ -1266,7 +1524,15 @@ fn hand_over_in_order(windows: &WindowRelays, header: &RelayHeader) -> Result<Ct
 /// is [`RelayOpen::Busy`], never [`RelayOpen::NoWindow`], so a peer is never told this Mac has
 /// no window (nor opened a second one) while one is up.
 fn relay_to_window(windows: &WindowRelays, header: &RelayHeader) -> RelayOpen {
-    match hand_over_in_order(windows, header) {
+    relay_to_window_within(windows, header, RELAY_CONNECT_TIMEOUT)
+}
+
+fn relay_to_window_within(
+    windows: &WindowRelays,
+    header: &RelayHeader,
+    within: Duration,
+) -> RelayOpen {
+    match hand_over_in_order_within(windows, header, within) {
         Ok(stream) => RelayOpen::Opened(stream),
         Err(Declined {
             busy: Some(why), ..
@@ -1916,8 +2182,7 @@ const UPDATE_LOOK_EVERY: Duration = Duration::from_secs(60);
 /// How long after a start that found a newer build and did not run it (its boot apply refused)
 /// the job may end its run for that same build again: a refusal that passes (a held apply lock,
 /// a roster not yet re-confirmed) is retried within the hour, and one that stands costs one
-/// restart an hour, never a loop of them. A trial the updater keeps refusing to settle gives way to a
-/// newer build after as long ([`restart_for`]).
+/// restart an hour, never a loop of them.
 const RETRY_LEFT_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// The node job's updater (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13, A4). The job checks
@@ -1932,7 +2197,11 @@ pub trait NodeUpdater: Send + Sync {
     /// after each stage, and once it sees a build another process staged or installed.
     fn start_checker(&self, noticed: Box<dyn Fn() + Send>);
     /// The newer build a start of this job would run: one staged and ready for a boot apply, or
-    /// one another process already installed over this job's image.
+    /// one another process already installed over this job's image. A staged download whose
+    /// exact bytes a window here saw fail to start is none: a windowless start never runs,
+    /// installs or supersedes with them (`aterm_update`'s window-start failure record), and a
+    /// headless settle of such bytes already installed keeps their window re-trial at the count
+    /// it carried (`aterm_update`'s window-trial witness).
     fn newer_build(&self) -> Option<u64>;
     /// `[update] auto_apply`: whether a newer build goes in by itself. Text that names it unreadably
     /// reads as no, as does a read that hits a fault that can pass or does not answer: that look
@@ -1971,8 +2240,22 @@ pub trait NodeUpdater: Send + Sync {
     /// this run ends where no replacement can check ([`mind_node_checker`]), once no trial is active
     /// ([`the_checker_ends_the_run`]), else `None`.
     fn mind_checker(&self) -> Option<String>;
+    /// Record in the update record that this build's boot trial missed, for `why`, before a
+    /// [`Self::restart`] ends the run for it: the revert a later start may make then holds the
+    /// build with this reason ([`aterm_update::note_trial_miss`]).
+    fn note_trial_miss(&self, why: &str);
     /// End this run so it is started again, saying `why`.
     fn restart(&self, why: &str);
+    /// Give back the launch this run counted against its build's boot trial, as a run ends by
+    /// choice ([`aterm_update::forgive_own_trial_launch`]): only a crash and a failed trial
+    /// ([`NodeUpdates::failed_trial`]) count toward the trial's launch limit, so a build that
+    /// serves is never reverted for the job's own restarts.
+    fn forgive_launch(&self);
+    /// How long `build` has waited on this machine, on a clock the job's restarts do not restart
+    /// (`aterm_update::pending_update_waited`, which this ask starts where nothing follows the
+    /// build yet). Where that clock does not answer, the wait since this run first asked for the
+    /// build ([`waited_or_since`]): every answer bounds, so a silent window never holds for good.
+    fn waited_for(&self, build: u64) -> Duration;
     /// The clock [`RETRY_LEFT_AFTER`] is read on.
     fn now(&self) -> Instant;
     /// How often the updater looks again without a notice.
@@ -2013,6 +2296,15 @@ impl NodeBoot {
 /// window hands the port over within its tick; a build whose listener does not answer misses every
 /// look.
 const TRIAL_SETTLES_WITHIN: Duration = Duration::from_secs(5 * 60);
+
+/// How long a trial's self-dial waits for its census reply once the listener has answered as this
+/// very node ([`health::Unproven::ReplyLate`]), apart from [`HANDSHAKE`]: a census reads the vault
+/// and the roster, which a writer or a Commons bootstrap can hold for seconds on a loaded Mac.
+#[cfg(not(test))]
+const HEALTH_REPLY_WITHIN: Duration = Duration::from_secs(10);
+/// A unit test's listeners are its own, which answer: the hang detector.
+#[cfg(test)]
+const HEALTH_REPLY_WITHIN: Duration = aterm_spec::wait::MUST_HAPPEN;
 
 /// Since when this run's looks have met each kind of thing that settled nothing, with nothing since
 /// that said otherwise ([`NodeUpdates::trial_answered`]). A look that could not ask does not clear
@@ -2150,8 +2442,13 @@ impl NodeUpdates {
         now.saturating_duration_since(first)
     }
 
+    /// The trial's misses lasted: note the miss and its reason in the update record, then end the
+    /// run, so the next start counts against the trial and a revert says why.
     fn failed_trial(&self, stop: &Stop, why: &str) {
         if !stop.is_set() && self.active_trial() && !stop.is_set() {
+            self.updater.note_trial_miss(&format!(
+                "the node service could not prove its listener: {why}"
+            ));
             self.updater.restart(&format!(
                 "the active node update trial could not prove its listener: {why}"
             ));
@@ -2170,7 +2467,13 @@ impl NodeUpdates {
         stop: &Stop,
     ) -> bool {
         self.settle_service_with(inputs, (addr, secret, node, listen), stop, |basis| {
-            basis.prove(addr, HANDSHAKE)
+            basis.prove(
+                addr,
+                health::Bounds {
+                    handshake: HANDSHAKE,
+                    reply: HEALTH_REPLY_WITHIN,
+                },
+            )
         })
     }
 
@@ -2184,7 +2487,7 @@ impl NodeUpdates {
             &str,
         ),
         stop: &Stop,
-        prove: impl FnOnce(&health::Basis) -> Result<health::Proven, String>,
+        prove: impl FnOnce(&health::Basis) -> Result<health::Proven, health::Unproven>,
     ) -> bool {
         if stop.is_set() {
             return false;
@@ -2227,10 +2530,13 @@ impl NodeUpdates {
             {
                 match proof {
                     Ok(proof) => self.confirm_service(stop, proof),
-                    Err(why) => match health::self_dial_says_nothing(addr) {
-                        Some(unprovable) => self.trial_unprovable(stop, unprovable),
-                        None => self.trial_proof_missed(stop, &why),
-                    },
+                    Err(health::Unproven::ReplyLate(why)) => self.trial_unprovable(stop, &why),
+                    Err(health::Unproven::Missed(why)) => {
+                        match health::self_dial_says_nothing(addr) {
+                            Some(unprovable) => self.trial_unprovable(stop, unprovable),
+                            None => self.trial_proof_missed(stop, &why),
+                        }
+                    }
                 }
             }
             // A fault that met this read says what one that met the read before the dial does.
@@ -2300,42 +2606,186 @@ fn checkpoint_idle_with(
     }
 }
 
-/// Whether a window that applies this Mac's updates runs here, as the node job's updater asks it
-/// (§4.13): a `wf-<pid>.sock` in `relay_dir` that takes a connect from this account and does not
-/// say it does not apply them now ([`relay_reply_applies`]). A relay file nothing listens on (its
-/// window crashed, or its pid went to another process) is no window. It never asks WindowServer.
-/// Every relay is asked, not only those up to the first that applies: each window's hold runs
-/// from the asks it hears ([`WindowHold::ask`]), so several windows hold the job no longer than
-/// the longest of them would alone.
-fn a_window_that_applies_answers(relay_dir: &Path) -> bool {
-    let mut applies = false;
-    for relay in window_relay_paths(relay_dir) {
-        applies |= relay_applies(&relay);
+/// What a window's `wf-<pid>.sock` says of its process to the node job's updater (§4.13).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WindowPresence {
+    /// Its relay took a connect from this account and answered [`RelayHeader::Applies`]: it
+    /// applies this Mac's updates unless it said `no` ([`relay_reply_applies`]).
+    Answers { applies: bool },
+    /// Its process lives and runs an aterm image ([`runs_an_aterm_image`]), but its relay took no
+    /// connect within [`RELAY_CONNECT_TIMEOUT`] (a listen queue full behind a window that is not
+    /// scheduled, a relay between two binds) or did not answer the ask. That cannot be told from a
+    /// window that applies its updates, so it holds the job as one does, for as long
+    /// ([`silent_window_holds`]).
+    Silent,
+    /// Its process has exited, its pid now runs a program that is not aterm, or the socket's
+    /// listener is another account's: no window.
+    Gone,
+}
+
+/// What the relay at `path`, named for process `pid`, says of its window: its pid's liveness and
+/// image first, by `runs_aterm`, then a connect and [`RelayHeader::Applies`]. A relay whose pid is
+/// alive is never read as gone because its socket refuses: a window that is not scheduled stops
+/// accepting, its listen queue fills, and every later connect is refused while it still holds its
+/// single-owner state.
+fn relay_presence(path: &Path, pid: u32, runs_aterm: impl FnOnce(u32) -> bool) -> WindowPresence {
+    if !crate::control_auth::pid_alive(pid) || !runs_aterm(pid) {
+        return WindowPresence::Gone;
     }
-    applies
+    let Ok(mut stream) = aterm_uds::connect::until(path, Instant::now() + RELAY_CONNECT_TIMEOUT)
+    else {
+        return WindowPresence::Silent;
+    };
+    if crate::control_auth::peer_check(&stream).is_err() {
+        aterm_uds::hangup::hang_up(&stream);
+        return WindowPresence::Gone;
+    }
+    let _ = stream.set_read_timeout(Some(RELAY_CONNECT_TIMEOUT));
+    let _ = stream.set_write_timeout(Some(RELAY_CONNECT_TIMEOUT));
+    let reply = stream
+        .write_all(RelayHeader::Applies.encode().as_bytes())
+        .and_then(|()| stream.flush())
+        .ok()
+        .and_then(|()| read_line_raw(&mut stream, RELAY_HEADER_MAX).ok().flatten());
+    aterm_uds::hangup::hang_up(&stream);
+    reply.map_or(WindowPresence::Silent, |reply| WindowPresence::Answers {
+        applies: relay_reply_applies(&reply),
+    })
+}
+
+/// Whether a relay's reply to [`RelayHeader::Applies`] leaves the applying to its process. Only
+/// `no` says otherwise: an older build refuses a command it does not know, so it is held for as a
+/// window has always been. Such an older headless or dev process holds the job until it exits or
+/// updates, as does an older window, whose answer is read once for its process and never runs out.
+fn relay_reply_applies(reply: &str) -> bool {
+    reply != "no\n"
+}
+
+/// Whether live process `pid` runs an aterm program's image (`aterm`, `aterm-<verb>`, or this
+/// process's own, which a test's windows share), told by the kernel's word on its executable; an
+/// image the kernel will not name is held to be one, since a wrong `no` installs beside a window.
+/// Linux names an image a later update replaced `<path> (deleted)`, and it is still that program.
+pub(crate) fn runs_an_aterm_image(pid: u32) -> bool {
+    let image = match aterm_uds::holders::exe_of(pid) {
+        aterm_uds::holders::Exe::Exited => return false,
+        aterm_uds::holders::Exe::Unnamed => return true,
+        aterm_uds::holders::Exe::At(image) => image,
+    };
+    let name = |path: &Path| {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.strip_suffix(" (deleted)").unwrap_or(name).to_owned())
+    };
+    let Some(image) = name(&image) else {
+        return true;
+    };
+    image == "aterm"
+        || image.starts_with("aterm-")
+        || std::env::current_exe().is_ok_and(|own| name(&own).as_deref() == Some(image.as_str()))
+}
+
+/// The `wf-<pid>.sock` files in `relay_dir`, live or not, each with its pid.
+fn window_relays(relay_dir: &Path) -> Vec<(u32, PathBuf)> {
+    std::fs::read_dir(relay_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str().and_then(parse_relay_filename)?;
+            Some((pid, entry.path()))
+        })
+        .collect()
+}
+
+/// What each window's relay in `relay_dir` says of its process ([`relay_presence`]), its pid's
+/// image judged by `runs_aterm` (production's is [`runs_an_aterm_image`]).
+pub(crate) fn window_presences_by(
+    relay_dir: &Path,
+    runs_aterm: impl Fn(u32) -> bool,
+) -> Vec<(u32, WindowPresence)> {
+    window_relays(relay_dir)
+        .into_iter()
+        .map(|(pid, relay)| (pid, relay_presence(&relay, pid, &runs_aterm)))
+        .collect()
+}
+
+/// Whether a window here holds the node job's install of `waiting` (the newer build its look found,
+/// if any), as the job's updater asks it (§4.13): one that answers it applies this Mac's updates,
+/// or one that is [`WindowPresence::Silent`] while [`silent_window_holds`]. It never asks
+/// WindowServer. Every relay is asked, not only those up to the first that holds: each window's
+/// hold runs from the asks it hears ([`WindowHold::ask`]), so several windows hold the job no
+/// longer than the longest of them would alone. Which window holds it, an answering one first.
+fn a_window_holds_the_update(
+    updater: &dyn NodeUpdater,
+    relay_dir: &Path,
+    waiting: Option<u64>,
+) -> Option<UpdateHolder> {
+    let mut holder = None;
+    for (pid, presence) in window_presences_by(relay_dir, runs_an_aterm_image) {
+        let holds = match presence {
+            WindowPresence::Answers { applies } => applies.then_some(UpdateHolder::Answering),
+            WindowPresence::Silent => {
+                silent_window_holds(updater, pid, waiting).then_some(UpdateHolder::Silent)
+            }
+            WindowPresence::Gone => None,
+        };
+        holder = holder.max(holds);
+    }
+    holder
+}
+
+/// The window that holds the node job's install of a waiting build ([`a_window_holds_the_update`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum UpdateHolder {
+    /// A window whose process lives but whose relay does not answer ([`WindowPresence::Silent`]):
+    /// it holds the install for its bound, and owns no boot trial, since it can neither launch
+    /// nor confirm one.
+    Silent,
+    /// A window that answers and applies this Mac's updates itself.
+    Answering,
+}
+
+/// What this run has said of each silent window, by pid: whether it held at the last say.
+static SILENT_WINDOWS_SAID: Mutex<BTreeMap<u32, bool>> = Mutex::new(BTreeMap::new());
+
+/// Whether the silent window `pid` holds the node job's install of `waiting`: as an answering window
+/// that applies its updates does, for [`WINDOW_HOLDS_AN_UPDATE_WITHIN`], read here on the pending
+/// clock the update check keeps for the waiting build ([`NodeUpdater::waited_for`]), which the
+/// first ask starts and a restart of the job does not restart. A frozen window therefore never
+/// holds an update for good: past the bound the job installs beside it, as it does beside a window
+/// that said it no longer holds. A look with no waiting build has nothing to hold, and holds. Each
+/// change of what a window does is said once in this run's journal.
+fn silent_window_holds(updater: &dyn NodeUpdater, pid: u32, waiting: Option<u64>) -> bool {
+    let waited = waiting.map(|build| updater.waited_for(build));
+    let holds = waited.is_none_or(|waited| waited < WINDOW_HOLDS_AN_UPDATE_WITHIN);
+    let said = SILENT_WINDOWS_SAID.lock_or_recover().insert(pid, holds);
+    if said != Some(holds) {
+        let bound = WINDOW_HOLDS_AN_UPDATE_WITHIN.as_secs() / 60;
+        if holds {
+            aterm_log::info!(
+                "aterm node serve: window pid {pid} is alive but its relay does not answer; it \
+                 holds this Mac's updates as a window that applies them, for at most {bound} min \
+                 of a waiting build's wait here"
+            );
+        } else {
+            aterm_log::warn!(
+                "aterm node serve: window pid {pid} is alive but its relay has not answered while \
+                 build {} waited here {} min, past its {bound} min hold: the job installs it",
+                waiting.unwrap_or(0),
+                waited.unwrap_or_default().as_secs() / 60
+            );
+        }
+    }
+    holds
 }
 
 /// Whether any process's relay answers here, whether or not it applies updates: the node health
 /// check asks it of `node-port.lock` held elsewhere ([`checkpoint_idle`]), where an answer is all it
 /// needs. A relay file nothing listens on is no answer. It never asks WindowServer.
 fn a_window_relay_answers(relay_dir: &Path) -> bool {
-    window_relay_paths(relay_dir).any(|relay| relay_answers(&relay))
-}
-
-/// The `wf-<pid>.sock` files in `relay_dir`, live or not.
-fn window_relay_paths(relay_dir: &Path) -> impl Iterator<Item = PathBuf> {
-    std::fs::read_dir(relay_dir)
+    window_relays(relay_dir)
         .into_iter()
-        .flatten()
-        .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .and_then(parse_relay_filename)
-                .is_some()
-        })
-        .map(|entry| entry.path())
+        .any(|(_, relay)| relay_answers(&relay))
 }
 
 /// Whether the relay socket at `path` takes a connect from this account; the connection is hung
@@ -2349,50 +2799,32 @@ fn relay_answers(path: &Path) -> bool {
     ours
 }
 
-/// Whether the relay socket at `path` takes a connect from this account and its process applies
-/// updates, by what it answers to [`RelayHeader::Applies`].
-fn relay_applies(path: &Path) -> bool {
-    let Ok(mut stream) = aterm_uds::connect::until(path, Instant::now() + RELAY_CONNECT_TIMEOUT)
-    else {
-        return false;
-    };
-    let ours = crate::control_auth::peer_check(&stream).is_ok();
-    let applies = ours && {
-        let _ = stream.set_read_timeout(Some(RELAY_CONNECT_TIMEOUT));
-        let _ = stream.set_write_timeout(Some(RELAY_CONNECT_TIMEOUT));
-        let asked = stream
-            .write_all(RelayHeader::Applies.encode().as_bytes())
-            .and_then(|()| stream.flush());
-        let reply = asked
-            .ok()
-            .and_then(|()| read_line_raw(&mut stream, RELAY_HEADER_MAX).ok().flatten());
-        relay_reply_applies(reply.as_deref())
-    };
-    aterm_uds::hangup::hang_up(&stream);
-    applies
-}
-
-/// Whether a relay's reply to [`RelayHeader::Applies`] leaves the applying to its process. Only
-/// `no` says otherwise: an older build refuses a command it does not know, and a relay that answers
-/// nothing cannot be told from a window that applies, so each is held for as a window has always
-/// been. Such an older headless or dev process holds the job until it exits or updates, as does an
-/// older window, whose answer is read once for its process and never runs out.
-fn relay_reply_applies(reply: Option<&str>) -> bool {
-    reply != Some("no\n")
-}
-
 /// The node job's boot (§4.13, A4), before its Commons runtime, listener or checker starts. The
-/// boot apply runs with `[update] auto_apply` on and no window here that applies it (a window that
-/// says it does applies its own), whatever this job's look at the stage finds, since the apply reads
-/// the stage itself. With
+/// boot apply runs with `[update] auto_apply` on and no window here that holds it
+/// ([`a_window_holds_the_update`]: a window that says it applies it applies its own, and one whose
+/// process lives but whose relay does not answer holds it as long), whatever this job's look at
+/// the stage finds, since the apply reads the stage itself. A window that does not answer holds
+/// only the apply: it can neither launch nor confirm a trial, so a start beside it still counts and
+/// recovers this build's armed headless trial, and a build that crash-loops under launchd beside a
+/// frozen window is still reverted. With
 /// automatic installation off, or a setting that could not be read, a windowless start only counts and
 /// recovers an already-armed trial, so a build that crash-loops under launchd is still reverted and the
 /// restored build re-execed (`ImageReplacement::Replaceable`) without admitting a stage: Install, or a
-/// later look, owns that decision. A boot that applies a stage never returns.
+/// later look, owns that decision. A boot that applies a stage never returns. Its apply leaves
+/// staged the exact bytes a window here saw fail to start, for a window to try, arms nothing for
+/// them, and installs nothing else in their place; [`NodeUpdater::newer_build`] names no such
+/// stage, so this start logs no failure to run it.
 pub(crate) fn apply_at_node_boot(updater: &dyn NodeUpdater, relay_dir: &Path) -> NodeBoot {
     let started = updater.now();
     let newer = updater.newer_build();
-    let held = if a_window_that_applies_answers(relay_dir) {
+    let held = if let Some(holder) = a_window_holds_the_update(updater, relay_dir, newer) {
+        if holder == UpdateHolder::Silent && updater.trial_pending() {
+            let recovery = updater.recover_trial_at_boot();
+            aterm_log::info!(
+                "aterm node serve: boot trial recovery beside a window that does not answer: \
+                 {recovery}"
+            );
+        }
         Some("a window runs here, which applies it")
     } else if !updater.auto_apply() {
         let recovery = updater.recover_trial_at_boot();
@@ -2427,32 +2859,37 @@ pub(crate) fn apply_at_node_boot(updater: &dyn NodeUpdater, relay_dir: &Path) ->
 }
 
 /// The build a node run ends for now, so its next start runs it (§4.13): a newer build waits,
-/// `[update] auto_apply` is on, no window here says it applies it, and within [`RETRY_LEFT_AFTER`]
-/// of this run's start neither of these holds: its boot already found that build and failed to run
-/// it, or a trial is active. A start during a trial counts against a build whose listener has not missed and runs
-/// nothing newer, since an armed trial applies nothing, so the build waits for it to settle. A trial
-/// the updater still refuses to settle an hour on gives way, each such start counted: three revert it,
-/// and the waiting build follows. Each question is asked only once those before it say go, so the
-/// relays are dialled last.
+/// `[update] auto_apply` is on, no window here holds it ([`a_window_holds_the_update`]), no trial
+/// is active, and this run's boot did not already find that build and fail to run it within
+/// [`RETRY_LEFT_AFTER`] of its start. A start during a trial runs nothing newer, since an armed
+/// trial applies nothing, so the build waits for the trial to settle (the run's own looks confirm
+/// it, or end the run on misses that last), however long: a restart while it stands would only
+/// end the job's service, since each run's deliberate end gives its launch back
+/// ([`NodeUpdater::forgive_launch`]) and the next start would meet the same armed trial. Each
+/// question is asked only once those before it say go, so the relays are dialled last. A stage
+/// of bytes a window here saw fail to start is no newer build ([`NodeUpdater::newer_build`]), so
+/// no run ends for a start that would leave them.
 fn restart_for(updater: &dyn NodeUpdater, boot: NodeBoot, relay_dir: &Path) -> Option<u64> {
     let build = updater.newer_build()?;
-    if updater.now().saturating_duration_since(boot.started) < RETRY_LEFT_AFTER
-        && (boot.left.is_some_and(|left| left >= build) || updater.trial_pending())
-    {
+    let left_within = updater.now().saturating_duration_since(boot.started) < RETRY_LEFT_AFTER
+        && boot.left.is_some_and(|left| left >= build);
+    if left_within || updater.trial_pending() {
         return None;
     }
-    (updater.auto_apply() && !a_window_that_applies_answers(relay_dir)).then_some(build)
+    (updater.auto_apply() && a_window_holds_the_update(updater, relay_dir, Some(build)).is_none())
+        .then_some(build)
 }
 
 /// The install over an activation the window here failed to switch to, with `[update] auto_apply`
 /// on, window or not: that window applies nothing newer while it waits on an activation it cannot
 /// reach, so a newer build would otherwise wait for it for good. That the window then takes the
 /// newer build from the install path is read in its code, not tested
-/// ([`aterm_update::install_over_failed_activation`]). The words the run ends with where the
-/// install path changed, else `None`.
+/// ([`aterm_update::install_over_failed_activation`]). It waits for this build's own trial to
+/// settle, as a changed setting does: the install would end a run whose listener has not missed.
+/// The words the run ends with where the install path changed, else `None`.
 fn install_over_a_failed_activation(updater: &dyn NodeUpdater) -> Option<String> {
     let waiting = updater.failed_activation()?;
-    if !updater.auto_apply() {
+    if !updater.auto_apply() || updater.trial_pending() {
         return None;
     }
     updater.install_over_failed_activation(waiting)
@@ -2465,7 +2902,8 @@ fn install_over_a_failed_activation(updater: &dyn NodeUpdater) -> Option<String>
 /// launch, and only a restart is this job's next launch. It waits for a trial to settle, since that
 /// start would count against a build whose listener has not missed. Then a newer stage installed
 /// over an activation the window here failed to switch to ([`install_over_a_failed_activation`]),
-/// window or not. Then [`restart_for`]'s newer build.
+/// window or not, once no trial is active. Then [`restart_for`]'s newer build. Each of these ends
+/// is deliberate, so the look gives back this run's trial launch first ([`spawn_node_look`]).
 fn why_the_run_ends(updater: &dyn NodeUpdater, boot: NodeBoot, relay_dir: &Path) -> Option<String> {
     if let Some(build) = updater.older_build_installed() {
         return Some(format!(
@@ -2531,6 +2969,8 @@ fn spawn_node_look(
             }));
             match decided {
                 Ok(Some(why)) => {
+                    // A deliberate end, no crash: only a crash and a failed trial count.
+                    updater.forgive_launch();
                     updater.restart(&why);
                     return;
                 }
@@ -2682,6 +3122,29 @@ struct LiveNodeUpdater {
     checker_watch: Mutex<crate::update_checker_watch::CheckerWatchState>,
     /// What this run's installs over a failed activation held for.
     failed_activation_holds: Arc<Mutex<FailedActivationHolds>>,
+    /// The waiting build this run first asked the wait of, and when ([`waited_or_since`]).
+    first_asked: Mutex<Option<(u64, Instant)>>,
+}
+
+/// How long `build` has waited: `clock`'s answer (the pending clock, which outlives this run), else
+/// the time since this run first asked for `build`, which `first` keeps (a newer build starts it
+/// again). Every ask records the first, so a clock that stops answering still bounds from then.
+#[cfg(any(target_os = "macos", test))]
+fn waited_or_since(
+    clock: Option<Duration>,
+    first: &Mutex<Option<(u64, Instant)>>,
+    build: u64,
+    now: Instant,
+) -> Duration {
+    let mut first = first.lock().unwrap_or_else(PoisonError::into_inner);
+    let since = match *first {
+        Some((asked, at)) if asked == build => at,
+        _ => {
+            *first = Some((build, now));
+            now
+        }
+    };
+    clock.unwrap_or_else(|| now.saturating_duration_since(since))
 }
 
 /// What a node run remembers of its installs over a failed activation
@@ -2954,11 +3417,32 @@ impl NodeUpdater for LiveNodeUpdater {
         )
     }
 
+    fn note_trial_miss(&self, why: &str) {
+        if !aterm_update::note_trial_miss(crate::running_build_number(), why) {
+            aterm_log::info!("aterm node serve: the update record noted no trial miss: {why}");
+        }
+    }
+
     fn restart(&self, why: &str) {
         // The stop and its deadline first: a log on a volume that stopped answering holds neither.
         self.stop.set();
         end_run_within(RUN_ENDS_WITHIN, end_stuck_run);
         aterm_log::info!("aterm node serve: {why}");
+    }
+
+    fn forgive_launch(&self) {
+        forgive_this_runs_launch();
+    }
+
+    fn waited_for(&self, build: u64) -> Duration {
+        let clock = look_within(
+            &STAGE_LOOKS,
+            LOOK_ANSWERS_WITHIN,
+            "the look at how long a build has waited",
+            None,
+            move || aterm_update::pending_update_waited(crate::running_build_number(), build),
+        );
+        waited_or_since(clock, &self.first_asked, build, Instant::now())
     }
 
     fn now(&self) -> Instant {
@@ -2993,6 +3477,7 @@ fn live_node_updater(stop: &Arc<Stop>) -> Option<Arc<dyn NodeUpdater>> {
             stop: Arc::clone(stop),
             checker_watch: Mutex::new(crate::update_checker_watch::CheckerWatchState::default()),
             failed_activation_holds: Arc::new(Mutex::new(FailedActivationHolds::default())),
+            first_asked: Mutex::new(None),
         }))
     }
     #[cfg(not(target_os = "macos"))]
@@ -3201,7 +3686,8 @@ fn claims_off_on_quit(relay_dir: &Path, off: &dyn Fn()) -> bool {
 /// `off` (production passes `harness_host::claims_off_as_the_node_job_stops`), the host's quit
 /// step (`crate::host_quit::run`, bounded by its host: the job's Commons runtime stops and
 /// closes the network history), and `state_dir`'s fleet times this job noted and holds
-/// unwritten ([`write_seen_at_quit`]); then the job dies of that signal as it did before
+/// unwritten ([`write_seen_at_quit`]), then this run's trial launch given back
+/// ([`forgive_this_runs_launch`]); then the job dies of that signal as it did before
 /// (`crate::owned_endpoint::arm_orderly_quit`; a second signal ends it at once). This is the
 /// job's usual end: launchd stops it with SIGTERM, and its serve loop returns only for an
 /// update's restart.
@@ -3210,6 +3696,10 @@ fn arm_claims_off_on_quit(relay_dir: PathBuf, state_dir: PathBuf, off: fn()) {
         claims_off_on_quit(&relay_dir, &off);
         crate::host_quit::run();
         write_seen_at_quit(&state_dir);
+        // A stop asked of the job is no crash: its launch does not count against a trial. Last,
+        // since the give-back may wait on an install's apply lock, and the claims' release and
+        // the seen times must not spend launchd's exit allowance on it.
+        forgive_this_runs_launch();
         // The quit ends the process without the keepers' drops: all three logs close first, so
         // its weak tier is flushed in full and marked closed (C2).
         aterm_mesh::logs::close_bus_at_quit();
@@ -3220,6 +3710,18 @@ fn arm_claims_off_on_quit(relay_dir: PathBuf, state_dir: PathBuf, off: fn()) {
             "aterm node serve: a terminating signal ends this job at once: its account claims' \
              release could not be armed ({err}); with no window open this Mac's claims stand \
              until their rows lapse"
+        );
+    }
+}
+
+/// Give back the launch this run of the job counted against its build's boot trial, if it counted
+/// one, as a run ends by choice (an update's restart, a terminating signal). It says what it did
+/// where it gave one back.
+fn forgive_this_runs_launch() {
+    if aterm_update::forgive_own_trial_launch(crate::running_build_number()) {
+        aterm_log::info!(
+            "aterm node serve: this run ends by choice, so its launch no longer counts against \
+             its build's boot trial"
         );
     }
 }
@@ -4891,17 +5393,6 @@ fn serve_one_node_generation(
                         return;
                     }
 
-                    if let Some(updates) = &updates_watch
-                        && !updates.settle_service(
-                            &health_inputs,
-                            (addr, &secret_watch, &proved, &initial_listen),
-                            &stop,
-                        )
-                    {
-                        listener_stop.set();
-                        return;
-                    }
-
                     let mut log = members_watch.as_ref().and_then(|members| members.keys());
                     if let Some(automatic) = &automatic {
                         automatic.observe_membership(log.as_ref());
@@ -4939,6 +5430,18 @@ fn serve_one_node_generation(
                     // A link to a key the log took out ends now, not at its next re-proof.
                     if let Some(table) = &neighbours_watch {
                         table.judge();
+                    }
+                    // The trial's self-dial may wait out its reply bound: it runs after the deny
+                    // list's cuts and the log's judgment, which it must not delay.
+                    if let Some(updates) = &updates_watch
+                        && !updates.settle_service(
+                            &health_inputs,
+                            (addr, &secret_watch, &proved, &initial_listen),
+                            &stop,
+                        )
+                    {
+                        listener_stop.set();
+                        return;
                     }
                     // The mail pushes route by the log as the mesh applied it (C3).
                     if let Some(mail) = mail_watch.as_ref().and_then(std::sync::Weak::upgrade) {

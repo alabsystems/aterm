@@ -928,6 +928,7 @@ fn sweep_opts(home: &Path, harness_state: &Path) -> Opts {
 
 fn report(tab: &str, from: &str, to: &str, step: &str) -> Report {
     Report {
+        rung: None,
         pid: 42,
         tab: tab.to_string(),
         session: "c-1".to_string(),

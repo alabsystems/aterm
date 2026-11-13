@@ -361,12 +361,11 @@ pub const fn clamp01(t: f32) -> f32 {
     if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) }
 }
 
-/// Hermite smoothstep on `[0, 1]`, clamped.
+/// Hermite easing of animation progress; NaN starts at zero.
 #[inline]
 #[must_use]
 pub const fn smoothstep01(t: f32) -> f32 {
-    let u = clamp01(t);
-    u * u * (3.0 - 2.0 * u)
+    aterm_scene::smoothstep(if t.is_nan() { 0.0 } else { t })
 }
 
 #[cfg(test)]

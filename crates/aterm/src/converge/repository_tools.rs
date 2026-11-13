@@ -246,7 +246,7 @@ fn admit(
             policy()?;
             if !ready
                 .snapshot
-                .is_current_now(&paths)
+                .is_current(&paths)
                 .map_err(|why| why.to_string())?
             {
                 return Err(super::REPOSITORIES_SYNCING.into());
@@ -347,7 +347,11 @@ impl Item for Prerequisites {
             .as_ref()
             .ok_or("repository tools have no admitted source")?;
         if let Some(selection) = &ready.credential {
-            let _ = selection.request_credential(self.sys.as_ref(), ready.current.as_ref())?;
+            let _ = selection.request_credential(
+                self.sys.as_ref(),
+                ready.current.as_ref(),
+                ready.continuing.as_ref(),
+            )?;
             *self.aside.lock().unwrap_or_else(PoisonError::into_inner) =
                 Some(StoodAside::Waiting(selection.waiting()));
             return Ok(());

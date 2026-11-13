@@ -354,30 +354,15 @@ pub fn struct_note(os: Os, name: &str) -> Option<&'static str> {
     }
 }
 
-const VM_STATISTICS64: &str = r"UPSTREAM-PARITY DIVERGENCE FROM THE PLATFORM SDK, inherited and deliberate.
+const VM_STATISTICS64: &str = r"UPSTREAM-PARITY LAYOUT.
 
-libc 0.2.186 declares this struct at Mach **rev1** -- the 24 fields and 152
-bytes measured here. The SDK on the machine that generated this file
-(`MacOSX.sdk/usr/include/mach/vm_statistics.h`) is at **rev3**: 36 fields and
-248 bytes, rev2 having added `swapped_count` and rev3 eleven more counters.
-This crate reproduces UPSTREAM byte-for-byte, so the oracle is green on it and
-the crates.io `libc` it replaces would behave identically.
-
-That parity is the decision, not an oversight. It was declared because rustix
-names it: `pub(super) use host_statistics64 as host_statistics, vm_statistics64_t
-as vm_statistics_t` in `src/backend/libc/c.rs` (0.38.44 and 1.1.4, called by
-neither). Since 2026-09-24 ONE caller exists: `aterm-sysprobe` reads `swapins`
-and `swapouts` for the memory ceiling, and it passes upstream's own
-`HOST_VM_INFO64_COUNT` -- THIS layout's size in words, 38 -- so the kernel
-writes the rev1 prefix and nothing past it. Both fields it reads are rev1
-fields. For a drop-in replacement, differing from the crate it replaces is
-still the worse property.
-
-This layout is NOT the one to hand `host_statistics64` alongside an SDK-derived
-`HOST_VM_INFO64_COUNT` (62 words): the kernel would write 248 bytes into 152.
-A caller that needs a rev2 or rev3 counter widens it here deliberately, and
-states the divergence where the oracle can see it rather than leaving it
-silent.";
+This declaration follows the measured reference libc 0.2.191, including its
+extended counters. HOST_VM_INFO64_COUNT is measured from the same reference
+layout; callers must keep that count paired with this buffer, rather than
+substituting an independently obtained SDK count. aterm-sysprobe passes this
+paired count and reads only the original swapins/swapouts fields. The kernel
+may return fewer words on older systems; the caller zero-initializes the
+complete buffer before the query.";
 
 const DARWIN_SIGINFO: &str = r"impl siginfo_t {
     /// # Safety
@@ -431,6 +416,180 @@ const DARWIN_SIGINFO: &str = r"impl siginfo_t {
 }";
 
 const GNU_LINUX_SIGINFO: &str = r"impl siginfo_t {
+    // The supported GNU cells are 64-bit x86_64/aarch64. These views follow
+    // libc 0.2.191 new/glibc/sysdeps/unix/linux/bits/types/siginfo_t.rs.
+
+    /// # Safety
+    /// The caller must know the signal initializes the timer union arm.
+    pub unsafe fn si_timerid(&self) -> c_int {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            timer: c_int, _overrun: c_int,
+        }
+        // SAFETY: The caller selects the initialized arm; this repr(C) view
+        // follows the reference's four-word prefix and that arm's field order.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).timer }
+    }
+
+    /// # Safety
+    /// The caller must know the signal initializes the timer union arm.
+    pub unsafe fn si_overrun(&self) -> c_int {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            _timer: c_int, overrun: c_int,
+        }
+        // SAFETY: The caller selects the initialized arm; this repr(C) view
+        // follows the reference's four-word prefix and that arm's field order.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).overrun }
+    }
+
+    /// # Safety
+    /// The caller must know the signal initializes the fault union arm.
+    pub unsafe fn si_addr_lsb(&self) -> c_short {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            _address: *mut c_void, lsb: c_short,
+        }
+        // SAFETY: The caller selects the initialized arm; this repr(C) view
+        // follows the reference's four-word prefix and that arm's field order.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).lsb }
+    }
+
+    /// # Safety
+    /// The caller must know the signal initializes the bounds union arm.
+    pub unsafe fn si_lower(&self) -> *mut c_void {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            _address: *mut c_void, _lsb: c_short, lower: *mut c_void, _upper: *mut c_void,
+        }
+        // SAFETY: The caller selects the initialized arm; this repr(C) view
+        // follows the reference's four-word prefix and that arm's field order.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).lower }
+    }
+
+    /// # Safety
+    /// The caller must know the signal initializes the bounds union arm.
+    pub unsafe fn si_upper(&self) -> *mut c_void {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            _address: *mut c_void, _lsb: c_short, _lower: *mut c_void, upper: *mut c_void,
+        }
+        // SAFETY: The caller selects the initialized arm; this repr(C) view
+        // follows the reference's four-word prefix and that arm's field order.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).upper }
+    }
+
+    /// # Safety
+    /// The caller must know the signal initializes the fault pkey union arm.
+    pub unsafe fn si_pkey(&self) -> u32 {
+        #[repr(C)]
+        union Bounds {
+            _alignment: *mut c_void,
+            pkey: u32,
+        }
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            _address: *mut c_void, _lsb: c_short, bounds: Bounds,
+        }
+        // SAFETY: The caller selects the initialized pkey arm. Bounds retains
+        // the reference union's pointer alignment, but reads only its u32 arm,
+        // never the potentially uninitialized bytes following that scalar.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).bounds.pkey }
+    }
+
+    /// # Safety
+    /// The caller must know the signal initializes the poll union arm.
+    pub unsafe fn si_band(&self) -> c_long {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            band: c_long, _fd: c_int,
+        }
+        // SAFETY: The caller selects the initialized arm; this repr(C) view
+        // follows the reference's four-word prefix and that arm's field order.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).band }
+    }
+
+    /// # Safety
+    /// The caller must know the signal initializes the poll union arm.
+    pub unsafe fn si_fd(&self) -> c_int {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            _band: c_long, fd: c_int,
+        }
+        // SAFETY: The caller selects the initialized arm; this repr(C) view
+        // follows the reference's four-word prefix and that arm's field order.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).fd }
+    }
+
+    /// # Safety
+    /// The caller must know the signal initializes the syscall union arm.
+    pub unsafe fn si_call_addr(&self) -> *mut c_void {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            address: *mut c_void, _syscall: c_int, _arch: c_uint,
+        }
+        // SAFETY: The caller selects the initialized arm; this repr(C) view
+        // follows the reference's four-word prefix and that arm's field order.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).address }
+    }
+
+    /// # Safety
+    /// The caller must know the signal initializes the syscall union arm.
+    pub unsafe fn si_syscall(&self) -> c_int {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            _address: *mut c_void, syscall: c_int, _arch: c_uint,
+        }
+        // SAFETY: The caller selects the initialized arm; this repr(C) view
+        // follows the reference's four-word prefix and that arm's field order.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).syscall }
+    }
+
+    /// # Safety
+    /// The caller must know the signal initializes the syscall union arm.
+    pub unsafe fn si_arch(&self) -> c_uint {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            _address: *mut c_void, _syscall: c_int, arch: c_uint,
+        }
+        // SAFETY: The caller selects the initialized arm; this repr(C) view
+        // follows the reference's four-word prefix and that arm's field order.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).arch }
+    }
+
+    /// # Safety
+    /// The caller must know the queued signal initializes its integer value.
+    pub unsafe fn si_int(&self) -> c_int {
+        #[repr(C)]
+        struct View {
+            _header: [c_int; 4],
+            _pid: pid_t,
+            _uid: uid_t,
+            value: c_int,
+        }
+        // SAFETY: The caller establishes the queued integer field. This reads
+        // that c_int alone, not the padding of the pointer-sized value union.
+        unsafe { (*(self as *const siginfo_t).cast::<View>()).value }
+    }
+
+    /// # Safety
+    /// The caller must know the queued signal initializes its value arm.
+    pub unsafe fn si_ptr(&self) -> *mut c_void {
+        // SAFETY: The caller establishes the queued-value arm.
+        unsafe { self.si_value().sival_ptr }
+    }
+
     /// # Safety
     ///
     /// The caller must know the signal was one that sets `si_addr`

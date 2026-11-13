@@ -60,7 +60,10 @@ fn every_reply_is_real_work_and_a_done_claim_of_its_own() {
         assert!(needs_you(r).is_empty(), "{r}");
         assert_eq!(open_work(Some(r)), Vec::<&str>::new(), "{r}");
         assert!(!MUSE_HEADS.iter().any(|h| r.starts_with(h)), "{r}");
-        assert!(!r.contains('\n'), "{r}");
+        let words = r
+            .strip_suffix("\n\nATERM-TASK-DONE")
+            .expect("the token line");
+        assert!(!words.contains('\n'), "{r}");
         assert!(all[..i].iter().all(|before| before != r), "{i} again: {r}");
     }
     assert!(long_reply_ms(super::super::DONE_CLAIM) < floor_ms());

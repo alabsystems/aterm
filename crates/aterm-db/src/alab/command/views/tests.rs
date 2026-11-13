@@ -15,8 +15,9 @@ use std::path::Path;
 
 /// A rekey cut short right after its rename leaves no `database.json` at the replica's path: the
 /// nouns stay with fleet_db, each spelling of a verb names the rekey, and the import refuses alike.
-/// NEGATIVE CONTROL: with `serves` reading the missing file as no replica:
-/// `` assertion failed: !serves(paths) ``.
+/// NEGATIVE CONTROL: with `kept` reading the missing file as no replica:
+/// `` assertion failed: kept(paths).is_some() ``. With `handed_back` not asking whether a replica is at
+/// its path, the command line says it read one that is not there.
 #[test]
 fn a_rekey_cut_short_after_its_rename_keeps_the_nouns_with_fleet_db() {
     let lab = Lab::new(&[Role::Writer]);
@@ -32,7 +33,11 @@ fn a_rekey_cut_short_after_its_rename_keeps_the_nouns_with_fleet_db() {
     )
     .unwrap();
 
-    assert!(!serves(paths));
+    assert!(kept(paths).is_some());
+    // No replica is at its path, so the command line adds no word of its own: fleet_db's
+    // refusal names the rekey.
+    let why = kept(paths).unwrap();
+    assert!(handed_back(paths, Noun::Emails, &why).is_none());
     for line in [
         &["emails"][..],
         &["emails", "--edit"],
@@ -885,16 +890,34 @@ fn a_killed_sessions_grid_folder_is_swept_at_the_next_edit() {
 }
 
 /// The four nouns serve from the registry once any import filled it, or where no fleet_db
-/// replica is; before that, a Mac holding a replica keeps fleet_db's views.
+/// replica is; before that, a Mac holding a replica keeps fleet_db's views, and the command line
+/// says so and why: the registry cannot be read here, or it reads and no import has filled it.
+/// NEGATIVE CONTROL: with `kept` taking a registry that cannot be read for one that is empty (or
+/// the reverse), the matching `matches!` fails.
 #[test]
 fn the_registry_takes_the_nouns_once_imported_or_where_no_replica_is() {
     let lab = Lab::new(&[Role::Writer]);
     let paths = &lab.paths[0];
-    assert!(serves(paths), "no replica here");
+    assert!(kept(paths).is_none(), "no replica here");
     let dir = replica_fixture(paths, 1, "active");
     assert!(
-        !serves(paths),
+        kept(paths).is_some(),
         "a replica and an empty registry: fleet_db keeps them"
+    );
+    // Why they stay there is said, and the two reasons are told apart: a registry this Mac
+    // cannot read, and one it reads that no import has filled.
+    let unread = kept(paths).unwrap();
+    assert!(
+        matches!(unread, Kept::Unread(_)),
+        "no registry is declared here"
+    );
+    assert!(handed_back(paths, Noun::AiAccounts, &unread).is_some());
+    Handle::at(paths.clone(), &att::REGISTRY)
+        .publish_schema()
+        .unwrap();
+    assert!(
+        matches!(kept(paths), Some(Kept::Empty)),
+        "declared, and holding no source row"
     );
     // A record of this Mac's own import keeps the nouns with the registry, whatever it reads.
     let record = crate::alab::import::covered::Record {
@@ -906,10 +929,10 @@ fn the_registry_takes_the_nouns_once_imported_or_where_no_replica_is() {
         sources: std::collections::BTreeSet::new(),
     };
     crate::alab::import::covered::write(&dir, &record, &[]).unwrap();
-    assert!(serves(paths), "this Mac's import ran");
+    assert!(kept(paths).is_none(), "this Mac's import ran");
     std::fs::remove_file(dir.join(crate::alab::import::covered::FILE)).unwrap();
     assert!(
-        !serves(paths),
+        kept(paths).is_some(),
         "the negative control: no record, an empty registry"
     );
     let mut never = |_: &Path| -> Result<()> { panic!("no review") };
@@ -921,7 +944,7 @@ fn the_registry_takes_the_nouns_once_imported_or_where_no_replica_is() {
         NOW,
     )
     .unwrap();
-    assert!(serves(paths));
+    assert!(kept(paths).is_none());
     let (email, _) = email_row(1, "active");
     assert_eq!(Noun::parse("emails"), Some(Noun::Emails));
     assert_eq!(Noun::parse("ai_accounts"), Some(Noun::AiAccounts));

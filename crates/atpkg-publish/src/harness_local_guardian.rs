@@ -24,6 +24,7 @@ use crate::error::{Error, Result};
 mod owned;
 
 const GUARD: &str = "__harness_local_guard";
+const DETACH: &str = "__harness_local_detach";
 const WORKER: &str = "__harness_local_worker";
 #[cfg(any(test, debug_assertions))]
 const FIXTURE_CLIENT: &str = "__harness_local_fixture_client";
@@ -31,6 +32,12 @@ const FIXTURE_CLIENT: &str = "__harness_local_fixture_client";
 const FIXTURE_LEAF: &str = "__harness_local_fixture_leaf";
 const TICK: Duration = Duration::from_millis(100);
 const START_WITHIN: Duration = Duration::from_secs(60);
+/// How long the detach process waits for its child's exec report. Under the client's
+/// [`START_WITHIN`], so a held exec is recorded before the client gives up.
+const EXEC_WITHIN: Duration = Duration::from_secs(30);
+/// The forked child's own line for a failed exec, written before its report: the private
+/// log names the failure whether or not anything still reads the report.
+const EXEC_FAILED: &[u8] = b"atpkg-publish: the local update owner could not exec its image\n";
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -310,7 +317,7 @@ fn stopping(signalled: &AtomicBool, line: &RefCell<OnWake>) -> bool {
     signalled.load(Ordering::SeqCst) || line.borrow_mut().cut().is_some()
 }
 
-/// Called first by the executable: only the guardian's early arm forks, before threads.
+/// Called first by the executable: the detach entry forks and immediately execs the owner.
 /// Normal publication commands return None and retain their existing entry.
 #[must_use = "return a handled guardian command's exit status to the caller"]
 pub fn early_entry() -> Option<ExitCode> {
@@ -351,21 +358,17 @@ pub fn early_entry() -> Option<ExitCode> {
             }
         });
     }
-    if verb != GUARD && verb != WORKER {
+    if verb != DETACH && verb != GUARD && verb != WORKER {
         return None;
     }
-    let result = if verb == GUARD {
+    let result = if verb == DETACH || verb == GUARD {
         if args.len() != 4 || args[2] != lifeline::FLAG || args[3] != "0" {
             return Some(ExitCode::from(2));
         }
-        // SAFETY: the binary calls this as main's first operation, before any thread or
-        // library initialization. fork takes no pointers. The parent runs no exit handlers.
-        match unsafe { libc::fork() } {
-            0 => guard(Path::new(&args[1])),
-            pid if pid > 0 => unsafe { libc::_exit(0) },
-            _ => Err(Error::cannot_run(
-                "the local manager could not detach its owner",
-            )),
+        if verb == DETACH {
+            detach(Path::new(&args[1]))
+        } else {
+            guard(Path::new(&args[1]))
         }
     } else {
         if args.len() != 2 {
@@ -380,6 +383,212 @@ pub fn early_entry() -> Option<ExitCode> {
             ExitCode::from(error.exit_code())
         }
     })
+}
+
+/// What the detach process read from its child's close-on-exec report pipe. Only
+/// [`Exec::Failed`] is a fact about the owner (there is none); the owner's own
+/// acknowledgement, which the client reads, is the one proof that an owner runs.
+#[derive(Debug)]
+enum Exec {
+    /// The pipe closed with nothing written: no exec error was reported. An exec closes
+    /// it, and so does a child that a signal ended before its exec, so this does not say
+    /// that a new image started.
+    Unreported,
+    /// The child reported the error `execve` returned with, and ended.
+    Failed(std::io::Error),
+    /// No verdict: the exec is still held at the bound, or the report could not be read.
+    /// The child may yet become the owner.
+    Unknown(String),
+}
+
+/// Read the forked child's exec report for at most `within`: never an unbounded read, because
+/// the system can hold an exec (macOS assesses a program before it starts) and the write end
+/// stays open in the child until the exec happens. The bound is judged after every wake, a
+/// timeout or an interrupting signal alike.
+fn exec_report(report: &std::io::PipeReader, within: Duration) -> Exec {
+    use std::io::Read as _;
+    use std::os::fd::AsRawFd as _;
+
+    let by = Instant::now() + within;
+    let mut word = [0u8; 4];
+    let mut got = 0;
+    while got < word.len() {
+        let left = by.saturating_duration_since(Instant::now());
+        let mut ready = libc::pollfd {
+            fd: report.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `ready` is one live pollfd naming a descriptor this borrow keeps open.
+        let polled = unsafe {
+            libc::poll(
+                &raw mut ready,
+                1,
+                i32::try_from(left.as_nanos().div_ceil(1_000_000)).unwrap_or(i32::MAX),
+            )
+        };
+        // A ready pipe is read without blocking. A timeout joins an interrupting signal:
+        // nothing to read yet, and the bound is judged below.
+        let read = match polled {
+            0 => Err(std::io::ErrorKind::Interrupted.into()),
+            n if n < 0 => Err(std::io::Error::last_os_error()),
+            _ => (&*report).read(&mut word[got..]),
+        };
+        match read {
+            Ok(0) => break,
+            Ok(n) => got += n,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                if Instant::now() >= by {
+                    return Exec::Unknown(format!(
+                        "the system still holds its exec after {} s",
+                        within.as_secs()
+                    ));
+                }
+            }
+            Err(error) => return Exec::Unknown(format!("its exec report is unreadable: {error}")),
+        }
+    }
+    match got {
+        0 => Exec::Unreported,
+        n if n == word.len() => {
+            Exec::Failed(std::io::Error::from_raw_os_error(i32::from_ne_bytes(word)))
+        }
+        _ => Exec::Unknown("its exec report was cut short".into()),
+    }
+}
+
+/// Fork a child that only execs `program`, and read its exec report for at most `within`.
+/// Returns the child's pid with what was read; the child never returns. A failed exec's line
+/// goes to `log`, a descriptor open in this process.
+///
+/// # Safety
+/// `program` is a NUL-terminated path, and `argv` and `envp` are NULL-terminated arrays of
+/// pointers to NUL-terminated strings, all alive for the call.
+unsafe fn exec_detached(
+    program: &std::ffi::CStr,
+    argv: &[*const libc::c_char],
+    envp: &[*const libc::c_char],
+    log: std::os::fd::RawFd,
+    within: Duration,
+) -> Result<(libc::pid_t, Exec)> {
+    use std::os::fd::AsRawFd as _;
+
+    // Both ends are close-on-exec and kept out of every other fork and spawn
+    // (`aterm_uds::pipe`): an exec closes the child's write end, which the parent reads as end
+    // of file, and the owner inherits neither end. This fork alone is handed the write end.
+    let (report, reporter) = aterm_uds::pipe().map_err(|e| Error::io("owner exec report", &e))?;
+    let reporter_fd = reporter.as_raw_fd();
+    let handing = aterm_uds::spawn_lock::handing(&[reporter_fd]);
+    // SAFETY: fork takes no pointers. The child calls only the async-signal-safe execve,
+    // write and _exit, on data prepared before the fork and kept alive by the caller: no
+    // allocator, destructor, lock or ACL code runs there, whatever threads the parent has.
+    let forked = unsafe { libc::fork() };
+    match forked {
+        0 => unsafe {
+            libc::execve(program.as_ptr(), argv.as_ptr(), envp.as_ptr());
+            exec_failed(log, reporter_fd)
+        },
+        pid if pid > 0 => {
+            drop(handing);
+            drop(reporter);
+            Ok((pid, exec_report(&report, within)))
+        }
+        _ => Err(Error::io(
+            "the local manager could not detach its owner",
+            &std::io::Error::last_os_error(),
+        )),
+    }
+}
+
+/// The forked child after `execve` returned: log the failure, report its error, and end.
+///
+/// The line is written first and always. The report cannot stand in for it: once the parent
+/// stopped at its bound no reader is left, and the report's write fails.
+///
+/// # Safety
+/// Only in the forked child, with `log` an open descriptor and `report` the write end of
+/// its exec report pipe.
+unsafe fn exec_failed(log: std::os::fd::RawFd, report: std::os::fd::RawFd) -> ! {
+    // Reads errno only: an OS error holds its code inline, with no allocation.
+    let word = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(0)
+        .to_ne_bytes();
+    // SAFETY: write and _exit are async-signal-safe; `EXEC_FAILED` and `word` are live.
+    unsafe {
+        libc::write(log, EXEC_FAILED.as_ptr().cast(), EXEC_FAILED.len());
+        libc::write(report, word.as_ptr().cast(), word.len());
+        libc::_exit(127)
+    }
+}
+
+/// Prepare all Rust-owned data before fork. The child must exec before calling any
+/// Rust or platform service: Darwin's ACL reader can fail with EINVAL after fork.
+///
+/// The detach process fails only where it knows no owner exists: before the fork, on a
+/// failed fork, or on the exec error its child reported before ending. Otherwise it ends
+/// with success, which claims nothing: the child may have started the owner's image, still
+/// be held before it, or have been ended by a signal. The owner's acknowledgement decides.
+fn detach(dir: &Path) -> Result<()> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let boot: Boot = require(dir, "boot.json")?;
+    boot.image.check()?;
+    let cstring = |bytes: &[u8]| {
+        CString::new(bytes).map_err(|_| Error::refused("guardian exec data contains NUL"))
+    };
+    let image = cstring(boot.image.path.as_os_str().as_bytes())?;
+    // A controlled body can name an image that is not there, for the failed-exec path.
+    #[cfg(any(test, debug_assertions))]
+    let program = if boot.controlled() && fs::read::<bool>(dir, "fail-exec.json")? == Some(true) {
+        cstring(dir.join("no-such-image").as_os_str().as_bytes())?
+    } else {
+        image.clone()
+    };
+    #[cfg(not(any(test, debug_assertions)))]
+    let program = image.clone();
+    let arguments = [
+        image,
+        cstring(GUARD.as_bytes())?,
+        cstring(dir.as_os_str().as_bytes())?,
+        cstring(lifeline::FLAG.as_bytes())?,
+        cstring(b"0")?,
+    ];
+    let environment: Vec<CString> = std::env::vars_os()
+        .map(|(key, value)| {
+            let mut entry = key.as_os_str().as_bytes().to_vec();
+            entry.push(b'=');
+            entry.extend_from_slice(value.as_os_str().as_bytes());
+            cstring(&entry)
+        })
+        .collect::<Result<_>>()?;
+    let argv: Vec<_> = arguments
+        .iter()
+        .map(|word| word.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    let envp: Vec<_> = environment
+        .iter()
+        .map(|word| word.as_ptr())
+        .chain(std::iter::once(std::ptr::null()))
+        .collect();
+    // SAFETY: `program`, `argv` and `envp` were built above from NUL-checked strings, each
+    // array ends in a null pointer, and their backing storage outlives the call. fd 0 remains
+    // the client lifeline, and stdout/stderr retain the private logs, the child's line among
+    // them.
+    let (_, exec) =
+        unsafe { exec_detached(&program, &argv, &envp, libc::STDERR_FILENO, EXEC_WITHIN) }?;
+    match exec {
+        Exec::Failed(error) => return Err(Error::io("exec the local update owner", &error)),
+        Exec::Unknown(reason) => {
+            eprintln!("atpkg-publish: the local update owner may still start: {reason}");
+        }
+        Exec::Unreported => {}
+    }
+    // SAFETY: _exit takes no pointers. Whatever became of the child is its own to
+    // acknowledge; this process ends without running exit handlers.
+    unsafe { libc::_exit(0) }
 }
 
 /// A controlled worker body for native process-ownership checks. It launches only this
@@ -567,7 +776,7 @@ fn launch_boot(boot: &Boot, dir: &Path) -> Result<()> {
     boot.image.check()?;
     let mut command = aterm_uds::spawnfd::command(&boot.image.path);
     command
-        .args([std::ffi::OsStr::new(GUARD), dir.as_os_str()])
+        .args([std::ffi::OsStr::new(DETACH), dir.as_os_str()])
         .setsid(true);
     command.stdout(
         private_file::open_private_rw(dir, "guardian.stdout")
@@ -601,9 +810,38 @@ fn launch_boot(boot: &Boot, dir: &Path) -> Result<()> {
                 dir.display()
             )));
         }
-        let _ = child.try_wait(); // Reap only the short-lived detach parent, never the owner.
+        // Reap only the short-lived detach process, never the owner. Its failure code says
+        // no owner exists (`detach`), so nothing can acknowledge: refuse now with its reason
+        // rather than at the startup bound. Its success, or its end by a signal, says nothing
+        // of the owner, whose acknowledgement alone arms this client.
+        let detached = child.try_wait();
+        if !armed
+            && let Ok(Some(status)) = detached
+            && status.code().is_some_and(|code| code != 0)
+        {
+            drop(lifeline.take());
+            return Err(Error::cannot_run(format!(
+                "local update owner did not start: {}; preserved {}",
+                detach_reason(dir),
+                dir.display()
+            )));
+        }
         std::thread::sleep(TICK);
     }
+}
+
+/// The last line the failed detach process left in its private log.
+fn detach_reason(dir: &Path) -> String {
+    private_file::read_private(dir, "guardian.stderr", 1 << 16)
+        .ok()
+        .and_then(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .lines()
+                .map(str::trim)
+                .rfind(|line| !line.is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| "its private log gives no reason".into())
 }
 
 /// One look at a launch directory: the owner's verdict once it has one, `None` while it works.

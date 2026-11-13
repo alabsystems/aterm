@@ -167,23 +167,32 @@ fn free_stage(holder: &Path, base: &OsStr) -> Option<PathBuf> {
 }
 
 /// THE STAGE `entry` WOULD BE RENAMED TO in `holder`, read and never acted on: the free stage
-/// name ([`free_stage`]), while `entry` itself can be renamed: it is no link, it is on
-/// `holder`'s volume (a volume mounted at it never moves), and this user may take its name out of
-/// `holder` (`platform::may_take_name`: on macOS its own flags and ACL and its folder's, as the
-/// rename itself is authorized; on Linux its folder's write bit, its own and its folder's
-/// immutable and append-only attributes, and a sticky folder's owners). A leaf or tooling entry
-/// is planned, and its intent asked, only while it is `Some`, so no plan lists, and no pass
-/// records, a removal no rename can start. What changes after this reading (a flag, an ACL entry
-/// or a folder mode set since, a volume mounted there, or an attribute no reading here sees) can
-/// still refuse the rename once the intent is on record: that intent closes with
-/// [`Unused::Refused`] ([`Intents`]), the entry left as it was.
+/// name ([`free_stage`]), while `entry` itself can be renamed out of `holder` ([`movable`]). A
+/// leaf or tooling entry is planned, and its intent asked, only while it is `Some`, so no plan
+/// lists, and no pass records, a removal no rename can start.
 fn stage_for(entry: &Path, holder: &Path, base: &OsStr) -> Option<PathBuf> {
     let stage = free_stage(holder, base)?;
-    let meta = std::fs::symlink_metadata(entry).ok()?;
-    let movable = !meta.file_type().is_symlink()
-        && same_volume(&meta, holder)
-        && crate::platform::may_take_name(entry);
-    movable.then_some(stage)
+    movable(entry, holder).then_some(stage)
+}
+
+/// WHETHER `entry` CAN BE RENAMED OUT OF ITS FOLDER `holder`, read and never acted on: it is no
+/// link, it is on `holder`'s volume (a volume mounted at it never moves), and this user may take
+/// its name out of `holder` (`platform::may_take_name`: on macOS its own flags and ACL and its
+/// folder's, as the rename itself is authorized; on Linux its folder's write bit, its own and its
+/// folder's immutable and append-only attributes, and a sticky folder's owners). A leaf or tooling
+/// entry's intent is asked only while it holds ([`stage_for`]), and so is a registered cache's
+/// whole retirement, whose root moves into a stage made in `holder` (review RV2, J2-1-R1): a root
+/// flagged before the pass is kept with no intent on record, rather than asked for, refused at its
+/// rename and asked for again every other pass, as before. What changes after this reading (a
+/// flag, an ACL entry or a folder mode set since, a volume mounted there, or an attribute no
+/// reading here sees) can still refuse the rename once the intent is on record: that intent
+/// closes with [`Unused::Refused`] ([`Intents`]), the entry left as it was.
+fn movable(entry: &Path, holder: &Path) -> bool {
+    std::fs::symlink_metadata(entry).is_ok_and(|meta| {
+        !meta.file_type().is_symlink()
+            && same_volume(&meta, holder)
+            && crate::platform::may_take_name(entry)
+    })
 }
 
 /// Whether the entry read as `meta` is on the volume of the folder `holder`.
@@ -515,7 +524,10 @@ elif [ -n "$__atb" ]; then
   if [ -n "$__atb_k" ]; then
     if [ -d "$__atb_c" ]; then [ -w "$__atb_c" ] || __atb_k=
     elif [ -d "${__atb_c%/*}" ]; then [ -w "${__atb_c%/*}" ] || __atb_k=
-    else [ -w "$HOME/Library/Caches" ] || __atb_k=
+    elif [ -d "$HOME/Library/Caches" ]; then [ -w "$HOME/Library/Caches" ] || __atb_k=
+    elif [ -d "$HOME/Library" ]; then [ -w "$HOME/Library" ] || __atb_k=
+    elif [ -d "$HOME" ]; then [ -w "$HOME" ] || __atb_k=
+    else __atb_k=
     fi
   fi
   if [ -z "$__atb_k" ]; then
@@ -639,6 +651,7 @@ pub fn with_build_dir_here(args: &[String], tool: Tool) -> Option<Vec<String>> {
             cwd: cwd.as_deref(),
             env: &|name| std::env::var_os(name),
             read: &read_config,
+            read_manifest: &read_manifest,
             writable: &writable,
         },
     )
@@ -660,6 +673,7 @@ pub fn with_build_dir_from(args: &[String], tool: Tool, cwd: &Path) -> Option<Ve
         cwd: None,
         env: &|name| std::env::var_os(name),
         read: &read_config,
+        read_manifest: &read_manifest,
         writable: &writable,
     };
     with_build_dir_at(args, tool, cwd, &m)
@@ -765,7 +779,7 @@ pub enum Unused {
     Tooling { idle: Duration, after: Duration },
     /// A tooling scratch carrying both its give-up exec stamp and a regular run-proof file ([`aterm_uds::deadline::RAN`]); elapsed time and a reboot never replace that proof.
     GivenUp,
-    /// PART of a build directory that stays ([`stale`]): `incremental` crate folders, `units` an old compiler built, and `superseded` units its last passing release run did not use beside another build of their package and kind that it did ([`stale::USED`]), each unwritten for `after` ([`ReclaimAfter::stale`]) or more.
+    /// PART of a build directory that stays ([`stale`]): `incremental` crate folders, `units` an old compiler built, and `superseded` units none of its kept check runs uses beside another build of their package and kind that one does ([`stale::USED`]); each unwritten for `after` ([`ReclaimAfter::stale`]) or more, but for a superseded unit the run that ended last retired ([`stale::Kept::retired`]), which goes however lately it was written before that run began.
     Stale {
         incremental: usize,
         units: usize,
@@ -797,9 +811,9 @@ pub enum Refusal {
     /// stays where it was.
     Stopped,
     /// The pass stopped once it was in a stage (moved aside by this pass, or a stage an earlier
-    /// pass left), before its removal: a check made again refused it, as for
-    /// [`Refusal::Stopped`]. It stays staged, returned as its stage's path, and the next pass
-    /// finishes that stage.
+    /// pass left), before its removal, as for [`Refusal::Stopped`]: a check made again refused
+    /// it, or a step its removal needs failed (a registered cache's receipt not written). It
+    /// stays staged, returned as its stage's path, and the next pass finishes that stage.
     Staged,
 }
 
@@ -817,24 +831,27 @@ impl Refusal {
     }
 
     /// What it says of the entry and of what the next pass does with it, in the words
-    /// `aterm pkg machine cache`, the disk ledger and a run's relief line say it by.
+    /// `aterm pkg machine cache`, the disk ledger and a run's relief line say it by: every cause
+    /// its variant's own doc names (review RV2, J2-1-R2).
     #[must_use]
     pub const fn reason(self) -> &'static str {
         match self {
             Self::Rename(_) => {
                 "its rename aside was refused after its check (a flag, an ACL entry or a folder \
-                 mode set since, or a volume mounted there); it stays where it was, and the next \
-                 pass judges it again"
+                 mode set since, a volume mounted there, or an attribute the check does not \
+                 read); it stays where it was, and the next pass judges it again"
             }
             Self::Stopped => {
-                "the pass stopped before its move (a process came to use it, or what it was \
-                 judged by changed, once its intent was on record); it stays where it was, and \
-                 the next pass judges it again"
+                "the pass stopped before its move, once its intent was on record (a process came \
+                 to use it, what it was judged by changed, or a step its move needs failed: its \
+                 stage could not be made or read, or its receipt written); it stays where it was, \
+                 and the next pass judges it again"
             }
             Self::Staged => {
-                "the pass stopped once it was moved aside, before its removal (a process came to \
-                 use it, or what it was judged by changed, once its intent was on record); it \
-                 stays in its stage, and the next pass finishes the stage"
+                "the pass stopped once it was moved aside, before its removal, once its intent \
+                 was on record (a process came to use it, what it was judged by changed, or its \
+                 receipt could not be written); it stays in its stage, and the next pass \
+                 finishes the stage"
             }
         }
     }
@@ -855,6 +872,10 @@ struct Intents<'r> {
     /// stage that holds it once it is staged.
     open: Option<(PathBuf, Option<PathBuf>)>,
     out: Vec<(PathBuf, Unused)>,
+    /// The bytes on disk the removals of a sweep's stages freed ([`Sweep::take`]): what went
+    /// whole, what went of a stage some entry of which stayed, and what a stopped walk took
+    /// before it stopped. A run-end trim says it ([`Trimmed::freed`]).
+    freed: u64,
 }
 
 impl<'r> Intents<'r> {
@@ -863,6 +884,7 @@ impl<'r> Intents<'r> {
             record,
             open: None,
             out: Vec::new(),
+            freed: 0,
         }
     }
 
@@ -1148,7 +1170,8 @@ impl Sweep<'_, '_> {
     /// read by path finds at `original` or above the stage, or by the pass's authority or fence,
     /// a process come to use it since its intent) closes its intent with nothing of it gone, at
     /// `stage` ([`Refusal::Staged`]), and `false`: it stays staged as it stood, for the next pass
-    /// to finish.
+    /// to finish. The bytes that went, whole or not, are added to the pass's count
+    /// ([`Intents::freed`]).
     fn take(&mut self, stage: &Path, went: PathBuf, why: Unused, original: &Path) -> bool {
         if !self
             .fence
@@ -1176,6 +1199,7 @@ impl Sweep<'_, '_> {
         let left = match remove::tree_while(stage, &permitted) {
             Ok(left) => left,
             Err(revoked) => {
+                self.intents.freed = self.intents.freed.saturating_add(revoked.freed);
                 self.intents.outcome(
                     stage.to_path_buf(),
                     Unused::Revoked {
@@ -1185,6 +1209,7 @@ impl Sweep<'_, '_> {
                 return false;
             }
         };
+        self.intents.freed = self.intents.freed.saturating_add(left.freed);
         if left.whole() {
             self.intents.outcome(went, why);
         } else {
@@ -1208,8 +1233,23 @@ impl Sweep<'_, '_> {
     /// moved, recorded as that stage ([`Unused::Stale`]; refused, or kept by custody read again,
     /// every entry moves back, never over another entry, and one whose path was taken meanwhile
     /// stays staged for a later pass, which finishes it only while custody at `leaf` allows),
-    /// and removed with the locks let go.
+    /// and removed with the locks let go. The locks are those a whole inventory of `leaf` finds
+    /// ([`look`]).
     fn prune(&mut self, dir: &Path, leaf: &Path, seen: Option<Seen>) -> bool {
+        self.prune_by(dir, leaf, seen, look)
+    }
+
+    /// [`Self::prune`], its cargo locks found by `look`, asked once where `seen` is none and
+    /// again once they are held: the whole inventory for a pass ([`look`]), or the locks of the
+    /// profiles the build directory's record names for a run's end ([`look_recorded`]), which
+    /// surveys and takes from those profiles alone.
+    fn prune_by(
+        &mut self,
+        dir: &Path,
+        leaf: &Path,
+        seen: Option<Seen>,
+        look: fn(&Path) -> Option<Seen>,
+    ) -> bool {
         if !self
             .fence
             .admit(leaf, KeepReason::IntentDeclined, !self.declined)
@@ -1734,6 +1774,144 @@ fn look(leaf: &Path) -> Option<Seen> {
     inventory::scan(leaf).ok()
 }
 
+/// WHAT A RUN'S END READS OF THE BUILD DIRECTORY `leaf` in place of an inventory ([`look`]), so
+/// it walks nothing: the cargo locks ([`CARGO_LOCKS`]) standing in each profile its record names
+/// ([`stale::Kept::profiles`]), sorted, and `leaf`'s own modification time. A profile is read
+/// only where every folder from `leaf` down to it is a real directory (a link is never
+/// followed; the record's names are plain components, [`stale::Kept::decode`]), and one with no
+/// lock standing in it is not surveyed, so nothing of it goes. `None` where `leaf` cannot be
+/// read.
+fn look_recorded(leaf: &Path) -> Option<Seen> {
+    let newest = last_written(leaf)?;
+    let real = |dir: &Path| std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir());
+    let mut locks = Vec::new();
+    for profile in stale::Kept::read(leaf).profiles() {
+        let mut dir = leaf.to_path_buf();
+        if !profile.split('/').all(|part| {
+            dir.push(part);
+            real(&dir)
+        }) {
+            continue;
+        }
+        for name in CARGO_LOCKS {
+            let lock = dir.join(name);
+            if std::fs::symlink_metadata(&lock).is_ok() {
+                locks.push(lock);
+            }
+        }
+    }
+    locks.sort();
+    Some(Seen { newest, locks })
+}
+
+/// What a run's end took of its build directory ([`trim_run_end`]).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Trimmed {
+    /// Each intent the trim recorded and its outcome, in order, as a pass returns them
+    /// ([`reclaim_watched`]): the stage of the stale parts it took ([`Unused::Stale`]), each
+    /// stage an earlier trim left there ([`Unused::Unfinished`]), and, at a stage that stays for
+    /// the next trim, what stayed of either ([`Unused::Stayed`], [`Unused::Revoked`],
+    /// [`Unused::Refused`]).
+    pub went: Vec<(PathBuf, Unused)>,
+    /// The bytes on disk its removals freed, whole or not.
+    pub freed: u64,
+    /// Why a step of it stopped, where one did: the first check that did not admit it, in that
+    /// check's words (cargo's locks held by a build, a process using the directory, custody, the
+    /// caller's leave withdrawn before a step). `None` where every step ran, and where the
+    /// caller's leave was withdrawn only once a removal's walk had begun, which [`Trimmed::went`]
+    /// says ([`Unused::Revoked`] at the stage that stays).
+    pub kept: Option<String>,
+}
+
+/// A RUN'S END TRIMS ITS BUILD DIRECTORY `dir`, whose record ([`stale::USED`]) the run has just
+/// written: each stage an earlier trim left in `dir` is finished (a pass of the cache looks for a
+/// build directory's stages beside it and never inside, so nothing else finishes one), and then,
+/// where the record says the run retired units ([`stale::Kept::retired`]), what no build reads
+/// again in the profiles the record names goes ([`stale::decide`] with room on the volume: the
+/// retired units at once, and whatever else there waited out the stale window), through every
+/// fence a cache pass has ([`Sweep::prune`]: cargo's locks held, the process check, custody read
+/// before and after the move, staged aside in a stage of its own in `dir`, then removed). It
+/// reads the record and the folders it names and walks nothing else ([`look_recorded`]): no
+/// inventory, and no measure of the directory. `within` is the caller's leave to go on (its time,
+/// its run not ending), asked before each step and at each boundary of a removal's walk: once it
+/// says `false` nothing more is moved or removed, and what the trim had moved aside stays in its
+/// stage, which the next trim of `dir` finishes. Nothing where `dir` is no real directory (a link
+/// is refused).
+#[must_use]
+pub fn trim_run_end(dir: &Path, now: SystemTime, within: &dyn Fn() -> bool) -> Trimmed {
+    trim_run_end_on(dir, now, within, &fence::Fence::default().with_reporting())
+}
+
+/// [`trim_run_end`] with an ownership probe supplied by a headless fixture.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn trim_run_end_with_processes(
+    dir: &Path,
+    now: SystemTime,
+    within: &dyn Fn() -> bool,
+    processes: fence::Processes<'_>,
+) -> Trimmed {
+    trim_run_end_on(
+        dir,
+        now,
+        within,
+        &fence::Fence::new(processes).with_reporting(),
+    )
+}
+
+fn trim_run_end_on(
+    dir: &Path,
+    now: SystemTime,
+    within: &dyn Fn() -> bool,
+    fence: &fence::Fence<'_>,
+) -> Trimmed {
+    if !std::fs::symlink_metadata(dir).is_ok_and(|meta| meta.is_dir()) {
+        return Trimmed::default();
+    }
+    let mut record = |_: &Path, _: Unused| true;
+    let mut intents = Intents::new(&mut record);
+    {
+        let mut sweep = Sweep {
+            root: dir,
+            home: None,
+            now,
+            after: ReclaimAfter::CALM.into(),
+            placing: None,
+            moved: false,
+            compiler_store: None,
+            intents: &mut intents,
+            fence,
+            permitted: within,
+            pruning: Vec::new(),
+            declined: false,
+        };
+        // `prune_by` makes a fresh stage in `dir`, and the shared cache's pass looks for a
+        // build directory's stages beside it, never inside: finish here what an earlier trim
+        // left.
+        for stage in stages_in(dir, OsStr::new(DOOMED)) {
+            if sweep.stage_recorded(&stage, dir) {
+                sweep.finish_stage(&stage, dir);
+            }
+        }
+        if !stale::Kept::read(dir).retired.profiles.is_empty() {
+            let _ = sweep.prune_by(dir, dir, None, look_recorded);
+        }
+    }
+    let freed = intents.freed;
+    let kept = fence.retained().first().map(|check| match &check.reason {
+        KeepReason::NoStaleParts { .. } => {
+            "nothing in the profiles its record names met the rule when they were read".to_owned()
+        }
+        KeepReason::PermissionChanged => "its caller had called the trim off".to_owned(),
+        reason => reason.to_string(),
+    });
+    Trimmed {
+        went: intents.finish(),
+        freed,
+        kept,
+    }
+}
+
 /// `dir`'s own modification time, not followed.
 fn last_written(dir: &Path) -> Option<SystemTime> {
     std::fs::symlink_metadata(dir).ok()?.modified().ok()
@@ -1858,8 +2036,12 @@ pub fn gone_leaves(root: &Path, home: Option<&Path>) -> std::collections::BTreeS
             }
             let child = entry.path();
             if entry.file_name() == LEAF {
+                // The fence reads the path alone, so it goes before the first stat of a
+                // workspace in a folder that is never looked into.
                 if workspace_of(root, dir).is_some_and(|ws| {
-                    !folder_stands(&ws) && checkout::gone_placed(&ws, home, None).is_ok()
+                    checkout::never_looked_at(&ws, home).is_none()
+                        && !folder_stands(&ws)
+                        && checkout::gone_placed(&ws, home, None).is_ok()
                 }) {
                     out.insert(child);
                 }

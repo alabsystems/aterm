@@ -8,8 +8,9 @@
 //! three on the merge, and census's `no-reach-read` guard holds that no member reads one.
 //!
 //! A path is in the class when it is one of:
-//! - **root Markdown**: a `*.md` file at the repository root, but `CHANGELOG.md`, which a test
-//!   reads until changelog fragments (§2.1b) replace it ([`EXCLUDED`]);
+//! - **root Markdown**: a `*.md` file at the repository root (`CHANGELOG.md` included: changelog
+//!   fragments, §2.1b, retired the test that read it, and verify's changelog guard, which the
+//!   census check runs, judges its structure on every merge `verify land` rechecks);
 //! - **docs Markdown**: `docs/**/*.md` with no `Cargo.toml` in `docs/` or any directory between it
 //!   and the file, so no package (member, fork or path dependency) owns it;
 //! - **a member's spec table**: `<dir>/SPECS.md` where `<dir>/Cargo.toml` exists and `<dir>` is a
@@ -21,9 +22,6 @@
 //! and in history; the entry's mode (a symlink, a gitlink) is the caller's to read.
 
 use std::collections::BTreeSet;
-
-/// The root Markdown file the class leaves out: a test reads it (§2.1b removes the reader).
-pub const EXCLUDED: &str = "CHANGELOG.md";
 
 /// What the class reads of a tree besides the path itself: the workspace's member patterns and
 /// exclusions, and every directory that holds a `Cargo.toml`.
@@ -97,7 +95,7 @@ pub fn class(path: &str, layout: &Layout) -> bool {
         return false;
     }
     match segments.as_slice() {
-        [name] => *name != EXCLUDED,
+        [_] => true,
         ["docs", rest @ ..] => {
             let mut dir = String::from("docs");
             if layout.manifests.contains(&dir) {
@@ -169,7 +167,7 @@ pub fn needles(path: &str) -> Vec<&str> {
 /// - other Markdown is read by a Rust file that names one of its [`needles`] in code;
 /// - in each case also by a crate's Markdown whose Rust code blocks name it, as a
 ///   `#[doc = include_str!(…)]` would run (not root or docs Markdown or a `SPECS.md`, which is in
-///   the class, where the guard names any include of it, or is `CHANGELOG.md`);
+///   the class, where the guard names any include of it);
 /// - never by census's own sources, whose guards name paths to police them and rerun on the
 ///   merge, nor by any other file.
 #[must_use]

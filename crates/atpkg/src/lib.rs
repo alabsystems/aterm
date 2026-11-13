@@ -87,6 +87,7 @@ pub mod hooks;
 pub mod image;
 /// Cheap, cross-process discovery of the next published toolchain index.
 pub mod index_probe;
+pub mod input_seal;
 pub mod install;
 /// The retired landing wait.
 pub mod landing;
@@ -164,6 +165,8 @@ pub mod selfupdate;
 /// Recorded answers for the index, manifests and `status.toml` (the serde corpus).
 #[cfg(test)]
 mod serde_corpus_tests;
+/// Which programs have a build for a target, from the signed manifests the store holds.
+pub mod serving;
 pub mod shim_env;
 pub mod sig;
 pub mod signed_artifact_cache;
@@ -198,7 +201,7 @@ pub(crate) fn joined<T>(thread: std::thread::JoinHandle<T>, what: &str) -> T {
 pub mod toolchain;
 pub mod tree;
 /// A tree's `trust.lock` in this store: its build's standing, the shim hop's locked target, and
-/// whether this Mac's shim honours locks (A14).
+/// whether this machine's shim honours locks (A14).
 pub mod trust_lock;
 pub mod upstream_identity;
 /// Per-protocol row admission (`https`: host allow-list + payload shape), the `system = "<bin>"` satisfaction probe and the PATH-shadow probe.
@@ -244,6 +247,7 @@ pub use sig::{
     Anchor, BuildFloor, Floor, Reject, TrustedIndex, TrustedRoster, VerifiedBytes, admit_roster,
     check_freshness,
 };
+pub use source::resolve_fetcher;
 pub use status::{ProgramStatus, Status};
 pub use store::{Layout, default_prefix, shim_allowed, vet_prefix};
 pub use tree::{sha256_bytes, sha256_file, tree_root};

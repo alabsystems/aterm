@@ -92,6 +92,11 @@ fn attempts(app: &App) -> Option<u8> {
     app.auto_apply_intent.map(|intent| intent.attempts)
 }
 
+fn hold_token(app: &App, build: u64) -> Option<&'static str> {
+    app.auto_apply_hold(build, [0xab; 32])
+        .map(|held| held.hold.token())
+}
+
 /// The lines the lane said of the hold named by `token`, as they reached the App's sink.
 fn lines_of(app: &App, token: &str) -> (usize, usize) {
     let kept = app.auto_apply_hold_words.kept();
@@ -123,6 +128,10 @@ fn status_of(app: &App, build: u64) -> aterm_update::UpdateStatus {
         failing_persistent: false,
         failing_checks_kind: String::new(),
         channel_unreadable: false,
+        hold: None,
+        last: None,
+        offered: None,
+        behind: false,
         linux: None,
     }
 }
@@ -160,7 +169,7 @@ fn an_unanswered_setup_offer_with_its_run_busy_never_holds_the_lane_past_its_lad
         "the first poll past the ladder attempts, and the lane keeps its promise: {:?}",
         app.auto_apply_intent
     );
-    assert_eq!(app.auto_apply_hold_token(build), None, "no hold was named");
+    assert_eq!(hold_token(&app, build), None, "no hold was named");
     assert!(
         app.auto_apply_hold_words.kept().is_empty(),
         "nothing held, so nothing said: {:?}",
@@ -217,7 +226,7 @@ fn the_page_answers_an_untouched_offer_by_itself_and_the_lane_then_attempts() {
     force_auto_apply_attempt_now(&mut app);
     app.try_pending_native_auto_apply(false);
     assert_eq!(
-        app.auto_apply_hold_token(build),
+        hold_token(&app, build),
         Some(LaneHold::SystemState.token()),
         "the answer's Apply holds the lane while the setup worker takes it, named"
     );
@@ -228,7 +237,7 @@ fn the_page_answers_an_untouched_offer_by_itself_and_the_lane_then_attempts() {
     app.resolve_system_state_apply();
     force_auto_apply_attempt_now(&mut app);
     app.try_pending_native_auto_apply(false);
-    assert_eq!(app.auto_apply_hold_token(build), None, "the hold is over");
+    assert_eq!(hold_token(&app, build), None, "the hold is over");
     assert_eq!(
         attempts(&app),
         Some(1),
@@ -310,7 +319,7 @@ fn a_hold_past_the_ladder_is_named_once_and_in_the_status() {
     assert!(!app.workstation_setup_holds_handoff(), "PRECONDITION");
     force_auto_apply_attempt_now(&mut app);
     app.try_pending_native_auto_apply(false);
-    assert_eq!(app.auto_apply_hold_token(build), None);
+    assert_eq!(hold_token(&app, build), None);
     assert_eq!(
         lines_of(&app, token),
         (1, 1),
@@ -355,13 +364,13 @@ fn a_hold_ends_with_its_intent_and_a_new_arming_names_its_own() {
     app.config.update = config;
     assert!(app.arm_native_auto_apply(build, &"ab".repeat(32)));
     assert_eq!(
-        app.auto_apply_hold_token(build),
+        hold_token(&app, build),
         None,
         "a new arming holds nothing yet"
     );
     force_auto_apply_attempt_now(&mut app);
     app.try_pending_native_auto_apply(false);
-    assert_eq!(app.auto_apply_hold_token(build), Some(token));
+    assert_eq!(hold_token(&app, build), Some(token));
     assert_eq!(
         lines_of(&app, token),
         (2, 1),
@@ -431,7 +440,7 @@ fn a_pending_boot_health_is_named_once_in_the_updaters_own_words() {
     };
     assert!(named(&app).is_empty(), "PRECONDITION: nothing said yet");
     app.try_pending_native_auto_apply(false);
-    assert_eq!(app.auto_apply_hold_token(12), Some("boot-health"));
+    assert_eq!(hold_token(&app, 12), Some("boot-health"));
     let lines = named(&app);
     assert_eq!(lines.len(), 1, "the hold is named as it begins: {lines:?}");
     assert!(
@@ -446,7 +455,7 @@ fn a_pending_boot_health_is_named_once_in_the_updaters_own_words() {
         .expect("a pending trial keeps the intent")
         .retry_at = now;
     app.try_pending_native_auto_apply(false);
-    assert_eq!(app.auto_apply_hold_token(12), Some("boot-health"));
+    assert_eq!(hold_token(&app, 12), Some("boot-health"));
     assert_eq!(
         named(&app).len(),
         1,

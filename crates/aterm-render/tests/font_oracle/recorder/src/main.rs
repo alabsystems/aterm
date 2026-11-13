@@ -156,8 +156,7 @@ fn hint_lines(dir: &str) -> Vec<Line> {
                 .collect();
             for px in hint_raster::SIZES {
                 for mode_name in hint_raster::MODES {
-                    // The subpixel raster's stage-1 set excludes variable
-                    // instances: it is only ever asked at the default.
+                    // The LCD modes are recorded at the default instance only.
                     if mode_name.starts_with("lcd") && !coords.is_empty() {
                         continue;
                     }
@@ -259,11 +258,12 @@ const HINT_HEADER: &str = "\
 # workspace (skrifa compiled into aterm-render only on Linux and Windows, and
 # the workspace's patched graph is not the registry's). It runs
 # tests/font_oracle/hint_raster.rs: copies of src/hinted.rs
-# (hinted_glyph_raster, PathPen) and src/subpixel.rs (subpixel_glyph_raster,
-# RGB order) over src/raster.rs included by path. Since TF.2 the linear
-# advance and the lcd-unhinted outline are ttf-parser 0.25.1's
-# (src/variation.rs VariedFace::linear_advance, src/subpixel.rs Scaled), so
-# skrifa answers the grid fit alone. `native` has no lines: since TF.2b it
+# (hinted_glyph_raster, PathPen) and its own 3x LCD raster
+# (subpixel_glyph_raster: FreeType's default FIR5 filter, RGB order) over
+# src/raster.rs included by path. Since TF.2 the linear advance and the
+# lcd-unhinted outline are ttf-parser 0.25.1's (src/variation.rs
+# VariedFace::linear_advance, tests/font_oracle/recorder/src/hint.rs Scaled),
+# so skrifa answers the grid fit alone. `native` has no lines: since TF.2b it
 # renders as `light` (tests/font_hinting_config.rs native_renders_as_light),
 # and the answers of the font's own TrueType bytecode it ran until then are
 # in this file's git history. Since TF.4 crates/aterm-font/tests/hint_oracle.rs

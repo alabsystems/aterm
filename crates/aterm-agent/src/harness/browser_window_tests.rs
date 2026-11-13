@@ -617,8 +617,8 @@ fn tidy_browser(
     std::thread::JoinHandle<Seen>,
 ) {
     use std::io::{Read as _, Write as _};
-    let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
-    let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
+    let (to_browser_r, to_browser_w) = aterm_uds::pipe().expect("pipe");
+    let (from_browser_r, mut from_browser_w) = aterm_uds::pipe().expect("pipe");
     let browser = std::thread::spawn(move || {
         let mut seen = Seen::default();
         let mut store = cookies;

@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! `atpkg-publish lane install <alab|linux>` and `lane disarm`: snapshot and arm.
+//! `atpkg-publish lane install <alab|linux|tip>` and `lane disarm`: snapshot and arm.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -37,7 +37,8 @@ pub struct InstallFlags {
     pub allow_dirty: bool,
     /// Snapshot and render, keeping the live link and armed units as they are.
     pub no_arm: bool,
-    /// Install an event-driven Linux publisher for existing qualified stages only.
+    /// Install an event-driven publisher for existing qualified stages only: the Linux lane's
+    /// unit in that mode, or the Apple ready dispatcher beside the tip lane's job.
     pub staged_only: bool,
     /// A Linux builder with no machine key: it stages for a rostered machine.
     pub keyless: bool,
@@ -171,7 +172,7 @@ impl Machine {
             Os::Linux
         } else {
             return Err(Error::refused(
-                "the lanes run on macOS (alab) and Linux (linux)",
+                "the lanes run on macOS (alab, tip) and Linux (linux)",
             ));
         };
         let config = std::env::var_os("XDG_CONFIG_HOME")
@@ -212,7 +213,7 @@ impl Machine {
     /// The refusal naming the OS the lane runs on.
     pub fn check_os(&self, kind: LaneKind) -> Result<()> {
         let wants = match kind {
-            LaneKind::Alab => Os::Darwin,
+            LaneKind::Alab | LaneKind::Tip => Os::Darwin,
             LaneKind::Linux => Os::Linux,
         };
         if self.os == wants {
@@ -231,7 +232,7 @@ impl Machine {
 
     fn unit_dir(&self, kind: LaneKind) -> &Path {
         match kind {
-            LaneKind::Alab => &self.agents_dir,
+            LaneKind::Alab | LaneKind::Tip => &self.agents_dir,
             LaneKind::Linux => &self.systemd_dir,
         }
     }
@@ -256,7 +257,7 @@ pub struct Installed {
     pub armed: Vec<PathBuf>,
 }
 
-/// `atpkg-publish lane install <lane> [--allow-dirty] [--no-arm] [--keyless] [--host gh|agh-staging|agh]`.
+/// `atpkg-publish lane install <lane> [--allow-dirty] [--no-arm] [--staged-only] [--keyless] [--host gh|agh-staging|agh]`.
 /// # Errors
 /// What [`install_with`] answers.
 pub fn install(ctx: &Ctx, kind: LaneKind, flags: &InstallFlags) -> Result<()> {
@@ -282,8 +283,11 @@ pub fn install_with(
     tx: &Transcript,
 ) -> Result<Installed> {
     machine.check_os(kind)?;
-    if flags.staged_only && kind != LaneKind::Linux {
-        return Err(Error::usage("lane install --staged-only is Linux-only"));
+    if flags.staged_only && kind == LaneKind::Alab {
+        return Err(Error::usage(
+            "lane install --staged-only is for linux and tip: the Apple ready dispatcher \
+             installs beside the tip lane (lane install tip --staged-only)",
+        ));
     }
     let keyless_ok = kind == LaneKind::Linux && flags.keyless;
     let identity = [
@@ -318,13 +322,15 @@ pub fn install_with(
         })?;
         let checks = if kind == LaneKind::Linux {
             crate::hosts_check::check_linux(ctx, &dirs, flags.host, stages_only)?
+        } else if kind == LaneKind::Tip {
+            crate::hosts_check::check_tip(ctx, &dirs, flags.host)
         } else {
             crate::hosts_check::check(
                 ctx,
                 &dirs,
                 flags.host,
                 stages_only,
-                &crate::hosts_check::program_repos(),
+                &crate::hosts_check::alab_program_repos(),
             )
         };
         let failed = crate::hosts_check::failed(&checks);
@@ -333,10 +339,10 @@ pub fn install_with(
                 "lane install --host {h}: hosts check failed ({}) — run atpkg-publish hosts \
                  check --host {h} --unit-env{}{}; nothing installed",
                 failed.join(", "),
-                if kind == LaneKind::Linux {
-                    " --lane linux"
-                } else {
-                    ""
+                match kind {
+                    LaneKind::Linux => " --lane linux",
+                    LaneKind::Tip => " --lane tip",
+                    LaneKind::Alab => "",
                 },
                 if stages_only { " --keyless" } else { "" }
             )));
@@ -345,6 +351,9 @@ pub fn install_with(
             "hosts check --host {h}: every check holds ({})",
             ctx.shown(&dirs.config_file())
         ));
+        if let Some(note) = checks.iter().find(|c| c.name == "program_grants") {
+            tx.say(format!("hosts check --host {h}: {}", note.detail));
+        }
     }
     let repo = &ctx.repo_root;
     let before = Inputs::read(repo)?;
@@ -395,6 +404,49 @@ pub fn install_with(
             )));
         }
     };
+    // The tip lane's dispatcher runs under its own lock: no pass of either may be in flight.
+    let _publishing = if state.publish_lock == state.lock {
+        None
+    } else {
+        match state.try_publish_lock()? {
+            Lock::Held(g) => Some(g),
+            Lock::Busy => {
+                return Err(Error::refused(format!(
+                    "a {} ready dispatch is in flight — re-run this installer when it finishes",
+                    kind.as_str()
+                )));
+            }
+        }
+    };
+    // Arming one Apple lane's jobs retires the other's, and a job booted out mid-run is
+    // killed where it stands (mid-publish, mid-pack): the other lane must be idle too, and is
+    // held out until this install has armed.
+    let other = match kind {
+        LaneKind::Alab => Some(LaneKind::Tip),
+        LaneKind::Tip => Some(LaneKind::Alab),
+        LaneKind::Linux => None,
+    };
+    let mut others_idle = Vec::new();
+    if let Some(other) = other.filter(|_| !flags.no_arm) {
+        let theirs = LaneState::of(other, &ctx.state_dir);
+        let mut locks = vec![theirs.try_lock()?];
+        if theirs.publish_lock != theirs.lock {
+            locks.push(theirs.try_publish_lock()?);
+        }
+        for lock in locks {
+            match lock {
+                Lock::Held(guard) => others_idle.push(guard),
+                Lock::Busy => {
+                    return Err(Error::refused(format!(
+                        "a {} run is in flight, and arming {} retires its jobs — re-run this \
+                         installer when it finishes",
+                        other.as_str(),
+                        kind.as_str()
+                    )));
+                }
+            }
+        }
+    }
     let link = ctx.state_dir.join("lane");
     if !flags.no_arm
         && link.is_dir()
@@ -553,7 +605,7 @@ pub fn install_with(
         // raised under the unit's directories says something no longer true. Best effort: it
         // reads no agh.toml and creates nothing.
         if let Some(dirs) = machine.agh_dirs(ctx) {
-            crate::ctx::clear_config_needs(&dirs);
+            crate::ctx::clear_config_need(&dirs);
         }
     }
     if let Retirement::Unknown(why) = arm {
@@ -659,6 +711,24 @@ pub fn install_with(
                 ctx.shown(&state.log),
                 units::SYSTEMD_SERVICE
             ),
+            LaneKind::Tip => format!(
+                "a pass every {} min; log {}; start one now: launchctl kickstart \
+                 gui/$(id -u)/{}{}",
+                units::TIP_INTERVAL_SECS / 60,
+                ctx.shown(&state.log),
+                units::TIP_LABEL,
+                if flags.staged_only {
+                    format!(
+                        "; the ready dispatcher {} starts when {} changes",
+                        units::TIP_READY_LABEL,
+                        ctx.shown(&state.ready_dir())
+                    )
+                } else {
+                    "; no ready dispatcher armed (--staged-only arms it): queued builds wait \
+                     for `lane run tip --staged-only`"
+                        .to_string()
+                }
+            ),
         }
     ));
     Ok(out)
@@ -677,6 +747,11 @@ pub fn disarm(ctx: &Ctx, kind: LaneKind, machine: &Machine) -> Result<()> {
     let names: Vec<String> = match kind {
         LaneKind::Alab => vec![
             format!("{}.plist", units::LAUNCHD_LABEL),
+            format!("{}.plist", units::RETIRED_LABEL),
+        ],
+        LaneKind::Tip => vec![
+            format!("{}.plist", units::TIP_LABEL),
+            format!("{}.plist", units::TIP_READY_LABEL),
             format!("{}.plist", units::RETIRED_LABEL),
         ],
         LaneKind::Linux => vec![units::SYSTEMD_SERVICE.into(), units::SYSTEMD_TIMER.into()],
@@ -1072,13 +1147,19 @@ impl ServiceManager for Launchd {
         })
     }
 
-    fn disarm(&self, _kind: LaneKind) -> Result<()> {
+    fn disarm(&self, kind: LaneKind) -> Result<()> {
         let uid = uid()?;
         let mut run = |args: &[&str]| run_tool(aterm_uds::os_path!("launchctl"), args);
-        if !bootout_or_absent(&uid, units::LAUNCHD_LABEL, &mut run) {
-            return Err(Error::cannot_run(
-                "the lane's launchd job may still be loaded",
-            ));
+        let labels: &[&str] = match kind {
+            LaneKind::Tip => &[units::TIP_LABEL, units::TIP_READY_LABEL],
+            LaneKind::Alab | LaneKind::Linux => &[units::LAUNCHD_LABEL],
+        };
+        for label in labels {
+            if !bootout_or_absent(&uid, label, &mut run) {
+                return Err(Error::cannot_run(format!(
+                    "the lane's launchd job {label} may still be loaded"
+                )));
+            }
         }
         match self.retire_vendor(&uid, &mut run) {
             Retirement::Confirmed => Ok(()),
@@ -1114,11 +1195,31 @@ impl Launchd {
         paths: &[PathBuf],
         mut run: impl FnMut(&[&str]) -> Result<std::process::Output>,
     ) -> Result<Retirement> {
-        let retirement = self.retire_vendor(uid, &mut run);
+        let mut retirement = self.retire_vendor(uid, &mut run);
+        let label_of = |p: &Path| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .and_then(|n| n.strip_suffix(".plist"))
+                .map(str::to_string)
+        };
+        let arming: Vec<String> = paths.iter().filter_map(|p| label_of(p)).collect();
+        // One lane snapshot is live per machine and an install prunes the others, so a job of
+        // another lane (or of this lane's last mode) left loaded would start a binary that is
+        // gone. Each is stopped and its definition removed, as the retired vendor job's is.
+        for label in units::APPLE_LABELS {
+            if arming.iter().any(|a| a == label) {
+                continue;
+            }
+            let retired = self.retire_label(uid, label, &mut run);
+            if retirement == Retirement::Confirmed {
+                retirement = retired;
+            }
+        }
         for p in paths {
-            let domain = format!("gui/{uid}/{}", units::LAUNCHD_LABEL);
+            let label = label_of(p).unwrap_or_else(|| units::LAUNCHD_LABEL.to_string());
+            let domain = format!("gui/{uid}/{label}");
             let _ = run(&["bootout", &domain]);
-            let _ = write_regular_file(&self.state_dir.join("alab.launchd.log"), b"");
+            let _ = write_regular_file(&units::launchd_log(&self.state_dir, &label), b"");
             let out = run(&["bootstrap", &format!("gui/{uid}"), &p.display().to_string()])?;
             if !out.status.success() {
                 return Err(Error::refused(format!(
@@ -1140,9 +1241,25 @@ impl Launchd {
         if !bootout_or_absent(uid, units::RETIRED_LABEL, run) {
             return Retirement::Unknown("the legacy launchd job may still be loaded".into());
         }
-        let plist = self
-            .agents_dir
-            .join(format!("{}.plist", units::RETIRED_LABEL));
+        self.remove_definition(units::RETIRED_LABEL)
+    }
+
+    /// Stop another lane's job `label` and remove its definition, so nothing can start the
+    /// snapshot it names once this install prunes it.
+    fn retire_label(
+        &self,
+        uid: &str,
+        label: &str,
+        run: &mut impl FnMut(&[&str]) -> Result<std::process::Output>,
+    ) -> Retirement {
+        if !bootout_or_absent(uid, label, run) {
+            return Retirement::Unknown(format!("the launchd job {label} may still be loaded"));
+        }
+        self.remove_definition(label)
+    }
+
+    fn remove_definition(&self, label: &str) -> Retirement {
+        let plist = self.agents_dir.join(format!("{label}.plist"));
         match std::fs::remove_file(&plist) {
             Ok(()) => Retirement::Confirmed,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Retirement::Confirmed,

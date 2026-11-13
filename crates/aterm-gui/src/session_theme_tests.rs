@@ -255,9 +255,10 @@ fn drain(fd: i32) -> Vec<u8> {
 /// A pipe whose write end a session's sink owns; the read end is the program's side.
 #[cfg(unix)]
 fn pipe_sink() -> (Arc<aterm_session::sink::SinkWriter>, i32) {
-    let mut fds = [0; 2];
-    // SAFETY: `fds` is a two-int array, as `pipe` requires.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    use std::os::fd::IntoRawFd;
+    let fds = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     // SAFETY: The read end was just opened.
     assert_eq!(
         unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) },

@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use aterm_update_core::linux::LinuxTarget;
 use aterm_update_core::release_asset::{Asset, AssetError, Reader};
+use aterm_update_core::update_record::{Cause, Failure, Hold, Sha, UpdateRecord, Witness};
 
 use crate::floor_sources::FloorSources;
 use crate::linux_trial::{Lane, LaneConfirm, Lanes, StartClock, Steady};
@@ -208,12 +209,15 @@ struct State {
     trial: Option<Trial>,
     #[serde(default)]
     staged: Option<Identity>,
+    /// Written for an older build of this copy, which a rollback restores and which requires
+    /// the field (it refuses every build at or below it): the build the update record holds
+    /// after a rollback while that hold lasts, else 0 ([`Context::save`]). This build never
+    /// reads it; its holds are the record's. A pre-record build restored by a rollback reads it
+    /// as a refusal with no expiry, which only a newer release it admits ends: the transitional
+    /// rule for that one boundary, chosen over 0, which would let it reinstall the rolled-back
+    /// build at every check.
+    #[serde(default)]
     rejected_build: u64,
-    /// Whether [`Self::rejected_build`] was rolled back after its starts spent the trial's
-    /// budget ([`rolls_back_unstarted`]), and not by `aterm update rollback` of a build
-    /// that ran.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    rejected_unstarted: bool,
     /// Build whose trial ended in a crash loop when rollback was refused ([`rollback_refusal`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     kept_unproven: Option<u64>,
@@ -272,6 +276,12 @@ fn context() -> Result<&'static Context, String> {
         })
         .as_ref()
         .map_err(Clone::clone)
+}
+
+/// This copy's update record file, where this process is an installed copy.
+#[must_use]
+pub fn record_path() -> Option<PathBuf> {
+    context().ok().map(Context::record)
 }
 
 /// Read this process's executable path into [`context`] now, if it is not read yet (it is read once per process).
@@ -384,13 +394,71 @@ impl Context {
     }
 
     fn save(&self, state: &State) -> Result<(), String> {
-        let text = aterm_toml::to_string(state).map_err(|e| e.to_string())?;
+        let mut written = state.clone();
+        written.rejected_build = UpdateRecord::load(&self.record())
+            .live_hold(crate::unix_now())
+            .filter(|hold| hold.cause == Cause::LinuxRollback)
+            .map_or(0, |hold| hold.build);
+        let text = aterm_toml::to_string(&written).map_err(|e| e.to_string())?;
         write_atomic(&self.dir.join("state.toml"), text.as_bytes())
     }
 
     fn backup(&self, identity: &Identity) -> PathBuf {
         self.dir.join(format!("rollback-{}", identity.sha256))
     }
+
+    /// This copy's update record ([`crate::RECORD`]).
+    fn record(&self) -> PathBuf {
+        self.dir.join(crate::RECORD)
+    }
+
+    /// The live hold on the artifact `(build, sha256)`, if one holds it (an unreadable record
+    /// holds nothing).
+    fn held(&self, build: u64, sha256: &str) -> Option<Hold> {
+        let sha = Sha::parse(sha256)?;
+        let record = UpdateRecord::load(&self.record());
+        record
+            .holds(build, &sha, crate::unix_now())
+            .then_some(record.hold)
+            .flatten()
+    }
+
+    /// Change the update record ([`UpdateRecord::edit`]); a failed write is logged and lost.
+    fn edit_record(&self, what: &str, change: impl FnOnce(&mut UpdateRecord)) {
+        if self.prepare_dir().is_err() {
+            return;
+        }
+        if let Err(error) = UpdateRecord::edit(&self.record(), change) {
+            aterm_log::warn!("aterm-update: could not write the update record ({what}): {error}");
+        }
+    }
+
+    /// Note what a check saw: the newest build offered, when the floors admit it (ending a
+    /// hold on an older one), the build installed (found running, which proves nothing: only a
+    /// settled trial does, [`UpdateRecord::confirm`]), and any lab peer's evidence that the held
+    /// artifact starts.
+    fn note_offer(&self, offered: Option<u64>, installed: u64, installed_sha256: &str) {
+        let now = crate::unix_now();
+        let peers = crate::lab::peers_for(&UpdateRecord::load(&self.record()), now);
+        let installed_sha = Sha::parse(installed_sha256);
+        self.edit_record("note the offered build", |record| {
+            if let Some(offered) = offered {
+                record.offer(offered, now);
+            }
+            record.observe_running(installed, installed_sha, now);
+            crate::lab::lift_by(record, &peers, now);
+        });
+    }
+}
+
+/// A hold in words, ending with what ends it.
+fn hold_words(hold: &Hold) -> String {
+    format!(
+        "held until {} ({}, try {}); a newer build, `aterm update retry` or that time ends it",
+        aterm_update_core::update_record::clock_words(hold.until, crate::unix_now()),
+        hold.why,
+        hold.tries
+    )
 }
 
 fn checked_file(path: &Path, cap: u64, executable: bool) -> Result<File, String> {
@@ -829,7 +897,6 @@ fn initial_state(context: &Context, installed: Identity) -> State {
         trial: None,
         staged: None,
         rejected_build: 0,
-        rejected_unstarted: false,
         kept_unproven: None,
         unsaid_trial_ends: Vec::new(),
         outcome: String::new(),
@@ -903,7 +970,7 @@ fn install_locked(
     let manifest = authorize(context, &mut state, proof, pins)?;
     let identity = verify_binary(source, &manifest, native()?)?;
     if identity.build < state.high_water.max(state.min_build)
-        || identity.build <= state.rejected_build
+        || context.held(identity.build, &identity.sha256).is_some()
     {
         return Err("bootstrap candidate is below the durable build/failure floor".into());
     }
@@ -1173,7 +1240,6 @@ pub fn enable(current_build: u64, proof_dir: Option<&Path>) -> Result<String, St
         trial: None,
         staged: None,
         rejected_build: 0,
-        rejected_unstarted: false,
         kept_unproven: None,
         unsaid_trial_ends: Vec::new(),
         outcome: String::new(),
@@ -1259,7 +1325,7 @@ fn recover(context: &Context, state: &mut State) -> Result<(), String> {
         }
         Phase::RollbackPrepared if digest == trial.old.sha256 => {
             let trial = trial.clone();
-            record_rollback(state, &trial);
+            record_rollback(context, state, &trial);
             state.installed = trial.old;
             state.trial = None;
             context.save(state)
@@ -1307,11 +1373,11 @@ fn apply_with_checkpoints(
     let manifest = authorize(context, state, proof, pins)?;
     let candidate = context.dir.join("candidate");
     let identity = verify_binary(&candidate, &manifest, native()?)?;
-    if identity.build <= state.high_water
-        || identity.build < state.min_build
-        || identity.build <= state.rejected_build
-    {
-        return Err("Linux candidate is not newer than the durable build/failure floor".into());
+    if identity.build <= state.high_water || identity.build < state.min_build {
+        return Err("Linux candidate is not newer than the durable build floor".into());
+    }
+    if let Some(hold) = context.held(identity.build, &identity.sha256) {
+        return Err(format!("Linux candidate is held: {}", hold_words(&hold)));
     }
     if let Some(pending) = awaiting_start(state) {
         return Err(pending);
@@ -1452,11 +1518,12 @@ fn rollback_with_checkpoint(
             .ok_or("missing executable directory")?,
     )?;
     state.outcome = format!(
-        "{} is back; aterm {} won\u{2019}t install again; existing sessions were not restarted",
+        "{} is back; aterm {} is held a while before it is tried again; existing sessions were not \
+         restarted",
         restored_name(&trial.old),
         trial.new.version
     );
-    record_rollback(state, &trial);
+    record_rollback(context, state, &trial);
     state.installed = trial.old;
     state.trial = None;
     context.save(state)?;
@@ -1464,11 +1531,51 @@ fn rollback_with_checkpoint(
     Ok(())
 }
 
-/// Record `trial`'s rollback in `state` and queue any crash-loop notice ([`State::unsaid_trial_ends`]).
-fn record_rollback(state: &mut State, trial: &Trial) {
-    state.rejected_build = state.rejected_build.max(trial.new.build);
-    state.rejected_unstarted = rolls_back_unstarted(trial);
-    if state.rejected_unstarted {
+/// Record `trial`'s rollback: the update record holds its new build's artifact on the crash
+/// schedule ([`Cause::LinuxRollback`]) and says the old one runs, the anti-rollback floor
+/// (`high_water`) drops back below the new build, and any crash-loop notice is queued
+/// ([`State::unsaid_trial_ends`]).
+fn record_rollback(context: &Context, state: &mut State, trial: &Trial) {
+    let why = if rolls_back_unstarted(trial) {
+        "it did not start cleanly, and the copy rolled it back"
+    } else {
+        "it was rolled back"
+    };
+    if let Some(sha) = Sha::parse(&trial.new.sha256) {
+        let now = crate::unix_now();
+        context.edit_record("hold a rolled-back build", |record| {
+            record.set_hold(
+                Failure {
+                    build: trial.new.build,
+                    version: trial.new.version.clone(),
+                    sha,
+                    cause: Cause::LinuxRollback,
+                    witness: Witness::Linux,
+                    why: why.to_owned(),
+                },
+                now,
+            );
+            record.trial = None;
+            // The restored build keeps the proof the record already had of it; one it never
+            // saw proven is not proven by coming back.
+            let old_sha = Sha::parse(&trial.old.sha256);
+            if record.running != trial.old.build || record.running_sha != old_sha {
+                record.running = trial.old.build;
+                record.running_sha = old_sha;
+                record.proven = false;
+            }
+        });
+    }
+    // The install raised the anti-rollback floor to the build it put on trial. That build
+    // never settled, so the floor goes back to just below it: as strict as it was before the
+    // trial (which admitted only builds above the floor it had, all below this one), and the
+    // rolled-back build is admitted again once its hold lapses, instead of reading as "up to
+    // date" for good.
+    state.high_water = state
+        .high_water
+        .min(trial.new.build.saturating_sub(1))
+        .max(trial.old.build);
+    if rolls_back_unstarted(trial) {
         keep_unsaid_trial_end(
             state,
             crate::linux_notice::rollback_body(&trial.new.version, &restored_name(&trial.old)),
@@ -1939,7 +2046,7 @@ fn count_start_locked(
     rollback_locked(context, state)?;
     state.outcome = format!(
         "aterm {new} didn\u{2019}t start properly in {MAX_TRIAL_STARTS} launches, so \
-         {restored} is back and aterm {new} won\u{2019}t install again"
+         {restored} is back and aterm {new} is held a while before it is tried again"
     );
     context.save(state)?;
     Ok(false)
@@ -2090,6 +2197,12 @@ fn confirm_lane_locked(
     trial.set_start_clock(StartClock::default());
     if settles {
         state.outcome = format!("aterm {} is installed", trial.new.version);
+        if let Some(sha) = Sha::parse(&trial.new.sha256) {
+            let (build, now) = (trial.new.build, crate::unix_now());
+            context.edit_record("confirm a trial", |record| {
+                record.confirm(build, sha, now);
+            });
+        }
     }
     context.save(state)?;
     Ok(Confirmed::Yes)
@@ -2265,23 +2378,28 @@ fn check_locked(
     if manifest.build_number < state.min_build {
         return Err("the published Linux build is below the signed minimum-build floor; no install permitted".into());
     }
-    if manifest.build_number <= state.high_water || manifest.build_number <= state.rejected_build {
-        state.outcome = if manifest.build_number <= state.installed.build {
-            format!(
-                "Up to date \u{2014} the newest release is aterm {}",
-                manifest.version
-            )
-        } else if manifest.build_number == state.rejected_build {
-            format!(
-                "aterm {} was rolled back on this copy, so it won\u{2019}t install again",
-                manifest.version
-            )
-        } else {
-            format!(
-                "aterm {} is older than a release this copy rolled back, so it won\u{2019}t install",
-                manifest.version
-            )
-        };
+    // A build at or below the anti-rollback floor and above what runs is no offer: nothing
+    // installs it, so it must not read as one this copy is behind.
+    context.note_offer(
+        (manifest.build_number > state.high_water
+            || manifest.build_number <= state.installed.build)
+            .then_some(manifest.build_number),
+        state.installed.build,
+        &state.installed.sha256,
+    );
+    if manifest.build_number <= state.high_water {
+        state.outcome = format!(
+            "Up to date \u{2014} the newest release is aterm {}",
+            manifest.version
+        );
+        return context.save(state).map(|()| Checked::Channel);
+    }
+    if let Some(hold) = context.held(manifest.build_number, artifact.sha256) {
+        state.outcome = format!(
+            "aterm {} was rolled back on this copy: {}",
+            manifest.version,
+            hold_words(&hold)
+        );
         return context.save(state).map(|()| Checked::Channel);
     }
     let executable = Asset::tagged(&source.owner, &source.repo, &tag, artifact.name);
@@ -2418,11 +2536,11 @@ fn finish_candidate(
     let manifest = authorize(context, state, proof, pins)?;
     let candidate = context.dir.join("candidate");
     let identity = verify_binary(&candidate, &manifest, native()?)?;
-    if identity.build <= state.high_water
-        || identity.build < state.min_build
-        || identity.build <= state.rejected_build
-    {
-        return Err("Linux stage is below its durable build/failure floor".into());
+    if identity.build <= state.high_water || identity.build < state.min_build {
+        return Err("Linux stage is below its durable build floor".into());
+    }
+    if let Some(hold) = context.held(identity.build, &identity.sha256) {
+        return Err(format!("Linux stage is held: {}", hold_words(&hold)));
     }
     drop(chmod_checked_file(&candidate, BINARY_LIMIT, 0o755)?);
     probe(&candidate, &manifest, native()?)?;
@@ -2626,6 +2744,13 @@ fn status_in(context: Result<&Context, String>, current_build: u64) -> crate::Up
                 .as_ref()
                 .filter(|_| linux.staged_build.is_none())
                 .map(|stage| (stage.version.clone(), stage_admissible(&state, stage)));
+            let record = UpdateRecord::load(&context.record());
+            output.hold = crate::HoldView::of(&record, state.installed.build, crate::unix_now());
+            output.behind = record
+                .offered
+                .is_some_and(|offered| offered > state.installed.build);
+            output.offered = record.offered;
+            output.last = record.last;
             output.linux = Some(linux);
             output.enabled &= state.enabled;
             output.installable = true;
@@ -2653,6 +2778,12 @@ fn status_in(context: Result<&Context, String>, current_build: u64) -> crate::Up
                     state.installed.build
                 ));
             }
+            output.outcome = crate::held_outcome(
+                std::mem::take(&mut output.outcome),
+                output.hold.as_ref(),
+                output.behind,
+                crate::unix_now(),
+            );
             if !output.enabled {
                 output.outcome = ENABLE_REMEDY.into();
             }
@@ -2683,7 +2814,6 @@ fn linux_status(context: &Context, state: &State) -> crate::LinuxUpdateStatus {
             .map(|trial| format!("{:?}", trial.phase)),
         trial_starts: state.trial.as_ref().map_or(0, |trial| trial.starts),
         trial_healthy: state.trial.as_ref().is_some_and(|trial| trial.healthy),
-        refused_newer: state.rejected_build > state.installed.build,
     }
 }
 
@@ -2736,7 +2866,6 @@ fn stage_present(context: &Context, state: &State, stage: &Identity) -> bool {
 
 fn stage_admissible(state: &State, stage: &Identity) -> bool {
     stage.build > state.high_water
-        && stage.build > state.rejected_build
         && stage.build >= state.min_build
         && !stage
             .machine_id

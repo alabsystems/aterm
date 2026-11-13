@@ -2016,6 +2016,10 @@ pub enum AccessibilityWalk {
     /// Not now on it), or walked within the last minute and may still be up (`OK recent`):
     /// macOS's own dialog would stand beside the walk's page.
     OtherPages,
+    /// The window's desk door refused the walk (`aterm_types::macos_setup::DESK_REFUSED`): this
+    /// run's tab is not the one in front of the person, so nothing of it comes up on their
+    /// screen, macOS's own dialog included.
+    Behind,
 }
 
 /// What the aterm window's answer to `permissions walk now <page>` says of `page`: `OK walking`
@@ -2024,6 +2028,9 @@ pub enum AccessibilityWalk {
 #[cfg(any(test, target_os = "macos"))]
 fn walk_answer(reply: &str, page: &str) -> AccessibilityWalk {
     let reply = reply.trim_end();
+    if aterm_types::macos_setup::desk_refused(reply) {
+        return AccessibilityWalk::Behind;
+    }
     if reply == "OK declined" {
         return AccessibilityWalk::NotNow;
     }
@@ -2380,7 +2387,8 @@ impl System for Live {
         self.capture_current()?;
         let (program, args) = self.argv(cmd)?;
         let mut child = fixed_command(&program, &args, &self.child_env(cmd), cmd.cwd.as_deref());
-        let (reader, mut writer) = io::pipe().map_err(|e| RunFailed::Spawn(e.to_string()))?;
+        let (reader, mut writer) =
+            aterm_uds::pipe().map_err(|e| RunFailed::Spawn(e.to_string()))?;
         writer
             .write_all(input.bytes())
             .and_then(|()| writer.write_all(b"\n"))

@@ -497,9 +497,10 @@ fn a_precise_stream_under_a_tracking_app_reports_whole_rows_only_and_moves_no_ba
     use aterm_window::dpi::PhysicalPosition;
     use aterm_window::event::MouseScrollDelta;
     use std::io::Read;
-    use std::os::fd::FromRawFd;
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     aterm_pty::set_nonblocking(pipe[0], true).expect("nonblocking pipe reader");
     let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(pipe[1]));
     let mut app = App::headless_for_test_with_sink(sink);
@@ -616,9 +617,10 @@ fn a_pager_that_comes_up_under_a_parked_band_still_gets_its_arrows() {
     use aterm_window::dpi::PhysicalPosition;
     use aterm_window::event::MouseScrollDelta;
     use std::io::Read;
-    use std::os::fd::FromRawFd;
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe");
+    use std::os::fd::{FromRawFd, IntoRawFd};
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     aterm_pty::set_nonblocking(pipe[0], true).expect("nonblocking pipe reader");
     let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(pipe[1]));
     let mut app = App::headless_for_test_with_sink(sink);

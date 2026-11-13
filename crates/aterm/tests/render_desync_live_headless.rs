@@ -148,11 +148,12 @@ impl Tui {
     }
 
     fn play(repaint: Repaint) -> ! {
-        let mut pipe = [0; 2];
-        // SAFETY: a pipe into a two-slot array, both ends made non-blocking,
-        // and the SIGWINCH handler installed for the whole process.
+        use std::os::fd::IntoRawFd as _;
+        let (wake_r, wake_w) = aterm_uds::pipe().expect("pipe");
+        let pipe = [wake_r.into_raw_fd(), wake_w.into_raw_fd()];
+        // SAFETY: both ends of a pipe this process owns made non-blocking, and the SIGWINCH
+        // handler installed for the whole process.
         unsafe {
-            assert_eq!(libc::pipe(pipe.as_mut_ptr()), 0, "pipe");
             for fd in pipe {
                 libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
             }

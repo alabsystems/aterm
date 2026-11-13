@@ -1379,6 +1379,7 @@ fn hosted_claude(sid: &str) -> aterm_agent::harness::relaunch::Snapshot {
         profile: None,
         tab: sid.to_string(),
         pid: 7,
+        lifetime: None,
         start: "Sat Sep 27 01:02:03 2026".to_string(),
         shell: 6,
         program: std::path::PathBuf::from("/opt/claude/bin/claude"),

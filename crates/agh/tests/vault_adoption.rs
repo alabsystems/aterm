@@ -518,22 +518,22 @@ fn a_token_github_refuses_is_not_adopted_and_is_asked_again() {
         assert!(lines[0].contains("unauthenticated"), "{stderr}");
         assert_eq!(
             next_of(lines[0]),
-            vault::REFRESH_STEP,
-            "a refused vault token's step is the vault's refresh: {stderr}"
+            vault::Slot::Dev.sync_step(),
+            "a refused vault token's step is its one path: {stderr}"
         );
         assert_eq!(
             row(&rows(&captured), "dev")["remedy"],
-            Value::from(vault::REFRESH_STEP)
+            Value::from(vault::Slot::Dev.sync_step())
         );
     }
     assert_eq!(user_gets(&fake), 2, "each call asks again");
     assert_eq!(record(root.path()), None);
 }
 
-/// A 401 for an adopted token on a real request names the vault's refresh as its step, never
+/// A 401 for an adopted token on a real request names its slot's one path as its step, never
 /// an agh.toml edit or a profile to add.
 #[test]
-fn a_401_for_an_adopted_token_names_the_vault_refresh() {
+fn a_401_for_an_adopted_token_names_its_one_path() {
     let root = common::scratch("vault-401-routed");
     let fake = FakeGithub::start();
     both(root.path(), &fake);
@@ -553,7 +553,11 @@ fn a_401_for_an_adopted_token_names_the_vault_refresh() {
     assert_eq!(run(&mut ctx, &["repo", "view", "fixture-dev/app"]), 4);
     let error = common::error_json(&captured.stderr_text());
     assert_eq!(error["kind"], Value::from("unauthenticated"), "{error}");
-    assert_eq!(error["next"], Value::from(vault::REFRESH_STEP), "{error}");
+    assert_eq!(
+        error["next"],
+        Value::from(vault::Slot::Dev.sync_step()),
+        "{error}"
+    );
 }
 
 #[test]
@@ -691,6 +695,22 @@ fn only_the_release_file_adopts_release_alone() {
     );
     let (kind, _) = decision(root.path(), &fake, "fixture-dev/app", "writer-read");
     assert_eq!(kind, "refuse");
+
+    let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
+    assert_ne!(
+        run(
+            &mut ctx,
+            &["release", "list", "fixture-dev/app", "--drafts"]
+        ),
+        0
+    );
+    let error = common::error_json(&captured.stderr_text());
+    assert_eq!(error["sub"], Value::from("policy.write_none"), "{error}");
+    assert_eq!(
+        error["next"],
+        Value::from(vault::Slot::Dev.sync_step()),
+        "an absent dev token's step is its one path: {error}"
+    );
 }
 
 #[test]
@@ -1243,23 +1263,25 @@ fn an_offline_learn_is_sent_once_with_no_retry_pause() {
     assert_eq!(record(root.path()), None);
 }
 
-/// A call that learns a login while another agh call holds the record's lock routes adopted
-/// and records nothing; the next call records. An auth edit's lock never stands in its way,
-/// and an adoption's lock never stands in an auth edit's.
+/// A call that learns a login while another agh call holds the record's lock past the wait
+/// routes adopted, records nothing and names the held lock in a note, never silently: a git
+/// run's helper reads only the record. An auth edit's lock
+/// never stands in its way, and an adoption's lock never stands in an auth edit's. The
+/// wait itself, a holder that lets go, is `a_call_waits_out_another_calls_record_lock`.
 #[test]
 fn the_record_lock_is_adoptions_own() {
     let root = common::scratch("vault-lock");
     let fake = FakeGithub::start();
     both(root.path(), &fake);
     let dirs = dirs(root.path());
-    {
+    vault::with_record_wait_for_tests(std::time::Duration::ZERO, || {
         let _held = vault::hold_record_lock_for_tests(&dirs).expect("the record lock");
         let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
         assert_eq!(run(&mut ctx, &["whoami"]), 0, "{}", captured.stderr_text());
-        assert_eq!(
-            captured.stderr_text(),
-            "",
-            "a held record lock is another call's write, which the next call outlasts: no note"
+        let stderr = captured.stderr_text();
+        assert!(
+            stderr.contains("vault adoption record's lock"),
+            "a lock held past the wait is named: {stderr}"
         );
         assert_eq!(
             row(&rows(&captured), "dev")["login"],
@@ -1275,7 +1297,7 @@ fn the_record_lock_is_adoptions_own() {
         let report = common::stdout_json(&captured);
         assert!(
             report["faults"].as_array().is_some_and(Vec::is_empty),
-            "a held record lock is no fault: {report}"
+            "policy check learns nothing, so it writes nothing and meets no lock: {report}"
         );
         assert_eq!(
             record(root.path()),
@@ -1297,7 +1319,7 @@ fn the_record_lock_is_adoptions_own() {
             "auth add never waits on adoption: {}",
             captured.stderr_text()
         );
-    }
+    });
     {
         let _held = identity::provision::hold_auth_edit_for_tests(&dirs).expect("the auth lock");
         let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
@@ -1305,6 +1327,36 @@ fn the_record_lock_is_adoptions_own() {
     }
     let text = record(root.path()).expect("the next call records");
     assert!(text.contains(DEV_LOGIN), "{text}");
+}
+
+/// A call that learns the vault's logins while another agh call holds the record's lock
+/// waits for it, then records them: the holder lets go at the call's first
+/// contended attempt, and the record holds the dev login once the call ends. Negative
+/// control, run by hand: with the wait at zero, the take before this fix, nothing is recorded.
+#[test]
+fn a_call_waits_out_another_calls_record_lock() {
+    let root = common::scratch("vault-lock-wait");
+    let fake = FakeGithub::start();
+    both(root.path(), &fake);
+    let dirs = dirs(root.path());
+    let held = vault::hold_record_lock_for_tests(&dirs).expect("the record lock");
+    let holder = std::rc::Rc::new(std::cell::RefCell::new(Some(held)));
+    let let_go = holder.clone();
+    let captured = aterm_uds::file_lock::with_lock_wait_observer(
+        move |_file| drop(let_go.borrow_mut().take()),
+        || {
+            let (mut ctx, captured) = common::ctx(root.path(), &fake, common::env());
+            assert_eq!(run(&mut ctx, &["whoami"]), 0, "{}", captured.stderr_text());
+            captured
+        },
+    );
+    assert_eq!(captured.stderr_text(), "", "a lock let go is no note");
+    let text = record(root.path()).expect("the call records once the holder lets go");
+    assert!(text.contains(DEV_LOGIN), "{text}");
+    assert!(
+        holder.borrow().is_none(),
+        "the call never waited on the held lock"
+    );
 }
 
 #[test]

@@ -4788,7 +4788,7 @@ drop_asked() {
 # is past that check: by its own exit, or a signal it or macOS raised. A run
 # cut off may still be in it, and macOS 27.0.1's syspolicyd crashes when the
 # file it is checking at a first exec is removed or renamed, stranding every
-# later exec until a restart.
+# exec then waiting on it.
 # A path that is no executable file never ran, and off macOS there is no such
 # check. An end of 126 or 127 with no line may be the shell's own failure to
 # exec it (denied, or a missing interpreter), which shows nothing but a kernel
@@ -4906,7 +4906,7 @@ bundle_showed_it_ran() { # <app>
 
 # Say that <path> was left where it is, for UNPROVEN (showed_it_ran).
 say_unproven() { # <path>
-	echo "install.sh: $1 was left as it is: $UNPROVEN, so macOS may still be checking its first start, and replacing it now could stall every program start on this Mac until a restart — $UNPROVEN_THEN" >&2
+	echo "install.sh: $1 was left as it is: $UNPROVEN, so macOS may still be checking its first start, and replacing it now could strand every program start then waiting on that check — $UNPROVEN_THEN" >&2
 }
 
 # Whether <path>, an aterm.app or a store's aterm, may be removed or renamed

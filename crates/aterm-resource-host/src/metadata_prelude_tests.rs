@@ -322,7 +322,7 @@ fn run_selected_actor(
         prelude.env("ATERM_TEST_METADATA_EXEC", mode);
     }
     let extra = owner.extra().unwrap();
-    let (read, write) = io::pipe().unwrap();
+    let (read, write) = aterm_uds::pipe().unwrap();
     prelude
         .inherit_guards_at(vec![
             extra,

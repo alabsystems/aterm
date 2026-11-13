@@ -265,7 +265,6 @@ const CUSTOM_BURST_KIND_ALIASES: &[&str] = &["super_nova", "super-nova"];
 const CUSTOM_GRAPHIC_COLLECTIONS: &[&str] = &["cats"];
 const WINDOWING_BEHAVIORS: &[&str] = &["new_window", "attach"];
 const FONT_HINTINGS: &[&str] = &["full", "light", "off"];
-const FONT_SUBPIXELS: &[&str] = &["off", "rgb", "bgr"];
 const RIGHT_CLICK_GESTURES: &[&str] = &["copy_paste", "off"];
 const RIGHT_CLICK_ALIASES: &[&str] = &["copy-paste"];
 const TAB_MENU_CHORDS: &[&str] = &["on", "menu_key", "off"];
@@ -923,15 +922,6 @@ const MANUAL_SCHEMA: &[ManualSchemaEntry] = &[
             "windows",
             "stem",
         ],
-        true,
-    ),
-    manual(
-        "font_subpixel",
-        "Linux subpixel-RGB text",
-        ConfigSchemaKind::Scalar(EditKind::Enum {
-            options: FONT_SUBPIXELS,
-        }),
-        &["lcd", "cleartype", "rgb", "bgr", "linux", "antialias"],
         true,
     ),
     manual(
@@ -2418,7 +2408,6 @@ fn manual_default_shown(key: &str) -> Option<String> {
         }
         "render.repaint_nudge" => config.repaint_nudge_mode().word().to_string(),
         "font_hinting" => config.font_hinting_or_default(),
-        "font_subpixel" => config.font_subpixel_or_default(),
         "right_click" => word(
             key,
             config.right_click_or_default(),
@@ -5770,7 +5759,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · at Claude Code's \"We recommend compacting earlier\" offer, chooses Autocompact at this size (300k to 900k), never the keep row or Esc · it changes Claude Code's own autocompact setting for that model (/autocompact switches back) · off: the offer is yours"
         }
         "harness.accounts" => {
-            " · at a usage limit, a Claude Code session is relaunched under the next listed account; \"early\" also moves it ahead of the limit, typing /usage to sample it; \"off\" moves no session and syncs no roster of any CLI by itself (aterm harness accounts sync by hand still runs) · the one key for every CLI whose roster this machine keeps beside aterm.toml (accounts-codex.toml, accounts-grok.toml, accounts-kimi.toml): those pools are listed, pinned, synced and renewed (aterm harness accounts --cli <id>), launches start under their serving row (a Codex launch reads only the row it is about to start on, trying up to 3 rows if the read shows that row cannot serve, and starts under a row other than the default only on a codex-alab that keeps that row's login its own, CODEX_AUTH_PATH; on any other Codex build it is refused, naming why), a Codex worker aterm spawns waits while every row it may start under is at its limit (on any other Codex build, the default row alone), starting once one serves (a limit a Grok Build or Kimi Code session meets is not recorded, one an aterm ai review reviewer meets is recorded under its row, and a Kimi Code row whose aterm harness accounts refresh --cli kimi panel reads a window full is passed over until that window resets), a Codex tab a cold restore relaunches, and a self-claimed codex-alab aterm relaunches after it crashed or was restarted, leaves its row for the serving one where that row is limited or signed out (that row's usage read first where the records say it serves and its reading is stale; on any other Codex build, only for the default row), and a running codex-alab moves only at its weekly limit, by its own proven handoff, to the row the report's at a weekly limit: line names; no running Grok Build or Kimi Code session is moved"
+            " · at a usage limit, a Claude Code session is relaunched under the next listed account; \"early\" also moves it ahead of the limit, typing /usage to sample it; \"off\" moves no session and syncs no roster of any CLI by itself (aterm harness accounts sync by hand still runs) · the one key for every CLI whose roster this machine keeps beside aterm.toml (accounts-codex.toml, accounts-grok.toml, accounts-kimi.toml): those pools are listed, pinned, synced and renewed (aterm harness accounts --cli <id>), launches start under their serving row (a Codex launch reads only the row it is about to start on, trying up to 3 rows if the read shows that row cannot serve, and starts under a row other than the default only on a codex-alab that keeps that row's login its own, CODEX_AUTH_PATH; on any other Codex build it is refused, naming why), a Codex worker aterm spawns waits while every row it may start under is at its limit (on any other Codex build, the default row alone), starting once one serves (a limit a Grok Build or Kimi Code session meets is not recorded, one an aterm ai review reviewer meets is recorded under its row, and a Kimi Code row whose aterm harness accounts refresh --cli kimi panel reads a window full is passed over until that window resets), a Codex tab a cold restore relaunches, and a self-claimed codex-alab aterm relaunches after it crashed or was restarted, leaves its row for the serving one where that row is limited or signed out (that row's usage read first where the records say it serves and its reading is stale; on any other Codex build, only for the default row), and a running codex-alab moves at its weekly limit, by its own proven handoff, to the row the report's at a weekly limit: line names, or when it is asked to (aterm ctl @<sid> restart account=<label>); no running Grok Build or Kimi Code session is moved"
         }
         "harness.logins" => {
             " · a login listed with an email is signed in again by aterm itself when it ends or comes due within a week of a session here running on it (a login whose directory was removed has ended), unless another Mac holds its claim, your sheet gives its account to other Macs alone, or this Mac cannot tell whose it is (a sheet only on the network, a source, lab or swarm roster it cannot read, or a Mac with no name), and a Claude Code session on it is relaunched onto the new login; aterm types no /login over it, and where nothing relaunches the tab (relaunch or resume_limits off, a restart it cannot make) the tab waits, its record naming why · a lost login listed nowhere is signed in where it stands: aterm types /login once and the browser sign-in is yours · off: aterm signs no listed login in by itself and no session follows a renewal, so a lost login gets /login once · in every CLI's roster: a window renews a due Codex or Kimi Code login in the background where a headless browser is installed and the row names an email (on macOS, Codex's device-flow sign-in runs in a sandbox that keeps it from opening a browser on the desk, and not at all where that sandbox is missing; never the Codex row on this machine's own login while this machine's Codex keeps no row's login its own, which Codex's own sign-in in its default home signs in, aterm ai login codex, once that login ends), and off stops that too (aterm harness accounts renew --cli <id> by hand still runs) · a window renews no Grok Build login: accounts.x.ai answers a headless browser with its bot-protection block page, so each try would be an xAI device code and a blocked page; aterm harness accounts login <label> --cli grok, run and approved by you, signs it in"
@@ -5846,7 +5835,7 @@ fn setting_help(setting: &ConfigSchemaEntry) -> String {
             " · default true: while the harness's theme is on a Claude Code session (its composer border drawn), the agents panel under the footer wears the theme's rainbow — each row's name in its stripe at Claude's own lightness, a workflow's bar along the whole palette — and each agent's dot tells its work: hue = which agent, brightness and glow = how much work, saturation = how fresh, full hue with a dim steady glow = in its own tool call (inside that call's timeout plus 30 s, read from its transcript), a grey breath = stuck (no work for 150 s with nothing of its own in flight), a still amber ring = awaiting approval, Claude's own green or red = done or failed — glass only; false leaves the panel as Claude drew it · serious mode keeps the colours and drops the glow · read live"
         }
         "claude_footer.card" => {
-            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by alab claude harness <harness version> · alab.systems` (the site's name a link), and under Autopilot off the same card in white; banners over Claude Code's update notice and its startup announcement name and link alab.systems — glass only; false leaves the card bare · read live"
+            " · default true: while the harness carries a Claude Code session (Autopilot cruise or land, its claim this window's), its launch card wears a rainbow border, a pixel-art kitty riding a rainbow with stars, and the line `✦ enhanced by ALab claude harness` (`ALab` a link to alab.systems), and under Autopilot off the same card in white; every row under the line stays Claude Code's own — glass only; false leaves the card bare · read live"
         }
         "keeper.enabled" => {
             " · default true · read at launch; on, a window of an app bundle starts this build's PTY keeper if none runs, every terminal is registered with it, and a launch after a crash or kill reattaches the shells it held; off: `aterm keeper stop` ends the one running · macOS only"

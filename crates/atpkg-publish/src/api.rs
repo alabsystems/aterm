@@ -57,6 +57,10 @@ pub struct PackRequest {
     pub upload: bool,
     /// Extra build environment (a cross linker: `CARGO_TARGET_<TRIPLE>_LINKER`).
     pub env: Vec<(String, String)>,
+    /// A bound on the build's own child (`None`: unbounded). A build still running at it is
+    /// ended with its process group and the pack is refused: nothing is staged, signed or
+    /// uploaded.
+    pub build_within: Option<std::time::Duration>,
 }
 
 /// What a pack produced.

@@ -381,6 +381,89 @@ fn private_bump_tree_matches_the_real_bump_edits() {
     assert_eq!(actual, planned);
 }
 
+/// `--open-next`'S ONE WRITE, AGAINST A REAL REMOTE. The production bump writer
+/// ([`Real::bump_on`]: the editor pipeline, the commit, the custody journal and the
+/// expected-old push) runs against a scratch bare origin. The remote's main becomes one commit
+/// on the tip it was read at, whose tree is the tree a dry `--bump` previews, so opening a
+/// version writes the bump set and nothing else; no other ref of the remote moves and no line
+/// state is written beside the custody journal.
+/// NEGATIVE CONTROL: a writer that pushed without the expected old tip, or that started a line,
+/// leaves a second ref or a journal here.
+#[cfg(unix)]
+#[test]
+fn the_open_next_commit_is_the_previewed_bump_alone_on_a_scratch_remotes_tip() {
+    let mut fixture = BumpFixture::new(false);
+    let candidate = unwritten_bump(&fixture);
+    let preview = fixture.preview(&candidate).unwrap();
+    let prover = Prover {
+        bin: crate::gates::trust_stage2_bin().unwrap(),
+        commit: "0".repeat(40),
+        source: "fixture Trust".into(),
+    };
+    fixture.real.repo = fixture.repo.canonicalize().unwrap();
+    assert_eq!(fixture.origin.refresh_main().unwrap(), fixture.base);
+    let bare = GitCli::new(fixture.root.path().join("origin.git"));
+    let refs_of = |git: &GitCli| {
+        crate::ledger::git_ok(git, &["for-each-ref", "--format=%(refname) %(objectname)"])
+            .unwrap()
+            .stdout_utf8()
+    };
+    let before = refs_of(&bare);
+
+    let opened = fixture
+        .real
+        .bump_on("0.5.0", "0.6.0", &prover, &fixture.origin, &|_| Ok(()))
+        .unwrap();
+
+    let git = GitCli::new(&fixture.repo);
+    let out = |git: &GitCli, args: &[&str]| {
+        crate::ledger::git_ok(git, args)
+            .unwrap()
+            .stdout_utf8()
+            .trim()
+            .to_owned()
+    };
+    assert_eq!(out(&bare, &["rev-parse", "refs/heads/main"]), opened);
+    assert_eq!(
+        out(&git, &["show", "-s", "--format=%P", &opened]),
+        fixture.base,
+        "one commit on the tip it was read at"
+    );
+    assert_eq!(
+        out(&git, &["rev-parse", &format!("{opened}^{{tree}}")]),
+        out(&git, &["rev-parse", &format!("{preview}^{{tree}}")]),
+        "the tree a dry bump previews"
+    );
+    assert!(
+        out(&git, &["show", "-s", "--format=%s", &opened]).starts_with("release: 0.6.0 "),
+        "the bump's subject"
+    );
+    let changed = out(&git, &["diff", "--name-only", &fixture.base, &opened]);
+    assert!(
+        changed.lines().any(|path| path == "Cargo.toml")
+            && changed.lines().any(|path| path == "Cargo.lock")
+            && !changed.lines().any(|path| path == "src/lib.rs"),
+        "{changed}"
+    );
+    assert_eq!(
+        refs_of(&bare),
+        before.replace(&fixture.base, &opened),
+        "only main moved on the remote: no tag, no line claim"
+    );
+    for line_state in [crate::release::JOURNAL_FILE, crate::release::SELECTION_FILE] {
+        assert!(
+            !fixture.real.release.join(line_state).exists(),
+            "{line_state}"
+        );
+    }
+    assert_eq!(
+        out(&git, &["status", "--porcelain"]),
+        "",
+        "the clone is clean"
+    );
+    assert_eq!(out(&git, &["rev-parse", "HEAD"]), opened);
+}
+
 /// The `--bump` candidate of [`BumpFixture`]'s base: 0.5.0 to 0.6.0, the bump unwritten.
 #[cfg(unix)]
 fn unwritten_bump(fixture: &BumpFixture) -> Candidate {

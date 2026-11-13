@@ -127,6 +127,10 @@ pub(crate) struct DurableUpdateStatus {
     pub(crate) channel_unreadable: bool,
     /// When the last check completed (Unix seconds; `aterm_update::UpdateStatus::updated_at`), `None` before any.
     pub(crate) checked_at: Option<i64>,
+    /// The update record's hold on a newer build ([`aterm_update::UpdateStatus::hold`]).
+    pub(crate) hold: Option<aterm_update::HoldView>,
+    /// The record's newest offer is newer than what runs ([`aterm_update::UpdateStatus::behind`]).
+    pub(crate) behind: bool,
 }
 
 /// Verified artifact identity retained across Settings-view close/reopen.
@@ -308,6 +312,13 @@ pub(crate) struct UpdaterSnapshot {
     /// that check, not of the latest one. A start stamped by a clock since set back stands until a
     /// receipt passes it: the words go on, and no update is held.
     pub(crate) check_unanswered_since: Option<i64>,
+    /// The update record's hold on a newer build, as the last read of the record said it
+    /// ([`NativeUpdaterService::note_hold`]): the build the gates refuse until it lapses, a person
+    /// asks again, it starts cleanly or a newer build is offered.
+    pub(crate) hold: Option<aterm_update::HoldView>,
+    /// Whether the record's newest offer is newer than the running build, as the same read said
+    /// ([`NativeUpdaterService::note_hold`]): the page never says "up to date" while it is.
+    pub(crate) behind: bool,
 }
 
 impl UpdaterSnapshot {
@@ -690,6 +701,8 @@ impl NativeUpdaterService {
                 channel_unreadable: false,
                 checked_at: None,
                 check_unanswered_since: None,
+                hold: None,
+                behind: false,
             },
             next_operation: 1,
             work_generation: 0,
@@ -933,6 +946,27 @@ impl NativeUpdaterService {
         changed
     }
 
+    /// Take the update record's hold, and whether this copy is behind its newest offer, as a read
+    /// of the record says them (a reconcile's or a check's; [`DurableUpdateStatus::hold`] and
+    /// [`DurableUpdateStatus::behind`]), whether or not anything is staged: a hold on a build the
+    /// page never staged still says why the page is not up to date. Returns whether either
+    /// changed.
+    pub(crate) fn note_hold(
+        &mut self,
+        hold: Option<&aterm_update::HoldView>,
+        behind: bool,
+    ) -> bool {
+        let hold = hold.filter(|_| self.snapshot.enabled).cloned();
+        let behind = behind && self.snapshot.enabled;
+        if self.snapshot.hold == hold && self.snapshot.behind == behind {
+            return false;
+        }
+        self.snapshot.hold = hold;
+        self.snapshot.behind = behind;
+        self.publish();
+        true
+    }
+
     /// A receipt written after the check that gave up had started: a check did answer on this Mac.
     /// Returns whether that ended [`UpdaterSnapshot::check_unanswered_since`].
     fn note_receipt_of_a_check(&mut self, checked_at: Option<i64>) -> bool {
@@ -1063,6 +1097,8 @@ impl NativeUpdaterService {
         if status.checked_at.is_some() {
             self.snapshot.checked_at = status.checked_at;
         }
+        self.snapshot.hold = status.hold.clone().filter(|_| status.enabled);
+        self.snapshot.behind = status.behind && status.enabled;
         let _answered = self.note_receipt_of_a_check(status.checked_at);
         if !status.enabled {
             let before = self.model_state();

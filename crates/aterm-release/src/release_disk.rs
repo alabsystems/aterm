@@ -65,6 +65,20 @@ pub fn need(kept: &aterm_capacity::Footprints, warm: bool) -> aterm_capacity::Es
     }
 }
 
+/// What sized a claim of `bytes` ([`need`]) for a clone whose build is `warm`, as the release
+/// says it.
+#[must_use]
+pub fn basis(bytes: u64, warm: bool) -> &'static str {
+    let floor = if warm { WARM } else { COLD };
+    if bytes > floor {
+        "the most a recorded release on this Mac wrote"
+    } else if warm {
+        "the floor where the clone's build is warm"
+    } else {
+        "the floor where the clone's build is cold"
+    }
+}
+
 /// The runs `path` keeps; none where it is absent or unreadable.
 #[must_use]
 pub fn load(path: &Path) -> aterm_capacity::Footprints {

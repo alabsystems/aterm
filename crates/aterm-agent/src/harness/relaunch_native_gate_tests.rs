@@ -443,6 +443,7 @@ fn retirement_discovered_during_abort_is_saved_before_any_further_observation() 
 
 fn report() -> Report {
     Report {
+        rung: None,
         pid: std::process::id(),
         tab: TAB.into(),
         session: SESSION.into(),
@@ -753,6 +754,7 @@ fn assert_only_discovery_and_hand(seen: &[String]) {
 
 fn exit_input(world: &Path, st: &St) -> (Snapshot, Plan) {
     let snap = Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         route: crate::harness::accounts::AuthRoute::Outside,

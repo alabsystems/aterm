@@ -5,7 +5,8 @@
 //! compaction cost, and the one-time migration of a format-1 journal.
 
 use super::tests::{
-    journaled_edit, open_as_the_app_does, preserved_images, snapshots, test_root, type_and_append,
+    JournalRecording, journaled_edit, open_as_the_app_does, preserved_images, snapshots, test_root,
+    type_and_append,
 };
 use super::*;
 use crate::document_store::TextEdit;
@@ -34,7 +35,7 @@ fn appending_does_not_change_a_preserved_hard_link() {
     })
     .unwrap();
     assert_eq!(preserved_images(&root), vec![before.clone()]);
-    let recording = aterm_durable::seam::Recording::start();
+    let recording = JournalRecording::start(&journals);
     let (_, completion) = type_and_append(&mut journals, &mut store, id, "new edit");
     assert!(matches!(completion, JournalCompletion::Durable { .. }));
     assert_eq!(
@@ -59,7 +60,7 @@ fn appending_does_not_change_a_preserved_hard_link() {
 #[test]
 fn appends_compactions_and_saves_are_durable_before_acknowledgement() {
     let (root, mut journals, mut store, id, _disk, path, key) = journaled_edit("append-barrier");
-    let recording = aterm_durable::seam::Recording::start();
+    let recording = JournalRecording::start(&journals);
     let mut compactions = 0;
     let mut typed = String::new();
     for n in 0..=COMPACT_RECORDS {
@@ -132,7 +133,7 @@ fn a_draft_larger_than_the_compaction_bound_appends_in_place() {
     let disk = "x".repeat(usize::try_from(COMPACT_BYTES).unwrap() + 1024 * 1024);
     let (_, id, initialized) = open_as_the_app_does(&mut journals, &mut store, URI, &disk);
     assert!(initialized.tail.byte_len() > COMPACT_BYTES);
-    let recording = aterm_durable::seam::Recording::start();
+    let recording = JournalRecording::start(&journals);
     for typed in ["a", "b"] {
         let (_, completion) = type_and_append(&mut journals, &mut store, id, typed);
         assert!(matches!(completion, JournalCompletion::Durable { .. }));
@@ -156,7 +157,7 @@ fn an_edit_to_a_4_mib_draft_writes_a_record_and_durably_flushes_once() {
     let mut store = crate::test_document_store();
     let disk = "0123456789abcdef\n".repeat(4 * 1024 * 1024 / 17);
     let (_, id, initialized) = open_as_the_app_does(&mut journals, &mut store, URI, &disk);
-    let recording = aterm_durable::seam::Recording::start();
+    let recording = JournalRecording::start(&journals);
     let tally = astream_sys::flush_tally();
     let start = len_of(&initialized.path);
     for n in 0..EDITS {
@@ -244,7 +245,7 @@ fn a_torn_tail_recovers_to_the_last_whole_record() {
     fs::write(&path, &damaged).unwrap();
     let decision = host.inspect_open("file:///tmp/draft.md", b"disk").unwrap();
     assert_eq!(decision.recovered_text.as_deref(), Some("disk+"));
-    host.initialize(decision, &disk, &head).unwrap();
+    let _prepared = host.initialize(decision, &disk, &head).unwrap();
     assert!(
         preserved_images(&root).contains(&damaged),
         "keep the damaged last frame"
@@ -252,16 +253,20 @@ fn a_torn_tail_recovers_to_the_last_whole_record() {
     let _ = fs::remove_dir_all(root);
 }
 
-/// A byte flipped inside the journal, with a whole record after it, is a fault: the open
-/// recovers nothing, says the draft could not be read, and keeps the image as it is.
+/// A byte flipped inside the journal's base snapshot, with whole records after it, is a fault
+/// before any draft record: the open recovers nothing, says the draft could not be read, and
+/// keeps the image as it is.
 #[test]
-fn a_flipped_byte_mid_journal_is_refused_and_the_file_kept() {
+fn a_flipped_byte_in_the_base_snapshot_recovers_nothing_and_keeps_the_file() {
     let (root, mut journals, mut store, id, _disk, path, key) = journaled_edit("flipped-byte");
     let (_, completion) = type_and_append(&mut journals, &mut store, id, " more");
     assert!(matches!(completion, JournalCompletion::Durable { .. }));
     let mut damaged = fs::read(&path).unwrap();
-    let middle = damaged.len() / 2;
-    damaged[middle] ^= 0x10;
+    let base = damaged
+        .windows(4)
+        .position(|bytes| bytes == b"disk")
+        .expect("the base snapshot holds the disk text");
+    damaged[base] ^= 0x10;
     fs::write(&path, &damaged).unwrap();
     assert!(recover_journal_for(key, &damaged).is_err());
     drop(journals);
@@ -276,10 +281,103 @@ fn a_flipped_byte_mid_journal_is_refused_and_the_file_kept() {
         "the inspection writes nothing"
     );
     let (_store, _, disk) = snapshots("disk");
-    host.initialize(decision, &disk, &disk).unwrap();
+    let _prepared = host.initialize(decision, &disk, &disk).unwrap();
     assert_eq!(
         preserved_images(&root),
         vec![damaged],
+        "kept aside, byte for byte"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A byte flipped in a draft record with a whole record after it is a fault past the whole
+/// records before it: the open recovers the draft as of them (older than the journal's last
+/// record, which survives only in the image kept aside), says the rest could not be read
+/// ([`RecoveryNotice::Partial`]), and keeps the image byte for byte.
+#[test]
+fn a_flipped_byte_past_a_draft_record_recovers_the_draft_before_it() {
+    let (root, mut journals, mut store, id, _disk, path, key) = journaled_edit("flipped-later");
+    for typed in [" more", " again"] {
+        let (_, completion) = type_and_append(&mut journals, &mut store, id, typed);
+        assert!(matches!(completion, JournalCompletion::Durable { .. }));
+    }
+    let mut damaged = fs::read(&path).unwrap();
+    let more = damaged
+        .windows(5)
+        .position(|bytes| bytes == b" more")
+        .expect("the second draft record holds its text");
+    damaged[more + 1] ^= 0x10;
+    fs::write(&path, &damaged).unwrap();
+    assert!(recover_journal_for(key, &damaged).is_err());
+    drop(journals);
+
+    let host = DraftJournalHost::new(root.clone()).unwrap();
+    let decision = host.inspect_open("file:///tmp/draft.md", b"disk").unwrap();
+    assert_eq!(decision.recovered_text.as_deref(), Some("disk+"));
+    assert_eq!(decision.notice, Some(RecoveryNotice::Partial));
+    let (mut documents, document, disk) = snapshots("disk");
+    let _ = documents.transact(
+        document,
+        disk.seq,
+        vec![TextEdit {
+            range: 4..4,
+            insert: "+".into(),
+        }],
+    );
+    let head = documents.snapshot(document).unwrap();
+    let _prepared = host.initialize(decision, &disk, &head).unwrap();
+    assert_eq!(
+        preserved_images(&root),
+        vec![damaged],
+        "kept aside, byte for byte"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A crash cuts an append past a whole astream frame nested in its record's text (`¥` is
+/// C2 A5, so `¥q`, U+0001 and nine NULs hold an empty frame's twelve bytes). astream reads the
+/// cut as a fault, not a torn tail, yet every record before the torn one is whole: the open
+/// recovers the draft as of them, says the rest could not be read, and keeps the image aside.
+#[test]
+fn a_cut_past_a_frame_nested_in_the_text_recovers_the_whole_records_before_it() {
+    let (root, mut journals, mut store, id, _disk, path, _key) = journaled_edit("nested-frame");
+    let whole = fs::read(&path).unwrap();
+    let (_, completion) = type_and_append(
+        &mut journals,
+        &mut store,
+        id,
+        "\u{a5}q\u{1}\0\0\0\0\0\0\0\0\0 and after",
+    );
+    assert!(matches!(completion, JournalCompletion::Durable { .. }));
+    let typed = fs::read(&path).unwrap();
+    let nested = whole.len()
+        + 1
+        + typed[whole.len()..]
+            .windows(4)
+            .position(|bytes| bytes == [0xc2, 0xa5, b'q', 1])
+            .expect("the appended frame holds the nested one");
+    let cut = typed[..nested + 12].to_vec();
+    drop(journals);
+    fs::write(&path, &cut).unwrap();
+
+    let host = DraftJournalHost::new(root.clone()).unwrap();
+    let decision = host.inspect_open("file:///tmp/draft.md", b"disk").unwrap();
+    assert_eq!(decision.recovered_text.as_deref(), Some("disk+"));
+    assert_eq!(decision.notice, Some(RecoveryNotice::Partial));
+    let (mut documents, document, disk) = snapshots("disk");
+    let _ = documents.transact(
+        document,
+        disk.seq,
+        vec![TextEdit {
+            range: 4..4,
+            insert: "+".into(),
+        }],
+    );
+    let head = documents.snapshot(document).unwrap();
+    let _prepared = host.initialize(decision, &disk, &head).unwrap();
+    assert_eq!(
+        preserved_images(&root),
+        vec![cut],
         "kept aside, byte for byte"
     );
     let _ = fs::remove_dir_all(root);
@@ -329,7 +427,7 @@ fn a_format_1_journal_stays_format_1_until_its_first_write() {
     let read_v1 = recover_journal_for(key, &v1).unwrap();
     assert_eq!(read_v1.text, "disk and a λ draft");
 
-    let recording = aterm_durable::seam::Recording::start();
+    let recording = JournalRecording::start(&journals);
     let mut store = crate::test_document_store();
     let (decision, id, initialized) = open_as_the_app_does(&mut journals, &mut store, URI, "disk");
     assert_eq!(

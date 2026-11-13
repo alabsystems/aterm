@@ -701,7 +701,7 @@ impl CursorRainbow {
         }
         let caret_floor = if dark_theme && paint > 0.0 {
             const INV_CARET_LIGHT_KNEE: f32 = 1.0 / CARET_LIGHT_KNEE;
-            RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(paint * INV_CARET_LIGHT_KNEE)
+            RAINBOW_CARET_LIGHT_FLOOR * aterm_scene::smoothstep(paint * INV_CARET_LIGHT_KNEE)
         } else {
             0.0
         };
@@ -1474,10 +1474,12 @@ fn push_ring_rect(
     if w <= 0 || h <= 0 || premul == 0 {
         return;
     }
+    // The effects box inside the overlay pixel space: every narrowing below is then exact.
+    let space = crate::cursor_glow::OVERLAY_PX_MAX;
     let x0 = x.max(geom.fx_left());
-    let x1 = (x + w).min(geom.fx_right());
+    let x1 = (x + w).min(geom.fx_right()).min(space);
     let y0 = y.max(geom.fx_top());
-    let y1 = (y + h).min(geom.fx_bot());
+    let y1 = (y + h).min(geom.fx_bot()).min(space);
     if x1 <= x0 || y1 <= y0 {
         return;
     }

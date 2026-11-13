@@ -195,7 +195,11 @@ ATERM-TASK-DONE",
 
     let (mut st, now) = checked_at(t0());
     st.face_start();
-    at(&mut st, &idle("All done.", Some(MIN)), now + MIN);
+    at(
+        &mut st,
+        &idle("All done.\n\nATERM-TASK-DONE", Some(MIN)),
+        now + MIN,
+    );
     assert_eq!(st.face_moved(), None);
 
     let mut now = t0();
@@ -434,7 +438,7 @@ fn a_seeded_landing_holds_only_where_the_last_words_are_the_landings_own() {
 fn a_reply_a_wall_cut_never_said_done_though_the_done_report_before_it_stands() {
     let t = t0();
     let s = Duration::from_secs;
-    let done = "All done. Nothing left to do.";
+    let done = "All done. Nothing left to do.\n\nATERM-TASK-DONE";
     let reported = || {
         let mut st = TurnEndState::default();
         let a = act(&mut st, &land(idle(done, Some(s(600)))), t);
@@ -483,7 +487,7 @@ fn a_reply_a_wall_cut_never_said_done_though_the_done_report_before_it_stands() 
 #[test]
 fn someone_elses_live_turn_and_a_persons_own_exchange_never_said_done() {
     let t = t0();
-    let done = "All done. Nothing left to do.";
+    let done = "All done. Nothing left to do.\n\nATERM-TASK-DONE";
     let mut st = TurnEndState::default();
     st.observe(&land(idle(done, Some(Duration::from_secs(600)))), t);
     assert!(st.said_done(), "the negative control: no live read since");

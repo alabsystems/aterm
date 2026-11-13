@@ -77,7 +77,6 @@ const LOOKS: &[(&str, Look)] = &[
     (
         "rainbow",
         Look {
-            ribbon_tall: false,
             beam: false,
             ..styled(GlowStyle::RainbowKitty)
         },
@@ -237,8 +236,8 @@ fn the_unset_default_is_the_rainbow_beside_the_cat_all_the_way_to_the_draw_seam(
     assert!(!unknown);
     assert_eq!(look.style, Some(GlowStyle::RainbowKitty));
     assert!(
-        !look.ribbon_tall && !look.ribbon_flat,
-        "the rainbow is the line under what you type"
+        look.ribbon_tall && !look.ribbon_flat,
+        "the rainbow is the band behind what you type, with the line under it"
     );
     assert_eq!(
         pet,

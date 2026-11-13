@@ -63,3 +63,18 @@ fn guard_paths_population_aliases_and_versions_refuse_without_truncation() {
     bytes.extend(0u64.to_be_bytes());
     assert!(Request::decode(&bytes).is_err());
 }
+#[test]
+fn warm_selection_binds_complete_original_receipt_and_one_use_sequence() {
+    let selected=Selection {retained:request(),sequence:1,attempt:[4;16]};
+    let bytes=selected.encode().unwrap();assert_eq!(Selection::decode(&bytes).unwrap(),selected);
+    for end in 0..bytes.len() {assert!(Selection::decode(&bytes[..end]).is_err());}
+    let reply=SelectionReply {selection:selected.clone(),decision:SelectionDecision::Selected}.encode().unwrap();
+    assert!(SelectionReply::decode(&reply,&selected).is_ok());
+    for changed in 0..5 {
+        let mut other=selected.clone();
+        match changed {0=>other.sequence+=1,1=>other.attempt=[5;16],2=>other.retained.key.attempt=[6;16],3=>other.retained.locks.swap(0,1),_=>other.retained.locks[0].backing.inode+=10};
+        assert!(SelectionReply::decode(&reply,&other).is_err(),"selection change {changed}");
+    }
+    let mut zero=selected.clone();zero.sequence=0;assert!(zero.encode().is_err());
+    let mut replay=selected;replay.attempt=replay.retained.key.attempt;assert!(replay.encode().is_err());
+}

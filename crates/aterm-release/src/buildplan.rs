@@ -20,8 +20,8 @@ mod hop_measure;
 #[path = "linux_release.rs"]
 pub mod linux;
 
-const ARM64: &str = "aarch64-apple-darwin";
-const X86_64: &str = "x86_64-apple-darwin";
+pub(crate) const ARM64: &str = "aarch64-apple-darwin";
+pub(crate) const X86_64: &str = "x86_64-apple-darwin";
 const NATIVE_SLICE: &str = "native";
 const COMPAT_CHECK_SLICE: &str = "x86_64-check";
 const COMPAT_CHECK_EPOCH: u64 = 1;
@@ -684,19 +684,22 @@ fn serial_slices_while<Parent, Slice, Result>(
 /// A minute is a patience bound, not evidence that the OS load will ever end.
 const SLICE_MEMORY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Whether a shortage is of memory alone and unclaimed under normal pressure: no claim holds or
+/// reserves any memory ahead of it, or its own look names it STUCK (no claim's end it can wait
+/// for brings what it lacks, `aterm_capacity::Spared::Stuck`), whatever claims hold memory
+/// beside it. Claims of memory that fits go first past a stuck parent and are held beside it,
+/// and a stream of them must not keep resetting its patience bound.
 fn serial_escape(short: &aterm_capacity::Shortfall, reading: &aterm_capacity::Reading) -> bool {
     reading.pressure == Some(aterm_sysprobe::MemoryLevel::Normal)
-        && short.holders.is_empty()
         && !short.shorts.is_empty()
-        && short.shorts.iter().all(|short| {
-            matches!(
-                short,
-                aterm_capacity::Short::Memory {
-                    reserved: 0,
-                    passes: None,
-                    ..
-                }
-            )
+        && short.shorts.iter().all(|s| match s {
+            aterm_capacity::Short::Memory { stuck: true, .. } => true,
+            aterm_capacity::Short::Memory {
+                reserved: 0,
+                passes: None,
+                ..
+            } => short.holders.is_empty(),
+            _ => false,
         })
 }
 

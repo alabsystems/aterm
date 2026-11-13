@@ -2,12 +2,18 @@
 // Copyright 2026 Andrew Yates
 
 //! Reference and unique findings (design §6). A table is one causal domain, so no foreign key
-//! or unique constraint is atomic against a concurrent writer and nothing cascades: the writer
-//! checks against its own view, and every reader re-checks the converged rows and reports
-//! what it finds. A finding names collections, keys and columns, never a value, so an address
-//! never reaches a report.
+//! or unique constraint is atomic against a concurrent writer and nothing cascades: an owner
+//! write is refused when a reference it writes names a row its own view, with the write landed,
+//! does not hold ([`missing_row`]), and every reader re-checks the converged rows and reports
+//! what it finds ([`findings`]), a reference a concurrent write left dangling among them. A
+//! finding or refusal names collections, keys and columns, never a value, so an address never
+//! reaches a report.
 
-use super::{Collection, Ty, cell::Projection};
+use super::{
+    Collection, Kind, Refused, Table, Ty,
+    cell::{CellKey, CellValue, Cells, Projection},
+};
+use crate::database::Change;
 use std::collections::BTreeMap;
 
 /// Something a reader reports for the owner.
@@ -83,6 +89,74 @@ fn refs<'a>(ty: &Ty, value: &'a aterm_json::Value, out: &mut Vec<(&'static str, 
     }
 }
 
+/// Whether `collection` holds a row keyed `pk` once `rows` land on `cells`: a cell of that row
+/// already held ([`super::grid::holds_row`], a retired or ended row included, as [`findings`]
+/// reads it) or one `rows` write.
+fn holds(collection: &Collection, cells: &Cells, rows: &[Vec<Change>], pk: &str) -> bool {
+    super::grid::holds_row(collection, cells, pk)
+        || rows.iter().flatten().any(|change| {
+            change.collection == collection.name
+                && change.value.is_some()
+                && CellKey::parse(&change.key).is_ok_and(|key| key.pk == pk)
+        })
+}
+
+/// The first reference an owner write's `rows` (one record each) writes into `table` that names
+/// a key its target cells collection would not hold once they land on `cells`, the table as the
+/// writer reads it: a `Ref` cell's value, a `Ref` inside a list or struct, or a `Set(Ref)`
+/// element the write adds. A row the same write makes may be named. Only what `rows` write is
+/// judged, so a reference already dangling in a column the write leaves alone, which a
+/// concurrent write may have made so, never holds the write back; [`findings`] still reports
+/// it. A row `seeded` says every build of the table compiles (a seed a pass has not written
+/// here yet) may be named too; [`findings`] reports the reference until a pass writes it. A
+/// reference into a collection that is not a cells collection of `table` is not judged, as
+/// [`findings`] does not judge one.
+pub fn missing_row(
+    table: &Table,
+    rows: &[Vec<Change>],
+    cells: &Cells,
+    seeded: fn(&str, &str) -> bool,
+) -> Option<Refused> {
+    for change in rows.iter().flatten() {
+        let Some(schema) = table
+            .collection(&change.collection)
+            .filter(|c| c.kind == Kind::Cells)
+        else {
+            continue;
+        };
+        let (Some(value), Ok(key)) = (&change.value, CellKey::parse(&change.key)) else {
+            continue;
+        };
+        let (Some(column), Ok(value)) = (schema.column(key.col), CellValue::decode(value)) else {
+            continue;
+        };
+        let mut targets = Vec::new();
+        match (column.ty, key.elem) {
+            (Ty::Set(Ty::Ref(target)), Some(elem)) => {
+                if value.x.as_bool() == Some(true) {
+                    targets.push((*target, elem));
+                }
+            }
+            (_, Some(_)) => {}
+            (ty, None) => refs(&ty, &value.x, &mut targets),
+        }
+        for &(target, pk) in &targets {
+            let judged = table.collection(target).filter(|c| c.kind == Kind::Cells);
+            if judged
+                .is_some_and(|target| !holds(target, cells, rows, pk) && !seeded(target.name, pk))
+            {
+                return Some(Refused {
+                    collection: schema.name,
+                    pk: key.pk.to_owned(),
+                    column: key.col.to_owned(),
+                    rule: format!("no such {target} row"),
+                });
+            }
+        }
+    }
+    None
+}
+
 /// Every finding over the projected `tables`, keyed by collection name, against their compiled
 /// `schemas`. A reference into a collection that is not among `tables` is not checked.
 pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -> Vec<Finding> {
@@ -97,7 +171,7 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
             .fields
             .get(column)
             .filter(|field| !field.conflicted())
-            .and_then(super::cell::Field::value)
+            .and_then(|_| row.get(column))
             .filter(|value| !value.is_null())?;
         match value {
             aterm_json::Value::String(s) => Some(UniqueVal::Str(s.as_str())),
@@ -142,7 +216,7 @@ pub fn findings(schemas: &[&Collection], tables: &BTreeMap<&str, &Projection>) -
                     super::cell::Field::Set(elements) => elements.values().any(|e| e.conflicted()),
                     other => other.conflicted(),
                 };
-                if conflicted {
+                if conflicted || row.claims.get(name).is_some_and(Option::is_none) {
                     found.push(Finding::Conflict {
                         collection: schema.name.to_owned(),
                         pk: pk.clone(),

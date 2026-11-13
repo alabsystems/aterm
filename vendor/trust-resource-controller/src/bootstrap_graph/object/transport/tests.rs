@@ -1,6 +1,5 @@
 //! Real descriptor/SCM controls; no fake original scope or Host is constructed.
 use std::fs::{self, File, OpenOptions};
-use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::os::unix::net::UnixStream;
@@ -17,11 +16,11 @@ struct Inputs {
     root: File,
     file: File,
     request: Request,
-    _scratch: aterm_tempfile::TempDir,
+    _scratch: tempfile::TempDir,
 }
 impl Inputs {
     fn new() -> Self {
-        let scratch = aterm_tempfile::Builder::new().prefix("object-source-").tempdir().unwrap();
+        let scratch = tempfile::Builder::new().prefix("object-source-").tempdir().unwrap();
         let path = scratch.path();
         fs::create_dir_all(path.join("src/bootstrap")).unwrap();
         let path = fs::canonicalize(path).unwrap();

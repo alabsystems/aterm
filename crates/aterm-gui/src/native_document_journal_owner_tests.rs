@@ -43,7 +43,9 @@ fn open_clean(host: &DraftJournalHost, uri: &str, disk: &str) -> PathBuf {
     let decision = host
         .inspect_open(uri, disk.text.as_bytes())
         .expect("inspect");
-    host.initialize(decision, &disk, &disk)
+    // Sweep fixtures deliberately have no per-open registration: only the owner lease
+    // and on-disk membership protect them, as after an interrupted acquisition.
+    host.initialize_owned(decision, &disk, &disk, None)
         .expect("initialize")
         .path
 }
@@ -66,7 +68,7 @@ fn open_with_draft(host: &DraftJournalHost, uri: &str, disk: &str, draft: &str) 
         crate::document_store::DocumentTxnOutcome::Committed { .. }
     ));
     let current = store.snapshot(disk_snapshot.id).expect("draft");
-    host.initialize(decision, &disk_snapshot, &current)
+    host.initialize_owned(decision, &disk_snapshot, &current, None)
         .expect("initialize")
         .path
 }
@@ -97,7 +99,7 @@ fn a_clean_prefix_does_not_authorize_sweeping_an_uninterpreted_tail() {
     let path = open_clean(&gone, "file:///tmp/torn-prefix.md", "baseline");
     let mut bytes = fs::read(&path).unwrap();
     bytes.push(bytes[8]);
-    let (read, tail) =
+    let (read, tail, _) =
         recover_journal_image_for(gone.key_for("file:///tmp/torn-prefix.md"), &bytes).unwrap();
     assert!(holds_no_draft(&read), "the interpreted prefix is clean");
     assert!(
@@ -114,7 +116,7 @@ fn a_clean_prefix_does_not_authorize_sweeping_an_uninterpreted_tail() {
         &BTreeSet::from([gone.owner_id().unwrap()]),
     )
     .unwrap();
-    drop(gone);
+    finish_host(gone);
     let sweep = sweep_unheld_journals(&root.path);
     assert_eq!(sweep.removed, 0, "{sweep:?}");
     assert_eq!(fs::read(&path).unwrap(), bytes);
@@ -159,7 +161,7 @@ fn a_launch_sweep_takes_only_a_clean_journal_nobody_holds() {
     };
     assert_eq!(images(), 5, "every open left its journal");
 
-    drop(gone);
+    finish_host(gone);
     let sweep = sweep_unheld_journals(&root.path);
     assert_eq!(sweep.removed, 1, "{sweep:?}");
     assert_eq!(sweep.kept, 4, "{sweep:?}");
@@ -188,7 +190,7 @@ fn a_launch_sweep_takes_only_a_clean_journal_nobody_holds() {
     assert_eq!(sweep.dead_owners, 1, "the gone owner's lease goes");
 
     assert_eq!(sweep_unheld_journals(&root.path).removed, 0);
-    drop(live);
+    finish_host(live);
     assert_eq!(sweep_unheld_journals(&root.path).removed, 1);
     assert!(!exists(&clean_held));
     assert!(exists(&draft_unheld) && exists(&older) && exists(&stale));
@@ -231,6 +233,7 @@ fn a_live_stores_writes_name_it_and_are_never_swept() {
         super::super::JournalCompletion::Durable { .. }
     ));
     assert_eq!(named(&path), Some(BTreeSet::from([owner])));
+    drop(plan);
     store
         .request_checkpoint(
             crate::native_document_io::DurableCheckpoint {
@@ -257,11 +260,13 @@ fn a_live_stores_writes_name_it_and_are_never_swept() {
         0,
         "its owner lives"
     );
+    drop(plan);
+    let done = store.host.owner.as_ref().unwrap().finished.clone();
     drop(store);
-    assert_eq!(
-        sweep_unheld_journals(&root.path).removed,
-        1,
-        "its owner is gone"
+    wait_finished(done);
+    assert!(
+        !exists(&path),
+        "the final registration retired the clean journal"
     );
 }
 
@@ -279,13 +284,13 @@ fn an_identical_republish_keeps_the_live_holders_claim() {
     );
     let both = BTreeSet::from([first.owner_id().unwrap(), second.owner_id().unwrap()]);
     assert_eq!(named(&path), Some(both));
-    drop(second);
+    finish_host(second);
     assert_eq!(
         sweep_unheld_journals(&root.path).removed,
         0,
         "the first holder still appends to these bytes"
     );
-    drop(first);
+    finish_host(first);
     assert_eq!(sweep_unheld_journals(&root.path).removed, 1);
 }
 
@@ -303,7 +308,7 @@ fn an_identical_republish_over_an_older_aterms_image_stays_unmarked() {
     .unwrap();
     assert_eq!(open_clean(&host, uri, "older"), path);
     assert_eq!(mark(&path), OwnerMark::Unmarked);
-    drop(host);
+    finish_host(host);
     assert_eq!(sweep_unheld_journals(&root.path).removed, 0);
     assert!(exists(&path));
 }
@@ -314,7 +319,7 @@ fn a_clean_journal_swept_after_the_inspection_still_opens() {
     let uri = "file:///tmp/mid-open.md";
     let gone = root.host();
     let path = open_clean(&gone, uri, "text");
-    drop(gone);
+    finish_host(gone);
     let host = root.host();
     let (_store, disk) = snapshot("text");
     let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
@@ -374,8 +379,11 @@ fn a_reseat_that_finds_its_own_image_joins_its_owner_set() {
     );
     assert_eq!(named(&path), Some(BTreeSet::from([owner])));
     assert_eq!(sweep_unheld_journals(&root.path).removed, 0);
+    drop(plan);
+    let done = store.host.owner.as_ref().unwrap().finished.clone();
     drop(store);
-    assert_eq!(sweep_unheld_journals(&root.path).removed, 1);
+    wait_finished(done);
+    assert!(!exists(&path));
 }
 
 #[test]
@@ -418,7 +426,7 @@ fn only_a_gone_owners_lease_is_removed() {
     let live_id = live.owner_id().unwrap();
     let gone_id = gone.owner_id().unwrap();
     assert!(owner_alive(&owners, live_id) && owner_alive(&owners, gone_id));
-    drop(gone);
+    finish_host(gone);
     assert!(!owner_alive(&owners, gone_id));
     assert_eq!(sweep_unheld_journals(&root.path).dead_owners, 1);
     assert!(!exists(&owners.join(gone_id.lease_name())));
@@ -432,7 +440,7 @@ fn a_journal_republished_after_the_sweeps_look_is_kept() {
     let uri = "file:///tmp/republished.md";
     let gone = root.host();
     let path = open_clean(&gone, uri, "restored");
-    drop(gone);
+    finish_host(gone);
     let (look, image) = candidate(&path).expect("clean, and nobody holds it");
     let live = root.host();
     assert_eq!(open_clean(&live, uri, "restored"), path);
@@ -453,7 +461,7 @@ fn an_owner_named_after_the_sweeps_look_keeps_the_journal() {
     let root = Root::new("named-mid-sweep");
     let gone = root.host();
     let path = open_clean(&gone, "file:///tmp/adopted.md", "adopted");
-    drop(gone);
+    finish_host(gone);
     let (look, image) = candidate(&path).expect("clean, and nobody holds it");
     let live = root.host();
     adopt(&path, image, live.owner_id());
@@ -470,7 +478,7 @@ fn a_lock_removed_while_a_writer_waits_on_it_is_never_taken_as_held() {
     let root = Root::new("lock-removed");
     let gone = root.host();
     let path = open_clean(&gone, "file:///tmp/waiter.md", "waiter");
-    drop(gone);
+    finish_host(gone);
     let lock = journal_lock_path(&path).unwrap();
     let swept = root.path.clone();
     super::super::between_lock_open_and_take_for_test(move || {
@@ -504,9 +512,19 @@ fn a_release_takes_a_clean_journal_once_no_live_owner_is_left_on_it() {
     let second_id = second.host.owner_id().unwrap();
 
     first.forget(&[disk.id]);
+    fence(&first.host);
     assert!(exists(&path), "the second process still holds it");
-    assert_eq!(named(&path), Some(BTreeSet::from([second_id])));
+    assert_eq!(
+        named(&path),
+        Some(BTreeSet::from([first.host.owner_id().unwrap(), second_id]))
+    );
+    // Its pinned inode was replaced by the second process. It cannot retarget that
+    // process's identical image, so its old mark conservatively lives until lease exit.
+    let done = first.host.owner.as_ref().unwrap().finished.clone();
+    drop(first);
+    wait_finished(done);
     second.forget(&[disk.id]);
+    fence(&second.host);
     assert!(!exists(&path), "nobody holds it now");
     assert!(!exists(&journal_lock_path(&path).unwrap()));
 
@@ -531,6 +549,7 @@ fn a_release_takes_a_clean_journal_once_no_live_owner_is_left_on_it() {
     let draft = drafting.initialize(decision, &base, &edited).unwrap().path;
     let drafting_id = drafting.host.owner_id().unwrap();
     drafting.forget(&[base.id]);
+    fence(&drafting.host);
     assert!(exists(&draft), "a draft is never taken");
     assert_eq!(named(&draft), Some(BTreeSet::from([drafting_id])));
 }
@@ -538,13 +557,646 @@ fn a_release_takes_a_clean_journal_once_no_live_owner_is_left_on_it() {
 #[test]
 fn a_release_leaves_a_journal_reopened_since_alone() {
     let root = Root::new("release-reopened");
-    let uri = "file:///tmp/reopened.md";
     let host = root.host();
-    let path = open_clean(&host, uri, "reopened");
-    let owner = host.owner_id().unwrap();
-    let let_go = released(path.clone(), host.key_for(uri)).expect("the image");
-    assert_eq!(open_clean(&host, uri, "reopened"), path);
-    settle_releases(owner, vec![let_go]);
-    assert!(exists(&path), "the reopened document's journal stays");
-    assert_eq!(named(&path), Some(BTreeSet::from([owner])));
+    let uri = "file:///tmp/reopened.md";
+    let (_documents, disk) = snapshot("reopened");
+    let prepare = || {
+        let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
+        host.initialize(decision, &disk, &disk).unwrap()
+    };
+    let old = prepare();
+    let reopened = prepare();
+    let path = reopened.path.clone();
+    let gate = Gate::hold(&host);
+    drop(old); // queued after the identical reopen acquired its own registration
+    gate.release();
+    fence(&host);
+    assert!(exists(&path));
+    assert_eq!(
+        named(&path),
+        Some(BTreeSet::from([host.owner_id().unwrap()]))
+    );
+    drop(reopened);
+    fence(&host);
+    assert!(!exists(&path));
+}
+
+const HANG: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn fence(host: &DraftJournalHost) {
+    host.owner.as_ref().unwrap().run(|_| ()).unwrap();
+}
+
+fn wait_finished(done: Arc<std::sync::Mutex<mpsc::Receiver<()>>>) {
+    done.lock()
+        .unwrap()
+        .recv_timeout(HANG)
+        .expect("custody worker finished");
+}
+
+fn finish_host(host: DraftJournalHost) {
+    let done = host.owner.as_ref().unwrap().finished.clone();
+    drop(host);
+    wait_finished(done);
+}
+
+struct Gate(mpsc::Sender<()>);
+impl Gate {
+    fn hold(host: &DraftJournalHost) -> Self {
+        let (entered, ready) = mpsc::channel();
+        let (resume, wait) = mpsc::channel();
+        host.owner
+            .as_ref()
+            .unwrap()
+            .sender
+            .send(Message::Run(Box::new(move |_| {
+                entered.send(()).unwrap();
+                wait.recv_timeout(HANG).expect("worker gate released");
+            })))
+            .unwrap();
+        ready.recv_timeout(HANG).expect("worker at gate");
+        Self(resume)
+    }
+    fn release(self) {
+        self.0.send(()).unwrap();
+    }
+}
+
+#[test]
+fn ui_retirement_and_cancel_only_enqueue_while_the_worker_is_blocked() {
+    let root = Root::new("responsive-release");
+    let mut store = super::super::DocumentJournalStore::for_test(root.path.clone()).unwrap();
+    let (_documents, disk) = snapshot("responsive");
+    let decision = store
+        .inspect_open("file:///tmp/responsive.md", disk.text.as_bytes())
+        .unwrap();
+    let initialized = store.initialize(decision, &disk, &disk).unwrap();
+    let gate = Gate::hold(&store.host);
+    // These run on the caller while every worker filesystem operation is barred.
+    FORBID_FS.with(|forbidden| forbidden.set(true));
+    assert!(store.forget(&[disk.id]));
+    drop(initialized);
+    FORBID_FS.with(|forbidden| forbidden.set(false));
+    assert!(store.entries.is_empty());
+    gate.release();
+    fence(&store.host);
+    assert!(!exists(&store.path_for_uri("file:///tmp/responsive.md")));
+
+    let host = &store.host;
+    let decision = host
+        .inspect_open("file:///tmp/canceled.md", disk.text.as_bytes())
+        .unwrap();
+    let prepared = host.initialize(decision, &disk, &disk).unwrap();
+    let path = prepared.path.clone();
+    let clone = prepared.clone();
+    let gate = Gate::hold(host);
+    FORBID_FS.with(|forbidden| forbidden.set(true));
+    drop(prepared);
+    drop(clone);
+    FORBID_FS.with(|forbidden| forbidden.set(false));
+    gate.release();
+    fence(host);
+    assert!(!exists(&path), "one shared cancellation authority");
+}
+
+#[test]
+fn same_inode_registrations_and_single_transfer_protect_each_other() {
+    let root = Root::new("same-inode");
+    let host = root.host();
+    let uri = "file:///tmp/same.md";
+    let (_documents, disk) = snapshot("same");
+    let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
+    let initialized = host.initialize(decision, &disk, &disk).unwrap();
+    let path = initialized.path.clone();
+    let first = initialized.take_registration().unwrap().unwrap();
+    assert!(initialized.clone().take_registration().is_err());
+    let other_host = host.clone();
+    let other_path = path.clone();
+    let second = host
+        .owner
+        .as_ref()
+        .unwrap()
+        .run(move |custody| {
+            with_journal_lock(&other_path, JournalLockPatience::Worker, || {
+                custody.register(
+                    other_host.owner.as_ref().unwrap(),
+                    &other_path,
+                    other_host.key_for(uri),
+                )
+            })
+            .unwrap()
+        })
+        .unwrap();
+    drop(first);
+    fence(&host);
+    assert!(exists(&path));
+    drop(second);
+    fence(&host);
+    assert!(!exists(&path));
+}
+
+#[test]
+fn same_byte_replacement_never_inherits_a_retired_registration() {
+    let root = Root::new("same-bytes");
+    let host = root.host();
+    let (_documents, disk) = snapshot("identical");
+    let decision = host
+        .inspect_open("file:///tmp/identical.md", disk.text.as_bytes())
+        .unwrap();
+    let prepared = host.initialize(decision, &disk, &disk).unwrap();
+    let path = prepared.path.clone();
+    let before = sys::stamp_at(&path).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let replacement = root.path.join("replacement");
+    fs::write(&replacement, &bytes).unwrap();
+    write_mark(
+        &replacement,
+        &sys::open_regular(&replacement).unwrap(),
+        ContentFingerprint::of(&bytes),
+        &BTreeSet::from([host.owner_id().unwrap()]),
+    )
+    .unwrap();
+    fs::rename(&replacement, &path).unwrap();
+    assert!(!before.same_file(&sys::stamp_at(&path).unwrap()));
+    drop(prepared);
+    fence(&host);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        named(&path),
+        Some(BTreeSet::from([host.owner_id().unwrap()]))
+    );
+}
+
+#[test]
+fn an_undelivered_initialization_result_releases_its_provisional_registration() {
+    let root = Root::new("undelivered");
+    let host = root.host();
+    let (_documents, disk) = snapshot("undelivered");
+    let uri = "file:///tmp/undelivered.md";
+    let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
+    let path = decision.path.clone();
+    let worker_host = host.clone();
+    let gate = Gate::hold(&host);
+    let (sender, receiver) = mpsc::channel();
+    host.owner
+        .as_ref()
+        .unwrap()
+        .sender
+        .send(Message::Run(Box::new(move |custody| {
+            let result = worker_host.initialize_owned(decision, &disk, &disk, Some(custody));
+            let _ = sender.send(result);
+        })))
+        .unwrap();
+    drop(receiver); // canceled before initialization and before delivery
+    gate.release();
+    fence(&host); // the failed delivery enqueues release behind this fence
+    fence(&host);
+    assert!(!exists(&path));
+}
+
+#[test]
+fn dirty_inflight_and_failed_entries_retain_their_reducer_and_write_custody() {
+    use super::super::{
+        DocumentJournalStore, JournalCompletion, JournalEffect, execute_journal_append,
+        execute_journal_rewrite,
+    };
+    let root = Root::new("busy-retire");
+    let mut journals = DocumentJournalStore::for_test(root.path.clone()).unwrap();
+    let (mut documents, disk) = snapshot("base");
+    let uri = "file:///tmp/busy.md";
+    let decision = journals.inspect_open(uri, disk.text.as_bytes()).unwrap();
+    let path = journals.initialize(decision, &disk, &disk).unwrap().path;
+    documents.transact(
+        disk.id,
+        disk.seq,
+        vec![crate::document_store::TextEdit {
+            range: 4..4,
+            insert: "!".into(),
+        }],
+    );
+    let edited = documents.snapshot(disk.id).unwrap();
+    journals.observe_commit(&edited).unwrap();
+    assert!(!journals.forget(&[disk.id]), "dirty head retains reducer");
+    let Some(JournalEffect::Append {
+        path: at,
+        key,
+        plan,
+    }) = journals.next_effect(disk.id).unwrap()
+    else {
+        panic!("append")
+    };
+    let gate = Gate::hold(&journals.host);
+    let (send, receive) = mpsc::channel();
+    let generation = plan.generation;
+    std::thread::spawn(move || {
+        let result = execute_journal_append(&at, key, &plan, JournalLockPatience::Worker);
+        send.send(result).unwrap();
+    });
+    FORBID_FS.with(|forbidden| forbidden.set(true));
+    assert!(
+        !journals.forget(&[disk.id]),
+        "inflight write retains reducer"
+    );
+    FORBID_FS.with(|forbidden| forbidden.set(false));
+    gate.release();
+    let result = receive.recv_timeout(HANG).unwrap();
+    assert!(matches!(
+        journals.complete_append(disk.id, generation, result),
+        JournalCompletion::Durable { .. }
+    ));
+    journals
+        .request_checkpoint(
+            crate::native_document_io::DurableCheckpoint {
+                document: disk.id,
+                seq: edited.seq,
+                source: crate::native_document_io::DurableSource::AtomicFile,
+            },
+            edited.text.clone(),
+        )
+        .unwrap();
+    let Some(JournalEffect::Rewrite { path: at, plan }) = journals.next_effect(disk.id).unwrap()
+    else {
+        panic!("rewrite")
+    };
+    assert!(!journals.forget(&[disk.id]));
+    let bad = super::super::JournalRewriteResult::Failed("injected failure".into());
+    journals.complete_rewrite(disk.id, plan.generation, bad);
+    assert!(!journals.forget(&[disk.id]), "failed checkpoint stays owed");
+    assert_eq!(journals.owed_documents(), vec![disk.id]);
+    drop(plan);
+    let Some(JournalEffect::Rewrite { path: _, plan }) = journals.next_effect(disk.id).unwrap()
+    else {
+        panic!("checkpoint retry")
+    };
+    let result = execute_journal_rewrite(&at, &plan, JournalLockPatience::Worker);
+    assert!(matches!(
+        journals.complete_rewrite(disk.id, plan.generation, result),
+        JournalCompletion::Durable { .. }
+    ));
+    drop(plan);
+    assert!(
+        journals.forget(&[disk.id]),
+        "production settled transition permits release"
+    );
+    fence(&journals.host);
+    assert!(
+        !exists(&path),
+        "checkpoint refreshed the exact pinned image"
+    );
+}
+
+#[test]
+fn asynchronous_release_keeps_uncertain_or_aliased_images() {
+    for mutation in [
+        "unknown",
+        "unreadable-mark",
+        "torn",
+        "dirty",
+        "hardlink",
+        "symlink",
+        "append",
+    ] {
+        let root = Root::new(mutation);
+        let host = root.host();
+        let (_documents, disk) = snapshot("safe");
+        let uri = "file:///tmp/safe.md";
+        let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
+        let prepared = host.initialize(decision, &disk, &disk).unwrap();
+        let path = prepared.path.clone();
+        let bytes = fs::read(&path).unwrap();
+        let alias = root.path.join("alias");
+        match mutation {
+            "unknown" => {
+                sys::write_mark(&path, &sys::open_regular(&path).unwrap(), UNKNOWN_HOLDERS).unwrap()
+            }
+            "unreadable-mark" => {
+                sys::write_mark(&path, &sys::open_regular(&path).unwrap(), b"invalid").unwrap()
+            }
+            "hardlink" => fs::hard_link(&path, &alias).unwrap(),
+            "symlink" => {
+                fs::rename(&path, &alias).unwrap();
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(&alias, &path).unwrap();
+                #[cfg(windows)]
+                std::os::windows::fs::symlink_file(&alias, &path).unwrap();
+            }
+            "dirty" => {
+                let (_documents, dirty) = snapshot("unsaved draft");
+                let bytes = encode_journal(&[
+                    JournalRecord::snapshot_for(host.key_for(uri), &disk),
+                    JournalRecord::snapshot_for(host.key_for(uri), &dirty),
+                ])
+                .unwrap();
+                fs::write(&path, &bytes).unwrap();
+            }
+            _ => {
+                let mut changed = bytes.clone();
+                changed.push(0x12);
+                fs::write(&path, &changed).unwrap();
+            }
+        }
+        let expected = fs::read(&path).unwrap();
+        drop(prepared);
+        fence(&host);
+        assert!(exists(&path), "{mutation}");
+        assert_eq!(fs::read(&path).unwrap(), expected, "{mutation}");
+    }
+}
+
+#[test]
+fn a_panicked_worker_keeps_active_custody_and_rejects_work_until_logical_owner_exit() {
+    for image in ["clean", "dirty", "inflight"] {
+        let root = Root::new(&format!("panic-{image}"));
+        let host = root.host();
+        let (mut documents, disk) = snapshot("base");
+        let uri = "file:///tmp/panic.md";
+        let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
+        if image == "dirty" {
+            let _ = documents.transact(
+                disk.id,
+                disk.seq,
+                vec![crate::document_store::TextEdit {
+                    range: 4..4,
+                    insert: ", unsaved".into(),
+                }],
+            );
+        }
+        let current = documents.snapshot(disk.id).unwrap();
+        let prepared = host.initialize(decision, &disk, &current).unwrap();
+        let path = prepared.path.clone();
+        let before = sys::stamp_at(&path).unwrap();
+        let worker_path = path.clone();
+        let owner = host.owner.as_ref().unwrap();
+        let failure: Result<(), String> = owner.run(move |_| {
+            if image == "inflight" {
+                // Interrupt an in-place mutation while its real production journal lock
+                // is held, before a writer could refresh its registration's stamp.
+                with_journal_lock(
+                    &worker_path,
+                    JournalLockPatience::Worker,
+                    || -> Result<(), String> {
+                        let file = super::super::open_journal_image(&worker_path).unwrap();
+                        super::super::write_at(&file, &[0x12], before.len()).unwrap();
+                        panic!("injected journal mutation panic");
+                    },
+                )
+                .unwrap();
+            }
+            panic!("injected journal job panic");
+        });
+        assert!(failure.is_err(), "the panicked call returns an error");
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempted = executed.clone();
+        assert!(
+            owner
+                .run(move |_| attempted.store(true, std::sync::atomic::Ordering::SeqCst))
+                .is_err()
+        );
+        assert!(
+            !executed.load(std::sync::atomic::Ordering::SeqCst),
+            "uncertain state is never reused"
+        );
+        let owners = root.path.join(OWNERS_DIR);
+        let id = host.owner_id().unwrap();
+        assert!(
+            owner_alive(&owners, id),
+            "{image}: live handles still own the lease"
+        );
+        assert!(before.same_file(&sys::stamp_at(&path).unwrap()));
+        let bytes = fs::read(&path).unwrap();
+        let sweep = sweep_unheld_journals(&root.path);
+        assert_eq!(
+            sweep.removed, 0,
+            "{image}: external sweep cannot retire an active registration"
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        FORBID_FS.with(|forbidden| forbidden.set(true));
+        drop(prepared); // rejected release only enqueues; uncertain pins remain on worker
+        FORBID_FS.with(|forbidden| forbidden.set(false));
+        assert!(
+            owner_alive(&owners, id),
+            "logical host lifetime still protects custody"
+        );
+        finish_host(host);
+        assert!(!owner_alive(&owners, id));
+        let sweep = sweep_unheld_journals(&root.path);
+        if image == "clean" {
+            assert_eq!(
+                sweep.removed, 1,
+                "negative control: the sweep can retire this exact clean image after owner exit"
+            );
+            assert!(!exists(&path));
+        } else {
+            assert_eq!(
+                sweep.removed, 0,
+                "{image}: failed writes/drafts remain recoverable after exit"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+}
+
+#[test]
+fn a_clean_release_keeps_an_owner_whose_lease_cannot_be_probed() {
+    let root = Root::new("unknown-lease");
+    let host = root.host();
+    let (_documents, disk) = snapshot("held");
+    let decision = host
+        .inspect_open("file:///tmp/held.md", disk.text.as_bytes())
+        .unwrap();
+    let prepared = host.initialize(decision, &disk, &disk).unwrap();
+    let path = prepared.path.clone();
+    let unknown = JournalOwnerId::from_raw(host.owner_id().unwrap().raw() ^ 1)
+        .unwrap_or_else(|| JournalOwnerId::from_raw(2).unwrap());
+    fs::create_dir(root.path.join(OWNERS_DIR).join(unknown.lease_name())).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    write_mark(
+        &path,
+        &sys::open_regular(&path).unwrap(),
+        ContentFingerprint::of(&bytes),
+        &BTreeSet::from([host.owner_id().unwrap(), unknown]),
+    )
+    .unwrap();
+    drop(prepared);
+    fence(&host);
+    assert!(
+        exists(&path),
+        "an unreadable/nonregular lease is not a dead owner"
+    );
+    assert!(named(&path).is_some_and(|owners| owners.contains(&unknown)));
+}
+
+#[test]
+fn a_canceled_recovered_draft_keeps_its_full_durable_image() {
+    let root = Root::new("canceled-draft");
+    let host = root.host();
+    let (mut documents, disk) = snapshot("baseline");
+    let uri = "file:///tmp/canceled-draft.md";
+    let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
+    let _ = documents.transact(
+        disk.id,
+        disk.seq,
+        vec![crate::document_store::TextEdit {
+            range: 8..8,
+            insert: ", unsaved".into(),
+        }],
+    );
+    let draft = documents.snapshot(disk.id).unwrap();
+    let prepared = host.initialize(decision, &disk, &draft).unwrap();
+    let path = prepared.path.clone();
+    let bytes = fs::read(&path).unwrap();
+    drop(prepared);
+    fence(&host);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let read = recover_journal_image_for(host.key_for(uri), &bytes)
+        .unwrap()
+        .0;
+    assert_eq!(read.text, draft.text.as_ref());
+    assert!(!holds_no_draft(&read));
+}
+
+#[test]
+fn privacy_purge_orders_after_a_queued_release_and_leaves_no_recreated_lock() {
+    let root = Root::new("purge-ready-release");
+    let mut store = super::super::DocumentJournalStore::for_test(root.path.clone()).unwrap();
+    let (_documents, disk) = snapshot("purge");
+    let uri = "file:///tmp/purge.md";
+    let decision = store.inspect_open(uri, disk.text.as_bytes()).unwrap();
+    let path = store.initialize(decision, &disk, &disk).unwrap().path;
+    let gate = Gate::hold(&store.host);
+    FORBID_FS.with(|forbidden| forbidden.set(true));
+    assert!(store.forget(&[disk.id]));
+    FORBID_FS.with(|forbidden| forbidden.set(false));
+    let host = store.host.clone();
+    let (queued, observed) = mpsc::channel();
+    let (completed, done) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        ENQUEUED.with(|slot| *slot.borrow_mut() = Some(queued));
+        completed.send(host.purge(uri)).unwrap();
+    });
+    observed
+        .recv_timeout(HANG)
+        .expect("actual purge queued behind release");
+    assert!(matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    gate.release();
+    done.recv_timeout(HANG)
+        .expect("purge acknowledged")
+        .unwrap();
+    worker.join().unwrap();
+    assert!(!exists(&path));
+    assert!(!exists(&journal_lock_path(&path).unwrap()));
+}
+
+#[test]
+fn privacy_purge_revokes_stale_plans_and_receipts_without_banning_a_fresh_open() {
+    use super::super::{
+        DocumentJournalStore, JournalAppendResult, JournalEffect, JournalReseatResult,
+        JournalRewriteResult, execute_journal_append, execute_journal_reseat,
+        execute_journal_rewrite,
+    };
+    use crate::native_document_io::{DurableCheckpoint, DurableSource};
+    for kind in ["append", "rewrite", "reseat"] {
+        let root = Root::new(kind);
+        let mut store = DocumentJournalStore::for_test(root.path.clone()).unwrap();
+        let (mut documents, disk) = snapshot("base");
+        let uri = "file:///tmp/purged.md";
+        let decision = store.inspect_open(uri, disk.text.as_bytes()).unwrap();
+        let path = store.initialize(decision, &disk, &disk).unwrap().path;
+        if kind == "reseat" {
+            store.owe_reseat_all();
+        } else {
+            let _ = documents.transact(
+                disk.id,
+                disk.seq,
+                vec![crate::document_store::TextEdit {
+                    range: 0..0,
+                    insert: "new ".into(),
+                }],
+            );
+            let head = documents.snapshot(disk.id).unwrap();
+            store.observe_commit(&head).unwrap();
+            if kind == "rewrite" {
+                store
+                    .request_checkpoint(
+                        DurableCheckpoint {
+                            document: disk.id,
+                            seq: head.seq,
+                            source: DurableSource::AtomicFile,
+                        },
+                        head.text,
+                    )
+                    .unwrap();
+            }
+        }
+        let effect = store.next_effect(disk.id).unwrap().unwrap();
+        let host = store.host.clone();
+        FORBID_FS.with(|forbidden| forbidden.set(true));
+        store.decline(disk.id, uri).unwrap();
+        FORBID_FS.with(|forbidden| forbidden.set(false));
+        assert!(!exists(&path));
+        assert!(!exists(&journal_lock_path(&path).unwrap()));
+        let run_stale = || match &effect {
+            JournalEffect::Append { path, key, plan } => {
+                assert!(
+                    matches!(execute_journal_append(path, *key, plan, JournalLockPatience::Worker),
+                    JournalAppendResult::Failed { message, .. } if message.contains("revoked"))
+                );
+            }
+            JournalEffect::Rewrite { path, plan } => {
+                assert!(
+                    matches!(execute_journal_rewrite(path, plan, JournalLockPatience::Worker),
+                    JournalRewriteResult::Failed(message) if message.contains("revoked"))
+                );
+            }
+            JournalEffect::Reseat { path, plan } => {
+                assert!(
+                    matches!(execute_journal_reseat(path, plan, JournalLockPatience::Worker),
+                    JournalReseatResult::Failed(message) if message.contains("revoked"))
+                );
+            }
+        };
+        run_stale();
+        assert!(!exists(&path));
+        assert!(!exists(&journal_lock_path(&path).unwrap()));
+        let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
+        let fresh = host.initialize(decision, &disk, &disk).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        run_stale();
+        drop(effect);
+        fence(&host);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(fresh.take_registration().unwrap().is_some());
+        // The transferred handle above is dropped once, so the fresh clean open retires.
+        fence(&host);
+        assert!(!exists(&path));
+        assert!(!exists(&journal_lock_path(&path).unwrap()));
+    }
+
+    let root = Root::new("purged-receipt");
+    let host = root.host();
+    let (_documents, disk) = snapshot("receipt");
+    let uri = "file:///tmp/receipt.md";
+    let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
+    let stale = host.initialize(decision, &disk, &disk).unwrap();
+    let clone = stale.clone();
+    let path = stale.path.clone();
+    host.purge(uri).unwrap();
+    let decision = host.inspect_open(uri, disk.text.as_bytes()).unwrap();
+    let fresh = host.initialize(decision, &disk, &disk).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let gate = Gate::hold(&host);
+    FORBID_FS.with(|forbidden| forbidden.set(true));
+    assert!(
+        stale.take_registration().is_err(),
+        "revoked receipt cannot adopt"
+    );
+    drop(stale);
+    drop(clone);
+    FORBID_FS.with(|forbidden| forbidden.set(false));
+    gate.release();
+    fence(&host);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    drop(fresh);
+    fence(&host);
+    assert!(!exists(&path));
 }

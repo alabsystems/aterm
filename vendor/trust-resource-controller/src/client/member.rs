@@ -15,6 +15,7 @@ use crate::{
     BirthKind, Cancel, Channel, HelperFds, Identity, ProducerChallenge, Request, Started, Status,
     StatusFrame,
 };
+mod transport;
 
 /// Actual helper sources, distinct from future target slots in Request.
 pub struct MemberIo {
@@ -39,15 +40,19 @@ enum Route {
 /// Once Request is offered, ambiguous delivery retains the original child.
 pub enum MemberError {
     BeforeRequest(io::Error),
-    Unknown { child: Box<ProxyChild>, error: io::Error },
+    Unknown {
+        child: Box<ProxyChild>,
+        error: io::Error,
+    },
 }
 impl std::fmt::Debug for MemberError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BeforeRequest(error) => f.debug_tuple("BeforeRequest").field(error).finish(),
-            Self::Unknown { error, .. } => {
-                f.debug_struct("Unknown").field("error", error).finish_non_exhaustive()
-            }
+            Self::Unknown { error, .. } => f
+                .debug_struct("Unknown")
+                .field("error", error)
+                .finish_non_exhaustive(),
         }
     }
 }
@@ -76,6 +81,13 @@ pub struct ProxyChild {
     pending_terminal: Option<Status>,
     observed_terminal: Option<Status>,
     helper_observation: Option<HelperObservation>,
+    compiler_request: Option<Request>,
+    compiler_original_store: bool,
+    compiler_scope: Option<std::sync::Arc<super::CompilerScope>>,
+    compiler_transport: Option<transport::OriginalCompilerTransport>,
+    compiler_prepared: Option<crate::workload::host::coordinator::CompilerPrepared>,
+    compiler_binding_attempted: bool,
+    compiler_bound: bool,
 }
 fn invalid() -> io::Error {
     io::ErrorKind::InvalidData.into()
@@ -146,7 +158,12 @@ fn inheritance_copies(
     Ok((offered, copies))
 }
 fn source_slots(request: &Request) -> Vec<u32> {
-    let mut slots: Vec<_> = request.delegations.fences.iter().map(|d| d.source).collect();
+    let mut slots: Vec<_> = request
+        .delegations
+        .fences
+        .iter()
+        .map(|d| d.source)
+        .collect();
     if let Some(cpu) = request.delegations.cpu {
         slots.push(cpu.source);
     }
@@ -203,6 +220,38 @@ impl Client {
     ) -> Result<ProxyChild, MemberError> {
         self.member_inner(request, io, deadline, Route::Workload)
     }
+    /// A producing attempt additionally retains its SAME attached native
+    /// original-input capsule, including every ambiguous delivery/failure.
+    /// Host producing admission remains separate and may still refuse.
+    pub fn scoped_workload_member_accounted(
+        &self,
+        request: &Request,
+        io: MemberIo,
+        scope: std::sync::Arc<super::CompilerScope>,
+        deadline: Instant,
+    ) -> Result<ProxyChild, MemberError> {
+        scope
+            .validate(deadline)
+            .map_err(MemberError::BeforeRequest)?;
+        let selected = scope.request();
+        if selected.query.binding != request.binding
+            || selected.member != request.member_attempt
+            || request.role != crate::Role::CoordinatorCompiler(selected.coordinator)
+        {
+            return Err(MemberError::BeforeRequest(invalid()));
+        }
+        match self.member_inner(request, io, deadline, Route::Workload) {
+            Ok(mut child) => {
+                child.compiler_scope = Some(scope);
+                Ok(child)
+            }
+            Err(MemberError::Unknown { mut child, error }) => {
+                child.compiler_scope = Some(scope);
+                Err(MemberError::Unknown { child, error })
+            }
+            Err(error) => Err(error),
+        }
+    }
     fn member_inner(
         &self,
         request: &Request,
@@ -218,7 +267,12 @@ impl Client {
             if !request.role.is_proxy_member() {
                 return Err(invalid());
             }
-            if original_store && request.role != crate::Role::Compile {
+            if original_store
+                && !matches!(
+                    request.role,
+                    crate::Role::Compile | crate::Role::CoordinatorCompiler(_)
+                )
+            {
                 return Err(invalid());
             }
             // Even metadata borrows the original real CPU continuation; live
@@ -226,8 +280,11 @@ impl Client {
             if request.delegations.cpu.is_none() {
                 return Err(invalid());
             }
-            let mut actual: Vec<_> =
-                io.descriptions.iter().map(|fd| fd.as_raw_fd() as u32).collect();
+            let mut actual: Vec<_> = io
+                .descriptions
+                .iter()
+                .map(|fd| fd.as_raw_fd() as u32)
+                .collect();
             actual.sort_unstable();
             if actual != source_slots(request) {
                 return Err(invalid());
@@ -268,7 +325,10 @@ impl Client {
             };
             fds.validate_delegations(&offered.delegations)?;
             let arguments = if let Some(store) = store {
-                let original = crate::WorkloadHelperFds { transport: fds, store };
+                let original = crate::WorkloadHelperFds {
+                    transport: fds,
+                    store,
+                };
                 original.validate_delegations(&offered.delegations)?;
                 original.arguments()?
             } else if accounted {
@@ -287,7 +347,15 @@ impl Client {
             // actions preserve only these descriptions, without forcing a
             // fork/pre_exec copy of a potentially large compiler address space.
             inherit_descriptions(&mut command, &inherited)?;
-            Ok((payload, command, control, proof, child_control, child_proof, descriptions))
+            Ok((
+                payload,
+                command,
+                control,
+                proof,
+                child_control,
+                child_proof,
+                descriptions,
+            ))
         };
         let (payload, mut command, control, proof, child_control, child_proof, mut descriptions) =
             prepare().map_err(MemberError::BeforeRequest)?;
@@ -313,13 +381,24 @@ impl Client {
             pending_terminal: None,
             observed_terminal: None,
             helper_observation: None,
+            compiler_request: matches!(request.role, crate::Role::CoordinatorCompiler(_))
+                .then(|| request.clone()),
+            compiler_original_store: original_store,
+            compiler_scope: None,
+            compiler_transport: None,
+            compiler_prepared: None,
+            compiler_binding_attempted: false,
+            compiler_bound: false,
         };
         let actual = match child.host.validate_child(&child.helper, deadline) {
             Ok(actual) => actual,
             Err(error) => {
                 // A helper was actually spawned. Identity failure does not
                 // establish retirement or return the original paid loan.
-                return Err(MemberError::Unknown { child: Box::new(child), error });
+                return Err(MemberError::Unknown {
+                    child: Box::new(child),
+                    error,
+                });
             }
         };
         child.helper_observation = Some(HelperObservation {
@@ -334,10 +413,18 @@ impl Client {
             outcome: None,
         });
         if let Err(error) = child.control.send(&payload, deadline) {
-            return Err(MemberError::Unknown { child: Box::new(child), error });
+            return Err(MemberError::Unknown {
+                child: Box::new(child),
+                error,
+            });
         }
         Ok(child)
     }
+}
+/// Whether this compiled client has the explicit per-child FD transport API.
+/// This is a build capability only; it grants no scheduler or SDK authority.
+pub const fn explicit_inheritance_supported() -> bool {
+    cfg!(trust_std)
 }
 
 /// Native member launch requires explicit child-only inheritance, never a
@@ -379,7 +466,10 @@ mod inheritance_tests {
         let before = unsafe { libc::fcntl(fd, libc::F_GETFD) };
         assert!(before >= 0 && before & libc::FD_CLOEXEC != 0);
         let mut command = Command::new("unused-helper");
-        assert_eq!(require_member_inheritance().unwrap_err().kind(), io::ErrorKind::Unsupported);
+        assert_eq!(
+            require_member_inheritance().unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
         let error = inherit_descriptions(&mut command, &[fd]).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         // SAFETY: the same socket still owns the descriptor.
@@ -436,7 +526,10 @@ impl ProxyChild {
     /// Available only from the negotiated terminal for this original attempt.
     /// Inner absent fields remain uncollected, even after a known child exit.
     pub fn accounting(&self) -> Option<crate::accounting::Observation> {
-        if matches!(self.terminal, Some(Status::Finished { .. } | Status::Refused { .. })) {
+        if matches!(
+            self.terminal,
+            Some(Status::Finished { .. } | Status::Refused { .. })
+        ) {
             self.accounting
         } else {
             None
@@ -447,12 +540,230 @@ impl ProxyChild {
     pub fn observed_terminal(&self) -> Option<&Status> {
         self.observed_terminal.as_ref()
     }
+    /// Full actual command at the native second-image hold. This remains DATA;
+    /// this SAME actual child owns the observation and must stay retained on
+    /// every error. Neither observation nor selection grants a CPU/SDK/proof.
+    pub fn compiler_prepared(
+        &mut self,
+        deadline: Instant,
+    ) -> io::Result<Option<&crate::workload::host::coordinator::CompilerPrepared>> {
+        if self.compiler_request.is_none() {
+            return Err(invalid());
+        }
+        self.host.validate(deadline)?;
+        if matches!(self.terminal, Some(Status::Unknown { .. })) {
+            return Err(invalid());
+        }
+        if self.compiler_prepared.is_none() && self.terminal.is_none() {
+            match self.poll(deadline) {
+                Ok(Some(status)) => self.terminal = Some(status),
+                Ok(None) => {}
+                Err(error) => {
+                    self.accounting = None;
+                    self.terminal = Some(Status::Unknown {
+                        reason: "native compiler preparation unavailable".into(),
+                        started: self.started,
+                    });
+                    return Err(error);
+                }
+            }
+        }
+        Ok(self.compiler_prepared.as_ref())
+    }
+    /// Retained full observation, including after subsequent failure. This is
+    /// no evidence of GO, native retirement or successful input bookends.
+    pub fn observed_compiler_prepared(
+        &self,
+    ) -> Option<&crate::workload::host::coordinator::CompilerPrepared> {
+        self.compiler_prepared.as_ref()
+    }
+    /// Retained local snapshots and descriptions only. No DATA count proves
+    /// preparation, GO, original ownership, retirement or a successful compiler.
+    pub fn retained_compiler_bytes(&self) -> Option<usize> {
+        let mut bytes = std::mem::size_of::<Self>().checked_add(
+            self.descriptions.capacity().checked_mul(std::mem::size_of::<OwnedFd>())?,
+        )?;
+        if let Some(request) = &self.compiler_request {
+            bytes = bytes
+                .checked_add(request.binding.session.capacity())?
+                .checked_add(request.command.retained_bytes()?)?
+                .checked_add(
+                    request
+                        .delegations
+                        .fences
+                        .capacity()
+                        .checked_mul(std::mem::size_of::<crate::Descriptor>())?,
+                )?;
+            if let crate::GnuTransport::NamedFifo { locator, .. } = &request.delegations.gnu {
+                bytes = bytes.checked_add(locator.capacity())?;
+            }
+        }
+        if let Some(prepared) = &self.compiler_prepared {
+            bytes = bytes.checked_add(prepared.command.retained_bytes()?)?;
+        }
+        if let Some(scope) = &self.compiler_scope {
+            bytes = bytes.checked_add(scope.retained_bytes()?)?;
+        }
+        if let Some(transport) = &self.compiler_transport {
+            bytes = bytes.checked_add(transport.retained_bytes()?)?;
+        }
+        for status in [
+            &self.terminal,
+            &self.pending_terminal,
+            &self.observed_terminal,
+        ] {
+            if let Some(Status::Refused { reason } | Status::Unknown { reason, .. }) = status {
+                bytes = bytes.checked_add(reason.capacity())?;
+            }
+        }
+        Some(bytes)
+    }
+    /// Bind only the current closed non-producing query after reconstructing
+    /// its WHOLE final command from actual originals. No reported environment
+    /// field is accepted as an expected value. CPU/SDK/GO remain Host-owned.
+    pub fn bind_compiler_query(
+        &mut self,
+        compiler: &trust_resource_provenance::program::HeldProgram,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        use std::os::unix::ffi::OsStrExt as _;
+        let run = (|| {
+            if !self.compiler_original_store
+                || self.compiler_scope.is_some()
+                || !self.accounted
+                || !self.attached
+                || !self.proof_done
+                || self.compiler_binding_attempted
+                || self.terminal.is_some()
+            {
+                return Err(invalid());
+            }
+            let request = self.compiler_request.as_ref().ok_or_else(invalid)?;
+            request.validate()?;
+            let cpu = request.delegations.cpu.ok_or_else(invalid)?;
+            if cpu.target != 6
+                || !matches!(request.delegations.gnu, crate::GnuTransport::None)
+                || request.timeout_ns.is_none_or(|ns| ns > 8_000_000_000)
+                || !self
+                    .descriptions
+                    .iter()
+                    .any(|fd| fd.as_raw_fd() as u32 == cpu.source)
+                || compiler.program().as_os_str().as_bytes() != request.command.program
+            {
+                return Err(invalid());
+            }
+            self.host.validate(deadline)?;
+            compiler.validate(deadline)?;
+            let prepared = self.compiler_prepared.as_ref().ok_or_else(invalid)?;
+            let host = trust_resource_provenance::process::read_identity(self.host.host_pid())?;
+            let actual = trust_resource_provenance::process::read_identity(prepared.identity.pid)?;
+            let kind = if cfg!(target_os = "macos") {
+                BirthKind::MacosWallMicroseconds
+            } else {
+                BirthKind::LinuxStartTicks
+            };
+            if prepared.identity.birth_kind != kind
+                || actual.birth != prepared.identity.birth
+                || actual.parent != host.pid
+                || host.birth != self.host.host_birth()
+                || (cfg!(target_os = "macos") && actual.parent_unique_id != host.unique_id)
+            {
+                return Err(invalid());
+            }
+            compiler.validate_loaded(actual, deadline)?;
+            let runtime = compiler
+                .runtime_environment()?
+                .into_iter()
+                .map(|(key, value)| (key.as_bytes().to_vec(), value.as_bytes().to_vec()))
+                .collect::<Vec<_>>();
+            let expected = crate::workload::host::coordinator::compiler_query_command(
+                &request.binding,
+                &request.command,
+                self.host.helper_path().as_os_str().as_bytes(),
+                &runtime,
+            )?;
+            if prepared.command != expected {
+                return Err(invalid());
+            }
+            compiler.validate(deadline)?;
+            self.host.validate(deadline)?;
+            if trust_resource_provenance::process::read_identity(actual.pid)? != actual
+                || Instant::now() >= deadline
+            {
+                return Err(invalid());
+            }
+            Ok(crate::workload::host::coordinator::CompilerSelection {
+                root_attempt: prepared.root_attempt,
+                member_attempt: prepared.member_attempt,
+                coordinator_attempt: prepared.coordinator_attempt,
+                prepared_sha256: prepared.digest()?,
+            })
+        })();
+        let result = run.and_then(|selection| self.bind_compiler(&selection, deadline));
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.compiler_binding_attempted = true;
+                self.accounting = None;
+                self.terminal = Some(Status::Unknown {
+                    reason: "native compiler query original transport binding unavailable".into(),
+                    started: self.started,
+                });
+                Err(error)
+            }
+        }
+    }
+    /// Only the checked original query/producing binders may select GO.
+    /// A public digest/selection observation cannot call this transport step.
+    /// No fallback, repeated selection or retry after ambiguous delivery exists.
+    fn bind_compiler(
+        &mut self,
+        selection: &crate::workload::host::coordinator::CompilerSelection,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        let result = (|| -> io::Result<()> {
+            if self.compiler_binding_attempted || self.terminal.is_some() {
+                return Err(invalid());
+            }
+            self.compiler_binding_attempted = true;
+            let prepared = self.compiler_prepared.as_ref().ok_or_else(invalid)?;
+            if selection.root_attempt != prepared.root_attempt
+                || selection.member_attempt != prepared.member_attempt
+                || selection.coordinator_attempt != prepared.coordinator_attempt
+                || selection.prepared_sha256 != prepared.digest()?
+            {
+                return Err(invalid());
+            }
+            self.host.validate(deadline)?;
+            self.control.send(&selection.encode()?, deadline)?;
+            self.compiler_bound = true;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.accounting = None;
+                self.terminal = Some(Status::Unknown {
+                    reason: "native compiler final-command selection unavailable".into(),
+                    started: self.started,
+                });
+                Err(error)
+            }
+        }
+    }
     pub fn cancel(&mut self, deadline: Instant) -> io::Result<()> {
-        if matches!(self.terminal, Some(Status::Finished { .. } | Status::Refused { .. })) {
+        if matches!(
+            self.terminal,
+            Some(Status::Finished { .. } | Status::Refused { .. })
+        ) {
             return Ok(());
         }
         self.control.send(
-            &Cancel { root_attempt: self.binding.0, member_attempt: self.binding.1 }.encode()?,
+            &Cancel {
+                root_attempt: self.binding.0,
+                member_attempt: self.binding.1,
+            }
+            .encode()?,
             deadline,
         )
     }
@@ -525,6 +836,22 @@ impl ProxyChild {
         }
         if self.control.ready_to_receive()? {
             let bytes = self.control.receive(deadline)?;
+            if let Some(request) = &self.compiler_request {
+                if let Ok(prepared) =
+                    crate::workload::host::coordinator::CompilerPrepared::decode(&bytes, request)
+                {
+                    if !self.attached
+                        || !self.proof_done
+                        || self.started.is_some()
+                        || self.compiler_prepared.is_some()
+                        || self.compiler_binding_attempted
+                    {
+                        return Err(invalid());
+                    }
+                    self.compiler_prepared = Some(prepared);
+                    return Ok(None);
+                }
+            }
             let (frame, accounting) = if self.accounted {
                 match crate::accounting::TerminalFrame::decode(
                     &bytes,
@@ -534,21 +861,35 @@ impl ProxyChild {
                     Ok(value) => (value.finished, Some(value.observation)),
                     Err(_) => {
                         let plain = StatusFrame::decode(&bytes, self.binding.0, self.binding.1)?;
-                        if matches!(plain.status, Status::Finished { .. } | Status::Refused { .. })
-                        {
+                        if matches!(
+                            plain.status,
+                            Status::Finished { .. } | Status::Refused { .. }
+                        ) {
                             return Err(invalid());
                         }
                         (plain, None)
                     }
                 }
             } else {
-                (StatusFrame::decode(&bytes, self.binding.0, self.binding.1)?, None)
+                (
+                    StatusFrame::decode(&bytes, self.binding.0, self.binding.1)?,
+                    None,
+                )
             };
             match frame.status {
                 Status::Attached if !self.attached && self.started.is_none() => {
                     self.attached = true
                 }
                 Status::Started(started) if self.proof_done && self.started.is_none() => {
+                    if self.compiler_request.is_some()
+                        && (!self.compiler_bound
+                            || self
+                                .compiler_prepared
+                                .as_ref()
+                                .is_none_or(|prepared| prepared.identity != started.identity))
+                    {
+                        return Err(invalid());
+                    }
                     self.started = Some(started)
                 }
                 Status::Finished { .. } if self.proof_done && self.started.is_some() => {

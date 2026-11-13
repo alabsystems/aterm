@@ -96,6 +96,7 @@ fn completion(attempt_id: u64) -> crate::UpdateHandoffCompletion {
         detail: "stood down".to_string(),
         input_drain_spins: 0,
         child_death: crate::ChildDeathEvidence::Unobserved,
+        successor_start: crate::app_update_handoff::SuccessorStart::Unlaunched,
     }
 }
 

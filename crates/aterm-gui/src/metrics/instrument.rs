@@ -756,6 +756,15 @@ impl Stamp {
         }
     }
 
+    /// Close an edge at or before `through`, leaving a later arrival open.
+    pub(crate) fn take_through(&self, through: u64) -> Option<u64> {
+        self.0
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |at| {
+                (at != 0 && at <= through).then_some(0)
+            })
+            .ok()
+    }
+
     pub(crate) fn reset(&self) {
         self.0.store(0, Ordering::Relaxed);
     }

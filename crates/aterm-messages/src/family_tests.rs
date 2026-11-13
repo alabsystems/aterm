@@ -217,7 +217,7 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
             Family::HugeDir,
             Family::ServiceMemory,
             Family::Vitals,
-            Family::Secrets,
+            Family::Stranded,
             Family::Agh,
             Family::Join,
             Family::NetworkPlace
@@ -227,6 +227,24 @@ fn every_family_has_one_mode_and_no_prefix_shadows_another() {
     // `vitals` stem would shadow (and a level pass of it would sweep).
     assert_eq!(Family::Vitals.stem(), "vitals.proc");
     assert_eq!(Family::Vitals.tag(), tags::SYSTEM);
+    // The stranded programs' entry is a vitals family of its own as well: the four are four level
+    // passes, and none sweeps another's entries.
+    let vitals = [
+        Family::HugeDir,
+        Family::ServiceMemory,
+        Family::Vitals,
+        Family::Stranded,
+    ];
+    assert_eq!(
+        vitals.map(Family::prefix),
+        [
+            "vitals.huge-dir.",
+            "vitals.service-memory.",
+            "vitals.proc.",
+            "vitals.stranded."
+        ]
+    );
+    assert_eq!(Family::Stranded.tag(), tags::SYSTEM);
     // The asking Macs' entries are the members desk's, filed apart from the need ledger's.
     assert_eq!(Family::Join.stem(), "members.join");
     assert_eq!(Family::Join.tag(), tags::PRIVACY);

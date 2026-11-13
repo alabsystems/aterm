@@ -602,6 +602,7 @@ fn a_one_shot_run_is_read_wherever_its_flag_stands() {
 fn an_exit_is_relaunched_only_where_the_relaunch_would_plan_it() {
     const ID: &str = "0badf00d-1111-2222-3333-444455556666";
     let snap = |argv: &[&str]| Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         route: crate::harness::accounts::AuthRoute::Outside,
@@ -697,6 +698,7 @@ fn a_snapshot_follows_its_own_process_and_nothing_else() {
     std::fs::create_dir_all(home.join(".claude/sessions")).expect("home");
     let start = "Thu Sep 24 01:02:03 2026";
     let snap = Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         route: crate::harness::accounts::AuthRoute::Outside,
@@ -2215,6 +2217,7 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
         Ok(format!(" HOME='/tmp/lab home' {survey} {tail}").as_str())
     );
     let snap = |home: Option<String>| Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         route: crate::harness::accounts::AuthRoute::Outside,
@@ -2257,6 +2260,7 @@ fn the_relaunch_line_carries_the_claude_home_its_agent_ran_under() {
 #[test]
 fn an_exit_is_promised_a_relaunch_only_where_the_line_can_hold_its_login() {
     let snap = |login: Option<String>| Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         route: crate::harness::accounts::AuthRoute::Outside,
@@ -2305,6 +2309,7 @@ fn a_label_is_a_login_only_through_the_roster() {
     assert_eq!(account_login(&roster, "pool-a"), None);
     assert_eq!(account_login(&accounts::Roster::default(), "main"), None);
     let on = |login: Option<&str>| Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         route: crate::harness::accounts::AuthRoute::Outside,
@@ -3054,6 +3059,7 @@ fn a_limit_row_a_move_left_is_no_standing_limit() {
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let snap = Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         tab: "s-restored".to_string(),
@@ -3238,6 +3244,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let live = |login: Option<&str>, home: Option<&str>| Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         tab: "s-restored".to_string(),
@@ -3330,6 +3337,7 @@ fn a_move_to_the_default_login_is_met_by_an_unset_variable_under_the_default_hom
 fn the_command_a_person_is_told_carries_the_home_its_relaunch_carries() {
     let user = Path::new("/u/me");
     let snap = |home: Option<&str>, claude_dir: Option<&str>, cwd: &str| Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         tab: "s-1".to_string(),
@@ -3641,6 +3649,7 @@ fn a_dropped_tap_or_token_is_recorded_in_the_ledger() {
         timings: super::super::Timings::for_build(),
     };
     let r = Report {
+        rung: None,
         pid: 4242,
         tab: "s-1".to_string(),
         session: LOGIN_ID.to_string(),
@@ -3725,6 +3734,7 @@ fn a_restart_whose_own_relaunch_was_retired_unissued_holds_no_claim() {
     let why = Restart::Memory;
     let ask = RestartAsk::of(&why, 600);
     let report = Report {
+        rung: None,
         pid: 4242,
         tab: "s-1".to_string(),
         session: LOGIN_ID.to_string(),
@@ -3790,6 +3800,7 @@ fn the_footers_promise_asks_whether_the_line_has_room_for_the_tap() {
     )
     .expect("a value");
     let snap = |cwd: &str| Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         tab: "s-1".to_string(),
@@ -3904,6 +3915,7 @@ fn a_relaunch_after_aterm_ended_is_made_on_the_carried_line_as_the_crash_rule_ma
         cwd: None,
     };
     let snap = |self_claimed: Option<super::super::self_claimed::Resume>| Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         route: crate::harness::accounts::AuthRoute::Outside,
@@ -5173,7 +5185,8 @@ fn a_harness_restart_held_by_keys_is_tried_once_its_own_grace_lets_them_go() {
         tell: crate::harness::upgrade_drive::Tell::Off,
     };
     std::fs::create_dir_all(state_dir(&opts)).expect("state");
-    let (pid, end_s) = (93_257, 1_793_034_365);
+    // Signalled a minute ago: inside the signal's own deadline, so its exit is the restart's.
+    let (pid, end_s) = (93_257, now_s() - 60);
     let restart_as = St {
         agent: upgrade::Agent::Claude,
         pid,
@@ -5289,6 +5302,7 @@ fn agent_resumed_recognizes_aterm_relaunches_and_refuses_fresh_or_recycled_proce
     std::fs::create_dir_all(state_dir(&o)).expect("state");
 
     let claude_snap = |pid: u32, start: &str, argv: &[&str], session: Option<&str>| Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         tab: "s-resumed".to_string(),
@@ -5648,6 +5662,7 @@ fn a_launch_that_resumes_a_conversation_is_a_resumed_agent() {
     };
     std::fs::create_dir_all(state_dir(&o)).expect("state");
     let snap = |argv: &[&str], run: AgentRun| Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         tab: "s-own".to_string(),

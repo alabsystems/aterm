@@ -11,10 +11,18 @@ use aterm_uds::private_file::{PrivateLock, create_private_dir};
 use std::path::Path;
 
 /// One machine-local admission for a dense PTY fixture. The file lock also
-/// coordinates separate worktrees and child test processes. It is not inherited
-/// through exec and is explicitly unlocked before its descriptor closes.
+/// coordinates separate worktrees and child test processes. A parent admitting a
+/// child hands it this lock description through explicit guard inheritance and
+/// retains its own lease until that child exits. The child holds its guard until
+/// every PTY closes, so killing the parent cannot admit another fixture early.
 pub struct Lease {
     _lock: PrivateLock,
+}
+
+impl std::os::fd::AsFd for Lease {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&self._lock)
+    }
 }
 
 impl Lease {

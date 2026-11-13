@@ -79,6 +79,7 @@ no_heap!(
     aterm_parser::State,
     aterm_parser::TmuxPassthrough,
     aterm_grid::GridHandbackCarry,
+    aterm_grid::LineSize,
     crate::config::BiDiConfig,
     super::types::TerminalModes,
     super::checkpoint::SavedCursorRepr,
@@ -225,6 +226,8 @@ impl Heap for TerminalCheckpoint {
             cursor,
             alt_grid,
             alt_cursor,
+            visible_cells,
+            alt_visible_cells,
             saved_cursor_main,
             saved_cursor_alt,
             modes,
@@ -255,6 +258,8 @@ impl Heap for TerminalCheckpoint {
             cursor.heap(),
             alt_grid.heap(),
             alt_cursor.heap(),
+            visible_cells.heap(),
+            alt_visible_cells.heap(),
             saved_cursor_main.heap(),
             saved_cursor_alt.heap(),
             modes.heap(),
@@ -279,6 +284,16 @@ impl Heap for TerminalCheckpoint {
         ]
         .into_iter()
         .fold(0, usize::saturating_add)
+    }
+}
+
+impl Heap for aterm_grid::VisibleCells {
+    fn heap(&self) -> usize {
+        let Self {
+            line_sizes,
+            protected,
+        } = self;
+        line_sizes.heap().saturating_add(protected.heap())
     }
 }
 

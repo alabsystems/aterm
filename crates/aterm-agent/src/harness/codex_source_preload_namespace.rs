@@ -72,8 +72,7 @@ impl CapturedPreloadCommand {
             &self.proof.caller,
             &self.proof.attempt.operation,
             &self.proof,
-        )
-        .map_err(|_| Error::Unavailable)?;
+        )?;
         self.proof.current()?;
         gate.current().map_err(|_| Error::Stale)?;
         self.read_gate = Some(gate);

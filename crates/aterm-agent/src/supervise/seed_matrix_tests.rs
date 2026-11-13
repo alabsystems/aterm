@@ -1674,9 +1674,12 @@ fn turn(prompt: Option<&str>, reply: &[&str], worked_s: i64, at: i64) -> Vec<Str
         r.push(format!("❯ {p}"));
         r.push(String::new());
     }
-    for line in reply {
-        r.push((*line).to_string());
-    }
+    r.extend(
+        reply
+            .iter()
+            .flat_map(|line| line.split('\n'))
+            .map(str::to_string),
+    );
     r.push(String::new());
     let (m, sec) = (worked_s / 60, worked_s % 60);
     let took = if m > 0 {
@@ -1917,7 +1920,7 @@ fn scenarios() -> Vec<Scenario> {
         ("progress", "⏺ Stage 3 of 5 is in; stage 4 is next.", 0),
         (
             "done",
-            "⏺ All done: the change is committed and pushed, and every suite passes.",
+            "⏺ All done: the change is committed and pushed, and every suite passes.\n\n  ATERM-TASK-DONE",
             0,
         ),
         ("worked", "⏺ Stage 3 of 5 is in; stage 4 is next.", 9 * MIN),
@@ -2093,7 +2096,7 @@ fn scenarios() -> Vec<Scenario> {
                         &turn(
                             Some("keep going"),
                             &[
-                                "⏺ All done: the change is committed and pushed, and every suite passes.",
+                                "⏺ All done: the change is committed and pushed, and every suite passes.\n\n  ATERM-TASK-DONE",
                             ],
                             10 * MIN,
                             0,
@@ -2109,7 +2112,9 @@ fn scenarios() -> Vec<Scenario> {
                         &h3,
                         &turn(
                             Some(crate::supervise::policy::turn_end::DONE_CHECK),
-                            &["⏺ All done: verified again, every suite passes."],
+                            &[
+                                "⏺ All done: verified again, every suite passes.\n\n  ATERM-TASK-DONE",
+                            ],
                             70,
                             0,
                         ),
@@ -2790,7 +2795,9 @@ fn more_scenarios() -> Vec<Scenario> {
             &h_c,
             &turn(
                 Some("keep going"),
-                &["⏺ All done: the change is committed and pushed, and every suite passes."],
+                &[
+                    "⏺ All done: the change is committed and pushed, and every suite passes.\n\n  ATERM-TASK-DONE",
+                ],
                 10 * MIN,
                 0,
             ),
@@ -2812,7 +2819,7 @@ fn more_scenarios() -> Vec<Scenario> {
             &h4,
             &turn(
                 Some("keep going"),
-                &["⏺ All done: verified again, every suite passes."],
+                &["⏺ All done: verified again, every suite passes.\n\n  ATERM-TASK-DONE"],
                 70,
                 0,
             ),
@@ -3010,7 +3017,7 @@ fn grown_scenarios() -> Vec<Scenario> {
     let again = five_again(reset);
     let sp0 = with(&w0, &spend_turn(None, 3 * MIN, T0 + 3 * MIN));
     let spend_wall = cc(&sp0, &[], "");
-    let done = "⏺ All done: the change is committed and pushed, and every suite passes.";
+    let done = "⏺ All done: the change is committed and pushed, and every suite passes.\n\n  ATERM-TASK-DONE";
     let force = "⏺ Shall I force-push the rewritten history over main?";
     let progress = "⏺ Stage 3 of 5 is in; stage 4 is next.";
     let check = "If the task is finished and verified, end your reply with ATERM-TASK-DONE on a line by itself and stop; otherwise continue.";
@@ -3336,7 +3343,7 @@ fn grown_scenarios() -> Vec<Scenario> {
             &h4,
             &turn(
                 Some("keep going"),
-                &["⏺ All done: verified again, every suite passes."],
+                &["⏺ All done: verified again, every suite passes.\n\n  ATERM-TASK-DONE"],
                 70,
                 0,
             ),
@@ -3900,7 +3907,7 @@ fn grown_scenarios() -> Vec<Scenario> {
 fn round8_scenarios() -> Vec<Scenario> {
     let mut out = Vec::new();
     let w0 = work0();
-    let done = "⏺ All done: the change is committed and pushed, and every suite passes.";
+    let done = "⏺ All done: the change is committed and pushed, and every suite passes.\n\n  ATERM-TASK-DONE";
     let progress = "⏺ Stage 3 of 5 is in; stage 4 is next.";
     let still = "⏺ Stage 3 of 5: still on it.";
     let check = "If the task is finished and verified, end your reply with ATERM-TASK-DONE on a line by itself and stop; otherwise continue.";
@@ -4046,7 +4053,9 @@ fn round8_scenarios() -> Vec<Scenario> {
             &h4,
             &turn(
                 Some("please also update the changelog"),
-                &["⏺ All done: the changelog is updated, committed and pushed."],
+                &[
+                    "⏺ All done: the changelog is updated, committed and pushed.\n\n  ATERM-TASK-DONE",
+                ],
                 3 * MIN,
                 0,
             ),
@@ -4271,7 +4280,9 @@ fn round9_scenarios() -> Vec<Scenario> {
             &h1,
             &turn(
                 Some("please also update the changelog"),
-                &["⏺ All done: the changelog is updated, committed and pushed."],
+                &[
+                    "⏺ All done: the changelog is updated, committed and pushed.\n\n  ATERM-TASK-DONE",
+                ],
                 3 * MIN,
                 0,
             ),
@@ -4487,7 +4498,7 @@ fn api_retry_scenarios() -> Vec<Scenario> {
             });
         }
         let check = crate::supervise::policy::turn_end::DONE_CHECK;
-        let claim = "⏺ All done: committed and pushed. Should I delete the old release branch?";
+        let claim = "⏺ All done: committed and pushed. Should I delete the old release branch?\n\n  ATERM-TASK-DONE";
         let h1 = with(&w0, &turn(None, &[claim], 0, T0 + 2 * MIN));
         let after = compacted("⏺ Running the suite.");
         let kept = &after[5..after.len() - 4];
@@ -4548,7 +4559,7 @@ fn api_retry_scenarios() -> Vec<Scenario> {
                 kept,
                 &turn(
                     Some(again),
-                    &["⏺ All done: verified again, every suite passes."],
+                    &["⏺ All done: verified again, every suite passes.\n\n  ATERM-TASK-DONE"],
                     3 * MIN,
                     0,
                 ),

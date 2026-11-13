@@ -310,6 +310,14 @@ impl Procs {
         Procs { procs }
     }
 
+    /// A unique process row with a reported footprint, usable for rejection-only attribution.
+    pub(crate) fn observes_resources(&self, pid: u32) -> bool {
+        let mut rows = self.procs.iter().filter(|process| process.pid == pid);
+        rows.next()
+            .is_some_and(|process| process.footprint > 0 && process.charged <= process.footprint)
+            && rows.next().is_none()
+    }
+
     /// The processes `pid` descends from, its parent first, as far as the sweep holds them.
     #[must_use]
     pub fn ancestors(&self, pid: u32) -> Vec<u32> {

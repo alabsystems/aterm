@@ -45,7 +45,7 @@ impl OriginalRootStore {
     }
 }
 
-/// Snapshot/capture only the explicit workload Root option at native entry.
+/// Snapshot/capture only an explicit typed Root option at native entry.
 /// `argv` excludes the executable and begins with the actual verb. Missing or
 /// closed originals refuse now; no later parser may adopt a replacement FD.
 ///
@@ -71,7 +71,7 @@ pub unsafe fn capture_original_root_store(
             continue;
         }
         let value = words.next();
-        if word != "--expect-original-store-fd" {
+        if word != "--expect-original-store-fd" && word != "--expect-native-job-original-store-fd" {
             continue;
         }
         if source.is_some() {

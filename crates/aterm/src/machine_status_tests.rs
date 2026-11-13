@@ -1147,9 +1147,11 @@ fn words_parse() {
 }
 
 /// Name: one name in the roster, the fleet and the Mac's own names is ok; a fleet name aterm
-/// still follows and a repair through its naming rule are aterm's; a missing rule needs setup's
-/// elevation, while an unreadable rule justifies no password request. A taken fleet name is an
-/// agent's pick; no label yet is aterm's at admission. A personal fleet name is no step.
+/// still follows and a repair through its naming rule are aterm's; a missing, older or
+/// unreadable rule is the person's (no automatic pass asks for that password): setup's
+/// password step leaves a missing one, and only `aterm init` renews an older or unreadable one,
+/// which that step never offers. A taken fleet name is an agent's pick; no label yet is aterm's
+/// at admission. A personal fleet name is no step.
 #[test]
 fn name_reads_one_name_across_vault_fleet_and_the_mac() {
     use crate::converge::{MacName, MacNamePending};
@@ -1178,7 +1180,25 @@ fn name_reads_one_name_across_vault_fleet_and_the_mac() {
         )),
     );
     assert_eq!((host.level, who(&host)), (Level::Due, Some(Who::Person)));
-    assert!(host.next.unwrap().act.contains("aterm init"));
+    assert!(host.says.contains("not in place"), "{}", host.says);
+    let act = host.next.unwrap().act;
+    assert!(
+        act.contains("password step") && act.contains("aterm init"),
+        "{act}"
+    );
+    let older = named(
+        FleetName::Current,
+        Some(MacNamePending::Renewal(
+            "this Mac's own name is m42, not m42-heron".to_owned(),
+        )),
+    );
+    assert_eq!((older.level, who(&older)), (Level::Due, Some(Who::Person)));
+    assert!(older.says.contains("out of date"), "{}", older.says);
+    let act = older.next.unwrap().act;
+    assert!(
+        act.contains("aterm init") && !act.contains("password step"),
+        "{act}"
+    );
     let automatic = named(
         FleetName::Current,
         Some(MacNamePending::ThroughRule("own name differs".to_owned())),
@@ -1189,11 +1209,19 @@ fn name_reads_one_name_across_vault_fleet_and_the_mac() {
     );
     let unread = named(
         FleetName::Current,
-        Some(MacNamePending::Unread("own name differs".to_owned())),
+        Some(MacNamePending::Unread(
+            "own name differs; the existing naming permission could not be read".to_owned(),
+        )),
     );
     assert_eq!(
         (unread.level, who(&unread)),
-        (Level::Unknown, Some(Who::Agent))
+        (Level::Due, Some(Who::Person))
+    );
+    assert!(unread.says.contains("could not be read"), "{}", unread.says);
+    let act = &unread.next.as_ref().unwrap().act;
+    assert!(
+        act.contains("renew") && !act.contains("password step"),
+        "{act}"
     );
     let collision = named(
         FleetName::Current,

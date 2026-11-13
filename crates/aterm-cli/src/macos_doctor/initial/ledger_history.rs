@@ -131,6 +131,86 @@ impl SetupHistoryStore {
         self.history(&value)
     }
 
+    /// Saved display context before the GUI starts. Read no live facts, flush no records,
+    /// and create no account identity. A partial recovery waits for the ordinary worker.
+    #[must_use]
+    pub fn display(&self) -> Option<(Plan, DisplayHistory)> {
+        let mut history = self.begin()?;
+        if history.rows.is_empty() {
+            return None;
+        }
+        let read = |name| match aterm_uds::private_file::read_owned(
+            &self.root,
+            name,
+            aterm_uds::atomic_file::MAX_CONFIG_BYTES as usize,
+        ) {
+            Ok(bytes) => Some(Some(bytes)),
+            Err(aterm_uds::private_file::PrivateFileError::Missing) => Some(None),
+            _ => None,
+        };
+        let names = [
+            "automatic-plan.json",
+            "initial-setup.json",
+            "first-run.json",
+        ];
+        let snapshot = [read(names[0])?, read(names[1])?, read(names[2])?];
+        for (name, before) in names.into_iter().zip(&snapshot) {
+            if read(name)?.as_ref() != before.as_ref() {
+                return None;
+            }
+        }
+        let [plan_bytes, progress_bytes, decision_bytes] = snapshot;
+        let plan_value = plan_bytes
+            .map(|bytes| aterm_json::from_slice::<Value>(&bytes))
+            .transpose()
+            .ok()?;
+        let plan = plan_value
+            .as_ref()
+            .map(parse_plan_record)
+            .transpose()
+            .ok()?;
+        let progress = progress_bytes
+            .map(|bytes| {
+                let value = aterm_json::from_slice::<Value>(&bytes).map_err(|e| e.to_string())?;
+                parse_progress(&value)
+            })
+            .transpose()
+            .ok()?;
+        if plan_value.as_ref().is_some_and(|value| {
+            (value.get("upgrade").is_some() || scope::put_back(value))
+                && progress.is_none_or(|progress| {
+                    plan.as_ref()
+                        .is_none_or(|(plan, _)| !progress.belongs_to(plan))
+                })
+        }) {
+            return None;
+        }
+        let (decision, restored, cancelled) = decision_bytes
+            .map(|bytes| parse_decision_reviewed(&bytes))
+            .transpose()
+            .ok()?
+            .unwrap_or((Decision::Missing, None, None));
+        let records = Records {
+            plan,
+            progress,
+            decision,
+            restored,
+            cancelled,
+            provisional: false,
+            stop_request: None,
+            person_access: false,
+        };
+        let configured =
+            ConfiguredVault::read(&aterm_secrets::client::Paths::locate_for_home(&self.home));
+        let source_read = configured.is_ok();
+        let plan = offered_plan(records.presented_plan_record(), configured);
+        if !source_read || history.vault_source.trim() != plan.vault_url.trim() {
+            history.rows.retain(|row| !row.subject.uses_vault_source());
+            history.vault_source.clear();
+        }
+        Some((plan, history))
+    }
+
     fn history(&self, ledger: &Value) -> Option<DisplayHistory> {
         let Some(value) = ledger.get(FIELD) else {
             return Some(DisplayHistory {

@@ -18,7 +18,9 @@ use crate::test_progress::{Phase, Progress};
 
 use crate::resource_waits as test_waits;
 
-pub use crate::test_content::{CarryProof, Evidence, Passed, encode_passed, read_passed};
+pub use crate::test_content::{
+    CarryProof, Evidence, KeyParts, Passed, encode_passed, moved_parts, read_passed,
+};
 
 /// The flag cargo's runner config hands this binary.
 pub const RECORD_FLAG: &str = "--record-test-binary";
@@ -835,6 +837,13 @@ where
 /// leaves the binary unstarted, as the stop leaves every other. A FIFO error answers it as a
 /// binary verify could not start ([`Run::spawn_error`]), never run and never started
 /// ([`Ran::started`]).
+///
+/// LOST TOKENS. A GNU client that dies holding a token takes it with it, and the pool cannot
+/// name who. So a binary whose whole charge the pool does not hold, while no binary of this
+/// dispatch runs and no child of the run is alive (`idle`, [`exec::no_child_runs`] in a run),
+/// waits for nobody: it starts on the tokens there are, at least one, its width and its cores
+/// within them (`BinaryPermit::granted`), and a line says so. It holds only what the pool had,
+/// so no other holder is overdrawn. This dispatch, outside a run, lists no children and waits.
 #[expect(
     clippy::too_many_arguments,
     reason = "dispatch's own seven inputs and the release's pool, which only a run under a \
@@ -854,8 +863,18 @@ where
     F: Fn(&Binary, &Planned, &(dyn Fn() + Sync)) -> Option<Run> + Sync,
     E: Fn(&Binary, &Ran, &dyn Fn()) + Sync,
 {
+    // A dispatch outside a run lists no children, so it never reads a missing token as lost.
     dispatch_resources(
-        bins, plan, memory, pool, None, live, stop, run_one, completed,
+        bins,
+        plan,
+        memory,
+        pool,
+        None,
+        live,
+        stop,
+        &|| false,
+        run_one,
+        completed,
     )
 }
 
@@ -871,6 +890,7 @@ fn dispatch_resources<F, E>(
     ctx: Option<&crate::Ctx>,
     live: &(dyn Fn() -> f64 + Sync),
     stop: &(dyn Fn() -> bool + Sync),
+    idle: &(dyn Fn() -> bool + Sync),
     run_one: F,
     completed: E,
 ) -> Vec<Option<Ran>>
@@ -880,6 +900,7 @@ where
 {
     let answers: Vec<Mutex<Option<Ran>>> = bins.iter().map(|_| Mutex::new(None)).collect();
     let state = Mutex::new(Dispatcher::new(plan, memory));
+    let probes = Mutex::new(AdmissionPass::default());
     let turn = Condvar::new();
     let waiters = BinaryWaiters::default();
     let halt = || {
@@ -913,8 +934,15 @@ where
                                 waiters.clear();
                             }
                         },
-                        &mut |b| {
-                            let (permit, reason) = binary_permit_observed(ctx, pool, b, &waiters);
+                        &mut |generation, b, alone| {
+                            let (permit, reason) = binary_permit_observed(
+                                ctx,
+                                pool,
+                                b,
+                                &waiters,
+                                alone && idle(),
+                                Some((&probes, generation)),
+                            );
                             waits.change(b.index, reason);
                             permit
                         },
@@ -922,10 +950,24 @@ where
                             waits.change(b.index, Some(test_waits::Reason::local(b, resources)))
                         },
                     );
-                    let Some((b, permit)) = next else {
+                    let Some((planned, permit)) = next else {
                         waits.finish_pending();
                         break;
                     };
+                    // What it runs on is what its ledger claim or pool tokens grant.
+                    let b = execution_grant(&state, &permit, planned);
+                    if let (true, Some(binary)) = (b.charge < planned.charge, bins.get(b.index)) {
+                        let source = if pool.is_some() {
+                            "release pool"
+                        } else {
+                            "capacity ledger"
+                        };
+                        eprintln!(
+                            "verify: {} starts on {} of its {} requested cores: the {source} \
+                             grant bounds its execution width",
+                            binary.spec, b.charge, planned.charge
+                        );
+                    }
                     let _charged = Charged {
                         state: &state,
                         turn: &turn,
@@ -981,11 +1023,52 @@ where
         .collect()
 }
 
-/// Actual per-binary custody. Memory is acquired before pool tokens; an incomplete attempt
-/// drops both and leaves no queue position, CPU charge or memory reservation behind.
+/// Actual per-binary custody. Memory is acquired before pool tokens. A failed permit drops
+/// held resources; [`BinaryWaiters`] retains only its pending admission request.
 struct BinaryPermit<'a> {
     claim: Option<Arc<aterm_capacity::Claim>>,
-    _tokens: Vec<aterm_capacity::Token<'a>>,
+    /// The pool's tokens it holds: `None` with no pool, where its claim's cores are its charge.
+    tokens: Option<Vec<aterm_capacity::Token<'a>>>,
+}
+
+/// Bind an admitted binary's execution budget to the resources it actually acquired.
+fn execution_grant(
+    state: &Mutex<Dispatcher>,
+    permit: &Result<BinaryPermit<'_>, std::io::Error>,
+    planned: Planned,
+) -> Planned {
+    let actual = permit
+        .as_ref()
+        .map_or(planned, |permit| permit.granted(planned));
+    if actual.charge < planned.charge {
+        state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .limit_charge(actual.index, actual.charge)
+            .expect("an admitted binary retains its positive external grant");
+    }
+    actual
+}
+
+impl BinaryPermit<'_> {
+    /// Cap the preferred charge and width by the pool tokens held, or by the ledger's
+    /// actual elastic core grant when there is no pool.
+    fn granted(&self, b: Planned) -> Planned {
+        let Some(held) = self
+            .tokens
+            .as_ref()
+            .and_then(|tokens| u32::try_from(tokens.len()).ok())
+            .or_else(|| self.claim.as_ref().map(|claim| claim.cores()))
+            .filter(|held| (1..b.charge).contains(held))
+        else {
+            return b;
+        };
+        Planned {
+            charge: held,
+            width: b.width.min(held),
+            ..b
+        }
+    }
 }
 
 /// Keep one stable admission request while trying the dispatch's other safe envelopes.
@@ -1016,7 +1099,7 @@ impl BinaryWaiters {
             aterm_capacity::Need,
         ) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>,
     ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error> {
-        self.poll_noting(index, need, machine, enter, &mut None)
+        self.poll_noting(index, need, machine, enter, &mut |_| None, &mut None)
     }
 
     fn poll_noting(
@@ -1027,15 +1110,33 @@ impl BinaryWaiters {
         enter: impl FnOnce(
             aterm_capacity::Need,
         ) -> Result<aterm_capacity::admit::Waiter, aterm_capacity::Error>,
+        rejection: &mut impl FnMut(
+            &aterm_capacity::Need,
+        ) -> Option<aterm_capacity::admit::ProbeRejection>,
         waiting: &mut Option<test_waits::Reason>,
     ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error> {
         use aterm_capacity::admit::Polled;
+        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
+        // A retained waiter keeps its queue position and always polls fresh. Only temporary
+        // alternative envelopes may be rejected by the bounded shared observation.
+        if pending.as_ref().is_some_and(|(queued, _)| *queued != index)
+            && let Some(rejection) = rejection(&need)
+        {
+            *waiting = Some(match rejection {
+                aterm_capacity::admit::ProbeRejection::Waiting(short) => {
+                    test_waits::Reason::ledger(&short)
+                }
+                aterm_capacity::admit::ProbeRejection::Unreachable(why) => {
+                    test_waits::Reason::unreachable(why)
+                }
+            });
+            return Ok(None);
+        }
         if let Some(why) = aterm_capacity::admit::never(&need, &machine.read(need.path.as_deref()))
         {
             *waiting = Some(test_waits::Reason::unreachable(why));
             return Ok(None);
         }
-        let mut pending = self.pending.lock().unwrap_or_else(PoisonError::into_inner);
         let waiter = if pending.as_ref().is_some_and(|(queued, _)| *queued == index) {
             pending.take().expect("the queued request was present").1
         } else {
@@ -1073,11 +1174,67 @@ fn dispatch_lifetime(
     .map_err(|why| format!("test dispatch lifetime admission refused: {why}"))
 }
 
+#[derive(Default)]
+struct AdmissionPass {
+    generation: Option<u64>,
+    sampled: Option<Instant>,
+    probe: Option<aterm_capacity::admit::ResourceProbe>,
+}
+
+impl AdmissionPass {
+    fn rejection(
+        &mut self,
+        generation: u64,
+        ledger: &aterm_capacity::Ledger,
+        machine: &dyn aterm_capacity::Machine,
+        need: &aterm_capacity::Need,
+        clock: &dyn Fn() -> Instant,
+    ) -> Option<aterm_capacity::admit::ProbeRejection> {
+        let at = clock();
+        if self.generation != Some(generation)
+            || self.sampled.is_none_or(|sampled| {
+                at.saturating_duration_since(sampled)
+                    >= aterm_capacity::admit::RESOURCE_PROBE_MAX_AGE
+            })
+        {
+            self.generation = Some(generation);
+            self.sampled = Some(at);
+            self.probe = aterm_capacity::admit::ResourceProbe::capture_at(ledger, machine, at)
+                .ok()
+                .flatten();
+        }
+        self.probe
+            .as_ref()
+            .and_then(|probe| probe.rejection_at(need, clock()))
+    }
+
+    #[cfg(test)]
+    fn allows(
+        &mut self,
+        generation: u64,
+        ledger: &aterm_capacity::Ledger,
+        machine: &dyn aterm_capacity::Machine,
+        need: &aterm_capacity::Need,
+        clock: &dyn Fn() -> Instant,
+    ) -> bool {
+        self.rejection(generation, ledger, machine, need, clock)
+            .is_none()
+    }
+
+    fn acquired(&mut self) {
+        self.generation = None;
+        self.sampled = None;
+        self.probe = None;
+    }
+}
+
 fn binary_permit_observed<'a>(
     ctx: Option<&crate::Ctx>,
     pool: Option<&'a aterm_capacity::Jobserver>,
     b: &Planned,
     waiters: &BinaryWaiters,
+    alone: bool,
+    pass: Option<(&Mutex<AdmissionPass>, u64)>,
 ) -> (
     Option<Result<BinaryPermit<'a>, std::io::Error>>,
     Option<test_waits::Reason>,
@@ -1090,9 +1247,17 @@ fn binary_permit_observed<'a>(
         b,
         &mut |need, mode| {
             if let Some(mode) = mode {
-                return crate::admit_live(need, mode).map(Some);
+                let result = crate::admit_live(need, mode).map(Some);
+                if matches!(&result, Ok(Some(_)))
+                    && let Some((pass, _)) = pass
+                {
+                    pass.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .acquired();
+                }
+                return result;
             }
-            waiters.poll_noting(
+            let result = waiters.poll_noting(
                 b.index,
                 need,
                 &aterm_capacity::Live,
@@ -1105,9 +1270,31 @@ fn binary_permit_observed<'a>(
                     aterm_capacity::admit::Waiter::enter(&ledger, &aterm_capacity::Live, need)
                         .map_err(aterm_capacity::Error::Ledger)
                 },
+                &mut |need| {
+                    let (pass, generation) = pass?;
+                    let ledger = aterm_capacity::Ledger::user()?;
+                    pass.lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .rejection(
+                            generation,
+                            &ledger,
+                            &aterm_capacity::Live,
+                            need,
+                            &Instant::now,
+                        )
+                },
                 &mut global_wait,
-            )
+            );
+            if matches!(&result, Ok(Some(_)))
+                && let Some((pass, _)) = pass
+            {
+                pass.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .acquired();
+            }
+            result
         },
+        alone,
         &mut core_wait,
     );
     (result, core_wait.or(global_wait))
@@ -1123,7 +1310,7 @@ fn binary_permit_with<'a>(
         Option<aterm_capacity::Admit>,
     ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error>,
 ) -> Option<Result<BinaryPermit<'a>, std::io::Error>> {
-    binary_permit_noting(ctx, pool, b, attempt, &mut None)
+    binary_permit_noting(ctx, pool, b, attempt, false, &mut None)
 }
 
 fn binary_permit_noting<'a>(
@@ -1134,6 +1321,7 @@ fn binary_permit_noting<'a>(
         aterm_capacity::Need,
         Option<aterm_capacity::Admit>,
     ) -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error>,
+    alone: bool,
     waiting: &mut Option<test_waits::Reason>,
 ) -> Option<Result<BinaryPermit<'a>, std::io::Error>> {
     let claim = if let Some(ctx) = ctx.filter(|ctx| ctx.memory.is_some()) {
@@ -1160,8 +1348,8 @@ fn binary_permit_noting<'a>(
         let mode = (!ctx.background && ctx.quiet == Some(aterm_capacity::Admit::Now))
             .then_some(aterm_capacity::Admit::Now);
         match attempt(need, mode) {
-            Ok(Some(claim)) if pool.is_none() && claim.cores() < b.charge => {
-                *waiting = Some(test_waits::Reason::partial_core_grant());
+            Ok(Some(claim)) if pool.is_none() && claim.cores() == 0 => {
+                *waiting = Some(test_waits::Reason::zero_core_grant());
                 return None;
             }
             Ok(Some(claim)) => Some(Arc::new(claim)),
@@ -1171,23 +1359,32 @@ fn binary_permit_noting<'a>(
     } else {
         None
     };
-    let mut tokens = Vec::new();
-    if let Some(pool) = pool {
-        for _ in 0..b.charge {
-            match pool.try_acquire() {
-                Ok(Some(token)) => tokens.push(token),
-                Ok(None) => {
-                    *waiting = Some(test_waits::Reason::fifo());
-                    return None;
+    let tokens = match pool {
+        None => None,
+        Some(pool) => {
+            let mut tokens = Vec::new();
+            for _ in 0..b.charge {
+                match pool.try_acquire() {
+                    Ok(Some(token)) => tokens.push(token),
+                    // LOST TOKENS. `alone` says no binary of this dispatch runs and no child of
+                    // this run is alive, so no holder this run knows of is left to give a token
+                    // back: a GNU client that died holding one took it with it, and the pool
+                    // cannot name that. Waiting for the whole charge would then never end, so
+                    // the binary takes the tokens there are and runs within them
+                    // ([`BinaryPermit::granted`]). It holds no more than the pool had, so the
+                    // pool's other branches are never overdrawn.
+                    Ok(None) if alone && !tokens.is_empty() => break,
+                    Ok(None) => {
+                        *waiting = Some(test_waits::Reason::fifo());
+                        return None;
+                    }
+                    Err(why) => return Some(Err(why)),
                 }
-                Err(why) => return Some(Err(why)),
             }
+            Some(tokens)
         }
-    }
-    Some(Ok(BinaryPermit {
-        claim,
-        _tokens: tokens,
-    }))
+    };
+    Some(Ok(BinaryPermit { claim, tokens }))
 }
 
 /// A binary whose wait for the release's pool's tokens an interrupt or the FIFO ended: verify
@@ -1275,7 +1472,35 @@ fn admitted_holding<T>(
     after_stop: &(impl Fn() + Sync),
     acquire: &mut impl FnMut(&Planned) -> Option<T>,
 ) -> Option<(Planned, T)> {
-    admitted_holding_observed(state, turn, live, stop, after_stop, acquire, &mut |_, _| {})
+    admitted_holding_observed(
+        state,
+        turn,
+        live,
+        stop,
+        after_stop,
+        &mut |_, b, _| acquire(b),
+        &mut |_, _| {},
+    )
+}
+
+#[cfg(test)]
+fn admitted_holding_pass<T>(
+    state: &Mutex<Dispatcher>,
+    turn: &Condvar,
+    live: &(dyn Fn() -> f64 + Sync),
+    stop: &(dyn Fn() -> bool + Sync),
+    after_stop: &(impl Fn() + Sync),
+    acquire: &mut impl FnMut(u64, &Planned) -> Option<T>,
+) -> Option<(Planned, T)> {
+    admitted_holding_observed(
+        state,
+        turn,
+        live,
+        stop,
+        after_stop,
+        &mut |generation, b, _| acquire(generation, b),
+        &mut |_, _| {},
+    )
 }
 
 fn admitted_holding_observed<T>(
@@ -1284,7 +1509,7 @@ fn admitted_holding_observed<T>(
     live: &(dyn Fn() -> f64 + Sync),
     stop: &(dyn Fn() -> bool + Sync),
     after_stop: &(impl Fn() + Sync),
-    acquire: &mut impl FnMut(&Planned) -> Option<T>,
+    acquire: &mut impl FnMut(u64, &Planned, bool) -> Option<T>,
     rejected: &mut impl FnMut(&Planned, test_plan::DispatchResources),
 ) -> Option<(Planned, T)> {
     loop {
@@ -1298,10 +1523,13 @@ fn admitted_holding_observed<T>(
             return None;
         }
         let mut permit = None;
+        let generation = d.generation();
+        // Whether no binary of this dispatch runs: `acquire` reads it under this lock.
+        let alone = d.held() == 0;
         if let Some(b) = d.next_with_observed(
             live(),
             &mut |b| {
-                permit = acquire(b);
+                permit = acquire(generation, b, alone);
                 permit.is_some()
             },
             rejected,
@@ -1331,6 +1559,50 @@ pub struct Carried {
     pub carried: Vec<CarriedBinary>,
     /// The current evidence of every candidate binary, by spec.
     pub known: BTreeMap<String, Evidence>,
+    /// Each binary a bounded prior proof was offered for and which runs again, with the first
+    /// thing that differs ([`refusal`]), in the binaries' order.
+    pub refused: Vec<(String, String)>,
+}
+
+/// Why a bounded prior proof does not carry `evidence`'s binary: a content key that differs
+/// names the parts that moved, so a part no two runs can share is read off the first report.
+fn refusal(golden: bool, prior: &CarryProof, evidence: &Evidence) -> String {
+    if golden {
+        return format!("{} always runs", crate::checks::GOLDEN.0);
+    }
+    if let Some(reason) = &evidence.reason {
+        return format!("unbounded here: {reason}");
+    }
+    if prior.exe_sha256 != evidence.exe_sha256 {
+        return "executable bytes changed".into();
+    }
+    let moved = moved_parts(&prior.key_parts, &evidence.parts);
+    if moved.is_empty() {
+        "content key changed; the prior proof names no parts".into()
+    } else {
+        format!("content key moved in {}", moved.join(", "))
+    }
+}
+
+/// The report's lines for the offered proofs that did not carry: one per reason, most frequent
+/// first, each with its count and one binary it holds for.
+fn refused_lines(refused: &[(String, String)]) -> Vec<String> {
+    let mut reasons: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (spec, why) in refused {
+        reasons.entry(why.as_str()).or_default().push(spec.as_str());
+    }
+    let mut reasons: Vec<_> = reasons.into_iter().collect();
+    reasons.sort_by_key(|(_, specs)| std::cmp::Reverse(specs.len()));
+    reasons
+        .into_iter()
+        .map(|(why, specs)| {
+            format!(
+                "  offered and run again: {} ({why}), as {}",
+                specs.len(),
+                specs[0]
+            )
+        })
+        .collect()
 }
 
 /// A prior success reused without executing this hop.
@@ -1340,6 +1612,8 @@ pub struct CarriedBinary {
     /// The prior run's global libtest JSON decision, which is part of the reconstructed command.
     pub json: bool,
     pub prior_execution_s: f64,
+    /// The release run whose execution this is, when its proof names one.
+    pub origin_run: Option<String>,
 }
 
 /// Which of `bins` a run carries. `evidence` runs for every binary, including a first run
@@ -1360,7 +1634,7 @@ pub fn carry(
         evidence(&bins[i], passed.get(&bins[i].spec))
     });
     let mut known = BTreeMap::new();
-    let (mut run, mut carried) = (Vec::new(), Vec::new());
+    let (mut run, mut carried, mut refused) = (Vec::new(), Vec::new(), Vec::new());
     for (binary, evidence) in bins.into_iter().zip(evidence) {
         let evidence = evidence.expect("every candidate binary was assigned to the evidence pool");
         known.insert(binary.spec.clone(), evidence.clone());
@@ -1377,10 +1651,18 @@ pub fn carry(
             carried.push(CarriedBinary {
                 json: prior.expect("matched prior proof").json,
                 prior_execution_s: prior.expect("matched prior proof").execution_s,
+                origin_run: prior.expect("matched prior proof").origin_run.clone(),
                 binary,
                 evidence,
             });
         } else {
+            if let Some(prior) = prior.filter(|prior| prior.outcome == "ok" && prior.inputs_bounded)
+            {
+                refused.push((
+                    binary.spec.clone(),
+                    refusal(golden(&binary), prior, &evidence),
+                ));
+            }
             run.push(binary);
         }
     }
@@ -1388,6 +1670,7 @@ pub fn carry(
         run,
         carried,
         known,
+        refused,
     }
 }
 
@@ -1410,7 +1693,14 @@ fn carried_event(carried: &CarriedBinary) -> String {
                 "width": aterm_json::Value::Null, "tests": aterm_json::Value::Null,
                 "test_counts": aterm_json::Value::Null,
                 "failures": [],
-                "detail": "carried: prior ok with equal executable and complete runtime inputs",
+                "detail": format!(
+                    "carried{}: prior ok with equal executable and complete runtime inputs",
+                    carried
+                        .origin_run
+                        .as_deref()
+                        .map(|run| format!(" from run {run}"))
+                        .unwrap_or_default()
+                ),
                 "evidence": {
                     "schema": crate::test_content::SCHEMA,
                     "exe_sha256": evidence.exe_sha256,
@@ -1422,9 +1712,11 @@ fn carried_event(carried: &CarriedBinary) -> String {
                 "content_key": evidence.content_key,
                 "inputs_bounded": evidence.bounded(),
                 "input_reason": evidence.reason,
+                "key_parts": evidence.parts,
                 "json": carried.json,
                 "recorded_execution_s": carried.prior_execution_s,
                 "carried": true,
+                "carried_from": carried.origin_run,
             })
         )
     )
@@ -1659,6 +1951,7 @@ fn binary_event(
                 "content_key": evidence.and_then(|evidence| evidence.content_key.as_deref()),
                 "inputs_bounded": evidence.map(Evidence::bounded),
                 "input_reason": evidence.and_then(|evidence| evidence.reason.as_deref()),
+                "key_parts": evidence.map(|evidence| &evidence.parts),
                 "json": json,
                 "recorded_execution_s": ran.execution.as_secs_f64(),
                 "carried": false,
@@ -2660,8 +2953,16 @@ fn probe_json(
                     "run ended before probe admission".into(),
                 )));
             }
-            let (permit, reason) =
-                binary_permit_observed(Some(ctx), ctx.pool.as_deref(), planned, &waiters);
+            // No dispatch runs yet: the probe alone asks, and a listing needs no more than the
+            // tokens a pool that lost some still holds.
+            let (permit, reason) = binary_permit_observed(
+                Some(ctx),
+                ctx.pool.as_deref(),
+                planned,
+                &waiters,
+                exec::no_child_runs(),
+                None,
+            );
             waits.change(index, reason);
             if let Some(permit) = permit {
                 match permit {
@@ -2787,6 +3088,17 @@ pub(crate) fn evidence_context(ctx: &crate::Ctx) -> Option<String> {
         hash.update(b"aterm-dev-test-input-drift-v1\0");
         aterm_codec::hex::encode_lower(&hash.finalize())
     })
+}
+
+/// ` (moved: a, b)` for the key parts two observations of one binary disagree on, or nothing
+/// when either recorded none.
+fn moved_note(before: &KeyParts, after: &KeyParts) -> String {
+    let moved = moved_parts(before, after);
+    if moved.is_empty() {
+        String::new()
+    } else {
+        format!(" (moved: {})", moved.join(", "))
+    }
 }
 
 /// Run the planned binaries: each through [`pool`], its cases read as they end ([`Watch`]), and
@@ -2934,6 +3246,7 @@ fn run_planned_observed(
                 exe_sha256: None,
                 content_key: None,
                 reason: Some("runtime inputs have no complete bounded declaration".into()),
+                parts: KeyParts::new(),
             }
         } else if exact_error.is_some() {
             let mut incomplete = command.clone();
@@ -2944,6 +3257,7 @@ fn run_planned_observed(
         };
         if let Some(why) = exact_error {
             evidence.content_key = None;
+            evidence.parts.clear();
             evidence.reason = Some(format!("the exact spawn environment is unbounded: {why}"));
         }
         evidenced.fetch_add(
@@ -2962,12 +3276,13 @@ fn run_planned_observed(
         )
     };
     let empty_passed = Passed::new();
-    let (carried, known) = if content_evidence {
+    let (carried, known, refused) = if content_evidence {
         let all = bins;
         let Carried {
             run,
             carried,
             mut known,
+            refused,
         } = carry(
             // Only a release carries: a development run's bracket runs every binary.
             ctx.passed_binaries
@@ -2981,6 +3296,7 @@ fn run_planned_observed(
                         exe_sha256: None,
                         content_key: None,
                         reason: Some("there is no prior successful execution to carry".into()),
+                        parts: KeyParts::new(),
                     },
                     |proof| candidate_for(binary, proof.json),
                 )
@@ -2992,9 +3308,9 @@ fn run_planned_observed(
             known.remove(&binary.spec);
         }
         bins = run;
-        (carried, known)
+        (carried, known, refused)
     } else {
-        (Vec::new(), BTreeMap::new())
+        (Vec::new(), BTreeMap::new(), Vec::new())
     };
     let evidence = Mutex::new(known);
     let evidence_of = |b: &Binary| {
@@ -3028,13 +3344,15 @@ fn run_planned_observed(
                 let changed = Evidence {
                     exe_sha256: after
                         .exe_sha256
+                        .clone()
                         .or_else(|| candidate.evidence.exe_sha256.clone()),
                     content_key: None,
-                    reason: Some(
+                    reason: Some(format!(
                         "runtime inputs changed after carry selection; the run-wide read-only \
-                         declaration was violated"
-                            .into(),
-                    ),
+                         declaration was violated{}",
+                        moved_note(&candidate.evidence.parts, &after.parts)
+                    )),
+                    parts: KeyParts::new(),
                 };
                 evidence
                     .lock()
@@ -3184,13 +3502,14 @@ fn run_planned_observed(
                         .unwrap_or_else(PoisonError::into_inner)
                         .push(binary.spec.clone());
                     Evidence {
+                        reason: Some(format!(
+                            "runtime inputs changed while the test binary ran; its read-only \
+                             declaration was violated{}",
+                            moved_note(&before.parts, &after.parts)
+                        )),
                         exe_sha256: after.exe_sha256.or(before.exe_sha256),
                         content_key: None,
-                        reason: Some(
-                            "runtime inputs changed while the test binary ran; its read-only \
-                             declaration was violated"
-                                .into(),
-                        ),
+                        parts: KeyParts::new(),
                     }
                 }
                 None => {
@@ -3205,6 +3524,7 @@ fn run_planned_observed(
                             "runtime inputs were not captured immediately before the test binary ran"
                                 .into(),
                         ),
+                        parts: KeyParts::new(),
                     }
                 }
             };
@@ -3233,6 +3553,7 @@ fn run_planned_observed(
         Some(ctx),
         &live,
         &stop,
+        &exec::no_child_runs,
         |b, planned, local_halt| {
             if ctx.halted().is_some() {
                 return None;
@@ -3377,6 +3698,9 @@ fn run_planned_observed(
                 bins.len() + probe_hung_count,
                 carried_drift.len()
             ));
+            for line in refused_lines(&refused) {
+                r.raw(line);
+            }
         }
         if content_evidence {
             let evidence = evidence.lock().unwrap_or_else(PoisonError::into_inner);
@@ -3622,3 +3946,11 @@ mod probe_hang_tests;
 #[cfg(test)]
 #[path = "testrun_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "testrun_probe_tests.rs"]
+mod probe_tests;
+
+#[cfg(target_os = "macos")]
+#[path = "testrun_admission_bench.rs"]
+pub(crate) mod admission_bench;

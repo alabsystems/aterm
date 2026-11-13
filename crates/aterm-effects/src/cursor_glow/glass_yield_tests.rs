@@ -16,7 +16,6 @@ fn published_caps_keep_synthetic_ink_readable_after_gradient_rounding_whole() {
     const WIDTH: usize = 15;
     let mut renderer =
         aterm_render::Renderer::from_system(40.0, aterm_render::Theme::default()).unwrap();
-    renderer.set_font_subpixel("off");
     renderer.debug_block_on_lazy_fallbacks();
     let (cw, ch) = renderer.cell_size();
     assert!(cw >= WIDTH, "the gradient fits wholly inside one word cell");

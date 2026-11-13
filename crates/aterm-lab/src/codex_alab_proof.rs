@@ -31,6 +31,8 @@ mod capacity_proof;
 mod facts_proof;
 #[path = "codex_alab_policy_proof.rs"]
 mod policy_proof;
+#[path = "codex_alab_published_target.rs"]
+mod published_target;
 #[path = "codex_alab_restart_proof.rs"]
 mod restart_proof;
 #[path = "codex_alab_terminals_proof.rs"]
@@ -254,13 +256,13 @@ fn acted_in_log(log: &str, act: &str, holder: &str) -> bool {
         })
 }
 
-/// The pad of a codex screen `text` (`text`'s rows): the row right above its last `›` prompt
+/// The pad of a codex screen `text` (`text`'s rows): the row right above its composer
 /// row, as the program drew it, trimmed of its blanks (empty where it left the pad blank); `None`
-/// where no row starts with the prompt. codex-alab's ALab interface draws its own Autopilot line
+/// where no composer is visible. codex-alab's ALab interface draws its own Autopilot line
 /// there; a blank pad is where aterm's chip lays (design §14.8).
 pub(crate) fn pad_of(text: &str) -> Option<String> {
     let rows: Vec<&str> = text.lines().collect();
-    let prompt = rows.iter().rposition(|r| r.starts_with('\u{203a}'))?;
+    let (prompt, _) = crate::screen::composer_at("codex", text)?;
     let pad = rows.get(prompt.checked_sub(1)?)?;
     Some(pad.trim().to_string())
 }
@@ -947,6 +949,17 @@ fn exec_generation(record: &J) -> i64 {
         .unwrap_or(0)
 }
 
+fn observed_upgrade(record: &J, pid: i32, before: i64, executable: &Path) -> bool {
+    exec_generation(record) > before
+        && record
+            .get("exe")
+            .and_then(J::as_str)
+            .and_then(|path| std::fs::canonicalize(path).ok())
+            .zip(std::fs::canonicalize(executable).ok())
+            .is_some_and(|(observed, expected)| observed == expected)
+        && aterm_uds::process::image_matches_file(pid, executable) == Some(true)
+}
+
 fn person_hand(status: &str) -> (Option<u64>, u64) {
     (
         field(status, "human_ms").and_then(|v| v.parse().ok()),
@@ -986,6 +999,7 @@ pub(crate) struct Proof {
     s: PathBuf,
     h: PathBuf,
     world_env: Vec<(String, String)>,
+    published_target: Option<published_target::Target>,
     api_log: Arc<std::sync::Mutex<codex_rig::ApiLog>>,
     /// The fake API and observer share this clock, outside every re-exec.
     api_clock: Instant,
@@ -1613,21 +1627,35 @@ impl Proof {
     }
 
     fn link(&self, pkg: &Path) -> Result<(), String> {
-        let out = aterm_uds::spawnfd::command(&self.inst.aterm)
+        if let Some(target) = &self.published_target
+            && target.matches(&self.h, pkg)?
+        {
+            if target.linked(&self.h)? {
+                self.package_action("unlink", None)?;
+            }
+            return target.activate(&self.h);
+        }
+        self.package_action("link", Some(pkg))
+    }
+
+    fn package_action(&self, action: &str, pkg: Option<&Path>) -> Result<(), String> {
+        let mut command = aterm_uds::spawnfd::command(&self.inst.aterm);
+        command
             .env_clear()
             .envs(self.world_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
-            .args(["pkg", "link", "codex"])
-            .arg(pkg)
-            .arg("bin/codex")
+            .args(["pkg", action, "codex"]);
+        if let Some(pkg) = pkg {
+            command.arg(pkg).arg("bin/codex");
+        }
+        let out = command
             .stdin(Stdio::null())
             .output()
-            .map_err(|e| format!("aterm pkg link: {e}"))?;
+            .map_err(|e| format!("aterm pkg {action}: {e}"))?;
         if out.status.success() {
             Ok(())
         } else {
             Err(format!(
-                "aterm pkg link codex {} bin/codex: {}{}",
-                pkg.display(),
+                "aterm pkg {action} codex: {}{}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr)
             ))
@@ -3070,21 +3098,6 @@ impl Proof {
     }
 
     fn upgrade_leg(&mut self, leg: &Leg, pkg_b: &Path) -> Result<(), Stopped> {
-        self.upgrade_leg_with_limits(
-            leg,
-            pkg_b,
-            Duration::from_secs(150),
-            Duration::from_secs(90),
-        )
-    }
-
-    fn upgrade_leg_with_limits(
-        &mut self,
-        leg: &Leg,
-        pkg_b: &Path,
-        moved_limit: Duration,
-        claim_limit: Duration,
-    ) -> Result<(), Stopped> {
         let Some(pid) = self.proven_pid(&leg.sid) else {
             self.check("upgrade: no proven codex-alab to move", false);
             return Ok(());
@@ -3094,29 +3107,24 @@ impl Proof {
         let linked = self.link(pkg_b);
         self.check(
             &format!(
-                "upgrade: the package re-linked to its replacement ({})",
+                "upgrade: the package selection moved to its replacement ({})",
                 linked.as_ref().err().map_or("ok", String::as_str)
             ),
             linked.is_ok(),
         );
-        let b = std::fs::canonicalize(pkg_b).unwrap_or_else(|_| pkg_b.to_path_buf());
-        let moved = Self::wait_for(moved_limit, Duration::from_secs(1), || {
-            Self::record(leg, pid).is_some_and(|r| {
-                generation(&r) > before
-                    && r.get("exe")
-                        .and_then(J::as_str)
-                        .and_then(|e| std::fs::canonicalize(e).ok())
-                        .is_some_and(|e| e.starts_with(&b))
-            })
+        let executable = pkg_b.join("bin/codex");
+        let moved = Self::wait_for(Duration::from_secs(150), Duration::from_secs(1), || {
+            Self::record(leg, pid).is_some_and(|r| observed_upgrade(&r, pid, before, &executable))
         })?;
         let acts = self.acts(&leg.sid);
         self.check(
-            "upgrade: the running codex-alab re-exec'd onto the re-linked build (upgrade@v1, execGeneration up, exe the replacement's)",
+            "upgrade: the running codex-alab re-exec'd onto the selected build (upgrade@v1, execGeneration up, exe the replacement's)",
             moved && acts.iter().any(|a| a == "upgrade@v1"),
         );
-        let reproven = Self::wait_for(claim_limit, Duration::from_secs(1), || {
-            self.proven_pid(&leg.sid) == Some(pid)
-        })?;
+        let reproven = moved
+            && Self::wait_for(Duration::from_secs(90), Duration::from_secs(1), || {
+                self.proven_pid(&leg.sid) == Some(pid)
+            })?;
         self.check("upgrade: the new image proved its claim again", reproven);
         Ok(())
     }
@@ -4066,6 +4074,11 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
     } else if matches!(lane, Lane::Upgrade | Lane::RawUpgrade) {
         println!("upgrade target: the same package bytes at another private path");
     }
+    let published_target = lane
+        .hands_off()
+        .then(|| published_target::Target::prepare(upgrade_pkg.as_deref().unwrap_or(&pkg)))
+        .transpose()
+        .map_err(not_run)?;
     let mut proof = start_with_grace(
         aterm,
         (&pkg, upgrade_pkg.as_deref()),
@@ -4077,6 +4090,7 @@ pub fn cmd_codex_alab_proof(args: &[String]) -> Res {
             "",
         ),
         if lane == Lane::Restart { 120 } else { 5 },
+        published_target,
     )?;
     proof.expect = expect;
     let (pkg_a, pkg_b) = (proof.s.join("pkg-a"), proof.s.join("pkg-b"));
@@ -4153,9 +4167,12 @@ fn settle(
 /// `expect` ([`Proof::expect`]), for a caller that judges the run itself (`codex-measure`): what
 /// it found, its world kept.
 /// # Errors
-/// The rig could not start, an interrupt, or a leg ended in an error before any check failed.
+/// The signed handoff target is unavailable, the rig could not start, an interrupt, or a leg
+/// ended in an error before any check failed.
 pub(crate) fn run(aterm: PathBuf, pkg: &Path, expect: Option<bool>) -> Result<Run, Fail> {
-    let mut proof = start(
+    let published_target = published_target::Target::prepare(pkg)
+        .map_err(|why| Fail::exit(3, format!("NOT RUN: {why}")))?;
+    let mut proof = start_with_grace(
         aterm,
         (pkg, None),
         true,
@@ -4165,6 +4182,8 @@ pub(crate) fn run(aterm: PathBuf, pkg: &Path, expect: Option<bool>) -> Result<Ru
                 .to_vec(),
             "",
         ),
+        5,
+        Some(published_target),
     )?;
     proof.expect = expect;
     let (pkg_a, pkg_b) = (proof.s.join("pkg-a"), proof.s.join("pkg-b"));
@@ -4208,8 +4227,8 @@ fn stand_rig_bus(world: World, aterm: &Path) -> Result<(World, Fabric), Fail> {
 }
 
 /// The proof's rig: its scratch world (kept once its bus stands, [`stand_rig_bus`]), the fake
-/// model on one loopback port, the lab's bus, the package (`pkg`, and `upgrade` for the handoff,
-/// else `pkg` again) copied in as `pkg-a` and `pkg-b`, and a headless sandboxed aterm started with
+/// model on one loopback port, the lab's bus, the packages (`pkg`, and `upgrade` for the handoff,
+/// else `pkg` again) exposed as `pkg-a` and `pkg-b`, and a headless sandboxed aterm started with
 /// `args` (its grid) and `top` at the head of its `aterm.toml` (`autopilot-captures`' theme; the
 /// proof's own is empty). No package is linked and no leg runs: [`legs`] does that, and so does
 /// `autopilot-captures` ([`Proof::captures_rig`]). It first takes [`PROOF_LOCK`], held until the
@@ -4224,7 +4243,7 @@ fn start(
     keep: bool,
     (args, top): (Vec<String>, &str),
 ) -> Result<Proof, Fail> {
-    start_with_grace(aterm, (pkg, upgrade), keep, (args, top), 5)
+    start_with_grace(aterm, (pkg, upgrade), keep, (args, top), 5, None)
 }
 
 fn start_with_grace(
@@ -4233,6 +4252,7 @@ fn start_with_grace(
     keep: bool,
     (args, top): (Vec<String>, &str),
     human_grace_s: u32,
+    published_target: Option<published_target::Target>,
 ) -> Result<Proof, Fail> {
     let lock = proof_lock(
         &crate::paths::state_root(crate::sys::getuid()).join(PROOF_LOCK),
@@ -4280,29 +4300,17 @@ fn start_with_grace(
     })();
     let port =
         made.map_err(|e| format!("codex-alab-proof: cannot lay out {}: {e}", s.display()))?;
-    let (pkg_a, pkg_b) = (s.join("pkg-a"), s.join("pkg-b"));
-    for (from, to) in [
-        (pkg, pkg_a.as_path()),
-        (upgrade.unwrap_or(pkg), pkg_b.as_path()),
-    ] {
-        let cloned = aterm_uds::spawnfd::command("/bin/cp")
-            .arg("-cR")
-            .arg(from)
-            .arg(to)
-            .stdin(Stdio::null())
-            .status()
-            .is_ok_and(|st| st.success());
-        if !cloned {
-            return Err(Fail::die(format!(
-                "codex-alab-proof: cannot copy {} to {}",
-                from.display(),
-                to.display()
-            )));
-        }
-    }
+    published_target::clone_package(pkg, &s.join("pkg-a")).map_err(Fail::die)?;
+    let registry = if let Some(target) = &published_target {
+        Some(target.stage(&s, &h).map_err(Fail::die)?)
+    } else {
+        published_target::clone_package(upgrade.unwrap_or(pkg), &s.join("pkg-b"))
+            .map_err(Fail::die)?;
+        None
+    };
     let sandbox = policy(port, crate::paths::paths(), &s).map_err(Fail::die)?;
     let sstr = |sub: &str| s.join(sub).to_string_lossy().into_owned();
-    let env: Vec<(String, String)> = [
+    let mut env: Vec<(String, String)> = [
         (
             "PATH",
             format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", sstr("bin")),
@@ -4317,10 +4325,22 @@ fn start_with_grace(
     ]
     .map(|(k, v)| (k.to_string(), v))
     .to_vec();
+    if let Some(registry) = &registry {
+        env.push((
+            "ATPKG_REGISTRY".into(),
+            format!("dir:{}", registry.display()),
+        ));
+    }
     let world_env = {
         let mut e = world.env();
         e.retain(|(k, _)| k != "PATH");
         e.push(("PATH".into(), "/usr/bin:/bin:/usr/sbin:/sbin".into()));
+        if let Some(registry) = &registry {
+            e.push((
+                "ATPKG_REGISTRY".into(),
+                format!("dir:{}", registry.display()),
+            ));
+        }
         e
     };
     let inst = Instance::start(
@@ -4340,6 +4360,7 @@ fn start_with_grace(
         s,
         h,
         world_env,
+        published_target,
         api_log,
         api_clock,
         port,
@@ -4506,9 +4527,6 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     proof.crash_leg(&first, pid_of("first"))?;
     timed(proof, "crash", t);
     let t = Instant::now();
-    restart_proof::leg(proof, &first, pkg, pkg)?;
-    timed(proof, "explicit restart", t);
-    let t = Instant::now();
     proof.carry_leg(&carry, pid_of("carry"))?;
     timed(proof, "carry", t);
     let t = Instant::now();
@@ -4580,6 +4598,11 @@ fn legs(proof: &mut Proof, pkg: &Path, pkg_b: &Path) -> Result<(), Fail> {
     proof.cruise_rests_never(&[
         &first, &needs, &cont, &approval, &hold, &off, &usage, &carry, &control,
     ]);
+    // The restart probe deliberately sends a person's key, retiring the pending automatic
+    // intent. Judge uninterrupted Cruise before that intervention, not its cancelled act.
+    let t = Instant::now();
+    restart_proof::leg(proof, &first, pkg, pkg)?;
+    timed(proof, "explicit restart", t);
     let exchange_was = proof.exchange_before_upgrade(&exchange);
     let landed_was = proof.landed_before_upgrade(&[&land, &reland, &repo])?;
     let t = Instant::now();

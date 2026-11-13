@@ -39,6 +39,10 @@ fn fixture(state: &State) -> LabView {
                 label: label(state[name]),
                 nickname: MachineNickname::Unset,
                 aliases: Vec::new(),
+                status: None,
+                os: None,
+                chip: None,
+                ram_gb: None,
                 live: true,
             },
         );
@@ -48,6 +52,7 @@ fn fixture(state: &State) -> LabView {
         ACCOUNT.into(),
         Account {
             pk: ACCOUNT.into(),
+            provider: None,
             realm: Some("claude".into()),
             label: Some("claude-one".into()),
             legacy_label: None,
@@ -61,6 +66,7 @@ fn fixture(state: &State) -> LabView {
                 }
                 .into(),
             ),
+            plan: None,
             region: None,
             flow: None,
             browser: None,

@@ -113,9 +113,9 @@ impl Probe {
         }
     }
 
-    /// Every user's threads in uninterruptible sleep now, as the last
-    /// [`core_ticks`](Self::core_ticks) read them: Linux `/proc/stat`'s `procs_blocked`, from that
-    /// same read ([`crate::linux::StatReader::blocked`]); `None` before one, and elsewhere (macOS
+    /// Every user's tasks waiting on I/O now, some of those in uninterruptible sleep, as the last
+    /// [`core_ticks`](Self::core_ticks) read them: Linux `/proc/stat`'s `procs_blocked` (the
+    /// kernel's `nr_iowait()`), from that same read ([`crate::linux::StatReader::blocked`]); `None` before one, and elsewhere (macOS
     /// refuses other users' thread states, so its count is this user's, [`crate::dstate`]).
     #[must_use]
     pub const fn blocked(&self) -> Option<u64> {
@@ -508,11 +508,13 @@ pub struct MemoryDetail {
     pub swap_total: u64,
     /// Commit charge and limit (Linux and Windows).
     pub commit: Option<Commit>,
-    /// Kernel memory pressure level.
+    /// Kernel memory pressure level (macOS `memory_pressure`, Linux PSI held to `MemAvailable`,
+    /// Windows commit against its limit).
     pub pressure: Option<MemoryLevel>,
     /// True when the reported classes partition managed physical memory (macOS).
     pub exact: bool,
-    /// Cumulative VM event counters from the same sample, if available.
+    /// Cumulative VM event counters from the same sample, where the OS gives them (macOS
+    /// `HOST_VM_INFO64`, Linux `/proc/vmstat`).
     pub counters: Option<VmCounters>,
     /// macOS's `kern.memorystatus_level`, the percentage `memory_pressure` prints as "free":
     /// the kernel's own figure, which counts the active queue too, so not [`Self::available`].

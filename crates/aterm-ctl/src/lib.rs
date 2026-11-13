@@ -52,6 +52,8 @@ pub mod edit;
 pub mod fleet_telemetry;
 pub mod github_usage;
 mod graph_hygiene;
+/// The release-line holder query a fleet survey carries (`survey holder=…`) and its answer row.
+pub mod release_holder;
 pub use drift::{CastDriftFn, CastDriftJob, DriftCut, DriftPeer, LocalVerbs};
 mod redial;
 pub use redial::{EXIT_REPLACED, target_sid};
@@ -62,6 +64,7 @@ pub use remote::{
 };
 mod survey;
 mod verb_first;
+mod vouch;
 pub use survey::{
     AuthenticatedPeer, DEFAULT_BUDGET, EXCERPT_CHARS, EXCERPT_WIDE_CHARS, EXCERPTS_CUT,
     FLEET_UNREAD, FLEET_WITHIN, FleetAsk, FleetRead, FleetRefused, FleetSurveyFn, LEFT_OUT_LEAD,
@@ -767,6 +770,14 @@ fn front_door_completions_result(
     let mut out = StdoutSink::new(stdout.lock());
     out.write_all(script.as_bytes())?;
     Ok(ExitCode::SUCCESS)
+}
+
+/// The control socket of the aterm this process runs under (the one hosting its tab, by
+/// `ATERM_PARENT_SESSION_ID`, else this Mac's), whether or not it answers.
+fn own_instance_sock() -> Option<String> {
+    resolve_path(None, None, env::var(SELF_SID_ENV).ok())
+        .ok()
+        .map(|path| aterm_uds::latest::resolve(&path))
 }
 
 /// The control socket of the instance a front-door request should go to, or `None` when nothing is reachable.

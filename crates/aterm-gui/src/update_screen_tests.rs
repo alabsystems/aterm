@@ -27,7 +27,6 @@ fn linux_facts() -> aterm_update::LinuxUpdateStatus {
         trial_phase: None,
         trial_starts: 0,
         trial_healthy: false,
-        refused_newer: false,
     }
 }
 
@@ -255,6 +254,10 @@ fn staged_status() -> aterm_update::UpdateStatus {
         failing_persistent: false,
         failing_checks_kind: String::new(),
         channel_unreadable: false,
+        hold: None,
+        last: None,
+        offered: None,
+        behind: false,
     }
 }
 
@@ -695,4 +698,146 @@ fn snapshot_renders_staged_update_notes() {
             .any(|l| l.contains('#') || l.contains("**"))
     );
     assert!(s.detail().unwrap().contains("0.5.15"));
+}
+
+fn held_view(build: u64, live: bool) -> aterm_update::HoldView {
+    aterm_update::HoldView {
+        build,
+        version: "0.5.15".to_string(),
+        cause: aterm_update_core::update_record::Cause::CrashLoop,
+        witness: aterm_update_core::update_record::Witness::Headless,
+        why: "the listener never answered".to_string(),
+        tries: 2,
+        until: 1_789_003_600,
+        live,
+        peer_lifted: false,
+    }
+}
+
+/// A HELD BUILD IS NEVER "READY" OR "UP TO DATE": the update record's live hold on a newer build
+/// is the headline, and the detail says why and when aterm tries it again by itself, on a staged
+/// build and on one this page never staged alike, on macOS and on Linux. NEGATIVE CONTROLS: a
+/// lapsed hold, and a hold on the build that runs, leave the page as it was.
+#[test]
+fn a_live_hold_is_the_headline_and_a_lapsed_one_leaves_the_page_alone() {
+    let mut st = staged_status();
+    st.hold = Some(held_view(830, true));
+    let staged = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
+    assert_eq!(staged.headline, "Update held");
+    let held = staged.held.clone().expect("the record's hold");
+    assert_eq!(
+        (held.name.as_str(), held.why, held.tries),
+        ("0.5.15", "it did not start cleanly", 2)
+    );
+    let detail = staged.detail.expect("a detail");
+    assert!(
+        detail.starts_with(
+            "Version 0.5.15 is held: it did not start cleanly. aterm tries it again by itself "
+        ) && detail.ends_with("or Try Now tries it now."),
+        "{detail}"
+    );
+
+    let mut idle = st.clone();
+    idle.staged_build = None;
+    idle.staged_version = None;
+    idle.outcome = "held: …".to_string();
+    let unstaged = UpdateState::from_status(828, "0.5.14", Some(&idle), false).projection();
+    assert_eq!(
+        unstaged.headline, "Update held",
+        "a hold on a build never staged here"
+    );
+
+    let mut linux = st.clone();
+    linux.linux = Some(linux_facts());
+    let mut on_linux = UpdateState::from_status(828, "0.5.14", Some(&linux), false);
+    on_linux.linux_host = true;
+    let on_linux = on_linux.projection();
+    assert_eq!(on_linux.headline, "Update held.");
+    assert!(
+        on_linux
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("`aterm update retry` tries it now")),
+        "{:?}",
+        on_linux.detail
+    );
+
+    st.hold = Some(held_view(830, false));
+    let lapsed = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
+    assert_eq!(
+        (lapsed.headline.as_str(), lapsed.held),
+        ("Update ready", None),
+        "NEGATIVE CONTROL: a lapsed hold is tried again, so the page is as it was"
+    );
+    st.hold = Some(held_view(828, true));
+    let running = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
+    assert_eq!(
+        running.held, None,
+        "NEGATIVE CONTROL: a hold on the build that runs holds no update"
+    );
+}
+
+/// NEVER "UP TO DATE" WHILE BEHIND: with nothing staged and nothing held now, a lapsed hold
+/// waiting for its next check, and a newer offer with no hold at all, each give a headline and
+/// compact texts that say a newer version is out. NEGATIVE CONTROL: a copy that is not behind
+/// still reads "You're up to date."
+#[test]
+fn a_lapsed_hold_or_a_newer_offer_with_nothing_staged_never_reads_up_to_date() {
+    let mut st = staged_status();
+    st.staged_build = None;
+    st.staged_version = None;
+    st.outcome = "behind: …".to_string();
+    st.installable = true;
+    st.hold = Some(held_view(830, false));
+    st.behind = true;
+    let says_current = |p: &crate::update_screen::UpdateProjection| {
+        p.headline.contains("up to date")
+            || crate::native_settings::compact_update_headline(p) == "Current"
+            || crate::native_settings::compact_update_detail_minimum(p) == "Up to date."
+    };
+    let lapsed = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
+    assert_eq!(lapsed.headline, "A newer version is out.");
+    assert!(lapsed.behind && !says_current(&lapsed), "{lapsed:?}");
+    assert!(
+        lapsed
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.starts_with("Version 0.5.15 was held: it did not start cleanly.")),
+        "{:?}",
+        lapsed.detail
+    );
+
+    st.hold = None;
+    let behind = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
+    assert_eq!(behind.headline, "A newer version is out.");
+    assert!(!says_current(&behind), "{behind:?}");
+
+    st.behind = false;
+    st.outcome = "up to date (latest release build 828)".to_string();
+    let current = UpdateState::from_status(828, "0.5.14", Some(&st), false).projection();
+    assert_eq!(
+        current.headline, "You\u{2019}re up to date.",
+        "NEGATIVE CONTROL: a copy that is not behind"
+    );
+}
+
+/// Linux lets only "Up to date" speak for the channel, by the predicate status uses to keep it
+/// from standing while a build is held ([`aterm_update::says_up_to_date`]), case and all.
+#[test]
+fn only_up_to_date_words_are_silenced_while_a_linux_check_does_not_answer() {
+    let mut state = linux_state(Some(linux_facts()), 0);
+    state.check_unanswered = true;
+    for (outcome, silenced) in [
+        ("Up to date \u{2014} build 828", true),
+        ("up to date", true),
+        ("held: aterm 0.5.15 (build 830) is held until …", false),
+        ("rolled back build 830", false),
+    ] {
+        state.outcome = outcome.to_string();
+        assert_eq!(
+            state.linux_outcome_predates_silence(),
+            silenced,
+            "{outcome}"
+        );
+    }
 }

@@ -12,16 +12,17 @@ use std::sync::{Arc, Mutex};
 use atpkg_publish::api::{
     Baseline, IndexRequest, Indexer, PackOutcome, PackRequest, Packer, Published, Signing,
 };
-use atpkg_publish::ctx::Ctx;
+use atpkg_publish::ctx::{Ctx, HostChoice};
 use atpkg_publish::error::{Error, Result};
 use atpkg_publish::host::fake::{FakeHost, FakeRelease};
 use atpkg_publish::host::{Replace, Slug};
+use atpkg_publish::hosts_check;
 use atpkg_publish::identity::MachineKey;
 use atpkg_publish::lane::report::{NoticeSink as _, Recorded};
 use atpkg_publish::testkit::{Keys, NOW};
 use atpkg_publish::triple::Triple;
 
-use super::super::shared::{Made, made_once, scratch};
+use super::super::shared::{Made, made_once, scratch, toml_path};
 
 /// Runs `git -C <dir> <args>` with a fixed identity.
 pub fn git(dir: &Path, args: &[&str]) -> String {
@@ -126,6 +127,94 @@ fn make_repo(dir: &Path, commits: u64) -> Vec<String> {
     history.into_iter().map(|(_, sha)| sha).collect()
 }
 
+/// Lay `ctx`'s trust checkout (`Ctx::trust_repo`) with an `origin` naming the staging owner's
+/// `trust` repository, as `hosts check`'s `trust_origin` row requires, or point an existing one
+/// at the staging owner `ctx` names now. Nothing fetches from that origin.
+pub fn trust_checkout(ctx: &Ctx) {
+    let dir = &ctx.trust_repo;
+    let url = format!("https://github.com/{}.git", ctx.staging_slug("trust"));
+    if dir.join(".git").is_dir() {
+        git(dir, &["remote", "set-url", "origin", &url]);
+    } else {
+        repo(dir, 0);
+        git(dir, &["remote", "add", "origin", &url]);
+    }
+}
+
+/// A seed ledger with no minted re-pin: the lineage switch it is read from is dormant.
+pub const DORMANT_LEDGER: &str = "[release]\ntag = \"fixture\"\n";
+/// A seed ledger once the first minted re-pin landed: the switch is live.
+pub const MINTED_LEDGER: &str =
+    "[release]\ntag = \"fixture\"\n\n[release.mint]\nddc_seed_relation = \"pin-ancestor\"\n";
+
+/// Commit `ledger` as the seed ledger of `ctx`'s trust checkout ([`trust_checkout`]) and point
+/// its `refs/remotes/origin/main` at that commit, as a fetch of its origin would leave it: what
+/// `lineage_switch::read_locally` reads before any host or origin is asked.
+pub fn trust_ledger(ctx: &Ctx, ledger: &str) {
+    let dir = &ctx.trust_repo;
+    let path = dir.join(atpkg_publish::artifact::lineage_switch::LEDGER);
+    std::fs::create_dir_all(path.parent().expect("the ledger's directory")).expect("mkdir");
+    std::fs::write(&path, ledger).expect("the ledger");
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", "ledger"]);
+    git(dir, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+}
+
+/// The agh directories a lane unit under `ctx`'s home resolves: `XDG_CONFIG_HOME` is
+/// `~/.config`, as `install`'s `machine` pins it, and `XDG_STATE_HOME` the state root's
+/// parent.
+#[must_use]
+pub fn unit_dirs(ctx: &Ctx) -> agh::config::Dirs {
+    let state = ctx.state_dir.parent().expect("the state root's parent");
+    agh::config::Dirs::resolve(&ctx.home, Some(&ctx.home.join(".config")), Some(state))
+        .expect("agh's directories")
+}
+
+/// The dev profile writing `staging`, its token file in `tokens`.
+#[must_use]
+pub fn dev_config(tokens: &Path, staging: &str) -> String {
+    format!(
+        "[profiles.dev]\ntoken_file = \"{}/dev.token\"\ntier = \"dev\"\n\
+         login = \"fixture-dev-bot\"\n\n\
+         [[owners]]\nname = \"{staging}\"\ntier = \"dev\"\nread = [\"dev\"]\nwrite = \"dev\"\n",
+        toml_path(tokens)
+    )
+}
+
+/// [`dev_config`], and a release profile writing `alabsystems`, with atpkg-publish's
+/// `[[writers]]` row over `repos`.
+#[must_use]
+pub fn release_config(tokens: &Path, staging: &str, repos: &[String]) -> String {
+    let list = repos
+        .iter()
+        .map(|r| format!("\"{r}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "{}\n[profiles.release]\ntoken_file = \"{}/release.token\"\ntier = \"release\"\n\
+         login = \"fixture-release-bot\"\n\n\
+         [[owners]]\nname = \"alabsystems\"\ntier = \"release\"\nread = [\"dev\", \
+         \"anonymous\"]\nwrite = \"release\"\n\n\
+         [[writers]]\ncaller = \"atpkg-publish\"\nrepos = [{list}]\n",
+        dev_config(tokens, staging),
+        toml_path(tokens)
+    )
+}
+
+/// `alabsystems/aterm` and `alabsystems/{repo}` for every repository `alab_program_repos()`
+/// gives.
+#[must_use]
+pub fn public_repos() -> Vec<String> {
+    let mut repos = vec!["alabsystems/aterm".to_string()];
+    for repo in hosts_check::alab_program_repos() {
+        let slug = format!("alabsystems/{repo}");
+        if !repos.contains(&slug) {
+            repos.push(slug);
+        }
+    }
+    repos
+}
+
 /// One more empty commit; its sha.
 pub fn commit(dir: &Path, msg: &str, day: Option<&str>) -> String {
     git_at(dir, &["commit", "-q", "--allow-empty", "-m", msg], day);
@@ -197,7 +286,8 @@ pub struct Ledger {
 }
 
 impl Fx {
-    /// A rostered machine with both token files, no channel yet.
+    /// A rostered machine built for agh (`HostChoice::Agh`: its pre-claim checks ask the
+    /// fake's `write_preflight`), with no token file and no channel yet.
     #[must_use]
     pub fn new(label: &str) -> Self {
         Self::at(scratch(label))
@@ -209,10 +299,9 @@ impl Fx {
         let keys = Arc::new(Keys::mint("m3", &[]));
         let host = Arc::new(FakeHost::new());
         let home = tmp.path().join("home");
-        let ctx = keys.ctx(&home, host.clone());
-        std::fs::create_dir_all(home.join(".secrets")).expect("mkdir secrets");
-        std::fs::write(&ctx.tokens.staging, "ghp_staging_stub\n").expect("token");
-        std::fs::write(&ctx.tokens.channel, "ghp_channel_stub\n").expect("token");
+        let ctx = keys
+            .ctx(&home, host.clone())
+            .with_host_choice(HostChoice::Agh);
         Self {
             packer: FakePacker::default(),
             indexer: FakeIndexer::new(keys.clone(), host.clone()),
@@ -223,6 +312,15 @@ impl Fx {
             host,
             ctx,
         }
+    }
+
+    /// This world built for the `gh` arm instead, said outright, with both token files: for a
+    /// test whose assertions read that arm's token checks or texts.
+    pub fn use_gh(&mut self) {
+        self.ctx = self.ctx.clone().with_host_choice(HostChoice::Gh);
+        std::fs::create_dir_all(self.ctx.home.join(".secrets")).expect("mkdir secrets");
+        std::fs::write(&self.ctx.tokens.staging, "ghp_staging_stub\n").expect("token");
+        std::fs::write(&self.ctx.tokens.channel, "ghp_channel_stub\n").expect("token");
     }
 
     /// What this world holds besides its directory, for [`Fx::laid`].
@@ -255,7 +353,10 @@ impl Fx {
                 .map_or_else(|_| p.to_path_buf(), |rel| root.join(rel))
         };
         let host = Arc::new(held.host.forked(&held.root, &root));
-        let ctx = held.keys.ctx_over(&root.join("home"), host.clone());
+        let ctx = held
+            .keys
+            .ctx_over(&root.join("home"), host.clone())
+            .with_host_choice(HostChoice::Agh);
         let packs = held
             .packs
             .iter()
@@ -799,6 +900,7 @@ impl Packer for FakePacker {
                 signing: Signing::Unsigned,
                 upload: false,
                 env: Vec::new(),
+                build_within: None,
             },
         )?;
         Ok(atpkg_publish::artifact::bottle::BottleOutcome {

@@ -14,6 +14,8 @@ pub const GNU_MARKER: u8 = 0x59;
 pub enum Kind {
     BuildScript,
     Harnesses,
+    /// A serial produced coordinator lends its actual one original primary.
+    Coordinator,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
@@ -59,6 +61,7 @@ impl Request {
                 e.number(match kind {
                     Kind::BuildScript => 0,
                     Kind::Harnesses => 1,
+                    Kind::Coordinator => 2,
                 });
                 e.number(gnu.device);
                 e.number(gnu.inode);
@@ -79,17 +82,24 @@ impl Request {
         if d.number()? != 1 {
             return Err(invalid());
         }
-        let key =
-            Key { root_attempt: d.array()?, invocation_sha256: d.array()?, sequence: d.number()? };
+        let key = Key {
+            root_attempt: d.array()?,
+            invocation_sha256: d.array()?,
+            sequence: d.number()?,
+        };
         let operation = match d.number()? {
             0 => Operation::Enter {
                 phase: d.array()?,
                 kind: match d.number()? {
                     0 => Kind::BuildScript,
                     1 => Kind::Harnesses,
+                    2 => Kind::Coordinator,
                     _ => return Err(invalid()),
                 },
-                gnu: FileIdentity { device: d.number()?, inode: d.number()? },
+                gnu: FileIdentity {
+                    device: d.number()?,
+                    inode: d.number()?,
+                },
             },
             1 => Operation::Leave { phase: d.array()? },
             2 => Operation::Drained,
@@ -106,10 +116,18 @@ impl Request {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Decision {
-    Ready { phase: [u8; 16], reserved_domain: u32, gnu: FileIdentity },
+    Ready {
+        phase: [u8; 16],
+        reserved_domain: u32,
+        gnu: FileIdentity,
+    },
     Busy,
-    Refused { reason: String },
-    Left { phase: [u8; 16] },
+    Refused {
+        reason: String,
+    },
+    Left {
+        phase: [u8; 16],
+    },
     Drained,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,7 +146,11 @@ impl Reply {
         e.0.extend(self.key.invocation_sha256);
         e.number(self.key.sequence);
         match &self.decision {
-            Decision::Ready { phase, reserved_domain, gnu } => {
+            Decision::Ready {
+                phase,
+                reserved_domain,
+                gnu,
+            } => {
                 if !phase_valid(&self.key, *phase)
                     || !(1..=MAX_CPU_SET as u32).contains(reserved_domain)
                     || gnu.inode == 0
@@ -165,8 +187,11 @@ impl Reply {
         if d.number()? != 1 {
             return Err(invalid());
         }
-        let key =
-            Key { root_attempt: d.array()?, invocation_sha256: d.array()?, sequence: d.number()? };
+        let key = Key {
+            root_attempt: d.array()?,
+            invocation_sha256: d.array()?,
+            sequence: d.number()?,
+        };
         if key != request.key {
             return Err(invalid());
         }
@@ -174,12 +199,15 @@ impl Reply {
             0 => Decision::Ready {
                 phase: d.array()?,
                 reserved_domain: d.narrow()?,
-                gnu: FileIdentity { device: d.number()?, inode: d.number()? },
+                gnu: FileIdentity {
+                    device: d.number()?,
+                    inode: d.number()?,
+                },
             },
             1 => Decision::Busy,
-            2 => {
-                Decision::Refused { reason: String::from_utf8(d.bytes()?).map_err(|_| invalid())? }
-            }
+            2 => Decision::Refused {
+                reason: String::from_utf8(d.bytes()?).map_err(|_| invalid())?,
+            },
             3 => Decision::Left { phase: d.array()? },
             4 => Decision::Drained,
             _ => return Err(invalid()),
@@ -190,7 +218,11 @@ impl Reply {
         match (&request.operation, &value.decision) {
             (
                 Operation::Enter { phase, gnu, .. },
-                Decision::Ready { phase: got, gnu: backing, .. },
+                Decision::Ready {
+                    phase: got,
+                    gnu: backing,
+                    ..
+                },
             ) if phase == got && gnu == backing => {}
             (Operation::Leave { phase }, Decision::Left { phase: got }) if phase == got => {}
             (Operation::Drained, Decision::Drained) => {}
@@ -205,13 +237,20 @@ mod tests {
     use super::*;
     #[test]
     fn phase_direction_version_bindings_and_terminals_do_not_convert_to_bank_authority() {
-        let key = Key { root_attempt: [1; 16], invocation_sha256: [2; 32], sequence: 1 };
+        let key = Key {
+            root_attempt: [1; 16],
+            invocation_sha256: [2; 32],
+            sequence: 1,
+        };
         let request = Request {
             key,
             operation: Operation::Enter {
                 phase: [3; 16],
                 kind: Kind::BuildScript,
-                gnu: FileIdentity { device: 4, inode: 5 },
+                gnu: FileIdentity {
+                    device: 4,
+                    inode: 5,
+                },
             },
         };
         let bytes = request.encode().unwrap();
@@ -235,7 +274,10 @@ mod tests {
             decision: Decision::Ready {
                 phase: [3; 16],
                 reserved_domain: 7,
-                gnu: FileIdentity { device: 4, inode: 5 },
+                gnu: FileIdentity {
+                    device: 4,
+                    inode: 5,
+                },
             },
         };
         let bytes = reply.encode().unwrap();
@@ -254,9 +296,17 @@ mod tests {
             };
             assert!(Reply::decode(&bytes, &other).is_err());
         }
-        let drained = Request { key, operation: Operation::Drained };
+        let drained = Request {
+            key,
+            operation: Operation::Drained,
+        };
         assert_eq!(drained.description_count(), 0);
-        let terminal = Reply { key, decision: Decision::Drained }.encode().unwrap();
+        let terminal = Reply {
+            key,
+            decision: Decision::Drained,
+        }
+        .encode()
+        .unwrap();
         assert!(Reply::decode(&terminal, &drained).is_ok());
         assert!(Reply::decode(&terminal, &request).is_err());
     }

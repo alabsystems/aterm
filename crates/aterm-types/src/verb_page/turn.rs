@@ -30,10 +30,11 @@ pub(crate) const PAGE: Page = Page {
              as its prompt, a shell as a command; read `status program= agent=` first.",
         ),
         para(
-            "Leading, before the options: `id=<epoch>:<producer>:<seq>` (exactly once) and \
-             `if-supervisor=<holder>` (and a scoped harness's `if-supervisor-revision=<n> \
-             harness-duty=<scope>`, as `help key` says). The options end at the first word that \
-             is none of them, or at `--` (`help turn words`).",
+            "Leading, before the options: `id=<epoch>:<producer>:<seq>` (exactly once), \
+             `if-supervisor=<holder>`, a scoped harness's `if-supervisor-revision=<n> \
+             harness-duty=<scope>` and the window harness's `harness-lane=<lane>` (`help key`). \
+             The options end at the first word that is none of them, or at `--` (`help turn \
+             words`).",
         ),
     ],
     options: &[

@@ -271,8 +271,8 @@ impl Look {
     #[must_use]
     pub const fn theme(self) -> &'static str {
         match self {
-            Look::Day => "Aterm Day",
-            Look::Night => "Aterm Night",
+            Look::Day => "aterm Day",
+            Look::Night => "aterm Night",
         }
     }
 
@@ -1431,7 +1431,7 @@ fn agent_settled(door: &Door<'_>, drive: &Path, scene: Scene, sid: &str, chain: 
         Scene::Landed => w("task") == "landed",
         Scene::Off => {
             idle && w("autopilot") == chain.autopilot()
-                && forever::on(door, sid, &["text"]).contains(forever::DONE_CLAIM)
+                && forever::on(door, sid, &["text"]).contains(forever::DONE_CLAIM_KEY)
         }
         Scene::Cruise | Scene::Land | Scene::Need => false,
     }
@@ -2965,7 +2965,7 @@ fn typing_in(tag: &str) -> Result<String, Fail> {
         return Err(Fail::die("the composer did not take the first prompt"));
     }
     let replied = crate::wait_until(Duration::from_secs(60), || {
-        forever::on(&door, &sid, &["text"]).contains(forever::DONE_CLAIM)
+        forever::on(&door, &sid, &["text"]).contains(forever::DONE_CLAIM_KEY)
             && forever::word(&forever::on(&door, &sid, &["status"]), "agent").as_deref()
                 == Some("idle")
     });

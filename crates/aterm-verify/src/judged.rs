@@ -284,8 +284,233 @@ fn decode_objects(mut bytes: &[u8]) -> Result<Vec<Record>, String> {
     Ok(records)
 }
 
+/// One change to the journal's tree, by a `/`-separated path from its root.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Edit {
+    /// The blob `blob` at `path`, added or in place of the file there.
+    Put { path: String, blob: String },
+    /// Nothing at `path`: the file or directory there removed, and nothing done where there is
+    /// none, as through a component no tree entry has (empty, `.` or `..`: [`journal_path`]),
+    /// below a file, or below a path an earlier edit puts or removes.
+    Remove { path: String },
+}
+
+/// One entry of a journal tree, as `git ls-tree -z` lists it and `git mktree -z` reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Entry {
+    mode: String,
+    kind: String,
+    id: String,
+}
+
+impl Entry {
+    fn blob(id: &str) -> Self {
+        Self {
+            mode: "100644".into(),
+            kind: "blob".into(),
+            id: id.into(),
+        }
+    }
+
+    fn tree(id: String) -> Self {
+        Self {
+            mode: "040000".into(),
+            kind: "tree".into(),
+            id,
+        }
+    }
+
+    fn is_tree(&self) -> bool {
+        self.kind == "tree"
+    }
+}
+
+/// A directory's entries, by name.
+type Entries = std::collections::BTreeMap<String, Entry>;
+
+/// How a tree edit reads and writes tree objects: `list` the entries of a tree (or of a commit's
+/// tree), `make` a tree of entries and say its id.
+struct Trees<'a> {
+    list: &'a mut dyn FnMut(&str) -> Result<Entries, String>,
+    make: &'a mut dyn FnMut(&Entries) -> Result<String, String>,
+}
+
+/// The edits below one directory, by the name of each entry they change.
+#[derive(Default)]
+struct Node(std::collections::BTreeMap<String, Change>);
+
+enum Change {
+    Put(String),
+    Remove,
+    Dir(Node),
+}
+
+/// Whether `path` can name a journal entry: no component of it is empty, `.` or `..`, or holds a
+/// NUL. A put must name one; a removal through a component no entry has finds nothing there.
+fn journal_path(path: &str) -> bool {
+    path.split('/')
+        .all(|name| !name.is_empty() && name != "." && name != ".." && !name.contains('\0'))
+}
+
+impl Node {
+    /// Add `change` at `path` below this directory. A later edit of a path replaces an earlier
+    /// edit of it or below it. Below a path an earlier edit puts or removes, a removal does
+    /// nothing, as nothing is there, and a put is refused.
+    fn add(&mut self, path: &str, change: Change) -> Result<(), String> {
+        let (name, rest) = path
+            .split_once('/')
+            .map_or((path, None), |(n, r)| (n, Some(r)));
+        match rest {
+            None => {
+                self.0.insert(name.to_owned(), change);
+                Ok(())
+            }
+            Some(rest) => match self
+                .0
+                .entry(name.to_owned())
+                .or_insert_with(|| Change::Dir(Node::default()))
+            {
+                Change::Dir(node) => node.add(rest, change),
+                Change::Put(_) | Change::Remove if matches!(change, Change::Remove) => Ok(()),
+                Change::Put(_) | Change::Remove => Err(format!(
+                    "journal edits name {name:?} both as an entry and as a directory"
+                )),
+            },
+        }
+    }
+
+    /// Whether any edit at or below this directory puts a blob.
+    fn puts(&self) -> bool {
+        self.0.values().any(|change| match change {
+            Change::Put(_) => true,
+            Change::Remove => false,
+            Change::Dir(below) => below.puts(),
+        })
+    }
+}
+
+/// `base`'s entries (none for no base) with `node`'s edits applied, and whether any entry
+/// differs from `base`'s. Only the directories on an edited path are listed; a directory below
+/// is made again only when its entries changed, and dropped when none are left, as an index
+/// keeps no empty directory. Removals below a file remove nothing. Every other entry keeps its
+/// object id.
+fn edited(
+    base: Option<&str>,
+    node: &Node,
+    trees: &mut Trees<'_>,
+) -> Result<(Entries, bool), String> {
+    let mut entries = match base {
+        Some(id) => (trees.list)(id)?,
+        None => Entries::new(),
+    };
+    let mut changed = false;
+    for (name, change) in &node.0 {
+        let now = match change {
+            Change::Put(blob) => {
+                if entries.get(name).is_some_and(Entry::is_tree) {
+                    return Err(format!("journal path {name:?} is a directory"));
+                }
+                Some(Entry::blob(blob))
+            }
+            Change::Remove => None,
+            Change::Dir(below) => {
+                let sub = match entries.get(name) {
+                    None => None,
+                    Some(entry) if entry.is_tree() => Some(entry.id.clone()),
+                    Some(_) if !below.puts() => continue,
+                    Some(_) => return Err(format!("journal path {name:?} is a file")),
+                };
+                let (dir, dir_changed) = edited(sub.as_deref(), below, trees)?;
+                if !dir_changed {
+                    continue;
+                }
+                if dir.is_empty() {
+                    None
+                } else {
+                    Some(Entry::tree((trees.make)(&dir)?))
+                }
+            }
+        };
+        let was = match now.clone() {
+            Some(entry) => entries.insert(name.clone(), entry),
+            None => entries.remove(name),
+        };
+        changed |= was != now;
+    }
+    Ok((entries, changed))
+}
+
+/// The tree of `base` (a commit or a tree; `None` for an empty journal) with `edits` applied,
+/// in order, through `trees`: a path edit that lists and makes only the root and the directories
+/// on the edited paths (`git mktree` over each), reusing every other subtree by its id, so its
+/// cost follows the edited paths and not the journal's size.
+/// A removal where there is nothing to remove ([`Edit::Remove`]) does nothing.
+/// # Errors
+/// A put's path has an empty, `.` or `..` component or one holding a NUL; a put goes below a
+/// path an earlier edit puts or removes, or below a file; a file is put where a directory is; or
+/// `trees` fails.
+fn edit_tree_with(
+    base: Option<&str>,
+    edits: &[Edit],
+    trees: &mut Trees<'_>,
+) -> Result<String, String> {
+    let mut node = Node::default();
+    for edit in edits {
+        match edit {
+            Edit::Put { path, .. } if !journal_path(path) => {
+                return Err(format!("invalid journal path: {path:?}"));
+            }
+            Edit::Put { path, blob } => node.add(path, Change::Put(blob.clone()))?,
+            Edit::Remove { path } => node.add(path, Change::Remove)?,
+        }
+    }
+    let (entries, _) = edited(base, &node, trees)?;
+    (trees.make)(&entries)
+}
+
+/// The entries of the tree `id` names (a commit names its own tree).
+fn ls_tree(root: &Path, id: &str, until: std::time::Instant) -> Result<Entries, String> {
+    let listing = output_until(&mut command(root, &["ls-tree", "-z", id]), None, until)?;
+    let mut entries = Entries::new();
+    for record in listing.split('\0').filter(|record| !record.is_empty()) {
+        let invalid = || format!("invalid journal tree entry: {record:?}");
+        let (head, name) = record.split_once('\t').ok_or_else(invalid)?;
+        let mut fields = head.split(' ');
+        let (Some(mode), Some(kind), Some(object), None) =
+            (fields.next(), fields.next(), fields.next(), fields.next())
+        else {
+            return Err(invalid());
+        };
+        entries.insert(
+            name.to_owned(),
+            Entry {
+                mode: mode.to_owned(),
+                kind: kind.to_owned(),
+                id: object.to_owned(),
+            },
+        );
+    }
+    Ok(entries)
+}
+
+/// Write the tree of `entries`: its id.
+fn mktree(root: &Path, entries: &Entries, until: std::time::Instant) -> Result<String, String> {
+    let input: String = entries
+        .iter()
+        .map(|(name, entry)| format!("{} {} {}\t{name}\0", entry.mode, entry.kind, entry.id))
+        .collect();
+    output_until(
+        &mut command(root, &["mktree", "-z"]),
+        Some(input.as_bytes()),
+        until,
+    )
+    .map(|id| id.trim().to_owned())
+}
+
 /// A normal fast-forward push is the CAS: a competing append rejects this parent.
-/// The caller rereads and redecides; it never force-pushes a stale decision.
+/// The caller rereads and redecides; it never force-pushes a stale decision. The new tree is
+/// `parent`'s with only the paths the append changes edited (`edit_tree_with`): the root and
+/// `verdicts/`, whatever else the journal holds.
 pub fn append(
     root: &Path,
     remote: &str,
@@ -293,83 +518,69 @@ pub fn append(
     record: &Record,
     until: std::time::Instant,
 ) -> Result<bool, String> {
+    append_with(
+        root,
+        remote,
+        parent,
+        record,
+        until,
+        &mut Trees {
+            list: &mut |id| ls_tree(root, id, until),
+            make: &mut |entries| mktree(root, entries, until),
+        },
+    )
+}
+
+/// [`append`], its tree objects read and written through `trees`.
+fn append_with(
+    root: &Path,
+    remote: &str,
+    parent: Option<&str>,
+    record: &Record,
+    until: std::time::Instant,
+    trees: &mut Trees<'_>,
+) -> Result<bool, String> {
     // One absolute deadline bounds the whole append, including CAS races and pruning.
     let git = |root: &Path, args: &[&str]| git_until(root, args, until);
     let output = |cmd: &mut Command, input: Option<&[u8]>| output_until(cmd, input, until);
     let capture = |cmd: &mut Command, input: Option<&[u8]>| capture_until(cmd, input, until);
-    let index = aterm_tempfile::tempdir().map_err(|e| e.to_string())?;
-    let index_path = index.path().join("index");
-    let mut read = command(root, &["read-tree", parent.unwrap_or("--empty")]);
-    read.env("GIT_INDEX_FILE", &index_path);
-    output(&mut read, None)?;
     let last_pruned = parent
         .and_then(|p| git(root, &["show", &format!("{p}:pruned-at")]).ok())
         .and_then(|s| s.parse::<u64>().ok());
     let prune = last_pruned.is_none_or(|day| day < record.updated / 86400);
-    for old in if prune {
-        records(root, parent, until)?
-    } else {
-        Vec::new()
-    } {
-        if old.updated.saturating_add(RETENTION) < record.updated {
-            let mut remove = command(
-                root,
-                &[
-                    "update-index",
-                    "--force-remove",
-                    &format!("verdicts/{}.toml", old.tree),
-                ],
-            );
-            remove.env("GIT_INDEX_FILE", &index_path);
-            output(&mut remove, None)?;
-        }
-    }
+    let mut edits = Vec::new();
     if prune {
+        for old in records(root, parent, until)? {
+            if old.updated.saturating_add(RETENTION) < record.updated {
+                edits.push(Edit::Remove {
+                    path: format!("verdicts/{}.toml", old.tree),
+                });
+            }
+        }
         let blob = output(
             &mut command(root, &["hash-object", "-w", "--stdin"]),
             Some((record.updated / 86400).to_string().as_bytes()),
         )?;
-        let mut add = command(
-            root,
-            &[
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                "100644",
-                blob.trim(),
-                "pruned-at",
-            ],
-        );
-        add.env("GIT_INDEX_FILE", &index_path);
-        output(&mut add, None)?;
+        edits.push(Edit::Put {
+            path: "pruned-at".into(),
+            blob: blob.trim().to_owned(),
+        });
     }
     let text = aterm_toml::to_string(record).map_err(|e| e.to_string())?;
     let blob = output(
         &mut command(root, &["hash-object", "-w", "--stdin"]),
         Some(text.as_bytes()),
     )?;
-    let path = format!("verdicts/{}.toml", record.tree);
-    let mut add = command(
-        root,
-        &[
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            "100644",
-            blob.trim(),
-            &path,
-        ],
-    );
-    add.env("GIT_INDEX_FILE", &index_path);
-    output(&mut add, None)?;
-    let mut write = command(root, &["write-tree"]);
-    write.env("GIT_INDEX_FILE", &index_path);
-    let tree = output(&mut write, None)?;
+    edits.push(Edit::Put {
+        path: format!("verdicts/{}.toml", record.tree),
+        blob: blob.trim().to_owned(),
+    });
+    let tree = edit_tree_with(parent, &edits, trees)?;
     let mut commit = command(
         root,
         &[
             "commit-tree",
-            tree.trim(),
+            &tree,
             "-m",
             &format!("verify watch: {} {}", record.state, record.commit),
         ],

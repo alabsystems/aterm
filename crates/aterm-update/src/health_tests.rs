@@ -844,27 +844,235 @@ fn the_pending_clock_is_the_first_sighting_and_survives_a_restage() {
     let _ = std::fs::remove_dir_all(p.parent().unwrap());
 }
 
+/// THE STOPPED LANE'S RECORD: kept for the build that wrote it, through a later failure of the
+/// re-sample it names, replaced by the next record and cleared by a landed apply. NEGATIVE CONTROL:
+/// without `clear_apply_lane` in `record_apply_success` the record outlives the apply that ended it
+/// ("a landed apply ends the record").
 #[test]
-fn settling_a_trial_unproven_clears_only_its_refused_proof() {
-    let p = tmp("trial-settled-unproven");
-    Health::record_apply_refusal(&p, 812, "a shell is running a command");
-    assert!(Health::record_trial_proof_failure(
+fn the_stopped_lanes_record_is_scoped_to_its_build_and_ends_with_a_landed_apply() {
+    let p = tmp("apply-lane");
+    let me = crate::LaneWriter {
+        pid: 4242,
+        birth: 1_790_000_000_000_001,
+    };
+    let record = crate::ApplyLaneRecord {
+        lane: "resampling".into(),
+        target_build: 901,
+        failure_signature: "structural/handoff proof ended ChildDied".into(),
+        next_action: "re-samples build 901 at 2026-11-12T00:00:00Z".into(),
+        at: "ignored".into(),
+    };
+    assert_eq!(Health::read(&p).apply_lane_for(900, me), None);
+    Health::record_apply_lane(&p, 900, me, &record);
+    let read = Health::read(&p).apply_lane_for(900, me).expect("recorded");
+    assert_eq!(
+        (
+            read.lane.as_str(),
+            read.target_build,
+            read.failure_signature.as_str(),
+            read.next_action.as_str()
+        ),
+        (
+            "resampling",
+            901,
+            record.failure_signature.as_str(),
+            record.next_action.as_str()
+        )
+    );
+    assert!(read.at.ends_with('Z'), "timed when written: {}", read.at);
+    assert_eq!(
+        Health::read(&p).apply_lane_for(902, me),
+        None,
+        "another running build's record is not this one's"
+    );
+    Health::record_apply_failure(&p, 900, 901, "handoff proof ended ChildDied");
+    assert!(
+        Health::read(&p).apply_lane_for(900, me).is_some(),
+        "a failed re-sample keeps the lane's record"
+    );
+    let newer = crate::ApplyLaneRecord {
+        lane: "awaiting-newer".into(),
+        ..record.clone()
+    };
+    Health::record_apply_lane(&p, 900, me, &newer);
+    assert_eq!(
+        Health::read(&p).apply_lane_for(900, me).map(|r| r.lane),
+        Some("awaiting-newer".into()),
+        "the next record replaces it"
+    );
+    Health::record_apply_success(&p);
+    assert_eq!(
+        Health::read(&p).apply_lane_for(900, me),
+        None,
+        "a landed apply ends the record"
+    );
+}
+
+/// A RECORD AN EARLIER PROCESS LEFT IS NOT THIS ONE'S: the record reports its writer's in-memory
+/// latch, so another process of the same build (a restart, a swap, a pid reused by a later
+/// process) reads none, a record written before the writer was kept reads none, and only the
+/// writer withdraws it, and only about the build it names. NEGATIVE CONTROL: without the writer
+/// check in `apply_lane_for` the earlier process's record reads as current ("an earlier
+/// process's record is not this one's").
+#[test]
+fn a_record_an_earlier_process_left_does_not_read_as_this_ones() {
+    let p = tmp("apply-lane-writer");
+    let earlier = crate::LaneWriter {
+        pid: 4242,
+        birth: 1_790_000_000_000_001,
+    };
+    let record = crate::ApplyLaneRecord {
+        lane: "resampling".into(),
+        target_build: 901,
+        failure_signature: "structural/handoff proof ended ChildDied".into(),
+        next_action: "re-samples build 901 at 2026-11-12T00:00:00Z".into(),
+        at: String::new(),
+    };
+    Health::record_apply_lane(&p, 900, earlier, &record);
+    let later = crate::LaneWriter {
+        pid: 4343,
+        birth: 1_790_000_100_000_000,
+    };
+    let reused_pid = crate::LaneWriter {
+        pid: earlier.pid,
+        birth: later.birth,
+    };
+    for reader in [later, reused_pid] {
+        assert_eq!(
+            Health::read(&p).apply_lane_for(900, reader),
+            None,
+            "an earlier process's record is not this one's: {reader:?}"
+        );
+    }
+    assert!(
+        Health::read(&p).apply_lane_for(900, earlier).is_some(),
+        "its writer still reads it"
+    );
+
+    Health::withdraw_apply_lane(&p, later, 901);
+    Health::withdraw_apply_lane(&p, earlier, 902);
+    assert!(
+        Health::read(&p).apply_lane_for(900, earlier).is_some(),
+        "another process, or a withdrawal about another build, leaves it"
+    );
+    Health::withdraw_apply_lane(&p, earlier, 901);
+    assert_eq!(
+        Health::read(&p).apply_lane_for(900, earlier),
+        None,
+        "its writer withdraws it"
+    );
+
+    std::fs::write(
         &p,
-        812,
-        "the rollback bundle could not be removed"
-    ));
-    let before = Health::read(&p);
-    assert_eq!(before.trial_proof_failure_build, 812);
+        "apply_lane = \"resampling\"\napply_lane_target_build = 901\napply_lane_build = 900\n",
+    )
+    .expect("an older ledger");
+    let old = Health::read(&p);
+    assert_eq!(
+        (old.apply_lane.as_str(), old.apply_lane_writer_pid),
+        ("resampling", 0),
+        "PRECONDITION: an older ledger still reads, its writer unkept"
+    );
+    assert_eq!(
+        old.apply_lane_for(900, crate::LaneWriter::this_process()),
+        None,
+        "a record from before the writer was kept is no process's"
+    );
+}
 
-    Health::record_trial_settled_unproven(&p);
-    let after = Health::read(&p);
-    assert!(after.trial_proof_failure.is_empty() && after.trial_proof_failure_at.is_empty());
-    assert_eq!(after.trial_proof_failure_build, 0);
-    assert_eq!(after.last_apply_refusal, before.last_apply_refusal);
-    assert_eq!(after.last_apply_refusal_build, 812);
+/// A LANDED APPLY LEAVES A LIVE WRITER'S RECORD: the node job's boot apply lands through
+/// `record_apply_success`, which cleared the stopped lane's record whoever wrote it, so a window
+/// whose latch still stood printed no `apply_lane=` or `next_action=` in `update status` until its
+/// plan changed; and once that kept another process's record, the writer's own trial settling
+/// still cleared its own. Only the writer withdraws its record, whichever process landed the
+/// apply. One whose writer has exited (its pid now another process's) still ends with a landed
+/// apply. NEGATIVE CONTROL: with `record_apply_success` clearing this process's own record, as
+/// the first fix had it, the writer's record goes with its own landed apply ("the writer's own
+/// landed apply leaves its record").
+#[cfg(unix)]
+#[test]
+fn a_landed_apply_leaves_a_live_writers_record() {
+    let p = tmp("apply-lane-live-writer");
+    // The test's runner stands in for a live window: another process that wrote its record.
+    let runner = std::os::unix::process::parent_id();
+    let window = crate::LaneWriter {
+        pid: runner,
+        birth: i32::try_from(runner)
+            .ok()
+            .and_then(aterm_uds::process::read_birth)
+            .map_or(0, |birth| birth.0),
+    };
+    assert!(
+        window.runs() && window != crate::LaneWriter::this_process(),
+        "PRECONDITION: the runner is another live process: {window:?}"
+    );
+    let record = crate::ApplyLaneRecord {
+        lane: "resampling".into(),
+        target_build: 901,
+        failure_signature: "unexplained/handoff proof ended Stalled".into(),
+        next_action: "re-samples build 901 at 2026-11-12T00:00:00Z".into(),
+        at: String::new(),
+    };
+    Health::record_apply_lane(&p, 900, window, &record);
+    Health::record_apply_failure(&p, 900, 901, "handoff proof ended Stalled");
+    let landed = Health::record_apply_success(&p);
+    assert_eq!(
+        (landed.apply_failures, landed.last_apply_error.as_str()),
+        (0, ""),
+        "PRECONDITION: the success landed"
+    );
+    assert_eq!(
+        Health::read(&p)
+            .apply_lane_for(900, window)
+            .map(|read| (read.lane, read.next_action)),
+        Some((record.lane.clone(), record.next_action.clone())),
+        "a success another process landed leaves a live writer's record"
+    );
 
-    // Nothing to clear writes nothing.
-    let written = std::fs::read(&*p).expect("ledger");
-    Health::record_trial_settled_unproven(&p);
-    assert_eq!(std::fs::read(&*p).expect("ledger"), written);
+    let me = crate::LaneWriter::this_process();
+    Health::record_apply_lane(&p, 900, me, &record);
+    Health::record_apply_success(&p);
+    assert_eq!(
+        Health::read(&p)
+            .apply_lane_for(900, me)
+            .map(|read| (read.lane, read.next_action)),
+        Some((record.lane.clone(), record.next_action.clone())),
+        "the writer's own landed apply leaves its record"
+    );
+    Health::withdraw_apply_lane(&p, me, 901);
+    assert_eq!(
+        Health::read(&p).apply_lane_for(900, me),
+        None,
+        "its writer withdraws it"
+    );
+
+    let exited = crate::LaneWriter {
+        pid: window.pid,
+        birth: window.birth.wrapping_add(1),
+    };
+    assert!(
+        !exited.runs(),
+        "PRECONDITION: a pid reused is not its writer"
+    );
+    Health::record_apply_lane(&p, 900, exited, &record);
+    Health::record_apply_success(&p);
+    assert_eq!(
+        Health::read(&p).apply_lane_for(900, exited),
+        None,
+        "a record whose writer has exited ends with a landed apply"
+    );
+}
+
+/// This process names itself the same way on every read, with a kernel birth where one is kept.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn this_process_is_named_by_its_pid_and_birth() {
+    let me = crate::LaneWriter::this_process();
+    assert_eq!(me.pid, std::process::id());
+    assert_ne!(me.birth, 0, "the kernel keeps this process's birth");
+    assert_eq!(
+        crate::LaneWriter::this_process(),
+        me,
+        "and reads it the same way"
+    );
 }

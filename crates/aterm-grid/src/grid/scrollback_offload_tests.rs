@@ -1652,3 +1652,88 @@ fn a_job_rewraps_a_line_straddling_the_store_ring_seam_whole() {
         g.assert_invariants();
     }
 }
+
+/// A line limit or byte budget changed while a resize rewrap has the store out (Settings or a
+/// config reload; the wasm hosts' budget share moving as a pane opens or closes) applies at
+/// re-attach without reordering history. The job's ring history and the
+/// window's staged output return as one run in write order, then the settings replay. Replayed
+/// first, each setter settled the staged output into the store ahead of the job's older ring
+/// history, so history read [store | window output | old ring history | live ring]. Both entry
+/// points, a converging re-detach, a store keeping lines and one whose share is zero.
+#[test]
+fn a_setting_changed_inside_the_offload_window_keeps_history_in_order() {
+    let (rows, cols, ring) = (3u16, 40u16, 64usize);
+    let number = |line: &str| -> usize {
+        line.trim_end()
+            .strip_prefix('L')
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("an unexpected line {line:?}"))
+    };
+    for start_limit in [Some(500), Some(ring)] {
+        for (limit, budget) in [
+            (Some(Some(1000)), false),
+            (None, true),
+            (Some(Some(1000)), true),
+            (Some(Some(100)), false),
+            (Some(None), false),
+        ] {
+            for converge in [false, true] {
+                let ctx = format!(
+                    "start {start_limit:?}, limit {limit:?}, budget {budget}, converge {converge}"
+                );
+                let mut g = tiered_grid(rows, cols, ring);
+                g.set_scrollback_line_limit(start_limit);
+                let mut written = 0usize;
+                let mut write = |g: &mut Grid, n: usize| {
+                    for _ in 0..n {
+                        logical_line(g, &format!("L{written}"));
+                        written += 1;
+                    }
+                };
+                write(&mut g, 300);
+                let job = g
+                    .resize_offloading_scrollback(rows, cols - 20)
+                    .expect("a tiered width change offloads its history");
+                assert!(
+                    !job.ring_lines.is_empty(),
+                    "{ctx}: precondition: ring history rides the job"
+                );
+                write(&mut g, 3 * ring);
+                assert!(
+                    !g.storage.lazy_buffer.is_empty() || start_limit == Some(ring),
+                    "{ctx}: precondition: the window staged its output"
+                );
+                if let Some(limit) = limit {
+                    g.set_scrollback_line_limit(limit);
+                }
+                if budget {
+                    g.set_scrollback_memory_budget(7_000_000)
+                        .expect("a deferred budget reports success");
+                }
+                if converge {
+                    g.resize(rows, cols - 15);
+                }
+                let mut next = Some(job.reflow());
+                let mut rounds = 0;
+                while let Some(done) = next.take() {
+                    rounds += 1;
+                    assert!(rounds < 8, "{ctx}: the re-attach converges");
+                    next = g
+                        .reattach_reflowed_scrollback_or_redetach(done)
+                        .map(PendingScrollbackReflow::reflow);
+                }
+                g.drain_lazy_buffer();
+
+                let numbers: Vec<usize> = logical_lines(&g).iter().map(|l| number(l)).collect();
+                let first = *numbers.first().expect("history and screen hold lines");
+                let expected: Vec<usize> = (first..written).collect();
+                assert_eq!(numbers, expected, "{ctx}: whole and in write order");
+                let keeps_all = start_limit != Some(ring) && limit != Some(Some(100));
+                if keeps_all {
+                    assert_eq!(first, 0, "{ctx}: nothing within the limit is lost");
+                }
+                g.assert_invariants();
+            }
+        }
+    }
+}

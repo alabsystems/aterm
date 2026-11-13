@@ -327,7 +327,8 @@ mod apple_test {
     fn fork_holds(fd: RawFd) -> bool {
         let mut report = [0; 2];
         // SAFETY: `pipe` fills the two-element array it is handed.
-        assert_eq!(unsafe { libc::pipe(report.as_mut_ptr()) }, 0, "report pipe");
+        let made = unsafe { libc::pipe(report.as_mut_ptr()) };
+        assert_eq!(made, 0, "report pipe");
         let spawning = crate::spawn_lock::spawning();
         // SAFETY: `fork` takes no arguments; the child calls only `fcntl`, `write` and `_exit`.
         let pid = unsafe { libc::fork() };

@@ -21,7 +21,7 @@ use aterm_effects::pet_seat::{
 };
 
 /// The pets a replay seats: the cat and the dog, by the styles that draw them today.
-const PETS: [(&str, &str); 2] = [("cat", "tall rainbow + cat"), ("dog", "tall rainbow + dog")];
+const PETS: [(&str, &str); 2] = [("cat", "rainbow + cat"), ("dog", "rainbow + dog")];
 
 /// A replay the reader runs: its name in the table, and whether its page is a full-screen
 /// program's ([`Rule::FULL_SCREEN`]).
@@ -457,13 +457,7 @@ fn survey_the_one_seat_rule_beside_the_seat_on_glass() {
 #[test]
 fn at_the_71_column_wall_the_rule_s_pet_leaves_and_returns_on_its_feet() {
     let (played, _) = last_row_at(71);
-    let judged = walled(
-        ("tall rainbow + cat", DARK),
-        71,
-        Drive::Console,
-        &played,
-        &[],
-    );
+    let judged = walled(("rainbow + cat", DARK), 71, Drive::Console, &played, &[]);
     let s = seated(&judged, false);
     assert!(s.frames > 500 && s.new_on > 100, "{s:?}");
     assert!(s.exits >= 1, "it walks off at the wall: {s:?}");

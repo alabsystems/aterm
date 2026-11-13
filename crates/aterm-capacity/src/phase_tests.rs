@@ -382,6 +382,7 @@ fn schedule(available: u64, jobs: &[Job]) -> Vec<Option<u64>> {
                     record,
                     used: TreeUse::default(),
                     credited: TreeUse::default(),
+                    seen: true,
                 })
                 .collect();
             if decide(&records[i].need, records[i].order(), &reading, &others, t).is_ok() {
@@ -674,7 +675,7 @@ fn a_wider_selections_run_phase_bounds_the_step_and_never_raises_the_claim() {
     );
 }
 
-/// Each of `records` as a look takes it, no tree using any memory.
+/// Each of `records` as a look that read every tree takes it, no tree using any memory.
 fn others(records: &[Record]) -> Vec<Other<'_>> {
     records
         .iter()
@@ -682,6 +683,7 @@ fn others(records: &[Record]) -> Vec<Other<'_>> {
             record,
             used: TreeUse::default(),
             credited: TreeUse::default(),
+            seen: true,
         })
         .collect()
 }
@@ -708,16 +710,19 @@ fn claim_of(pid: u32, asks: u64, need: Need, held: bool) -> Record {
     }
 }
 
-/// A WAITER WHOSE SHORTFALL NO CLAIM'S END BRINGS SPARES WHAT FIRST IN, FIRST OUT LEFT BESIDE IT
-/// (CAP3): a VM's boot asks 20 GiB and 24 GiB spare beside it on 40 GiB with no claim held, so it
-/// waits for memory no claim holds, and an 8 GiB claim behind it goes first beside its
-/// reservation, as before the passing rule; a 21 GiB one waits, and its line says why, with no
-/// figure that contradicts it. Where the claims ahead can bring the VM's room (a held 10 GiB
-/// claim's end), what goes first past it is held to what it spares, 6 GiB, so its turn comes no
-/// later, and a waiter that asked to run alone lets none go first. NEGATIVE CONTROL: a margin
-/// waiter that spared nothing held the 8 GiB claim for good.
+/// A WAITER NO CLAIM'S END CAN START HOLDS BACK NO CLAIM BEHIND IT (CAP3, KI-1111-25): a VM's
+/// boot asks 20 GiB and 24 GiB spare beside it on 40 GiB with no claim held, so it waits for
+/// memory no claim holds and is STUCK. It reserves nothing against the claims behind it: an 8
+/// GiB claim and a 21 GiB one each go first; a 41 GiB one of no margin, short only of memory no
+/// claim holds, runs ALONE, the stuck VM not counted among the claims ahead; and a 39 GiB one
+/// with 2 GiB beside it, stuck itself, waits only for the room, its line naming the VM's 20 GiB
+/// apart from what is reserved. Where the claims ahead can bring the
+/// VM's room (a held 10 GiB claim's end), it keeps its place and what goes first past it is held
+/// to what it spares, 6 GiB, so its turn comes no later, and a waiter that asked to run alone
+/// lets none go first. NEGATIVE CONTROL: under the rule before, the 21 GiB claim waited behind
+/// the VM for as long as the memory it lacks stayed taken.
 #[test]
-fn a_waiter_no_claims_end_can_start_spares_what_first_in_first_out_left_beside_it() {
+fn a_waiter_no_claims_end_can_start_holds_back_no_claim_behind_it() {
     let reading = Reading::of_gib(64, 40, 14);
     let look =
         |records: &[Record], need: Need| decide(&need, (9, 99, 0), &reading, &others(records), 10);
@@ -725,23 +730,34 @@ fn a_waiter_no_claims_end_can_start_spares_what_first_in_first_out_left_beside_i
     let alone = [vm.clone()];
     assert!(
         look(&alone, Need::new("small").mem_gib(8)).is_ok(),
-        "an 8 GiB claim goes first beside the VM's reservation"
+        "an 8 GiB claim goes first past the stuck VM"
     );
-    let short = look(&alone, Need::new("big").mem_gib(21)).expect_err("21 GiB waits");
+    assert!(
+        look(&alone, Need::new("big").mem_gib(21)).is_ok(),
+        "a 21 GiB claim goes first past the stuck VM"
+    );
+    let grant = look(&alone, Need::new("whole").mem_gib(41)).expect("41 GiB runs alone");
+    assert!(grant.alone.is_some(), "admitted alone: {grant:?}");
+    let short = look(&alone, Need::new("vm2").mem_gib(39).margin(2 * GIB)).expect_err("waits");
     assert_eq!(
         short.shorts,
         [Short::Memory {
-            need: 21 * GIB,
-            margin: 0,
+            need: 39 * GIB,
+            margin: 2 * GIB,
             available: 40 * GIB,
-            reserved: 20 * GIB,
-            passes: Some(20 * GIB),
+            reserved: 0,
+            passes: None,
+            stuck_ahead: 20 * GIB,
+            stuck: true,
         }]
     );
-    assert_eq!(
-        short.shorts[0].to_string(),
-        "memory short by 1 GiB: needs 21 GiB, 40 GiB available less 20 GiB reserved, and past \
-         the claims ahead that cannot start yet only a claim of 20 GiB or less goes first"
+    let line = short.shorts[0].to_string();
+    assert!(
+        line.contains(&format!(
+            "; no claim's end can start the claims ahead that ask {} more",
+            crate::admit::gib(20 * GIB)
+        )) && line.ends_with("; no end of a claim it can wait for brings what it lacks (it waits for memory no claim holds)"),
+        "{line}"
     );
 
     let held = claim_of(2, 0, Need::new("held").mem_gib(10), true);
@@ -757,6 +773,8 @@ fn a_waiter_no_claims_end_can_start_spares_what_first_in_first_out_left_beside_i
             available: 40 * GIB,
             reserved: 30 * GIB,
             passes: Some(6 * GIB),
+            stuck_ahead: 0,
+            stuck: false,
         }]
     );
 
@@ -799,6 +817,8 @@ fn a_waiter_that_fits_beside_the_reservations_ahead_spares_what_its_fit_leaves()
             available: 40 * GIB,
             reserved: 38 * GIB,
             passes: Some(2 * GIB),
+            stuck_ahead: 0,
+            stuck: false,
         }]
     );
 }

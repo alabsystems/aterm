@@ -1210,3 +1210,5 @@ fn public_refs_include_peeled_tags_without_rest_or_writer_identity() {
         2
     );
 }
+
+mod source_cache_tests;

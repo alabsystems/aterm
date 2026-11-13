@@ -180,8 +180,8 @@ pub fn dependents_in_graph(
 /// build inputs, including host tools that are absent from its normal library graph. Only what the
 /// change touched where its dependents read it ([`crate::scope::Scope::reaches_dependents`]) is
 /// closed over: a crate of the cone that is there for its tests alone, or whose change is
-/// confined to it (its own tests, comments no macro reads), holds the change in no build of its
-/// dependents.
+/// confined to it (its own tests, comments no macro reads), or whose reads reach only its own
+/// tests, benches and examples, holds the change in no build of its dependents.
 #[must_use]
 pub fn wanted_in_cell(
     normal: &BTreeSet<String>,

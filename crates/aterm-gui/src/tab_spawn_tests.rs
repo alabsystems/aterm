@@ -106,14 +106,9 @@ fn a_plain_drive_shell_is_fresh_and_clears_only_its_inherited_command() {
 }
 
 fn piped_session(id: u64) -> (Session, std::fs::File) {
-    let mut fds = [0; 2];
-    // SAFETY: `fds` is a two-int array, as `pipe` requires.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: the read end was just opened and is owned by nothing else.
-    let read = unsafe { <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(fds[0]) };
-    // SAFETY: the write end was just opened; the sink takes sole ownership.
-    let write = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fds[1]) };
-    let sink = Arc::new(SinkWriter::new_owned(write));
+    let (read, write) = aterm_uds::pipe().expect("pipe");
+    let read = std::fs::File::from(std::os::fd::OwnedFd::from(read));
+    let sink = Arc::new(SinkWriter::new_owned(write.into()));
     (crate::stub_session_with_sink(id, sink), read)
 }
 

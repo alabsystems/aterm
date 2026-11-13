@@ -2408,6 +2408,71 @@ fn a_pick_made_while_another_is_typed_waits_and_the_latest_wins() {
     assert!(pty(&mut reader, 0).is_empty());
 }
 
+/// A PICK WAITING ON A PRESS THE PERSON STOPPED IS DROPPED, NOT TYPED: the person picks medium,
+/// then xhigh while medium is typed, then clears what aterm typed. The press ends as theirs
+/// ("nothing more sent"), and no second command begins (the defect: the waiting xhigh was typed
+/// at once, over the person's cancel). CONTROL: the next pick is typed.
+#[test]
+fn a_pick_waiting_on_a_press_the_person_stopped_is_dropped() {
+    let (mut app, wid, session, mut reader) = idle();
+    claude_with(&app, session, "Opus 5.5", "low");
+    frame(&mut app, wid);
+    app.open_fact_menu(wid, session, Fact::Effort, (0, 0), true);
+    let pick = |app: &mut App, level: &'static str| {
+        let key = format!("fact-menu/effort/set-effort/{level}");
+        let menu = app.autopilot_menu.as_mut().expect("the slider's card");
+        let (row, stop) = menu
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(i, row)| match row {
+                MenuRow::Stops { stops, .. } => stops
+                    .iter()
+                    .position(|stop| stop.act.key() == key)
+                    .map(|j| (i, j)),
+                _ => None,
+            })
+            .expect("the stop");
+        if let MenuRow::Stops { focus, .. } = &mut menu.rows[row] {
+            *focus = Some(stop);
+        }
+        app.choose_autopilot_menu_row(row);
+    };
+    pick(&mut app, "medium");
+    assert_eq!(pty(&mut reader, 1), b"/", "medium's probe");
+    pick(&mut app, "xhigh");
+    assert_eq!(
+        in_flight(&app, session),
+        Some(Slash::Effort("medium")),
+        "xhigh waits"
+    );
+    app.note_person_input(
+        session,
+        &InputEvent::KeySequence(b"\x7f".to_vec()),
+        Source::Human,
+    );
+    echo(&app, session, CARET, "");
+    app.advance_slash_presses(Instant::now());
+    assert_eq!(
+        ended(&app, session),
+        Some(SlashEnd::Stopped(SlashRefusal::Person))
+    );
+    assert_eq!(in_flight(&app, session), None, "no second press began");
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "nothing typed after the cancel"
+    );
+    assert!(
+        app.claude_facts
+            .get(&session)
+            .and_then(|facts| facts.effort_wish)
+            .is_none(),
+        "the waiting pick is dropped"
+    );
+    pick(&mut app, "high");
+    assert_eq!(pty(&mut reader, 1), b"/", "CONTROL: the next pick is typed");
+}
+
 /// A REFUSED PICK IS SAID IN THE CARD, IN PLACE: nothing is typed, the card stays open with its
 /// slider live and its thumb where the footer has it, and the next pick that begins clears the
 /// note.

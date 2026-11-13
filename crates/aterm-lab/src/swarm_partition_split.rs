@@ -425,9 +425,9 @@ fn made_in(ledger: &Ledger, island: Island) -> usize {
         .count()
 }
 
-/// Why a split is not shown to have held: what its row, F21's unjudged row and the
-/// not-recorded line say, so a split that could not be read whole is never told as one that
-/// leaked.
+/// Why a split is not shown to have held: what its row, F21's unjudged row and the record's and
+/// the console's not-measured line say, so a split that could not be read whole is never told
+/// as one that leaked.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Shortfall {
     /// A record or head crossed it ([`crossings`]).
@@ -461,8 +461,8 @@ impl Shortfall {
     }
 
     /// It leaves the split not shown to have kept what each island made from the other: a row
-    /// judged on that split is not judged, and the run is not recorded. A split whose records
-    /// sync went unexercised still saw nothing cross, so it does not.
+    /// judged on that split is not judged, and the run is not shown to measure the build. A
+    /// split whose records sync went unexercised still saw nothing cross, so it does not.
     #[must_use]
     pub const fn voids(self) -> bool {
         !matches!(self, Shortfall::Unexercised)

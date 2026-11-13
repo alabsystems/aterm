@@ -11,6 +11,48 @@ fn layout(label: &str) -> crate::testdir::ScratchLayout {
     crate::testdir::layout(&format!("atpkg-doctor-{label}-"))
 }
 
+#[test]
+fn intentional_pins_are_visible_without_becoming_problems_or_changing_the_pin() {
+    let l = layout("update-pins");
+    assert!(pin_findings(&l).is_empty());
+    crate::pin::set_pinned(&l, "codex", true).unwrap();
+    let before = std::fs::read(l.prefix.join("pins")).unwrap();
+    let installed = builds(&["codex"]);
+    let (findings, _) = toolset_findings_with(&l, &installed, None, &|_| {
+        Ok(Missing {
+            present: 1,
+            ..Missing::default()
+        })
+    });
+    let rows = c::report(findings);
+    let pin = rows.iter().find(|row| c::is(&row.id, c::PIN)).unwrap();
+    assert_eq!(pin.outcome, Outcome::Ok);
+    assert!(c::passes(&rows));
+    let shown = render(&rows, "doctor", Detail::Problems);
+    assert!(shown.verdict.contains("healthy"));
+    assert!(shown.rest.contains("aterm pkg unpin codex"));
+    assert!(shown.faults.is_empty());
+    assert_eq!(std::fs::read(l.prefix.join("pins")).unwrap(), before);
+    assert!(crate::pin::is_pinned(&l, "codex").unwrap());
+
+    crate::pin::set_pinned(&l, "codex", false).unwrap();
+    assert!(pin_findings(&l).is_empty());
+}
+
+#[test]
+fn unreadable_pins_are_reported_and_preserved() {
+    let l = layout("unreadable-update-pins");
+    let before = b"codex\n\xff";
+    std::fs::write(l.prefix.join("pins"), before).unwrap();
+    let rows = c::report(pin_findings(&l));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].id, c::PIN);
+    assert!(!c::passes(&rows));
+    assert_eq!(rows[0].explain.as_ref().unwrap().remedy, Remedy::None);
+    assert!(!render(&rows, "doctor", Detail::Problems).rest.is_empty());
+    assert_eq!(std::fs::read(l.prefix.join("pins")).unwrap(), before);
+}
+
 fn tool(name: &str) -> crate::store::ToolName {
     crate::store::ToolName::new(name).unwrap()
 }
@@ -162,7 +204,7 @@ fn no_cached_index_judges_the_vendor_half_alone() {
         missing_from_set(
             None,
             crate::config::cached(),
-            crate::cli::current_triple(),
+            &crate::serving::Targets::unread(crate::cli::current_triple()),
             &installed,
             &names(&[]),
             &names(&[]),
@@ -178,7 +220,7 @@ fn no_cached_index_judges_the_vendor_half_alone() {
         missing_from_set(
             None,
             &cfg,
-            "aarch64-apple-darwin",
+            &crate::serving::Targets::unread("aarch64-apple-darwin"),
             &installed,
             &names(&["agy"]),
             &names(&[]),
@@ -193,6 +235,7 @@ fn no_cached_index_judges_the_vendor_half_alone() {
             ],
             on_purpose: vec!["agy".into()],
             excluded: vec!["muse".into()],
+            unserved: vec![],
         }
     );
 }
@@ -225,6 +268,87 @@ fn index_naming(programs: &[&str]) -> crate::manifest::Index {
     }
 }
 
+/// A PROGRAM NO BUILD SERVES HERE IS OUTSIDE THE SET HERE AND ONLY SAID: on a target the signed
+/// manifests serve only in part, the toolset row counts and names as missing the served
+/// programs alone (one with no verdict among them), and the platform note names the rest off
+/// macOS; an unserved program here anyway (a dev link, say) is not named unserved.
+/// NEGATIVE CONTROL (2026-11-11): with `default_set_here`'s `retain` removed, trust and trust-ir
+/// were counted missing beside ay and ty.
+#[test]
+fn a_program_no_build_serves_here_is_outside_the_set_here_and_only_said() {
+    let linux = "aarch64-unknown-linux-gnu";
+    let unserved = crate::serving::Serving::Unserved(crate::state::unavailable(linux, ""));
+    let here = crate::serving::Targets::of_verdicts(
+        linux,
+        [
+            ("ay", crate::serving::Serving::Served),
+            ("gitleaks", crate::serving::Serving::Served),
+            ("trust", unserved.clone()),
+            ("trust-ir", unserved.clone()),
+            ("lean4", unserved),
+        ],
+    );
+    let index = index_naming(&["ay", "gitleaks", "trust", "trust-ir", "lean4", "ty"]);
+    let vendors = crate::cli::vendor_set_here(
+        linux,
+        &crate::config::PackagesConfig::default(),
+        &names(&[]),
+    );
+    let mut installed = builds(&["gitleaks"]);
+    installed.extend(vendors.iter().map(|program| (program.clone(), 1)));
+    let cfg = crate::config::PackagesConfig::default();
+    let missing = missing_from_set(
+        Some(&index),
+        &cfg,
+        &here,
+        &installed,
+        &names(&[]),
+        &names(&["lean4"]),
+    );
+    assert_eq!(
+        missing,
+        Missing {
+            present: 1 + vendors.len(),
+            unexplained: vec!["ay".into(), "ty".into()],
+            unserved: vec!["trust".into(), "trust-ir".into()],
+            ..Missing::default()
+        }
+    );
+
+    let l = layout("unserved-here");
+    std::fs::create_dir_all(&l.prefix).unwrap();
+    let (findings, _) = toolset_findings_with(&l, &installed, None, &|_| Ok(missing.clone()));
+    let rows = crate::converge::report(findings);
+    let why = |id: &str| {
+        rows.iter()
+            .find(|row| row.id == id)
+            .and_then(|row| row.explain.as_ref())
+            .map(|explain| explain.why.clone())
+            .unwrap_or_default()
+    };
+    let toolset = why(c::TOOLSET);
+    assert!(
+        toolset.contains(&format!(
+            "2 of {} program(s) in the default set here are not installed (ay, ty)",
+            3 + vendors.len()
+        )),
+        "{toolset}"
+    );
+    assert!(!toolset.contains("trust"), "{toolset}");
+    let note = why(c::TOOLSET_PLATFORM);
+    if cfg!(target_os = "macos") {
+        assert!(note.is_empty(), "never said on macOS: {note}");
+    } else {
+        assert!(
+            note.contains(
+                "no build is published for this target of 2 program(s) the index lists \
+                 (trust, trust-ir): the toolset here leaves them out"
+            ),
+            "{note}"
+        );
+    }
+}
+
 /// A MISSING VENDOR CLI LEAVES THE TOOLSET INCOMPLETE, AND AN EXCLUDED ONE IS ONLY SAID: the
 /// toolset row weighs the one default set (the index's programs and the vendor rows that serve
 /// this machine), so a machine without claude is missing it although every index program is
@@ -234,7 +358,7 @@ fn index_naming(programs: &[&str]) -> crate::manifest::Index {
 /// is not).
 #[test]
 fn a_missing_vendor_cli_is_missing_and_an_excluded_one_is_only_said() {
-    let darwin = "aarch64-apple-darwin";
+    let darwin = &crate::serving::Targets::unread("aarch64-apple-darwin");
     let index = index_naming(&["ay", "trust"]);
     let cfg = crate::config::PackagesConfig {
         exclude: Some(vec!["muse".into()]),
@@ -256,6 +380,7 @@ fn a_missing_vendor_cli_is_missing_and_an_excluded_one_is_only_said() {
             unexplained: vec!["claude".into()],
             on_purpose: vec!["agy".into()],
             excluded: vec!["muse".into()],
+            unserved: vec![],
         }
     );
     assert!(excluded_clause(&missing.excluded).contains("muse"));
@@ -679,6 +804,10 @@ fn dev_link_only_toolset_is_healthy_but_deleted_tool_is_not() {
     let path = on_bin(&l);
     let (ok, out, _) = report_of(&l, &home, Some(&path), &Probes::default());
     assert!(ok, "a dev-linked toolset is not an empty store:\n{out}");
+    let (findings, _) = toolset_findings_with(&l, &builds(&[]), None, &|_| Ok(Missing::default()));
+    let shown = render(&c::report(findings), "doctor", Detail::Problems);
+    assert!(shown.verdict.contains("healthy"));
+    assert!(shown.rest.contains("aterm pkg unlink ay"));
     assert!(
         crate::ops::active_builds(&l).is_empty(),
         "no fabricated signed build"
@@ -834,9 +963,13 @@ fn an_unserved_platform_is_a_note_not_a_problem_off_macos_and_unchanged_on_macos
         assert!(
             out.contains(
                 "note — the ALab toolset is unavailable on this platform: no build is \
-                 published for this target (ay, trust, ty)"
+                 published for this target; "
             ),
             "{out}"
+        );
+        assert!(
+            !out.contains("(ay, trust, ty)"),
+            "a recorded row names no program the signed manifests have not judged: {out}"
         );
         assert!(
             out.contains("0 program(s) active — none is published for this platform"),
@@ -909,10 +1042,10 @@ fn an_unserved_platform_is_a_note_not_a_problem_off_macos_and_unchanged_on_macos
     assert!(healthy, "{out}");
     assert!(out.contains("1 program(s) active"), "{out}");
     assert!(!out.contains("PROBLEM"), "{out}");
-    assert_eq!(
-        out.contains("unavailable on this platform"),
-        !cfg!(target_os = "macos"),
-        "the note is never said on macOS: {out}"
+    assert!(
+        !out.contains("unavailable on this platform"),
+        "with no unserved toolset and no index judged, recorded program rows alone say \
+         nothing: {out}"
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
 
@@ -977,10 +1110,9 @@ fn an_unreachable_index_is_a_problem_on_an_unserved_platform_too() {
         out.contains("next — aterm pkg install --default-set"),
         "the ordinary act, on every platform: {out}"
     );
-    assert_eq!(
-        out.contains("unavailable on this platform"),
-        !cfg!(target_os = "macos"),
-        "{out}"
+    assert!(
+        !out.contains("unavailable on this platform"),
+        "no index judged: nothing is said unserved: {out}"
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
@@ -1156,26 +1288,6 @@ fn clear_row(l: &Layout, program: &str) {
     let mut s = crate::status::read(l).unwrap_or_default();
     s.programs.remove(program);
     crate::status::write(l, &s).unwrap();
-}
-
-#[test]
-fn drop_unserved_removes_only_the_unserved_members() {
-    let missing = |v: &[&str]| v.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
-    assert_eq!(
-        drop_unserved(missing(&["ay", "claude", "trust"]), None),
-        missing(&["ay", "claude", "trust"])
-    );
-    assert_eq!(
-        drop_unserved(
-            missing(&["ay", "claude", "trust"]),
-            Some(&missing(&["ay", "trust"]))
-        ),
-        missing(&["claude"])
-    );
-    assert_eq!(
-        drop_unserved(missing(&["ay"]), Some(&missing(&[]))),
-        missing(&["ay"])
-    );
 }
 
 #[test]
@@ -2420,7 +2532,7 @@ fn on_disk_build_is_the_newer_of_receipt_and_bundle_and_the_note_needs_installed
     let updates = base.prefix.join("Updates");
     std::fs::create_dir_all(&updates).unwrap();
     let report = |bundle: Option<u64>| -> String {
-        report_aterm_posture_at(&updates, bundle, &[], true)
+        report_aterm_posture_at(&updates, bundle, &[], true, 1_789_000_000)
             .map_or_else(String::new, |row| format!("atpkg: {}\n", spelled(&row)))
     };
     std::fs::write(
@@ -2454,6 +2566,61 @@ fn on_disk_build_is_the_newer_of_receipt_and_bundle_and_the_note_needs_installed
     )
     .unwrap();
     assert!(report(Some(1_789_000_876)).contains("aterm build 1790000000 is on disk"));
+    let _ = std::fs::remove_dir_all(&base.prefix);
+}
+
+/// A HELD BUILD IS SAID, NOT "INSTALLED": the update record's live hold on a newer build is the
+/// posture row, with how long it lasts, why, and the verb that tries it now. NEGATIVE CONTROLS: a
+/// hold that lapsed, and one on the build that runs, say nothing of a hold.
+#[test]
+fn a_live_hold_on_a_newer_build_is_the_posture_and_a_lapsed_one_is_not() {
+    use aterm_update_core::update_record::{Cause, FILE, Failure, Sha, UpdateRecord, Witness};
+    let base = layout("posture-held");
+    let updates = base.prefix.join("Updates");
+    std::fs::create_dir_all(&updates).unwrap();
+    std::fs::write(updates.join("installed.toml"), "build_number = 100\n").unwrap();
+    std::fs::write(updates.join("status.toml"), "current_build = 100\n").unwrap();
+    let at = 1_789_000_000;
+    let hold = |build: u64| {
+        let _ = std::fs::remove_file(updates.join(FILE));
+        UpdateRecord::edit(&updates.join(FILE), |record| {
+            record.running = 100;
+            record.set_hold(
+                Failure {
+                    build,
+                    version: format!("0.{build}.0"),
+                    sha: Sha::parse(&"ab".repeat(32)).unwrap(),
+                    cause: Cause::CrashLoop,
+                    witness: Witness::Headless,
+                    why: "the listener never answered".to_string(),
+                },
+                at,
+            )
+        })
+        .unwrap();
+    };
+    let report = |now: u64| -> String {
+        report_aterm_posture_at(&updates, Some(100), &[], true, now)
+            .map_or_else(String::new, |row| spelled(&row))
+    };
+    hold(101);
+    let held = report(at + 60);
+    assert!(
+        held.contains("aterm 0.101.0 is held for 59 min more (it did not start cleanly, try 1)")
+            && held.contains("`aterm update retry` tries it now"),
+        "{held}"
+    );
+    assert_eq!(
+        report(at + 2 * 3600),
+        "ok \u{2014} aterm build 100 installed",
+        "NEGATIVE CONTROL: a lapsed hold holds nothing, and doctor says none"
+    );
+    hold(100);
+    assert_eq!(
+        report(at + 60),
+        "ok \u{2014} aterm build 100 installed",
+        "NEGATIVE CONTROL: a hold on the build that runs is no hold on an update"
+    );
     let _ = std::fs::remove_dir_all(&base.prefix);
 }
 
@@ -2603,6 +2770,7 @@ fn an_accepted_workspace_policy_is_ok_and_a_local_seal_only_warns() {
             link_target: local.clone(),
             trustc: "d3866677".into(),
             stale: None,
+            trust_unserved: false,
         }),
         ..Probes::default()
     };
@@ -2620,7 +2788,7 @@ fn an_accepted_workspace_policy_is_ok_and_a_local_seal_only_warns() {
 }
 
 #[test]
-fn a_local_trust_where_none_is_published_is_a_note_off_macos() {
+fn a_local_trust_is_a_note_only_when_no_managed_build_is_served() {
     let l = unserved_platform_store("unserved-local-trust", false);
     let home = synthetic_home("unserved-local-trust");
     let path = std::env::join_paths([l.bin_dir()]).unwrap();
@@ -2632,6 +2800,7 @@ fn a_local_trust_where_none_is_published_is_a_note_off_macos() {
             link_target: local.clone(),
             trustc: "41d799797b".into(),
             stale: None,
+            trust_unserved: true,
         }),
         ..Probes::default()
     };
@@ -2643,21 +2812,25 @@ fn a_local_trust_where_none_is_published_is_a_note_off_macos() {
         )
     };
     let warned = "warn — rustup `trust` names a local toolchain, not the managed one";
-    let (out, shown) = report(&probes);
-    if cfg!(target_os = "macos") {
-        assert!(out.contains(warned), "{out}");
-        assert!(shown.contains("rustup `trust`"), "counted: {shown}");
-    } else {
-        let note = out
-            .lines()
-            .find(|line| line.contains("note — rustup `trust`"))
-            .unwrap_or_else(|| panic!("a note on the local trust: {out}"));
-        assert!(
-            note.contains(&local.display().to_string()),
-            "it names the toolchain: {note}"
-        );
-        assert!(!out.contains("warn — rustup `trust`"), "{out}");
-        assert!(!shown.contains("rustup `trust`"), "not counted: {shown}");
+    for unserved in [false, true] {
+        probes.local_seal.as_mut().unwrap().trust_unserved = unserved;
+        let (out, shown) = report(&probes);
+        if unserved {
+            let note = out
+                .lines()
+                .find(|line| line.contains("note — rustup `trust`"))
+                .unwrap_or_else(|| panic!("a note on the local trust: {out}"));
+            assert!(
+                note.contains(&local.display().to_string()),
+                "it names the toolchain: {note}"
+            );
+            assert!(!out.contains("warn — rustup `trust`"), "{out}");
+            assert!(!shown.contains("rustup `trust`"), "not counted: {shown}");
+        } else {
+            assert!(out.contains(warned), "{out}");
+            assert!(!out.contains("note — rustup `trust`"), "{out}");
+            assert!(shown.contains("rustup `trust`"), "counted: {shown}");
+        }
     }
     if let Some(seal) = probes.local_seal.as_mut() {
         seal.link_target = home.join("gone");
@@ -2691,6 +2864,7 @@ fn an_older_local_toolchain_is_named_stale_with_repair_as_its_fix() {
             link_target: PathBuf::from("/Users//me/trust/build/host/stage2"),
             trustc: "1a2b3c4d5e".into(),
             stale: Some(stale),
+            trust_unserved: false,
         }),
         ..Probes::default()
     };
@@ -4615,4 +4789,28 @@ fn a_packages_line_names_its_fix_once() {
         bare,
         "reroute stub clippy missing \u{2014} fix: aterm pkg repair"
     );
+}
+
+/// `verify provision` lays the pinned rustup at `<tooling>/rustup-<version>/bin/rustup` beside a
+/// stamp; doctor counts that copy as this Mac's rustup only once the stamp is there, and never
+/// a tooling directory it was not given.
+#[test]
+fn a_provisioned_rustup_counts_only_once_stamped() {
+    let tooling = crate::testdir::dir("atpkg-doctor-tooling-");
+    let row = aterm_uds::host::tool("rustup");
+    let exe = row.pinned_in(&tooling).expect("rustup carries a pin");
+    std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+    std::fs::write(&exe, b"#!/bin/true\n").unwrap();
+    assert_eq!(provisioned_rustup(Some(&tooling)), None, "unstamped");
+    let root = row.pinned_root(&tooling).unwrap();
+    std::fs::write(root.join(aterm_uds::host::PIN_STAMP), b"{}").unwrap();
+    assert_eq!(provisioned_rustup(Some(&tooling)), Some(exe.clone()));
+    assert_eq!(provisioned_rustup(None), None);
+    let note = provisioned_rustup_note(&exe);
+    let dir = exe.parent().unwrap().display().to_string();
+    assert!(
+        note.contains(&format!("put {dir} on that tool's PATH")),
+        "{note}"
+    );
+    assert!(note.contains("`rustup run trust targo`"), "{note}");
 }

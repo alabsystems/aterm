@@ -39,7 +39,7 @@ fn waiting_under(before: &[&str], said: &[&str]) -> Vec<String> {
 const PLAIN: &[&str] = &["Both workflows are running; I will pick up when they finish."];
 const NEEDS: &[&str] = &[
     "Both workflows are running; the docs are next.",
-    "NEEDS YOU: the release credential to sign 0.145.0",
+    "NEEDS YOU: the release permission to sign 0.145.0",
 ];
 const DONE: &[&str] = &[
     "Nothing left: the fix is on main and every check passed.",
@@ -332,7 +332,7 @@ fn a_needs_you_report_at_a_break_is_raised_and_the_work_is_carried() {
     );
     let up = raised(&cruise);
     assert_eq!(up.len(), 1, "raised once, not at every read: {up:#?}");
-    assert!(up[0].contains("the release credential"), "{up:#?}");
+    assert!(up[0].contains("the release permission"), "{up:#?}");
     assert_eq!(
         carries(&cruise),
         1,
@@ -404,7 +404,7 @@ fn a_call_lost_at_a_break_still_raises_its_need() {
         "{up:?} before {send:?}: {requests:#?}"
     );
     assert!(
-        requests[up[0]].contains("the release credential"),
+        requests[up[0]].contains("the release permission"),
         "{requests:#?}"
     );
     assert_eq!(carries(&lines_lost), 1, "{:#?}", lines_lost.writes());
@@ -422,7 +422,7 @@ fn a_call_lost_at_a_break_still_raises_its_need() {
     .run(&mut nothing);
     let up = raised(&raise_lost);
     assert!(
-        up.len() == 2 && up.iter().all(|r| r.contains("the release credential")),
+        up.len() == 2 && up.iter().all(|r| r.contains("the release permission")),
         "the lost raise, then the raise: {up:#?}"
     );
     let control = ran(
@@ -488,12 +488,12 @@ fn a_need_earlier_in_the_turn_is_raised_at_its_break() {
         .run(&mut nothing)
     };
     let need =
-        Some("NEEDS YOU: the release credential to sign 0.145.0; carrying on with the docs.");
+        Some("NEEDS YOU: the release permission to sign 0.145.0; carrying on with the docs.");
     let cruise = run("carry-needs-earlier", None, need);
     let up = raised(&cruise);
     assert_eq!(up.len(), 1, "{:#?}", cruise.requests());
     assert!(
-        up[0].contains("the release credential to sign 0.145.0"),
+        up[0].contains("the release permission to sign 0.145.0"),
         "{up:#?}"
     );
     assert_eq!(carries(&cruise), 1, "{:#?}", cruise.writes());
@@ -525,7 +525,7 @@ fn tall_turn(before: &[&str], above: usize) -> (Vec<String>, Vec<String>) {
         [
             "❯ ship 0.145.0",
             "",
-            "⏺ NEEDS YOU: the release credential to sign 0.145.0; carrying on with the docs.",
+            "⏺ NEEDS YOU: the release permission to sign 0.145.0; carrying on with the docs.",
             "",
         ]
         .map(ToString::to_string),
@@ -575,7 +575,7 @@ fn a_need_above_the_screen_is_raised_at_its_break() {
     let up = raised(&cruise);
     assert_eq!(up.len(), 1, "{:#?}", cruise.requests());
     assert!(
-        up[0].contains("the release credential to sign 0.145.0"),
+        up[0].contains("the release permission to sign 0.145.0"),
         "{up:#?}"
     );
     // The mock moves its screen's generation on the walk's own read, so the carry's first send
@@ -595,7 +595,7 @@ fn a_need_above_the_screen_is_raised_at_its_break() {
     );
     let before = run(
         "carry-needs-above-before",
-        &["⏺ NEEDS YOU: the signing key for 0.144.0", ""],
+        &["⏺ NEEDS YOU: the signing nod for 0.144.0", ""],
         6,
     );
     let up = raised(&before);
@@ -653,11 +653,11 @@ fn a_wrapped_need_at_a_break_is_raised_whole() {
     let (short, told) = run(
         "carry-needs-wrapped-short",
         None,
-        "NEEDS YOU: the signing key\nEverything else is on main.".to_string(),
+        "NEEDS YOU: the signing nod\nEverything else is on main.".to_string(),
     );
     assert_eq!(
         told,
-        ["the signing key"],
+        ["the signing nod"],
         "CONTROL: {:#?}",
         short.requests()
     );
@@ -4198,7 +4198,7 @@ fn a_break_that_judges_no_go_ahead_holds_back_no_persons_need() {
     let up = raised(&ran);
     assert!(
         up.iter().any(|r| r.contains("back so")),
-        "the credential's line goes up: {up:#?}"
+        "the permission's line goes up: {up:#?}"
     );
     let restated = run("carry-land-restated", &park);
     let up = raised(&restated);

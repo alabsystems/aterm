@@ -47,7 +47,7 @@ fn store(tag: &str) -> (aterm_tempfile::TempDir, Store) {
     let dir = crate::test_scratch_dir(tag);
     let root = dir.path().join("notify");
     std::fs::create_dir_all(root.join("cur")).expect("the store");
-    (dir, Store { root })
+    (dir, Store::at(root).expect("owned store"))
 }
 
 fn verdict(line: &str) -> Step {

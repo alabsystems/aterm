@@ -268,7 +268,7 @@ mod imp {
         if ARMED.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        let (mut reader, writer) = std::io::pipe()?;
+        let (mut reader, writer) = aterm_uds::pipe()?;
         let fd = writer.into_raw_fd();
         std::thread::Builder::new()
             .name("aterm-quit-signal".to_string())

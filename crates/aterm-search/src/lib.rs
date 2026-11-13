@@ -35,6 +35,19 @@ pub use index::{
 };
 pub use types::{DirectedFind, LineFrame, SearchDirection, SearchMatch, SearchResults};
 
+/// Whether `haystack` contains the exact bytes of `needle`.
+///
+/// Uses the same linear-time byte search as terminal search, without UTF-8
+/// conversion or case folding. An empty needle matches every byte slice.
+#[must_use]
+pub fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || bytesearch::Searcher::new(needle)
+            .matches_in::<false>(haystack)
+            .next()
+            .is_some()
+}
+
 #[cfg(test)]
 mod tests;
 

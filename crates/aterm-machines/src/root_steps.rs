@@ -240,11 +240,13 @@ fn console_member_now(sys: &dyn System) -> DebuggerMember {
     debugger_member_now(sys, &identity.user)
 }
 
-/// Whether the rule is in place as a stat reads it, which needs no root (the include directory
-/// is world-searchable, the rule itself may be readable by the admitted account): a root-owned regular file of
-/// mode 0440 with nonzero length. `None` when the stat answered with anything but not-found.
-#[must_use]
-pub fn rule_in_place(sys: &dyn System) -> Option<bool> {
+/// Whether a rule file stands as a stat reads it, which needs no root (the include directory
+/// is world-searchable): a root-owned regular file of mode 0440 with nonzero length. `None`
+/// when the stat answered with anything but not-found. Metadata alone: it tells a missing rule
+/// ([`owed`]) and gates an explicit attempt ([`name_by_rule`]), but a rule an older build wrote
+/// passes it while sudo refuses the generated names, so nothing outside this module reads it;
+/// whether the rule can set them is [`name_rule_current`].
+fn rule_in_place(sys: &dyn System) -> Option<bool> {
     match sys.stat(Path::new(ADMITTED_NAME_RULE)) {
         Ok(stat) => {
             Some(!stat.dir && !stat.symlink && stat.uid == 0 && stat.mode == 0o440 && stat.len > 0)
@@ -254,11 +256,34 @@ pub fn rule_in_place(sys: &dyn System) -> Option<bool> {
     }
 }
 
-/// Whether this account can read the exact safe, compiled naming permission.
-/// This is advisory UI evidence; every effect still goes through sudo's current policy.
+/// The naming permission as this process's ordinary account reads it ([`name_rule_reading`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NameRuleReading {
+    /// No rule stands as setup leaves one: no file, or not a root-owned 0440 regular file of
+    /// nonzero length. Setup's password step owes it ([`owed`]) unless this Mac's `visudo`
+    /// refused it before ([`REFUSED_RULE`]).
+    Missing,
+    /// A rule stands as setup leaves one, but its bytes are not this build's [`name_rule`] for
+    /// this account (an older build's text, or another account's rule). Setup's password step
+    /// never owes it ([`owed`] counts a missing rule only), so only setup the person asks for
+    /// renews it.
+    Other,
+    /// This build's [`name_rule`] for this account, byte for byte.
+    Current,
+}
+
+/// Whether this process's ordinary account (not root) can read the exact safe, compiled naming
+/// permission: this build's [`name_rule`] for that account, byte for byte. The rule's text has
+/// changed only with what it admits (the nickname, the account quoting, `m0`, non-ASCII
+/// nicknames), so a rule of other bytes may refuse this build's generated names, and an
+/// unreadable one predates the read access this build grants. Only
+/// `Ok(NameRuleReading::Current)` admits an automatic naming attempt or a status that promises
+/// one; a missing rule waits for setup's password step, and any other reading for setup the
+/// person asks for. This is evidence for presentation and that gate; every effect still goes
+/// through sudo's current policy.
 /// # Errors
 /// The account or existing root-owned rule cannot be read safely.
-pub fn name_rule_current(sys: &dyn System) -> Result<bool, String> {
+pub fn name_rule_reading(sys: &dyn System) -> Result<NameRuleReading, String> {
     let identity = sys.identity()?;
     if identity.user.uid != sys.euid() || sys.euid() == 0 {
         return Err("naming permission belongs to the current ordinary account".into());
@@ -266,14 +291,26 @@ pub fn name_rule_current(sys: &dyn System) -> Result<bool, String> {
     let wanted =
         name_rule(&identity.user.name).ok_or("the current account cannot own a naming rule")?;
     match rule_in_place(sys) {
-        Some(false) => return Ok(false),
+        Some(false) => return Ok(NameRuleReading::Missing),
         None => return Err("the existing naming permission could not be inspected".into()),
         Some(true) => {}
     }
     let bytes = sys
         .read_owned_file(Path::new(ADMITTED_NAME_RULE), 0, 16 * 1024, false)
         .map_err(|why| format!("the existing naming permission could not be read: {why}"))?;
-    Ok(bytes == wanted.as_bytes())
+    Ok(if bytes == wanted.as_bytes() {
+        NameRuleReading::Current
+    } else {
+        NameRuleReading::Other
+    })
+}
+
+/// [`name_rule_reading`] as a yes or no: `Ok(true)` exactly where it reads
+/// [`NameRuleReading::Current`].
+/// # Errors
+/// As [`name_rule_reading`].
+pub fn name_rule_current(sys: &dyn System) -> Result<bool, String> {
+    name_rule_reading(sys).map(|reading| reading == NameRuleReading::Current)
 }
 
 /// What the elevation still owes this Mac beside the tools, as the person's account reads it.
@@ -373,6 +410,10 @@ fn run_ok(sys: &dyn System, cmd: &Cmd) -> Result<Ran, String> {
 /// admission after the elevation takes. Exact names and diagnosed collision aliases are left; changed slots are
 /// returned. `current` re-reads the caller's naming intent after each name read, before any
 /// write, so a newer choice retires this work without undoing an earlier name already set.
+///
+/// The guard is the rule file's metadata alone, so an explicit attempt also tries a rule an
+/// older build wrote that may still admit these names; `sudo -n` asks nothing either way. An
+/// automatic caller first holds [`name_rule_current`] to `Ok(true)`.
 ///
 /// # Errors
 /// No rule is in place (the next elevation names the Mac), or a

@@ -371,6 +371,11 @@ impl<C: Ctl> Session<'_, C> {
                 "(`[harness] stall_term = true` ends it)",
             );
         }
+        // An unconfirmed agent is never restarted: the restart is withheld here, as the turn
+        // end's Restart is at its decision, and the person is warned once, as with the remedy off.
+        if self.observing() {
+            return self.withhold_stall_restart(read, &stall, seq, review);
+        }
         let leader = self.stall_host.as_ref().and_then(|h| h.agent_pid());
         let pid = leader.map(|p| format!("pid={p}"));
         let quiet = format!("quiet={}", self.stall_grace_s);
@@ -382,6 +387,9 @@ impl<C: Ctl> Session<'_, C> {
         let r = self.call(&args)?;
         if self.unserved(&r) {
             return Err(Fail::Lost(format!("restart failed: {}", r.stderr.trim())));
+        }
+        if super::observe::refused(&r) {
+            return self.withhold_stall_restart(read, &stall, seq, review);
         }
         if crate::supervise::report::without_verb(&r) {
             return self.stall_signal_term(&stall, seq, review);
@@ -413,6 +421,22 @@ impl<C: Ctl> Session<'_, C> {
             ))
             .map_err(Fail::Hard)?;
         Ok(())
+    }
+
+    /// The stall remedy withheld from an unconfirmed agent ([`Self::observing`]): counted as the
+    /// episode's remedy, so it is said once, `STALL-WARNED … ended=no (<why>)`
+    /// ([`super::observe::RESTART_WITHHELD`]), and the person warned as with the remedy off.
+    fn withhold_stall_restart(
+        &mut self,
+        read: &StallRead,
+        stall: &WorkerStall,
+        seq: u64,
+        review: &mut dyn Review,
+    ) -> Result<(), Fail> {
+        self.stall_termed = true;
+        let after = self.after_restart();
+        let why = format!("({})", super::observe::RESTART_WITHHELD);
+        self.warn_stall(read, stall, &after, seq, review, &why)
     }
 
     /// The warning in place of the remedy, once an episode: said `STALL-WARNED … ended=no <why>`,

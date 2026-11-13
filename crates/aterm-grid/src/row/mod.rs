@@ -406,21 +406,7 @@ impl Row {
     /// Set the line size attribute.
     #[inline]
     pub fn set_line_size(&mut self, size: LineSize) {
-        self.flags.remove(
-            RowFlags::DOUBLE_WIDTH | RowFlags::DOUBLE_HEIGHT_TOP | RowFlags::DOUBLE_HEIGHT_BOTTOM,
-        );
-        match size {
-            LineSize::SingleWidth => {}
-            LineSize::DoubleWidth => {
-                self.flags |= RowFlags::DOUBLE_WIDTH;
-            }
-            LineSize::DoubleHeightTop => {
-                self.flags |= RowFlags::DOUBLE_WIDTH | RowFlags::DOUBLE_HEIGHT_TOP;
-            }
-            LineSize::DoubleHeightBottom => {
-                self.flags |= RowFlags::DOUBLE_WIDTH | RowFlags::DOUBLE_HEIGHT_BOTTOM;
-            }
-        }
+        self.restore_line_size(size);
         if matches!(
             size,
             LineSize::DoubleWidth | LineSize::DoubleHeightTop | LineSize::DoubleHeightBottom
@@ -436,6 +422,29 @@ impl Row {
                 if start < old_len {
                     self.recalculate_len_up_to(start);
                 }
+            }
+        }
+        self.flags |= RowFlags::DIRTY;
+    }
+
+    /// Set the line size attribute without the blanking [`Self::set_line_size`] does.
+    ///
+    /// A checkpoint restore puts back the live row's own cells, the half a double-width size hides included, so it must not blank what a later ICH, SR or REP moved there.
+    #[inline]
+    pub(crate) fn restore_line_size(&mut self, size: LineSize) {
+        self.flags.remove(
+            RowFlags::DOUBLE_WIDTH | RowFlags::DOUBLE_HEIGHT_TOP | RowFlags::DOUBLE_HEIGHT_BOTTOM,
+        );
+        match size {
+            LineSize::SingleWidth => {}
+            LineSize::DoubleWidth => {
+                self.flags |= RowFlags::DOUBLE_WIDTH;
+            }
+            LineSize::DoubleHeightTop => {
+                self.flags |= RowFlags::DOUBLE_WIDTH | RowFlags::DOUBLE_HEIGHT_TOP;
+            }
+            LineSize::DoubleHeightBottom => {
+                self.flags |= RowFlags::DOUBLE_WIDTH | RowFlags::DOUBLE_HEIGHT_BOTTOM;
             }
         }
         self.flags |= RowFlags::DIRTY;

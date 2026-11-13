@@ -131,7 +131,7 @@ fn the_units_inks_read_on_every_ground_and_day_stays_vivid() {
         };
         for palette in palettes {
             let what = format!("{name}, {palette:?}");
-            let vivid = name == "Aterm Day"
+            let vivid = name == "aterm Day"
                 && matches!(palette, Some(CardPalette::Cruise | CardPalette::Land));
             for rule in rule_greys(blank) {
                 let glass = rule_glass(palette, rule, blank);
@@ -203,15 +203,14 @@ fn the_units_inks_read_on_every_ground_and_day_stays_vivid() {
     );
 }
 
-/// A CARD THAT WEARS THE GLASS STANDS ON THE PANE'S GROUND, AND A STOP ON A WASH OF THE WARN INK
-/// (§1.4, §4.1, review 2026-11-07): over every built-in scheme under Cruise and Land, every cell
-/// of the card inside its border (its words, its rules, its drawn rows) has the pane's ground,
-/// the ground the glass's inks are solved on, so Day's letters are not floored on the band's grey
-/// into olive and brown; a warn cell (`╳`, a lane's out line) alone stands on a wash of the warn
-/// ink, so it reads apart from the projected line's letters even where a letter takes the warn's
-/// hue (Land's orange). With no palette the card keeps the band's grey. Negative controls: the
-/// card on the band's grey under a palette (S6 before this review) misses the pane's ground; a
-/// warn cell with no wash shares the letters' ground.
+/// A CARD STANDS ON THE PANE'S GROUND, AND A STOP ON A WASH OF THE WARN INK (§1.4, §4.1): over
+/// every built-in scheme under Cruise and Land, every cell of the card's rows between its blank
+/// first and last column (its words, its rules, its drawn rows) has the pane's ground, the
+/// ground the glass's inks are solved on, so Day's letters are not floored on another grey into
+/// olive and brown; a drawn row's warn cell (`╳`) alone stands on a ground of its own, a wash
+/// of the warn ink, so it reads apart from the projected line's letters even where a letter
+/// takes the warn's hue (Land's orange), and exactly one cell does. With no palette the card
+/// stands on the pane's ground too.
 #[test]
 fn a_glass_card_stands_on_the_panes_ground_and_a_stop_on_a_warn_wash() {
     use aterm_effects::harness_card::CardPalette;
@@ -253,10 +252,9 @@ fn a_glass_card_stands_on_the_panes_ground_and_a_stop_on_a_warn_wash() {
         }
         let plain =
             crate::autopilot_menu::paint(rect, &card_rows(), Default::default(), None, theme, None);
-        let grey = crate::tab_menu::menu_colors(theme).card_bg;
         assert!(
-            plain[1][1..rect.w - 1].iter().all(|c| c.bg == grey),
-            "{name}: no palette, the band's grey"
+            plain[1][1..rect.w - 1].iter().all(|c| c.bg == pane),
+            "{name}: no palette, the pane's own ground too"
         );
     }
     assert!(checked > 0);
@@ -274,7 +272,7 @@ fn a_glass_card_stands_on_the_panes_ground_and_a_stop_on_a_warn_wash() {
 /// it is grey, below the vivid law.
 #[test]
 fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
-    use aterm_effects::glass_inks::{GlassInks, field};
+    use aterm_effects::glass_inks::field;
     use aterm_effects::harness_card::CardPalette;
     let accents: Vec<(&str, Option<[u8; 3]>)> = std::iter::once(("its own", None))
         .chain(MAC_ACCENTS.iter().map(|&(name, c)| (name, Some(c))))
@@ -298,7 +296,7 @@ fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
         };
         let theme = aterm_render::Theme::from(&scheme);
         for palette in palettes {
-            let vivid = name == "Aterm Day"
+            let vivid = name == "aterm Day"
                 && matches!(palette, Some(CardPalette::Cruise | CardPalette::Land));
             let mut first: Option<Vec<Vec<RenderCell>>> = None;
             for &(accent_name, accent) in &accents {
@@ -307,16 +305,8 @@ fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
                     on_light: c,
                 }));
                 let what = format!("{name}, {palette:?}, {accent_name} accent");
-                let menu = match palette {
-                    Some(_) => crate::tab_menu::glass_menu_colors(theme),
-                    None => crate::tab_menu::menu_colors(theme),
-                };
-                let glass = GlassInks::of(
-                    palette,
-                    pack_rgb(menu.card_bg),
-                    theme.fg & 0x00FF_FFFF,
-                    pack_rgb(menu.rule),
-                );
+                let menu = crate::autopilot_menu::CardInks::of(theme, palette);
+                let glass = menu.glass;
                 let light = !glass.dark();
                 let painted = crate::autopilot_menu::paint(
                     rect,
@@ -331,7 +321,7 @@ fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
                     let k = reads(cell.fg, cell.bg);
                     let (want, floor, bold) = match cell.ch {
                         '\u{2583}' | '\u{2585}' => {
-                            let meter = legible_on(menu.band.accent, menu.card_bg);
+                            let meter = legible_on(menu.accent, menu.ground);
                             accent_meters += usize::from(meter != rgb_of(glass.mark(at)));
                             if vivid {
                                 assert!(day_vivid(pack_rgb(cell.fg)), "{what}: a level on Day");
@@ -348,12 +338,12 @@ fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
                             let hued = glass.warn() != glass.lit();
                             let ground = if hued {
                                 crate::chrome_band::mix3(
-                                    menu.card_bg,
+                                    menu.ground,
                                     rgb_of(glass.warn()),
                                     crate::autopilot_menu::WARN_WASH,
                                 )
                             } else {
-                                menu.card_bg
+                                menu.ground
                             };
                             assert_eq!(cell.bg, ground, "{what}: the warn wash");
                             let ink = aterm_effects::color_math::floor_contrast_keeping_hue(
@@ -372,14 +362,31 @@ fn the_cards_outlook_inks_read_on_every_ground_and_day_stays_vivid() {
                 }
                 let note: String = painted[2].iter().map(|c| c.ch).collect();
                 assert!(note.contains("\u{2573} out ~Wed"), "{what}: {note:?}");
-                for cell in painted[2]
-                    .iter()
-                    .filter(|c| c.ch != ' ' && c.ch != '\u{2502}')
-                {
-                    assert_eq!(cell.fg, rgb_of(glass.warn()), "{what}: the warn words");
+                for cell in painted[2].iter().filter(|c| c.ch != ' ') {
+                    // The note's words stand on a pill of the warn ink where it has a hue
+                    // (the frame's, under its cells), floored on it as a drawn row's are.
+                    let hued = glass.warn() != glass.lit();
+                    let wash = if hued {
+                        crate::chrome_band::mix3(
+                            menu.ground,
+                            rgb_of(glass.warn()),
+                            crate::autopilot_menu::WARN_WASH,
+                        )
+                    } else {
+                        menu.ground
+                    };
+                    let ink = aterm_effects::color_math::floor_contrast_keeping_hue(
+                        glass.warn(),
+                        pack_rgb(wash),
+                        NAME_CONTRAST,
+                    );
+                    assert_eq!(cell.fg, rgb_of(ink), "{what}: the warn words");
+                    assert_eq!(cell.bg, menu.ground, "{what}: the wash is no cell's ground");
                     assert!(cell.bold, "{what}: the warn words are bold");
-                    let k = reads(cell.fg, menu.card_bg);
-                    assert!(k >= NAME_CONTRAST, "{what}: card warn words {k:.2}:1");
+                    for ground in [wash, menu.ground] {
+                        let k = reads(cell.fg, ground);
+                        assert!(k >= NAME_CONTRAST, "{what}: card warn words {k:.2}:1");
+                    }
                 }
                 let drawn: Vec<Vec<RenderCell>> = painted[1..3].to_vec();
                 match &first {

@@ -491,12 +491,9 @@ fn a_name_in_no_utf8_is_named_lossily() {
         .to_string();
     let mut entry = format!("100644,{blob},bad").into_bytes();
     entry.extend_from_slice(b"\xffname");
-    let mut cmd = aterm_uds::spawnfd::command(crate::test_program::git());
-    if let Some(exec_path) = crate::test_program::git_exec_path() {
-        cmd.env("GIT_EXEC_PATH", exec_path);
-    }
     let staged = aterm_uds::deadline::output_until(
-        cmd.args(["update-index", "--add", "--cacheinfo"])
+        crate::test_program::kept_git_command()
+            .args(["update-index", "--add", "--cacheinfo"])
             .arg(std::ffi::OsStr::from_bytes(&entry))
             .current_dir(&work)
             .env("GIT_CONFIG_NOSYSTEM", "1")

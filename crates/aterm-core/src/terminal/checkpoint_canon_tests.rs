@@ -214,6 +214,28 @@ fn a_version_2_stream_is_refused_at_its_version() {
     );
 }
 
+/// The visible rows' line sizes and protected runs are in the canonical bytes: a checkpoint
+/// holding them decodes to itself, and dropping either list changes the bytes.
+#[test]
+fn the_visible_cells_are_in_the_canonical_bytes() {
+    let mut t = Terminal::new(4, 20);
+    t.process(b"\x1b#6WIDE\r\n\x1b[1\"qKEEP\x1b[0\"q gone");
+    let c = t.checkpoint();
+    assert!(
+        !c.visible_cells.line_sizes.is_empty() && !c.visible_cells.protected.is_empty(),
+        "precondition: a double-width row and a protected run: {:?}",
+        c.visible_cells
+    );
+    let bytes = c.canonical();
+    assert_eq!(TerminalCheckpoint::from_canonical(&bytes), Ok(c.clone()));
+    let mut unprotected = c.clone();
+    unprotected.visible_cells.protected.clear();
+    assert_ne!(unprotected.canonical(), bytes);
+    let mut single_width = c;
+    single_width.visible_cells.line_sizes.clear();
+    assert_ne!(single_width.canonical(), bytes);
+}
+
 #[test]
 fn a_config_decodes_to_itself_and_a_poisoned_field_changes_its_bytes() {
     let mut config = TerminalConfig::default();

@@ -4869,6 +4869,8 @@ fn the_sign_in_aterm_runs_itself_is_said_to_be_aterms() {
 /// session on `main` the words point at the report's `at a weekly limit:` line; where nothing moves
 /// one (a build that runs only `main`, rotation off, the OS keyring, a CLI none of whose running
 /// sessions moves, a host no handoff is qualified on) they do not, and the report has no such line.
+/// Where a limit moves a codex-alab session the words also name the way to move one by asking
+/// (`restart account=`); they name it for no other CLI and nowhere a session cannot move.
 /// Each is read of a pin and of its end.
 #[test]
 fn use_and_the_report_say_one_thing_of_a_running_session() {
@@ -4921,6 +4923,11 @@ fn use_and_the_report_say_one_thing_of_a_running_session() {
             assert_eq!(
                 out.contains("`at a weekly limit:`"),
                 moves,
+                "{world}: {label:?}: {out}"
+            );
+            assert_eq!(
+                out.contains("restart account=<label>"),
+                moves && cli == Cli::Codex,
                 "{world}: {label:?}: {out}"
             );
         }

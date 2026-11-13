@@ -9,8 +9,15 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn git_home(dir: &Path, args: &[&str], home: &Path) {
-    let mut cmd = aterm_uds::spawnfd::command(crate::test_program::git());
+    let mut cmd = crate::test_program::kept_git_command();
+    // `env_clear` drops what the builder set too (where the kept Git finds its scripted
+    // commands and init templates), so the cleared environment starts with it again.
+    let named: Vec<_> = cmd
+        .get_envs()
+        .filter_map(|(key, value)| Some((key.to_owned(), value?.to_owned())))
+        .collect();
     cmd.env_clear()
+        .envs(named)
         .env("PATH", std::env::var("PATH").unwrap_or_default())
         .env("HOME", home)
         .env("GIT_CONFIG_NOSYSTEM", "1")

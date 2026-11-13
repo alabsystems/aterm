@@ -41,6 +41,190 @@ fn only_an_external_frontend_loses_the_config_words() {
 use super::*;
 
 #[test]
+fn unreadable_initial_manifests_do_not_select_a_compatibility_file_or_parent() {
+    for (name, directory) in [
+        ("Cargo.toml", true),
+        ("Targo.toml", true),
+        ("Cargo.toml", false),
+        ("Targo.toml", false),
+    ] {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let home = scratch.path();
+        let parent = home.join("source");
+        let child = parent.join("member");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(parent.join("Cargo.toml"), "[workspace]\n").unwrap();
+        if name == "Targo.toml" {
+            std::fs::write(child.join("Cargo.toml"), "[workspace]\n").unwrap();
+        }
+        let manifest = child.join(name);
+        if directory {
+            std::fs::create_dir(&manifest).unwrap();
+        } else {
+            std::fs::write(&manifest, [0xff]).unwrap();
+        }
+        // Configuration discovery ignores non-files, but initial manifest discovery
+        // stops on the same existing path the driver selects before trying to read it.
+        #[cfg(unix)]
+        if directory {
+            assert_eq!(read_config(&manifest), Ok(None));
+        }
+        let machine = Machine {
+            home: Some(home),
+            root: None,
+            cwd: Some(&child),
+            env: &|_| None,
+            read: &read_config,
+            read_manifest: &read_manifest,
+            writable: &|_| Some(true),
+        };
+        assert_eq!(
+            initial_manifest(&machine, true),
+            InitialManifest::Unreadable(manifest),
+            "{name}, directory={directory}"
+        );
+    }
+}
+
+#[test]
+fn native_manifest_discovery_keeps_directory_priority_and_explicit_overrides() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let parent = home.join("workspace");
+    let member = parent.join("member");
+    for shape in [
+        "native-only",
+        "native-preferred",
+        "nearest-cargo",
+        "preferred-unreadable",
+        "explicit-cargo",
+    ] {
+        let read = |path: &Path| {
+            if path == member.join("Targo.toml") {
+                return match shape {
+                    "nearest-cargo" => Ok(None),
+                    "preferred-unreadable" | "explicit-cargo" => Err(()),
+                    _ => Ok(Some("[workspace]".into())),
+                };
+            }
+            Ok((path == parent.join("Targo.toml")
+                || path == parent.join("Cargo.toml")
+                || (shape != "native-only" && path == member.join("Cargo.toml")))
+            .then(|| "[workspace]".into()))
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&member),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let mut args = vec![
+            "--unverified".into(),
+            "build".into(),
+            "--target-dir".into(),
+            home.join("output").display().to_string(),
+        ];
+        if shape == "explicit-cargo" {
+            args.extend([
+                "--manifest-path".into(),
+                member.join("Cargo.toml").display().to_string(),
+            ]);
+        }
+        let selected = explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None);
+        let expected = match shape {
+            "preferred-unreadable" => None,
+            "nearest-cargo" | "explicit-cargo" => Some(member.join("Cargo.toml")),
+            _ => Some(member.join("Targo.toml")),
+        };
+        assert_eq!(
+            selected.map(|cache| cache.manifests),
+            expected.map(|path| vec![path]),
+            "{shape}"
+        );
+    }
+}
+
+#[test]
+fn native_manifest_discovery_reaches_a_distant_compatibility_manifest() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let owner = home.join("workspace");
+    let mut cwd = owner.clone();
+    for _ in 0..40 {
+        cwd.push("nested");
+    }
+    let read = |path: &Path| Ok((path == owner.join("Cargo.toml")).then(|| "[workspace]".into()));
+    let machine = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &|_| None,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    let args = vec![
+        "--unverified".into(),
+        "build".into(),
+        "--target-dir".into(),
+        home.join("output").display().to_string(),
+    ];
+    let selected = explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None).unwrap();
+    assert_eq!(selected.manifests, vec![owner.join("Cargo.toml")]);
+}
+
+#[test]
+fn implicit_manifest_selection_distinguishes_absence_from_read_errors() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let parent = home.join("workspace");
+    let cwd = parent.join("member");
+    for tool in [Tool::Targo, Tool::CargoCompat, Tool::Cargo] {
+        for shape in ["readable", "absent", "unreadable"] {
+            let read = |path: &Path| {
+                if path == cwd.join("Cargo.toml") {
+                    return match shape {
+                        "readable" => Ok(Some("[workspace]".into())),
+                        "absent" => Ok(None),
+                        _ => Err(()),
+                    };
+                }
+                Ok((path == parent.join("Cargo.toml")).then(|| "[workspace]".into()))
+            };
+            let machine = Machine {
+                home: Some(&home),
+                root: None,
+                cwd: Some(&cwd),
+                env: &|_| None,
+                read: &read,
+                read_manifest: &read,
+                writable: &|_| Some(true),
+            };
+            let args = vec![
+                "--unverified".into(),
+                "build".into(),
+                "--target-dir".into(),
+                home.join("output").display().to_string(),
+            ];
+            let selected = explicit_cache(&args, tool, &machine, &|_| UserAlias::None);
+            let expected = match shape {
+                "readable" => Some(cwd.join("Cargo.toml")),
+                "absent" => Some(parent.join("Cargo.toml")),
+                _ => None,
+            };
+            assert_eq!(
+                selected.map(|selection| selection.manifests),
+                expected.map(|path| vec![path]),
+                "{tool:?}: {shape}"
+            );
+        }
+    }
+}
+
+#[test]
 fn explicit_outputs_keep_independent_winners_and_definition_bases() {
     let scratch = aterm_tempfile::tempdir().unwrap();
     let home = scratch.path().join("home");
@@ -82,6 +266,7 @@ fn explicit_outputs_keep_independent_winners_and_definition_bases() {
                 cwd: Some(&cwd),
                 env: &env,
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             let mut args = vec![
@@ -94,7 +279,7 @@ fn explicit_outputs_keep_independent_winners_and_definition_bases() {
             let selected = explicit_cache(&args, tool, &machine, &|_| UserAlias::None).unwrap();
             assert_eq!(selected.target, target);
             assert_eq!(selected.intermediates, Some(intermediate));
-            assert_eq!(selected.manifest, cwd.join("Cargo.toml"));
+            assert_eq!(selected.manifests, vec![cwd.join("Cargo.toml")]);
         }
     }
 }
@@ -120,6 +305,7 @@ fn explicit_intermediates_require_a_known_path_and_frontend() {
                 cwd: Some(&cwd),
                 env: &env,
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             let args = [
@@ -150,6 +336,7 @@ fn proof_frontend_output_selection_requires_its_own_provenance() {
         cwd: Some(&cwd),
         env: &|_| None,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     for config in [
@@ -250,6 +437,7 @@ fn a_configured_target_is_the_one_every_targo_reads() {
             cwd: Some(&cwd),
             env: &env,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         assert_eq!(
@@ -280,9 +468,8 @@ fn configured_final_targets_follow_cargo_precedence_without_guessing() {
     let config = root.join(".cargo/config.toml");
     let legacy = root.join(".cargo/config");
     let outer = home.join(".cargo/config.toml");
-    // The file the include rows name is there and names nothing: an include that names no file,
-    // though not optional, Targo refuses, and [`config_dirs`] takes it for one that may name a
-    // build directory, so no target is owned for it, even one the caller chose.
+    // The included file is present and neutral. Known Trust compile fronts can resolve
+    // the outer target through it; the upstream target hint still has no include capability.
     let layout = root.join(".cargo/layout.toml");
     let manifest = root.join("Cargo.toml");
     let args = ["--unverified".into(), "build".into()];
@@ -329,11 +516,17 @@ fn configured_final_targets_follow_cargo_precedence_without_guessing() {
             cwd: Some(&cwd),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
+        };
+        let trust_expected = if text == "include = ['layout.toml']" {
+            Some(home.join("outer"))
+        } else {
+            expected.clone()
         };
         assert_eq!(
             explicit_cache(&args, Tool::Targo, &machine, &|_| UserAlias::None).map(|c| c.target),
-            expected,
+            trust_expected,
             "{text}"
         );
         match &expected {
@@ -372,6 +565,7 @@ fn target_lookup_distinguishes_cargo_defaults_and_invalid_overrides() {
         cwd: Some(cwd),
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| None,
     };
     assert_eq!(target_hint(&machine, Tool::Cargo).unwrap(), None);
@@ -405,6 +599,7 @@ fn target_lookup_distinguishes_cargo_defaults_and_invalid_overrides() {
         target_hint(
             &Machine {
                 read: &|_| Err(()),
+                read_manifest: &|_| Err(()),
                 ..machine
             },
             Tool::Cargo
@@ -504,6 +699,7 @@ fn target_lookup_distinguishes_cargo_defaults_and_invalid_overrides() {
                 home: Some(home),
                 env: &env,
                 read: &read,
+                read_manifest: &read,
                 ..machine
             },
             Tool::Targo,
@@ -532,6 +728,7 @@ fn target_lookup_distinguishes_cargo_defaults_and_invalid_overrides() {
                     home: Some(home),
                     env: &env,
                     read: &read,
+                    read_manifest: &read,
                     ..machine
                 },
                 Tool::Targo
@@ -1039,6 +1236,7 @@ fn with_env<R>(env: &[(&str, &str)], cwd: Option<&Path>, f: impl FnOnce(&Machine
         cwd,
         env: &lookup,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(true),
     })
 }
@@ -1149,6 +1347,7 @@ fn caller_intermediates_follow_cargo_precedence_and_original_config_bases() {
             cwd: Some(&cwd),
             env: &env,
             read: &read,
+            read_manifest: &read,
             writable: &|_| None,
         };
         let hint = cargo_build_dir_hint_with(&machine).unwrap().unwrap();
@@ -1197,6 +1396,7 @@ fn caller_intermediates_preserve_valid_templates_and_refuse_unresolved_choices()
             cwd: Some(&cwd),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| None,
         };
         let hint = cargo_build_dir_hint_with(&machine).unwrap().unwrap();
@@ -1221,6 +1421,7 @@ fn caller_intermediates_preserve_valid_templates_and_refuse_unresolved_choices()
             cwd: Some(&cwd),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| None,
         };
         assert!(cargo_build_dir_hint_with(&machine).is_err(), "{text}");
@@ -1231,6 +1432,7 @@ fn caller_intermediates_preserve_valid_templates_and_refuse_unresolved_choices()
         cwd: Some(&cwd),
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| None,
     };
     assert_eq!(cargo_build_dir_hint_with(&machine).unwrap(), None);
@@ -1244,6 +1446,7 @@ fn caller_intermediates_preserve_valid_templates_and_refuse_unresolved_choices()
     assert!(
         cargo_build_dir_hint_with(&Machine {
             read: &|_| Err(()),
+            read_manifest: &|_| Err(()),
             ..machine
         })
         .is_err()
@@ -1349,6 +1552,86 @@ fn the_cache_root_is_quiet_and_noindex() {
     assert!(!aterm_tempfile::is_quiet(&old), "{old:?}");
     assert_eq!(old.file_name(), root.file_name());
     assert_ne!(old, root);
+
+    let home = PathBuf::from(native("/h"));
+    let root = cache_root(&home);
+    let cwd = home.join("source");
+    let args = ["--unverified".into(), "build".into()];
+    for existing in [
+        home.clone(),
+        home.join("Library"),
+        home.join("Library/Caches"),
+        root.parent().unwrap().to_owned(),
+        root.clone(),
+    ] {
+        let writable = |path: &Path| {
+            assert!(
+                path.starts_with(&home),
+                "never inspect above the selected home"
+            );
+            (path == existing).then_some(true)
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &|_| None,
+            read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
+            writable: &writable,
+        };
+        assert!(
+            matches!(
+                super::decide(&args, Tool::Targo, &machine),
+                Some(BuildDir::Cache(_))
+            ),
+            "{existing:?}"
+        );
+    }
+    for blocked in [
+        home.clone(),
+        home.join("Library"),
+        home.join("Library/Caches"),
+        root.parent().unwrap().to_owned(),
+        root.clone(),
+    ] {
+        let writable = |path: &Path| {
+            if path == blocked {
+                Some(false)
+            } else {
+                (path == home).then_some(true)
+            }
+        };
+        let machine = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &|_| None,
+            read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
+            writable: &writable,
+        };
+        assert!(
+            matches!(
+                super::decide(&args, Tool::Targo, &machine),
+                Some(BuildDir::Target(_))
+            ),
+            "{blocked:?}"
+        );
+    }
+    let unknown = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &|_| None,
+        read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
+        writable: &|_| None,
+    };
+    assert!(matches!(
+        super::decide(&args, Tool::Targo, &unknown),
+        Some(BuildDir::Target(_))
+    ));
 }
 
 /// A shim's `__atb_c` line names the root it builds in: this version's quiet one, or the
@@ -1444,6 +1727,7 @@ fn decide(
         cwd: cwd.as_deref().map(Path::new),
         env: &lookup,
         read: &read,
+        read_manifest: &read,
         writable: &writable,
     };
     target_build_dir(Path::new(&native(target)), &m)
@@ -1624,6 +1908,7 @@ fn cli_include_graphs_preserve_target_custody_only_when_every_layer_does() {
             cwd: Some(&cwd),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         for config in [
@@ -1683,6 +1968,7 @@ fn included_targets_keep_definition_bases_and_cargo_merge_order() {
             cwd: Some(&cwd),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let args = ["--unverified", "build", "--config", "cfg/root.toml"]
@@ -1740,6 +2026,7 @@ fn explicit_targets_accept_only_proven_directory_neutral_config_files() {
                 cwd: Some(&cwd),
                 env: &|_| None,
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             for config in [
@@ -1759,7 +2046,7 @@ fn explicit_targets_accept_only_proven_directory_neutral_config_files() {
                 let selected = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
                     .expect("readable directory-neutral file preserves explicit target custody");
                 assert_eq!(selected.target, cwd.join("fresh.noindex"));
-                assert_eq!(selected.manifest, manifest);
+                assert_eq!(selected.manifests, vec![manifest.clone()]);
                 // Observation grants no new placement behavior and never rewrites argv.
                 assert!(super::decide(&args, Tool::Targo, &m).is_none());
             }
@@ -1794,6 +2081,7 @@ fn config_files_with_unresolved_output_choices_grant_no_explicit_target() {
             cwd: Some(&cwd),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let args = [
@@ -1841,6 +2129,7 @@ fn explicit_target_custody_parses_neutral_inline_config_values() {
                 cwd: Some(&cwd),
                 env: &|_| None,
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             for config in [
@@ -1864,7 +2153,7 @@ fn explicit_target_custody_parses_neutral_inline_config_values() {
                     let selected =
                         selected.expect("neutral parsed inline data preserves target custody");
                     assert_eq!(selected.target, cwd.join("fresh.noindex"));
-                    assert_eq!(selected.manifest, cwd.join("Cargo.toml"));
+                    assert_eq!(selected.manifests, vec![cwd.join("Cargo.toml")]);
                 }
             }
         }
@@ -1882,6 +2171,7 @@ fn inline_configs_with_unknown_or_escaped_output_selection_grant_no_target() {
         cwd: Some(&cwd),
         env: &|_| None,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     for value in [
@@ -1945,6 +2235,7 @@ fn explicit_target_selection_outranks_config_target_keys() {
                 cwd: Some(&cwd),
                 env: &env,
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             let mut args = vec![
@@ -1963,7 +2254,7 @@ fn explicit_target_selection_outranks_config_target_keys() {
             let chosen = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
                 .expect("explicit target overrides config target-dir");
             assert_eq!(chosen.target, cwd.join("chosen.noindex"));
-            assert_eq!(chosen.manifest, manifest);
+            assert_eq!(chosen.manifests, vec![manifest.clone()]);
         }
     }
 }
@@ -1989,6 +2280,7 @@ fn neutral_or_overridden_cli_files_need_no_target_path_base() {
             cwd: Some(&cwd),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let args = [
@@ -2045,6 +2337,7 @@ fn unresolved_cli_include_graphs_never_grant_custody() {
                 cwd: Some(&cwd),
                 env: &|_| None,
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             let mut args = vec![
@@ -2086,6 +2379,7 @@ fn cli_include_seen_sets_match_file_and_inline_argument_scopes() {
         cwd: Some(&cwd),
         env: &|_| None,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     for value in ["settings.toml", text] {
@@ -2133,6 +2427,7 @@ fn cli_include_observation_bounds_aggregate_text_before_retaining_layers() {
         cwd: Some(&cwd),
         env: &|_| None,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     let args = [
@@ -2187,6 +2482,7 @@ fn cli_include_observation_bounds_depth_and_optional_missing_reads() {
             cwd: Some(&cwd),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let args = [
@@ -2208,6 +2504,570 @@ fn cli_include_observation_bounds_depth_and_optional_missing_reads() {
 }
 
 #[test]
+fn discovered_include_observation_bounds_optional_missing_reads() {
+    use std::cell::Cell;
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("workspace");
+    let dir = cwd.join(".cargo");
+    let root = dir.join("config.toml");
+    let text = format!(
+        "include=[{}]",
+        (0..1100)
+            .map(|n| format!("{{path='{n}.toml',optional=true}}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let reads = Cell::new(0);
+    let read = |p: &Path| {
+        if p == root {
+            return Ok(Some(text.clone()));
+        }
+        if p.file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.parse::<usize>().is_ok())
+        {
+            reads.set(reads.get() + 1);
+        }
+        Ok(None)
+    };
+    let m = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &|_| None,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    let named = config_dirs(&dir, &m);
+    assert!(
+        reads.get() <= 1024,
+        "bounded missing reads, got {}",
+        reads.get()
+    );
+    assert!(
+        named.build && named.target,
+        "an incomplete graph names both outputs"
+    );
+    let args = ["--unverified", "build", "--target-dir", "chosen"].map(str::to_owned);
+    assert!(explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none());
+}
+
+#[test]
+fn discovered_include_observation_bounds_aggregate_text() {
+    use std::cell::Cell;
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("workspace");
+    let dir = cwd.join(".cargo");
+    let reads = Cell::new(0);
+    let read = |p: &Path| {
+        let n = if p == dir.join("config.toml") {
+            Some(0)
+        } else {
+            p.file_stem()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<usize>().ok())
+        };
+        Ok(n.map(|n| {
+            reads.set(reads.get() + 1);
+            let mut text = if n < 20 {
+                format!("include=['{}.toml']\n#", n + 1)
+            } else {
+                "#".into()
+            };
+            text.push_str(&"x".repeat((1 << 20) - text.len()));
+            text
+        }))
+    };
+    let m = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &|_| None,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    let named = config_dirs(&dir, &m);
+    assert!(
+        reads.get() <= 17,
+        "stop after the first layer beyond 16 MiB, got {}",
+        reads.get()
+    );
+    assert!(
+        named.build && named.target,
+        "an incomplete graph names both outputs"
+    );
+}
+
+#[test]
+fn discovered_include_observation_bounds_deep_and_wide_graphs_before_loading_more() {
+    use std::cell::Cell;
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("workspace");
+    let dir = cwd.join(".cargo");
+    for wide in [false, true] {
+        let reads = Cell::new(0);
+        let read = |p: &Path| {
+            if p == dir.join("config") {
+                return Ok(None);
+            }
+            let n = if p == dir.join("config.toml") {
+                Some(0)
+            } else {
+                p.file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<usize>().ok())
+            };
+            Ok(n.map(|n| {
+                reads.set(reads.get() + 1);
+                if wide {
+                    format!(
+                        "include=[{}]",
+                        (0..5000)
+                            .map(|n| format!("'{n}.toml'"))
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                } else if n < 5000 {
+                    format!("include=['{}.toml']", n + 1)
+                } else {
+                    String::new()
+                }
+            }))
+        };
+        let m = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let named = config_dirs(&dir, &m);
+        assert!(named.build && named.target);
+        if wide {
+            assert_eq!(
+                reads.get(),
+                1,
+                "oversized pending work loads no included file"
+            );
+        } else {
+            assert!(
+                reads.get() <= 1024,
+                "an acyclic graph has a finite read bound"
+            );
+        }
+    }
+}
+
+#[test]
+fn discovered_include_observation_preserves_conservative_markers_and_fresh_root_cycles() {
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("workspace");
+    let dir = cwd.join(".cargo");
+    for (root, included, build, target) in [
+        ("build.jobs=2", "", false, false),
+        ("# include build-dir target-dir", "", false, false),
+        ("build.target-dir='chosen'", "", false, true),
+        (
+            "include=['nested/../shared.toml']",
+            "build.build-dir='built'",
+            true,
+            false,
+        ),
+        (
+            "include=['shared.toml']",
+            "build.target-dir='chosen'",
+            false,
+            true,
+        ),
+        (
+            "include=['shared.toml']",
+            "include=['shared.toml']",
+            true,
+            true,
+        ),
+        ("include=['shared.toml','shared.toml']", "", true, true),
+        ("include=['absent.toml']", "", true, true),
+        (
+            "include=[{path='absent.toml',optional=true}]",
+            "",
+            false,
+            false,
+        ),
+        (
+            "include=[{path='unreadable.toml',optional=true}]",
+            "",
+            true,
+            true,
+        ),
+        ("include = [", "", true, true),
+        (
+            "include=['shared.toml']",
+            "build.\"build\\u002ddir\"='built'",
+            true,
+            false,
+        ),
+    ] {
+        let read = |p: &Path| {
+            if p == dir.join("unreadable.toml") {
+                return Err(());
+            }
+            Ok(if p == dir.join("config.toml") || p == dir.join("config") {
+                Some(root.into())
+            } else if p == dir.join("shared.toml") {
+                Some(included.into())
+            } else {
+                None
+            })
+        };
+        let m = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let named = config_dirs(&dir, &m);
+        assert_eq!(
+            (named.build, named.target),
+            (build, target),
+            "{root} / {included}"
+        );
+    }
+}
+
+#[test]
+fn discovered_outputs_keep_independent_winners_and_definition_bases() {
+    let home = PathBuf::from(native("/home/person"));
+    let project = home.join("project");
+    let cwd = project.join("member");
+    for legacy in [false, true] {
+        for explicit in [false, true] {
+            let selected = project.join(if legacy {
+                ".cargo/config"
+            } else {
+                ".cargo/config.toml"
+            });
+            let ignored = project.join(".cargo/config.toml");
+            let read = |p: &Path| {
+                if legacy && p == ignored {
+                    return Err(());
+                }
+                Ok(if p == selected {
+                    Some("include=['layers/build.toml']\nbuild.target-dir='far-final'".into())
+                } else if p == project.join(".cargo/layers/build.toml") {
+                    Some("build.build-dir='selected-build'".into())
+                } else if p == cwd.join(".cargo/config.toml") {
+                    Some("build.target-dir='near-final'".into())
+                } else if p == home.join(".cargo/config.toml") {
+                    Some("build.target-dir='home-final'\nbuild.build-dir='home-build'".into())
+                } else if p == cwd.join("Cargo.toml") {
+                    Some("[workspace]".into())
+                } else {
+                    None
+                })
+            };
+            let m = Machine {
+                home: Some(&home),
+                root: None,
+                cwd: Some(&cwd),
+                env: &|_| None,
+                read: &read,
+                read_manifest: &read,
+                writable: &|_| Some(true),
+            };
+            let mut args = vec!["--unverified".into(), "build".into()];
+            if explicit {
+                args.extend(["--target-dir".into(), "explicit-final".into()]);
+            }
+            let chosen = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
+                .expect("complete discovered outputs retain independent winners");
+            assert_eq!(
+                chosen.target,
+                cwd.join(if explicit {
+                    "explicit-final"
+                } else {
+                    "near-final"
+                })
+            );
+            assert_eq!(
+                chosen.intermediates,
+                Some(project.join(".cargo/selected-build"))
+            );
+            assert_eq!(chosen.manifests, vec![cwd.join("Cargo.toml")]);
+        }
+    }
+}
+
+#[test]
+fn discovered_output_precedence_is_independent_for_each_selected_path() {
+    let home = PathBuf::from(native("/home/person"));
+    let project = home.join("project");
+    let cwd = project.join("member");
+    for tool in [Tool::Targo, Tool::CargoCompat] {
+        for level in 0..5 {
+            let read = |p: &Path| {
+                Ok(if p == project.join(".cargo/config.toml") {
+                    Some(
+                        "build.target-dir='discovered-final'\nbuild.build-dir='discovered-build'"
+                            .into(),
+                    )
+                } else if p == cwd.join("Cargo.toml") {
+                    Some("[workspace]".into())
+                } else {
+                    None
+                })
+            };
+            let env = |name: &str| match name {
+                "CARGO_BUILD_TARGET_DIR" if level >= 1 => Some("env-final".into()),
+                "CARGO_BUILD_BUILD_DIR" if level >= 1 => Some("env-build".into()),
+                "CARGO_TARGET_DIR" if level >= 3 => Some("direct-final".into()),
+                "TARGO_BUILD_TARGET_DIR" if level >= 1 => Some("hidden-twin-final".into()),
+                "TARGO_BUILD_BUILD_DIR" if level >= 1 => Some("hidden-twin-build".into()),
+                _ => None,
+            };
+            let m = Machine {
+                home: Some(&home),
+                root: None,
+                cwd: Some(&cwd),
+                env: &env,
+                read: &read,
+                read_manifest: &read,
+                writable: &|_| Some(true),
+            };
+            let mut args = vec!["--unverified".into(), "build".into()];
+            if level >= 2 {
+                args.extend([
+                    "--config".into(),
+                    "build.target-dir='cli-final'\nbuild.build-dir='cli-build'".into(),
+                ]);
+            }
+            if level >= 4 {
+                args.extend(["--target-dir".into(), "argv-final".into()]);
+            }
+            let chosen = explicit_cache(&args, tool, &m, &|_| UserAlias::None).unwrap();
+            let (target, build) = match level {
+                0 => (
+                    project.join("discovered-final"),
+                    project.join("discovered-build"),
+                ),
+                1 => (cwd.join("env-final"), cwd.join("env-build")),
+                2 => (cwd.join("cli-final"), cwd.join("cli-build")),
+                3 => (cwd.join("direct-final"), cwd.join("cli-build")),
+                _ => (cwd.join("argv-final"), cwd.join("cli-build")),
+            };
+            assert_eq!(
+                (chosen.target, chosen.intermediates),
+                (target, Some(build)),
+                "{tool:?} level={level}"
+            );
+        }
+    }
+}
+
+#[test]
+fn discovered_package_home_variants_must_agree_after_higher_choices() {
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("project");
+    let twin = home.join("twin");
+    let custom = home.join("packages/cargo");
+    for mode in ["ambiguous", "override", "custom", "empty-cargo-home"] {
+        let read = |p: &Path| {
+            if mode == "custom" && p.starts_with(&twin) {
+                panic!("CARGO_HOME suppresses the twin");
+            }
+            Ok(if p == twin.join("config.toml") {
+                Some("build.build-dir='twin-build'".into())
+            } else if p == custom.join("config.toml") {
+                Some("build.build-dir='custom-build'".into())
+            } else if p == cwd.join("Cargo.toml") {
+                Some("[workspace]".into())
+            } else {
+                None
+            })
+        };
+        let env = |name: &str| match name {
+            "TARGO_HOME" => Some(twin.clone().into_os_string()),
+            "CARGO_HOME" if mode == "custom" => Some(custom.clone().into_os_string()),
+            "CARGO_HOME" if mode == "empty-cargo-home" => Some(OsString::new()),
+            "CARGO_BUILD_BUILD_DIR" if mode == "override" => Some("env-build".into()),
+            _ => None,
+        };
+        let m = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let args = ["--unverified", "build", "--target-dir", "chosen"].map(str::to_owned);
+        let selected = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None);
+        if mode == "ambiguous" {
+            assert!(selected.is_none());
+            continue;
+        }
+        let chosen = selected.unwrap();
+        assert_eq!(chosen.target, cwd.join("chosen"));
+        assert_eq!(
+            chosen.intermediates,
+            match mode {
+                "override" => Some(cwd.join("env-build")),
+                "custom" => Some(home.join("packages/custom-build")),
+                _ => None,
+            }
+        );
+    }
+}
+
+#[test]
+fn discovered_output_grants_keep_unknown_graphs_frontends_and_templates_refused() {
+    let home = PathBuf::from(native("/home/person"));
+    let cwd = home.join("project");
+    for text in [
+        "include=['missing.toml']",
+        "include=['config.toml']",
+        "include=[3]",
+        "include=[{path='bad*.toml',optional=true}]",
+        "include=[",
+        "build.build-dir=false",
+        "build.build-dir=''",
+        "build.build-dir='{workspace-root}/b'",
+        "build.build-dir='../outside'",
+        "build.target-dir=3\nbuild.build-dir='b'",
+    ] {
+        let read = |p: &Path| {
+            Ok(if p == cwd.join(".cargo/config.toml") {
+                Some(text.into())
+            } else if p == cwd.join("Cargo.toml") {
+                Some("[workspace]".into())
+            } else {
+                None
+            })
+        };
+        let m = Machine {
+            home: Some(&home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let args = ["--unverified", "build", "--target-dir", "known"].map(str::to_owned);
+        assert!(
+            explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).is_none(),
+            "{text}"
+        );
+    }
+    let read = |p: &Path| {
+        Ok(if p == cwd.join(".cargo/config.toml") {
+            Some("build.build-dir='discovered'".into())
+        } else if p == cwd.join("Cargo.toml") {
+            Some("[workspace]".into())
+        } else {
+            None
+        })
+    };
+    let m = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &|_| None,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    for (tool, words) in [
+        (Tool::Cargo, vec!["build", "--target-dir", "known"]),
+        (Tool::Targo, vec!["trust", "check", "--target-dir", "known"]),
+        (Tool::Targo, vec!["--unverified", "build"]),
+    ] {
+        let args: Vec<_> = words.into_iter().map(str::to_owned).collect();
+        assert!(
+            explicit_cache(&args, tool, &m, &|_| UserAlias::None).is_none(),
+            "{tool:?}"
+        );
+    }
+    let env = |name: &str| (name == BUILD_DIR_ENV).then(|| "higher-build".into());
+    let read = |p: &Path| {
+        Ok(if p == cwd.join(".cargo/config.toml") {
+            Some("build.build-dir='{workspace-root}/unused'".into())
+        } else if p == cwd.join("Cargo.toml") {
+            Some("[workspace]".into())
+        } else {
+            None
+        })
+    };
+    let m = Machine {
+        env: &env,
+        read: &read,
+        read_manifest: &read,
+        ..m
+    };
+    let args = ["--unverified", "build", "--target-dir", "known"].map(str::to_owned);
+    assert_eq!(
+        explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
+            .unwrap()
+            .intermediates,
+        Some(cwd.join("higher-build"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn discovered_package_home_alias_of_an_ancestor_is_not_loaded_again() {
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let home = scratch.path().join("home");
+    let project = home.join("project");
+    let cwd = project.join("member");
+    let config = project.join(".cargo");
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::create_dir(&config).unwrap();
+    std::fs::write(config.join("config.toml"), "build.build-dir='chosen-build'").unwrap();
+    let alias = home.join("package-alias");
+    std::os::unix::fs::symlink(&config, &alias).unwrap();
+    let read = |p: &Path| {
+        assert!(
+            !p.starts_with(&alias),
+            "a canonical ancestor package home is skipped"
+        );
+        match std::fs::read_to_string(p) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(()),
+        }
+    };
+    let env = |name: &str| (name == "TARGO_HOME").then(|| alias.clone().into_os_string());
+    let m = Machine {
+        home: Some(&home),
+        root: None,
+        cwd: Some(&cwd),
+        env: &env,
+        read: &read,
+        read_manifest: &read,
+        writable: &|_| Some(true),
+    };
+    let args = [
+        "--unverified",
+        "build",
+        "--manifest-path",
+        "Cargo.toml",
+        "--target-dir",
+        "known",
+    ]
+    .map(str::to_owned);
+    let chosen = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None).unwrap();
+    assert_eq!(chosen.intermediates, Some(project.join("chosen-build")));
+}
+
+#[test]
 fn cli_include_support_requires_a_known_frontend_capability() {
     let home = PathBuf::from(native("/home/person"));
     let cwd = home.join("workspace");
@@ -2226,6 +3086,7 @@ fn cli_include_support_requires_a_known_frontend_capability() {
         cwd: Some(&cwd),
         env: &|_| None,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     for tool in [Tool::Cargo, Tool::CargoCompat, Tool::Targo] {
@@ -2305,6 +3166,7 @@ fn cli_config_targets_keep_the_winning_values_path_base() {
             cwd: Some(&cwd),
             env: &|key| (key == "CARGO_BUILD_TARGET_DIR").then(|| "lower.noindex".into()),
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let mut args = vec!["--unverified".into(), "build".into()];
@@ -2314,7 +3176,7 @@ fn cli_config_targets_keep_the_winning_values_path_base() {
         let selected = explicit_cache(&args, Tool::Targo, &m, &|_| UserAlias::None)
             .expect("parsed CLI config selects its target before config-level environment");
         assert_eq!(selected.target, expected);
-        assert_eq!(selected.manifest, manifest);
+        assert_eq!(selected.manifests, vec![manifest.clone()]);
     }
 }
 
@@ -2349,6 +3211,7 @@ fn config_targets_preserve_higher_override_and_program_boundaries() {
             cwd: Some(&cwd),
             env: &env,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let mut args = vec![
@@ -2377,5 +3240,65 @@ fn config_targets_preserve_higher_override_and_program_boundaries() {
                 "{source}"
             );
         }
+    }
+}
+
+#[test]
+fn initial_manifest_readings_preserve_frontend_grammar() {
+    let home = Path::new("/home/me");
+    let cwd = home.join("workspace");
+    for unreadable_native in [false, true] {
+        let read = |path: &Path| {
+            if path == cwd.join("Targo.toml") {
+                if unreadable_native {
+                    Err(())
+                } else {
+                    Ok(Some("[workspace]".into()))
+                }
+            } else {
+                Ok((path == cwd.join("Cargo.toml")).then(|| "[workspace]".into()))
+            }
+        };
+        let machine = Machine {
+            home: Some(home),
+            root: None,
+            cwd: Some(&cwd),
+            env: &|_| None,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        for tool in [Tool::Targo, Tool::Cargo, Tool::CargoCompat, Tool::Tippy] {
+            let mut args = match tool {
+                Tool::Targo => vec!["--unverified".into(), "build".into()],
+                Tool::Tippy => vec![],
+                _ => vec!["build".into()],
+            };
+            args.push("--target-dir=output".into());
+            let selected = explicit_cache(&args, tool, &machine, &|_| UserAlias::None);
+            let expected = if tool == Tool::Cargo {
+                Some(vec![cwd.join("Cargo.toml")])
+            } else if unreadable_native {
+                None
+            } else if tool == Tool::Targo {
+                Some(vec![cwd.join("Targo.toml")])
+            } else {
+                Some(vec![cwd.join("Targo.toml"), cwd.join("Cargo.toml")])
+            };
+            assert_eq!(
+                selected.map(|cache| cache.manifests),
+                expected,
+                "{tool:?}, unreadable={unreadable_native}"
+            );
+        }
+        let proof = vec!["trust".into(), "check".into(), "--target-dir=output".into()];
+        let expected =
+            (!unreadable_native).then(|| vec![cwd.join("Targo.toml"), cwd.join("Cargo.toml")]);
+        assert_eq!(
+            explicit_cache(&proof, Tool::Targo, &machine, &|_| UserAlias::None)
+                .map(|cache| cache.manifests),
+            expected,
+            "proof frontend, unreadable={unreadable_native}"
+        );
     }
 }

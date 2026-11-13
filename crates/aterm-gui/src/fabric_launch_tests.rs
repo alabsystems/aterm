@@ -200,6 +200,244 @@ fn denied_metadata_does_not_decide_whether_a_bridge_may_execute() {
     }
 }
 
+fn link_moves_since(before: u64) -> Vec<(String, u64)> {
+    crate::session_log_node::node_log()
+        .lines()
+        .into_iter()
+        .filter_map(|line| {
+            let seq = line.split_whitespace().next()?.parse::<u64>().ok()?;
+            if seq <= before || !line.contains(" mark n link ") {
+                return None;
+            }
+            let field = |prefix: &str| {
+                line.split_whitespace()
+                    .find_map(|word| word.strip_prefix(prefix))
+            };
+            Some((field("state=")?.to_string(), field("gen=")?.parse().ok()?))
+        })
+        .collect()
+}
+
+fn original_bridge_was_reaped(pid: i32, birth: aterm_uds::process::Birth) -> bool {
+    aterm_spec::wait::within(
+        aterm_spec::wait::MUST_HAPPEN,
+        Duration::from_millis(1),
+        || {
+            (aterm_uds::process::process_presence(pid)
+                == aterm_uds::process::ProcessPresence::Absent
+                || aterm_uds::process::read_birth(pid).is_some_and(|now| now != birth))
+            .then_some(())
+        },
+    )
+    .is_some()
+}
+
+#[test]
+fn a_bridge_needs_both_lanes_and_failed_attachment_retires_its_generation() {
+    use std::cell::{Cell, RefCell};
+    use std::io::{BufRead as _, Read as _, Write as _};
+    use std::sync::Arc;
+
+    crate::session_log_node::install();
+    for mask in [[false, false], [true, false], [false, true], [true, true]] {
+        crate::fabric::with_link_reset(|| {
+            let before = crate::session_log_node::node_log().last_seq();
+            let lanes = RefCell::new(Vec::new());
+            let ended = RefCell::new(Vec::new());
+            let generation = Cell::new(None);
+            let proof = RefCell::new(None);
+            let losses = Arc::new(Mutex::new(Vec::new()));
+            let lost = Arc::clone(&losses);
+            let store = crate::session_store::new_store();
+            let argv = ["/bin/sh", "-c", "echo $$ >&3; read reply <&3"]
+                .map(str::to_string)
+                .to_vec();
+            let result = launch_serving(
+                &argv,
+                |mut near, incarnation, token| {
+                    let index = lanes.borrow().len();
+                    generation.set(Some(incarnation));
+                    if near
+                        .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                        .is_ok()
+                        && index == 0
+                    {
+                        let mut line = String::new();
+                        let read = std::io::BufReader::new(&mut near).read_line(&mut line);
+                        let pid = line.trim().parse::<i32>().ok();
+                        *proof.borrow_mut() = Some((
+                            read,
+                            pid.and_then(|pid| {
+                                aterm_uds::process::read_birth(pid).map(|birth| (pid, birth))
+                            }),
+                        ));
+                    }
+                    lanes.borrow_mut().push(near);
+                    if mask[index] {
+                        ended.borrow_mut().push(token);
+                    }
+                    mask[index]
+                },
+                Told {
+                    attached: crate::fabric::bridge_attached,
+                    lost: Box::new(move |incarnation| {
+                        lost.lock().unwrap().push(incarnation);
+                        crate::fabric::bridge_lost(&store, incarnation);
+                    }),
+                },
+            );
+            let rejected = result.is_err();
+            // Release an unexpectedly accepted partial launch too, so the regression fails
+            // after cleaning up instead of hanging its supervisor behind this bridge.
+            if let Ok(mut launched) = result {
+                let _ = (&lanes.borrow()[0]).write_all(b"finish\n");
+                let status = aterm_spec::wait::within(
+                    aterm_spec::wait::MUST_HAPPEN,
+                    Duration::from_millis(1),
+                    || match launched.child.try_wait() {
+                        Ok(Some(status)) => Some(Ok(status)),
+                        Ok(None) => None,
+                        Err(error) => Some(Err(error)),
+                    },
+                );
+                launched.retire().watch_behind(LANES_END_WAIT);
+                assert!(
+                    status
+                        .as_ref()
+                        .is_some_and(|status| status.as_ref().is_ok_and(|status| status.success())),
+                    "{mask:?}: {status:?}"
+                );
+            }
+            let (read, identity) = proof
+                .borrow_mut()
+                .take()
+                .expect("the verb callback read the execution proof");
+            let (pid, birth) = identity.expect("the bridge wrote its live PID on fd 3");
+            assert!(read.is_ok(), "{mask:?}: {read:?}");
+            let reaped = original_bridge_was_reaped(pid, birth);
+            let eof: Vec<_> = lanes
+                .borrow_mut()
+                .iter_mut()
+                .map(|near| near.read(&mut [0u8; 1]).map_err(|error| error.kind()))
+                .collect();
+            let incarnation = generation.get().expect("both attachment callbacks ran");
+            if mask.iter().any(|served| *served) {
+                // A served lane may not reach its attach until the cleanup already told
+                // the loss. Its late attach cannot resurrect the discarded generation.
+                crate::fabric::bridge_attached(incarnation);
+            }
+            let moves = link_moves_since(before);
+            let lost = losses.lock().unwrap().clone();
+            ended.borrow_mut().clear();
+            assert_eq!(rejected, mask != [true, true], "{mask:?}");
+            assert!(reaped, "{mask:?}: the original bridge was not reaped");
+            assert_eq!(
+                eof,
+                [Ok(0), Ok(0)],
+                "{mask:?}: held lane endpoints are revoked"
+            );
+            if mask.iter().any(|served| *served) {
+                assert_eq!(
+                    lost,
+                    [incarnation],
+                    "{mask:?}: one synchronous generation loss"
+                );
+                assert_eq!(
+                    moves
+                        .iter()
+                        .map(|(state, _)| state.as_str())
+                        .collect::<Vec<_>>(),
+                    ["stalled", "disconnected"],
+                    "{mask:?}: {moves:?}"
+                );
+                assert_eq!(moves[0].1, moves[1].1, "{mask:?}: one generation");
+            } else {
+                assert!(
+                    lost.is_empty() && moves.is_empty(),
+                    "no served lane publishes an attach or loss: {lost:?} {moves:?}"
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn a_failed_lane_attachment_backs_off_and_the_next_launch_can_serve_both() {
+    use std::cell::{Cell, RefCell};
+    use std::io::{BufRead as _, Write as _};
+    let attempts = Cell::new(0usize);
+    let first_failed = Cell::new(false);
+    let kept = RefCell::new(Vec::new());
+    let proof = RefCell::new(None);
+    let pauses = RefCell::new(Vec::new());
+    let argv = [true_program()];
+    supervise_with(
+        &argv,
+        |argv| {
+            let first = attempts.get() == 0;
+            attempts.set(attempts.get() + 1);
+            if !first {
+                return launch_serving(argv, |_, _, _| true, untold());
+            }
+            let script = ["/bin/sh", "-c", "echo $$ >&3; read reply <&3"]
+                .map(str::to_string)
+                .to_vec();
+            let result = launch_serving(
+                &script,
+                |mut near, _, _| {
+                    let verb = kept.borrow().is_empty();
+                    if verb
+                        && near
+                            .set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+                            .is_ok()
+                    {
+                        let mut line = String::new();
+                        if std::io::BufReader::new(&mut near)
+                            .read_line(&mut line)
+                            .is_ok()
+                        {
+                            *proof.borrow_mut() = line.trim().parse::<i32>().ok().and_then(|pid| {
+                                aterm_uds::process::read_birth(pid).map(|birth| (pid, birth))
+                            });
+                        }
+                    }
+                    kept.borrow_mut().push(near);
+                    verb
+                },
+                untold(),
+            );
+            first_failed.set(result.is_err());
+            if result.is_ok() {
+                let _ = (&kept.borrow()[0]).write_all(b"finish\n");
+            }
+            result
+        },
+        || attempts.get() == 2,
+        |pause| pauses.borrow_mut().push(pause),
+    );
+    let (pid, birth) = proof
+        .borrow_mut()
+        .take()
+        .expect("the failed bridge executed and wrote its PID");
+    assert!(original_bridge_was_reaped(pid, birth));
+    assert!(
+        first_failed.get(),
+        "one failed lane rejects the first launch"
+    );
+    assert_eq!(
+        attempts.get(),
+        2,
+        "the next attempt serves both lanes and returns normally"
+    );
+    let pauses = pauses.into_inner();
+    assert_eq!(pauses.len(), 2);
+    assert_eq!(
+        pauses[0],
+        RELAUNCH_MIN * 2,
+        "an attachment failure takes normal launch back-off"
+    );
+}
+
 #[test]
 fn the_lanes_are_retired_when_the_bridge_exits_whoever_else_holds_a_far_end() {
     use std::io::{BufRead as _, Read as _};
@@ -515,7 +753,7 @@ struct Relaunch {
 /// said their loss and the session's hold is read.
 ///
 /// `exit_tells_loss` is the supervisor telling each generation's loss at its exit, as
-/// `control::fabric_bridge_exited` does; with it off, the lanes alone say it.
+/// `control::fabric_bridge_retired` does; with it off, the lanes alone say it.
 fn the_link_over_a_relaunch(exit_tells_loss: bool) -> Relaunch {
     use std::os::unix::net::UnixStream;
     use std::sync::Arc;

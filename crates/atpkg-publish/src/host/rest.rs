@@ -17,15 +17,13 @@ use aterm_update_core::github_rest::Spawn;
 use aterm_update_core::github_rest::{Answer, Client, Method, Origins, RestError, Token};
 use aterm_update_core::release_asset::{Asset, AssetError, Reader};
 
-use super::{HostError, Probe, RETRY_PAUSE, Release, ReleaseHost, Replace, Slug};
+use super::{HostError, Probe, RETRY_PAUSE, Release, ReleaseHost, Replace, STAGED, Slug};
+use crate::git::{git_environment_removals, git_tracing_environment};
 
 const PER_PAGE: usize = 100;
 /// An anonymous Git child that produces neither captured bytes nor descendant CPU/I/O progress
 /// for this long is hung. Progress starts another full window; this is not a latency budget.
 const ANONYMOUS_GIT_STALL: Duration = Duration::from_secs(60);
-
-/// Suffix used when staging a replacement asset under [`Replace::Clobber`].
-pub const STAGED: &str = ".atpkg-staged";
 
 /// Environment variable from which git's credential helper reads the token.
 pub const GIT_TOKEN_ENV: &str = "ATPKG_PUBLISH_GIT_TOKEN";
@@ -65,24 +63,6 @@ impl GitAuth {
         }
     }
 
-    /// Resolve the publication identity for an authenticated source fetch.
-    /// # Errors
-    /// An invalid HTTP origin, or a missing, unreadable, blank or malformed credential file.
-    #[cfg(any(unix, test))]
-    pub(crate) fn required(file: &Path, base: &str) -> Result<Self, HostError> {
-        if credential_origin(base).is_none() {
-            return Err(HostError::Refused(
-                "Git credentials require an HTTP origin".into(),
-            ));
-        }
-        let token = Token::from_file(file)
-            .map_err(HostError::Refused)?
-            .ok_or_else(|| {
-                HostError::Refused("the configured source credential is absent or empty".into())
-            })?;
-        Ok(Self::new(Some(token), base))
-    }
-
     pub(crate) fn arguments(&self) -> Vec<OsString> {
         let mut args = vec!["-c".into(), "credential.helper=".into()];
         if self.token.is_some()
@@ -109,60 +89,6 @@ impl GitAuth {
             _ => Ok(Vec::new()),
         }
     }
-
-    #[cfg(any(unix, test))]
-    pub(crate) fn redact(&self, text: &str) -> String {
-        match self
-            .token
-            .as_ref()
-            .and_then(|token| std::str::from_utf8(token.expose()).ok())
-        {
-            Some(secret) => text.replace(secret, "[redacted]"),
-            None => text.to_owned(),
-        }
-    }
-}
-
-/// Remove ambient credentials and all inherited trace selectors before the known helper runs.
-pub(crate) fn git_environment_removals() -> Vec<String> {
-    git_environment_removals_from(std::env::vars_os().map(|(key, _)| key))
-}
-
-/// Environment overrides also disable Trace2 targets enabled by system/global Git config.
-pub(crate) fn git_tracing_environment() -> Vec<(String, OsString)> {
-    [
-        ("GIT_TRACE", "0"),
-        ("GIT_TRACE2", "0"),
-        ("GIT_TRACE2_EVENT", "0"),
-        ("GIT_TRACE2_PERF", "0"),
-        ("GIT_TRACE_CURL", "0"),
-        ("GIT_TRACE_REDACT", "1"),
-    ]
-    .map(|(name, value)| (name.into(), value.into()))
-    .into()
-}
-
-fn git_environment_removals_from(names: impl IntoIterator<Item = OsString>) -> Vec<String> {
-    let mut remove = std::collections::BTreeSet::from([
-        GIT_TOKEN_ENV.to_owned(),
-        "GITHUB_TOKEN".into(),
-        "GH_TOKEN".into(),
-        "GIT_CURL_VERBOSE".into(),
-        "BASH_ENV".into(),
-        "ENV".into(),
-        "SHELLOPTS".into(),
-        "BASHOPTS".into(),
-    ]);
-    for name in names {
-        if let Some(name) = name.to_str()
-            && (name.starts_with("GIT_TRACE")
-                || name.starts_with("GH_")
-                || name.starts_with("GITHUB_"))
-        {
-            remove.insert(name.to_owned());
-        }
-    }
-    remove.into_iter().collect()
 }
 
 /// GitHub's REST API, as one identity.

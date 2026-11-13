@@ -869,13 +869,14 @@ pub(crate) fn block_read(
             None => before(term, block),
         };
         let next_exec = next.and_then(|next| next.command_exec_start_time_ms);
-        let reading = block_detail(term, block, prior, (closed_at, next_exec), ran);
+        let (reading, shape) = block_detail(term, block, prior, (closed_at, next_exec), ran);
         read.facts.push(BlockFact {
             id: block.id,
             started_ms: block.command_exec_start_time_ms,
             end,
             detail_final: reading.as_ref().is_some_and(|r| r.own),
             detail: reading.map(|r| r.text),
+            shape,
         });
     }
     read
@@ -989,16 +990,27 @@ pub(crate) fn executing_detail(
     term: &aterm_core::terminal::Terminal,
     ran: &crate::command_ran::Ran,
 ) -> Option<String> {
-    let block = term.current_block()?;
-    if block.state != aterm_types::BlockState::Executing {
-        return None;
-    }
+    let (block, window) = executing_block(term)?;
     let line = block_command_line(term, block)?;
-    let window = crate::command_ran::Window::of_block(block, before(term, block), None, None);
     command_detail(
         &line,
         &ran.heard(block.id, window, block.working_directory.as_deref()),
     )
+}
+
+/// `term`'s currently executing block and the window its execs count in
+/// ([`crate::command_ran::Window::of_block`], open while it runs).
+pub(crate) fn executing_block(
+    term: &aterm_core::terminal::Terminal,
+) -> Option<(
+    &aterm_types::OutputBlock,
+    Option<crate::command_ran::Window>,
+)> {
+    let block = term
+        .current_block()
+        .filter(|b| b.state == aterm_types::BlockState::Executing)?;
+    let window = crate::command_ran::Window::of_block(block, before(term, block), None, None);
+    Some((block, window))
 }
 
 /// The block `term` holds just before `block`.
@@ -1022,20 +1034,64 @@ pub(crate) fn executing_candidate(term: &aterm_core::terminal::Terminal) -> Opti
 /// placed in the block (its own job's, and those stamped in its window, which the block `before`
 /// it bounds and its D, else `closed_ms`, the A of the prompt that closed it, ends, cut before
 /// `next_ms`, the next block's C: [`crate::command_ran::Window::of_block`]), and the files its
-/// program word names from its working directory.
+/// program word names from its working directory; with its line's [`LineShape`] ([`line_reading`];
+/// a block whose line cannot be read is taken as one element, [`LineShape::ONE`]).
 fn block_detail(
     term: &aterm_core::terminal::Terminal,
     block: &aterm_types::OutputBlock,
     before: Option<&aterm_types::OutputBlock>,
     (closed_ms, next_ms): (Option<u64>, Option<u64>),
     ran: &crate::command_ran::Ran,
-) -> Option<Reading> {
-    let line = block_command_line(term, block)?;
+) -> (Option<Reading>, LineShape) {
+    let Some(line) = block_command_line(term, block) else {
+        return (None, LineShape::ONE);
+    };
     let window = crate::command_ran::Window::of_block(block, before, closed_ms, next_ms);
-    command_reading(
+    line_reading(
         &line,
         &ran.heard(block.id, window, block.working_directory.as_deref()),
     )
+}
+
+/// `line`'s reading against `heard` ([`command_reading`]) and its [`LineShape`]: the parser's
+/// ([`line_shape`]), and, where the detail reads the last of more than one element, shared
+/// ([`LineShape::shared`]) as well where more than one of the block's own jobs ran an image of the
+/// detail's program ([`jobs_ran`]): the line's words may not show it (an earlier element an alias
+/// or a function that runs that program), the jobs the kernel heard do.
+pub(crate) fn line_reading(
+    line: &str,
+    heard: &crate::command_ran::Heard<'_>,
+) -> (Option<Reading>, LineShape) {
+    let reading = command_reading(line, heard);
+    let mut shape = line_shape(line);
+    if shape.elements > 1
+        && shape.reads_last()
+        && let Some(program) = reading.as_ref().and_then(|r| detail_program(&r.text))
+    {
+        shape.shared |= jobs_ran(heard, program) > 1;
+    }
+    (reading, shape)
+}
+
+/// The program word of a detail ([`Reading::text`]): its first word, the program before its
+/// subcommand.
+pub(crate) fn detail_program(detail: &str) -> Option<&str> {
+    detail.split(' ').next().filter(|word| !word.is_empty())
+}
+
+/// How many of the block's own jobs ran an image named `name` ([`image_named`]): the distinct
+/// process groups of the execs `heard` places in the block's job
+/// ([`crate::command_ran::Heard::stand_ins`]), each a group that held the terminal's foreground
+/// while it ran there, so each a job of the line's own. A group the kernel did not show (`0`)
+/// counts for none.
+fn jobs_ran(heard: &crate::command_ran::Heard<'_>, name: &str) -> usize {
+    let mut groups: Vec<i32> = Vec::new();
+    for exec in &heard.stand_ins {
+        if exec.pgid != 0 && !groups.contains(&exec.pgid) && image_named(exec, name) {
+            groups.push(exec.pgid);
+        }
+    }
+    groups.len()
 }
 
 /// Extracts the full command line of `term`'s currently executing block.
@@ -1279,10 +1335,25 @@ const WRAPPERS: [Wrapper; 8] = [
 /// `begin` segment opens a group whose next segment is the command that runs: [`candidate`]).
 const KEYWORD_OPENERS: [&str; 7] = ["for", "while", "if", "until", "case", "{", "begin"];
 /// The words, as typed, that the shell reads in a command's first place without running them,
-/// stepped over to the command they stand before: `!` alone negates its pipeline's status, `{`
-/// and `(` open a group and a subshell, and pwsh's `&` calls the program its next word names.
-/// The shell knows them only unquoted and before any assignment.
-const STEPPED_OVER: [&str; 4] = ["!", "{", "(", "&"];
+/// stepped over to the command they stand before: `!` alone and fish's `not` negate its
+/// pipeline's status, `{` and `(` open a group and a subshell, and pwsh's `&` calls the program
+/// its next word names. The shell knows them only unquoted and before any assignment.
+const STEPPED_OVER: [&str; 5] = ["!", "not", "{", "(", "&"];
+/// The words of [`STEPPED_OVER`] that negate the command after them: what a block's opener or
+/// closer is read past ([`lone_begin`], [`fish_end`]).
+const NEGATIONS: [&str; 2] = ["!", "not"];
+/// fish's list connectors, typed in a command's first place: `and` runs the command after it only
+/// when the one before it succeeded, as `&&` does, and `or` only when it failed, as `||` does, so
+/// [`split_list`] cuts the list at them with `&&`'s and `||`'s [`ListOp`]. The shell knows them
+/// only unquoted.
+const FISH_CONNECTORS: [(&str, ListOp); 2] = [("and", ListOp::And), ("or", ListOp::Or)];
+/// The words that open a function's definition in a command's first place: `function` in bash,
+/// zsh, fish and pwsh, and pwsh's `filter`. A definition runs nothing where it is typed
+/// ([`undefined`]).
+const DEFINERS: [&str; 2] = ["function", "filter"];
+/// fish's blocks, each closed by an `end` of its own: what a fish `function` definition's body
+/// nests until the `end` that closes it ([`fish_end`]).
+const FISH_BLOCKS: [&str; 6] = ["begin", "if", "while", "for", "switch", "function"];
 /// The commands with no letter or digit in their name that people know by sight: the null
 /// command, sourcing a file (`source`'s other spelling, so the file is its argument, as
 /// `bash run.sh` reads `bash`) and `test`. A detail names the word itself, never a word after it.
@@ -2048,11 +2119,15 @@ fn detail_text(program: &str, sub: Option<&str>) -> String {
 /// [`ExecNames::iter`]: crate::command_ran::ExecNames::iter
 /// [`ExecNames::same`]: crate::command_ran::ExecNames::same
 fn ran_named(ran: &[std::sync::Arc<crate::command_ran::Exec>], name: &str) -> bool {
-    ran.iter().any(|exec| {
-        let names = &exec.names;
-        names.iter().any(|image| {
-            names.same(image, name) || basename(image).is_some_and(|base| names.same(base, name))
-        })
+    ran.iter().any(|exec| image_named(exec, name))
+}
+
+/// Whether `name` is a name the kernel keeps for the image `exec` mapped, whole, in the case its
+/// system compares ([`ran_named`]).
+fn image_named(exec: &crate::command_ran::Exec, name: &str) -> bool {
+    let names = &exec.names;
+    names.iter().any(|image| {
+        names.same(image, name) || basename(image).is_some_and(|base| names.same(base, name))
     })
 }
 
@@ -2212,25 +2287,15 @@ fn joined(cmdline: &str) -> std::borrow::Cow<'_, str> {
 }
 
 /// The text reader: the program word of `cmdline`'s running command, the wrappers before it and
-/// its allowlisted subcommand, or `None` when no word in its first place names a program.
+/// its allowlisted subcommand, or `None` when no word in its first place names a program. A
+/// function's definition runs nothing where it is typed, so the line is read without it
+/// ([`undefined`]): no word of its body is ever the candidate.
 pub(crate) fn candidate(cmdline: &str) -> Option<ProgramCandidate> {
-    let cmdline = joined(cmdline);
-    let cmdline: &str = &cmdline;
+    let whole = joined(cmdline);
+    let bare = undefined(&whole);
+    let cmdline: &str = &bare.line;
     let segments = split_list(cmdline);
-    let opener = segments
-        .iter()
-        .position(|(_, text)| leading_word(text).is_some_and(|w| KEYWORD_OPENERS.contains(&&*w)));
-    let segment = match opener {
-        // fish's lone `begin` opens a group: the command that runs is its next segment, and a
-        // lone `end` closes it, never a command of its own.
-        Some(at) if segments[at].1.trim() == "begin" => segments[at + 1..]
-            .iter()
-            .map(|(_, text)| *text)
-            .find(|text| !text.trim().is_empty())
-            .filter(|text| !lone_end(text))?,
-        Some(at) => segments[at].1,
-        None => running_segment(cmdline, &segments),
-    };
+    let segment = segments[read_at(&segments)?].1;
     if lone_end(segment) {
         return None;
     }
@@ -2311,7 +2376,43 @@ enum ListOp {
     Or,
 }
 
+/// `cmdline`'s list: each command, with the operator that joins it to the command before it
+/// (`;` and a newline [`ListOp::Seq`], `&&` and fish's `and` [`ListOp::And`], `||` and fish's
+/// `or` [`ListOp::Or`]: [`FISH_CONNECTORS`]), so a fish line reads as the same line in bash and
+/// zsh reads ([`running_segment`]).
 fn split_list(cmdline: &str) -> Vec<(ListOp, &str)> {
+    let mut segments = cut_list(cmdline);
+    for segment in &mut segments {
+        *segment = fish_connector(*segment);
+    }
+    segments
+}
+
+/// `segment` with a [`FISH_CONNECTORS`] word typed bare in its first place taken for the
+/// operator it is: the command after it, joined by `&&`'s or `||`'s [`ListOp`].
+fn fish_connector((op, text): (ListOp, &str)) -> (ListOp, &str) {
+    let Some(first) = shell_words(text).next() else {
+        return (op, text);
+    };
+    match FISH_CONNECTORS.iter().find(|(word, _)| *word == first) {
+        Some(&(_, joined)) => (joined, &text[offset(text, first) + first.len()..]),
+        None => (op, text),
+    }
+}
+
+/// Whether the `#` at `bytes[at]` opens a comment: one that starts a word, at the start of the
+/// line or after a blank or an operator byte.
+fn opens_comment(bytes: &[u8], at: usize) -> bool {
+    at == 0
+        || matches!(
+            bytes[at - 1],
+            b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
+        )
+}
+
+/// `cmdline` cut at its list operators (`;`, a newline, `&&`, `||`) outside quotes, comments and
+/// a here-document's text.
+fn cut_list(cmdline: &str) -> Vec<(ListOp, &str)> {
     let bytes = cmdline.as_bytes();
     let mut segments = Vec::new();
     let mut start = 0;
@@ -2341,12 +2442,7 @@ fn split_list(cmdline: &str) -> Vec<(ListOp, &str)> {
                 i += 2;
                 continue;
             }
-            b'#' if i == 0
-                || matches!(
-                    bytes[i - 1],
-                    b' ' | b'\t' | b'\n' | b';' | b'&' | b'|' | b'(' | b')'
-                ) =>
-            {
+            b'#' if opens_comment(bytes, i) => {
                 // A comment, to the end of its line: what it holds is never a command, and
                 // its `;`, `&&` and `||` cut nothing.
                 segments.push((op, &cmdline[start..i]));
@@ -2393,26 +2489,374 @@ fn lone_end(segment: &str) -> bool {
     segment.trim() == "end"
 }
 
-fn running_segment<'a>(cmdline: &'a str, segments: &[(ListOp, &'a str)]) -> &'a str {
-    let Some(end) = segments
+/// Whether a segment is fish's lone `begin`, negated or not (`not begin`, as `! {`), which opens
+/// a group whose next segment is the command that runs.
+fn lone_begin(segment: &str) -> bool {
+    let mut words = shell_words(segment).skip_while(|word| NEGATIONS.contains(word));
+    words.next() == Some("begin") && words.next().is_none()
+}
+
+/// Whether a segment of a line's top-level list holds a command: neither empty (a comment's,
+/// one a leading or doubled `;` cut, fish's lone `and` or `or`, or what a blanked definition
+/// leaves: [`undefined`]) nor fish's lone `end`.
+fn holds_command(segment: &str) -> bool {
+    !segment.trim().is_empty() && !lone_end(segment)
+}
+
+/// THE ELEMENT THE TEXT READER READS ([`candidate`]): its index in `segments` ([`split_list`]),
+/// the first compound command's opener, where one opens (a loop, a test, a case, a `{` group; for
+/// fish's lone `begin`, negated or not ([`lone_begin`]), the command after it, as a lone `end`
+/// closes the group and runs nothing of its own); else the running segment
+/// ([`running_segment`]). `None` where it reads nothing: fish's lone `begin` with no command
+/// before its `end`, or a line no segment of which holds a command.
+fn read_at(segments: &[(ListOp, &str)]) -> Option<usize> {
+    let opener = segments
         .iter()
-        .rposition(|(_, text)| !text.trim().is_empty() && !lone_end(text))
-    else {
-        return cmdline;
+        .position(|(_, text)| leading_word(text).is_some_and(|w| KEYWORD_OPENERS.contains(&&*w)));
+    match opener {
+        Some(at) if lone_begin(segments[at].1) => segments[at + 1..]
+            .iter()
+            .position(|(_, text)| !text.trim().is_empty())
+            .map(|next| at + 1 + next)
+            .filter(|&next| !lone_end(segments[next].1)),
+        Some(at) => Some(at),
+        None => running_segment(segments),
+    }
+}
+
+/// Where `part`, a slice of `line`, starts in it.
+fn offset(line: &str, part: &str) -> usize {
+    part.as_ptr() as usize - line.as_ptr() as usize
+}
+
+/// `cmdline` with each function definition in a command's first place blanked out: bash's and
+/// zsh's `name() body` (`name ()`, `name ( )`), and `function name …` (bash, zsh, fish, pwsh) or
+/// pwsh's `filter name …`. A definition runs nothing where it is typed, so no word of its body is
+/// a command of the line, and the line reads as it would without it: `qzf() { true; }` reads
+/// nothing in every shell, and `qzf() { true; }; qzf` reads `qzf`. A body in braces ends at the
+/// brace that closes it ([`group_end`]: bash, zsh and pwsh, a brace right after the name and its
+/// parameter list, on the definition's own line: [`keyword_brace`]); fish's `function name …`,
+/// whose name its options or its list's end follow, ends at the `end` that closes it
+/// ([`fish_end`]). One whose end is not found, and a `name()` body of any other form (a
+/// subshell, zsh's one-command body), runs to the end of the line: nothing after it is read.
+/// A definition is still an element of the line's list, where it was typed ([`line_shape`]), so
+/// the line comes with where each blank stands in it ([`Undefined`]).
+fn undefined(cmdline: &str) -> Undefined<'_> {
+    let segments = split_list(cmdline);
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut read_from = 0;
+    let mut unclosed = false;
+    for (at, &(_, text)) in segments.iter().enumerate() {
+        let start = offset(cmdline, text);
+        if start < read_from {
+            continue;
+        }
+        let Some((head, body)) = definition(text) else {
+            continue;
+        };
+        let found = match body {
+            Body::After(from) => {
+                let rest = &cmdline[start + from..];
+                let open = start + from + (rest.len() - rest.trim_start().len());
+                (cmdline.as_bytes().get(open) == Some(&b'{'))
+                    .then(|| group_end(cmdline, open))
+                    .flatten()
+            }
+            Body::Keyword(from) => match keyword_brace(cmdline, start + from) {
+                Some(open) => group_end(cmdline, open),
+                None => fish_end(cmdline, &segments[at + 1..]),
+            },
+        };
+        // One whose end is not found takes the rest of the line, so it is the last.
+        unclosed = found.is_none();
+        let end = found.unwrap_or(cmdline.len());
+        spans.push((start + head, end));
+        read_from = end;
+    }
+    if spans.is_empty() {
+        return Undefined {
+            line: cmdline.into(),
+            blanks: Vec::new(),
+            unclosed,
+        };
+    }
+    let mut out = String::with_capacity(cmdline.len());
+    let mut blanks = Vec::with_capacity(spans.len());
+    let mut from = 0;
+    for (start, end) in spans {
+        out.push_str(&cmdline[from..start]);
+        blanks.push(out.len());
+        out.push(' ');
+        from = end;
+    }
+    out.push_str(&cmdline[from..]);
+    Undefined {
+        line: out.into(),
+        blanks,
+        unclosed,
+    }
+}
+
+/// A line read without its function definitions ([`undefined`]).
+struct Undefined<'a> {
+    /// The line, a blank where each definition stood.
+    line: std::borrow::Cow<'a, str>,
+    /// Where each of those blanks stands in [`Self::line`], in the line's order.
+    blanks: Vec<usize>,
+    /// Whether the last definition's end was not found: it took the rest of the line, which
+    /// nothing read, and which may hold commands of its own.
+    unclosed: bool,
+}
+
+/// Where a definition's body is looked for ([`definition`]), from the start of its segment.
+enum Body {
+    /// `name()`'s: the first word after this byte.
+    After(usize),
+    /// A [`DEFINERS`] word's, which ends at this byte: a brace after the name
+    /// ([`keyword_brace`]), else fish's `end`.
+    Keyword(usize),
+}
+
+/// Whether `segment` opens a function definition in its first place: where in it the definition
+/// starts and where its body is looked for.
+fn definition(segment: &str) -> Option<(usize, Body)> {
+    let mut words = shell_words(segment);
+    let first = words.next()?;
+    let head = offset(segment, first);
+    if DEFINERS.contains(&first) {
+        return Some((head, Body::Keyword(head + first.len())));
+    }
+    let name = |word: &str| {
+        !word.is_empty()
+            && !word.contains([
+                '\'', '"', '`', '\\', '$', '=', '(', ')', '{', '}', '<', '>', '|', '&', ';',
+            ])
     };
+    if let Some(at) = first.find("()") {
+        return name(&first[..at]).then_some((head, Body::After(head + at + 2)));
+    }
+    if !name(first) {
+        return None;
+    }
+    let second = words.next()?;
+    let after = offset(segment, second);
+    if second.starts_with("()") {
+        return Some((head, Body::After(after + 2)));
+    }
+    let third = words
+        .next()
+        .filter(|word| second == "(" && word.starts_with(')'))?;
+    Some((head, Body::After(offset(segment, third) + 1)))
+}
+
+/// Where the `{` that opens the body of the [`DEFINERS`] definition whose word ends at
+/// `cmdline[from]` is: after the blanks, the name (up to a blank or one of `(){};&|<>`), and a
+/// parameter list in parentheses (bash's and zsh's `()`, pwsh's `($a, $b)`: [`group_end`]), each
+/// with the blanks before it, on the definition's own line. `None` when the name is followed by
+/// anything else: fish's options (`function f -d '{x}'`) or its list's end, so a brace in a
+/// fish definition's head is never taken for a body.
+fn keyword_brace(cmdline: &str, from: usize) -> Option<usize> {
+    let bytes = cmdline.as_bytes();
+    let blanks = |mut at: usize| {
+        while matches!(bytes.get(at), Some(b' ' | b'\t')) {
+            at += 1;
+        }
+        at
+    };
+    let mut at = blanks(from);
+    while bytes
+        .get(at)
+        .is_some_and(|c| !c.is_ascii_whitespace() && !b"(){};&|<>".contains(c))
+    {
+        at += 1;
+    }
+    at = blanks(at);
+    if bytes.get(at) == Some(&b'(') {
+        at = blanks(group_end(cmdline, at)?);
+    }
+    (bytes.get(at) == Some(&b'{')).then_some(at)
+}
+
+/// Where the group opened at `cmdline[open]` (a `{` or a `(`) ends: the byte after the brace or
+/// parenthesis that closes it, counting the ones nested in it outside quotes and comments (read
+/// as [`cut_list`] reads them). `None` when it never closes, or when a here-document comes first,
+/// whose text no count may read.
+fn group_end(cmdline: &str, open: usize) -> Option<usize> {
+    let bytes = cmdline.as_bytes();
+    let (opener, closer) = match bytes.get(open)? {
+        b'{' => (b'{', b'}'),
+        b'(' => (b'(', b')'),
+        _ => return None,
+    };
+    let mut depth = 0usize;
+    let mut quote: Option<u8> = None;
+    let mut i = open;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == b'\\' && q != b'\'' {
+                i += 1;
+            } else if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\\' => i += 1,
+            b'\'' | b'"' | b'`' => quote = Some(c),
+            b'#' if opens_comment(bytes, i) => {
+                i = cmdline[i..].find('\n').map_or(bytes.len(), |n| i + n);
+            }
+            b'<' if bytes.get(i + 1) == Some(&b'<') && bytes.get(i + 2) != Some(&b'<') => {
+                return None;
+            }
+            b'<' if bytes.get(i + 1) == Some(&b'<') => i += 2,
+            c if c == opener => depth += 1,
+            c if c == closer => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Where a fish `function` definition whose head's list ends just before `rest` ends: the end of
+/// the segment whose `end` closes it, counting the [`FISH_BLOCKS`] its body opens, each read in
+/// a segment's first place (past a [`NEGATIONS`] word). `None` when no `end` closes it.
+fn fish_end(cmdline: &str, rest: &[(ListOp, &str)]) -> Option<usize> {
+    let mut depth = 1usize;
+    for &(_, text) in rest {
+        match shell_words(text).find(|word| !NEGATIONS.contains(word)) {
+            Some(word) if FISH_BLOCKS.contains(&word) => depth += 1,
+            Some("end") => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(offset(cmdline, text) + text.len());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The index of the segment of `segments` whose command the line runs last: the last one that
+/// holds a command ([`holds_command`]), less the `||` arms that end its `;`-separated list, which
+/// run only when the command before them fails. `None` when no segment holds a command: a line of
+/// nothing but separators, connectors (`&&`, fish's lone `and`) and `end`s.
+fn running_segment(segments: &[(ListOp, &str)]) -> Option<usize> {
+    let end = segments.iter().rposition(|(_, text)| holds_command(text))?;
     let start = segments[..=end]
         .iter()
         .rposition(|(op, _)| *op == ListOp::Seq)
         .unwrap_or(0);
-    let mut chain = &segments[start..=end];
-    while chain.len() > 1
-        && chain
-            .last()
-            .is_some_and(|(op, text)| *op == ListOp::Or || text.trim().is_empty())
-    {
-        chain = &chain[..chain.len() - 1];
+    let mut last = end;
+    while last > start && {
+        let (op, text) = segments[last];
+        op == ListOp::Or || text.trim().is_empty()
+    } {
+        last -= 1;
     }
-    chain.last().map_or(cmdline, |(_, text)| text)
+    Some(last)
+}
+
+/// THE TOP-LEVEL SHAPE OF A COMMAND LINE (review RV2, E2-R2), read by the text reader's own
+/// splitter ([`split_list`]) and its own choice of element ([`read_at`]); no word of the line is
+/// kept, only two counts and one bit. The shell reports one status for a line, its last top-level
+/// element's (`claude; echo done` reports the `echo`'s, `claude || true` the `true`'s whenever
+/// `claude` failed), so the session log gives a run under the line its status only where the run's
+/// group ran that element (`SessionLog::run_end`): the line's only element (a pipeline is one
+/// job), or the last, where the detail reads it and no earlier element may have run its program
+/// ([`Self::names_last`]), and the run is the program the detail names. A run is known by its
+/// program's name, so where an earlier element ran the same program (`make; make install`, `vim
+/// a; vim b`) the name tells neither run from the other, and neither takes the status.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LineShape {
+    /// How many elements its top-level list holds: the parts `;`, a newline, `&&` and `||` (and
+    /// fish's `and` and `or`) cut it into that hold a command ([`holds_command`]), and each
+    /// function definition, whose body's parts count for none, with one more for the rest of the
+    /// line a definition with no end found took ([`line_shape`]).
+    pub(crate) elements: u16,
+    /// Which of them, counted from 1, the detail's program word is read from (`0`: none, the reader
+    /// read nothing).
+    pub(crate) read: u16,
+    /// Whether an element before the one read may have run the same program: an earlier element's
+    /// program word is the read one's ([`line_shape`]), or more than one of the block's own jobs
+    /// ran an image of the detail's program ([`line_reading`]).
+    pub(crate) shared: bool,
+}
+
+impl LineShape {
+    /// One element, read: a line the reader could not see, taken as the shell reports it, one
+    /// status for one line.
+    pub(crate) const ONE: Self = Self {
+        elements: 1,
+        read: 1,
+        shared: false,
+    };
+
+    /// Whether the detail reads the line's last element, whose status the shell reports.
+    pub(crate) const fn reads_last(self) -> bool {
+        self.read != 0 && self.read == self.elements
+    }
+
+    /// Whether the detail's program names the run of the line's last element alone: the detail
+    /// reads that element ([`Self::reads_last`]) and no earlier element may have run its program
+    /// ([`Self::shared`]).
+    pub(crate) const fn names_last(self) -> bool {
+        self.reads_last() && !self.shared
+    }
+}
+
+/// `cmdline`'s [`LineShape`], read off the list [`candidate`] reads: the line less its function
+/// definitions ([`undefined`]), cut by [`split_list`]. A definition runs nothing, so no part of
+/// its body is an element and it is never the one read, but it is an element of the list where it
+/// was typed, whose status the shell reports when it is the last (`make; qzf() { true; }` ends
+/// with the definition's status, not `make`'s): each counts as one. One whose end the reader did
+/// not find took the rest of the line unread ([`Undefined::unclosed`]), which may hold elements
+/// of its own (zsh's `qzf() true; make`), so that rest counts as one more: nothing read before
+/// it is the last, and the line is never one element.
+pub(crate) fn line_shape(cmdline: &str) -> LineShape {
+    let whole = joined(cmdline);
+    let bare = undefined(&whole);
+    let cmdline: &str = &bare.line;
+    let segments = split_list(cmdline);
+    // The elements before segment `upto`: the segments that hold a command, and the definitions
+    // typed before it.
+    let count = |upto: usize| {
+        let before = segments
+            .get(upto)
+            .map_or(cmdline.len(), |(_, text)| offset(cmdline, text));
+        let commands = segments[..upto]
+            .iter()
+            .filter(|(_, text)| holds_command(text))
+            .count();
+        let definitions = bare.blanks.iter().filter(|&&at| at < before).count();
+        u16::try_from(commands + definitions).unwrap_or(u16::MAX)
+    };
+    let (read, shared) = match read_at(&segments) {
+        Some(at) if holds_command(segments[at].1) => {
+            let program = |text: &str| candidate(text).map(|c| c.program);
+            let own = program(segments[at].1);
+            let shared = own.is_some()
+                && segments[..at]
+                    .iter()
+                    .any(|(_, text)| holds_command(text) && program(text) == own);
+            (count(at + 1), shared)
+        }
+        Some(_) | None => (0, false),
+    };
+    LineShape {
+        elements: count(segments.len()).saturating_add(u16::from(bare.unclosed)),
+        read,
+        shared,
+    }
 }
 
 const SUBCOMMANDS: &[(&str, &[&str])] = &[

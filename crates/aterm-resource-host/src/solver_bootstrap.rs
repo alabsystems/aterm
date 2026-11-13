@@ -55,17 +55,7 @@ pub(super) struct RunIntent {
     pub monotonic_ns: u64,
 }
 
-pub(super) struct Accepted {
-    // This one-shot final-image process keeps its watcher until process exit.
-    // Dropping Accepted cannot disable loss detection or release Host custody.
-    _watch: std::thread::JoinHandle<()>,
-    pub attempt: [u8; 16],
-    pub units: u32,
-    pub footprint_mib: u32,
-    pub monotonic_ns: u64,
-    pub pid: u32,
-    pub birth: u64,
-}
+pub(super) type Accepted = trust_resource_controller::solver_bootstrap::Accepted;
 
 impl Owner {
     pub fn new(
@@ -371,132 +361,26 @@ fn monotonic_ns() -> io::Result<u64> {
 pub(super) fn receive(
     channel: CtlStream,
     deadline: Instant,
-    authenticate: impl FnOnce(transport::Peer) -> io::Result<()>,
+    mut authenticate: impl FnMut(transport::Peer) -> io::Result<()>,
 ) -> io::Result<Accepted> {
     use std::os::fd::AsRawFd as _;
-    // SAFETY: read-only descriptor status on this held private stream. Require
-    // preparation before sharing rather than mutating an inherited OFD's flags.
+    // SAFETY: inspect only this held original endpoint. The shared protocol
+    // uses per-call nonblocking I/O and never mutates inherited OFD flags.
     let flags = unsafe { libc::fcntl(channel.as_raw_fd(), libc::F_GETFL) };
     if flags < 0 || flags & libc::O_NONBLOCK == 0 {
         return Err(invalid());
     }
-    let peer = transport::local_peer(&channel)?;
-    let original = process::read_lineage(std::process::id() as i32).ok_or_else(invalid)?;
-    if original.parent != peer.pid {
-        return Err(invalid());
-    }
-    authenticate(peer)?;
-    let offer = Frame::decode(&read_fixed(&channel, deadline)?)?;
-    if offer.kind != 1
-        || offer.pid != std::process::id()
-        || offer.birth != original.identity.birth.0
-    {
-        return Err(invalid());
-    }
-    trust_exec_policy::ExecutionSeal::NoForkOrExec.install_current()?;
-    if process::read_lineage(std::process::id() as i32) != Some(original)
-        || transport::local_peer(&channel)? != peer
-    {
-        return Err(invalid());
-    }
-    // Allocate and create the watcher before Ready. It cannot read Run: the
-    // original stream moves to it only after this thread validates that frame.
-    let (send, receive) = std::sync::mpsc::sync_channel(1);
-    let (armed, ready) = std::sync::mpsc::sync_channel(1);
-    let watch = std::thread::Builder::new()
-        .name("resource-host-loss".into())
-        .spawn(move || {
-            if armed.send(()).is_err() {
-                return;
-            }
-            if let Ok(channel) = receive.recv() {
-                watch_owner(channel);
-            }
-        })?;
-    ready
-        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        .map_err(|error| match error {
-            std::sync::mpsc::RecvTimeoutError::Timeout => io::Error::from(io::ErrorKind::TimedOut),
-            std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                io::Error::from(io::ErrorKind::UnexpectedEof)
-            }
-        })?;
-    transport::write_all(&channel, &offer.response(2, 0).encode(), deadline)?;
-    let run = Frame::decode(&read_fixed(&channel, deadline)?)?;
-    if run != offer.response(3, run.monotonic_ns) || run.kind != 3 {
-        return Err(invalid());
-    }
-    // The one preallocated slot cannot block after Run. A dead watcher or a
-    // violated single-delivery invariant fails before ordinary payload work.
-    send.try_send(channel).map_err(|_| invalid())?;
-    Ok(Accepted {
-        _watch: watch,
-        attempt: run.attempt,
-        units: run.units,
-        footprint_mib: run.footprint_mib,
-        monotonic_ns: run.monotonic_ns,
-        pid: run.pid,
-        birth: run.birth,
-    })
-}
-
-fn watch_owner(mut channel: CtlStream) {
-    use std::os::fd::AsRawFd as _;
-    loop {
-        let mut poll = libc::pollfd {
-            fd: channel.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: this thread exclusively owns the original endpoint for its
-        // whole process lifetime. The poll array is initialized and writable.
-        let ready = unsafe { libc::poll(&mut poll, 1, -1) };
-        if ready < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
-        if ready > 0
-            && let Err(error) = channel.read(&mut [0_u8; 1])
-            && matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            )
-        {
-            continue;
-        }
-        // After Run this private channel carries no further data. EOF, an
-        // unexpected message or loss of the read observation ends THIS payload;
-        // never infer authority to signal a separately observed PID or group.
-        // SAFETY: fail closed without unwinding past a possibly live payload or
-        // releasing any borrowed resource. The OS closes this process's handles.
-        unsafe { libc::_exit(75) }
-    }
-}
-
-fn read_fixed(mut channel: &CtlStream, deadline: Instant) -> io::Result<[u8; LEN]> {
-    let mut bytes = [0; LEN];
-    // Read the fixed private Run record with the same bounded/no-SIGPIPE transport.
-    // The Host sends no command or additional capability in this phase.
-    let mut read = 0;
-    while read < LEN {
-        if Instant::now() >= deadline {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        match channel.read(&mut bytes[read..]) {
-            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
-            Ok(n) => read += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                use std::os::fd::AsFd as _;
-                aterm_uds::ready::until(
-                    channel.as_fd(),
-                    aterm_uds::ready::Interest::Read,
-                    deadline,
-                )?;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(bytes)
+    trust_resource_controller::solver_bootstrap::receive(
+        trust_resource_controller::solver_bootstrap::BootstrapChannel::new(channel)?,
+        deadline,
+        |peer, _offer| {
+            authenticate(transport::Peer {
+                pid: peer.pid,
+                birth: peer.birth,
+            })
+        },
+        |_offer| trust_exec_policy::ExecutionSeal::NoForkOrExec.install_current(),
+    )
 }
 
 #[cfg(test)]

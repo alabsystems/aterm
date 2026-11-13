@@ -453,6 +453,8 @@ pub mod caps {
     pub const RELAY_ROW: usize = 12 * 1024;
     /// An allocator `place` row.
     pub const PLACE_ROW: usize = 512;
+    /// A Mac's `upd` update record row.
+    pub const UPD_ROW: usize = 2048;
     /// One flush record's payload.
     pub const RECORD: usize = 60 * 1024;
     /// Buckets accounts fall into for relaying.

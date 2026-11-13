@@ -245,23 +245,25 @@ pub(crate) fn observe_store_if_declared_within<T>(
 ) -> Result<Option<T>> {
     pass_current(read_by)?;
     let paths = crate::generation::observed_generation_until(paths, read_by)?;
-    observe_selected_if_declared(&paths, descriptor, read_by, wait, action)
+    observe_selected_if_declared(&paths, descriptor, read_by, wait, false, action)
 }
 
 /// [`observe_store_if_declared_within`] at `selected`, the home
 /// [`crate::generation::observed_generation_until`] named: its established custody opened, then
-/// its session ([`observed_session`]), then the declared table read.
+/// its session ([`observed_session`]), then the declared table read ([`observe_declared`], which
+/// `held` is for).
 fn observe_selected_if_declared<T>(
     selected: &Paths,
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
     read_by: std::time::Instant,
     wait: &dyn Fn() -> std::time::Instant,
+    held: bool,
     action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
 ) -> Result<Option<T>> {
     let (bootstrap, journal) = Bootstrap::established_with_journal_until(selected, wait())
         .map_err(crate::table::failure)?;
     let session = observed_session(&bootstrap, journal, read_by, wait)?;
-    observe_declared_in_session(&session, descriptor(&bootstrap)?, read_by, action)
+    observe_declared(&session, descriptor(&bootstrap)?, read_by, held, action)
 }
 
 /// A read-only session of the selected home whose established custody is `bootstrap`, with its
@@ -318,9 +320,29 @@ pub(crate) fn observe_declared_in_session<T>(
     deadline: std::time::Instant,
     action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
 ) -> Result<Option<T>> {
+    observe_declared(session, descriptor, deadline, false, action)
+}
+
+/// The table `descriptor` declares, observed in `session` where its catalog retains that
+/// declaration. Where `held`, a catalog or declared table whose directory binding was lost to a
+/// relocation is answered from its witnessed prefix if `session`'s home is a fenced original
+/// whose selection record holds no completion and that holds no completion mark
+/// ([`Directory::observe_held_table`]); otherwise,
+/// and for every reader that does not ask, such a table refuses.
+fn observe_declared<T>(
+    session: &Session<'_>,
+    descriptor: Descriptor,
+    deadline: std::time::Instant,
+    held: bool,
+    action: impl FnOnce(&Session<'_>, &Store, Scope) -> Result<T>,
+) -> Result<Option<T>> {
     pass_current(deadline)?;
     let directory = Directory::new(session.paths(), session.trust());
-    let snapshot = directory.snapshot_existing(session)?;
+    let snapshot = if held {
+        directory.snapshot_existing_held(session)?
+    } else {
+        directory.snapshot_existing(session)?
+    };
     pass_current(deadline)?;
     let Some(entry) = snapshot.entries.get(&descriptor.scope.digest()) else {
         return Ok(None);
@@ -335,7 +357,11 @@ pub(crate) fn observe_declared_in_session<T>(
             "application table has an incompatible or unavailable descriptor",
         ));
     }
-    let store = directory.observe_table(session, descriptor.scope)?;
+    let store = if held {
+        directory.observe_held_table(session, descriptor.scope)?
+    } else {
+        directory.observe_table(session, descriptor.scope)?
+    };
     pass_current(deadline)?;
     action(session, &store, descriptor.scope).map(Some)
 }
@@ -345,6 +371,17 @@ pub(crate) fn observe_declared_in_session<T>(
 /// [`admission_deadline`]. It creates no table, catalog or declaration, though asking
 /// [`commons_here`] may establish this Mac's custody; invalid custody, catalog or declared table
 /// storage remains an error, and a vault writer's moment is busy, never "no Commons here".
+///
+/// This is the one reader that answers a displaced table (SF-13): where the home it reads is a
+/// fenced original whose selection record holds no completion and that holds no completion
+/// mark ([`crate::generation::Preserving`]), a catalog or declared table
+/// whose directory binding was lost to a relocation is read from the prefix its claim witnesses
+/// ([`Directory::observe_held_table`]), each record authenticated as on any observation. That
+/// table read writes nothing, backfills no volume witness and repairs no binding. A table whose
+/// prefix has no witness still refuses, as does a displaced table of a home that is not fenced;
+/// and every other reader here ([`observe_store_if_declared_within`] and those built on it,
+/// [`observe_store_in_session`], [`peek_catalog`], [`peek_declaration`]) refuses a displaced
+/// table as before.
 pub(crate) fn observe_store_if_here<T>(
     paths: &Paths,
     descriptor: impl FnOnce(&Bootstrap) -> Result<Descriptor>,
@@ -356,7 +393,7 @@ pub(crate) fn observe_store_if_here<T>(
     if !commons_here(&selected)? {
         return Ok(None);
     }
-    observe_selected_if_declared(&selected, descriptor, deadline, &|| deadline, action)
+    observe_selected_if_declared(&selected, descriptor, deadline, &|| deadline, true, action)
 }
 
 /// This Mac's lab and the catalog it holds, read as an observer that creates no table, catalog

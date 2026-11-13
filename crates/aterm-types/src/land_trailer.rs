@@ -314,6 +314,15 @@ impl Stated {
     /// is read whole or not at all.
     #[must_use]
     pub fn of_trailers(text: &str) -> Option<Self> {
+        Self::of_block(text).filter(|stated| !stated.checked.is_empty())
+    }
+
+    /// [`Self::of_trailers`] for a receipt still being written, which may hold no judgment yet
+    /// (none, or interrupted ones only): the landing's handoff to another build of itself
+    /// carries its receipt in this one format. `None` where any line with one of [`KEYS`] is
+    /// malformed.
+    #[must_use]
+    pub fn of_block(text: &str) -> Option<Self> {
         let mut stated = Self::default();
         for line in text.lines() {
             let Some((key, value)) = line.split_once(": ") else {
@@ -336,7 +345,7 @@ impl Stated {
                 _ => {}
             }
         }
-        (!stated.checked.is_empty()).then_some(stated)
+        Some(stated)
     }
 }
 

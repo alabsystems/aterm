@@ -471,6 +471,9 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
                 crate::actor::workload_ready,
             )
         }
+        Some("native-job-ready-v1") if hello["version"].as_u64() == Some(3) => {
+            crate::workload_transport::native_ready(stream, peer, &hello, deadline)
+        }
         Some("native-workload-member-original-v1") if hello["version"].as_u64() == Some(3) => {
             crate::workload_transport::member_original(
                 stream,
@@ -529,6 +532,16 @@ fn serve_one(stream: &CtlStream, program: &Program, guis: Arc<AtomicUsize>) -> i
             wire::write_frame(stream, &[0x50], deadline)?;
             let incoming = crate::workload_transport::receive(stream, &job, deadline)?;
             crate::actor::submit_workload_query(incoming)?;
+            aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
+        }
+        Some("sealed-native-job-query-v1") => {
+            let job = crate::actor::native_job_binding(&hello)?;
+            if wire::local_peer(stream)? != peer {
+                return Err(refused());
+            }
+            wire::write_frame(stream, &[0x50], deadline)?;
+            let incoming = crate::workload_transport::receive_native(stream, &job, deadline)?;
+            crate::actor::submit_native_job_query(incoming)?;
             aterm_ctl::resource_subgroup_client::acknowledge(stream, deadline)
         }
         Some("native-linker-loan-v1") => {

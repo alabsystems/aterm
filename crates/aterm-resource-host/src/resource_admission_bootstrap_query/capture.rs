@@ -29,7 +29,7 @@ pub(in crate::actor::owner) struct CaptureObservation {
 }
 impl Capture {
     pub(super) fn pipe() -> io::Result<(Self, io::PipeWriter)> {
-        let (reader, writer) = aterm_uds::kept_out(io::pipe)?;
+        let (reader, writer) = aterm_uds::pipe()?;
         // This description is still private and is never inherited by the
         // child. Changing its flags cannot change the target's write OFD.
         let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };

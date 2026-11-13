@@ -2327,17 +2327,85 @@ pub(crate) fn repair_server_with(
 /// The arguments of `home`'s server job when [`repair_server`] would install it again: its unit
 /// file reads as a `secrets serve` job, not switched off, whose program `exists` finds gone.
 fn server_repair_due(home: &Path, exists: &dyn Fn(&Path) -> bool) -> Option<Vec<String>> {
-    let text = read_regular_string(&unit_file(home, Job::Server), UNIT_FILE_MOST)?;
-    let argv = if cfg!(target_os = "macos") {
-        plist_argv(&text).filter(|_| !text.contains("<key>Disabled</key>"))
-    } else {
-        exec_argv(&text)
-    };
-    let (held, args) = argv.as_deref().and_then(<[String]>::split_first)?;
+    let argv = unit_argv(home, Job::Server)?;
+    let (held, args) = argv.split_first()?;
     let serves = args
         .get(..2)
         .is_some_and(|words| words == ["secrets", "serve"]);
     (serves && !exists(Path::new(held))).then(|| args.to_vec())
+}
+
+/// The program and arguments `home`'s `job` unit file starts, whoever's home it is: `None` for no
+/// unit file, one a person switched off (a plist's `Disabled` key), or a form [`plist_text`] and
+/// [`systemd_unit`] never write.
+pub(crate) fn unit_argv(home: &Path, job: Job) -> Option<Vec<String>> {
+    let text = read_regular_string(&unit_file(home, job), UNIT_FILE_MOST)?;
+    if cfg!(target_os = "macos") {
+        plist_argv(&text).filter(|_| !text.contains("<key>Disabled</key>"))
+    } else {
+        exec_argv(&text)
+    }
+}
+
+/// Stop and remove `home`'s server job while its unit runs arguments `retired` names (after its
+/// program) and no pin record ([`pin_path`]) says a person chose it: the member server an earlier
+/// automatic setup installed where nothing finds or feeds it (`sync.steward.server.standby` off
+/// macOS). No Off record is written, as no person chose off. `None` where nothing was removed,
+/// and for a home that is not this login's own, whose jobs its service manager never reads (as
+/// [`state`]).
+/// # Errors
+/// The job's decision lock or pin record cannot be read, or the job did not stop or go.
+pub(crate) fn retire_server(
+    home: &Path,
+    retired: &dyn Fn(&[String]) -> bool,
+) -> crate::Result<Option<String>> {
+    if check_own_home(home).is_err() {
+        return Ok(None);
+    }
+    retire_server_with(home, retired, || uninstall_job(home, Job::Server))
+}
+
+/// Whether [`retire_server`] would remove `home`'s server job now.
+/// # Errors
+/// The pin record cannot be read.
+pub(crate) fn server_retire_due(
+    home: &Path,
+    retired: &dyn Fn(&[String]) -> bool,
+) -> crate::Result<bool> {
+    if check_own_home(home).is_err() {
+        return Ok(false);
+    }
+    retire_due(home, retired)
+}
+
+/// [`retire_server`] under `home`, whoever's it is, `remove` stopping and removing the job. The
+/// job's decision lock (`JobDecision`) is taken only once the unit reads as one to retire, and
+/// the unit is read again under it, so an `on`, an `off` or a repair meanwhile stands and a home
+/// with no such job gets no lock file.
+pub(crate) fn retire_server_with(
+    home: &Path,
+    retired: &dyn Fn(&[String]) -> bool,
+    remove: impl FnOnce() -> crate::Result<bool>,
+) -> crate::Result<Option<String>> {
+    if !retire_due(home, retired)? {
+        return Ok(None);
+    }
+    let _decision = JobDecision::take(home, Job::Server)?;
+    if !retire_due(home, retired)? {
+        return Ok(None);
+    }
+    Ok(remove()?.then(|| format!("removed {}", unit_file(home, Job::Server).display())))
+}
+
+fn retire_due(home: &Path, retired: &dyn Fn(&[String]) -> bool) -> crate::Result<bool> {
+    let Some(argv) = unit_argv(home, Job::Server) else {
+        return Ok(false);
+    };
+    let Some((_, args)) = argv.split_first() else {
+        return Ok(false);
+    };
+    Ok(retired(args)
+        && crate::fsx::kind(&pin_path(home, Job::Server))? == crate::fsx::Kind::Missing)
 }
 
 /// A vault job held on another aterm than the one asking ([`held`]).

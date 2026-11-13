@@ -401,3 +401,338 @@ fn complete_descendant_answers_do_not_require_ancestor_side_history() {
             .any(|arg| arg == "fetch" || arg == "clone" || arg == "update-ref")
     }));
 }
+
+struct FilteredStore {
+    donor: PathBuf,
+    store: PathBuf,
+    first: String,
+    tip: String,
+    retired: String,
+}
+
+fn filtered_store(world: &World) -> FilteredStore {
+    let donor = bare_repo(world.path(), "filtered-donor");
+    let work = world.path().join("filtered-donor-work");
+    let first = host_git(&donor, &["rev-parse", "main"]);
+    std::fs::write(work.join("retired"), vec![0xa5; 64 * 1024]).unwrap();
+    host_git(&work, &["add", "retired"]);
+    host_git(&work, &["commit", "--quiet", "-m", "historical blob"]);
+    let retired = host_git(&work, &["rev-parse", "HEAD:retired"]);
+    host_git(&work, &["rm", "--quiet", "retired"]);
+    host_git(&work, &["commit", "--quiet", "-m", "current source"]);
+    host_git(&work, &["push", "--quiet", donor.to_str().unwrap(), "main"]);
+    host_git(&donor, &["config", "uploadpack.allowFilter", "true"]);
+    let tip = host_git(&donor, &["rev-parse", "main"]);
+    let store = world.path().join("filtered-store.git");
+    // A file URL uses real upload-pack, rather than local hardlink cloning.
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            "--filter=blob:none",
+            &format!("file://{}", donor.display()),
+            store.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        host_git(&store, &["config", "remote.origin.promisor"]),
+        "true"
+    );
+    assert_eq!(
+        host_git(&store, &["config", "remote.origin.partialclonefilter"]),
+        "blob:none"
+    );
+    assert!(!local_object(&store, &retired));
+    FilteredStore {
+        donor,
+        store,
+        first,
+        tip,
+        retired,
+    }
+}
+
+fn local_object(store: &Path, id: &str) -> bool {
+    let mut command = aterm_uds::spawnfd::command(host_git_path());
+    command
+        .args([
+            "-C",
+            store.to_str().unwrap(),
+            "-c",
+            "protocol.allow=never",
+            "cat-file",
+            "-e",
+            id,
+        ])
+        .env_clear()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_NO_LAZY_FETCH", "1");
+    aterm_uds::deadline::output_until(&mut command, std::time::Instant::now() + common::HANG)
+        .unwrap()
+        .status
+        .success()
+}
+
+#[test]
+fn real_filtered_clones_allow_only_immutable_commit_reads_and_keep_omitted_blobs_missing() {
+    let world = World::canonical("commit-filtered-local");
+    let fixture = filtered_store(&world);
+    let full = world.path().join("full-control.git");
+    host_git(
+        world.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--bare",
+            &format!("file://{}", fixture.donor.display()),
+            full.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        local_object(&full, &fixture.retired),
+        "unfiltered control must contain the exact retired blob"
+    );
+    let tree = host_git(&fixture.store, &["rev-parse", "main^{tree}"]);
+    let unrelated = host_git(&fixture.store, &["commit-tree", &tree, "-m", "unrelated"]);
+    let refs = host_git(&fixture.store, &["show-ref"]);
+    let config = std::fs::read(fixture.store.join("config")).unwrap();
+    std::fs::write(fixture.store.join("FETCH_HEAD"), b"original fetch head\n").unwrap();
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &fixture.donor)
+        .build();
+    for (ancestor, contained) in [(&fixture.first, true), (&unrelated, false)] {
+        let result = answer(&gh, &fixture.store, ancestor, &fixture.tip).unwrap();
+        assert_eq!(result["queries"][0]["contained"], json!(contained));
+        assert_eq!(result["acquired_commits"], json!(0));
+        assert_eq!(result["refs_written"], json!(false));
+        assert_eq!(result["checkout_complete"], json!(false));
+    }
+    let transport = gh.run_git(&GitRun::fetch_main(
+        &common::slug("fixture-dev/app"),
+        &fixture.store,
+        "refs/agh/transport-control",
+    ));
+    let error = transport.expect_err("commit-read metadata cannot authorize Git transport");
+    assert_eq!(error.kind, Kind::Refused);
+    assert!(matches!(error.sub, Sub::GitConfig { .. }));
+    assert_eq!(host_git(&fixture.store, &["show-ref"]), refs);
+    assert_eq!(std::fs::read(fixture.store.join("config")).unwrap(), config);
+    assert_eq!(
+        std::fs::read(fixture.store.join("FETCH_HEAD")).unwrap(),
+        b"original fetch head\n"
+    );
+    assert!(!local_object(&fixture.store, &fixture.retired));
+    assert!(
+        world
+            .fake
+            .seen()
+            .iter()
+            .all(|call| !call.path_and_query.contains("/git/commits/"))
+    );
+}
+
+#[test]
+fn filtered_missing_commits_are_acquired_as_exact_api_bytes_without_promisor_transport() {
+    let world = World::canonical("commit-filtered-acquire");
+    let fixture = filtered_store(&world);
+    let alternate = bare_repo(world.path(), "auxiliary");
+    let alternate_bytes = format!("{}/objects\n", alternate.display());
+    std::fs::write(
+        fixture.store.join("objects/info/alternates"),
+        &alternate_bytes,
+    )
+    .unwrap();
+    let input = world.path().join("future-blob");
+    std::fs::write(&input, vec![0x5a; 64 * 1024]).unwrap();
+    let blob = host_git(
+        &fixture.donor,
+        &["hash-object", "-w", input.to_str().unwrap()],
+    );
+    let mut tree_bytes = b"100644 future\0".to_vec();
+    for pair in blob.as_bytes().as_chunks::<2>().0 {
+        tree_bytes.push(u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap());
+    }
+    let input = world.path().join("future-tree");
+    std::fs::write(&input, tree_bytes).unwrap();
+    let tree = host_git(
+        &fixture.donor,
+        &["hash-object", "-w", "-t", "tree", input.to_str().unwrap()],
+    );
+    let middle = host_git(
+        &fixture.donor,
+        &["commit-tree", &tree, "-p", &fixture.tip, "-m", "middle"],
+    );
+    let tip = host_git(
+        &fixture.donor,
+        &["commit-tree", &tree, "-p", &middle, "-m", "future"],
+    );
+    assert!(!local_object(&fixture.store, &tip));
+    api_commit(&world, &fixture.donor, &middle);
+    api_commit(&world, &fixture.donor, &tip);
+    let config = std::fs::read(fixture.store.join("config")).unwrap();
+    let refs = host_git(&fixture.store, &["show-ref"]);
+    std::fs::write(fixture.store.join("FETCH_HEAD"), b"original fetch head\n").unwrap();
+    let gh = world.client(git_env()).build();
+    let result = answer(&gh, &fixture.store, &fixture.first, &tip).unwrap();
+    assert_eq!(result["queries"][0]["contained"], json!(true));
+    assert_eq!(result["acquired_commits"], json!(2));
+    assert!(local_object(&fixture.store, &middle));
+    assert!(local_object(&fixture.store, &tip));
+    for id in [&tree, &blob, &fixture.retired] {
+        assert!(!local_object(&fixture.store, id));
+    }
+    assert_eq!(std::fs::read(fixture.store.join("config")).unwrap(), config);
+    assert_eq!(
+        std::fs::read(fixture.store.join("FETCH_HEAD")).unwrap(),
+        b"original fetch head\n"
+    );
+    assert_eq!(host_git(&fixture.store, &["show-ref"]), refs);
+    assert_eq!(
+        std::fs::read(fixture.store.join("objects/info/alternates")).unwrap(),
+        alternate_bytes.as_bytes()
+    );
+    let reader_children = gh
+        .fx()
+        .children_run()
+        .into_iter()
+        .filter(|child| {
+            child
+                .args
+                .iter()
+                .any(|arg| arg == "core.commitGraph=false" || arg == "count-objects")
+        })
+        .collect::<Vec<_>>();
+    assert!(!reader_children.is_empty());
+    assert!(
+        reader_children
+            .iter()
+            .any(|child| child.args.iter().any(|arg| arg == "count-objects"))
+    );
+    assert!(reader_children.iter().all(|child| {
+        child
+            .env
+            .iter()
+            .any(|(name, value)| name == "GIT_NO_LAZY_FETCH" && value == "1")
+    }));
+}
+
+#[test]
+fn filtered_missing_parent_and_wrong_api_identity_cannot_become_negative_evidence() {
+    let world = World::canonical("commit-filtered-missing");
+    let fixture = filtered_store(&world);
+    let tree = host_git(&fixture.donor, &["rev-parse", "main^{tree}"]);
+    let parent = host_git(
+        &fixture.donor,
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &fixture.tip,
+            "-m",
+            "missing parent",
+        ],
+    );
+    let raw = format!(
+        "tree {tree}\nparent {parent}\nauthor fixture <fixture> 1700000000 +0000\ncommitter fixture <fixture> 1700000000 +0000\n\ngap\n"
+    );
+    let input = world.path().join("gap");
+    std::fs::write(&input, raw).unwrap();
+    let tip = host_git(
+        &fixture.store,
+        &["hash-object", "-w", "-t", "commit", input.to_str().unwrap()],
+    );
+    let unrelated = host_git(&fixture.store, &["commit-tree", &tree, "-m", "unrelated"]);
+    assert!(!local_object(&fixture.store, &parent));
+    world.fake.fault_always(
+        Match::api(&format!("/repos/fixture-dev/app/git/commits/{parent}")),
+        Fault::Status {
+            status: 200,
+            body: format!("{{\"sha\":\"{}\"}}", fixture.first),
+            headers: Vec::new(),
+        },
+    );
+    let gh = world.client(git_env()).build();
+    assert!(answer(&gh, &fixture.store, &unrelated, &tip).is_err());
+    assert!(!local_object(&fixture.store, &parent));
+    assert!(!local_object(&fixture.store, &fixture.retired));
+    assert!(gh.fx().children_run().iter().all(|child| {
+        !child
+            .args
+            .iter()
+            .any(|arg| arg == "fetch" || arg == "update-ref")
+    }));
+}
+
+#[test]
+fn a_missing_promised_blob_cannot_be_fetched_or_accepted_as_a_commit() {
+    let world = World::canonical("commit-filtered-promised-blob");
+    let fixture = filtered_store(&world);
+    let api = format!("/repos/fixture-dev/app/git/commits/{}", fixture.retired);
+    world.fake.fault_always(
+        Match::api(&api),
+        Fault::Status {
+            status: 200,
+            body: format!("{{\"sha\":\"{}\",\"type\":\"blob\"}}", fixture.retired),
+            headers: Vec::new(),
+        },
+    );
+    let requested = CommitRead::new(CommitReadInput {
+        commits: vec![fixture.retired.clone()],
+        queries: Vec::new(),
+    })
+    .unwrap();
+    let gh = world.client(git_env()).build();
+    gh.run_git(&GitRun::commit_read(
+        &common::slug("fixture-dev/app"),
+        &fixture.store,
+        requested,
+        true,
+    ))
+    .expect_err("a missing promised blob is not an authenticated commit");
+    assert!(!local_object(&fixture.store, &fixture.retired));
+    assert!(
+        world
+            .fake
+            .seen()
+            .iter()
+            .any(|call| call.path_and_query == api)
+    );
+}
+
+#[test]
+fn filtered_metadata_never_admits_duplicate_or_other_guarded_source_configuration() {
+    let world = World::canonical("commit-filtered-config");
+    let fixture = filtered_store(&world);
+    let config = std::fs::read(fixture.store.join("config")).unwrap();
+    let gh = world.client(git_env()).build();
+    for added in [
+        "[remote \"origin\"]\npromisor = true\n",
+        "[remote \"origin\"]\npartialclonefilter = tree:0\n",
+        "[remote \"origin\"]\nproxy = https://elsewhere.invalid/\n",
+        "[core]\nhooksPath = /untrusted\n",
+        "[core]\nalternateRefsCommand = untrusted\n",
+        "[extensions]\npartialClone = origin\n",
+        "[http]\nsslVerify = false\n",
+        "[include]\npath = /untrusted\n",
+    ] {
+        let bytes = [config.as_slice(), added.as_bytes()].concat();
+        std::fs::write(fixture.store.join("config"), bytes).unwrap();
+        let error = answer(&gh, &fixture.store, &fixture.first, &fixture.tip)
+            .expect_err("filter metadata cannot admit unsafe configuration");
+        assert_eq!(error.kind, Kind::Refused, "{added}");
+        assert!(matches!(error.sub, Sub::GitConfig { .. }), "{added}");
+        std::fs::write(fixture.store.join("config"), &config).unwrap();
+    }
+    assert!(!local_object(&fixture.store, &fixture.retired));
+    assert!(
+        world
+            .fake
+            .seen()
+            .iter()
+            .all(|call| !call.path_and_query.contains("/git/commits/"))
+    );
+}

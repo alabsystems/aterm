@@ -256,13 +256,17 @@ impl Drop for Launch {
 }
 
 impl Launch {
-    fn bind(&mut self, process: Process) {
+    fn bind(&mut self, process: Process) -> Result<(), Error> {
+        if let Some(native) = &self.native_restart {
+            native.bind_generation(&process)?;
+        }
         self.process = Some(process);
         self.typed = true;
         // Native constructor work is complete at actual kernel bind. Consumer
         // and connection lifetime now owns startup; the gate is NOT released.
         // This scope never contains an irreversible provider response.
         self._scope.take();
+        Ok(())
     }
 }
 
@@ -833,6 +837,9 @@ impl ReadySourceProof {
         if !self.alive.load(Ordering::Acquire) {
             return false;
         }
+        // Observe the kernel outside State, then compare the complete process
+        // identity under the same metadata guard as the retained version.
+        let observed = Process::observe(self.caller.pid);
         let Some(state) = self.state.upgrade() else {
             return false;
         };
@@ -847,7 +854,7 @@ impl ReadySourceProof {
             member.version == self.version
                 && member.readiness.manager()
                 && !member.unknown
-                && Process::observe(member.caller.pid).as_ref() == Some(&member.process)
+                && observed.as_ref() == Some(&member.process)
         });
         current && self.alive.load(Ordering::Acquire)
     }
@@ -896,6 +903,7 @@ impl ReaderSourceProof {
         if !self.alive.load(Ordering::Acquire) {
             return false;
         }
+        let observed = Process::observe(self.caller.pid);
         let Some(state) = self.state.upgrade() else {
             return false;
         };
@@ -910,7 +918,7 @@ impl ReaderSourceProof {
             member.version == self.version
                 && member.readiness.reader()
                 && !member.unknown
-                && Process::observe(member.caller.pid).as_ref() == Some(&member.process)
+                && observed.as_ref() == Some(&member.process)
         });
         current && self.alive.load(Ordering::Acquire)
     }
@@ -1365,7 +1373,7 @@ impl Registry {
         if let Some(gate) = &launch.gate {
             gate.current().map_err(|_| Error::Stale)?;
         }
-        launch.bind(process.clone());
+        launch.bind(process.clone())?;
         Ok(Peer {
             caller: caller.clone(),
             process,
@@ -1667,18 +1675,20 @@ impl Registry {
             if current.process != peer.process
                 || current.operation != operation
                 || current.registration != registration
-                || current.unknown
                 || !current.connection.same(connection)
             {
                 return Err(Error::Stale);
             }
             let role = reservation::target::reported_role(&ready, &current.source)?;
+            // Reconcile an exact committed report after a lost ACK even while
+            // the authenticated rebound member is unknown. This returns only
+            // metadata: it does not clear unknown or restore native Ready.
             Ok(!state.preloads.contains_key(&key)
                 && current.readiness.role == Some(role)
                 && state
                     .preload_sequences
                     .get(&key)
-                    .is_some_and(|ledger| ledger.completed(registration)))
+                    .is_some_and(|ledger| ledger.recorded_ready(&attempt, registration, role)))
         };
         if recorded()? {
             return Ok(());
@@ -1779,13 +1789,19 @@ impl Registry {
         // A Ready ACK cannot outrun the source worker whose custody it settles.
         worker.check_completion(&state, &key)?;
         reservation::target::resources::check_member_update(&state, &peer.caller, member)?;
+        // Keep the accepted immutable report with the completed sequence, as
+        // the owned PRELOAD path does. A completed bit alone cannot prove which
+        // Ready body was accepted or support coherent native observation.
+        let mut ledger = state
+            .preload_sequences
+            .get(&key)
+            .ok_or(Error::Stale)?
+            .clone();
+        ledger.accept_ready(&attempt, registration, role)?;
+        ledger.complete(&attempt, registration)?;
         let current = state.members.get_mut(&key).ok_or(Error::Stale)?;
         current.readiness.complete(role)?;
-        state
-            .preload_sequences
-            .get_mut(&key)
-            .ok_or(Error::Stale)?
-            .complete(&attempt, registration)?;
+        state.preload_sequences.insert(key.clone(), ledger);
         let preload = state.preloads.remove(&key);
         if let Some(token) = peer.launch
             && let Some(launch) = state.launches.get_mut(&token)
@@ -1807,13 +1823,14 @@ impl Registry {
         member: &str,
     ) -> Result<ReadySourceProof, Error> {
         let key = member_key(caller, member)?;
+        let observed = Process::observe(caller.pid);
         let state = lock(&self.state)?;
         let current = state.members.get(&key).ok_or(Error::Unavailable)?;
         if reservation::target::normalize::handoff::source_revoked(&state, caller, member)
             || !current.readiness.manager()
             || current.unknown
             || !current.connection.alive.load(Ordering::Acquire)
-            || Process::observe(caller.pid).as_ref() != Some(&current.process)
+            || observed.as_ref() != Some(&current.process)
         {
             return Err(Error::Stale);
         }
@@ -1834,13 +1851,14 @@ impl Registry {
         member: &str,
     ) -> Result<ReaderSourceProof, Error> {
         let key = member_key(caller, member)?;
+        let observed = Process::observe(caller.pid);
         let state = lock(&self.state)?;
         let current = state.members.get(&key).ok_or(Error::Unavailable)?;
         if reservation::target::normalize::handoff::source_revoked(&state, caller, member)
             || !current.readiness.reader()
             || current.unknown
             || !current.connection.is_live()
-            || Process::observe(caller.pid).as_ref() != Some(&current.process)
+            || observed.as_ref() != Some(&current.process)
         {
             return Err(Error::Stale);
         }

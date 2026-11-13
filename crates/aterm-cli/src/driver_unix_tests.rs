@@ -3,7 +3,6 @@
 
 use super::*;
 use std::io::{Read, Write};
-use std::os::fd::FromRawFd;
 
 #[test]
 fn run_returns_the_shells_status_not_an_older_zombie_childs() {
@@ -598,7 +597,7 @@ fn a_resize_between_the_signal_check_and_the_poll_reaches_the_program() {
     static HOST: AtomicI32 = AtomicI32::new(-1);
     static FIRED: AtomicBool = AtomicBool::new(false);
     if std::env::var_os(CHILD).is_none() {
-        let (stdin, held) = std::io::pipe().expect("stdin pipe");
+        let (stdin, held) = aterm_uds::pipe().expect("stdin pipe");
         reexec(
             "a_resize_between_the_signal_check_and_the_poll_reaches_the_program",
             CHILD,
@@ -819,19 +818,8 @@ fn every_terminal_poll_flag_reaches_the_read_path() {
 
 #[test]
 fn closed_pipe_drains_buffered_bytes_then_consumes_hangup() {
-    let mut raw = [-1; 2];
-    assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0);
-    for fd in raw {
-        // SAFETY: `fd` is a valid pipe descriptor from `libc::pipe`.
-        assert_eq!(
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
-            0
-        );
-    }
-    // SAFETY: transfers ownership of fresh pipe read fd `raw[0]` to `File`.
-    let mut reader = unsafe { std::fs::File::from_raw_fd(raw[0]) };
-    // SAFETY: transfers ownership of fresh pipe write fd `raw[1]` to `File`.
-    let mut writer = unsafe { std::fs::File::from_raw_fd(raw[1]) };
+    let (mut reader, mut writer) = aterm_uds::pipe().expect("pipe");
+    let read_end = std::os::fd::AsRawFd::as_raw_fd(&reader);
     let expected = b"buffered-after-close";
     writer.write_all(expected).expect("seed pipe");
     drop(writer);
@@ -841,7 +829,7 @@ fn closed_pipe_drains_buffered_bytes_then_consumes_hangup() {
     let mut saw_eof = false;
     for _ in 0..expected.len() + 2 {
         let mut event = libc::pollfd {
-            fd: raw[0],
+            fd: read_end,
             events: libc::POLLIN,
             revents: 0,
         };

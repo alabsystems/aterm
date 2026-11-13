@@ -6,6 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+const HOUR: Duration = Duration::from_secs(60 * 60);
+const MINUTE: Duration = Duration::from_secs(60);
 
 /// The clock every case reads.
 fn now() -> SystemTime {
@@ -280,7 +282,7 @@ fn observations_separate_quiet_units_from_missing_compiler_evidence_without_more
     assert_eq!(seen.last_build_current, Some(true));
     assert_eq!(seen.profiles_with_compiler_references, 1);
     assert_eq!(seen.units_without_compiler, 0);
-    assert!(!seen.release_record);
+    assert!(!seen.used_record);
 
     let mut missing = s.clone();
     missing.last_built = None;
@@ -334,11 +336,11 @@ fn observations_separate_quiet_units_from_missing_compiler_evidence_without_more
 }
 
 #[test]
-fn observations_distinguish_release_records_and_do_not_count_omitted_layouts() {
+fn observations_distinguish_used_records_and_do_not_count_omitted_layouts() {
     let mut fs = release_clone();
     let s = clone_survey(&fs);
     let seen = observations(&s, now(), RECLAIM_STALE);
-    assert!(seen.release_record);
+    assert!(seen.used_record);
     assert_eq!(seen.profiles_naming_used_units, 1);
     assert_eq!(
         seen.units.quiet + seen.units.not_quiet + seen.units.unknown,
@@ -346,7 +348,7 @@ fn observations_distinguish_release_records_and_do_not_count_omitted_layouts() {
     );
     fs.file(&format!("{LEAF}/{USED}"), now(), b"malformed record");
     let missing = observations(&clone_survey(&fs), now(), RECLAIM_STALE);
-    assert!(!missing.release_record);
+    assert!(!missing.used_record);
     assert_eq!(missing.profiles_naming_used_units, 0);
     fs.blind.push(PathBuf::from(format!("{PROFILE}/build")));
     let omitted = observations(&clone_survey(&fs), now(), RECLAIM_STALE);
@@ -1436,10 +1438,40 @@ fn millis(at: SystemTime) -> u64 {
     u64::try_from(at.duration_since(UNIX_EPOCH).unwrap().as_millis()).unwrap()
 }
 
-/// When the last passing release run of [`release_clone`] began: an hour before its record was
+/// When the one run [`release_clone`]'s record keeps began: an hour before the record was
 /// written, four days ago.
 fn began() -> SystemTime {
-    now() - 4 * DAY - Duration::from_secs(60 * 60)
+    now() - 4 * DAY - HOUR
+}
+
+/// The scope [`release_clone`]'s record keeps its one run under.
+const SCOPE: &str = "verify /c/Users//me/ws test --workspace";
+
+/// The record at the top of `fs`'s build directory.
+fn record(fs: &Fake) -> Kept {
+    Kept::decode(&fs.nodes[Path::new(&format!("{LEAF}/{USED}"))].2).unwrap()
+}
+
+/// `kept` as the record at the top of `fs`'s build directory, written `at`.
+fn keep(fs: &mut Fake, kept: &Kept, at: SystemTime) {
+    fs.file(&format!("{LEAF}/{USED}"), at, kept.encode().as_bytes());
+}
+
+/// A run that began at `began`, built tests of `members` and used each `(package, hash)` unit of
+/// the profile, named by an output in its folder.
+fn ran(began: SystemTime, members: &[&str], units: &[(&str, &str)]) -> Used {
+    let mut used = Used {
+        began_ms: millis(began),
+        members: members.iter().map(|m| (*m).to_owned()).collect(),
+        ..Used::default()
+    };
+    for (package, hash) in units {
+        used.add(
+            Path::new(LEAF),
+            Path::new(&format!("{PROFILE}/build/{package}/{hash}/out/x-{hash}")),
+        );
+    }
+    used
 }
 
 /// The release clone's profile. Of `aterm-grid`, a package of the workspace's own: the test unit of
@@ -1448,8 +1480,9 @@ fn began() -> SystemTime {
 /// ago; a test unit built a day ago (`FRESH`); and the build of its library another compile of
 /// the run made ([`SPEC`]), written after the run began. Of `libc`, a dependency every candidate
 /// reuses, unwritten a month: the build the tests used ([`LIBC`]) and another compile's
-/// ([`LIBC_SPEC`]). The record of the last passing release run ([`began`]), written four days
-/// ago, names `NEW`, [`USED_LIB`] and [`LIBC`], and `aterm-grid` as the workspace's own.
+/// ([`LIBC_SPEC`]). The record, written four days ago, keeps one run ([`SCOPE`], [`began`]), which
+/// names `NEW`, [`USED_LIB`] and [`LIBC`], and `aterm-grid` as the workspace's own, and retired
+/// nothing.
 fn release_clone() -> Fake {
     release_clone_with(
         &["libaterm_grid-{h}.rlib", "libaterm_grid-{h}.rmeta"],
@@ -1500,23 +1533,20 @@ fn release_clone_with(lib: &[&str], members: &[&str]) -> Fake {
             now() - 30 * DAY,
         );
     }
-    let mut used = Used {
-        began_ms: millis(began()),
-        members: members.iter().map(|m| (*m).to_owned()).collect(),
-        ..Used::default()
-    };
-    for file in [
-        format!("{PROFILE}/build/aterm-grid/{NEW}/out/aterm_grid-{NEW}"),
-        format!("{PROFILE}/build/aterm-grid/{USED_LIB}/out/libaterm_grid-{USED_LIB}.rmeta"),
-        format!("{PROFILE}/build/libc/{LIBC}/out/liblibc-{LIBC}.rlib"),
-    ] {
-        used.add(Path::new(LEAF), Path::new(&file));
-    }
-    fs.file(
-        &format!("{LEAF}/{USED}"),
-        now() - 4 * DAY,
-        used.encode().as_bytes(),
+    let mut kept = Kept::default();
+    kept.end(
+        SCOPE,
+        ran(
+            began(),
+            members,
+            &[
+                ("aterm-grid", NEW),
+                ("aterm-grid", USED_LIB),
+                ("libc", LIBC),
+            ],
+        ),
     );
+    keep(&mut fs, &kept, now() - 4 * DAY);
     fs
 }
 
@@ -1533,23 +1563,319 @@ fn superseded(units: &[(&str, &str)]) -> Vec<(Part, Vec<String>)> {
         .collect()
 }
 
-/// A UNIT THE LAST PASSING RELEASE RUN SUPERSEDED GOES ([`Part::Superseded`]): of the release
-/// clone's units ([`release_clone`]), the test unit of the candidate before, which that run did not
-/// use beside the test unit of the same package it did, goes whole once stale, and below the floor
-/// alone too. Kept: the units the run used, however long unwritten (cargo found them fresh);
-/// lint's check of the library, which wrote `.rmeta` alone, so another kind than the library build
-/// the run used; the test unit built a day ago; the library build another compile of the run made,
-/// written after the run began; and `libc`'s other build, a dependency's, which no version bump
-/// hashes anew and another compile may read fresh. NEGATIVE CONTROLS, each the one thing that kept
-/// a unit taken away: the old test unit written after the run began stays; the check goes where the
-/// library build the run used wrote `.rmeta` alone too; `libc`'s other build goes where the record
-/// names `libc` among the workspace's own; the other compile's library build goes where it was
-/// written before the run began; and without the record, or with a torn one, nothing goes.
+/// When the first and the second run of [`dev_checkout`]'s scope began.
+fn first() -> SystemTime {
+    now() - 2 * HOUR
+}
+
+fn second() -> SystemTime {
+    now() - 10 * MINUTE
+}
+
+/// A dev checkout's profile across two runs of one scope. Of `aterm-grid`, a package of the
+/// workspace's own: the test unit the first run used (`OLD`, written `old_at`), the test unit the
+/// second built (`NEW`, written a minute after it began) and the library build both used
+/// ([`USED_LIB`], written three hours ago, before either). Of `libc`, a dependency, unwritten a
+/// month: the build both used ([`LIBC`]) and another ([`LIBC_SPEC`]). No record.
+fn dev_checkout(old_at: SystemTime) -> Fake {
+    let mut fs = Fake::default();
+    fs.file(
+        &format!("{PROFILE}/.cargo-build-lock"),
+        now() - 90 * DAY,
+        b"",
+    );
+    let test = ["aterm_grid-{h}", "aterm_grid-{h}.d"];
+    folder_unit(
+        &mut fs,
+        "aterm-grid",
+        OLD,
+        "test-lib-aterm_grid",
+        2,
+        &test,
+        old_at,
+    );
+    folder_unit(
+        &mut fs,
+        "aterm-grid",
+        NEW,
+        "test-lib-aterm_grid",
+        2,
+        &test,
+        second() + MINUTE,
+    );
+    folder_unit(
+        &mut fs,
+        "aterm-grid",
+        USED_LIB,
+        "lib-aterm_grid",
+        2,
+        &["libaterm_grid-{h}.rlib", "libaterm_grid-{h}.rmeta"],
+        now() - 3 * HOUR,
+    );
+    for hash in [LIBC, LIBC_SPEC] {
+        folder_unit(
+            &mut fs,
+            "libc",
+            hash,
+            "lib-libc",
+            2,
+            &["liblibc-{h}.rlib", "liblibc-{h}.rmeta"],
+            now() - 30 * DAY,
+        );
+    }
+    fs
+}
+
+/// A UNIT THE KEPT RUNS STOPPED USING GOES WHEN ITS RUN ENDS ([`Part::Superseded`],
+/// [`Kept::retired`]): a scope's first run, two hours ago, used the test unit `OLD`; its second,
+/// ten minutes ago, used `NEW` in its place, so its end retired `OLD`, and `OLD`, written an hour
+/// ago, goes under the calm window it is nowhere near quiet for. The units the second run used
+/// stay, and so does `libc`'s other build. NEGATIVE CONTROLS, each the one thing that took the
+/// unit away: a third end of the same run retires nothing (nothing is carried over), and `OLD`
+/// waits the window; `OLD` written after the second run began stays; a retired unit of `libc`
+/// stays while `libc` is no package the runs built tests of, and goes once it is; `OLD` stays
+/// where the second run names no unit of its kind; where its folder cannot be listed; and where
+/// the record is the one before this one (schema 1), under either name, which is not read, even
+/// below the floor.
 #[test]
-fn a_unit_the_last_passing_release_run_superseded_goes() {
+fn a_unit_the_kept_runs_stopped_using_goes_when_its_run_ends() {
+    let grid = "aterm-grid";
+    let run1 = ran(
+        first(),
+        &[grid],
+        &[(grid, OLD), (grid, USED_LIB), ("libc", LIBC)],
+    );
+    let run2 = ran(
+        second(),
+        &[grid],
+        &[(grid, NEW), (grid, USED_LIB), ("libc", LIBC)],
+    );
+    // Each run ended in turn under the one scope: the record, and what each end retired.
+    let ended = |runs: &[&Used]| {
+        let mut kept = Kept::default();
+        let retired: Vec<usize> = runs
+            .iter()
+            .map(|run| kept.end("s", (*run).clone()))
+            .collect();
+        (kept, retired)
+    };
+    let gone = |fs: &Fake| paths(&decide(&clone_survey(fs), now(), RECLAIM_STALE));
+    let written = now() - 5 * MINUTE;
+
+    let (kept, retired) = ended(&[&run1, &run2]);
+    assert_eq!(retired, vec![0, 1]);
+    assert_eq!(kept.runs.len(), 1, "one scope keeps one run");
+    assert_eq!(
+        kept.retired.profiles,
+        BTreeMap::from([("debug".to_owned(), BTreeSet::from([OLD.to_owned()]))])
+    );
+    let mut fs = dev_checkout(now() - HOUR);
+    keep(&mut fs, &kept, written);
+    let s = clone_survey(&fs);
+    assert_eq!(
+        (s.began, s.retired_before),
+        (Some(second()), Some(second()))
+    );
+    assert_eq!(
+        gone(&fs),
+        superseded(&[(grid, OLD)]),
+        "an hour old, and not waited on"
+    );
+
+    let (same, retired) = ended(&[&run1, &run2, &run2]);
+    assert_eq!(retired, vec![0, 1, 0]);
+    keep(&mut fs, &same, written);
+    assert_eq!(
+        gone(&fs),
+        Vec::new(),
+        "the same run ended again retires nothing, and nothing is carried over"
+    );
+
+    let mut after = dev_checkout(second() + MINUTE);
+    keep(&mut after, &kept, written);
+    assert_eq!(
+        gone(&after),
+        Vec::new(),
+        "written after the run that retired it began"
+    );
+
+    let with_libc = |members: &[&str]| {
+        let (kept, retired) = ended(&[
+            &ran(
+                first(),
+                members,
+                &[
+                    (grid, NEW),
+                    (grid, USED_LIB),
+                    ("libc", LIBC),
+                    ("libc", LIBC_SPEC),
+                ],
+            ),
+            &ran(
+                second(),
+                members,
+                &[(grid, NEW), (grid, USED_LIB), ("libc", LIBC)],
+            ),
+        ]);
+        assert_eq!(retired, vec![0, 1]);
+        let mut fs = dev_checkout(now() - HOUR);
+        keep(&mut fs, &kept, written);
+        gone(&fs)
+    };
+    assert_eq!(
+        with_libc(&[grid]),
+        Vec::new(),
+        "a retired unit of a dependency"
+    );
+    assert_eq!(
+        with_libc(&[grid, "libc"]),
+        superseded(&[("libc", LIBC_SPEC)]),
+        "the same unit, of a package the runs built tests of"
+    );
+
+    let (kindless, retired) = ended(&[
+        &run1,
+        &ran(second(), &[grid], &[(grid, USED_LIB), ("libc", LIBC)]),
+    ]);
+    assert_eq!(retired, vec![0, 1]);
+    let mut fs = dev_checkout(now() - HOUR);
+    keep(&mut fs, &kindless, written);
+    assert_eq!(gone(&fs), Vec::new(), "no kept run uses a unit of its kind");
+
+    let mut blind = dev_checkout(now() - HOUR);
+    keep(&mut blind, &kept, written);
+    blind
+        .blind
+        .push(PathBuf::from(format!("{PROFILE}/build/aterm-grid/{OLD}")));
+    assert_eq!(gone(&blind), Vec::new(), "its folder lists nothing");
+
+    let mut before = dev_checkout(now() - HOUR);
+    let schema1 = format!(
+        r#"{{"schema":1,"began_ms":{},"members":["aterm-grid"],"profiles":{{"debug":["{NEW}","{USED_LIB}"]}}}}"#,
+        millis(second())
+    );
+    for name in [USED, USED_BEFORE] {
+        before.file(&format!("{LEAF}/{name}"), written, schema1.as_bytes());
+    }
+    let s = clone_survey(&before);
+    assert_eq!(
+        (
+            s.began,
+            s.retired_before,
+            decide(&s, now(), RECLAIM_STALE_UNDER_PRESSURE)
+        ),
+        (None, None, Vec::new()),
+        "the record before this one is not read"
+    );
+}
+
+/// A SCOPED RUN'S RECORD DOOMS NO UNIT ANOTHER KEPT SCOPE USED: a run of the whole workspace
+/// (`W`, two days ago) used the test unit `NEW`, and a scoped run (`P`, ten minutes ago) the test
+/// unit `FRESH` of the same package and kind. Both runs are kept, `P`'s end retires nothing, and
+/// `NEW`, unwritten four days, stays under both windows: only its kept run keeps it. NEGATIVE
+/// CONTROLS: `P`'s run ended under `W`'s key replaces `W`'s and retires `NEW`, which then goes at
+/// once, an hour old (and waits the window with the retirement taken out of the record); and a
+/// `W` begun more than [`KEPT_FOR`] before `P` is evicted when `P` ends, its unit retired.
+#[test]
+fn a_scoped_runs_record_dooms_no_unit_another_kept_scope_used() {
+    let grid = "aterm-grid";
+    let world = |new_at: SystemTime| {
+        let test = ["aterm_grid-{h}", "aterm_grid-{h}.d"];
+        let mut fs = Fake::default();
+        fs.file(
+            &format!("{PROFILE}/.cargo-build-lock"),
+            now() - 90 * DAY,
+            b"",
+        );
+        folder_unit(&mut fs, grid, NEW, "test-lib-aterm_grid", 2, &test, new_at);
+        folder_unit(
+            &mut fs,
+            grid,
+            FRESH,
+            "test-lib-aterm_grid",
+            2,
+            &test,
+            now() - 5 * MINUTE,
+        );
+        fs
+    };
+    let whole = |began: SystemTime| ran(began, &[grid], &[(grid, NEW)]);
+    let scoped = ran(now() - 10 * MINUTE, &[grid], &[(grid, FRESH)]);
+    let scopes = |kept: &Kept| kept.runs.keys().cloned().collect::<Vec<_>>();
+    let gone = |fs: &Fake, after| paths(&decide(&clone_survey(fs), now(), after));
+    let written = now() - 5 * MINUTE;
+
+    let mut kept = Kept::default();
+    assert_eq!(kept.end("W", whole(now() - 2 * DAY)), 0);
+    assert_eq!(kept.end("P", scoped.clone()), 0);
+    assert_eq!(scopes(&kept), ["P", "W"]);
+    assert!(kept.retired.profiles.is_empty());
+    let mut fs = world(now() - 4 * DAY);
+    keep(&mut fs, &kept, written);
+    assert_eq!(clone_survey(&fs).began, Some(now() - 2 * DAY));
+    for after in [RECLAIM_STALE, RECLAIM_STALE_UNDER_PRESSURE] {
+        assert_eq!(gone(&fs, after), Vec::new(), "{after:?}");
+    }
+
+    let mut one = Kept::default();
+    assert_eq!(one.end("W", whole(now() - 2 * DAY)), 0);
+    assert_eq!(
+        one.end("W", scoped.clone()),
+        1,
+        "the same run under the other scope's key retires its unit"
+    );
+    assert_eq!(scopes(&one), ["W"]);
+    let mut fs = world(now() - HOUR);
+    keep(&mut fs, &one, written);
+    assert_eq!(
+        gone(&fs, RECLAIM_STALE),
+        superseded(&[(grid, NEW)]),
+        "an hour old, at once"
+    );
+    one.retired = Used::default();
+    keep(&mut fs, &one, written);
+    assert_eq!(
+        gone(&fs, RECLAIM_STALE),
+        Vec::new(),
+        "not retired, it waits the window"
+    );
+
+    let mut aged = Kept::default();
+    assert_eq!(aged.end("W", whole(now() - 4 * DAY - 10 * MINUTE)), 0);
+    assert_eq!(
+        aged.end("P", scoped),
+        1,
+        "a run begun more than KEPT_FOR before the one ending is evicted"
+    );
+    assert_eq!(scopes(&aged), ["P"]);
+    assert_eq!(
+        aged.retired.profiles,
+        BTreeMap::from([("debug".to_owned(), BTreeSet::from([NEW.to_owned()]))])
+    );
+}
+
+/// A UNIT NO KEPT RUN REPORTED KEEPS THE STALE WINDOW ([`Part::Superseded`]): of the release
+/// clone's units ([`release_clone`]), whose record keeps one run and retired nothing, the test
+/// unit of the candidate before, which that run did not use beside the test unit of the same
+/// package it did, goes whole once stale, and below the floor alone too. Kept: the units the run
+/// used, however long unwritten (cargo found them fresh); lint's check of the library, which
+/// wrote `.rmeta` alone, so another kind than the library build the run used; the test unit built
+/// a day ago; the library build another compile of the run made, written after the run began; and
+/// `libc`'s other build, a dependency's, which no version bump hashes anew and another compile
+/// may read fresh. With a second, later run kept the oldest kept run's beginning still judges:
+/// that library build, quiet and written between the two, stays. And the day-old test unit, once
+/// the record names it retired by a run begun an hour ago, goes without waiting. NEGATIVE
+/// CONTROLS, each the one thing that kept a unit taken away: the old test unit written after the
+/// run began stays; the check goes where the library build the run used wrote `.rmeta` alone too;
+/// `libc`'s other build goes where the record names `libc` among the workspace's own; the other
+/// compile's library build goes where it was written before the run began, and where the later
+/// run alone is kept; and without the record, or with a torn one, nothing goes.
+#[test]
+fn a_unit_no_run_reported_keeps_the_stale_window() {
     let s = clone_survey(&release_clone());
     assert_eq!(s.began, Some(began()));
     assert_eq!(s.members, BTreeSet::from(["aterm-grid".to_owned()]));
+    assert!(s.profiles[0].retired.is_empty());
     let gone = |s: &Survey, after| paths(&decide(s, now(), after));
     assert_eq!(gone(&s, RECLAIM_STALE), superseded(&[("aterm-grid", OLD)]));
     assert_eq!(
@@ -1600,17 +1926,70 @@ fn a_unit_the_last_passing_release_run_superseded_goes() {
         "the other compile's build, written before the run began"
     );
 
+    let mut two = release_clone();
+    let mut kept = record(&two);
+    let later = now() - 2 * DAY;
+    assert_eq!(
+        kept.end(
+            "later",
+            ran(
+                later,
+                &["aterm-grid"],
+                &[
+                    ("aterm-grid", NEW),
+                    ("aterm-grid", USED_LIB),
+                    ("libc", LIBC)
+                ],
+            ),
+        ),
+        0
+    );
+    assert_eq!(kept.runs.len(), 2);
+    keep(&mut two, &kept, later + HOUR);
+    let s = clone_survey(&two);
+    assert_eq!(s.began, Some(began()), "the older of the two kept runs");
+    assert_eq!(
+        gone(&s, RECLAIM_STALE),
+        superseded(&[("aterm-grid", OLD)]),
+        "the other compile's build, written between the two runs, stays"
+    );
+    kept.runs.remove(SCOPE);
+    keep(&mut two, &kept, later + HOUR);
+    assert_eq!(
+        gone(&clone_survey(&two), RECLAIM_STALE),
+        superseded(&[("aterm-grid", OLD), ("aterm-grid", SPEC)]),
+        "the later run alone kept, it is written before that run began"
+    );
+
+    let mut retired = release_clone();
+    let mut kept = record(&retired);
+    kept.retired = ran(now() - HOUR, &[], &[("aterm-grid", FRESH)]);
+    keep(&mut retired, &kept, now() - HOUR / 2);
+    let s = clone_survey(&retired);
+    assert_eq!(
+        (s.began, s.retired_before),
+        (Some(began()), Some(now() - HOUR))
+    );
+    assert_eq!(
+        gone(&s, RECLAIM_STALE),
+        superseded(&[("aterm-grid", OLD), ("aterm-grid", FRESH)]),
+        "the day-old test unit, retired"
+    );
+
     let mut none = release_clone();
     none.nodes.remove(Path::new(&format!("{LEAF}/{USED}")));
     let s = clone_survey(&none);
-    assert_eq!((s.began, s.profiles[0].used.clone()), (None, None));
+    assert_eq!(
+        (s.began, s.retired_before, s.profiles[0].used.clone()),
+        (None, None, None)
+    );
     assert_eq!(decide(&s, now(), RECLAIM_STALE), Vec::new());
 
     let mut torn = release_clone();
     torn.file(
         &format!("{LEAF}/{USED}"),
         now() - 4 * DAY,
-        b"{\"schema\":1,\"began_ms\":1,\"members\":[\"aterm-grid\"],\"profiles\":{\"debug\":[\"x\"]}}",
+        b"{\"schema\":2,\"runs\":{\"s\":{\"began_ms\":1,\"members\":[\"aterm-grid\"],\"profiles\":{\"debug\":[\"x\"]}}},\"retired\":{\"began_ms\":1,\"members\":[],\"profiles\":{}}}",
     );
     let s = clone_survey(&torn);
     assert_eq!(
@@ -1620,21 +1999,124 @@ fn a_unit_the_last_passing_release_run_superseded_goes() {
     );
 }
 
-/// THE RUN'S BEGINNING IS READ NO LATER THAN ITS RECORD WAS WRITTEN: a record that says its run
-/// began after it was written (a clock moved) is read as beginning when it was written, so the old
-/// test unit, written after the record, is never taken, while the other compile's library build,
-/// written before it, is. NEGATIVE CONTROL: a record whose run began before it was written is read
-/// as it says.
+/// THE RECORD KEEPS THE NEWEST RUN OF EACH SCOPE AND RETIRES WHAT THEY DROPPED ([`Kept::end`]): a
+/// scope's run replaces the one before and retires what that used and no kept run uses now, as
+/// of when the ending run began; each end computes it again, so nothing an earlier end retired is
+/// carried over; a unit another kept scope uses is not retired; past [`KEPT_RUNS`] the run that
+/// began first goes, never the one ending, however early that began; and the record reads back
+/// as written, with as many runs as an end leaves at most. NEGATIVE CONTROLS: bytes of schema 1
+/// (the record before this one, and this one's shape under its number), of schema 3, without its
+/// runs or what it retired, with one run more than [`KEPT_RUNS`], with a word that is no hash, or
+/// with a profile that is no plain path below the build directory, are no record.
+#[test]
+fn the_record_keeps_the_newest_run_of_each_scope_and_retires_what_they_dropped() {
+    let grid = "aterm-grid";
+    let at = |minutes: u64| now() - DAY + Duration::from_secs(60 * minutes);
+    let run = |began: SystemTime, hashes: &[&str]| {
+        let units: Vec<(&str, &str)> = hashes.iter().map(|h| (grid, *h)).collect();
+        ran(began, &[grid], &units)
+    };
+    let debug = |hashes: &[&str]| {
+        BTreeMap::from([(
+            "debug".to_owned(),
+            hashes
+                .iter()
+                .map(|h| (*h).to_owned())
+                .collect::<BTreeSet<_>>(),
+        )])
+    };
+    let scopes = |kept: &Kept| kept.runs.keys().cloned().collect::<Vec<_>>();
+
+    let mut kept = Kept::default();
+    assert_eq!(kept.end("a", run(at(0), &[OLD, USED_LIB])), 0);
+    assert_eq!(
+        kept.retired,
+        Used {
+            began_ms: millis(at(0)),
+            ..Used::default()
+        }
+    );
+    assert_eq!(kept.end("a", run(at(1), &[NEW, USED_LIB])), 1);
+    assert_eq!(kept.retired.profiles, debug(&[OLD]));
+    assert_eq!(kept.retired.began_ms, millis(at(1)));
+    assert_eq!(kept.end("b", run(at(2), &[NEW])), 0);
+    assert_eq!(
+        kept.retired,
+        Used {
+            began_ms: millis(at(2)),
+            ..Used::default()
+        },
+        "what the end before retired is not carried over"
+    );
+    assert_eq!(
+        kept.end("a", run(at(3), &[FRESH, USED_LIB])),
+        0,
+        "the other kept scope uses what this one dropped"
+    );
+    assert_eq!(kept.end("b", run(at(4), &[FRESH])), 1);
+    assert_eq!(kept.retired.profiles, debug(&[NEW]));
+    assert_eq!(scopes(&kept), ["a", "b"]);
+
+    assert_eq!(kept.end("c", run(at(5), &[SPEC])), 0);
+    assert_eq!(kept.end("d", run(at(6), &[SPEC])), 0);
+    assert_eq!(kept.runs.len(), KEPT_RUNS);
+    assert_eq!(
+        kept.end("e", run(at(7), &[SPEC])),
+        1,
+        "past KEPT_RUNS the run that began first goes"
+    );
+    assert_eq!(scopes(&kept), ["b", "c", "d", "e"]);
+    assert_eq!(kept.retired.profiles, debug(&[USED_LIB]));
+    assert_eq!(kept.end("z", run(now() - 2 * DAY, &[OLD])), 1);
+    assert_eq!(
+        scopes(&kept),
+        ["c", "d", "e", "z"],
+        "never the run ending, though it began first"
+    );
+    assert_eq!(kept.retired.profiles, debug(&[FRESH]));
+
+    assert_eq!(Kept::decode(kept.encode().as_bytes()), Some(kept));
+
+    let one =
+        r#"{"began_ms":1,"members":["aterm-grid"],"profiles":{"debug":["1111111111111111"]}}"#;
+    let none = r#"{"began_ms":1,"members":[],"profiles":{}}"#;
+    let whole = format!(r#"{{"schema":2,"runs":{{"s":{one}}},"retired":{none}}}"#);
+    assert!(Kept::decode(whole.as_bytes()).is_some(), "{whole}");
+    let full = format!(
+        r#"{{"schema":2,"runs":{{"a":{one},"b":{one},"c":{one},"d":{one}}},"retired":{none}}}"#
+    );
+    assert_eq!(
+        Kept::decode(full.as_bytes()).map(|kept| kept.runs.len()),
+        Some(KEPT_RUNS),
+        "{full}"
+    );
+    for torn in [
+        full.replace(r#""d":"#, &format!(r#""d":{one},"e":"#)),
+        r#"{"schema":1,"began_ms":1,"members":["aterm-grid"],"profiles":{"debug":["1111111111111111"]}}"#.to_owned(),
+        whole.replace(r#""schema":2"#, r#""schema":1"#),
+        whole.replace(r#""schema":2"#, r#""schema":3"#),
+        format!(r#"{{"schema":2,"retired":{none}}}"#),
+        format!(r#"{{"schema":2,"runs":{{"s":{one}}}}}"#),
+        whole.replace("1111111111111111", "x"),
+        whole.replace("debug", "../x"),
+        whole.replace("debug", "debug/"),
+    ] {
+        assert_eq!(Kept::decode(torn.as_bytes()), None, "{torn}");
+    }
+}
+
+/// THE BEGINNINGS ARE READ NO LATER THAN THE RECORD WAS WRITTEN: a record whose run says it began
+/// after the record was written (a clock moved) is read as beginning when it was written, so the
+/// old test unit, written after the record, is never taken, while the other compile's library
+/// build, written before it, is; and the beginning a retired unit is judged against is read the
+/// same way. NEGATIVE CONTROL: a record whose run began before it was written is read as it says.
 #[test]
 fn a_run_is_read_as_beginning_no_later_than_its_record() {
     let mut fs = release_clone();
-    let mut used = Used::decode(&fs.nodes[Path::new(&format!("{LEAF}/{USED}"))].2).unwrap();
-    used.began_ms = millis(now());
-    fs.file(
-        &format!("{LEAF}/{USED}"),
-        now() - 4 * DAY,
-        used.encode().as_bytes(),
-    );
+    let mut kept = record(&fs);
+    kept.runs.get_mut(SCOPE).unwrap().began_ms = millis(now());
+    kept.retired.began_ms = millis(now());
+    keep(&mut fs, &kept, now() - 4 * DAY);
     date_folder(
         &mut fs,
         &format!("build/aterm-grid/{OLD}"),
@@ -1642,6 +2124,7 @@ fn a_run_is_read_as_beginning_no_later_than_its_record() {
     );
     let s = clone_survey(&fs);
     assert_eq!(s.began, Some(now() - 4 * DAY));
+    assert_eq!(s.retired_before, Some(now() - 4 * DAY));
     assert_eq!(
         paths(&decide(&s, now(), RECLAIM_STALE)),
         superseded(&[("aterm-grid", SPEC)])
@@ -1731,12 +2214,12 @@ fn date_folder(fs: &mut Fake, rel: &str, at: SystemTime) {
     }
 }
 
-/// THE RECORD NAMES THE UNIT EACH OUTPUT IS OF, in either layout and any profile, and reads back
-/// as written, with when its run began and its own packages: `build/<pkg>/<hash>/…`, a `deps/`
-/// file and a `build/<pkg>-<hash>` folder named with the hash, a build script's run (its
+/// THE RECORD NAMES THE UNIT EACH OUTPUT IS OF, in either layout and any profile, and its run
+/// reads back as written, with when it began and its own packages: `build/<pkg>/<hash>/…`, a
+/// `deps/` file and a `build/<pkg>-<hash>` folder named with the hash, a build script's run (its
 /// `out/`), a cross target's profile. NEGATIVE CONTROL: an output cargo copied into the target
-/// directory, one named with no hash, and a path with no profile name no unit; a record without
-/// when its run began, or without its packages, or of another schema, is none.
+/// directory, one named with no hash, and a path with no profile name no unit; a record whose run
+/// is without when it began, or without its packages, or names an empty one, is none.
 #[test]
 fn the_used_record_names_each_outputs_unit() {
     let leaf = Path::new(LEAF);
@@ -1771,20 +2254,31 @@ fn the_used_record_names_each_outputs_unit() {
             ("debug".to_owned(), set(&[OLD, NEW, FRESH, LIBC])),
         ])
     );
-    assert_eq!(Used::decode(used.encode().as_bytes()), Some(used));
+    let mut kept = Kept::default();
+    kept.end("s", used.clone());
+    assert_eq!(
+        Kept::decode(kept.encode().as_bytes()).map(|kept| kept.runs["s"].clone()),
+        Some(used)
+    );
+    let none = r#"{"began_ms":1,"members":[],"profiles":{}}"#;
     for torn in [
-        &b"{\"schema\":1,\"members\":[],\"profiles\":{}}"[..],
-        b"{\"schema\":1,\"began_ms\":1,\"profiles\":{}}",
-        b"{\"schema\":1,\"began_ms\":1,\"members\":[\"\"],\"profiles\":{}}",
-        b"{\"schema\":2,\"began_ms\":1,\"members\":[],\"profiles\":{}}",
+        r#"{"members":[],"profiles":{}}"#,
+        r#"{"began_ms":1,"profiles":{}}"#,
+        r#"{"began_ms":1,"members":[""],"profiles":{}}"#,
     ] {
-        assert_eq!(
-            Used::decode(torn),
-            None,
-            "{}",
-            String::from_utf8_lossy(torn)
-        );
+        for record in [
+            format!(r#"{{"schema":2,"runs":{{"s":{torn}}},"retired":{none}}}"#),
+            format!(r#"{{"schema":2,"runs":{{"s":{none}}},"retired":{torn}}}"#),
+        ] {
+            assert_eq!(Kept::decode(record.as_bytes()), None, "{record}");
+        }
     }
+    assert!(
+        Kept::decode(
+            format!(r#"{{"schema":2,"runs":{{"s":{none}}},"retired":{none}}}"#).as_bytes()
+        )
+        .is_some()
+    );
 }
 
 /// `file`'s modification time set to `at`.

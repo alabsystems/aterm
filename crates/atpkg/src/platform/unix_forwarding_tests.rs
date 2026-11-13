@@ -4,7 +4,7 @@
 //! One forwarding at a time ([`super::FORWARDING_TURN`]): two waits that overlap in one process
 //! leave its signal dispositions as they found them.
 
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd as _, OwnedFd, RawFd};
 
 use aterm_spec::wait::{MUST_HAPPEN, until_within};
 
@@ -26,18 +26,17 @@ fn sigint_now() -> libc::sighandler_t {
 }
 
 /// A pipe whose read end children inherit and whose write end none does: the read end and the
-/// write end.
+/// write end. Both are made kept out ([`aterm_uds::pipe`]); the read end then loses its marks
+/// (close-on-exec, and close-on-fork where the kernel keeps it), so the pass-through shell
+/// [`waiting`] spawns inherits it by its number.
 fn pipe() -> (OwnedFd, OwnedFd) {
-    let mut fds = [0; 2];
-    // SAFETY: `pipe` writes two descriptors into the two-element array.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-    // SAFETY: `fcntl` on the write end this call just made, with plain integers.
+    let (read, write) = aterm_uds::pipe().expect("a pipe");
+    // SAFETY: `fcntl` on the read end this call just made, with plain integers.
     assert_eq!(
-        unsafe { libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC) },
+        unsafe { libc::fcntl(read.as_raw_fd(), libc::F_SETFD, 0) },
         0
     );
-    // SAFETY: both ends are this process's own, each owned once here.
-    unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
+    (read.into(), write.into())
 }
 
 /// One wait standing aside for a shell that reads `fd` to its end, armed as a front arms it, on a

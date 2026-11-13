@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use crate::App;
+use crate::app_update_handoff::SuccessorStart;
 use crate::native_updater_service::{
     ApplyAttemptTicket, ApplyMode, CheckCompletion, CheckStart, DurableUpdateStatus,
 };
@@ -41,6 +42,8 @@ fn stage_one_build(app: &mut App) -> u64 {
                 installable: Some(true),
                 channel_unreadable: false,
                 checked_at: None,
+                hold: None,
+                behind: false,
             },
         ),
         CheckCompletion::Reduced,
@@ -58,7 +61,8 @@ fn is_structural_resample(retry_at: Option<std::time::Instant>) -> bool {
     })
 }
 
-/// Drive one returned handoff for `mode` through `reduce_returned_handoff_completion`.
+/// Drive one returned handoff for `mode` through `reduce_returned_handoff_completion`, its
+/// successor having reported no finished native launch.
 fn reduce_one_returned_failure(
     app: &mut App,
     mode: ApplyMode,
@@ -67,9 +71,28 @@ fn reduce_one_returned_failure(
     outcome: crate::UpdateHandoffOutcome,
     child_death: crate::ChildDeathEvidence,
 ) {
+    reduce_one_returned_failure_heard(
+        app,
+        mode,
+        build,
+        digest,
+        outcome,
+        child_death,
+        SuccessorStart::Unlaunched,
+    );
+}
+
+/// Park one attempt of `mode` on the download `build` with `digest`, as the handoff does before
+/// its successor's proof; the attempt's cancel channel, which the caller keeps while it runs.
+fn park_one_attempt(
+    app: &mut App,
+    mode: ApplyMode,
+    build: u64,
+    digest: &str,
+) -> std::sync::mpsc::Receiver<()> {
     let ticket = ApplyAttemptTicket::for_test(build, TEST_COMMIT, digest);
     ticket.make_current_apply_for_test(&mut app.native_updater_service);
-    let (cancel, _cancelled) = std::sync::mpsc::sync_channel(1);
+    let (cancel, cancelled) = std::sync::mpsc::sync_channel(1);
     app.pending_update_handoff = Some(crate::PendingUpdateHandoff {
         park_at: std::time::Instant::now(),
         proof_ready_at: None,
@@ -98,6 +121,20 @@ fn reduce_one_returned_failure(
         held_commit: None,
         revoked_by_activity: false,
     });
+    cancelled
+}
+
+/// [`reduce_one_returned_failure`] whose successor's reports said it got as far as `start`.
+fn reduce_one_returned_failure_heard(
+    app: &mut App,
+    mode: ApplyMode,
+    build: u64,
+    digest: &str,
+    outcome: crate::UpdateHandoffOutcome,
+    child_death: crate::ChildDeathEvidence,
+    start: SuccessorStart,
+) {
+    let _cancelled = park_one_attempt(app, mode, build, digest);
     let teardown = app
         .reduce_returned_handoff_completion(crate::UpdateHandoffCompletion {
             attempt_id: 1,
@@ -110,6 +147,7 @@ fn reduce_one_returned_failure(
             detail: format!("handoff proof ended {outcome:?}"),
             input_drain_spins: 0,
             child_death,
+            successor_start: start,
         })
         .expect("a matching pending attempt is always reduced");
     assert_eq!(
@@ -235,6 +273,7 @@ fn a_person_s_activity_revoked_completion_arms_no_automatic_retry() {
         detail: "activity revoked handoff during physical preparation".to_string(),
         input_drain_spins: 0,
         child_death: crate::ChildDeathEvidence::Unobserved,
+        successor_start: SuccessorStart::Unlaunched,
     });
     assert!(
         app.auto_overlap_retry.is_none(),
@@ -1503,4 +1542,627 @@ fn a_dead_candidate_is_classified_by_what_the_worker_saw() {
             "{death:?} must not move a TimedOut, whose candidate we killed"
         );
     }
+}
+
+/// The bytes `aterm_update`'s window-start failure record names, as `(build, digest)`.
+#[cfg(target_os = "macos")]
+fn recorded_start_failure() -> Option<(u64, String)> {
+    aterm_update::window_start_failure().map(|record| (record.build, record.dmg_sha256))
+}
+
+/// Books the window-start failure of the download `build` with `digest` as a window running this
+/// build would, replacing whatever the record held.
+#[cfg(target_os = "macos")]
+fn record_start_failure(build: u64, digest: &str) {
+    aterm_update::record_window_start_failure(
+        crate::running_build_number(),
+        aterm_update::FailedStartBytes::Download {
+            build,
+            dmg_sha256: digest,
+        },
+        "stalled (unlaunched)",
+    )
+    .expect("PRECONDITION: the scratch root takes the record");
+    assert_eq!(
+        recorded_start_failure(),
+        Some((build, digest.to_string())),
+        "PRECONDITION: the record names the bytes it was given"
+    );
+}
+
+/// Withdraws whatever window-start failure an earlier test left in the shared scratch root.
+#[cfg(target_os = "macos")]
+fn clear_start_failure_record() {
+    if let Some((build, digest)) = recorded_start_failure() {
+        let _ =
+            aterm_update::withdraw_window_start_failure(aterm_update::FailedStartBytes::Download {
+                build,
+                dmg_sha256: &digest,
+            });
+    }
+    assert_eq!(
+        recorded_start_failure(),
+        None,
+        "PRECONDITION: no window-start failure is on record"
+    );
+}
+
+/// A START FAILURE OUTLIVES THE WINDOW THAT SAW IT (KI-1112-144): the window that launched its
+/// successor from a download and saw it stall kept that evidence in its own memory, and only it
+/// held the node job off those bytes. Once that window quit, the job's next boot installed exactly
+/// those bytes under a headless trial, which never runs AppKit's launch nor makes a window, and
+/// settled it as proven. The window now books the failure durably in `aterm_update`'s
+/// window-start failure record, which the windowless lanes read, so it stands after the window is
+/// gone; another window's passing failure of the same bytes leaves it, and only a successor of
+/// those bytes that presents its first window withdraws it. NEGATIVE CONTROL: writing only in
+/// memory, as the branch did, fails "THE QUIT WINDOW" once the first window is dropped.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_start_failure_outlives_the_window_that_saw_it() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    clear_start_failure_record();
+    let digest = "ab".repeat(32);
+    let mut first = App::headless_for_test();
+    let build = stage_one_build(&mut first);
+    reduce_one_returned_failure(
+        &mut first,
+        ApplyMode::Automatic,
+        build,
+        &digest,
+        crate::UpdateHandoffOutcome::Stalled,
+        crate::ChildDeathEvidence::Unobserved,
+    );
+    drop(first);
+    assert_eq!(
+        recorded_start_failure(),
+        Some((build, digest.clone())),
+        "THE QUIT WINDOW: the bytes whose successor stalled stay on record after the window that \
+         saw it is gone, for the node job's boot to leave them"
+    );
+
+    let mut second = App::headless_for_test();
+    assert_eq!(
+        stage_one_build(&mut second),
+        build,
+        "PRECONDITION: the next window stages the same download"
+    );
+    reduce_one_returned_failure(
+        &mut second,
+        ApplyMode::Automatic,
+        build,
+        &digest,
+        crate::UpdateHandoffOutcome::TimedOut,
+        crate::ChildDeathEvidence::Unobserved,
+    );
+    assert_eq!(
+        recorded_start_failure(),
+        Some((build, digest.clone())),
+        "a later window's passing failure of the same bytes says nothing of them"
+    );
+    reduce_one_returned_failure_heard(
+        &mut second,
+        ApplyMode::Automatic,
+        build,
+        &digest,
+        crate::UpdateHandoffOutcome::TimedOut,
+        crate::ChildDeathEvidence::Unobserved,
+        SuccessorStart::Presented,
+    );
+    assert_eq!(
+        recorded_start_failure(),
+        None,
+        "a successor of those bytes that presents its first window withdraws the record"
+    );
+}
+
+/// ONLY A SUCCESSOR THAT FAILED TO START RECORDS ITS BYTES: every Structural failure was evidence
+/// against its download, so a successor that launched and answered with the wrong proof (an
+/// adoption mismatch, whose bytes start here), and a preparation that launched nothing, kept the
+/// bytes from the node job though its install would run. Then every non-Transient death did, so did
+/// a successor's ordinary refusal (exit 0: it ran its own code to a decision, one that could not
+/// read the outgoing build's handoff among them), and so did this process's own kill of a successor
+/// still running when its readiness channel closed (one whose boot swap deferred, which ran the old
+/// build, not the target's bytes). Now a successor that stalled, or died of a fault, a failing exit
+/// or nothing anyone saw, records the bytes, whoever asked for the handoff, and only before any
+/// report that it had presented its first window (a report that its native launch finished is not
+/// one: making its first window, surface and frame comes after, and the node job's headless trial
+/// never does that either); nothing else does. A successor that reported its launch finished and
+/// then hung making its first window, its own work carrying every silence, reaches the hang
+/// detector as a timeout and records its bytes, while a timeout with no report of a finished launch
+/// (the park's, the grant's or the dial's deadline) does not. A successor whose first window
+/// surface could not be created exited 0 and recorded nothing; it now exits
+/// `EXIT_FIRST_SURFACE_FAILED`, a failing exit. NEGATIVE CONTROLS: with every non-Transient shape
+/// counted, the adoption mismatch records ("launched nothing, or answered"); with exit 0 counted,
+/// the refusal does ("refused the handoff"); with this process's kill counted, so does that ("this
+/// process ended"); with the first-present report ignored, a stall after it does ("after it
+/// presented its first window"); with every timeout passed over, the hang making its first window
+/// records nothing ("THE HANG DETECTOR"); with every timeout counted, the park's deadline records
+/// ("no report of a finished launch"); with the surface failure's status read as exit 0, it
+/// records nothing ("THE SURFACE").
+#[cfg(target_os = "macos")]
+#[test]
+fn only_a_successor_that_failed_to_start_records_its_bytes() {
+    use crate::ChildDeathEvidence as Death;
+    use crate::UpdateHandoffOutcome as Outcome;
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let before = SuccessorStart::Unlaunched;
+    let launched = SuccessorStart::Launched;
+    let after = SuccessorStart::Presented;
+    for (mode, outcome, death, start, records, why) in [
+        (
+            ApplyMode::Automatic,
+            Outcome::AdoptionMismatch,
+            Death::Unobserved,
+            before,
+            false,
+            "launched nothing, or answered: an adoption mismatch",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::PreparationFailed,
+            Death::Unobserved,
+            before,
+            false,
+            "launched nothing, or answered: a preparation that failed",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::Stalled,
+            Death::Unobserved,
+            before,
+            true,
+            "stalled before its proof",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::ChildDied,
+            Death::Signalled {
+                signal: libc::SIGSEGV,
+            },
+            before,
+            true,
+            "crashed in its launch",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::ChildDied,
+            Death::Signalled {
+                signal: libc::SIGABRT,
+            },
+            launched,
+            true,
+            "crashed making its first window, its native launch done but no first present \
+             reported",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::ChildDied,
+            Death::Exited { code: 1 },
+            before,
+            true,
+            "ended itself with a failing exit before its proof",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::ChildDied,
+            Death::Exited {
+                code: crate::seamless::EXIT_SUCCESSOR_LAUNCH_STALLED,
+            },
+            before,
+            true,
+            "left its stalled AppKit launch with its named exit",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::ChildDied,
+            Death::Exited {
+                code: crate::system_quit::EXIT_FIRST_SURFACE_FAILED,
+            },
+            launched,
+            true,
+            "could not create its first window surface, and said so in its status (THE SURFACE)",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::ChildDied,
+            Death::Unobserved,
+            before,
+            true,
+            "died of nothing anyone saw",
+        ),
+        (
+            ApplyMode::Immediate,
+            Outcome::Stalled,
+            Death::Unobserved,
+            before,
+            true,
+            "stalled on a person's install, which latches nothing",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::ChildDied,
+            Death::Exited { code: 0 },
+            before,
+            false,
+            "refused the handoff, its ordinary exit 0",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::ChildDied,
+            Death::EndedHere,
+            before,
+            false,
+            "this process ended, still running when its readiness channel closed",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::Stalled,
+            Death::Unobserved,
+            after,
+            false,
+            "stalled only after it presented its first window",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::ChildDied,
+            Death::Signalled {
+                signal: libc::SIGSEGV,
+            },
+            after,
+            false,
+            "crashed only after it presented its first window",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::ChildDied,
+            Death::Signalled {
+                signal: libc::SIGKILL,
+            },
+            before,
+            false,
+            "was killed by something else",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::TimedOut,
+            Death::Unobserved,
+            launched,
+            true,
+            "reported its launch finished, then hung making its first window until the hang \
+             detector timed it out (THE HANG DETECTOR)",
+        ),
+        (
+            ApplyMode::Immediate,
+            Outcome::TimedOut,
+            Death::Unobserved,
+            launched,
+            true,
+            "hung making its first window on a person's install until the hang detector timed \
+             it out (THE HANG DETECTOR)",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::TimedOut,
+            Death::Unobserved,
+            after,
+            false,
+            "timed out only after it presented its first window",
+        ),
+        (
+            ApplyMode::Automatic,
+            Outcome::TimedOut,
+            Death::Unobserved,
+            before,
+            false,
+            "timed out with no report of a finished launch: the park's, the grant's or the \
+             dial's deadline",
+        ),
+        (
+            ApplyMode::Immediate,
+            Outcome::TimedOut,
+            Death::Unobserved,
+            before,
+            false,
+            "timed out on a person's install with no report of a finished launch",
+        ),
+    ] {
+        clear_start_failure_record();
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        let digest = "ab".repeat(32);
+        reduce_one_returned_failure_heard(&mut app, mode, build, &digest, outcome, death, start);
+        assert_eq!(
+            recorded_start_failure(),
+            records.then_some((build, digest)),
+            "a successor that {why} ({mode:?}, {outcome:?}, {death:?}, its reports reached \
+             {start:?})"
+        );
+    }
+}
+
+/// A SUCCESSOR THAT PROVES ADOPTION CLEARS THE EVIDENCE AGAINST ITS BYTES: once a successor of a
+/// download stalled here, those bytes stayed on record though a later handoff of the very same
+/// bytes launched a successor that painted and proved exact adoption, whatever its Commit's fate (a
+/// Commit refused for activity keeps the intent). The proof now withdraws the record for those
+/// bytes, once per attempt: the drain gate reposts the same proof every few milliseconds until its
+/// fence holds, and a respin, its proof already seen, does no record I/O again. CONTROLS: a proof
+/// of a same-image successor (which ran this image, not the target's), and a proof of other
+/// bytes, withdraw nothing. NEGATIVE CONTROLS: without the withdraw in `finish_proven_handoff`,
+/// the proven bytes stay on record ("THE PROOF"); withdrawing on every spin of the drain gate
+/// withdraws on the respin ("THE RESPIN").
+#[cfg(target_os = "macos")]
+#[test]
+fn a_successor_that_proves_adoption_clears_the_evidence_against_its_bytes() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let digest = "ab".repeat(32);
+    let proven_on = |app: &mut App, same_image: Option<super::SameImageHandoff>, respin: bool| {
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        let _cancelled = park_one_attempt(app, ApplyMode::Automatic, build, &digest);
+        if let Some(pending) = app.pending_update_handoff.as_mut() {
+            pending.same_image = same_image;
+            if respin {
+                pending.proof_ready_at = Some(std::time::Instant::now());
+            }
+        }
+        let (reject, _rejected) = std::sync::mpsc::sync_channel(1);
+        app.finish_proven_handoff(crate::UpdateHandoffCompletion {
+            attempt_id: 1,
+            nonce: None,
+            child_pid: None,
+            outcome: crate::UpdateHandoffOutcome::ProofReady,
+            commit_fd: None,
+            reject: Some(reject),
+            reconcile: None,
+            detail: "child painted and proved exact readerless adoption".to_string(),
+            input_drain_spins: 1,
+            child_death: crate::ChildDeathEvidence::Unobserved,
+            successor_start: SuccessorStart::Presented,
+        });
+    };
+    let proven = |app: &mut App, same_image| proven_on(app, same_image, false);
+    let stalled = |app: &mut App, build: u64| {
+        clear_start_failure_record();
+        reduce_one_returned_failure(
+            app,
+            ApplyMode::Automatic,
+            build,
+            &digest,
+            crate::UpdateHandoffOutcome::Stalled,
+            crate::ChildDeathEvidence::Unobserved,
+        );
+        assert_eq!(
+            recorded_start_failure(),
+            Some((build, digest.clone())),
+            "PRECONDITION: a stall records the bytes"
+        );
+    };
+
+    let mut app = App::headless_for_test();
+    let build = stage_one_build(&mut app);
+    stalled(&mut app, build);
+    proven(&mut app, None);
+    assert_eq!(
+        recorded_start_failure(),
+        None,
+        "THE PROOF: a successor of these bytes proved adoption here, so they start here"
+    );
+
+    let mut app = App::headless_for_test();
+    let build = stage_one_build(&mut app);
+    stalled(&mut app, build);
+    proven(&mut app, Some(super::SameImageHandoff::DebugSeam));
+    assert_eq!(
+        recorded_start_failure(),
+        Some((build, digest.clone())),
+        "CONTROL: a same-image successor ran this image, not the target's bytes"
+    );
+
+    let other = "cd".repeat(32);
+    record_start_failure(build, &other);
+    proven(&mut app, None);
+    assert_eq!(
+        recorded_start_failure(),
+        Some((build, other)),
+        "CONTROL: a proof of other bytes says nothing of these"
+    );
+
+    let mut app = App::headless_for_test();
+    let build = stage_one_build(&mut app);
+    stalled(&mut app, build);
+    proven_on(&mut app, None, true);
+    assert_eq!(
+        recorded_start_failure(),
+        Some((build, digest.clone())),
+        "THE RESPIN: the drain gate's repost of a proof already seen leaves the record alone"
+    );
+}
+
+/// A SUCCESSOR THAT PRESENTS ITS FIRST WINDOW CLEARS THE EVIDENCE AGAINST ITS BYTES: only a proof
+/// of adoption cleared it, so once a successor of a download stalled before its first window (on
+/// a machine in swap, which stops a healthy image too), later successors of the very same bytes
+/// that presented their first window and then timed out, or answered with the wrong proof, left
+/// bytes that start here on record. A report of the first present now withdraws the record,
+/// whatever ended the attempt after. CONTROLS: the same failure with no such report, a same-image
+/// successor's report (it ran this image, not the target's) and a report of other bytes withdraw
+/// nothing. NEGATIVE CONTROL: without the withdraw in `reduce_returned_handoff_completion`, the
+/// bytes stay on record ("THE FIRST WINDOW").
+#[cfg(target_os = "macos")]
+#[test]
+fn a_successor_that_presents_its_first_window_clears_the_evidence_against_its_bytes() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let digest = "ab".repeat(32);
+    let stalled = |app: &mut App, build: u64| {
+        clear_start_failure_record();
+        reduce_one_returned_failure(
+            app,
+            ApplyMode::Automatic,
+            build,
+            &digest,
+            crate::UpdateHandoffOutcome::Stalled,
+            crate::ChildDeathEvidence::Unobserved,
+        );
+        assert_eq!(
+            recorded_start_failure(),
+            Some((build, digest.clone())),
+            "PRECONDITION: a stall records the bytes"
+        );
+    };
+    for outcome in [
+        crate::UpdateHandoffOutcome::TimedOut,
+        crate::UpdateHandoffOutcome::AdoptionMismatch,
+    ] {
+        let mut app = App::headless_for_test();
+        let build = stage_one_build(&mut app);
+        stalled(&mut app, build);
+        let ended = |app: &mut App, start: SuccessorStart| {
+            reduce_one_returned_failure_heard(
+                app,
+                ApplyMode::Automatic,
+                build,
+                &digest,
+                outcome,
+                crate::ChildDeathEvidence::Unobserved,
+                start,
+            );
+        };
+        ended(&mut app, SuccessorStart::Unlaunched);
+        assert_eq!(
+            recorded_start_failure(),
+            Some((build, digest.clone())),
+            "CONTROL: a successor that ended {outcome:?} with no report of a first present says \
+             nothing of the bytes"
+        );
+        ended(&mut app, SuccessorStart::Presented);
+        assert_eq!(
+            recorded_start_failure(),
+            None,
+            "THE FIRST WINDOW: a successor of these bytes presented its first window here before \
+             its attempt ended {outcome:?}, so they start here"
+        );
+    }
+
+    let mut app = App::headless_for_test();
+    let build = stage_one_build(&mut app);
+    stalled(&mut app, build);
+    let _cancelled = park_one_attempt(&mut app, ApplyMode::Automatic, build, &digest);
+    if let Some(pending) = app.pending_update_handoff.as_mut() {
+        pending.same_image = Some(super::SameImageHandoff::DebugSeam);
+    }
+    let _teardown = app
+        .reduce_returned_handoff_completion(crate::UpdateHandoffCompletion {
+            attempt_id: 1,
+            nonce: None,
+            child_pid: None,
+            outcome: crate::UpdateHandoffOutcome::TimedOut,
+            commit_fd: None,
+            reject: None,
+            reconcile: None,
+            detail: "handoff proof ended TimedOut".to_string(),
+            input_drain_spins: 0,
+            child_death: crate::ChildDeathEvidence::Unobserved,
+            successor_start: SuccessorStart::Presented,
+        })
+        .expect("a matching pending attempt is always reduced");
+    assert_eq!(
+        recorded_start_failure(),
+        Some((build, digest.clone())),
+        "CONTROL: a same-image successor presented this image's window, not the target's bytes'"
+    );
+
+    let other = "cd".repeat(32);
+    record_start_failure(build, &other);
+    reduce_one_returned_failure_heard(
+        &mut app,
+        ApplyMode::Automatic,
+        build,
+        &digest,
+        crate::UpdateHandoffOutcome::TimedOut,
+        crate::ChildDeathEvidence::Unobserved,
+        SuccessorStart::Presented,
+    );
+    assert_eq!(
+        recorded_start_failure(),
+        Some((build, other)),
+        "CONTROL: a first present of other bytes says nothing of these"
+    );
+}
+
+/// A FAILED ACTIVATION RETRY KEEPS THE DOWNLOAD'S RECORD: an installed activation's attempt carries
+/// a digest made up for the activation (`installed_activation_digest`), which matches no stage,
+/// trial or receipt. Booked as a download, its failure to start would replace the one slot with a
+/// key nothing reads, and the download a window saw fail would lose its record. An activation is
+/// keyed by the installed receipt's digest for its build, or not at all: with no receipt it books
+/// nothing, and with a receipt naming the build its stall books the receipt's bytes, which a
+/// presented activation then withdraws, so a job's headless settle of those installed bytes keeps
+/// their re-trial. NEGATIVE CONTROLS: passing the activation's made-up digest as a download evicts
+/// the download's record ("THE DOWNLOAD"); naming an activation by anything but `Installed`, or
+/// keying `Installed` by anything but the receipt, books nothing for it ("THE RECEIPT").
+#[cfg(target_os = "macos")]
+#[test]
+fn a_failed_activation_retry_keeps_the_downloads_record() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = stage_one_build(&mut app);
+    let digest = "ab".repeat(32);
+    record_start_failure(build, &digest);
+    let activation = crate::native_updater_service::installed_activation_digest(build, TEST_COMMIT);
+    assert!(
+        ApplyAttemptTicket::for_test(build, TEST_COMMIT, &activation).is_installed_activation(),
+        "PRECONDITION: the attempt is an installed activation"
+    );
+    reduce_one_returned_failure(
+        &mut app,
+        ApplyMode::Automatic,
+        build,
+        &activation,
+        crate::UpdateHandoffOutcome::Stalled,
+        crate::ChildDeathEvidence::Unobserved,
+    );
+    assert_eq!(
+        recorded_start_failure(),
+        Some((build, digest)),
+        "THE DOWNLOAD: an activation's failure to start books no made-up digest over the \
+         download's record"
+    );
+
+    let installed = "ef".repeat(32);
+    let receipt = aterm_update_core::seal_guard::updates_root()
+        .expect("the scratch update root")
+        .join("installed.toml");
+    std::fs::write(
+        &receipt,
+        format!(
+            "build_number = {build}\ngit_commit = \"{TEST_COMMIT}\"\ndmg_sha256 = \"{installed}\"\n"
+        ),
+    )
+    .expect("PRECONDITION: the scratch root takes a receipt");
+    reduce_one_returned_failure(
+        &mut app,
+        ApplyMode::Automatic,
+        build,
+        &activation,
+        crate::UpdateHandoffOutcome::Stalled,
+        crate::ChildDeathEvidence::Unobserved,
+    );
+    let booked = recorded_start_failure();
+    reduce_one_returned_failure_heard(
+        &mut app,
+        ApplyMode::Automatic,
+        build,
+        &activation,
+        crate::UpdateHandoffOutcome::TimedOut,
+        crate::ChildDeathEvidence::Unobserved,
+        SuccessorStart::Presented,
+    );
+    let withdrawn = recorded_start_failure();
+    std::fs::remove_file(&receipt).expect("the receipt this test wrote");
+    assert_eq!(
+        booked,
+        Some((build, installed)),
+        "THE RECEIPT: a stalled activation books the bytes the receipt names for its build"
+    );
+    assert_eq!(
+        withdrawn, None,
+        "THE RECEIPT: an activation of those bytes that presents withdraws them"
+    );
 }

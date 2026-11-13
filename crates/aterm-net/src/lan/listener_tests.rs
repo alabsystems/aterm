@@ -74,6 +74,69 @@ fn unsupported_ipv6_lan_listener_is_withheld_before_bind() {
     assert!(remote_supported("192.0.2.1:0".parse().unwrap()));
 }
 
+/// The only clock an idle listener keeps. A loopback listener has none. A LAN listener on macOS
+/// must look again when the read of the attachments it judges by is [`ATTACHMENTS_REREAD`] old
+/// (by when the read was made, however often it was judged by since), because Darwin drops a
+/// routing message from a full socket and says nothing; where no read is kept it looks again
+/// one [`ACCEPT_POLL`] later, the cadence before. On Linux it has none: a lost netlink message
+/// is an error on its change source, which withdraws it. The attachment and its kept reads are
+/// stand-ins on a clock this test holds; nothing is enumerated and the listener is never
+/// rechecked.
+///
+/// NEGATIVE CONTROL (2026-11-12): with `unheard_look` giving every listener
+/// `attachments_clock() + ACCEPT_POLL` (the timer before), the kept read's assert fails on macOS
+/// (`left: Some(start + 200ms)`, `right: Some(start + 10s)`).
+#[test]
+fn an_idle_listeners_only_clock_is_the_expiry_of_the_read_it_judges_by() {
+    use super::super::{ATTACHMENTS_REREAD, FIXED_NOW, kept_attachments};
+    use std::time::Duration;
+
+    let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    assert_eq!(listener.validity_deadline(), None, "loopback");
+
+    let start = Instant::now();
+    FIXED_NOW.set(Some(start));
+    listener.attachment = Some(Attachment {
+        index: 3,
+        name: "test-physical".into(),
+        address: listener.local.ip(),
+        netmask: "255.255.255.0".parse().unwrap(),
+        flags: super::super::REQUIRED_FLAGS,
+        physical: true,
+    });
+    let local = Some(listener.local);
+    let judge = |at: Duration| {
+        kept_attachments(|memo| memo.read(Some(7), start + at, local, None, || Ok(Vec::new())))
+            .unwrap();
+    };
+    let on_macos = |at: Instant| cfg!(target_os = "macos").then_some(at);
+    assert_eq!(
+        listener.validity_deadline(),
+        on_macos(start + ACCEPT_POLL),
+        "no kept read"
+    );
+    judge(Duration::ZERO);
+    judge(Duration::from_secs(3));
+    assert_eq!(
+        listener.validity_deadline(),
+        on_macos(start + ATTACHMENTS_REREAD),
+        "a kept read, judged by again 3 s on"
+    );
+    judge(ATTACHMENTS_REREAD);
+    assert_eq!(
+        listener.validity_deadline(),
+        on_macos(start + 2 * ATTACHMENTS_REREAD),
+        "read again at its expiry"
+    );
+    forget_attachments();
+    assert_eq!(
+        listener.validity_deadline(),
+        on_macos(start + ACCEPT_POLL),
+        "forgotten"
+    );
+    FIXED_NOW.set(None);
+}
+
 #[test]
 fn withdrawal_is_permanent_and_service_drops_the_listening_socket() {
     let mut listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();

@@ -34,6 +34,7 @@ pub(crate) mod test_counters;
 pub mod test_counters;
 
 pub use grid::Grid;
+pub use grid::VisibleCells;
 pub use grid::scroll_convert::{scrollback_text_only, set_scrollback_text_only};
 pub use grid::{AnchorLend, LendReach};
 pub use grid::{CanonicalHandbackCarry, GridHandbackCarry, GridImageCarry, ResizeLaw};

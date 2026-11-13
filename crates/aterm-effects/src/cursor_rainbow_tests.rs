@@ -284,7 +284,7 @@ fn caret_continuity_ceiling(base: u32, mix: f32, dt: f32) -> u32 {
 fn caret_law(base: u32, rainbow: u32, mix: f32, e: f32) -> u32 {
     lift_to_light_floor(
         mix_rgb(base, rainbow, mix),
-        RAINBOW_CARET_LIGHT_FLOOR * aterm_render::smoothstep01(e / CARET_LIGHT_KNEE),
+        RAINBOW_CARET_LIGHT_FLOOR * aterm_scene::smoothstep(e / CARET_LIGHT_KNEE),
     )
 }
 

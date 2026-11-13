@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::io;
 use std::process::ExitCode;
 
-const USAGE: &str = "usage: aterm resource-run [--sock PATH] [--session @self|@<sid>|@<local-id>] [--ai WORD] --job LABEL [--cpu-units N --memory-bytes M [--timeout-ms N] [--status-fd N] [--accounted] [--expect-original-store-fd N]] -- PROGRAM [ARGS...]\n       aterm resource-run [--sock PATH] [--session @self|@<sid>] --capabilities";
+const USAGE: &str = "usage: aterm resource-run [--sock PATH] [--session @self|@<sid>|@<local-id>] [--ai WORD] --job LABEL [--cpu-units N --memory-bytes M [--timeout-ms N] [--status-fd N] [--accounted] [--expect-original-store-fd N | --expect-native-job-original-store-fd N]] -- PROGRAM [ARGS...]\n       aterm resource-run [--sock PATH] [--session @self|@<sid>] --capabilities";
 
 #[cfg(unix)]
 #[path = "resource_run_admission.rs"]
@@ -95,6 +95,7 @@ fn parse_with_original_store(
     let mut capabilities = false;
     let mut accounted = false;
     let mut expected_store_fd: Option<String> = None;
+    let mut native_store = false;
     while let Some(arg) = args.next() {
         let Some(word) = arg.to_str() else {
             return Err(super::usage(USAGE));
@@ -128,7 +129,7 @@ fn parse_with_original_store(
             }
             let expected_store: Option<std::fs::File> = if let Some(value) = expected_store_fd {
                 if !accounted
-                    || !matches!(command.as_slice(), [_, entry] if entry == "--resource-workload-v1")
+                    || !matches!(command.as_slice(), [_, entry] if entry == if native_store { "--resource-native-job-v1" } else { "--resource-workload-v1" })
                 {
                     return Err(super::usage(USAGE));
                 }
@@ -191,6 +192,10 @@ fn parse_with_original_store(
             "--timeout-ms" => &mut timeout,
             "--status-fd" => &mut status,
             "--expect-original-store-fd" => &mut expected_store_fd,
+            "--expect-native-job-original-store-fd" => {
+                native_store = true;
+                &mut expected_store_fd
+            }
             _ => return Err(super::usage(USAGE)),
         };
         if slot.is_some() {
@@ -289,6 +294,7 @@ pub fn main_entry_with_original_store(
                         | "--status-fd"
                         | "--capabilities"
                         | "--expect-original-store-fd"
+                        | "--expect-native-job-original-store-fd"
                 )
             )
         });

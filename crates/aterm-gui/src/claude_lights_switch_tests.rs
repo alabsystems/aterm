@@ -130,7 +130,7 @@ fn not_saved(app: &App, key: &str) -> Option<String> {
 const MASTER_OFF: &str = "[harness]\nenabled = false\n";
 
 /// AUTOPILOT OFF IS NOT THE HARNESS OFF: a session whose Autopilot is Off keeps the harness's
-/// switch lit, ` ● on ` and its label, `alab` bold in the moonbow's hero (the Off card's settled
+/// switch lit, ` ● on ` and its label, `ALab` bold in the moonbow's hero (the Off card's settled
 /// hero letters, never the system accent), and a press on it turns the WHOLE harness off:
 /// it writes `harness.enabled = false`, arms `◌ turning off` (the refused write here lets it go),
 /// and writes no Autopilot word. CONTROL: the rule beside the switch is no button.
@@ -142,7 +142,7 @@ fn an_autopilot_off_session_reads_on_in_the_moonbow_and_its_press_turns_the_harn
     let row =
         |app: &App, b: &BorderSwitch| app.windows[&wid].input_scratch.cells[b.frame_row].clone();
     let brand = |app: &App, b: &BorderSwitch| {
-        let label = b.label.clone().expect("the label");
+        let label = b.mark.clone().expect("the label");
         row(app, b)[label.start..label.start + 4].to_vec()
     };
     let cruise_brand: Vec<[u8; 3]> = brand(&app, &lit).iter().map(|c| c.fg).collect();
@@ -167,7 +167,7 @@ fn an_autopilot_off_session_reads_on_in_the_moonbow_and_its_press_turns_the_harn
         "{rule:?}"
     );
     let alab = brand(&app, &on);
-    assert_eq!(alab.iter().map(|c| c.ch).collect::<String>(), "alab");
+    assert_eq!(alab.iter().map(|c| c.ch).collect::<String>(), "ALab");
     let ground = app.windows[&wid].input_scratch.implicit_blank.bg;
     let ground = u32::from_be_bytes([0, ground[0], ground[1], ground[2]]);
     for (k, c) in alab.iter().enumerate() {
@@ -1259,7 +1259,7 @@ fn the_switch_is_a_switch_a_screen_reader_can_press() {
 }
 
 /// THE SWITCH NAMES THE HARNESS IT SWITCHES: lit, or held off by the master switch, the `Switch`
-/// names the harness by its label and no product (`alab v0.5 on: harness`), since a press there
+/// names the harness by its label and no product (`ALab v0.5 on: harness`), since a press there
 /// turns every agent's harness. NEGATIVE CONTROL: under the agent's own switch off it names the
 /// agent's harness.
 #[cfg(a11y_tree)]
@@ -1544,7 +1544,7 @@ fn the_switch_reads_on_a_tab_theme_the_instance_did_not_choose() {
         reads(accent, ground)
     );
     let floor = aterm_effects::cli_marks::NAME_CONTRAST;
-    let label = off.label.clone().expect("the label");
+    let label = off.mark.clone().expect("the label");
     let mut letters = 0;
     for col in off.cols.clone().chain(label.clone()) {
         let c = row[col];
@@ -2292,7 +2292,7 @@ fn harness_switch_gallery() {
             readings.push('\n');
             let (w, h) = two.size;
             let first_col = b.cols.start.saturating_sub(3);
-            let last_col = b.label.as_ref().map_or(b.cols.end, |l| l.end) + 3;
+            let last_col = b.mark.as_ref().map_or(b.cols.end, |l| l.end) + 3;
             let x0 = left + first_col * cw;
             let x1 = (left + last_col * cw).min(w);
             let y0 = (top + b.frame_row * ch).saturating_sub(ch / 2);
@@ -2465,6 +2465,134 @@ fn split_pane_find_bar_and_pre_frame_banner_shield_only_covered_pane_glass() {
     );
 }
 
+/// A PRESS ON THE MARK OPENS THE SITE ONCE: the top rule's label is the mark, `ALab` and its
+/// fine print. A plain press anywhere on it in the pane in front opens alab.systems, once per
+/// double click, as a link-modifier press does; the hand shows where a press would open it. The
+/// press turns no switch and reaches no program, a Shift press and (on macOS) a control-click
+/// open nothing, and the mark opens the site with the harness switched off too.
+#[test]
+fn a_press_on_the_mark_opens_the_site_once() {
+    use aterm_window::keyboard::ModifiersState;
+    let site = aterm_types::identity::SITE_URL.to_string();
+    let link = if cfg!(target_os = "macos") {
+        ModifiersState::SUPER
+    } else {
+        ModifiersState::CONTROL
+    };
+    let (mut app, wid, _session, mut reader, _host) = claude_pane(120);
+    let b = switch(&app, wid).expect("lit");
+    let mark = b.mark.clone().expect("the mark");
+    assert_eq!(
+        painted(&app, wid, &b, mark.start..mark.start + 4),
+        aterm_types::identity::COMPANY,
+        "the label opens with the mark"
+    );
+    let press = |app: &mut App, col: usize, mods: ModifiersState, when: Instant| {
+        app.windows.get_mut(&wid).expect("window").mods = mods;
+        click_at_when(app, wid, (b.frame_row, col), when);
+        app.windows.get_mut(&wid).expect("window").mods = ModifiersState::empty();
+        crate::platform::take_opened_urls()
+    };
+    let hand = |app: &mut App, col: usize, mods: ModifiersState| {
+        let (x, y) = px_of(app, wid, (b.frame_row, col));
+        app.windows.get_mut(&wid).expect("window").mods = mods;
+        app.on_cursor_moved(wid, x, y);
+        app.update_hover_cursor(wid);
+        let hand = app.windows[&wid].hover_pointer;
+        app.windows.get_mut(&wid).expect("window").mods = ModifiersState::empty();
+        hand
+    };
+    assert!(
+        hand(&mut app, mark.start, ModifiersState::empty()),
+        "the hand over the mark"
+    );
+    assert!(
+        hand(&mut app, mark.end - 1, link),
+        "and over its fine print, with the link modifier"
+    );
+    assert!(
+        !hand(&mut app, mark.start, ModifiersState::SHIFT),
+        "CONTROL: no hand under Shift"
+    );
+    let _ = crate::platform::take_opened_urls();
+    let _ = pty(&mut reader, 0);
+    super::SWITCHES_LET_GO.with(|n| n.set(0));
+    let mut when = a_minute_ago();
+    let mut opened = Vec::new();
+    for k in 0..3 {
+        if k > 0 {
+            when += interval();
+        }
+        opened.extend(press(
+            &mut app,
+            mark.start + 1,
+            ModifiersState::empty(),
+            when,
+        ));
+    }
+    assert_eq!(
+        opened,
+        [site.as_str()],
+        "a triple click opens the site once"
+    );
+    when += interval() + Duration::from_millis(1);
+    assert_eq!(
+        press(&mut app, mark.end - 1, ModifiersState::empty(), when),
+        [site.as_str()],
+        "a separate click on the fine print opens it again"
+    );
+    when += interval() + Duration::from_millis(1);
+    assert_eq!(
+        press(&mut app, mark.start, link, when),
+        [site.as_str()],
+        "a link-modifier press opens it"
+    );
+    when += interval() + Duration::from_millis(1);
+    assert!(
+        press(&mut app, mark.start, ModifiersState::SHIFT, when).is_empty(),
+        "a Shift press opens nothing"
+    );
+    #[cfg(target_os = "macos")]
+    {
+        when += interval() + Duration::from_millis(1);
+        assert!(
+            press(&mut app, mark.start, ModifiersState::CONTROL, when).is_empty(),
+            "a control-click is a secondary press: it opens nothing"
+        );
+    }
+    assert!(
+        pty(&mut reader, 0).is_empty(),
+        "no press on the mark reaches the program"
+    );
+    assert_eq!(
+        (
+            switch(&app, wid).map(|b| b.face),
+            not_saved(&app, "harness.enabled")
+        ),
+        (Some(HarnessSwitch::On), None),
+        "CONTROL: the mark's press turns no switch"
+    );
+    when += interval() + Duration::from_millis(1);
+    assert!(
+        press(&mut app, b.cols.start - 2, ModifiersState::empty(), when).is_empty(),
+        "NEGATIVE CONTROL: a press on the rule beside the switch opens nothing"
+    );
+    policy(&mut app, MASTER_OFF);
+    frame(&mut app, wid);
+    let off = switch(&app, wid).expect("the off switch");
+    assert!(off.face.is_off(), "{:?}", off.face);
+    let mark = off
+        .mark
+        .clone()
+        .expect("the mark stands with the switch off");
+    when += interval() + Duration::from_millis(1);
+    assert_eq!(
+        press(&mut app, mark.start + 2, ModifiersState::empty(), when),
+        [site.as_str()],
+        "with the harness off the mark still opens the site"
+    );
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn glass_selection_and_key_walk_do_not_rebuild_leaf_plan_without_chrome_spans() {
@@ -2528,7 +2656,7 @@ fn under_the_switch_off_the_only_harness_glass_is_the_switch() {
         let b = switch(&app, wid).unwrap_or_else(|| panic!("{what}: the switch stands"));
         assert!(b.face.is_off(), "{what}: {:?}", b.face);
         let top = top_rule(&app, wid);
-        let label = b.label.clone().expect("the switch's label");
+        let label = b.mark.clone().expect("the switch's label");
         let mut rest: Vec<char> = top.chars().collect();
         // The face, its label and the blank that closes it.
         rest[b.cols.start..=label.end].fill('\u{2500}');
@@ -2549,13 +2677,8 @@ fn under_the_switch_off_the_only_harness_glass_is_the_switch() {
         );
         assert_eq!(ours(&app), (0, 0), "{what}: no chip, light or fact is laid");
         assert!(
-            app.windows[&wid].claude_card.lines().next().is_none()
-                && app.windows[&wid]
-                    .claude_card
-                    .banner_edits()
-                    .next()
-                    .is_none(),
-            "{what}: no card and no banner"
+            app.windows[&wid].claude_card.lines().next().is_none(),
+            "{what}: no card line"
         );
         assert_eq!(
             super::drawn::Drawn::SwitchOnly,

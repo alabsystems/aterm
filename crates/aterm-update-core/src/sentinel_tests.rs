@@ -65,6 +65,29 @@ fn crash_loop_triggers_revert_at_max_attempts() {
     assert!(s.should_revert(1235, 2), "two unconfirmed boots ⇒ revert");
 }
 
+/// A RESUMED ARM STARTS AT ITS COUNT: `arm_at(11, 2)` reads `(11, 2)` with no launch names,
+/// so one more counted launch reaches a threshold of 3, while `arm_with` still starts at 0.
+/// NEGATIVE CONTROL: an `arm_at` that wrote 0 (as `arm_with` does) fails the first read and
+/// leaves `should_revert(11, 3)` false after the launch.
+#[test]
+fn a_resumed_arm_starts_at_its_count() {
+    let (s, _dir) = sentinel("resumed");
+    s.arm_at(11, 2, Flush::Durable).unwrap();
+    assert_eq!(s.read_state(), Some((11, 2)), "the carried count");
+    assert!(s.named_launches(11).is_empty(), "no launch is named yet");
+    assert!(
+        !s.should_revert(11, 3),
+        "two carried launches are not three"
+    );
+    assert_eq!(s.observe_launch(11).unwrap(), 3);
+    assert!(
+        s.should_revert(11, 3),
+        "the resumed trial's next launch reverts"
+    );
+    s.arm_with(11, Flush::Durable).unwrap();
+    assert_eq!(s.read_state(), Some((11, 0)), "a fresh arm starts at zero");
+}
+
 #[test]
 fn a_launch_the_killer_forgives_is_not_a_crash() {
     let (s, _dir) = sentinel("forgive");

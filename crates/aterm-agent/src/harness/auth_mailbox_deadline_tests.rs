@@ -11,8 +11,8 @@ fn expired_pending_credential_remains_owned_and_live_pending_is_reused_once() {
     let now = Cell::new(start);
     let clock = || now.get();
     let deadline = Deadline::new(Duration::from_secs(10), &clock);
-    let (commands, to_browser) = std::io::pipe().unwrap();
-    let (from_browser, events) = std::io::pipe().unwrap();
+    let (commands, to_browser) = aterm_uds::pipe().unwrap();
+    let (from_browser, events) = aterm_uds::pipe().unwrap();
     let mut cdp = CdpClient::new(to_browser, from_browser);
     let expected = MailboxCredential::Otp("918472".into());
     let mut pending = Some(expected.clone());
@@ -238,8 +238,8 @@ fn a_sign_ins_mailbox_poll_ends_when_its_deadline_passes() {
     };
     let (said, polled) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let (_commands, to_browser) = std::io::pipe().unwrap();
-        let (from_browser, _events) = std::io::pipe().unwrap();
+        let (_commands, to_browser) = aterm_uds::pipe().unwrap();
+        let (from_browser, _events) = aterm_uds::pipe().unwrap();
         let mut cdp = CdpClient::new(to_browser, from_browser);
         let mut seen = BTreeSet::new();
         let _ = said.send(poll_mailbox_or_webmail_for_credential_by(
@@ -278,8 +278,8 @@ fn a_mailbox_poll_its_host_slept_past_reads_no_mail() {
         seen_file: Some(tmp.path().join("mail.seen")),
         ..MailboxConfig::default()
     };
-    let (_commands, to_browser) = std::io::pipe().unwrap();
-    let (from_browser, _events) = std::io::pipe().unwrap();
+    let (_commands, to_browser) = aterm_uds::pipe().unwrap();
+    let (from_browser, _events) = aterm_uds::pipe().unwrap();
     let mut cdp = CdpClient::new(to_browser, from_browser);
     let mut seen = BTreeSet::new();
     let _seam = super::super::wake_deadline::SleepSeam::hold();

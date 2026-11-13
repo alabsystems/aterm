@@ -12,7 +12,22 @@ pub(crate) fn read<T>(
     aterm_uds::deadline::spin_stopped(min_ns, cpu_ns, read, MUST_HAPPEN)
 }
 
-/// Whether `read` is within 2x of `kernel`, either way: far inside a Mach tick factor (125/3 on Apple silicon).
+/// The scale this host's CPU times are read through, for a failure's message: the kernel's
+/// Mach timebase (macOS), the clock ticks per second (Linux).
+pub(crate) fn scale() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        format!("timebase {:?}", super::kernel_timebase())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        format!("{} clock ticks a second", crate::jobs::linux::clock_ticks())
+    }
+}
+
+/// Whether `read` is within 2x of `kernel`, either way: far inside a Mach tick factor (125/3 on
+/// Apple silicon) or a clock-tick factor (Linux's `USER_HZ`, 100, read as nanoseconds or as
+/// microseconds).
 pub(crate) fn within_2x(read: u64, kernel: u64) -> bool {
     read <= kernel.saturating_mul(2) && read.saturating_mul(2) >= kernel
 }

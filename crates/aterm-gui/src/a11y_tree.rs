@@ -305,9 +305,10 @@ pub(crate) enum HarnessChip {
     Switch,
     /// Passive status title beside the chips.
     Title,
-    /// A link of the harness words on the glass: a banner's, or the card line's
-    /// (`claude_card::GlassLink`), each in a slot of its own.
-    Link(crate::claude_card::GlassLink),
+    /// The top rule's mark, `ALab` with its fine print: a link to the site.
+    Mark,
+    /// The launch card line's mark, `ALab`: a link to the site.
+    CardMark,
     /// The top rule's ⬆️ of a newer CLI build: a press asks for the move now.
     Upgrade,
 }
@@ -330,10 +331,9 @@ impl HarnessChip {
             Self::Title => 10,
             Self::Context => 11,
             Self::Account => 12,
-            Self::Link(crate::claude_card::GlassLink::Notice) => 13,
-            Self::Link(crate::claude_card::GlassLink::Line) => 14,
-            Self::Link(crate::claude_card::GlassLink::Announcement) => 15,
-            Self::Upgrade => 16,
+            Self::Mark => 13,
+            Self::CardMark => 14,
+            Self::Upgrade => 15,
         }
     }
 
@@ -352,10 +352,9 @@ impl HarnessChip {
             10 => Self::Title,
             11 => Self::Context,
             12 => Self::Account,
-            13 => Self::Link(crate::claude_card::GlassLink::Notice),
-            14 => Self::Link(crate::claude_card::GlassLink::Line),
-            15 => Self::Link(crate::claude_card::GlassLink::Announcement),
-            16 => Self::Upgrade,
+            13 => Self::Mark,
+            14 => Self::CardMark,
+            15 => Self::Upgrade,
             _ => return None,
         })
     }
@@ -392,7 +391,8 @@ impl HarnessChip {
             | Self::Mode
             | Self::Switch
             | Self::Title
-            | Self::Link(_)
+            | Self::Mark
+            | Self::CardMark
             | Self::Upgrade => None,
         }
     }
@@ -549,7 +549,7 @@ fn push_chips(
         let title = chip.chip == HarnessChip::Title;
         let mut node = Node::new(if title {
             Role::Status
-        } else if matches!(chip.chip, HarnessChip::Link(_)) {
+        } else if matches!(chip.chip, HarnessChip::Mark | HarnessChip::CardMark) {
             Role::Link
         } else if chip.toggled.is_some() {
             Role::Switch

@@ -955,6 +955,8 @@ fn a_workspace_removed_while_a_run_waits_renews_its_relief() {
             available: GIB,
             reserved: 0,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }],
         holders: Vec::new(),
     };

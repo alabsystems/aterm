@@ -76,6 +76,7 @@ pub(super) fn snapshot(sid: &str, conversation: &str) -> aterm_agent::harness::r
         profile: None,
         tab: sid.to_owned(),
         pid: 4243,
+        lifetime: None,
         start: "Thu Sep 24 01:02:03 2026".to_owned(),
         shell: PGID.unsigned_abs(),
         program: std::path::PathBuf::from("/opt/claude"),
@@ -1501,7 +1502,7 @@ fn a_click_on_the_chips_commits_an_open_in_grid_rename() {
     assert!(app.inline_rename_edit(wid).is_none(), "the blank: closed");
     assert_eq!(pinned(&app).as_deref(), Some("gap"));
     let b = &app.windows[&wid].claude_lights.border_toggles[0];
-    let label = (b.frame_row, b.label.as_ref().expect("top label").start);
+    let label = (b.frame_row, b.mark.as_ref().expect("top label").start);
     rename(&mut app, "label");
     let (x, y) = px_of(&app, wid, label);
     app.on_cursor_moved(wid, x, y);

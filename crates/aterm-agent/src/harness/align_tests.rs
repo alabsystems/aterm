@@ -479,6 +479,7 @@ fn settle_until(observed: &CaptureLifecycleObservation, ready: impl Fn() -> bool
 
 #[cfg(unix)]
 fn escaped_holder_stage() -> ! {
+    use std::os::fd::IntoRawFd as _;
     use std::os::unix::ffi::OsStrExt as _;
     let path = |var: &str| {
         let path = std::env::var_os(var).expect("the staged paths");
@@ -492,12 +493,13 @@ fn escaped_holder_stage() -> ! {
     let top = aterm_uds::spawnfd::descriptor_bound();
     let print_stop = std::env::var_os(ESCAPE_STOP).is_some();
     let interrupted = || std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
-    let mut sync: [libc::c_int; 2] = [-1, -1];
-    // SAFETY: `pipe` fills the two-element array; after `fork` the holder makes only
-    // async-signal-safe calls on memory prepared before it and never returns, and this branch
-    // leaves through `_exit`.
+    let (sync_r, sync_w) = aterm_uds::pipe().expect("pipe");
+    let sync: [libc::c_int; 2] = [sync_r.into_raw_fd(), sync_w.into_raw_fd()];
+    // The sync pipe's write end is the holder's: unmarked for this fork alone.
+    let handing = aterm_uds::spawn_lock::handing(&[sync[1]]);
+    // SAFETY: after `fork` the holder makes only async-signal-safe calls on memory prepared
+    // before it and never returns, and this branch leaves through `_exit`.
     unsafe {
-        assert_eq!(libc::pipe(sync.as_mut_ptr()), 0, "pipe");
         match libc::fork() {
             -1 => panic!("fork: {}", std::io::Error::last_os_error()),
             0 => {
@@ -538,6 +540,8 @@ fn escaped_holder_stage() -> ! {
                 libc::_exit(0)
             }
             _ => {
+                // The holder's copy of the hold is never released: it `_exit`s.
+                drop(handing);
                 libc::close(sync[1]);
                 let mut byte = 0u8;
                 let got = loop {

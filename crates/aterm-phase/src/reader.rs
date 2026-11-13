@@ -1276,7 +1276,8 @@ const NOT_AGENTS: &[&str] = &[
 
 /// The names of Google's Gemini CLI, which aterm no longer supports: agy replaces it. A program
 /// so named is no agent to any reader ([`identify`]) and no lane's ([`program_of`] names none),
-/// and a spawn, config table or record naming it is refused with [`RETIRED_AGENT`].
+/// and a saved leaf, an older policy's switch or a lab's record naming it is answered with
+/// [`RETIRED_AGENT`].
 pub const RETIRED_AGENTS: &[&str] = &["gemini", "gemini-cli"];
 
 /// Why a name in [`RETIRED_AGENTS`] is refused, for the refusal a person reads.

@@ -499,10 +499,10 @@ fn a_public_usage_poll_with_no_result_still_refuses_changed_policy() {
 }
 
 /// A reader that keeps the homes it was asked about and answers `answer` for each.
-struct Reads<'a> {
-    user_home: &'a Path,
-    homes: std::sync::Mutex<Vec<PathBuf>>,
-    answer: &'a (dyn Fn(&Path) -> Reading + Sync),
+pub(super) struct Reads<'a> {
+    pub(super) user_home: &'a Path,
+    pub(super) homes: std::sync::Mutex<Vec<PathBuf>>,
+    pub(super) answer: &'a (dyn Fn(&Path) -> Reading + Sync),
 }
 
 impl crate::harness::accounts_pool::UsageReader for Reads<'_> {
@@ -539,7 +539,7 @@ impl crate::harness::accounts_pool::UsageReader for Reads<'_> {
     }
 }
 
-fn plain_usage() -> Reading {
+pub(super) fn plain_usage() -> Reading {
     Reading::Usage(Usage {
         sample: Sample {
             session_pct: Some(10),
@@ -550,7 +550,7 @@ fn plain_usage() -> Reading {
     })
 }
 
-fn spent_usage() -> Reading {
+pub(super) fn spent_usage() -> Reading {
     Reading::Usage(Usage {
         sample: Sample {
             session_pct: Some(100),
@@ -1184,7 +1184,7 @@ fn a_fresh_row_starts_with_no_read() {
 }
 
 /// A Codex pool of six on `main`: `main`, `work`, and `w2` to `w5`, each with a login of its own.
-fn six(tag: &str) -> World {
+pub(super) fn six(tag: &str) -> World {
     let world = World::new(tag);
     world.two(Cli::Codex);
     let mut text =

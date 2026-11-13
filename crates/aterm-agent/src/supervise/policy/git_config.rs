@@ -819,7 +819,7 @@ impl Probe<'_> {
         paths: Vec<u8>,
         wait: std::time::Duration,
     ) -> Option<Vec<String>> {
-        let (reader, mut writer) = aterm_uds::kept_out(std::io::pipe).ok()?;
+        let (reader, mut writer) = aterm_uds::pipe().ok()?;
         let wrote = std::thread::spawn(move || {
             use std::io::Write as _;
             writer.write_all(&paths)

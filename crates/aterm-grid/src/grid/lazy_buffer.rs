@@ -591,6 +591,16 @@ impl LazyBuffer {
         }
     }
 
+    /// Put back what [`take_staged`](Self::take_staged) moved out, into a buffer nothing was
+    /// staged in since. The arrival count stays this buffer's.
+    pub(crate) fn restore_staged(&mut self, staged: Self) {
+        debug_assert!(self.is_empty(), "restore_staged over staged rows");
+        *self = Self {
+            arrivals_since_drain: self.arrivals_since_drain,
+            ..staged
+        };
+    }
+
     /// Drain up to `n` of the oldest pending lines, oldest first: the bounded
     /// [`drain_all`](Self::drain_all) the compression worker uses to keep each term-lock hold
     /// short. Lines the caller does not take are dropped when the [`Drain`] is.

@@ -330,8 +330,10 @@ fn a_forked_child_reads_as_not_execd_until_it_execs() {
     let _ = spawned.kill();
     let _ = spawned.wait();
     assert_eq!(spawned_execd, Some(true), "a spawned child");
-    let (go_r, go_w) = std::io::pipe().expect("pipe");
+    let (go_r, go_w) = crate::pipe().expect("pipe");
     let (go_fd, go_w_fd) = (go_r.as_raw_fd(), go_w.as_raw_fd());
+    // The child waits on the read end, which is kept out of every fork it is not handed to.
+    let handing = crate::spawn_lock::handing(&[go_fd]);
     // SAFETY: the child calls only async-signal-safe functions (`close`, `read`, `_exit`)
     // on descriptors opened before `fork`, then exits without unwinding.
     let pid = unsafe { libc::fork() };
@@ -352,6 +354,7 @@ fn a_forked_child_reads_as_not_execd_until_it_execs() {
             libc::_exit(0);
         }
     }
+    drop(handing);
     drop(go_r);
     let forked = super::read_process_execd(pid);
     drop(go_w);

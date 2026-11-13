@@ -33,7 +33,14 @@ pub struct Finding {
 /// The rules over the Macs' own rows (design §4.7): each is a finding and nothing merges. Two live
 /// enrollments bind one machine; two live enrollments state one hardware hint, a clone or a
 /// machine identifier VMs share; a row binds a machine the registry does not have; and a Mac's
-/// facts differ from the owner's statement on its machine row, where the facts win in views.
+/// facts differ from the owner's statement on its machine row, where the facts win in views. A
+/// row whose chain of `predecessor`s reaches another of its group is that Mac's later enrollment
+/// (a writer succession, whose earlier uuid stays seated), so a group is shared only where it
+/// has more than one enrollment that succeeded no other of it, or two rows on its chains that
+/// name one `predecessor`: a home has one successor at a time, so a second is a copy of it. A
+/// chain runs through every row, a removed seat's included: a Mac twice succeeded whose middle
+/// seat is gone is still one Mac, and a copy that succeeded the same writer as that gone seat is
+/// still a copy.
 pub fn facts(read: &OwnedRead, live: &BTreeSet<String>, machines: &Projection) -> Vec<Finding> {
     let mut found = Vec::new();
     let mut by_machine = BTreeMap::<&str, Vec<&str>>::new();
@@ -68,8 +75,47 @@ pub fn facts(read: &OwnedRead, live: &BTreeSet<String>, machines: &Projection) -
             by_hint.entry(hint).or_default().push(uuid.as_str());
         }
     }
+    let predecessor = |uuid: &str| {
+        read.rows
+            .get(uuid)
+            .and_then(|row| row.value.get("predecessor"))
+            .and_then(Value::as_str)
+    };
     let shared = |kind, by: BTreeMap<&str, Vec<&str>>, found: &mut Vec<Finding>| {
-        for pks in by.into_values().filter(|pks| pks.len() > 1) {
+        for pks in by.into_values() {
+            let mut roots = 0;
+            // Each row a member's chain names, with the rows that name it.
+            let mut named = BTreeMap::<&str, BTreeSet<&str>>::new();
+            for uuid in &pks {
+                let mut walked = BTreeSet::from([*uuid]);
+                let mut links = Vec::new();
+                let mut at = *uuid;
+                let succeeds = loop {
+                    let Some(earlier) = predecessor(at) else {
+                        break false;
+                    };
+                    // A chain that returns to a row it passed names no earlier enrollment.
+                    if !walked.insert(earlier) {
+                        break false;
+                    }
+                    links.push((earlier, at));
+                    if pks.contains(&earlier) {
+                        break true;
+                    }
+                    at = earlier;
+                };
+                if succeeds {
+                    for (earlier, later) in links {
+                        named.entry(earlier).or_default().insert(later);
+                    }
+                } else {
+                    roots += 1;
+                }
+            }
+            let forked = named.values().any(|rows| rows.len() > 1);
+            if roots < 2 && !forked {
+                continue;
+            }
             found.push(Finding {
                 kind,
                 collection: MACHINE_FACTS.name,

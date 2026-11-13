@@ -96,6 +96,40 @@ macro_rules! dispatch {
 }
 
 impl ScrollbackStorage {
+    /// Borrow a line by index (`0` = oldest) without cloning cached warm/cold [`Line`]s.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScrollbackError`] if the underlying warm or cold block fails to decode
+    /// or is quarantined.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn with_line<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(&Line) -> R,
+    ) -> Result<Option<R>, ScrollbackError> {
+        match self {
+            Self::Memory(sb) => sb.with_line(idx, f),
+        }
+    }
+
+    /// Borrow a line by reverse index (`0` = newest) without cloning cached warm/cold [`Line`]s.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScrollbackError`] if the underlying warm or cold block fails to decode
+    /// or is quarantined.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn with_line_rev<R>(
+        &self,
+        rev_idx: usize,
+        f: impl FnOnce(&Line) -> R,
+    ) -> Result<Option<R>, ScrollbackError> {
+        match self {
+            Self::Memory(sb) => sb.with_line_rev(rev_idx, f),
+        }
+    }
+
     /// Whether retained history holds an image accepted by `selected`.
     /// Compressed tiers contain no image spans.
     #[must_use]

@@ -215,7 +215,7 @@ impl<C: Ctl> Session<'_, C> {
                 return unconfirmed(&why);
             }
         }
-        let person = self.person_fence(seen);
+        let person = seen.human_seq;
         let seen = match self.first_key_wait(&first, seen, grace)? {
             Ok(now) => now,
             Err(stop) => return Ok(stop),
@@ -408,7 +408,7 @@ impl<C: Ctl> Session<'_, C> {
         if !self.gen_fence_known()? || seen.generation.is_none() {
             return unconfirmed("this host cannot fence a question's key on the screen generation");
         }
-        let person = self.person_fence(seen);
+        let person = seen.human_seq;
         if !self.send_fence_known()? || person.is_none() {
             return unconfirmed(
                 "this host cannot fence a typed answer (send if-gen=, the person count)",
@@ -934,7 +934,7 @@ impl<C: Ctl> Session<'_, C> {
         let Some((_, key)) = box_on(&seen.rows) else {
             return Ok(Pressing::Done(Press::Skipped { seq: seen.seq }));
         };
-        let person = self.person_fence(seen).map(|n| format!("if-human={n}"));
+        let person = seen.human_seq.map(|n| format!("if-human={n}"));
         let mut now = seen.clone();
         let mut written = 0;
         loop {

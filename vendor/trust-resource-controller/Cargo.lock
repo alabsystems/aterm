@@ -30,18 +30,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
 dependencies = [
  "cfg-if",
- "libc 0.2.191",
+ "libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)",
  "r-efi",
 ]
 
 [[package]]
 name = "jobserver"
 version = "0.1.35"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
 dependencies = [
  "getrandom",
- "libc 0.2.191",
+ "libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -49,12 +47,12 @@ name = "jobserver_utils"
 version = "0.0.0"
 dependencies = [
  "jobserver",
- "libc 0.2.191",
+ "libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.191"
 
 [[package]]
 name = "libc"
@@ -74,7 +72,7 @@ version = "0.13.0"
 dependencies = [
  "aterm-tempfile",
  "jobserver_utils",
- "libc 0.2.186",
+ "libc 0.2.191",
  "trust-resource-provenance",
  "trust-sha2",
 ]
@@ -85,7 +83,7 @@ version = "0.13.0"
 dependencies = [
  "aterm-json",
  "aterm-serde",
- "libc 0.2.186",
+ "libc 0.2.191",
  "trust-sha2",
 ]
 

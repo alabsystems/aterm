@@ -5658,18 +5658,18 @@ impl crate::App {
         wid: crate::WindowId,
         receipt: Option<LensPaintReceipt>,
         visible: bool,
-        capture_forced: bool,
+        input: crate::metrics::PresentInput,
     ) {
         let Some(ws) = self.windows.get_mut(&wid) else {
             return;
         };
-        if !visible || capture_forced {
+        if !visible || input.capture_forced() {
             ws.stats_lens.retire_input();
             return;
         }
         ws.stats_lens.presented_selection = receipt.map(|paint| paint.selection);
         if let Some(token) = receipt.and_then(|paint| paint.input) {
-            ws.stats_lens.input.record(token, false);
+            ws.stats_lens.input.record(token, input);
         } else if receipt.is_none() {
             ws.stats_lens.retire_input();
         }

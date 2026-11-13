@@ -587,6 +587,7 @@ impl LiveRig {
     fn carry(&self) -> Report {
         let st = self.record().expect("a record in flight");
         let r = Report {
+            rung: None,
             pid: st.pid,
             tab: TAB.to_string(),
             session: key(TAB),
@@ -1315,7 +1316,13 @@ fn a_muse_restart_finished_before_its_carry_has_landed() {
     };
     let carry = |st: &St| {
         save(&rig.opts, &key(TAB), st);
-        carry_restart(&rig.opts, Agent::Muse, Some(TUI), false)
+        carry_restart(
+            &rig.opts,
+            Agent::Muse,
+            Some(TUI),
+            false,
+            crate::harness::upgrade_drive::now_s(),
+        )
     };
     let landed = carry(&done);
     assert_eq!(landed.step, "landed", "{landed:?}");

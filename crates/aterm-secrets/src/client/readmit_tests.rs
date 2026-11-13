@@ -1704,7 +1704,7 @@ fn a_fresh_vault_key_proves_its_node_key_to_a_members_desk_and_is_in() {
     };
     let served = std::sync::Mutex::new(Vec::new());
     std::thread::scope(|scope| {
-        let (cancelled, cancel) = std::io::pipe().unwrap();
+        let (cancelled, cancel) = aterm_uds::pipe().unwrap();
         let requests = &requests;
         let source = &source;
         scope.spawn(move || {

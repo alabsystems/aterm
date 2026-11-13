@@ -368,8 +368,8 @@ fn ran_unproven(
     };
     Some(format!(
         "{why}, so macOS may still be checking its first start, and removing the bundle now can \
-         stall every program start until a restart — uninstall again in {} minutes, or after a \
-         restart",
+         strand every program start then waiting on that check — uninstall again in {} minutes, \
+         or after a restart",
         aterm_uds::deadline::FIRST_EXEC_HANG.as_secs() / 60
     ))
 }

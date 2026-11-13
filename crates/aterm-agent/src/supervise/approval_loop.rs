@@ -62,6 +62,19 @@ const QUESTION_STANDIN_QUIET: Duration = Duration::from_secs(10);
 /// answered without them.
 pub(super) const QUESTION_PERSON_GRACE: Duration = Duration::from_secs(15);
 
+/// Why a Claude Code permission box nobody has touched is held ([`PERSON_SETTLE`]).
+const SETTLE_ACT: &str =
+    "the box's answer; nobody has touched it, so it waits only for their keys to settle";
+
+/// THE QUIET A CLAUDE CODE PERMISSION BOX NOBODY HAS TOUCHED WAITS FOR ([`Session::settle`]): the
+/// person's last gesture at least this old, and no input of theirs unread by the worker. Claude
+/// Code draws no box while its composer is active (2.1.323: for 1.5 s after an edit that leaves
+/// text, 0.6 s after an Enter that clears it), so a box it draws took the keyboard from the
+/// composer, and a person typing into the composer or queuing a message as it came up made no
+/// choice on it. This much quiet outlasts both windows, so the box answered is the one the
+/// person's last key left drawn; their grace (`[harness] human_grace_s`) is for a box they touch.
+pub(super) const PERSON_SETTLE: Duration = Duration::from_millis(2_500);
+
 /// The quiet a person's input buys before the loop acts: `[harness] human_grace_s`.
 fn person_grace(opts: &SuperviseOpts) -> Duration {
     Duration::from_secs(u64::from(opts.policy.human_grace_s))
@@ -76,9 +89,9 @@ enum Dialog {
     /// Chrome intro): [`QUESTION_PERSON_GRACE`] at most.
     Choice,
     /// A permission box, which grants a command, a tool, a file, the network, a folder, an app or
-    /// a server its reach: [`QUESTION_PERSON_GRACE`] at most while nobody has touched it since it
-    /// appeared, the person's whole grace once a person or another driver has
-    /// ([`Session::answer_grace`]).
+    /// a server its reach: while nobody has touched it, only [`PERSON_SETTLE`] on Claude Code and
+    /// [`QUESTION_PERSON_GRACE`] at most on another program; the person's whole grace once a
+    /// person or another driver has ([`Session::answer_grace`]).
     Permission,
     /// The usage-limit menu, whose answer can spend a reset or credits; a held message, another
     /// session's text, which becomes the worker's prompt; or a box not recognized: the person's
@@ -505,8 +518,7 @@ fn leave_wait(now: Instant, deny: Option<Instant>) -> Duration {
 
 const TICK_SLACK: Duration = Duration::from_secs(3);
 
-/// Recheck interval for a box whose auto-deny countdown has not yet been seen ticking, or whose
-/// person count is owed a verdict ([`Episode::owed`]).
+/// Recheck interval for a box whose auto-deny countdown has not yet been seen ticking.
 pub(super) const TICK_LOOK: Duration = Duration::from_secs(1);
 
 /// Auto-deny countdown read from a box, trusted only once seen ticking in step with the loop's clock.
@@ -577,129 +589,45 @@ pub(super) enum DenyClock {
     At { deny: Instant },
 }
 
-/// How long Claude Code's auto-deny countdown runs from the box's first frame by default: two
-/// minutes, measured on 2.1.301's and 2.1.316's rm safety check
-/// (`docs/measured/real-claude-lab-2026-10-15.md`, "The auto-deny countdown under a hold"). Its
-/// server flag (`tengu_splendid_horizon`'s `timeoutMs`, 120000 by default in the 2.1.301, 2.1.307
-/// and 2.1.316 to 2.1.318 builds) sets any window from 5 s to an hour, so a countdown can run
-/// shorter or longer than this.
-pub(super) const AUTO_DENY_WINDOW: Duration = Duration::from_secs(120);
-
-/// When the box an episode reads was drawn, as far as its countdown tells.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Drawn {
-    /// It draws no countdown, or the episode read one showing more time left than
-    /// [`AUTO_DENY_WINDOW`] and [`TICK_SLACK`] allow, which that window cannot place: at any time
-    /// before its first read.
-    Untold,
-    /// Its countdown row is drawn and its time is not read (`about 2 minutes`, a row cut
-    /// mid-redraw): a later frame's countdown may place it.
-    Unread,
-    /// Its countdown has not been seen ticking yet, so it is not believed yet.
-    Unseen,
-    /// No earlier than this: its ticking countdown's deny less [`AUTO_DENY_WINDOW`] and the
-    /// [`TICK_SLACK`] a countdown's clock is believed to.
-    From(Instant),
-}
-
-/// A rise in the person count a box's first read found, owed a verdict ([`Episode::owed`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Owed {
-    /// The count that read found.
-    count: u64,
-    /// How long before that read's snapshot the person's last gesture was (`human_ms`).
-    ms: u64,
-    /// The latest instant that gesture can have been made: `ms` before the next read was asked
-    /// for, which was after the server took the snapshot. `None` until that next read.
-    last: Option<Instant>,
-}
-
-/// Contiguous box episode tracking whether a person or another driver touched the session while a box was up.
+/// One dialog's run on the screen ([`dialog_key`]), from the read that first found it to the first
+/// read with no dialog, and whether a person or another driver touched it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Episode {
-    baseline: Option<u64>,
+    /// The dialog ([`dialog_key`]).
+    key: String,
+    /// The inputs aterm had written to the session when [`Self::focus`] was set
+    /// ([`Session::inputs_written`]).
+    inputs: u64,
+    /// The option (its index) the focus is on while nobody but aterm keys the dialog: the first,
+    /// where Claude Code draws it, until a person's gesture refuses one of aterm's keys
+    /// ([`Session::episode_yielded`]), and then where the last read before that showed it.
+    focus: Option<usize>,
+    /// The option the focus was on at the episode's last read.
+    shown: Option<usize>,
     by: Option<&'static str>,
-    /// The box the episode's last read showed ([`box_identity`]).
-    shown: String,
-    /// The person count a box's first read found above `baseline`: a gesture between the read
-    /// before the box and its first read, told apart from the box once its countdown places the
-    /// box's first frame.
-    owed: Option<Owed>,
-    /// A countdown the episode read showed more time left than [`AUTO_DENY_WINDOW`] and
-    /// [`TICK_SLACK`] allow: that window places none of its boxes ([`Drawn::Untold`]).
-    outlasted: bool,
+    /// The person count the episode counts touches from, in the loop before [`PERSON_SETTLE`]
+    /// ([`Session::set_old_grace`]): the read's before the dialog.
+    #[cfg(test)]
+    count: Option<u64>,
 }
 
 const BY_DRIVER: &str = "another driver's hand was on the session while it was up";
 
-const BY_OWED: &str = "a person's gesture was counted between the read before it and its first \
-                       read, which its countdown, once seen ticking, places before or after it";
+const BY_FOCUS: &str = "a key not aterm's moved its focus";
 
-const BY_COUNTED: &str = "a person's gesture was counted on the session since it appeared";
+/// Which dialog `v2` is, for its episode: a box is its kind and command whatever width wraps it,
+/// and every tab of a question dialog is one dialog.
+fn dialog_key(v2: &aterm_phase::PromptV2) -> String {
+    if v2.kind == PromptKind::Question {
+        return v2.kind.name().to_string();
+    }
+    let command: String = v2.command.chars().filter(|c| !c.is_whitespace()).collect();
+    format!("{}\n{command}", v2.kind.name())
+}
 
 impl Episode {
     fn touch(&mut self, by: &'static str) {
         self.by.get_or_insert(by);
-    }
-
-    /// Who touched the box: a person count owed a verdict ([`Self::owed`]) is a touch until its
-    /// countdown says it came before the box.
-    const fn by(&self) -> Option<&'static str> {
-        match (self.by, self.owed) {
-            (Some(by), _) => Some(by),
-            (None, Some(_)) => Some(BY_OWED),
-            (None, None) => None,
-        }
-    }
-
-    /// Reads `screen`, asked for at `asked` (`first`: the read that first found the box it shows).
-    /// A rise in the person count is a touch unless the box's first read found it and the person's
-    /// last gesture by then is older than the box's first frame ([`Drawn::From`]): that gesture
-    /// answered something else, and the count it left is the episode's baseline.
-    fn read(&mut self, screen: &Screen, asked: Instant, first: bool, drawn: Drawn) {
-        let by = match (self.baseline, screen.human_seq, screen.human) {
-            (None, _, _) | (_, None, _) | (_, _, HumanInput::Unknown) => {
-                "whether a person touched it since it appeared cannot be told"
-            }
-            (Some(then), Some(now), human) if now > then => {
-                if first {
-                    self.owed = match human {
-                        HumanInput::Ago(ms) => Some(Owed {
-                            count: now,
-                            ms,
-                            last: None,
-                        }),
-                        HumanInput::Never | HumanInput::NeverFor(_) | HumanInput::Unknown => None,
-                    };
-                } else if let Some(o) = self.owed.as_mut().filter(|o| o.last.is_none()) {
-                    o.last = asked.checked_sub(Duration::from_millis(o.ms));
-                }
-                match (self.owed.take().filter(|o| o.count == now), drawn) {
-                    (Some(o), Drawn::Unseen | Drawn::Unread) => {
-                        self.owed = Some(o);
-                        return;
-                    }
-                    (Some(o), Drawn::From(from)) => match o.last {
-                        None => {
-                            self.owed = Some(o);
-                            return;
-                        }
-                        Some(last) if last < from => {
-                            self.baseline = Some(now);
-                            return;
-                        }
-                        Some(_) => BY_COUNTED,
-                    },
-                    _ => BY_COUNTED,
-                }
-            }
-            (Some(then), Some(now), _) if now < then => {
-                "the session's person count started over since it appeared, so whether a \
-                 person touched it cannot be told"
-            }
-            _ => return,
-        };
-        self.touch(by);
     }
 }
 
@@ -1873,10 +1801,6 @@ impl<C: Ctl> Session<'_, C> {
             super::super::policy::turn_end::PERSON_TYPING
         };
         let (until, why) = match (clock, self.touched()) {
-            (_, Some(by)) if self.touch_owed() => (
-                grace_ends.min(self.fx.mono() + TICK_LOOK),
-                format!("; {by}"),
-            ),
             (DenyClock::None, _) => (grace_ends, String::new()),
             (DenyClock::Unseen, Some(by)) => (grace_ends, format!("; {by}: held as ever")),
             (DenyClock::At { deny, .. }, Some(by)) => (
@@ -1966,61 +1890,70 @@ impl<C: Ctl> Session<'_, C> {
         self.countdown = Some(read.after(self.countdown.as_ref()));
     }
 
-    /// Keeps the box episode `screen` (asked for at `asked`) reads, its baseline `before` (the
-    /// prior read's person count); a read with no box ends it. A box drawn in another's place
-    /// while nobody has touched the episode, and no count is owed a verdict, is read as the box's
-    /// first read, so its countdown places a gesture made between the read before it and its
-    /// first frame as it places the first box's; a count owed a verdict at a box drawn over
-    /// before its countdown placed it is a touch.
-    pub(super) fn keep_episode(
-        &mut self,
-        screen: &Screen,
-        before: Option<Option<u64>>,
-        asked: Instant,
-    ) {
+    /// Keeps the episode of the dialog `screen` shows ([`Episode`]). A dialog other than the
+    /// episode's begins another; a read with no dialog ends it, unless the read caught a frame half
+    /// drawn. While aterm has written no key to a Claude Code dialog, its focus off the first
+    /// option is a person's touch: Claude Code draws every dialog focused there, so a key moved it,
+    /// even one made before the dialog's first read. Once a person's gesture has refused one of
+    /// aterm's keys, the focus off the option the read before that showed is one too
+    /// ([`Self::episode_yielded`]). A key that moves nothing (a letter, a scroll) is no touch: a
+    /// person typing a message, or queuing one, as the dialog came up decided nothing on it, and a
+    /// key that answers it (a digit, Enter, Esc) takes it off the screen.
+    pub(super) fn keep_episode(&mut self, screen: &Screen) {
         let v2 = aterm_phase::parse_prompt_v2(&screen.rows);
-        let shown = v2.as_ref().map(|v2| identity_of(v2, &screen.rows));
         #[cfg(test)]
         {
+            let shown = v2.as_ref().map(|v2| identity_of(v2, &screen.rows));
             if self.episode_per_box && self.last_box.is_some() && shown != self.last_box {
                 self.episode = None;
             }
-            self.last_box.clone_from(&shown);
+            self.last_box = shown;
         }
-        let (Some(v2), Some(identity)) = (v2, shown) else {
-            self.episode = None;
+        let Some(v2) = v2 else {
+            if !screen.frame_open {
+                self.episode = None;
+            }
             return;
         };
-        let countdown = self.countdown_of_box(&identity);
-        let outlasts = countdown.is_some_and(|c| c.left > AUTO_DENY_WINDOW + TICK_SLACK);
-        let deny = countdown.map(Countdown::deny);
-        let first = self
-            .episode
-            .as_ref()
-            .is_none_or(|e| e.by.is_none() && e.owed.is_none() && e.shown != identity);
-        let episode = self.episode.get_or_insert_with(|| Episode {
-            baseline: before.flatten(),
-            by: None,
-            shown: String::new(),
-            owed: None,
-            outlasted: false,
-        });
-        if episode.shown != identity && episode.owed.take().is_some() {
-            // The box the count was owed at was drawn over before its countdown placed it.
-            episode.touch(BY_COUNTED);
-        }
-        episode.shown = identity;
-        episode.outlasted |= outlasts;
-        let drawn = match deny {
-            _ if episode.outlasted => Drawn::Untold,
-            None if v2.auto_deny.is_some() => Drawn::Unread,
-            None => Drawn::Untold,
-            Some(None) => Drawn::Unseen,
-            Some(Some(deny)) => deny
-                .checked_sub(AUTO_DENY_WINDOW + TICK_SLACK)
-                .map_or(Drawn::Untold, Drawn::From),
+        let key = dialog_key(&v2);
+        let inputs = self.inputs_written;
+        let mut episode = match self.episode.take().filter(|e| e.key == key) {
+            Some(episode) => episode,
+            None => Episode {
+                key,
+                inputs,
+                focus: Some(0),
+                shown: None,
+                by: None,
+                #[cfg(test)]
+                count: self.last_read_count.flatten(),
+            },
         };
-        episode.read(screen, asked, first, drawn);
+        #[cfg(test)]
+        if self.old_grace
+            && let (Some(then), Some(now)) = (episode.count, screen.human_seq)
+            && now != then
+        {
+            episode.touch("a person's gesture was counted on the session since it appeared");
+        }
+        let claude = is_claude(&self.reader(&screen.rows).program());
+        episode.shown = v2.options.iter().position(|o| o.focused);
+        let moved = episode.shown.is_some() && episode.shown != episode.focus;
+        if claude && moved && episode.inputs == inputs {
+            episode.touch(BY_FOCUS);
+        }
+        self.episode = Some(episode);
+    }
+
+    /// A person's gesture refused one of aterm's keys to the episode's dialog: the focus the last
+    /// read showed is where aterm's keys left it, and a move off it with no key of aterm's since is
+    /// the person's ([`Self::keep_episode`]).
+    pub(super) fn episode_yielded(&mut self) {
+        let inputs = self.inputs_written;
+        if let Some(e) = self.episode.as_mut() {
+            e.focus = e.shown;
+            e.inputs = inputs;
+        }
     }
 
     pub(super) fn episode_driven(&mut self) {
@@ -2034,24 +1967,7 @@ impl<C: Ctl> Session<'_, C> {
         if self.touch_off {
             return None;
         }
-        self.episode.as_ref().and_then(Episode::by)
-    }
-
-    /// Whether the box's episode holds a person count its countdown has yet to place
-    /// ([`Episode::owed`]).
-    fn touch_owed(&self) -> bool {
-        self.episode
-            .as_ref()
-            .is_some_and(|e| e.by.is_none() && e.owed.is_some())
-    }
-
-    /// The one person count every key of an answer names: an untouched episode's baseline, else
-    /// `seen`'s.
-    pub(super) const fn person_fence(&self, seen: &Screen) -> Option<u64> {
-        match &self.episode {
-            Some(e) if e.by().is_none() => e.baseline,
-            _ => seen.human_seq,
-        }
+        self.episode.as_ref().and_then(|e| e.by)
     }
 
     pub(super) fn deny_clock(&self, screen: &Screen) -> DenyClock {
@@ -2097,25 +2013,45 @@ impl<C: Ctl> Session<'_, C> {
         }
     }
 
+    /// The quiet a person's input buys before the loop answers `dialog` on `screen`, a ticking
+    /// countdown's margin past ([`Self::hold_over`]) buying none.
     fn box_grace(&self, opts: &SuperviseOpts, screen: &Screen, dialog: Dialog) -> Duration {
-        if self.hold_over(screen) {
+        if let Some(settle) = self.settle(screen, dialog) {
+            settle
+        } else if self.hold_over(screen) {
             Duration::ZERO
         } else {
             self.answer_grace(opts, dialog)
         }
     }
 
-    /// The quiet a person's input buys before the loop answers `dialog` on this read. A permission
-    /// box nobody has touched since it appeared is held by input older than it no longer than a
-    /// choice dialog is ([`QUESTION_PERSON_GRACE`]): that input answered something else (owner,
-    /// 2026-10-25, of a subagent's `bash -c` rm box held 114 s for a keystroke 6 s older than it:
-    /// "the claude harness needs to immediately auto-approve these messages!"). A box a person or
-    /// another driver touched, or whose touch cannot be told, keeps the whole grace, as ever.
-    fn answer_grace(&self, opts: &SuperviseOpts, dialog: Dialog) -> Duration {
+    /// [`PERSON_SETTLE`], where it is all a person's input buys before the loop answers `dialog`
+    /// on `screen`: a Claude Code permission box nobody has touched. Their grace is for a box
+    /// they are deciding; input they made before it was drawn, or into the composer it hid, or
+    /// queued as a message, decided nothing on it. The answer's keys are still fenced on the
+    /// person count and the screen generation the decision read, so a key of theirs after it,
+    /// or a box their typing hid, stops them before they reach the composer.
+    fn settle(&self, screen: &Screen, dialog: Dialog) -> Option<Duration> {
         #[cfg(test)]
-        if self.bound_off {
-            return dialog_grace(opts, dialog);
+        if self.old_grace {
+            return None;
         }
+        let untouched = self.episode.is_some() && self.touched().is_none();
+        let claude = is_claude(&self.reader(&screen.rows).program());
+        let settle = (dialog == Dialog::Permission && untouched && claude).then_some(PERSON_SETTLE);
+        #[cfg(test)]
+        if self.settle_off {
+            return settle.map(|_| Duration::ZERO);
+        }
+        settle
+    }
+
+    /// The quiet a person's input buys before the loop answers `dialog` on this read, where
+    /// [`Self::settle`] does not set it. A permission box nobody has touched since it appeared is
+    /// held by input older than it no longer than a choice dialog is ([`QUESTION_PERSON_GRACE`]):
+    /// that input answered something else. A box a person or another driver touched keeps the
+    /// whole grace, as ever.
+    fn answer_grace(&self, opts: &SuperviseOpts, dialog: Dialog) -> Duration {
         let untouched = self.episode.is_some() && self.touched().is_none();
         match dialog {
             Dialog::Permission if untouched => person_grace(opts).min(QUESTION_PERSON_GRACE),
@@ -2161,6 +2097,14 @@ impl<C: Ctl> Session<'_, C> {
         self.turn_end
             .login_typed_at()
             .is_some_and(|typed| !self.driver && self.person.is_none_or(|key| key <= typed))
+    }
+
+    /// Whether `status` last read input the worker has not read yet (`input=pending|typeahead`).
+    fn box_input_unread(&self) -> bool {
+        matches!(
+            self.launch_status.input.as_deref(),
+            Some("pending" | "typeahead")
+        )
     }
 
     /// THE LAUNCH.
@@ -2291,7 +2235,13 @@ impl<C: Ctl> Session<'_, C> {
             Decision::Approve { .. } | Decision::Decline { .. }
         ) && !carried_pick;
         let dialog = Dialog::of(p.kind);
-        let grace = self.answer_grace(opts, dialog);
+        let settle = self.settle(&turn.screen, dialog);
+        if answers && settle.is_some() && self.box_input_unread() {
+            // The person's input the worker has not read yet goes to the box ahead of the answer.
+            self.wait(&["seq", &seq.to_string()], PROGRAM_SETTLE)?;
+            return Ok(Step::Again { settle: false });
+        }
+        let grace = settle.unwrap_or_else(|| self.answer_grace(opts, dialog));
         let launch = if answers && self.hands_off_for(grace).is_some() {
             self.launch_call(&turn.screen, &p, &decision, opts)?
         } else {
@@ -2311,8 +2261,10 @@ impl<C: Ctl> Session<'_, C> {
                 if p.kind == PromptKind::Question && self.hands_off_for(grace).is_some() {
                     self.question.person_gave_input();
                 }
-                let clock = self.deny_clock(&turn.screen);
-                let act = "the box's answer";
+                let (clock, act) = match settle {
+                    Some(_) => (DenyClock::None, SETTLE_ACT),
+                    None => (self.deny_clock(&turn.screen), "the box's answer"),
+                };
                 if self.held_for_person_within(seq, act, false, clock, grace, review)? {
                     return Ok(Step::Review(turn));
                 }
@@ -2480,10 +2432,15 @@ impl<C: Ctl> Session<'_, C> {
         };
         let dialog = Dialog::of(p.kind);
         let grace = self.box_grace(opts, &turn.screen, dialog);
-        let past_hold = (self.hold_over(&turn.screen)
-            || self.answer_grace(opts, dialog) < dialog_grace(opts, dialog))
-            && self.hands_off_for(dialog_grace(opts, dialog)).is_some();
-        let person = past_hold.then(|| self.person_fence(&turn.screen)).flatten();
+        let person = turn.screen.human_seq;
+        if person.is_none() && self.hands_off_for(dialog_grace(opts, dialog)).is_some() {
+            // Answered inside the person's whole grace, every key names the count it was decided
+            // on, so a gesture of theirs after it stops the key.
+            let why = "the read carried no person count to fence an answer inside their grace on";
+            self.ledger_row(rule_id, approvals::Outcome::Escalated, &what, why, seq);
+            self.box_reason = Some((self.review_key(&turn), why.to_string()));
+            return Ok(Step::Review(turn));
+        }
         let pressing = match &act {
             Act::Approve {
                 guard,
@@ -2497,44 +2454,20 @@ impl<C: Ctl> Session<'_, C> {
             Act::Approve {
                 guard,
                 choice: Choice::Focus { steps, label },
-            } => {
-                let person = turn
-                    .screen
-                    .human_seq
-                    .filter(|_| {
-                        reset
-                            || p.kind == PromptKind::Trust
-                            || p.kind == PromptKind::AutocompactOffer
-                            || p.kind == PromptKind::ChromeIntro
-                            || rule_id == super::super::policy::login::RULE_LOGIN_METHOD
-                            || is_muse(&self.reader(&turn.screen.rows).program())
-                    })
-                    .or(person);
-                self.press_focused(
-                    &p,
-                    *steps,
-                    label,
-                    "enter",
-                    guard,
-                    &turn.screen,
-                    person,
-                    Some(super::super::policy::KeyAct::Approve),
-                )?
-            }
+            } => self.press_focused(
+                &p,
+                *steps,
+                label,
+                "enter",
+                guard,
+                &turn.screen,
+                person,
+                Some(super::super::policy::KeyAct::Approve),
+            )?,
             Act::Approve {
                 guard,
                 choice: Choice::FocusKey { steps, label, key },
-            } => {
-                let person = turn
-                    .screen
-                    .human_seq
-                    .filter(|_| {
-                        p.kind == PromptKind::AutocompactOffer
-                            || rule_id == super::super::policy::login::RULE_LOGIN_BACK_OUT
-                    })
-                    .or(person);
-                self.press_focused(&p, *steps, label, key, guard, &turn.screen, person, None)?
-            }
+            } => self.press_focused(&p, *steps, label, key, guard, &turn.screen, person, None)?,
             Act::Approve {
                 choice: Choice::Answer(answer),
                 ..
@@ -3295,6 +3228,20 @@ fn note_unproven(review: &mut dyn Review, seq: u64, rule_id: &str, unproven: Opt
         if rule_id == RULE_RM_BREAKER_WARN {
             let _ = review.say(&format!("WARN seq={seq} rule={rule_id} {u}"));
         }
+    }
+}
+
+/// Whether `program` is Claude Code, whose dialogs open focused on their first option and stay
+/// hidden behind an active composer ([`PERSON_SETTLE`]).
+const fn is_claude(program: &Program) -> bool {
+    match program {
+        Program::Claude => true,
+        Program::Codex
+        | Program::Grok
+        | Program::Kimi
+        | Program::Agy
+        | Program::Muse
+        | Program::Generic => false,
     }
 }
 

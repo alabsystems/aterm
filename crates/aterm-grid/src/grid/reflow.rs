@@ -654,6 +654,7 @@ impl Grid {
         self.storage.pages.shrink_to_fit();
         self.storage.damage = Damage::Full;
         self.storage.content_gen += 1;
+        self.storage.history_content_gen += 1;
         if new_cols != old_cols && reflow {
             self.storage.history_renumber_epoch =
                 self.storage.history_renumber_epoch.saturating_add(1);

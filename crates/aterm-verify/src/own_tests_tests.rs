@@ -30,6 +30,8 @@ mod tests {
 struct Change {
     before: BTreeMap<String, String>,
     now: BTreeMap<String, String>,
+    /// Files of other packages, by repo-relative path, the same before and after.
+    beside: BTreeMap<String, String>,
 }
 
 impl Change {
@@ -43,7 +45,14 @@ impl Change {
         Self {
             now: before.clone(),
             before,
+            beside: BTreeMap::new(),
         }
+    }
+
+    /// The same, with another package's file at the repo-relative `path`.
+    fn beside(mut self, path: &str, text: &str) -> Self {
+        self.beside.insert(path.to_string(), text.to_string());
+        self
     }
 
     /// The package of `lib.rs` and `services.rs` above, with `files` added or replaced.
@@ -69,21 +78,74 @@ impl Change {
         self.with(path, Some(&text.replacen(from, to, 1)))
     }
 
-    fn judge(&self) -> Result<(), Doubt> {
-        let changed: Vec<String> = self
-            .before
+    /// The repo-relative paths that differ between the two versions.
+    fn changed(&self) -> Vec<String> {
+        self.before
             .keys()
             .chain(self.now.keys())
             .filter(|path| self.before.get(*path) != self.now.get(*path))
             .map(|path| join(DIR, path))
             .collect::<BTreeSet<_>>()
             .into_iter()
-            .collect();
+            .collect()
+    }
+
+    fn judge(&self) -> Result<(), Doubt> {
+        let changed = self.changed();
         assert!(!changed.is_empty(), "the fixture changes something");
         let changed: Vec<&str> = changed.iter().map(String::as_str).collect();
-        confined(self, DIR, &changed)
+        confined(
+            self,
+            DIR,
+            Touched {
+                changed: &changed,
+                ..Touched::default()
+            },
+        )
+    }
+
+    /// The judgment of this change beside one outside the package: `readers`, package-relative,
+    /// read another package's changed files, and `elsewhere`, repo-relative, changed outside it.
+    fn judge_reads(&self, readers: &[&str], elsewhere: &[&str]) -> Result<(), Doubt> {
+        let changed = self.changed();
+        let changed: Vec<&str> = changed.iter().map(String::as_str).collect();
+        let readers: Vec<String> = readers.iter().map(|rel| join(DIR, rel)).collect();
+        let readers: Vec<&str> = readers.iter().map(String::as_str).collect();
+        assert!(
+            !changed.is_empty() || !readers.is_empty(),
+            "the package holds something of the change"
+        );
+        confined(
+            self,
+            DIR,
+            Touched {
+                changed: &changed,
+                readers: &readers,
+                elsewhere,
+            },
+        )
+    }
+
+    /// Where `rel` spells [`FOREIGN`] now, for [`observes`].
+    fn spelling(&self, rel: &str) -> Spelling {
+        self.spelling_of(rel, FOREIGN)
+    }
+
+    /// Where `rel` spells the repo-relative `path` now, for [`observes`].
+    fn spelling_of(&self, rel: &str, path: &str) -> Spelling {
+        let text = &self.now[rel];
+        let at: Vec<usize> = text.match_indices(path).map(|(at, _)| at).collect();
+        assert!(!at.is_empty(), "{rel} spells {path}");
+        Spelling {
+            file: join(DIR, rel),
+            path: path.to_string(),
+            at,
+        }
     }
 }
+
+/// Another package's file, which the package's sources read or spell.
+const FOREIGN: &str = "crates/t/src/x.rs";
 
 impl Files for Change {
     fn under(&self, dir: &str) -> Vec<String> {
@@ -95,11 +157,15 @@ impl Files for Change {
     }
 
     fn now(&self, path: &str) -> Result<Option<String>, String> {
-        Ok(within(DIR, path).and_then(|rel| self.now.get(rel).cloned()))
+        Ok(within(DIR, path)
+            .map_or_else(|| self.beside.get(path), |rel| self.now.get(rel))
+            .cloned())
     }
 
     fn before(&self, path: &str) -> Result<Option<String>, String> {
-        Ok(within(DIR, path).and_then(|rel| self.before.get(rel).cloned()))
+        Ok(within(DIR, path)
+            .map_or_else(|| self.beside.get(path), |rel| self.before.get(rel))
+            .cloned())
     }
 }
 
@@ -463,27 +529,82 @@ fn a_file_shipped_code_embeds_or_names_is_not_confined() {
     assert_eq!(change.judge(), shipped("src/lib_tests.rs"));
 }
 
+/// A bench or example root, and what such a root alone mounts, compiles into no target a
+/// dependent links: a code change there is confined, as a test's is. Cargo discovers
+/// `benches/<x>.rs`, `benches/<x>/main.rs` and the same under `examples/` while `autobenches` and
+/// `autoexamples` hold, and takes a `[[bench]]` or `[[example]]` by its path or, with none, by its
+/// name. CONTROL: the build script is another target, a README is no source, a bench file the
+/// library also mounts or embeds ships, a file no root mounts is unplaced, and with discovery off
+/// a bench or example no entry names is unplaced too.
 #[test]
-fn files_of_other_targets_and_no_source_keep_the_cone() {
-    let base = Change::services(&[
-        ("tests/it.rs", "#[test]\nfn it() {}\n"),
-        ("benches/b.rs", "fn main() {}\n"),
-        ("examples/e.rs", "fn main() {}\n"),
+fn a_bench_or_example_only_its_targets_compile_is_confined_and_the_build_script_is_not() {
+    let main = "fn main() {}\n";
+    let coded = |change: Change, path: &str| {
+        change
+            .edit(path, "fn main() {}", "fn main() { let _ = 1; }")
+            .judge()
+    };
+    let with = |files: &[(&str, &str)]| Change::services(files);
+    for (files, path) in [
+        (vec![("benches/b.rs", main)], "benches/b.rs"),
+        (vec![("benches/x/main.rs", main)], "benches/x/main.rs"),
+        (vec![("examples/e.rs", main)], "examples/e.rs"),
+        (vec![("examples/x/main.rs", main)], "examples/x/main.rs"),
         (
-            "build.rs",
-            "fn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n}\n",
+            vec![
+                (
+                    "examples/e.rs",
+                    "#[path = \"../src/codegen.rs\"]\nmod codegen;\nfn main() {}\n",
+                ),
+                ("src/codegen.rs", main),
+            ],
+            "src/codegen.rs",
         ),
+        (
+            vec![
+                ("benches/b.rs", "mod support;\nfn main() {}\n"),
+                ("benches/support/mod.rs", main),
+            ],
+            "benches/support/mod.rs",
+        ),
+    ] {
+        assert_eq!(coded(with(&files), path), Ok(()), "{path}");
+    }
+    // With discovery off, a `[[bench]]` or `[[example]]` by name, or by path, is a root.
+    for (manifest, path) in [
+        (
+            "autobenches = false\n\n[[bench]]\nname = \"x\"\n",
+            "benches/x.rs",
+        ),
+        (
+            "autobenches = false\n\n[[bench]]\nname = \"x\"\n",
+            "benches/x/main.rs",
+        ),
+        (
+            "autoexamples = false\n\n[[example]]\nname = \"x\"\n",
+            "examples/x.rs",
+        ),
+        (
+            "autobenches = false\n\n[[bench]]\nname = \"b\"\npath = \"src/bench.rs\"\n",
+            "src/bench.rs",
+        ),
+    ] {
+        let manifest = format!("{MANIFEST}{manifest}");
+        let change = with(&[("Cargo.toml", &manifest), (path, main)]);
+        assert_eq!(coded(change, path), Ok(()), "{manifest} {path}");
+    }
+    // A `[[test]]` root outside `tests/` is a test's.
+    let custom = format!("{MANIFEST}\n[[test]]\nname = \"inner\"\npath = \"src/inner_test.rs\"\n");
+    let change = with(&[("Cargo.toml", &custom), ("src/inner_test.rs", main)]);
+    assert_eq!(coded(change, "src/inner_test.rs"), Ok(()));
+
+    let script = "fn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n}\n";
+    let base = with(&[
+        ("benches/b.rs", main),
+        ("build.rs", script),
         ("README.md", "# a\n"),
     ]);
     for (path, want) in [
-        (
-            "benches/b.rs",
-            Doubt::OtherTarget(join(DIR, "benches/b.rs")),
-        ),
-        (
-            "examples/e.rs",
-            Doubt::OtherTarget(join(DIR, "examples/e.rs")),
-        ),
         ("build.rs", Doubt::OtherTarget(join(DIR, "build.rs"))),
         ("README.md", Doubt::NotRust(join(DIR, "README.md"))),
     ] {
@@ -494,13 +615,437 @@ fn files_of_other_targets_and_no_source_keep_the_cone() {
             "{path}"
         );
     }
-    let custom = format!("{MANIFEST}\n[[test]]\nname = \"inner\"\npath = \"src/inner_test.rs\"\n");
-    let change = Change::services(&[
-        ("Cargo.toml", &custom),
-        ("src/inner_test.rs", "fn main() {}\n"),
-    ])
-    .with("src/inner_test.rs", Some("fn main() { let _ = 1; }\n"));
-    assert_eq!(change.judge(), Ok(()));
+    let bench_shipped = |extra: &str| {
+        with(&[
+            ("benches/b.rs", main),
+            ("src/lib.rs", &format!("{LIB}{extra}")),
+        ])
+    };
+    assert_eq!(
+        coded(
+            bench_shipped("#[path = \"../benches/b.rs\"]\nmod b;\n"),
+            "benches/b.rs"
+        ),
+        shipped("benches/b.rs")
+    );
+    assert_eq!(
+        coded(
+            bench_shipped("pub const B: &str = include_str!(\"../benches/b.rs\");\n"),
+            "benches/b.rs"
+        ),
+        Err(Doubt::Embedded(join(DIR, "benches/b.rs")))
+    );
+    assert_eq!(
+        coded(
+            with(&[("benches/common/helper.rs", main)]),
+            "benches/common/helper.rs"
+        ),
+        shipped("benches/common/helper.rs")
+    );
+    for (manifest, path) in [
+        ("autobenches = false\n", "benches/b.rs"),
+        (
+            "autobenches = false\n\n[[bench]]\nname = \"y\"\n",
+            "benches/b.rs",
+        ),
+        ("autoexamples = false\n", "examples/e.rs"),
+    ] {
+        let manifest = format!("{MANIFEST}{manifest}");
+        let change = with(&[("Cargo.toml", &manifest), (path, main)]);
+        assert_eq!(coded(change, path), shipped(path), "{manifest} {path}");
+    }
+}
+
+/// A source that reads another package's changed file, by a mount, an include or any literal,
+/// is judged where it compiles: in code only the package's test, bench or example targets
+/// compile, no build of a dependent reads it, and the package is confined. CONTROL: the same
+/// reader in the library, in a file no declaration places, in a bench file the library also
+/// mounts, or in the build script keeps the cone, and so does a build script that may read the
+/// changed file, by a declared path, a literal spelled in pieces, or a build-dependency's code.
+#[test]
+fn a_reader_only_tests_benches_or_examples_compile_is_confined() {
+    let mount = "#[path = \"../../t/src/x.rs\"]\nmod x;\n";
+    let embed = "const S: &str = include_str!(\"../../t/src/x.rs\");\n";
+    let reads = |files: &[(&str, &str)], reader: &str| {
+        Change::services(files)
+            .beside(FOREIGN, "pub fn x() {}\n")
+            .judge_reads(&[reader], &[FOREIGN])
+    };
+    for (files, reader) in [
+        (
+            vec![("benches/b.rs", format!("{mount}fn main() {{}}\n"))],
+            "benches/b.rs",
+        ),
+        (
+            vec![("benches/b.rs", format!("{embed}fn main() {{}}\n"))],
+            "benches/b.rs",
+        ),
+        (
+            vec![("examples/e.rs", format!("{mount}fn main() {{}}\n"))],
+            "examples/e.rs",
+        ),
+        (vec![("tests/it.rs", mount.to_string())], "tests/it.rs"),
+        (
+            vec![
+                ("benches/b.rs", "mod support;\nfn main() {}\n".to_string()),
+                ("benches/support/mod.rs", mount.to_string()),
+            ],
+            "benches/support/mod.rs",
+        ),
+        (
+            vec![
+                ("src/lib.rs", format!("{LIB}{MOUNTED}")),
+                ("src/lib_tests.rs", embed.to_string()),
+            ],
+            "src/lib_tests.rs",
+        ),
+    ] {
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        assert_eq!(reads(&files, reader), Ok(()), "{reader}");
+    }
+    // A reader that also changed is judged both ways.
+    let edited = Change::services(&[("benches/b.rs", &format!("{mount}fn main() {{}}\n"))]).edit(
+        "benches/b.rs",
+        "fn main() {}",
+        "fn main() { let _ = 1; }",
+    );
+    assert_eq!(edited.judge_reads(&["benches/b.rs"], &[FOREIGN]), Ok(()));
+
+    let read_where = |rel: &str| Err(Doubt::Reads(join(DIR, rel)));
+    assert_eq!(
+        reads(&[("src/lib.rs", &format!("{LIB}{mount}"))], "src/lib.rs"),
+        read_where("src/lib.rs")
+    );
+    assert_eq!(
+        reads(
+            &[("src/services.rs", &format!("{SERVICES}{embed}"))],
+            "src/services.rs"
+        ),
+        read_where("src/services.rs")
+    );
+    assert_eq!(
+        reads(&[("src/stray.rs", mount)], "src/stray.rs"),
+        read_where("src/stray.rs")
+    );
+    let both = format!("{mount}fn main() {{}}\n");
+    assert_eq!(
+        reads(
+            &[
+                ("benches/b.rs", &both),
+                (
+                    "src/lib.rs",
+                    &format!("{LIB}#[path = \"../benches/b.rs\"]\nmod b;\n")
+                ),
+            ],
+            "benches/b.rs"
+        ),
+        read_where("benches/b.rs")
+    );
+    let unlexed = format!("{mount}fn main() {{ \"open }}\n");
+    assert_eq!(
+        reads(&[("benches/b.rs", &unlexed)], "benches/b.rs"),
+        Err(Doubt::Unread(join(DIR, "benches/b.rs")))
+    );
+
+    // What the build script may read reaches every dependent, whichever file reads it.
+    let bench = ("benches/b.rs", both.as_str());
+    let script = |body: &str| {
+        format!("fn main() {{\n    println!(\"cargo:rerun-if-changed=build.rs\");\n{body}}}\n")
+    };
+    let quiet = script("");
+    assert_eq!(
+        reads(&[bench, ("build.rs", &quiet)], "benches/b.rs"),
+        Ok(())
+    );
+    let input = |path: &str| Err(Doubt::BuildInput(path.to_string()));
+    // A `..` names the folder that holds every package.
+    let up = script("    let _ = std::fs::read(std::path::Path::new(\"..\").join(name()));\n");
+    assert_eq!(
+        reads(&[bench, ("build.rs", &up)], "benches/b.rs"),
+        input(&join(DIR, "benches/b.rs"))
+    );
+    let foreign = input(FOREIGN);
+    for body in [
+        "    println!(\"cargo:rerun-if-changed=../t/src/x.rs\");\n",
+        "    let _ = std::fs::read(workspace().join(\"t/src/x.rs\"));\n",
+        "    let _ = include_str!(\"../t/src/x.rs\");\n",
+    ] {
+        assert_eq!(
+            reads(&[bench, ("build.rs", &script(body))], "benches/b.rs"),
+            foreign,
+            "{body}"
+        );
+    }
+    let mounting = format!("#[path = \"../t/src/x.rs\"]\nmod x;\n{quiet}");
+    assert_eq!(
+        reads(&[bench, ("build.rs", &mounting)], "benches/b.rs"),
+        foreign
+    );
+    // The script itself, or a bench the manifest makes the script, reads as the script.
+    assert_eq!(
+        reads(&[("build.rs", &mounting)], "build.rs"),
+        input(&join(DIR, "build.rs"))
+    );
+    let as_script = format!("{MANIFEST}build = \"benches/b.rs\"\n");
+    assert_eq!(
+        reads(&[bench, ("Cargo.toml", &as_script)], "benches/b.rs"),
+        input(&join(DIR, "benches/b.rs"))
+    );
+    // A build-dependency's code may read what no literal of the script shows.
+    let with_deps =
+        format!("{MANIFEST}\n[build-dependencies]\nhelper = {{ path = \"../helper\" }}\n");
+    assert_eq!(
+        reads(
+            &[bench, ("build.rs", &quiet), ("Cargo.toml", &with_deps)],
+            "benches/b.rs"
+        ),
+        input(&join(DIR, "benches/b.rs"))
+    );
+    // The same holds for a package whose only change is its own: a script that may read another
+    // package's changed file keeps the cone.
+    let own = Change::services(&[(
+        "build.rs",
+        &script("    println!(\"cargo:rerun-if-changed=../t/src/x.rs\");\n"),
+    )])
+    .edit("src/services.rs", "\"tester\");", "\"probe\");");
+    assert_eq!(own.judge(), Ok(()), "alone, nothing else changed");
+    assert_eq!(own.judge_reads(&[], &[FOREIGN]), foreign);
+}
+
+/// A member that spells another's changed path observes it by where the spelling sits: in test
+/// code, a doc comment no macro reads, or a file only its test, bench or example targets compile,
+/// only its own rows can see it (`Tests`); in a plain comment no macro reads, nothing reads it
+/// (`Nothing`); in code its library, binaries or build script compile, a carried comment, a
+/// comment in a file the library `include!`s, a comment in a file shipped code embeds by
+/// `include_str!`, a file it cannot place or read, or a file its build script may read, a
+/// dependent's test may run the code that reads it (`Linked`). Several spellings observe as the
+/// most of them. CONTROL: the same plain comment in the library itself, or in the same module
+/// when nothing embeds it, observes nothing.
+#[test]
+fn a_namer_observes_by_where_it_spells_the_path() {
+    let spelled = format!("\"{FOREIGN}\"");
+    let constant = format!("pub const P: &str = {spelled};\n");
+    let observed = |files: &[(&str, &str)], rel: &str| {
+        let change = Change::services(files);
+        let by_path = observes(&change, DIR, &[change.spelling(rel)]);
+        assert_eq!(by_path.len(), 1, "{by_path:?}");
+        by_path[FOREIGN]
+    };
+    let lib = |extra: &str| format!("{LIB}{extra}");
+    let tested = format!("#[cfg(test)]\nmod tests {{\n    const P: &str = {spelled};\n}}\n");
+    let seam = format!("#[cfg(any(test, debug_assertions))]\npub const P: &str = {spelled};\n");
+    let script = format!(
+        "fn main() {{\n    println!(\"cargo:rerun-if-changed=build.rs\");\n    let _ = {spelled};\n}}\n"
+    );
+    let quiet = "fn main() {\n    println!(\"cargo:rerun-if-changed=build.rs\");\n}\n";
+    let main = |body: &str| format!("{body}fn main() {{}}\n");
+    for (files, rel, want) in [
+        (
+            vec![("tests/it.rs", constant.clone())],
+            "tests/it.rs",
+            Observed::Tests,
+        ),
+        (
+            vec![("src/services.rs", format!("{SERVICES}{tested}"))],
+            "src/services.rs",
+            Observed::Tests,
+        ),
+        (
+            vec![(
+                "src/lib.rs",
+                lib(&format!("/// See {FOREIGN}.\npub fn g() {{}}\n")),
+            )],
+            "src/lib.rs",
+            Observed::Tests,
+        ),
+        (
+            vec![("benches/b.rs", main(&constant))],
+            "benches/b.rs",
+            Observed::Tests,
+        ),
+        (
+            vec![("examples/e.rs", main(&constant))],
+            "examples/e.rs",
+            Observed::Tests,
+        ),
+        (
+            vec![("src/lib.rs", lib(&format!("// {FOREIGN}\n")))],
+            "src/lib.rs",
+            Observed::Nothing,
+        ),
+        (
+            vec![("src/lib.rs", lib(&format!("/* {FOREIGN} */\n")))],
+            "src/lib.rs",
+            Observed::Nothing,
+        ),
+        (
+            vec![("src/lib.rs", lib(&constant))],
+            "src/lib.rs",
+            Observed::Linked,
+        ),
+        (
+            vec![("src/lib.rs", lib(&seam))],
+            "src/lib.rs",
+            Observed::Linked,
+        ),
+        (
+            vec![("build.rs", script.clone())],
+            "build.rs",
+            Observed::Linked,
+        ),
+        (
+            vec![("src/lib.rs", lib(&format!("m!(/* {FOREIGN} */);\n")))],
+            "src/lib.rs",
+            Observed::Linked,
+        ),
+        (
+            vec![
+                ("src/lib.rs", lib("#[x::y]\nmod r;\n")),
+                ("src/r.rs", format!("/// See {FOREIGN}.\npub fn g() {{}}\n")),
+            ],
+            "src/r.rs",
+            Observed::Linked,
+        ),
+        (
+            vec![
+                ("src/lib.rs", lib("include!(\"inc.rs\");\n")),
+                ("src/inc.rs", format!("// {FOREIGN}\n")),
+            ],
+            "src/inc.rs",
+            Observed::Linked,
+        ),
+        // A shipped module that embeds itself holds its own plain comment as data.
+        (
+            vec![
+                ("src/lib.rs", lib("pub mod watched;\n")),
+                (
+                    "src/watched.rs",
+                    format!("// {FOREIGN}\npub const SELF: &str = include_str!(\"watched.rs\");\n"),
+                ),
+            ],
+            "src/watched.rs",
+            Observed::Linked,
+        ),
+        // CONTROL: the same module that embeds nothing observes nothing.
+        (
+            vec![
+                ("src/lib.rs", lib("pub mod watched;\n")),
+                (
+                    "src/watched.rs",
+                    format!("// {FOREIGN}\npub const SELF: &str = \"\";\n"),
+                ),
+            ],
+            "src/watched.rs",
+            Observed::Nothing,
+        ),
+        (
+            vec![("src/stray.rs", format!("// {FOREIGN}\n"))],
+            "src/stray.rs",
+            Observed::Linked,
+        ),
+        (
+            vec![("src/stray.rs", constant.clone())],
+            "src/stray.rs",
+            Observed::Linked,
+        ),
+        (
+            vec![("tests/it.rs", format!("{constant}fn open() {{ \"\n"))],
+            "tests/it.rs",
+            Observed::Linked,
+        ),
+        (
+            vec![
+                ("tests/it.rs", constant.clone()),
+                (
+                    "build.rs",
+                    quiet.replace(
+                        "build.rs\");",
+                        "build.rs\");\n    let _ = include_str!(\"tests/it.rs\");",
+                    ),
+                ),
+            ],
+            "tests/it.rs",
+            Observed::Linked,
+        ),
+        (
+            vec![
+                ("tests/it.rs", constant.clone()),
+                ("build.rs", quiet.to_string()),
+                (
+                    "Cargo.toml",
+                    format!("{MANIFEST}\n[build-dependencies]\nhelper = \"1\"\n"),
+                ),
+            ],
+            "tests/it.rs",
+            Observed::Linked,
+        ),
+        // CONTROL: the same with no build-dependency, and with a script that reads none of it.
+        (
+            vec![
+                ("tests/it.rs", constant.clone()),
+                ("build.rs", quiet.to_string()),
+            ],
+            "tests/it.rs",
+            Observed::Tests,
+        ),
+        // Several spellings observe as the most of them.
+        (
+            vec![("src/lib.rs", lib(&format!("// {FOREIGN}\n{tested}")))],
+            "src/lib.rs",
+            Observed::Tests,
+        ),
+        (
+            vec![("src/lib.rs", lib(&format!("{tested}{constant}")))],
+            "src/lib.rs",
+            Observed::Linked,
+        ),
+    ] {
+        let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+        assert_eq!(observed(&files, rel), want, "{rel}: {files:?}");
+    }
+    // A manifest that does not parse observes as linked.
+    let broken = Change::services(&[("Cargo.toml", "[package\n"), ("tests/it.rs", &constant)]);
+    assert_eq!(
+        observes(&broken, DIR, &[broken.spelling("tests/it.rs")]),
+        BTreeMap::from([(FOREIGN.to_string(), Observed::Linked)])
+    );
+    // Each changed path observes as the most of its own spellings, one file's or several's: the
+    // library spells one, its tests the other, and a plain comment a third. CONTROL: the same
+    // spellings of one path observe as the library's.
+    let other = "crates/t/src/y.rs";
+    let quiet = "crates/t/src/z.rs";
+    let paths = Change::services(&[(
+        "src/lib.rs",
+        &lib(&format!(
+            "{constant}// {quiet}\n#[cfg(test)]\nmod tests {{\n    const Q: &str = \"{other}\";\n}}\n"
+        )),
+    )]);
+    let spellings = [
+        paths.spelling_of("src/lib.rs", FOREIGN),
+        paths.spelling_of("src/lib.rs", other),
+        paths.spelling_of("src/lib.rs", quiet),
+    ];
+    assert_eq!(
+        observes(&paths, DIR, &spellings),
+        BTreeMap::from([
+            (FOREIGN.to_string(), Observed::Linked),
+            (other.to_string(), Observed::Tests),
+            (quiet.to_string(), Observed::Nothing),
+        ])
+    );
+    let one: Vec<Spelling> = spellings
+        .iter()
+        .cloned()
+        .map(|spelling| Spelling {
+            path: FOREIGN.to_string(),
+            ..spelling
+        })
+        .collect();
+    assert_eq!(
+        observes(&paths, DIR, &one),
+        BTreeMap::from([(FOREIGN.to_string(), Observed::Linked)])
+    );
+    assert!(Observed::Nothing < Observed::Tests && Observed::Tests < Observed::Linked);
 }
 
 /// Integration targets and their modules are not linked into dependent crates. Negative

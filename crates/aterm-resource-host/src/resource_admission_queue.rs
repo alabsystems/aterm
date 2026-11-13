@@ -581,7 +581,10 @@ impl Owner {
         let request = &pending.submission.request;
         let cooperative = !metadata
             && pending.recipe.as_ref().is_some_and(|recipe| {
-                matches!(recipe.kind, recipe::Kind::Targo | recipe::Kind::Workload)
+                matches!(
+                    recipe.kind,
+                    recipe::Kind::Targo | recipe::Kind::Workload | recipe::Kind::NativeJob
+                )
             });
         if cooperative {
             let mode = if workload::closed_request(request) {

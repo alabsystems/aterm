@@ -198,6 +198,7 @@ pub const MESA: &[&str] = &["libgl1-mesa-dri", "libegl-mesa0", "mesa-vulkan-driv
 /// GNU Git source packaging also needs `patchelf` for ELF relocation, `xz-utils` for its pinned source archive, and the native curl development package. Ubuntu's curl development packages share an architecture-specific `/usr/bin/curl-config`, so they cannot be co-installed here.
 pub const TOOLS: &[&str] = &[
     "build-essential",
+    "lld",
     "pkg-config",
     "libcurl4-openssl-dev",
     "patchelf",
@@ -503,8 +504,8 @@ sudo ln -sfn "$dir/bin/bash" "/usr/local/bin/$link"
 /// Webster's Second International (`web2`), the public-domain word list aterm-lexicon's dictionary gates walk: their allowlists are curated against it, so another list decides nothing and they answer COULD NOT RUN without it (`crates/aterm-lexicon/tests/lexicon_suite.rs`). macOS ships it here and Ubuntu packages no web2 (its `wamerican` is another list), so the guest gets this Mac's copy at the same path.
 pub const WEB2: &str = aterm_uds::os_path!("web2");
 
-/// THE GUEST'S SWAP, IN GIB: a compile's peak outgrows the guest's RAM ([`crate::linux::MEMORY_GIB`]),
-/// whose size every Mac that runs the lane must spare. The kernel killed `rustc` building
+/// THE GUEST'S SWAP, IN GIB: a compile's peak outgrows the guest's RAM ([`crate::linux::memory_gib`]:
+/// [`crate::linux::MEMORY_GIB`], or less under `--memory`), which the Mac spares for the boot. The kernel killed `rustc` building
 /// aterm-gui's x86_64 tests at 15.7 GiB resident (2026-11-05), so a compile pages rather than dies;
 /// a run's timed rows follow its builds, with the pages freed.
 pub const SWAP_GIB: u32 = 16;
@@ -694,7 +695,7 @@ pub fn fingerprint(steps: &[Step]) -> String {
     format!("{:016x}", astream_wire::hash::fnv1a_64(text.as_bytes()))
 }
 
-/// The environment `cargo` gets for `arch`: the pinned stock toolchain, no incremental cache, the guest-local target dir, and for x86_64 the cross linker, C compiler and pkg-config search path (`CARGO_BUILD_TARGET` names x86_64, a cross triple here, only when `default_target` asks) and libtest's one-test-at-a-time (`RUST_TEST_THREADS=1`, which a CMD's own `--test-threads` overrides): the proof's rule for Rosetta ([`crate::linux_proof::ROSETTA_ONE_AT_A_TIME`]) for every x86_64 `exec`.
+/// The environment `cargo` gets for `arch`: the pinned stock toolchain, no incremental cache, the guest-local target dir, native ARM64's LLD selection, and for x86_64 the cross linker, C compiler and pkg-config search path (`CARGO_BUILD_TARGET` names x86_64, a cross triple here, only when `default_target` asks) and libtest's one-test-at-a-time (`RUST_TEST_THREADS=1`, which a CMD's own `--test-threads` overrides): the proof's rule for Rosetta ([`crate::linux_proof::ROSETTA_ONE_AT_A_TIME`]) for every x86_64 `exec`.
 #[must_use]
 pub fn cargo_env(arch: Arch, target_dir: &str, default_target: bool) -> Vec<(String, String)> {
     let mut env: Vec<(String, String)> = vec![
@@ -703,6 +704,15 @@ pub fn cargo_env(arch: Arch, target_dir: &str, default_target: bool) -> Vec<(Str
         ("CARGO_TARGET_DIR".into(), target_dir.into()),
         ("CARGO_TERM_COLOR".into(), "never".into()),
     ];
+    if arch == Arch::Aarch64 {
+        // The GUI test binary exceeds CALL26's range. LLD inserts range-extension thunks
+        // where the guest's GNU ld reports relocation overflows. Keep this target-specific:
+        // global RUSTFLAGS would replace the checkout's configuration on other targets.
+        env.push((
+            "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS".into(),
+            "-Clink-arg=-fuse-ld=lld".into(),
+        ));
+    }
     if arch == Arch::X86_64 {
         let t = arch.triple().replace('-', "_");
         env.extend([

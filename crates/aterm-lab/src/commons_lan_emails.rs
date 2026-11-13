@@ -206,7 +206,7 @@ pub(super) fn set(
     let started = Instant::now();
     let output = if column == "password" {
         // The value goes through a pipe, as the owner's `--stdin` takes it: never argv.
-        let (reader, mut writer) = std::io::pipe().map_err(fail)?;
+        let (reader, mut writer) = aterm_uds::pipe().map_err(fail)?;
         writer
             .write_all(password(seed, &format!("edit:{value}"), index).as_bytes())
             .map_err(fail)?;

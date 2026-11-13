@@ -23,31 +23,18 @@ struct Real {
 
 impl Real {
     fn new() -> (Self, [std::os::fd::OwnedFd; 2]) {
-        use std::os::fd::FromRawFd as _;
-        let mut ready = [0i32; 2];
-        let mut spare = [0i32; 2];
-        // SAFETY: both arrays provide pipe(2)'s two writable descriptor slots.
-        assert_eq!(unsafe { libc::pipe(ready.as_mut_ptr()) }, 0, "ready pipe");
-        assert_eq!(unsafe { libc::pipe(spare.as_mut_ptr()) }, 0, "spare pipe");
-        // SAFETY: four fresh descriptors, one owner each from here.
-        let (ready_read, ready_write, spare_read, spare_write) = unsafe {
-            (
-                std::os::fd::OwnedFd::from_raw_fd(ready[0]),
-                std::os::fd::OwnedFd::from_raw_fd(ready[1]),
-                std::os::fd::OwnedFd::from_raw_fd(spare[0]),
-                std::os::fd::OwnedFd::from_raw_fd(spare[1]),
-            )
-        };
+        let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+        let (spare_read, spare_write) = aterm_uds::pipe().expect("spare pipe");
         let mut handoff = App::headless_for_test();
         handoff.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
-            ready_write,
+            ready_write.into(),
             "restore-pass",
             [1; 32],
             [2; 32],
         ));
         let mut degraded = App::headless_for_test();
         degraded.handoff_ready = Some(crate::seamless::ReadySignal::for_test(
-            spare_write,
+            spare_write.into(),
             "restore-pass-degraded",
             [3; 32],
             [4; 32],
@@ -61,7 +48,7 @@ impl Real {
                 cold,
                 windows: [window(false), window(true)],
             },
-            [ready_read, spare_read],
+            [ready_read.into(), spare_read.into()],
         )
     }
 

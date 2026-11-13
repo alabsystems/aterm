@@ -560,8 +560,13 @@ fn vault(plan: &Plan, here: scope::VaultHere, root: Option<&Path>) -> Result<Obs
         (Some(_), Membership::Pending) => pending_read(&paths, &status, join_place_now),
         (Some(_), Membership::Revoked { .. }) if client::dropped(&paths) => VaultRead::Dropped,
         (Some(_), Membership::Revoked { .. }) => VaultRead::Revoked,
+        // A status read: a vault pass holding the state lock reads as not ready at once.
         (Some(config), Membership::In { .. } | Membership::Plain) => member_read(
-            client::materialization_ready_for(&paths, config).map_err(|error| error.to_string())?,
+            matches!(
+                client::observe_materialization(&paths, config, || Ok(()))
+                    .map_err(|error| error.to_string())?,
+                client::MaterializationObservation::Ready(_)
+            ),
             subscriber_now(&paths.home)?,
             std::env::current_exe()
                 .and_then(std::fs::canonicalize)

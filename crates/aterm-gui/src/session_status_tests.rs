@@ -172,6 +172,7 @@ fn the_sweep_asks_for_a_released_codex_tabs_rollout_while_its_process_fronts_it(
     let group = i32::try_from(proven.pid).expect("a pid");
     let copy = Copy {
         pid: proven.pid,
+        lifetime: None,
         start: proven.start.clone(),
         home: "/private/tmp/x/codex-home".into(),
         seen: Seen::Present(Record {
@@ -282,6 +283,7 @@ fn the_sweep_owes_a_settle_read_after_a_counted_codex_tabs_screen_moves() {
     let group = i32::try_from(proven.pid).expect("a pid");
     let copy = Copy {
         pid: proven.pid,
+        lifetime: None,
         start: proven.start.clone(),
         home: "/private/tmp/x/codex-home".into(),
         seen: Seen::Present(Record {
@@ -2667,6 +2669,144 @@ fn a_refused_sample_still_advances_the_observation_gate() {
     );
 }
 
+/// A LINE'S SHAPE IS ITS TOP-LEVEL ELEMENT COUNT AND THE ONE THE DETAIL READS (review RV2, E2-R2):
+/// the parts `;`, a newline, `&&` and `||` cut it into that hold a command (a pipeline, a
+/// comment's text, an empty part and fish's lone `end` cut nothing or count for none), and the
+/// position, from 1, of the element the text reader takes the program word from ([`candidate`]:
+/// the running one, or a compound command's opener, or the command after fish's `begin`); `0` where
+/// it reads none. Each row's read element is the one whose program word the reader picks. An
+/// earlier element whose program word, read by the same reader past its wrappers, is the read
+/// one's makes the shape shared ([`LineShape::shared`]: `make; make install`, `sudo make && make
+/// install`, `git status; git push`), and a later one, or another program, does not. The list is
+/// the one the reader reads (J2-3): fish's `and` and `or` cut it as `&&` and `||` do, and a
+/// function's definition, which the reader blanks ([`undefined`]), counts as one element where it
+/// was typed, its body's parts for none, and is never the one read; one whose end the reader does
+/// not find (zsh's `qzf() true; make`) took the rest of the line unread, which counts as one more.
+/// NEGATIVE CONTROLS (run): the read position taken as the last element's fails the `||` rows;
+/// `shared` never set fails the `make`, `vim`, `claude` and `git` rows marked shared.
+#[test]
+fn a_lines_shape_is_its_top_level_elements_and_the_one_the_detail_reads() {
+    let shape = |elements, read| LineShape {
+        elements,
+        read,
+        shared: false,
+    };
+    let shared = |elements, read| LineShape {
+        elements,
+        read,
+        shared: true,
+    };
+    for (line, want, word) in [
+        ("claude", shape(1, 1), Some("claude")),
+        ("claude | tee out.log", shape(1, 1), Some("claude")),
+        ("claude;", shape(1, 1), Some("claude")),
+        ("claude; echo done", shape(2, 2), Some("echo")),
+        ("claude || true", shape(2, 1), Some("claude")),
+        ("false || claude", shape(2, 1), Some("false")),
+        ("cd proj && claude", shape(2, 2), Some("claude")),
+        ("make && make install; ls", shape(3, 3), Some("ls")),
+        ("claude # a note; echo x", shape(1, 1), Some("claude")),
+        ("claude\nvim notes", shape(2, 2), Some("vim")),
+        ("begin; claude; end", shape(2, 2), Some("claude")),
+        ("for f in a b; do claude; done", shape(3, 1), Some("for")),
+        ("|| claude", shape(1, 0), None),
+        ("; ;", shape(0, 0), None),
+        ("", shape(0, 0), None),
+        ("make; make install", shared(2, 2), Some("make install")),
+        ("vim a; vim b", shared(2, 2), Some("vim")),
+        ("claude; claude --continue", shared(2, 2), Some("claude")),
+        (
+            "sudo make && make install",
+            shared(2, 2),
+            Some("make install"),
+        ),
+        ("vim a; /usr/bin/vim b", shared(2, 2), Some("vim")),
+        ("git status; git push", shared(2, 2), Some("git push")),
+        ("make; ls; make install", shared(3, 3), Some("make install")),
+        ("claude || claude", shape(2, 1), Some("claude")),
+        ("vim a; vimdiff b c", shape(2, 2), Some("vimdiff")),
+        ("make; and make install", shared(2, 2), Some("make install")),
+        ("claude; or true", shape(2, 1), Some("claude")),
+        ("qzf() { true; }; claude", shape(2, 2), Some("claude")),
+        ("make; qzf() { true; }", shape(2, 1), Some("make")),
+        ("function qzf; claude; end; make", shape(2, 2), Some("make")),
+        ("qzf() { claude; }", shape(1, 0), None),
+        ("qzf() true; make", shape(2, 0), None),
+    ] {
+        assert_eq!(line_shape(line), want, "{line:?}");
+        assert_eq!(command_detail(line).as_deref(), word, "{line:?}");
+    }
+}
+
+/// A LINE'S READING NAMES ITS LAST ELEMENT'S RUN ONLY WHERE THE KERNEL SAW NO OTHER JOB RUN ITS
+/// PROGRAM (review RV2 lander, E2-R2), production's reader ([`line_reading`]) over execs placed in
+/// the block's own job: the line's words cannot show an earlier element that is an alias or a
+/// function (`g st; git push`, `g` an alias for `git`), but two of the block's jobs (two process
+/// groups that held the foreground) running `git` do, so the shape is shared; one job running
+/// `git` twice (a `git push` that runs `git` again) is one job, and a group the kernel did not show
+/// (`0`) counts for none. A last element the reader cannot confirm (`vim notes; QZP7RV`, an alias
+/// no file names) reads the job's first program as a stand-in (`vim`, not its own), which the
+/// session log never takes for the last element's ([`crate::session_log`]'s `StatusOf`).
+/// NEGATIVE CONTROL (run): `line_reading` that never asks the jobs fails the two-jobs row.
+#[test]
+fn a_lines_reading_is_shared_where_two_of_its_jobs_ran_its_program() {
+    use crate::command_ran::{During, Exec, Heard, ran_of};
+    let ran = gate_ran();
+    let own = During::Job(Some(Heard::BLOCK));
+    let in_groups = |names: &[&str], groups: &[i32]| -> Vec<Exec> {
+        placed(ran_of(names), own)
+            .into_iter()
+            .zip(groups)
+            .map(|(exec, &pgid)| Exec { pgid, ..exec })
+            .collect()
+    };
+    let read = |line: &str, execs: Vec<Exec>| {
+        let heard = Heard::of(&ran, execs, Some(GATE_CWD), Some(GATE_PATH));
+        let (reading, shape) = line_reading(line, &heard);
+        (reading.map(|r| (r.text, r.own)), shape)
+    };
+    let shape = |shared| LineShape {
+        elements: 2,
+        read: 2,
+        shared,
+    };
+    let git_push = Some(("git push".to_string(), true));
+    for (why, line, execs, want) in [
+        (
+            "two jobs ran git",
+            "g st; git push",
+            in_groups(&["git", "git"], &[2, 3]),
+            (git_push.clone(), shape(true)),
+        ),
+        (
+            "one job ran git twice",
+            "cd proj && git push",
+            in_groups(&["git", "git"], &[2, 2]),
+            (git_push.clone(), shape(false)),
+        ),
+        (
+            "groups the kernel did not show",
+            "g st; git push",
+            in_groups(&["git", "git"], &[0, 0]),
+            (git_push.clone(), shape(false)),
+        ),
+        (
+            "another program in the other job",
+            "vim notes; git push",
+            in_groups(&["vim", "git"], &[2, 3]),
+            (git_push, shape(false)),
+        ),
+        (
+            "a stand-in for the last element",
+            "vim notes; QZP7RV",
+            in_groups(&["vim", "curl"], &[2, 3]),
+            (Some(("vim".to_string(), false)), shape(false)),
+        ),
+    ] {
+        assert_eq!(read(line, execs), want, "{why}: {line:?}");
+    }
+}
+
 #[test]
 fn command_detail_keeps_the_program_and_an_allowlisted_subcommand_only() {
     let cases: &[(&str, Option<&str>)] = &[
@@ -3234,8 +3374,10 @@ fn a_nameless_first_word_never_makes_an_argument_the_program() {
     .map(|(cmd, want)| (cmd.to_owned(), want))
     .collect();
     for word in STEPPED_OVER {
+        // Quoted, a word with a name (fish's `not`) is the program word: never `prog`.
+        let quoted = word.chars().any(char::is_alphanumeric).then_some(word);
         cases.push((format!("{word} prog QZP6WORD17"), Some("prog")));
-        cases.push((format!("'{word}' prog QZP6WORD17"), None));
+        cases.push((format!("'{word}' prog QZP6WORD17"), quoted));
         cases.push((format!("FOO=1 {word} prog QZP6WORD17"), None));
         assert_eq!(
             lead(Some(word), word.trim_matches(WORD_TRIM)),
@@ -4721,6 +4863,165 @@ fn a_fish_begin_group_reads_the_program_it_runs() {
             let got = read_gated(&ran, line, ran_of(runs));
             let want = want.map(|(d, own)| (d.to_owned(), own));
             (got != want).then(|| format!("{line:?} (ran {runs:?}): {got:?}, want {want:?}"))
+        })
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// One line in each shell's own form of it, as `(shell, line)` (where the shell has the form),
+/// the programs its job ran, and the reading every form gives.
+type FormsRow = (
+    &'static [(&'static str, &'static str)],
+    &'static [&'static str],
+    Want,
+);
+
+/// J2-3, ONE LINE READS ALIKE IN EVERY SHELL: a command's detail is its own name or its own job's
+/// program, so a line reads the same in bash, zsh, fish and pwsh. fish's `and` and `or` join the
+/// list as `&&` and `||` do and `not` negates as `!` does, so the chain rule picks the same
+/// command; a function's definition runs nothing where it is typed, so it reads nothing in every
+/// shell, never a word of its body, and the commands around it read as they would without it.
+/// What H2's live run read instead: fish's `mkdir -p X; and X/` read `and`, fish's `function
+/// qzf2; true; end` read `true`, and pwsh's definitions read `function`. NEGATIVE CONTROLS
+/// (scratch): no connector cut fails the `and` and `or` rows (`and`, `or`); `not` not stepped
+/// over fails the `not` rows (`not`); a lone `begin` read without its negation fails `not
+/// begin` (`begin`); no definition blanked fails the definition rows (fish's `true` and `if`,
+/// zsh's and pwsh's `function`, pwsh's filter's `echo`) and the rows of a command after or
+/// before one; no fish `end` matched, or no brace matched, fails the definition then its call
+/// (nothing, for the stand-in); a block nested in a body not counted fails the nested rows
+/// (`true`); the first brace after `function` taken for the body, wherever it stands, fails
+/// fish's `-a {a,b}` row (`true`), its quoted `-d '{x}'` row with `ls` after it (nothing) and
+/// pwsh's typed parameter's (`echo`); a `#` after a brace read as a comment fails bash's
+/// `${#1}` row (nothing, for `ls`).
+#[test]
+fn a_line_reads_the_same_detail_in_every_shells_form_of_it() {
+    use crate::command_ran::ran_of;
+    let ran = &gate_ran();
+    let rows: &[FormsRow] = &[
+        (
+            &[
+                ("bash", "true && ls"),
+                ("zsh", "true && ls"),
+                ("fish", "true; and ls"),
+                ("fish", "true && ls"),
+                ("pwsh", "true && ls"),
+            ],
+            &["ls"],
+            Some(("ls", true)),
+        ),
+        (
+            &[
+                ("bash", "mkdir -p X && X/"),
+                ("zsh", "mkdir -p X && X/"),
+                ("fish", "mkdir -p X; and X/"),
+                ("fish", "mkdir -p X\nand X/"),
+            ],
+            &["mkdir"],
+            None,
+        ),
+        (
+            &[
+                ("bash", "make || echo failed"),
+                ("zsh", "make || echo failed"),
+                ("fish", "make; or echo failed"),
+                ("pwsh", "make || echo failed"),
+            ],
+            &["make"],
+            Some(("make", true)),
+        ),
+        (
+            &[
+                ("bash", "! make test"),
+                ("zsh", "! make test"),
+                ("fish", "not make test"),
+                ("fish", "true; and not make test"),
+            ],
+            &["make"],
+            Some(("make test", true)),
+        ),
+        (
+            &[
+                ("bash", "{ sleep 1; }"),
+                ("bash", "! { sleep 1; }"),
+                ("zsh", "{ sleep 1 }"),
+                ("fish", "begin; sleep 1; end"),
+                ("fish", "not begin; sleep 1; end"),
+                ("fish", "true; and begin; sleep 1; end"),
+            ],
+            &["sleep"],
+            Some(("sleep", true)),
+        ),
+        (
+            &[
+                ("bash", "if true; then sleep 1; fi"),
+                ("zsh", "if true; then sleep 1; fi"),
+                ("fish", "if true; sleep 1; end"),
+                ("pwsh", "if ($true) { sleep 1 }"),
+            ],
+            &["sleep"],
+            Some(("if", true)),
+        ),
+        (
+            &[
+                ("bash", "qzf2() { true; }"),
+                ("bash", "function qzf2 { true; }"),
+                ("bash", "qzf2 ( ) { true; }"),
+                ("bash", "function qzf2\n{\n  true\n}"),
+                ("zsh", "qzf2() { true }"),
+                ("zsh", "function qzf2 { true }"),
+                ("zsh", "function qzf2 () { true; echo hi }"),
+                ("zsh", "qzf2() true"),
+                ("fish", "function qzf2; true; end"),
+                ("fish", "function qzf2\n    true\nend"),
+                ("fish", "function qzf2 -d '{x}'; true; end"),
+                ("fish", "function qzf2; if true; echo; end; true; end"),
+                ("fish", "function qzf2 -a {a,b}; true; end"),
+                ("pwsh", "function qzf2 { true }"),
+                ("pwsh", "function qzf2($a) {\n  true\n}"),
+                ("pwsh", "filter qzf2 { true; echo $_ }"),
+                ("pwsh", "function qzf2 { if ($true) { echo }; true }"),
+                (
+                    "pwsh",
+                    "function qzf2([ValidateScript({ $_ })]$a) { true; echo }",
+                ),
+            ],
+            &[],
+            None,
+        ),
+        (
+            &[
+                ("bash", "qzf2() { sleep 1; }; qzf2"),
+                ("zsh", "function qzf2 { sleep 1 }; qzf2"),
+                ("fish", "function qzf2; sleep 1; end; qzf2"),
+                ("pwsh", "function qzf2 { /bin/sleep 1 }; qzf2"),
+            ],
+            &["sleep"],
+            Some(("sleep", false)),
+        ),
+        (
+            &[
+                ("bash", "ls; qzf2() { true; }"),
+                ("zsh", "ls; function qzf2 { true }"),
+                ("fish", "ls; function qzf2; true; end"),
+                ("bash", "qzf2() { echo ${#1}; }; ls"),
+                ("fish", "function qzf2 -d '{x}'; true; end; ls"),
+                ("fish", "function qzf2 -a {a,b}; true; end; ls"),
+                ("pwsh", "ls; function qzf2 { true }"),
+                ("pwsh", "function qzf2($a = -1) { true }; ls"),
+            ],
+            &["ls"],
+            Some(("ls", true)),
+        ),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .flat_map(|(forms, runs, want)| {
+            let want = want.map(|(d, own)| (d.to_owned(), own));
+            forms.iter().filter_map(move |(shell, line)| {
+                let got = read_gated(ran, line, ran_of(runs));
+                (got != want)
+                    .then(|| format!("{shell} {line:?} (ran {runs:?}): {got:?}, want {want:?}"))
+            })
         })
         .collect();
     assert!(wrong.is_empty(), "{wrong:#?}");

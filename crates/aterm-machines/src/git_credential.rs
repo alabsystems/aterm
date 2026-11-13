@@ -134,7 +134,7 @@ impl Helper {
         }
     }
 
-    /// The helper over the vault's `~/.secrets/gh_access_token`; `None` while `user` has no
+    /// The helper over the secrets registry's `gh:dev` entry; `None` while `user` has no
     /// nonempty executable installed command.
     pub(crate) fn vault(sys: &dyn System, user: &User) -> Option<Self> {
         Self::run(sys, user, String::new())

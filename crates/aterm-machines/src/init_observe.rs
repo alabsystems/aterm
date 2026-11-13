@@ -88,7 +88,7 @@ pub enum Wait {
     Settings,
     /// The GitHub token file the vault syncs is not on this Mac yet.
     Token,
-    /// The GitHub token file is there but cannot be used: not the person's own private
+    /// The GitHub token file is there but cannot be used: not this account's own private
     /// file, or not one literal token.
     TokenUnusable,
     /// GitHub reached no answer: the network, a proxy or a deadline.
@@ -140,26 +140,25 @@ impl Wait {
         }
     }
 
-    /// What ends this wait (design §3.6): Git becoming ready, GitHub answering again, or room on
-    /// the disk (which the disk watch, a finished download or a person frees), tried again while
-    /// the run has tries left ([`FailureKind::Transient`]). Other reasons need a person's act:
-    /// the token the vault syncs is refused, missing, unusable or another account's,
-    /// or aterm's settings or an existing repository destination need attention
-    /// ([`FailureKind::NeedsPerson`]).
+    /// What ends this wait (design §3.6): Git becoming ready, GitHub answering again, room on
+    /// the disk (which the disk watch, a finished download or a person frees), or a GitHub token
+    /// the vault delivers (its need is filed in the ledger, never with a person), tried again
+    /// while the run has tries left ([`FailureKind::Transient`]). A credential never waits on a
+    /// person. Only aterm's settings
+    /// (an account other than the token's included) or an existing repository destination need
+    /// a person's act ([`FailureKind::NeedsPerson`]).
     #[must_use]
     pub const fn kind(self) -> FailureKind {
         match self {
             Self::GitReadiness
+            | Self::Token
+            | Self::TokenUnusable
+            | Self::TokenRefused
             | Self::Unreached
             | Self::GitHub
             | Self::RepositoryInventory
             | Self::DiskSpace => FailureKind::Transient,
-            Self::Settings
-            | Self::Token
-            | Self::TokenUnusable
-            | Self::TokenRefused
-            | Self::OtherAccount
-            | Self::InTheWay => FailureKind::NeedsPerson,
+            Self::Settings | Self::OtherAccount | Self::InTheWay => FailureKind::NeedsPerson,
         }
     }
 
@@ -171,11 +170,11 @@ impl Wait {
         match self {
             Self::GitReadiness => "Waiting for Git to finish installing",
             Self::Settings => "Fix aterm's GitHub settings; aterm doctor says how",
-            Self::Token => "Add your GitHub token to the Secrets vault",
-            Self::TokenUnusable => "Fix your GitHub token file; aterm doctor says how",
+            Self::Token => "Waits for the GitHub token from the Secrets vault",
+            Self::TokenUnusable => "GitHub token file is unusable",
             Self::Unreached => "GitHub can't be reached",
-            Self::TokenRefused => aterm_types::macos_setup::GITHUB_TOKEN_REFUSED,
-            Self::OtherAccount => "Your GitHub token is for another account; replace it",
+            Self::TokenRefused => "Token refused by GitHub; waits for a new one",
+            Self::OtherAccount => "GitHub account setting differs from the token's",
             Self::GitHub => "Can't read your repositories from GitHub",
             Self::RepositoryInventory => "Waits for repository metadata from the Secrets vault",
             Self::InTheWay => "A folder blocks a repository; aterm doctor names it",
@@ -307,8 +306,7 @@ impl Reading {
             Self::Repositories {
                 signed_in: false, ..
             } => "Needs sign-in".to_owned(),
-            // A sign-in only a person gives: the token is missing, refused or another
-            // account's.
+            // Not signed in: the token is missing, refused or another account's.
             Self::Waits(wait) if wait.signs_in() => "Needs sign-in".to_owned(),
             // A probe that could not go on read no value, and the person's own
             // project folders are no value of the row's. A value live until the next login

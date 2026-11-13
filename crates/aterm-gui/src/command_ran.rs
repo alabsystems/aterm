@@ -152,8 +152,9 @@ pub(crate) struct ExecNames {
     /// what a stand-in shows, and a bare word equal to it confirms.
     pub(crate) image: Option<Box<str>>,
     /// macOS's `p_name` (else `p_comm`): the name the kernel gave the exec from the file it
-    /// mapped, which no process sets afterwards; a bare word equal to it confirms. Never read on
-    /// Linux, whose `comm` the process sets (`prctl(PR_SET_NAME)`, perl's `$0`).
+    /// mapped, which no process sets afterwards; a bare word equal to it confirms. Linux's
+    /// `comm`, which the process sets (`prctl(PR_SET_NAME)`, perl's `$0`), is never read: there it
+    /// is only the file name a gone file's `/proc/<pid>/exe` keeps ([`ExecNames::is_gone`]).
     pub(crate) exec: Option<Box<str>>,
     /// The identity of the file the image was mapped from (macOS: the file `proc_pidpath` names;
     /// Linux: `/proc/<pid>/exe`, the mapped file itself).
@@ -223,6 +224,27 @@ impl ExecNames {
     #[cfg(any(unix, windows, test))]
     pub(crate) fn is_empty(&self) -> bool {
         self.image.is_none() && self.exec.is_none() && self.file.is_none()
+    }
+
+    /// Whether these are the names of a live image whose file is gone (unlinked since its exec,
+    /// as a package upgrade or `brew upgrade`'s cleanup leaves a running program): the kernel
+    /// keeps its exec name but names no path of it, so no file of it either
+    /// ([`image_and_exec_name`]).
+    #[cfg(unix)]
+    pub(crate) fn is_gone(&self) -> bool {
+        self.image.is_none() && self.file.is_none() && self.exec.is_some()
+    }
+
+    /// The names an image whose file is gone is noted by ([`ExecNames::is_gone`]): the exec name
+    /// the kernel keeps (`exec`) alone, with no file and no steer, so only a typed word equal to
+    /// it confirms the image, never a file's identity (a path names another file now, or none),
+    /// and it never stands in ([`ExecNames::shown`] has no file name to show).
+    #[cfg(unix)]
+    pub(crate) fn gone(exec: Option<Box<str>>) -> Self {
+        Self {
+            exec,
+            ..Self::default()
+        }
     }
 
     /// Names from an image's path alone.
@@ -455,9 +477,11 @@ pub(crate) fn read_names(pid: i32, steer: Steering<'_>) -> ExecNames {
     let Some(id) = u32::try_from(pid).ok().filter(|p| *p > 1) else {
         return ExecNames::default();
     };
-    let exe = aterm_sysprobe::process_path(id);
-    let (file, linked) =
-        image_file(id, exe.as_deref()).map_or((None, false), |(f, l)| (Some(f), l));
+    let (exe, exec) = image_and_exec_name(id, pid);
+    let (file, linked) = exe
+        .as_deref()
+        .and_then(|exe| image_file(id, exe))
+        .map_or((None, false), |(f, l)| (Some(f), l));
     let steers = if steer(file) {
         exec_args(id)
     } else {
@@ -465,7 +489,7 @@ pub(crate) fn read_names(pid: i32, steer: Steering<'_>) -> ExecNames {
     };
     ExecNames {
         image: exe.as_deref().and_then(file_name),
-        exec: exec_name(pid),
+        exec,
         file,
         env_path: steers.env_path.map(Arc::from),
         handed: steers.handed,
@@ -476,18 +500,18 @@ pub(crate) fn read_names(pid: i32, steer: Steering<'_>) -> ExecNames {
 }
 
 /// The names the kernel keeps for process `pid`'s exec ([`ExecNames::iter`]: its image's file
-/// name, macOS's `p_name`), read from the process table alone: no file is stat'ed and no record
-/// read, so the thread that draws may ask ([`crate::session_status::program::LeaderImage::names_only`]).
+/// name, its exec name: macOS's `p_name`, the name a gone file's Linux link keeps), read from the
+/// process table alone ([`image_and_exec_name`]): no file is stat'ed and no record read, so the
+/// thread that draws may ask ([`crate::session_status::program::LeaderImage::names_only`]).
 #[cfg(unix)]
 pub(crate) fn kernel_names(pid: i32) -> ExecNames {
     let Some(id) = u32::try_from(pid).ok().filter(|p| *p > 1) else {
         return ExecNames::default();
     };
+    let (exe, exec) = image_and_exec_name(id, pid);
     ExecNames {
-        image: aterm_sysprobe::process_path(id)
-            .as_deref()
-            .and_then(file_name),
-        exec: exec_name(pid),
+        image: exe.as_deref().and_then(file_name),
+        exec,
         ..ExecNames::default()
     }
 }
@@ -525,19 +549,53 @@ fn file_and_links(path: &Path) -> Option<(FileId, bool)> {
     })
 }
 
-/// The identity of the file `pid`'s image was mapped from: Linux's `/proc/<pid>/exe` is the
-/// mapped file itself, wherever its path went, and names the link it was exec'd by, so it is
-/// never [`ExecNames::linked`].
+/// The identity of the file `pid`'s image was mapped from, its path read as `exe`: Linux's
+/// `/proc/<pid>/exe` is the mapped file itself, wherever its path went, and names the link it was
+/// exec'd by, so it is never [`ExecNames::linked`].
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn image_file(pid: u32, _exe: Option<&Path>) -> Option<(FileId, bool)> {
+fn image_file(pid: u32, _exe: &Path) -> Option<(FileId, bool)> {
     file_id(Path::new(&format!("/proc/{pid}/exe"))).map(|id| (id, false))
 }
 
-/// The identity of the file `proc_pidpath` names for `pid`, and whether it has other names
-/// ([`ExecNames::linked`]).
+/// The identity of the file `proc_pidpath` names for `pid` (`exe`), and whether it has other
+/// names ([`ExecNames::linked`]).
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-fn image_file(_pid: u32, exe: Option<&Path>) -> Option<(FileId, bool)> {
-    exe.and_then(file_and_links)
+fn image_file(_pid: u32, exe: &Path) -> Option<(FileId, bool)> {
+    file_and_links(exe)
+}
+
+/// The path of process `pid`'s (`id`'s) image while its file is still there, and the name the
+/// kernel keeps for its exec ([`ExecNames::exec`]). macOS's `proc_pidpath` names no path once the
+/// file is unlinked, and its `p_name` stays. Linux's `/proc/<pid>/exe` then names the path it had
+/// with a ` (deleted)` mark, which is never part of a file's name: that path names another file or
+/// none, so it is no path of the image, and the file name it keeps, the mark dropped, is the
+/// exec's name (Linux's `comm`, the process's own to set, never is).
+#[cfg(unix)]
+fn image_and_exec_name(id: u32, pid: i32) -> (Option<PathBuf>, Option<Box<str>>) {
+    let exe = aterm_sysprobe::process_path(id);
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        let _ = pid;
+        linux_image(exe)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        (exe, exec_name(pid))
+    }
+}
+
+/// [`image_and_exec_name`] of a Linux `/proc/<pid>/exe` read, `exe`: a path marked ` (deleted)`
+/// is no path of the image, and the file name it keeps, the mark dropped, is its exec name; an
+/// unmarked one is the image's path, with no exec name.
+#[cfg(any(target_os = "linux", target_os = "android", all(test, unix)))]
+fn linux_image(exe: Option<PathBuf>) -> (Option<PathBuf>, Option<Box<str>>) {
+    if let Some(path) = exe.as_deref() {
+        let kept = atpkg::image::strip_deleted(path);
+        if kept != path {
+            return (None, file_name(kept));
+        }
+    }
+    (exe, None)
 }
 
 #[cfg(target_vendor = "apple")]
@@ -711,9 +769,12 @@ fn exec_name(pid: i32) -> Option<Box<str>> {
     text(&info.pbsd.pbi_name).or_else(|| text(&info.pbsd.pbi_comm))
 }
 
-/// No exec name is read here: Linux's `comm` is the process's own to set, so it confirms
-/// nothing.
-#[cfg(all(unix, not(target_vendor = "apple")))]
+/// No exec name is read here (Linux's is read from its `exe` link alone, [`linux_image`]: its
+/// `comm` is the process's own to set, so it confirms nothing).
+#[cfg(all(
+    unix,
+    not(any(target_vendor = "apple", target_os = "linux", target_os = "android"))
+))]
 const fn exec_name(_pid: i32) -> Option<Box<str>> {
     None
 }
@@ -1427,6 +1488,14 @@ impl Ran {
     /// session's history change nothing.
     pub(crate) fn runs_jobs(&self, jobs: bool) {
         self.lock().own_group = !jobs;
+    }
+
+    /// Whether the session's shell runs every command in its own group (pwsh), as
+    /// [`Ran::runs_jobs`] was told: a restore then reads the shell's children for the running
+    /// command ([`RanFeed::restored_in_shell_group`]).
+    #[cfg(unix)]
+    fn runs_own_group(&self) -> bool {
+        self.lock().own_group
     }
 
     /// The `PATH` the session's shell was spawned with: what a bare word's lookup uses where no
@@ -2519,7 +2588,9 @@ impl Ran {
 /// ([`crate::exec_edges::ExecEdges`]) and, where no watch hears them, each holder image it reads
 /// at a foreground edge, each held until the parse stage has parsed where the shell's output
 /// stood when it was heard ([`Ran::hear`]); and the holder a restore finds in front
-/// ([`RanFeed::restored`]). The shell's own images are never a command's, so none is heard.
+/// ([`RanFeed::restored`]), or, in front in the shell's own group, the shell's children
+/// ([`RanFeed::restored_in_shell_group`]). The shell's own images are never a command's, so
+/// none is heard.
 #[cfg(unix)]
 #[derive(Clone, Debug)]
 pub(crate) struct RanFeed {
@@ -2528,6 +2599,10 @@ pub(crate) struct RanFeed {
     /// Reads an `exec`ed process's names, with its steers when asked ([`read_names`]; a test's
     /// own).
     read: fn(i32, Steering<'_>) -> ExecNames,
+    /// Carries a process's start as read (microseconds on the start clock) to the wall clock a
+    /// restore places it by ([`crate::fg_sample::started_wall_ms`]; a test's: its starts are
+    /// wall-clock microseconds).
+    started: fn(u64) -> Option<u64>,
 }
 
 #[cfg(unix)]
@@ -2538,17 +2613,23 @@ impl RanFeed {
             ran,
             shell,
             read: read_names,
+            started: crate::fg_sample::started_wall_ms,
         }
     }
 
-    /// A test's feed, reading names with `read`.
+    /// A test's feed, reading names with `read`; a start it reads is wall-clock microseconds.
     #[cfg(test)]
     pub(crate) fn reading(
         ran: Arc<Ran>,
         shell: i32,
         read: fn(i32, Steering<'_>) -> ExecNames,
     ) -> Self {
-        Self { ran, shell, read }
+        Self {
+            ran,
+            shell,
+            read,
+            started: |us| (us > 0).then_some(us / 1_000),
+        }
     }
 
     /// A test's feed that reads no process's names (a restore then notes an image by its path).
@@ -2679,7 +2760,9 @@ impl RanFeed {
     }
 
     /// Hear the image `exe` of group `pgid`'s leader at `spot` ([`RanFeed::image`],
-    /// [`RanFeed::sampled`]).
+    /// [`RanFeed::sampled`]); one whose file the read finds gone (Linux's `(deleted)` link, a
+    /// file unlinked since `exe` was read) by the names such an image is noted by
+    /// ([`ExecNames::gone`]).
     fn hear_image(&self, pgid: i32, exe: &Path, spot: Spot) {
         if pgid <= 1 || pgid == self.shell {
             return;
@@ -2689,19 +2772,23 @@ impl RanFeed {
             return;
         }
         let read = (self.read)(pgid, &mut |_| true);
-        let same = read.image == names.image;
-        let file = read.file.filter(|_| same);
+        let names = if read.is_gone() {
+            ExecNames::gone(read.exec)
+        } else {
+            let same = read.image == names.image;
+            ExecNames {
+                file: read.file.filter(|_| same),
+                env_path: read.env_path,
+                scripts: if same { read.scripts } else { Box::default() },
+                ..names
+            }
+        };
         self.ran.hear(
             Exec {
                 at_ms: 0,
                 pid: pgid,
                 pgid,
-                names: ExecNames {
-                    file,
-                    env_path: read.env_path,
-                    scripts: if same { read.scripts } else { Box::default() },
-                    ..names
-                },
+                names,
                 during: During::Window,
             },
             spot,
@@ -2709,36 +2796,98 @@ impl RanFeed {
     }
 
     /// A restore found `image` in front, the job of the restored block `running` (`None`: no
-    /// block runs): note it now as that job's exec, with what an exec heard live records (its
-    /// file's identity and the steers its `KERN_PROCARGS2` record shows: its `PATH`, the path it
-    /// was given as its file), read again for the leader when it still maps that image; else
-    /// with its file's identity alone. So the restored command's typed word is confirmed by its
-    /// file's identity, as it was before the update (a `claude` through its versions link). The
-    /// shell's own image is no command's.
+    /// block runs): note it now as that job's exec, by the names a restore reads
+    /// ([`RanFeed::restored_names`]). So the restored command's typed word is confirmed as it
+    /// was before the update: by its file's identity (a `claude` through its versions link), or,
+    /// once that file is gone, by the exec name the kernel keeps. The shell's own image is no
+    /// command's.
     pub(crate) fn restored(&self, image: &crate::holder_image::HolderImage, running: Option<u64>) {
         if image.pgid <= 1 || image.pgid == self.shell {
             return;
         }
-        let shown = ExecNames::of_path(&image.exe);
-        if shown.image.is_none() {
-            return;
-        }
-        let read = (self.read)(image.pgid, &mut |_| true);
-        let names = if read.image == shown.image && read.file.is_some() {
-            read
-        } else {
-            ExecNames {
-                file: file_id(&image.exe),
-                ..shown
-            }
-        };
         self.ran.note(Exec {
             at_ms: wall_ms(),
             pid: image.pgid,
             pgid: image.pgid,
-            names,
+            names: self.restored_names(image.pgid, &image.exe),
             during: During::Job(running),
         });
+    }
+
+    /// A restore found the shell's own group in front while the restored block `running` ran
+    /// (its id, and the window its execs count in: [`Window::of_block`]), in a session whose shell
+    /// runs every command in its own group (pwsh, [`Ran::runs_jobs`]): the command runs in one of
+    /// the shell's live `children`. Each child that has exec'd since its fork (`execd` gives its
+    /// birth then, as a sampled edge's leader must have one: a fork that has not exec'd still
+    /// maps the shell's image, which no command ran), its image read with `edge_image` (of that
+    /// birth, or naming no path: its file is gone), is noted now by the names a restore reads
+    /// ([`RanFeed::restored_names`]), placed by its birth: one started in the running block's
+    /// window is that block's own ([`During::Shell`]: it confirms and may stand in, as its exec
+    /// heard live did), and one started before it (a `Start-Process` an earlier block left
+    /// running), or whose start is not carried to the wall clock, is placed by its stamp alone
+    /// ([`During::Window`]: it confirms a typed word that names it and never stands in). The
+    /// shell is never one. Nothing is read when no block runs, nor in a session whose shell runs
+    /// jobs: there its children lead jobs of their own, and the shell's group in front is the
+    /// shell at work.
+    pub(crate) fn restored_in_shell_group(
+        &self,
+        running: Option<(u64, Option<Window>)>,
+        children: fn(i32) -> Vec<i32>,
+        edge_image: crate::holder_image::ReadImage,
+        execd: fn(i32) -> Option<u64>,
+    ) {
+        let Some((block, window)) = running.filter(|_| self.ran.runs_own_group()) else {
+            return;
+        };
+        for child in children(self.shell) {
+            if child <= 1 || child == self.shell {
+                continue;
+            }
+            let Some(birth) = execd(child) else {
+                continue;
+            };
+            let image = edge_image(child, None);
+            if image.start_us != birth && !image.exe.as_os_str().is_empty() {
+                continue;
+            }
+            let own = window.is_some_and(|w| (self.started)(birth).is_some_and(|ms| ms >= w.from));
+            self.ran.note(Exec {
+                at_ms: wall_ms(),
+                pid: child,
+                pgid: self.shell,
+                names: self.restored_names(child, &image.exe),
+                during: if own {
+                    During::Shell(Some(block))
+                } else {
+                    During::Window
+                },
+            });
+        }
+    }
+
+    /// The names a restore notes for process `pid`, whose image it read as `exe`: what an exec
+    /// heard live records (its file's identity and the steers its `KERN_PROCARGS2` record shows:
+    /// its `PATH`, the path it was given as its file), read again for `pid` when it still maps
+    /// that image, else its file's identity alone. An image whose file is gone (macOS's
+    /// `proc_pidpath` names no path once the file is unlinked, as `brew upgrade`'s cleanup does
+    /// under a running `nvim`, so `exe` is empty; Linux's `/proc/<pid>/exe` marks the path
+    /// ` (deleted)`, so the read finds it gone: [`ExecNames::is_gone`]) is noted by the exec name
+    /// the kernel still holds alone ([`ExecNames::gone`]): only a typed word equal to that name
+    /// confirms it, never a file's identity, and it never stands in.
+    fn restored_names(&self, pid: i32, exe: &Path) -> ExecNames {
+        let shown = ExecNames::of_path(exe);
+        let read = (self.read)(pid, &mut |_| shown.image.is_some());
+        if shown.image.is_none() || read.is_gone() {
+            return ExecNames::gone(read.exec);
+        }
+        if read.image == shown.image && read.file.is_some() {
+            read
+        } else {
+            ExecNames {
+                file: file_id(exe),
+                ..shown
+            }
+        }
     }
 }
 

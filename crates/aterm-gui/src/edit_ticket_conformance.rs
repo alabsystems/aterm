@@ -617,7 +617,7 @@ fn dirty_close_after_its_ack() {
     assert_eq!(rig.answers.len(), 2, "a late waiter reads the ring");
 }
 
-fn refused_whole_tab_close_then_closed() {
+fn whole_tab_close_after_its_ack() {
     let mut rig = Rig::new("whole-tab");
     rig.edit();
     rig.wait(&["Await"]);
@@ -625,15 +625,28 @@ fn refused_whole_tab_close_then_closed() {
     let document = rig.document.unwrap();
     let held = rig.app.hold_document_save_for_test(document);
     rig.step("a save starts", &[]);
-    assert!(rig.close_edit_view(&[]).is_err(), "refused while saving");
+    assert!(rig.close_edit_view(&["RequestClose"]).is_err());
+    assert_eq!(rig.state["closing"], 1);
+    assert_eq!((rig.state["view"], rig.state["answered"]), (1, 0));
     let view = rig.edit_view.unwrap();
     rig.app
         .land_held_document_save_for_test(document, view, held)
         .unwrap();
-    rig.step("the save lands", &["SaveAck"]);
-    assert_eq!(rig.state["answered"], 0, "the view is still open");
-    rig.close_edit_view(&["RequestClose", "Retire"]).unwrap();
-    assert_eq!((rig.state["answered"], rig.state["saved"]), (1, 1));
+    rig.step(
+        "the save lands and the original whole-tab close completes",
+        &["SaveAck", "Retire"],
+    );
+    assert_eq!(
+        (rig.state["view"], rig.state["answered"], rig.state["saved"]),
+        (0, 1, 1)
+    );
+    assert_eq!(rig.state["answer_seq"], rig.state["close_seq"]);
+    rig.wait(&[]);
+    assert_eq!(rig.answers.len(), 2);
+    assert_eq!(
+        rig.answers[0], rig.answers[1],
+        "a late waiter reads the same receipt"
+    );
 }
 
 fn orphan_and_adopt() {
@@ -1110,7 +1123,7 @@ fn abort_that_discards_others_text_is_caught() {
 #[test]
 fn refines_amacs_edit_ticket() {
     dirty_close_after_its_ack();
-    refused_whole_tab_close_then_closed();
+    whole_tab_close_after_its_ack();
     orphan_and_adopt();
     the_persons_view_never_answers();
     refuse_and_cancel();

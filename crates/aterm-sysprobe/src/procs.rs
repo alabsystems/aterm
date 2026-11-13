@@ -97,11 +97,16 @@ pub struct ProcessReading {
     /// where refused, for an unreaped zombie, for a Linux process read only by `statm`, and
     /// elsewhere. Windows its working set.
     pub resident: Option<u64>,
-    /// Bytes it has read from disk since it started (macOS `ri_diskio_bytesread`: storage reads,
-    /// not page-cache hits); `None` where refused, on Linux, and on Windows, whose process record
-    /// counts no storage bytes apart from a pipe's or a socket's ([`Self::io_read`]).
+    /// Bytes it has read from disk since it started (macOS `ri_diskio_bytesread`, Linux `io`'s
+    /// `read_bytes`: storage reads, not page-cache hits); `None` where refused (another user's
+    /// process) and on Windows, whose process record counts no storage bytes apart from a pipe's
+    /// or a socket's ([`Self::io_read`]).
     pub disk_read: Option<u64>,
-    /// Bytes it has written to disk since it started (macOS `ri_diskio_byteswritten`: what reached storage, not every `write(2)`); `None` where refused, on Linux, and on Windows ([`Self::io_written`] holds what it reads there). An unreaped zombie keeps its final count, its start, its `disk_read` and its CPU times (macOS), though not its footprint.
+    /// Bytes it has written to disk since it started (macOS `ri_diskio_byteswritten`, Linux `io`'s
+    /// `write_bytes`: what reached or went toward storage, not every `write(2)`); `None` where
+    /// refused (another user's process) and on Windows ([`Self::io_written`] holds what it reads
+    /// there). An unreaped zombie keeps its final count, its start, its `disk_read` and its CPU
+    /// times (macOS), though not its footprint.
     pub disk_written: Option<u64>,
     /// Bytes it has read through any handle since it started (Windows `ReadTransferCount`: a
     /// file's, a pipe's, a console's and a socket's alike), which says it is doing something and
@@ -142,7 +147,9 @@ pub struct ProcessReading {
     /// Whether it ran a program since its fork (macOS `P_EXEC`, Linux `PF_FORKNOEXEC` clear): a
     /// fork that kept its parent's program did not; `None` where unread, and on Windows.
     pub exec: Option<bool>,
-    /// Time its threads spent runnable (running or waiting for a core) since it started, nanoseconds (macOS `ri_runnable_time`); `None` where refused or not read.
+    /// Time its threads spent runnable (running or waiting for a core) since it started,
+    /// nanoseconds (macOS `ri_runnable_time`; Linux the CPU time plus every live thread's
+    /// `schedstat` wait, for the user's own processes); `None` where refused or not read (Windows).
     pub runnable_ns: Option<u64>,
     /// Which kind of core its threads ran on, on a host with more than one ([`CoreSplit`]);
     /// `None` where the host has one kind, where refused or not read, and off macOS.
@@ -164,6 +171,10 @@ pub struct ProcessReading {
     /// finds it: nothing records it between two readings or after the process exits. `None`
     /// where its record named another parent (a new process at the pid), and off macOS.
     pub reaps_unwaited: Option<bool>,
+    /// Its threads (Linux `stat`'s `num_threads`): on Linux the per-user limit (`RLIMIT_NPROC`)
+    /// counts threads, not processes. `None` where unread (macOS, whose limit counts processes;
+    /// Windows).
+    pub threads: Option<u32>,
 }
 
 /// Of a process's CPU time since it started, what ran on the host's performance cores and what
@@ -876,8 +887,9 @@ mod imp {
     }
 }
 
-/// Test support (macOS): a CPU-time reader checked against the kernel's own account of the same CPU, for the sweep's tests here and the job probe's (`jobs/tests.rs`).
-#[cfg(all(test, target_os = "macos"))]
+/// Test support (macOS and Linux): a CPU-time reader checked against the kernel's own account of
+/// the same CPU, for the sweep's tests here and the job probe's (`jobs/tests.rs`).
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 #[path = "procs_stopped_spinner_tests.rs"]
 pub(crate) mod stopped_spinner;
 

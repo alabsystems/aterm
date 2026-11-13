@@ -368,8 +368,8 @@ fn the_stamp_is_heads_facts_as_the_build_script_reads_them() {
             dev_commits: 2,
         }
     );
-    // The build script's rule: the measured ledger's entries, which a perf set writes
-    // between its runs, leave the stamp clean; a changed source file below marks it dirty.
+    // The build script's rule: a file in the measured ledger, which no build reads, leaves
+    // the stamp clean; a changed source file below marks it dirty.
     std::fs::create_dir_all(root.join("docs/measured/fabric")).unwrap();
     std::fs::write(
         root.join("docs/measured/fabric/2026-11-04-fabric-1001.json"),

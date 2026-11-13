@@ -374,7 +374,7 @@ impl Owner {
         let ready = !self.faulted
             && self.fence.check_current().is_ok()
             && self.ledger.cohort_aware().is_ok_and(|ready| ready);
-        aterm_json::json!({"version":3,"ready":ready,"recipes":["ay-campaign-v3","targo-native-v3"],"unqualified":"refused","inspection":"resource-inspect-v3","status":"json-lines-v3","timeout":"actual-start","accounting":crate::resource_accounting::supported().then_some(trust_resource_controller::accounting::CAPABILITY),"root_store_expectation":crate::runtime::store_expectation_supported().then_some(aterm_ctl::resource_admission_transport::store_expectation::CAPABILITY)})
+        aterm_json::json!({"version":3,"ready":ready,"recipes":["ay-campaign-v3","targo-native-v3"],"unqualified":"refused","inspection":"resource-inspect-v3","status":"json-lines-v3","timeout":"actual-start","accounting":crate::resource_accounting::supported().then_some(trust_resource_controller::accounting::CAPABILITY),"root_store_expectation":crate::runtime::store_expectation_supported().then_some(aterm_ctl::resource_admission_transport::store_expectation::CAPABILITY),"native_job_root_store_expectation":crate::runtime::store_expectation_supported().then_some(aterm_ctl::resource_admission_transport::native_store::CAPABILITY)})
     }
     pub(super) fn accepts(&self, binding: &Binding) -> bool {
         self.accepts_with_queued(binding, 0)

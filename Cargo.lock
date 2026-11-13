@@ -12,6 +12,7 @@ dependencies = [
  "aterm-codec",
  "aterm-ctl",
  "aterm-digest",
+ "aterm-dirfd",
  "aterm-durable",
  "aterm-http",
  "aterm-json",
@@ -26,6 +27,7 @@ dependencies = [
  "aterm-toml",
  "aterm-types",
  "aterm-uds",
+ "libc",
 ]
 
 [[package]]
@@ -149,7 +151,7 @@ version = "0.2.0"
 
 [[package]]
 name = "aterm"
-version = "0.199.0"
+version = "0.200.0"
 dependencies = [
  "agh",
  "astream-broker",
@@ -282,6 +284,7 @@ dependencies = [
  "aterm-phase",
  "aterm-primer",
  "aterm-pty",
+ "aterm-search",
  "aterm-secrets",
  "aterm-serde",
  "aterm-shell-integration",
@@ -663,6 +666,7 @@ dependencies = [
  "aterm-toml",
  "aterm-types",
  "aterm-uds",
+ "aterm-update-core",
  "ring",
  "zeroize",
 ]
@@ -1182,6 +1186,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "aterm-land"
+version = "0.0.0"
+
+[[package]]
 name = "aterm-lexicon"
 version = "0.0.0"
 dependencies = [
@@ -1217,6 +1225,7 @@ dependencies = [
  "aterm-cores",
  "aterm-ctl",
  "aterm-digest",
+ "aterm-dirfd",
  "aterm-durable",
  "aterm-hash",
  "aterm-json",
@@ -1442,6 +1451,7 @@ dependencies = [
  "aterm-tempfile",
  "aterm-types",
  "aterm-update",
+ "aterm-update-core",
  "aterm-vz",
 ]
 
@@ -1773,6 +1783,7 @@ dependencies = [
  "aterm-models-render",
  "aterm-objc",
  "aterm-png",
+ "aterm-scene",
  "aterm-spec",
  "aterm-spec-anchor",
  "aterm-tempfile",
@@ -1930,7 +1941,6 @@ dependencies = [
  "aterm-json",
  "aterm-log",
  "aterm-mesh-core",
- "aterm-messages",
  "aterm-models-db",
  "aterm-models-swarm",
  "aterm-netplace",
@@ -2250,7 +2260,10 @@ dependencies = [
  "aterm-durable",
  "aterm-json",
  "aterm-log",
+ "aterm-models-update",
  "aterm-serde",
+ "aterm-spec",
+ "aterm-spec-anchor",
  "aterm-tempfile",
  "aterm-time",
  "aterm-toml",
@@ -2278,6 +2291,7 @@ dependencies = [
  "aterm-forge",
  "aterm-hash",
  "aterm-json",
+ "aterm-land",
  "aterm-models-capacity",
  "aterm-models-misc",
  "aterm-phase",
@@ -2614,7 +2628,7 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.191"
 
 [[package]]
 name = "once_cell"

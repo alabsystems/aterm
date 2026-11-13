@@ -4412,7 +4412,7 @@ impl JobAtRest {
                 );
             }
         }
-        let (stop_read, stop) = std::io::pipe().expect("stop pipe");
+        let (stop_read, stop) = aterm_uds::pipe().expect("stop pipe");
         let module = module_path!().split_once("::").expect("crate and module").1;
         let mut cmd = aterm_uds::spawnfd::command(std::env::current_exe().expect("test image"));
         cmd.args([
@@ -6597,8 +6597,8 @@ fn a_program_first_named_as_not_started_is_recorded_once() {
                  does not reach"
             ),
             one(
-                "pid 7011 nfsprog: it has not started, and its program is on a volume aterm \
-                 cannot prove local, so nothing read says why"
+                "pid 7011 nfsprog: it has not started, and nothing aterm read says why; \
+                 macOS's program check may be holding it, which aterm cannot confirm"
             ),
             one("pid 7013 debuggee: it has not started, and it reads stopped and traced"),
         ],
@@ -6734,6 +6734,171 @@ fn a_stranded_row_is_recorded_once_while_it_stands() {
         "{:?}",
         message.detail.last()
     );
+}
+
+/// A PROGRAM STRANDED TEN MINUTES IS ONE DIGEST ENTRY UNTIL IT GOES (leftover §5.1, §6.6): a view
+/// that names a row stranded for `FIRST_EXEC_HANG` raises one Info `vitals.stranded.programs.held`
+/// entry; the next views post none and fold no repeat into it, a relaunched syspolicyd restates
+/// the same entry, a view that names no syspolicyd leaves it as it stands, and one that names one
+/// and no row stranded ends it at the digest's clock. A row a millisecond short of ten minutes,
+/// and a held row that is not stranded at 31 min, raise nothing, and nothing is ever a Now.
+#[test]
+fn a_program_stranded_ten_minutes_is_one_digest_entry_until_it_goes() {
+    use crate::message_reporters as mr;
+    use aterm_vitals::jobs::{HeldProc, JobTick, Jobs, StartWait};
+    static BOARD: JobsBoard = JobsBoard::new();
+    const KEY: &str = "vitals.stranded.programs.held";
+    fn adopt(
+        app: &mut crate::App,
+        engine: &mut Jobs,
+        seq: u64,
+        at_ms: u64,
+        held: &[HeldProc],
+        daemon: Option<u32>,
+    ) {
+        let view = engine.absorb(&JobTick {
+            at_ms,
+            read_ms: at_ms,
+            self_uid: Some(501),
+            held: held.to_vec(),
+            program_check_daemon: daemon,
+            ..JobTick::default()
+        });
+        app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+            seq,
+            jobs: Some(Arc::new(view)),
+            ..Snapshot::default()
+        }));
+        app.on_vitals_wake();
+    }
+    let row = |pid, name: &str, stranded| HeldProc {
+        pid,
+        exec: u64::from(pid),
+        exec_version: Some(u64::from(pid)),
+        name: name.into(),
+        wait: StartWait::ProgramCheck,
+        stranded,
+        ..HeldProc::default()
+    };
+    let band = row(11271, "band-dd34e7089f8bb855", true);
+    let gh = row(7020, "gh", false);
+    let both = [band.clone(), gh.clone()];
+    let entries = |app: &crate::App| -> Vec<aterm_messages::DigestEntry> {
+        app.messages
+            .digest()
+            .entries
+            .into_iter()
+            .filter(|e| e.key.starts_with("vitals.stranded."))
+            .collect()
+    };
+    let posted = |app: &crate::App| {
+        app.messages
+            .log()
+            .records()
+            .filter(|r| r.later && r.key.as_deref() == Some(KEY))
+            .count()
+    };
+    let no_now = |app: &crate::App| {
+        assert!(
+            app.messages
+                .live_by_key(mr::PROGRAM_CHECK_STUCK_KEY)
+                .is_none(),
+            "a stranded program is never the stuck check's Now"
+        );
+    };
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    let mut engine = Jobs::new();
+    adopt(&mut app, &mut engine, 1, 1_000, &both, Some(11291));
+    adopt(&mut app, &mut engine, 2, 600_999, &both, Some(11291));
+    assert_eq!(entries(&app), [], "CONTROL: 599_999 ms raises nothing");
+    adopt(&mut app, &mut engine, 3, 601_000, &both, Some(11291));
+    let raised = entries(&app);
+    assert_eq!(raised.len(), 1, "{raised:?}");
+    let e = &raised[0];
+    assert_eq!(
+        (e.key.as_str(), e.severity, e.title.as_str()),
+        (
+            KEY,
+            aterm_messages::Severity::Info,
+            "1 program stranded at macOS's check"
+        )
+    );
+    assert_eq!(
+        e.why,
+        "its check went to a syspolicyd that is no longer running, and aterm ends no held program"
+    );
+    assert_eq!(e.then, "Stop what started it, then run it again");
+    assert!(
+        e.detail.ends_with(&[
+            "pid 11271 band-dd34e7089f8bb855: held 10 m or more".to_owned(),
+            "The syspolicyd running now (pid 11291) checks new programs".to_owned(),
+        ]),
+        "{:?}",
+        e.detail
+    );
+    adopt(&mut app, &mut engine, 4, 603_000, &both, Some(11291));
+    adopt(&mut app, &mut engine, 5, 604_000, &both, Some(11291));
+    assert_eq!(
+        entries(&app).iter().map(|e| e.repeats).collect::<Vec<_>>(),
+        [1],
+        "views that say the same fold nothing into it"
+    );
+    adopt(&mut app, &mut engine, 6, 604_500, &both, Some(4242));
+    let restated = entries(&app);
+    assert_eq!(
+        restated
+            .iter()
+            .map(|e| (e.key.as_str(), e.detail.last().map(String::as_str)))
+            .collect::<Vec<_>>(),
+        [(
+            KEY,
+            Some("The syspolicyd running now (pid 4242) checks new programs")
+        )],
+        "a relaunched syspolicyd restates the one entry"
+    );
+    adopt(&mut app, &mut engine, 7, 605_000, &both, None);
+    assert_eq!(posted(&app), 1, "the next views post none");
+    assert_eq!(
+        (entries(&app).len(), app.messages.digest_deadline()),
+        (1, None),
+        "a view that names no syspolicyd leaves it as it stands"
+    );
+    let unstranded = [row(11271, "band-dd34e7089f8bb855", false), gh.clone()];
+    adopt(&mut app, &mut engine, 8, 607_000, &unstranded, Some(11291));
+    let due = app
+        .messages
+        .digest_deadline()
+        .expect("a view naming a syspolicyd and none stranded ends it");
+    let _ = app.settle_messages(due + Duration::from_secs(1));
+    assert_eq!(entries(&app), [], "ended at the digest's clock");
+    no_now(&app);
+
+    let mut app = crate::App::headless_for_test();
+    app.vitals.board = &BOARD;
+    let mut engine = Jobs::new();
+    adopt(
+        &mut app,
+        &mut engine,
+        1,
+        1_000,
+        std::slice::from_ref(&gh),
+        Some(11291),
+    );
+    adopt(
+        &mut app,
+        &mut engine,
+        2,
+        1_861_000,
+        std::slice::from_ref(&gh),
+        Some(11291),
+    );
+    assert_eq!(
+        entries(&app),
+        [],
+        "CONTROL: a held row that is not stranded raises nothing at 31 min"
+    );
+    no_now(&app);
 }
 
 /// A held episode is one `program-check.` record at each edge (the opening says when aterm started
@@ -6882,6 +7047,73 @@ fn the_verdict_refresh_waits_out_a_backed_up_episode() {
     );
     adopt(&mut app, 4, Findings::default());
     assert_eq!(app.devtools_helper.refreshes_started(), 1, "once");
+}
+
+/// A stranded row holds back no verdict refresh (leftover-processes design §5.1, §13): a held row
+/// that backs up the check holds a switch-on's refresh while it stands in the running check's
+/// line, and once the host judges it stranded the engine's episode drains two views later and the
+/// refresh starts, once, though the row stays held. The same row not stranded, or stranded with no
+/// syspolicyd judged against, keeps the refresh held.
+#[test]
+fn a_stranded_row_holds_back_no_verdict_refresh() {
+    use crate::devtools_helper::test_arms;
+    use aterm_vitals::jobs::{HeldProc, JobTick, Jobs, StartWait};
+    static BOARD: JobsBoard = JobsBoard::new();
+    let run = |stranded: bool, daemon: Option<u32>| {
+        let mut engine = Jobs::new();
+        let mut app = crate::App::headless_for_test();
+        app.vitals.board = &BOARD;
+        test_arms::stand_in(&mut app, test_arms::opening());
+        let mut seen = Vec::new();
+        for seq in 1..=5_u64 {
+            let at_ms = seq * 2_000;
+            let view = engine.absorb(&JobTick {
+                at_ms,
+                read_ms: at_ms,
+                self_uid: Some(501),
+                held: vec![HeldProc {
+                    pid: 11271,
+                    exec: 11271,
+                    exec_version: Some(11271),
+                    name: "band-dd34e7089f8bb855".into(),
+                    wait: StartWait::ProgramCheck,
+                    stranded: stranded && seq >= 3,
+                    ..HeldProc::default()
+                }],
+                program_check_daemon: daemon,
+                ..JobTick::default()
+            });
+            let held = view.findings.program_check.len();
+            let episode = view.findings.program_check_episode.is_some();
+            app.vitals.latest.lock().unwrap().snap = Some(Arc::new(Snapshot {
+                seq,
+                jobs: Some(Arc::new(view)),
+                ..Snapshot::default()
+            }));
+            app.on_vitals_wake();
+            if seq == 2 {
+                assert!(episode, "held across two readings: backed up");
+                switch_devtools_on(&mut app);
+            }
+            assert_eq!(held, 1, "the row stays held at view {seq}");
+            seen.push(app.devtools_helper.refreshes_started());
+        }
+        seen
+    };
+    assert_eq!(
+        run(true, Some(11291)),
+        [0, 0, 0, 1, 1],
+        "switched on inside the episode, asked once it drains two views after the row turns \
+         stranded"
+    );
+    for (stranded, daemon) in [(false, Some(11291)), (true, None)] {
+        assert_eq!(
+            run(stranded, daemon),
+            [0, 0, 0, 0, 0],
+            "CONTROL: a row not judged stranded (stranded {stranded}, daemon {daemon:?}) is the \
+             check's queue"
+        );
+    }
 }
 
 /// Waits for the devtools lane's refresh worker to end: a one-minute hang detector.

@@ -2312,6 +2312,173 @@ fn an_idle_listener_waits_only_for_a_connection_or_its_stop() {
     serving.join().unwrap();
 }
 
+/// A link listener that has heard nothing asks the serving loop for no deadline: the 200 ms
+/// validity timer that woke every idle link listener five times a second is gone, and what is
+/// left is what `lan::Listener::validity_deadline` owes (nothing, on loopback).
+///
+/// NEGATIVE CONTROL (2026-11-12): with `ListenerSocket::validity_deadline` giving a link
+/// listener `Some(Instant::now() + ACCEPT_POLL)` again, the deadline is `Some(..)`, not `None`.
+#[cfg(unix)]
+#[test]
+fn a_quiet_link_listener_asks_the_serving_loop_for_no_deadline() {
+    let listener =
+        crate::lan::Listener::bind("127.0.0.1:0".parse().unwrap(), crate::lan::Scope::Loopback)
+            .unwrap();
+    assert_eq!(ListenerSocket::Link(listener).validity_deadline(), None);
+}
+
+/// With no timer, a link listener's own change source is what turns its serving loop: a route
+/// or interface change it hears turns the loop at once (which rechecks before the next accept),
+/// and the loop turns once more for the look that change is owed [`ACCEPT_POLL`] later. The
+/// change source is a datagram socket this test writes an `RTM_NEWADDR` header to.
+///
+/// NEGATIVE CONTROL (2026-11-12): with `ListenerSocket::validity_deadline` giving a link
+/// listener no deadline at all, the third look never comes (`the listener looks once more`
+/// meets the hang detector).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_heard_change_turns_the_link_listener_now_and_once_more() {
+    let (kernel, heard) = std::os::unix::net::UnixDatagram::pair().unwrap();
+    let listener =
+        crate::lan::Listener::bind("127.0.0.1:0".parse().unwrap(), crate::lan::Scope::Loopback)
+            .unwrap()
+            .hearing(heard.into());
+    let live = Arc::new(LiveConnections::default());
+    let looks = || live.looks.load(Ordering::Relaxed);
+    let stop = Arc::new(Stop::new());
+    let serving = std::thread::spawn({
+        let (live, stop) = (Arc::clone(&live), Arc::clone(&stop));
+        move || {
+            let listening = listening(1, HANG);
+            let empty = Arc::new(Denied::default());
+            let offering = (listening.scope, listening.serves);
+            serve_seated(
+                ListenerSocket::Link(listener),
+                (
+                    &listening,
+                    Arc::new(move || offering),
+                    Arc::new(move || Arc::clone(&empty)),
+                ),
+                None,
+                &stop,
+                Locality::Link(crate::lan::Scope::Loopback),
+                HANG,
+                (echo, |_| {}),
+                (Arc::new(Slots::new(listening.slots, PREAUTH_GRACE)), live),
+            );
+        }
+    });
+    let until = |what: &str, most: usize| {
+        aterm_spec::wait::until_within(aterm_spec::wait::MUST_HAPPEN, what, || {
+            (looks() >= most).then_some(())
+        });
+    };
+    until("the listener looks", 1);
+    // An `rt_msghdr` head: its length, the routing version, and `RTM_NEWADDR`.
+    kernel.send(&[4, 0, 5, 0xc]).unwrap();
+    until("the listener looks at the change", 2);
+    until("the listener looks once more", 3);
+    stop.set();
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the listener ends at its stop",
+        || serving.is_finished().then_some(()),
+    );
+    serving.join().unwrap();
+}
+
+/// The serving loop reads its listener's change source at the top of every turn, not only in
+/// its idle wait: with connections queued back to back it never idles, and what the listener
+/// heard meanwhile is judged before the next accept. Here a connection waits in the accept
+/// queue and a message on the change source (a datagram socket this test writes to) before the
+/// loop starts, and the listener has no slot to seat anyone in, so the loop refuses that
+/// connection on its own thread, where this test looks at the change source:
+/// - an `RTM_NEWADDR` is read before the connection is accepted (none is left queued at its
+///   refusal);
+/// - a message that is no routing message withdraws the listener before it accepts anyone.
+///
+/// NEGATIVE CONTROL (2026-11-12): without the `listener.drain_changes()` at the top of
+/// `serve_seated`'s loop, the `RTM_NEWADDR` is still queued when the connection is refused
+/// (`left: [(true, true)]`, `right: [(true, false)]`), and the listener whose change source
+/// failed accepts and refuses the connection (`left: [(true, true)]`, `right: [(false, false)]`).
+#[cfg(target_os = "macos")]
+#[test]
+fn a_change_heard_while_connections_queue_is_judged_before_the_next_accept() {
+    // Each event the loop tells: whether it refused a connection, and whether the message was
+    // still queued on the change source then.
+    let turn = |message: &[u8]| {
+        let (kernel, heard) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        let queued = Arc::new(heard.try_clone().unwrap());
+        let listener =
+            crate::lan::Listener::bind("127.0.0.1:0".parse().unwrap(), crate::lan::Scope::Loopback)
+                .unwrap()
+                .hearing(heard.into());
+        let _peer = TcpStream::connect_timeout(&listener.local_addr().unwrap(), HANG).unwrap();
+        assert!(
+            listener.pending_within(HANG).unwrap(),
+            "the connection waits in the queue"
+        );
+        kernel.send(message).unwrap();
+        let stop = Arc::new(Stop::new());
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let on_event = {
+            let (stop, told) = (Arc::clone(&stop), Arc::clone(&told));
+            move |event: FleetEvent| {
+                let still_queued =
+                    !aterm_uds::ready::any_interests_now(&[aterm_uds::ready::Watch::new(
+                        std::os::fd::AsFd::as_fd(&*queued),
+                        aterm_uds::ready::Interest::Read,
+                    )])
+                    .unwrap()
+                    .is_empty();
+                let refused = matches!(event, FleetEvent::Refused { .. });
+                told.lock().unwrap().push((refused, still_queued));
+                if refused {
+                    stop.set();
+                }
+            }
+        };
+        let serving = std::thread::spawn(move || {
+            let listening = listening(1, HANG);
+            let empty = Arc::new(Denied::default());
+            let offering = (listening.scope, listening.serves);
+            serve_seated(
+                ListenerSocket::Link(listener),
+                (
+                    &listening,
+                    Arc::new(move || offering),
+                    Arc::new(move || Arc::clone(&empty)),
+                ),
+                None,
+                &stop,
+                Locality::Link(crate::lan::Scope::Loopback),
+                HANG,
+                (echo, on_event),
+                (Arc::new(Slots::new(0, PREAUTH_GRACE)), Arc::default()),
+            );
+        });
+        aterm_spec::wait::until_within(
+            aterm_spec::wait::MUST_HAPPEN,
+            "the listener ends at its stop or its withdrawal",
+            || serving.is_finished().then_some(()),
+        );
+        serving.join().unwrap();
+        drop(kernel);
+        told.lock().unwrap().clone()
+    };
+    // An `rt_msghdr` head: its length, the routing version, and `RTM_NEWADDR`.
+    assert_eq!(
+        turn(&[4, 0, 5, 0xc]),
+        [(true, false)],
+        "the change is read before the queued connection is accepted"
+    );
+    assert_eq!(
+        turn(&[0]),
+        [(false, false)],
+        "a failed change source withdraws the listener, which accepts no one"
+    );
+}
+
 /// Native time cannot spend a manually driven clock's lifetime or make its deadline spin.
 /// Advancing that clock explicitly wakes the listener and cuts the proved connection.
 #[cfg(unix)]

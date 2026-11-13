@@ -139,9 +139,11 @@ pub(crate) fn drain(fd: i32) -> Vec<u8> {
 #[cfg(unix)]
 #[test]
 fn a_theme_switch_pushes_997_after_the_new_palette_and_an_unrelated_edit_does_not() {
+    use std::os::fd::IntoRawFd;
     let dir = scratch_dir("push");
-    let mut fds = [0; 2];
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let fds = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     assert_eq!(
         unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) },
         0,
@@ -197,9 +199,11 @@ fn a_theme_switch_pushes_997_after_the_new_palette_and_an_unrelated_edit_does_no
 #[cfg(unix)]
 #[test]
 fn a_program_background_outranks_the_theme_until_it_resets() {
+    use std::os::fd::IntoRawFd;
     let dir = scratch_dir("program-bg");
-    let mut fds = [0; 2];
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let fds = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     assert_eq!(
         unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) },
         0,

@@ -381,6 +381,28 @@ fn volume_reports_every_writer(f_flags: u32, fstype: &str) -> bool {
     f_flags & MNT_LOCAL != 0 && !ELSEWHERE.contains(&fstype.to_ascii_lowercase().as_str())
 }
 
+/// Whether this kernel sets the times of the files on the volume the open `file` is on, as it
+/// hears every change of them (`volume_reports_every_writer` on macOS,
+/// `volume_type_reports_every_writer` on Linux): a network, user-space or virtual machine's volume's
+/// times come from a clock elsewhere. `false` where the volume cannot be read, and on a system
+/// neither names.
+#[cfg(unix)]
+pub(crate) fn volume_times_are_this_kernels(file: &std::fs::File) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        crate::shared_write::filesystem_of(file).is_some_and(volume_type_reports_every_writer)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        kqueue::volume_hears_every_writer(file)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = file;
+        false
+    }
+}
+
 /// Whether a Linux volume of `statfs`'s `f_type` `magic` reports every writer's change to
 /// inotify, which hears only what this kernel's own calls do. One the shared-write rule counts as
 /// a network or FUSE one does not ([`crate::shared_write::REMOTE_FILESYSTEMS`]: NFS, SMB 2 and
@@ -1876,7 +1898,7 @@ mod kqueue {
 
     /// Whether the volume `file` is on reports every writer's change to this kqueue
     /// ([`super::volume_reports_every_writer`]); `false` where `fstatfs` refuses.
-    fn volume_hears_every_writer(file: &std::fs::File) -> bool {
+    pub(super) fn volume_hears_every_writer(file: &std::fs::File) -> bool {
         // SAFETY: `statfs` is integers and arrays: all-zero is a value.
         let mut volume: libc::statfs = unsafe { std::mem::zeroed() };
         // SAFETY: a live descriptor and a writable `statfs`.
@@ -2362,14 +2384,20 @@ mod inotify {
             }
             // SAFETY: `raw` is fresh and exclusively ours.
             let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-            let mut pipe = [0; 2];
-            // SAFETY: pipe2 writes two fresh descriptors into the two-slot array.
-            if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) } < 0 {
-                return Err(io::Error::last_os_error());
+            let (wake_read, wake_write) = crate::pipe()?;
+            let (wake_read, wake_write) = (OwnedFd::from(wake_read), OwnedFd::from(wake_write));
+            for end in [&wake_read, &wake_write] {
+                // SAFETY: F_GETFL reads the status flags of a descriptor this function owns.
+                let flags = unsafe { libc::fcntl(end.as_raw_fd(), libc::F_GETFL) };
+                // SAFETY: F_SETFL takes an integer flag word for the same owned descriptor.
+                if flags < 0
+                    || unsafe {
+                        libc::fcntl(end.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    } < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
             }
-            // SAFETY: both descriptors are fresh and exclusively ours.
-            let (wake_read, wake_write) =
-                unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
             Ok(Self {
                 fd,
                 wake_read,

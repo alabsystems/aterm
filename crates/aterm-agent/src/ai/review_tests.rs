@@ -4903,7 +4903,7 @@ fn a_review_reads_a_lone_walled_row_only_on_its_way_to_start_on_it() {
     pool.wall("main");
     let repo = pool.b.dir.path().join("repo");
     let git = |args: &[&str]| {
-        let status = aterm_uds::spawnfd::command(crate::test_program::git())
+        let status = crate::test_program::kept_git_command()
             .args(args)
             .current_dir(&repo)
             .env("HOME", &pool.b.home)

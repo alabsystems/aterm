@@ -299,12 +299,18 @@ fn a_stop_that_meets_the_handler_says_its_line_and_ends_the_process() {
         (libc::SIGINT, false),
     ] {
         let saying = armed.then(|| say_on_stop(line));
-        let (mut said, to_said) = std::io::pipe().expect("pipe");
+        let (mut said, to_said) = aterm_uds::pipe().expect("pipe");
         let to_said_fd = to_said.as_raw_fd();
+        // The write end becomes the child's standard error: unmarked for this fork alone.
+        let handing = aterm_uds::spawn_lock::handing(&[to_said_fd]);
         // SAFETY: the child calls only async-signal-safe functions (`dup2`, `raise`, the
         // handler's `write`, `sigaction` and `_exit`) on a descriptor opened before `fork`,
         // and exits without unwinding.
         let pid = unsafe { libc::fork() };
+        if pid != 0 {
+            // The child's copy of the hold is never released: it ends at its stop or `_exit`s.
+            drop(handing);
+        }
         assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
         if pid == 0 {
             // SAFETY: as above.

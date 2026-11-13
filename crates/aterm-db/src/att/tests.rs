@@ -13,7 +13,7 @@ use super::{
 use crate::{
     alab::{
         Registry,
-        registry::{ADDRESS, MACHINE},
+        registry::{ADDRESS, CLI, MACHINE},
     },
     table::tests::{Lab, repair_commons_first},
     typed::{
@@ -239,6 +239,287 @@ fn history_follows_causality_when_a_writer_clock_runs_behind() {
         .unwrap();
     assert_eq!(shown["hlc"], json!({"ms": u64::MAX, "counter": 4}));
     assert_eq!(shown["authored_ms"], json!(0));
+}
+
+/// A clear of a typed cell (`x: null`), as the grid writes an emptied cell.
+fn clear(pk: &str, column: &str) -> crate::database::Change {
+    put(&MACHINE, pk, column, Value::Null)
+}
+
+/// A set member taken out (`x: false`).
+fn take_out(pk: &str, column: &str, member: &str) -> crate::database::Change {
+    crate::typed::cell::change(
+        &MACHINE,
+        crate::typed::cell::CellKey {
+            pk,
+            col: column,
+            elem: Some(member),
+        },
+        &crate::typed::cell::CellValue::owner(1, Value::Bool(false)),
+    )
+    .unwrap()
+}
+
+/// A table reads as of the causal cut an operation names, through the one read every verb uses,
+/// and two points compare forward with each difference named by the operation, writer and
+/// machine that made it. Mac 0 writes a row (`born`); Mac 1 then sets its status (`parked`) while
+/// Mac 0, concurrently and with a clock claim older than Mac 1's, sets another status and takes a
+/// set member out (`lost`); after both meet, Mac 0 sets a nickname and clears the location
+/// (`after`). As of `parked` the table holds only `born` and `parked`: `lost`, which `parked`
+/// never observed, is left out though its clock claims an earlier time. From `born` to the head
+/// the nickname is added, the location and the member retired, and the status conflict-changed
+/// by both concurrent writes; from `born` to `parked` the status is changed, by Mac 1 alone.
+/// NEGATIVE CONTROL: with `Log::as_of` keeping every operation (its cut ignored), `get --at`
+/// reads the head: `` assertion `left == right` failed: as of born left: Null right:
+/// String("rack b") ``. With the cut taken by authored time (every operation whose clock claims
+/// no later time than the point's), `lost`, which claims an earlier time than `born`, joins
+/// `born`'s cut: `` left: String("lost") right: String("active") ``.
+#[test]
+fn a_table_reads_as_of_an_operation_and_diffs_two_points() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    Registry::at(lab.paths[0].clone()).open().unwrap();
+    let here = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let mut born_row = machine(MC);
+    born_row[2] = put(&MACHINE, MC, "location", json!("rack b"));
+    let born = append_history_at(
+        &here,
+        Command::Write {
+            request: [81; 16],
+            changes: born_row,
+        },
+        2_000,
+    );
+    repair_new_registry(&lab);
+    let there = Handle::at(lab.paths[1].clone(), &REGISTRY);
+    let parked = append_history_at(
+        &there,
+        Command::Write {
+            request: [82; 16],
+            changes: vec![put(&MACHINE, MC, "status", json!("parked"))],
+        },
+        3_000,
+    );
+    let lost = append_history_at(
+        &here,
+        Command::Write {
+            request: [83; 16],
+            changes: vec![
+                put(&MACHINE, MC, "status", json!("lost")),
+                take_out(MC, "clis", "codex"),
+            ],
+        },
+        1_000,
+    );
+    repair_registry(&lab, 2);
+    let after = append_history_at(
+        &here,
+        Command::Write {
+            request: [84; 16],
+            changes: vec![
+                put(&MACHINE, MC, "nickname", json!("spare")),
+                clear(MC, "location"),
+            ],
+        },
+        4_000,
+    );
+    repair_registry(&lab, 2);
+    let hex = |id: &Digest| hex::encode_lower(id);
+    let get_at = |at: Option<&Digest>| {
+        let mut words = vec!["get", "alab/registry", "machine", MC];
+        let at = at.map(hex);
+        if let Some(at) = &at {
+            words.extend(["--at", at.as_str()]);
+        }
+        let Output::Json(row) = run(&lab.paths[0], &words) else {
+            panic!("get prints JSON");
+        };
+        row["row"].clone()
+    };
+
+    // As of `born`: the row as Mac 0 first wrote it.
+    let as_born = get_at(Some(&born));
+    assert_eq!(as_born["location"], json!("rack b"), "as of born");
+    assert_eq!(as_born["status"], json!("active"));
+    assert_eq!(as_born["clis"], json!(["claude", "codex"]));
+    assert_eq!(as_born["nickname"], Value::Null);
+    // As of `parked`: Mac 1's status, without `lost`, whose clock claims an earlier time.
+    let as_parked = get_at(Some(&parked));
+    assert_eq!(as_parked["status"], json!("parked"), "as of parked");
+    assert_eq!(as_parked["clis"], json!(["claude", "codex"]));
+    // The head: both statuses, the nickname, no location.
+    let head = get_at(None);
+    let mut statuses: Vec<String> = head["status"]["conflict"]
+        .as_array()
+        .expect("the head's status is a conflict")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect();
+    statuses.sort();
+    assert_eq!(statuses, ["lost", "parked"]);
+    assert_eq!(head["nickname"], json!("spare"));
+    assert_eq!(head["location"], Value::Null);
+    assert_eq!(head["clis"], json!(["claude"]));
+    // scan and export read the same cut.
+    let Output::Json(scanned) = run(
+        &lab.paths[0],
+        &["scan", "alab/registry", "machine", "--at", &hex(&born)],
+    ) else {
+        panic!("scan prints JSON");
+    };
+    assert_eq!(scanned["rows"][0]["location"], json!("rack b"));
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let file = scratch.path().join("machine.tsv");
+    let word = file.to_str().unwrap();
+    run(
+        &lab.paths[0],
+        &[
+            "export",
+            "alab/registry",
+            "machine",
+            "--tsv",
+            word,
+            "--at",
+            &hex(&parked),
+        ],
+    );
+    let exported = std::fs::read_to_string(&file).unwrap();
+    assert!(exported.contains("\tparked\t"), "{exported}");
+    assert!(!exported.contains("lost"), "{exported}");
+    // A point this table does not hold is refused, never read as the head.
+    let unknown = command::run(
+        &lab.paths[0],
+        &[
+            "get",
+            "alab/registry",
+            "machine",
+            MC,
+            "--at",
+            &hex(&[9; 32]),
+        ]
+        .map(str::to_owned),
+        &mut never_open,
+        &mut |_| {},
+    );
+    assert!(unknown.is_err());
+
+    // Each operation's machine, as history resolves it.
+    let history = here.history().unwrap();
+    let machine_of = |id: &Digest| {
+        history
+            .iter()
+            .find(|entry| entry.operation == *id)
+            .unwrap()
+            .machine
+    };
+    assert_ne!(machine_of(&parked), machine_of(&lost), "two Macs wrote");
+    let made = |diff: &Diff, key: &str| {
+        let cell = diff
+            .cells
+            .iter()
+            .find(|cell| cell.collection == MACHINE.name && cell.key == key)
+            .unwrap_or_else(|| panic!("{key} differs"));
+        (
+            cell.delta,
+            cell.by
+                .iter()
+                .map(|by| (by.operation, by.machine))
+                .collect::<BTreeSet<_>>(),
+        )
+    };
+
+    // From `born` to the head: every kind of difference, each with its makers.
+    let to_head = here.diff(born, Point::Head).unwrap();
+    assert_eq!(
+        made(&to_head, &format!("{MC}.nickname")),
+        (Delta::Added, BTreeSet::from([(after, machine_of(&after))]))
+    );
+    assert_eq!(
+        made(&to_head, &format!("{MC}.location")),
+        (
+            Delta::Retired,
+            BTreeSet::from([(after, machine_of(&after))])
+        )
+    );
+    assert_eq!(
+        made(&to_head, &format!("{MC}.clis.codex")),
+        (Delta::Retired, BTreeSet::from([(lost, machine_of(&lost))]))
+    );
+    assert_eq!(
+        made(&to_head, &format!("{MC}.status")),
+        (
+            Delta::ConflictChanged,
+            BTreeSet::from([(parked, machine_of(&parked)), (lost, machine_of(&lost))])
+        )
+    );
+    assert!(
+        !to_head.cells.iter().any(
+            |cell| cell.key == format!("{MC}.label") || cell.key == format!("{MC}.clis.claude")
+        ),
+        "an unchanged cell is not a difference"
+    );
+    // From `born` to `parked`: the status changed, by Mac 1 alone; nothing else.
+    let to_parked = here.diff(born, Point::At(parked)).unwrap();
+    assert_eq!(
+        to_parked
+            .cells
+            .iter()
+            .map(|cell| (cell.key.as_str(), cell.delta))
+            .collect::<Vec<_>>(),
+        vec![(format!("{MC}.status").as_str(), Delta::Changed)]
+    );
+    assert_eq!(
+        made(&to_parked, &format!("{MC}.status")).1,
+        BTreeSet::from([(parked, machine_of(&parked))])
+    );
+    // `lost` never observed `parked`: no forward comparison runs between them.
+    assert!(here.diff(parked, Point::At(lost)).is_err());
+    // A peer that holds the same operations answers the same comparison.
+    assert_eq!(there.diff(born, Point::Head).unwrap(), to_head);
+
+    // The verb: one cell per difference, with its operation, author and machine.
+    let Output::Json(shown) = run(
+        &lab.paths[0],
+        &["diff", "alab/registry", "machine", &hex(&born), "head"],
+    ) else {
+        panic!("diff prints JSON");
+    };
+    assert_eq!(shown["from"], json!(hex(&born)));
+    assert_eq!(shown["to"], json!("head"));
+    let status = shown["cells"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|cell| cell["key"] == json!(format!("{MC}.status")))
+        .unwrap();
+    assert_eq!(status["change"], json!("conflict-changed"));
+    assert_eq!(status["before"], json!(["active"]));
+    let by: BTreeSet<String> = status["by"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|by| {
+            assert_eq!(by["author"].as_str().unwrap().len(), 96);
+            assert!(by["machine"].as_str().is_some());
+            by["operation"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(by, BTreeSet::from([hex(&parked), hex(&lost)]));
+    let Output::Json(forward) = run(
+        &lab.paths[0],
+        &["diff", "alab/registry", &hex(&born), &hex(&parked)],
+    ) else {
+        panic!("diff prints JSON");
+    };
+    assert_eq!(forward["cells"].as_array().unwrap().len(), 1);
+    // A mistyped digest is refused as a digest, never taken for a collection.
+    let mistyped = command::run(
+        &lab.paths[0],
+        &["diff", "alab/registry", &hex(&born).to_uppercase()].map(str::to_owned),
+        &mut never_open,
+        &mut |_| {},
+    )
+    .unwrap_err();
+    assert!(mistyped.to_string().contains("hex"), "{mistyped}");
 }
 
 /// A grid save on one Mac never overwrites what another Mac wrote after the export: of the
@@ -737,6 +1018,135 @@ fn assert_quota_revert(owner_first: bool) {
 #[test]
 fn typed_revert_ignores_later_over_quota_edits() {
     assert_quota_revert(true);
+}
+
+/// An explicit undo of a withdrawn machine number has the same claim semantics whether
+/// the exact beforeimage is a native value or a candidate carried by a registry roll.
+#[test]
+fn typed_claim_undo_keeps_its_semantics_across_a_registry_roll() {
+    use crate::table::tests::repair_commons;
+    let pks = ["mc-0000000000000001", "mc-0000000000000002"];
+    for rolled in [false, true] {
+        let lab = Lab::new(&[Role::Writer, Role::Writer]);
+        let macs: Vec<_> = lab.paths.iter().cloned().map(Registry::at).collect();
+        for registry in &macs {
+            registry.open().unwrap();
+        }
+        repair_commons(&lab, 6);
+        for (registry, pk) in macs.iter().zip(pks) {
+            let mut row = machine(pk);
+            row[0] = put(&MACHINE, pk, "label", json!("m7"));
+            registry.write(vec![row]).unwrap();
+        }
+        repair_commons(&lab, 6);
+        let original = macs[0].view().unwrap().project(&MACHINE);
+        let winner = pks
+            .iter()
+            .position(|pk| original.rows[*pk].get("label") == Some(&json!("m7")))
+            .unwrap();
+        let now = || aterm_time::unix_millis().unwrap();
+        if rolled {
+            macs[0].roll(true, now()).unwrap();
+            repair_commons(&lab, 6);
+            macs[1].release(now()).unwrap();
+            repair_commons(&lab, 6);
+            assert!(macs[0].roll(true, now()).unwrap().sealed);
+            repair_commons(&lab, 6);
+            assert_eq!(macs[winner].generation().generation, 2);
+            assert_eq!(
+                macs[winner].view().unwrap().project(&MACHINE).rows[pks[winner]].get("label"),
+                Some(&json!("m7")),
+            );
+        }
+        macs[winner]
+            .write(vec![vec![put(&MACHINE, pks[winner], "label", json!("m8"))]])
+            .unwrap();
+        let handle = Handle::at(lab.paths[winner].clone(), macs[winner].generation());
+        let coordinate = (MACHINE.name.to_owned(), format!("{}.label", pks[winner]));
+        let target = handle.view().unwrap().cells[&coordinate].candidates[0].operation;
+        let undone = handle.revert([81; 16], target).unwrap();
+        let read = handle.view().unwrap();
+        assert_eq!(read.cells[&coordinate].candidates[0].operation, undone);
+        let signed = read
+            .ops
+            .iter()
+            .find(|operation| operation.id == undone)
+            .unwrap();
+        assert_eq!(
+            crate::typed::cell::carried_refs(signed.changes[0].value.as_ref().unwrap()).is_some(),
+            rolled,
+            "the signed compensation still contains its exact beforeimage"
+        );
+        assert!(
+            crate::typed::cell::CellValue::decode(&read.cells[&coordinate].candidates[0].value)
+                .is_ok()
+        );
+        let restored = read.project(&MACHINE);
+        assert_eq!(
+            restored.rows[pks[1 - winner]].get("label"),
+            Some(&json!("m7")),
+            "a restored claim follows the incumbent after its withdrawal, rolled={rolled}"
+        );
+    }
+}
+
+/// A lifecycle reactivation reasserts the observed claim at its signed event, including
+/// when the registry carries that assertion into a sealed generation.
+#[test]
+fn a_revived_machine_keeps_the_replacement_holders_label_across_a_roll() {
+    use crate::table::tests::repair_commons;
+    let pks = ["mc-0000000000000001", "mc-0000000000000002"];
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let macs: Vec<_> = lab.paths.iter().cloned().map(Registry::at).collect();
+    for registry in &macs {
+        registry.open().unwrap();
+    }
+    repair_commons(&lab, 6);
+    let mut first = machine(pks[0]);
+    first[0] = put(&MACHINE, pks[0], "label", json!("m7"));
+    macs[0].write(vec![first]).unwrap();
+    macs[0]
+        .write(vec![vec![put(&MACHINE, pks[0], "row", json!("retired"))]])
+        .unwrap();
+    repair_commons(&lab, 6);
+    let mut second = machine(pks[1]);
+    second[0] = put(&MACHINE, pks[1], "label", json!("m7"));
+    macs[1].write(vec![second]).unwrap();
+    repair_commons(&lab, 6);
+    macs[0]
+        .write(vec![vec![put(&MACHINE, pks[0], "row", json!("live"))]])
+        .unwrap();
+    repair_commons(&lab, 6);
+    for registry in &macs {
+        let view = registry.view().unwrap();
+        assert_eq!(
+            view.project(&MACHINE).rows[pks[1]].get("label"),
+            Some(&json!("m7"))
+        );
+        assert_ne!(
+            view.project(&MACHINE).rows[pks[0]].get("label"),
+            Some(&json!("m7"))
+        );
+    }
+    let now = || aterm_time::unix_millis().unwrap();
+    macs[0].roll(true, now()).unwrap();
+    repair_commons(&lab, 6);
+    macs[1].release(now()).unwrap();
+    repair_commons(&lab, 6);
+    assert!(macs[0].roll(true, now()).unwrap().sealed);
+    repair_commons(&lab, 6);
+    for registry in &macs {
+        assert_eq!(registry.generation().generation, 2);
+        let view = registry.view().unwrap();
+        assert_eq!(
+            view.project(&MACHINE).rows[pks[1]].get("label"),
+            Some(&json!("m7"))
+        );
+        assert_ne!(
+            view.project(&MACHINE).rows[pks[0]].get("label"),
+            Some(&json!("m7"))
+        );
+    }
 }
 
 /// Compensation restores the same preimage the typed reader saw, not an inert automatic
@@ -1285,4 +1695,246 @@ fn a_read_that_a_writer_kept_busy_reopens_until_it_reads() {
     });
     assert!(read.is_err_and(|e| e.is_busy()));
     assert_eq!(attempts, 1, "past the deadline a busy read is the answer");
+}
+
+/// A machine row `label` keyed `pk`, live, as a write lands it.
+fn other_machine(pk: &str, label: &str) -> Vec<Change> {
+    vec![
+        put(&MACHINE, pk, "label", json!(label)),
+        put(&MACHINE, pk, "status", json!("active")),
+        put(&MACHINE, pk, "row", json!("live")),
+    ]
+}
+
+/// The machine key no row of these tests holds.
+const MISSING: &str = "mc-00000000000000ff";
+/// A machine row these tests make.
+const OTHER: &str = "mc-0000000000000008";
+
+/// The problems a save comes back with, or a panic naming what it wrote instead.
+fn problems(saved: Saved) -> Vec<grid::Problem> {
+    match saved {
+        Saved::Problems(problems) => problems,
+        Saved::Written { applied, .. } => panic!("the save was written: {applied:?}"),
+    }
+}
+
+/// A grid save whose `Ref` cell, or whose `Set(Ref)` element, names a row its target
+/// collection does not hold is refused at that cell, as the registry's own rules refuse a
+/// write, and nothing of it is written, not even the row's other edited cell. A reference to a
+/// row the table holds is written, and a column already dangling (an unguarded write made it
+/// so, as a concurrent one can) holds back no save that leaves it alone, while `check` still
+/// reports it.
+/// NEGATIVE CONTROL: with `Compiled::rules` answering the table's guard alone
+/// (`typed::check::missing_row` not called), the save naming the missing machine is written:
+/// `` the save was written: Applied { records: 1, cells: 2, .. } ``.
+#[test]
+fn a_grid_save_naming_a_missing_row_is_refused_and_writes_nothing() {
+    let lab = Lab::new(&[Role::Writer]);
+    let owner = Registry::at(lab.paths[0].clone());
+    owner.open().unwrap();
+    owner
+        .write(vec![
+            machine(MC),
+            other_machine(OTHER, "m8"),
+            vec![put(&CLI, "agy", "row", json!("live"))],
+        ])
+        .unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let written = handle.history().unwrap().len();
+    let exported = export_machines(&lab.paths[0]);
+    let row = record(&exported.text, MC);
+    let moved = type_in(&exported.text, row, "location", "rack b");
+
+    let named = type_in(&moved, row, "merged_into", MISSING);
+    let found = problems(handle.save(&MACHINE, &exported.base, &named).unwrap());
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].rule, "machine.merged_into: no such machine row");
+    assert_eq!(
+        (found[0].record, found[0].column),
+        (row, sheet::tests::column(&named, "merged_into"))
+    );
+    assert!(!found[0].rule.contains(MISSING), "a refusal quotes no key");
+
+    let added = type_in(&moved, row, "clis", "agy, claude, codex, nonesuch");
+    let found = problems(handle.save(&MACHINE, &exported.base, &added).unwrap());
+    assert_eq!(found[0].rule, "machine.clis: no such cli row");
+    assert_eq!(found[0].column, sheet::tests::column(&added, "clis"));
+
+    assert_eq!(handle.history().unwrap().len(), written, "nothing written");
+    let rows = handle.view().unwrap().project(&MACHINE).rows;
+    assert_eq!(rows[MC].get("location"), Some(&json!("rack a")));
+    assert_eq!(rows[MC].get("merged_into"), None);
+
+    // Rows the table holds are named, and both edits land.
+    let held = type_in(
+        &type_in(&moved, row, "merged_into", OTHER),
+        row,
+        "clis",
+        "agy, claude, codex",
+    );
+    let Saved::Written { applied, .. } = handle.save(&MACHINE, &exported.base, &held).unwrap()
+    else {
+        panic!("references to held rows are written");
+    };
+    assert_eq!(applied.records, 1);
+    let rows = handle.view().unwrap().project(&MACHINE).rows;
+    assert_eq!(rows[MC].get("merged_into"), Some(&json!(OTHER)));
+    assert!(rows[MC].fields["clis"].has_member("agy"));
+
+    // A reference already dangling, in a column the save leaves alone, holds nothing back.
+    owner
+        .write(vec![vec![put(
+            &MACHINE,
+            OTHER,
+            "merged_into",
+            json!(MISSING),
+        )]])
+        .unwrap();
+    let exported = export_machines(&lab.paths[0]);
+    let saved = type_in(
+        &exported.text,
+        record(&exported.text, OTHER),
+        "location",
+        "rack c",
+    );
+    let Saved::Written { .. } = handle.save(&MACHINE, &exported.base, &saved).unwrap() else {
+        panic!("a save that leaves a dangling column alone is written");
+    };
+    let Output::Json(checked) = run(&lab.paths[0], &["check", "alab/registry"]) else {
+        panic!("check prints JSON");
+    };
+    let dangling: Vec<_> = checked["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["finding"] == json!("dangling") && f["column"] == json!("merged_into"))
+        .collect();
+    assert_eq!(dangling.len(), 1, "{checked}");
+    assert_eq!(dangling[0]["pk"], json!(OTHER));
+}
+
+/// An owner verb's write and a revert pass the same rule as a grid save: a write naming a
+/// missing row is refused and appends nothing, one that makes the row it names in the same
+/// write is written, and a revert whose compensation would restore a reference to a missing row
+/// is refused.
+/// NEGATIVE CONTROL: with `Compiled::rules` answering the table's guard alone, the owner verb
+/// naming the missing machine is written: `` an owner write naming a missing row is refused ``.
+#[test]
+fn an_owner_write_and_a_revert_naming_a_missing_row_are_refused() {
+    let lab = Lab::new(&[Role::Writer]);
+    let owner = Registry::at(lab.paths[0].clone());
+    owner.open().unwrap();
+    owner.write(vec![machine(MC)]).unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    let written = handle.history().unwrap().len();
+
+    let refused = handle
+        .commit_owner(|_| {
+            Ok((
+                (),
+                vec![vec![put(&MACHINE, MC, "merged_into", json!(MISSING))]],
+            ))
+        })
+        .expect_err("an owner write naming a missing row is refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("machine.merged_into: row mc-0000000000000009: no such machine row"),
+        "{refused}"
+    );
+    assert_eq!(handle.history().unwrap().len(), written, "nothing written");
+
+    let mut born = other_machine(OTHER, "m8");
+    born.push(put(&MACHINE, MC, "merged_into", json!(OTHER)));
+    handle.commit_owner(|_| Ok(((), vec![born]))).unwrap();
+
+    // An unguarded write leaves MC naming a missing row; the owner then names a held one, and
+    // undoing that would name the missing row again.
+    owner
+        .write(vec![vec![put(&MACHINE, MC, "merged_into", json!(MISSING))]])
+        .unwrap();
+    let ((), applied) = handle
+        .commit_owner(|_| {
+            Ok((
+                (),
+                vec![vec![put(&MACHINE, MC, "merged_into", json!(OTHER))]],
+            ))
+        })
+        .unwrap();
+    let written = handle.history().unwrap().len();
+    let refused = handle
+        .revert([7; 16], applied.operations[0])
+        .expect_err("a revert restoring a missing row's reference is refused");
+    assert!(
+        refused
+            .to_string()
+            .contains("machine.merged_into: row mc-0000000000000009: no such machine row"),
+        "{refused}"
+    );
+    assert_eq!(handle.history().unwrap().len(), written, "nothing written");
+    assert_eq!(
+        handle.view().unwrap().project(&MACHINE).rows[MC].get("merged_into"),
+        Some(&json!(OTHER))
+    );
+}
+
+/// A row every build of the table compiles (a registry seed: a CLI, provider or plan) may be
+/// named before any seed pass has written it here, as the next pass writes it: a grid save adding
+/// a compiled CLI to a machine on a registry no pass seeded is written, `check` reports the
+/// reference until a pass writes the row, and then reports nothing. A key no build compiles is
+/// still refused.
+/// NEGATIVE CONTROL: with `Compiled::rules` passing `|_, _| false` for `Compiled::seeded`, the
+/// save naming the compiled CLI is refused: `` panicked … a compiled seed row may be named ``.
+#[test]
+fn a_write_may_name_a_seed_row_no_pass_has_written_here() {
+    let lab = Lab::new(&[Role::Writer]);
+    let owner = Registry::at(lab.paths[0].clone());
+    owner.open().unwrap();
+    owner.write(vec![other_machine(OTHER, "m8")]).unwrap();
+    let handle = Handle::at(lab.paths[0].clone(), &REGISTRY);
+    assert!(
+        !handle
+            .view()
+            .unwrap()
+            .project(&CLI)
+            .rows
+            .contains_key("grok"),
+        "no seed pass wrote the CLI rows here"
+    );
+    let dangling = |paths: &Paths| {
+        let Output::Json(checked) = run(paths, &["check", "alab/registry"]) else {
+            panic!("check prints JSON");
+        };
+        checked["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| {
+                f["finding"] == json!("dangling")
+                    && f["pk"] == json!(OTHER)
+                    && f["column"] == json!("clis")
+            })
+            .count()
+    };
+
+    let exported = export_machines(&lab.paths[0]);
+    let row = record(&exported.text, OTHER);
+    let unknown = type_in(&exported.text, row, "clis", "nonesuch");
+    let found = problems(handle.save(&MACHINE, &exported.base, &unknown).unwrap());
+    assert_eq!(found[0].rule, "machine.clis: no such cli row");
+
+    let compiled = type_in(&exported.text, row, "clis", "grok");
+    let Saved::Written { applied, .. } = handle.save(&MACHINE, &exported.base, &compiled).unwrap()
+    else {
+        panic!("a compiled seed row may be named");
+    };
+    assert_eq!(applied.cells, 1);
+    assert_eq!(dangling(&lab.paths[0]), 1, "check reports it unseeded");
+    owner.seed().unwrap();
+    assert_eq!(
+        dangling(&lab.paths[0]),
+        0,
+        "a seed pass writes every named row"
+    );
 }

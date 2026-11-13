@@ -2,6 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+
+/// The build the copy's update record holds now, 0 for none.
+fn held_build(context: &Context) -> u64 {
+    UpdateRecord::load(&context.record())
+        .live_hold(crate::unix_now())
+        .map_or(0, |hold| hold.build)
+}
 use ring::signature::{Ed25519KeyPair, KeyPair};
 
 #[test]
@@ -284,25 +291,15 @@ fn staged_status_and_reuse_obey_new_minimum_revocations_and_exact_current_bytes(
         &manifest,
         native().unwrap()
     ));
-    for (min_build, high_water, rejected_build, admitted) in
-        [(11, 10, 0, true), (0, 11, 0, false), (0, 10, 11, false)]
-    {
-        (
-            f.state.min_build,
-            f.state.high_water,
-            f.state.rejected_build,
-        ) = (min_build, high_water, rejected_build);
+    for (min_build, high_water, admitted) in [(11, 10, true), (0, 11, false)] {
+        (f.state.min_build, f.state.high_water) = (min_build, high_water);
         assert_eq!(
             reusable_stage(&f.context, &f.state, &manifest, native().unwrap()),
             admitted,
-            "min_build {min_build}, high_water {high_water}, rejected {rejected_build}"
+            "min_build {min_build}, high_water {high_water}"
         );
     }
-    (
-        f.state.min_build,
-        f.state.high_water,
-        f.state.rejected_build,
-    ) = (0, 10, 0);
+    (f.state.min_build, f.state.high_water) = (0, 10);
     f.state.staged.as_mut().unwrap().machine_id = Some("revoked".into());
     f.state.revoked_machines.push("revoked".into());
     assert!(linux_status(&f.context, &f.state).staged_build.is_none());
@@ -461,7 +458,6 @@ impl Fixture {
             trial: None,
             staged: None,
             rejected_build: 0,
-            rejected_unstarted: false,
             kept_unproven: None,
             unsaid_trial_ends: Vec::new(),
             outcome: String::new(),
@@ -950,17 +946,46 @@ fn verified_native_update_replaces_disk_without_changing_open_old_inode_and_roll
         hash_file(&f.context.backup(&f.state.trial.as_ref().unwrap().old)).unwrap(),
         old_hash
     );
-    assert!(!linux_status(&f.context, &f.state).refused_newer);
+    assert_eq!(held_build(&f.context), 0);
     rollback_locked(&f.context, &mut f.state).unwrap();
     assert_eq!(hash_file(&f.context.target).unwrap(), old_hash);
     assert_eq!(
-        f.state.high_water, 11,
-        "repair is not permission to replay the failed build"
+        f.state.high_water, 10,
+        "the floor drops back below the build that never settled; its hold, not the floor, \
+         keeps it from being replayed at once"
     );
-    assert_eq!(f.state.rejected_build, 11);
+    assert_eq!(held_build(&f.context), 11);
+    let status = status_in(Ok(&f.context), 10);
     assert!(
-        linux_status(&f.context, &f.state).refused_newer,
-        "`aterm update status` must not call the rolled-back copy up to date"
+        status
+            .hold
+            .as_ref()
+            .is_some_and(|hold| hold.live && hold.build == 11),
+        "`aterm update status` must not call the rolled-back copy up to date: {status:?}"
+    );
+
+    // While the hold lasts, the same artifact is refused; once it lapses, it is tried again.
+    let candidate = f.context.dir.join("candidate");
+    let restage = || {
+        fs::write(&candidate, elf(2, native().unwrap())).unwrap();
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o644)).unwrap();
+    };
+    restage();
+    let refused = f.apply().unwrap_err();
+    assert!(refused.contains("held"), "{refused}");
+    assert_eq!(f.state.installed.build, 10);
+    UpdateRecord::edit(&f.context.record(), |record| {
+        let hold = record.hold.as_mut().unwrap();
+        hold.at -= hold.span;
+        hold.until -= hold.span;
+    })
+    .unwrap();
+    assert_eq!(held_build(&f.context), 0);
+    restage();
+    f.apply().unwrap();
+    assert_eq!(
+        f.state.installed.build, 11,
+        "a rolled-back build is retried once its hold lapses"
     );
 }
 
@@ -1131,8 +1156,9 @@ fn a_linux_apply_and_rollback_order_their_steps_and_keep_the_state_durable() {
     rollback_locked(&f.context, &mut f.state).unwrap();
     assert_eq!(
         recording.take(),
-        [O, D, D, O, D, D],
-        "the restored copy, RollbackPrepared saved, its rename into place, the rollback saved"
+        [O, D, D, O, D, D, D, D],
+        "the restored copy, RollbackPrepared saved, its rename into place, the rollback \
+         saved, then the update record's hold, file and folder"
     );
 }
 
@@ -1490,7 +1516,7 @@ fn a_window_that_has_not_confirmed_still_decides_after_a_session_confirms() {
     );
     let state = f.context.read_state().unwrap().unwrap();
     assert_eq!(state.installed.build, 10);
-    assert_eq!(state.rejected_build, 11);
+    assert_eq!(held_build(&f.context), 11);
 }
 
 #[test]
@@ -1520,7 +1546,7 @@ fn a_silent_session_still_up_buys_its_burst_one_more_window() {
     assert!(!session_start(&silent, t0 + 21));
     let state = silent.context.read_state().unwrap().unwrap();
     assert_eq!(
-        (state.installed.build, state.rejected_build),
+        (state.installed.build, held_build(&silent.context)),
         (10, 11),
         "PRECONDITION: without the deferral the burst is rolled back"
     );
@@ -1547,7 +1573,7 @@ fn a_silent_session_still_up_buys_its_burst_one_more_window() {
     assert_eq!(f.context.read_state().unwrap().unwrap().installed.build, 11);
     assert!(!session_start(&f, t0 + 31));
     let state = f.context.read_state().unwrap().unwrap();
-    assert_eq!((state.installed.build, state.rejected_build), (10, 11));
+    assert_eq!((state.installed.build, held_build(&f.context)), (10, 11));
 
     let mut late = Fixture::new();
     late.apply().unwrap();
@@ -1678,7 +1704,7 @@ fn a_crash_loop_restarting_every_five_seconds_is_rolled_back() {
     );
     let state = f.context.read_state().unwrap().unwrap();
     assert_eq!(state.installed.build, 10);
-    assert_eq!(state.rejected_build, 11);
+    assert_eq!(held_build(&f.context), 11);
 }
 
 #[test]
@@ -1811,7 +1837,7 @@ fn a_trial_no_rollback_can_be_taken_from_ends_and_the_copy_updates_again() {
         let state = f.context.read_state().unwrap().unwrap();
         assert!(state.trial.is_none(), "{way}: the trial is over");
         assert_eq!(state.installed.build, 11, "{way}: the build stays");
-        assert_eq!(state.rejected_build, 0, "{way}: and is not refused");
+        assert_eq!(held_build(&f.context), 0, "{way}: and is not refused");
         assert_eq!(
             state.kept_unproven,
             Some(11),
@@ -1890,7 +1916,7 @@ fn a_rotated_signers_build_still_comes_back_from_a_crash_loop() {
             state.outcome
         );
         assert_eq!(state.installed.build, 10, "manual={manual}");
-        assert_eq!(state.rejected_build, 11, "manual={manual}");
+        assert_eq!(held_build(&f.context), 11, "manual={manual}");
         assert!(state.trial.is_none(), "manual={manual}");
         assert!(
             state.revoked_machines.contains(&"m3".to_string()),
@@ -1926,7 +1952,7 @@ mod v098 {
         trial: Option<Trial>,
         #[serde(default)]
         staged: Option<Identity>,
-        rejected_build: u64,
+        pub(super) rejected_build: u64,
         outcome: String,
         updated_at: String,
         failing_checks: u32,
@@ -1937,6 +1963,41 @@ mod v098 {
         last_attempt_unix: i64,
         pub(super) next_check_unix: i64,
     }
+}
+
+/// A ROLLBACK ACROSS THE RECORD'S BOUNDARY: a pre-record build of this copy reads
+/// `rejected_build` as a refusal of every build at or below it, for good, and never reads the
+/// update record. A rollback the record-era build makes writes the rolled-back build there while
+/// the record's hold on it lives, so the restored older build refuses it as it would have after
+/// its own rollback, until a newer release ships (which it admits, and which then rewrites the
+/// field from the record). Writing 0 instead would let the older build reinstall the broken one
+/// at every check, a crash loop the record's schedule cannot reach. Once the hold ends, a save
+/// by a record-era build writes 0.
+/// NEGATIVE CONTROL: a `save` that never writes the field fails the first assertion; one that
+/// writes the hold's build whether or not it lives fails the second.
+#[test]
+fn a_rollback_names_the_held_build_to_a_pre_record_build_only_while_it_holds() {
+    let mut f = Fixture::new();
+    f.apply().unwrap();
+    rollback_locked(&f.context, &mut f.state).unwrap();
+    let older = |f: &Fixture| -> v098::State {
+        let text = fs::read_to_string(f.context.dir.join("state.toml")).unwrap();
+        aterm_toml::from_str(&text).expect("0.98 reads the state")
+    };
+    assert_eq!(older(&f).rejected_build, 11, "the older build refuses it");
+    UpdateRecord::edit(&f.context.record(), |record| {
+        record.end_hold(
+            aterm_update_core::update_record::Ending::Person,
+            crate::unix_now(),
+        )
+    })
+    .unwrap();
+    f.context.save(&f.state).unwrap();
+    assert_eq!(
+        older(&f).rejected_build,
+        0,
+        "the hold ended, so the field is 0"
+    );
 }
 
 fn save_as_098(f: &Fixture) {
@@ -1962,7 +2023,7 @@ fn an_older_builds_save_mid_trial_keeps_the_window_verdict() {
     assert!(!window_start(&f, minute(i64::from(MAX_TRIAL_STARTS) + 1)));
     let state = f.context.read_state().unwrap().unwrap();
     assert_eq!(state.installed.build, 10);
-    assert_eq!(state.rejected_build, 11);
+    assert_eq!(held_build(&f.context), 11);
 
     let mut g = Fixture::new();
     g.apply().unwrap();
@@ -2217,7 +2278,7 @@ fn an_inherited_rollback_target_a_yank_ruled_out_is_not_inherited() {
         let state = f.context.read_state().unwrap().unwrap();
         assert_eq!(state.installed.build, target.build, "yank={yank}");
         assert_eq!(hash_file(&f.context.target).unwrap(), target.sha256);
-        assert_eq!(state.rejected_build, 12);
+        assert_eq!(held_build(&f.context), 12);
     }
 }
 
@@ -2238,7 +2299,7 @@ fn an_older_builds_save_mid_burst_still_rolls_a_crash_loop_back() {
     ));
     let state = g.context.read_state().unwrap().unwrap();
     assert_eq!(state.installed.build, 10);
-    assert_eq!(state.rejected_build, 11);
+    assert_eq!(held_build(&g.context), 11);
 }
 
 fn clock_at(unix: i64, boot: &str, secs: i64) -> StartClock {
@@ -2268,7 +2329,7 @@ fn a_clock_step_mid_burst_rolls_no_healthy_build_back() {
         assert_eq!(session_confirm(&f), Confirmed::Yes, "step {step}");
         let state = f.context.read_state().unwrap().unwrap();
         assert_eq!(state.installed.build, 11, "step {step}: {}", state.outcome);
-        assert_eq!(state.rejected_build, 0, "step {step}");
+        assert_eq!(held_build(&f.context), 0, "step {step}");
     }
     for step in [3_600, -3_600, 0] {
         let mut g = Fixture::new();
@@ -2286,7 +2347,7 @@ fn a_clock_step_mid_burst_rolls_no_healthy_build_back() {
         );
         let state = g.context.read_state().unwrap().unwrap();
         assert_eq!(state.installed.build, 10, "step {step}");
-        assert_eq!(state.rejected_build, 11, "step {step}");
+        assert_eq!(held_build(&g.context), 11, "step {step}");
     }
     for next in [
         clock_at(t0 + 3_600, "boot-b", 7),
@@ -2298,11 +2359,7 @@ fn a_clock_step_mid_burst_rolls_no_healthy_build_back() {
             assert!(session_start(&h, clock_at(t0, "boot-a", 500)));
         }
         assert!(!session_start(&h, next.clone()), "{next:?}");
-        assert_eq!(
-            h.context.read_state().unwrap().unwrap().rejected_build,
-            11,
-            "{next:?}"
-        );
+        assert_eq!(held_build(&h.context), 11, "{next:?}");
     }
 }
 
@@ -2353,7 +2410,7 @@ fn a_start_that_waited_on_the_lock_rolls_no_healthy_build_back() {
         );
         let state = f.context.read_state().unwrap().unwrap();
         assert_eq!(state.installed.build, 11, "{lane:?}: {}", state.outcome);
-        assert_eq!(state.rejected_build, 0, "{lane:?}");
+        assert_eq!(held_build(&f.context), 0, "{lane:?}");
 
         let mut g = Fixture::new();
         g.apply().unwrap();
@@ -2363,7 +2420,7 @@ fn a_start_that_waited_on_the_lock_rolls_no_healthy_build_back() {
         assert!(!start_in(&g, lane, reads(began)), "{lane:?}");
         let state = g.context.read_state().unwrap().unwrap();
         assert_eq!(
-            (state.installed.build, state.rejected_build),
+            (state.installed.build, held_build(&g.context)),
             (10, 11),
             "{lane:?}"
         );
@@ -2445,7 +2502,7 @@ fn an_older_builds_save_before_every_start_still_rolls_a_crash_loop_back() {
     );
     let state = f.context.read_state().unwrap().unwrap();
     assert_eq!(state.installed.build, 10);
-    assert_eq!(state.rejected_build, 11);
+    assert_eq!(held_build(&f.context), 11);
     assert!(awaiting_start(&state).is_none(), "checks and applies go on");
 }
 
@@ -2465,7 +2522,7 @@ fn an_older_builds_save_in_a_burst_does_not_roll_a_healthy_build_back() {
         assert_eq!(session_confirm(&f), Confirmed::Yes);
         let state = f.context.read_state().unwrap().unwrap();
         assert_eq!(state.installed.build, 11, "save before {past} past");
-        assert_eq!(state.rejected_build, 0);
+        assert_eq!(held_build(&f.context), 0);
     }
 }
 
@@ -3213,10 +3270,8 @@ fn a_crash_loop_rollback_the_loop_sees_is_said() {
     assert!(rolled, "PRECONDITION: the crash loop is rolled back");
     let rolled_back = status_in(Ok(&f.context), 10);
     assert!(
-        rolled_back
-            .linux
-            .as_ref()
-            .is_some_and(|linux| linux.refused_newer)
+        rolled_back.linux.as_ref().is_some()
+            && rolled_back.hold.as_ref().is_some_and(|hold| hold.live)
     );
     let said = notices_over(&mut reporter, &f, [&rolled_back]);
     assert!(
@@ -3283,11 +3338,8 @@ fn a_rollback_a_person_asked_for_is_said_as_no_install_failure() {
     rollback_locked(&f.context, &mut state).expect("aterm update rollback");
     let rolled = status_in(Ok(&f.context), 10);
     assert!(
-        rolled
-            .linux
-            .as_ref()
-            .is_some_and(|linux| linux.refused_newer),
-        "PRECONDITION: the copy refuses the build it rolled back"
+        rolled.linux.as_ref().is_some() && rolled.hold.as_ref().is_some_and(|hold| hold.live),
+        "PRECONDITION: the copy holds the build it rolled back"
     );
     let said = notices_over(&mut reporter, &f, [&rolled]);
     assert!(
@@ -3382,7 +3434,7 @@ fn a_crash_loop_no_rollback_could_answer_is_said() {
         assert!(!window_start(&f, minute(i64::from(MAX_TRIAL_STARTS))));
         let kept = f.context.read_state().unwrap().unwrap();
         assert!(
-            kept.trial.is_none() && kept.installed.build == 11 && kept.rejected_build == 0,
+            kept.trial.is_none() && kept.installed.build == 11 && held_build(&f.context) == 0,
             "PRECONDITION: the trial ended and the build stays"
         );
         let said = notices_over(&mut reporter, &f, [&status_in(Ok(&f.context), 10)]);

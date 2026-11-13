@@ -273,6 +273,7 @@ impl<T> EventLoop<T> {
             || {
                 autoreleasepool(|_| {
                     el.delegate.set_stop_on_launch();
+                    el.delegate.entering_run();
                     // SAFETY: the application's loop has not been entered yet.
                     unsafe { send_v(el.app.id(), sel!(run)) };
                     if let Some(panic) = el.panic_info.take() {
@@ -390,6 +391,7 @@ impl<T> AppKitEventLoop<T> {
                     self.delegate.dispatch_init_events();
                 }
 
+                self.delegate.entering_run();
                 // SAFETY: `-run` (`v16@0:8`) is not entered re-entrantly.
                 unsafe { send_v(self.app.id(), sel!(run)) };
 
@@ -418,6 +420,7 @@ impl<T> AppKitEventLoop<T> {
                     debug_assert!(!self.delegate.is_running());
 
                     self.delegate.set_stop_on_launch();
+                    self.delegate.entering_run();
                     // SAFETY: `-run` is not entered re-entrantly.
                     unsafe { send_v(self.app.id(), sel!(run)) };
                 } else if !self.delegate.is_running() {

@@ -144,7 +144,8 @@ impl Forwarder {
         store: OwnedFd,
     ) -> io::Result<()> {
         self.with(|stream, deadline| {
-            if !wire::store_expectation::eligible(&submission.request)
+            if !(wire::store_expectation::eligible(&submission.request)
+                || wire::native_store::eligible(&submission.request))
                 || submission.request.peer_pid != submission.peer.pid
                 || submission.request.peer_birth != submission.peer.birth
             {
@@ -259,7 +260,8 @@ pub(crate) fn serve(
                 } else {
                     let expectation = if *op == SUBMIT_ACCOUNTED_EXPECT_STORE {
                         let expected = wire::store_expectation::receive(stream, deadline)?;
-                        let matches = wire::store_expectation::eligible(&request)
+                        let matches = (wire::store_expectation::eligible(&request)
+                            || wire::native_store::eligible(&request))
                             && crate::runtime::matches_original_store(expected.as_fd())
                                 .unwrap_or(false);
                         wire::write_frame(stream, &[u8::from(matches)], deadline)?;

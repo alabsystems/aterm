@@ -262,6 +262,20 @@ impl Owner {
             None,
         );
     }
+    pub(in super::super) fn submit_native_job_query(
+        &mut self,
+        incoming: crate::workload_transport::NativeIncoming,
+    ) {
+        let timeout = incoming.sealed.member.timeout_ns.map(Duration::from_nanos);
+        self.submit_member_inner(
+            incoming.subgroup,
+            Purpose::Sealed(Box::new(metadata::Purpose::NativeJobQuery(incoming.sealed))),
+            None,
+            None,
+            timeout,
+            None,
+        );
+    }
     pub(super) fn submit_member_proved(
         &mut self,
         incoming: AuthorizedSubgroup,
@@ -355,7 +369,14 @@ impl Owner {
             return;
         }
         if let Some(sealed) = &sealed {
-            if matches!(sealed, metadata::Purpose::WorkloadQuery(_)) {
+            if let metadata::Purpose::NativeJobQuery(query) = sealed {
+                if events
+                    .native_job(query.member.binding.root_attempt, query.plan_sha256)
+                    .is_err()
+                {
+                    return;
+                }
+            } else if sealed.cooperative_query() {
                 if events
                     .workload(sealed.member().binding.root_attempt)
                     .is_err()
@@ -385,7 +406,10 @@ impl Owner {
         let root = (request.job.session.clone(), request.job.attempt);
         if let Some(job) = self.jobs.get_mut(&root) {
             if let Some(workload) = job.workload.as_mut() {
-                let kind = if matches!(&sealed, Some(metadata::Purpose::WorkloadQuery(_))) {
+                let kind = if sealed
+                    .as_ref()
+                    .is_some_and(metadata::Purpose::cooperative_query)
+                {
                     workload::CensusKind::Query
                 } else if loan.is_some() {
                     workload::CensusKind::Linker
@@ -408,7 +432,9 @@ impl Owner {
             if matches!(&sealed, Some(metadata::Purpose::Resolver(_))) {
                 job.resolver_queries += 1;
             }
-            if matches!(&sealed, Some(metadata::Purpose::WorkloadQuery(_)))
+            if sealed
+                .as_ref()
+                .is_some_and(metadata::Purpose::cooperative_query)
                 && let Some(state) = job.workload.as_mut()
             {
                 state.queries += 1;
@@ -607,7 +633,10 @@ impl Owner {
                             let original_gnu = if pending.linker.is_some()
                                 || matches!(
                                     &pending.sealed,
-                                    Some(metadata::Purpose::WorkloadQuery(_))
+                                    Some(
+                                        metadata::Purpose::WorkloadQuery(_)
+                                            | metadata::Purpose::NativeJobQuery(_)
+                                    )
                                 ) {
                                 pending.delegated.gnu.is_empty() && prepared.cpu_slot().is_some()
                             } else if pending.sealed.is_none() && job.workload.is_some() {
@@ -897,7 +926,11 @@ impl Owner {
         if pending.linker.is_some()
             || matches!(
                 &pending.sealed,
-                Some(metadata::Purpose::Resolver(_) | metadata::Purpose::WorkloadQuery(_))
+                Some(
+                    metadata::Purpose::Resolver(_)
+                        | metadata::Purpose::WorkloadQuery(_)
+                        | metadata::Purpose::NativeJobQuery(_)
+                )
             )
         {
             // Role 5 has no caller-supplied source input. Own the empty reader

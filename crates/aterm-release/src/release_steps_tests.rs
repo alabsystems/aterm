@@ -595,6 +595,317 @@ fn only_an_exact_held_descendant_tippy_claim_opens_the_compiler_barrier() {
     );
 }
 
+fn queued_tree_record() -> aterm_capacity::Record {
+    let shapes = super::tree_lint_claim_shapes().unwrap();
+    aterm_capacity::Record {
+        accounting: aterm_capacity::Accounting::Holder,
+        pid: 20,
+        start_ms: 10,
+        seq: 1,
+        checkout: "queued-tree-test".into(),
+        need: aterm_capacity::Need::new(shapes[0].label.clone())
+            .rank(aterm_capacity::Rank::Release)
+            .mem(12 << 30)
+            .covers(),
+        timing: aterm_capacity::TimingEvidence::default(),
+        held: None,
+        credit: Vec::new(),
+        wrote: None,
+        next_ms: None,
+    }
+}
+
+#[test]
+fn a_shared_tree_cpu_proof_rejects_replaced_changed_and_alone_claims() {
+    let waiting = queued_tree_record();
+    let proof = super::SharedTreeMemory::new(&waiting, super::TreeLintClaim::Waiting).unwrap();
+    let mut held = waiting.clone();
+    held.held = Some(aterm_capacity::Held {
+        admitted_ms: 30,
+        cores: 0,
+        alone: false,
+    });
+    assert_eq!(proof.held_in(std::slice::from_ref(&held)), held.held);
+    assert!(proof.held_in(std::slice::from_ref(&waiting)).is_none());
+    assert!(proof.held_in(&[]).is_none());
+    let mutations: [fn(&mut aterm_capacity::Record); 8] = [
+        |row: &mut aterm_capacity::Record| row.pid += 1,
+        |row: &mut aterm_capacity::Record| row.start_ms += 1,
+        |row: &mut aterm_capacity::Record| row.seq += 1,
+        |row: &mut aterm_capacity::Record| row.checkout.push_str("-other"),
+        |row: &mut aterm_capacity::Record| row.need.mem += 1,
+        |row: &mut aterm_capacity::Record| row.need.covers = false,
+        |row: &mut aterm_capacity::Record| row.need.alone = true,
+        |row: &mut aterm_capacity::Record| row.held.as_mut().unwrap().alone = true,
+    ];
+    for mutate in mutations {
+        let mut changed = held.clone();
+        mutate(&mut changed);
+        assert!(proof.held_in(&[changed]).is_none());
+    }
+    let mut alone = waiting.clone();
+    alone.need.alone = true;
+    assert!(super::SharedTreeMemory::new(&alone, super::TreeLintClaim::Waiting).is_none());
+    assert!(super::SharedTreeMemory::new(&waiting, super::TreeLintClaim::Invalid).is_none());
+    let admitted = super::SharedTreeMemory::new(&held, super::TreeLintClaim::Held).unwrap();
+    assert_eq!(admitted.held_in(std::slice::from_ref(&held)), held.held);
+    assert!(super::SharedTreeMemory::new(&held, super::TreeLintClaim::Waiting).is_none());
+    assert!(super::SharedTreeMemory::new(&waiting, super::TreeLintClaim::Held).is_none());
+    held.held.as_mut().unwrap().alone = true;
+    assert!(super::SharedTreeMemory::new(&held, super::TreeLintClaim::Held).is_none());
+}
+
+#[test]
+fn an_initially_admitted_tree_borrows_free_cores_and_stops_when_its_claim_ends() {
+    use std::cell::{Cell, RefCell};
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let jobs =
+        aterm_capacity::BranchShares::new(&dir.path().join("jobs"), 18, 4, [true, true]).unwrap();
+    let live_build = [
+        jobs.pool(false).try_acquire().unwrap().unwrap(),
+        jobs.pool(false).try_acquire().unwrap().unwrap(),
+    ];
+    let live_tree = RefCell::new(vec![jobs.pool(true).try_acquire().unwrap().unwrap()]);
+    let mut record = queued_tree_record();
+    record.held = Some(aterm_capacity::Held {
+        admitted_ms: 30,
+        cores: 0,
+        alone: false,
+    });
+    let claim = super::SharedTreeMemory::new(&record, super::TreeLintClaim::Held).unwrap();
+    let observed = Cell::new(record.held);
+    let pauses = Cell::new(0);
+    let event = super::await_tree_cpu_lending(
+        &jobs,
+        &claim,
+        &|| false,
+        || observed.get(),
+        || {
+            while let Some(token) = jobs.pool(true).try_acquire().unwrap() {
+                live_tree.borrow_mut().push(token);
+            }
+            match pauses.get() {
+                0 => {
+                    assert_eq!(live_tree.borrow().len(), 7);
+                    jobs.finish(2);
+                }
+                1 => {
+                    assert_eq!(live_tree.borrow().len(), 9);
+                    observed.set(None);
+                }
+                _ => panic!("a removed admitted claim must stop the observer"),
+            }
+            pauses.set(pauses.get() + 1);
+        },
+    )
+    .unwrap();
+    assert_eq!(pauses.get(), 2);
+    assert_eq!(event["transferred_cores"].as_u64(), Some(8));
+    assert_eq!(event["transfers"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        event["observer_residence_is_starvation"].as_bool(),
+        Some(false)
+    );
+    let mut free_build = Vec::new();
+    while let Some(token) = jobs.pool(false).try_acquire().unwrap() {
+        free_build.push(token);
+    }
+    assert_eq!(
+        live_build.len() + live_tree.borrow().len() + free_build.len(),
+        18
+    );
+    drop((live_tree, live_build, free_build));
+    jobs.build_compilers_drained();
+    jobs.finish(0);
+    jobs.finish(1);
+}
+
+#[test]
+fn a_waiting_shared_tree_borrows_nothing_until_admission_then_keeps_the_build_floor() {
+    use std::cell::Cell;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let jobs =
+        aterm_capacity::BranchShares::new(&dir.path().join("jobs"), 6, 1, [true, true]).unwrap();
+    jobs.reserve_initial().unwrap().release_to_build().unwrap();
+    let live_build = [
+        jobs.pool(false).try_acquire().unwrap().unwrap(),
+        jobs.pool(false).try_acquire().unwrap().unwrap(),
+    ];
+    let record = queued_tree_record();
+    let proof = super::SharedTreeMemory::new(&record, super::TreeLintClaim::Waiting).unwrap();
+    let polls = Cell::new(0);
+    let stopped = Cell::new(false);
+    let event = super::await_tree_cpu_lending(
+        &jobs,
+        &proof,
+        &|| stopped.get(),
+        || {
+            polls.set(polls.get() + 1);
+            (polls.get() >= 3).then_some(aterm_capacity::Held {
+                admitted_ms: 30,
+                cores: 0,
+                alone: false,
+            })
+        },
+        || {
+            if polls.get() < 3 {
+                assert!(jobs.pool(true).try_acquire().unwrap().is_none());
+            } else {
+                stopped.set(true);
+            }
+        },
+    )
+    .unwrap();
+    assert_eq!(polls.get(), 3);
+    assert_eq!(event["transferred_cores"].as_u64(), Some(2));
+    let mut tree = Vec::new();
+    while let Some(token) = jobs.pool(true).try_acquire().unwrap() {
+        tree.push(token);
+    }
+    let free_build = jobs.pool(false).try_acquire().unwrap().unwrap();
+    assert!(jobs.pool(false).try_acquire().unwrap().is_none());
+    assert_eq!(tree.len(), 2);
+    assert_eq!(live_build.len() + 1, 3);
+    drop((live_build, free_build, tree));
+    jobs.build_compilers_drained();
+    for branch in [0, 1, 2] {
+        jobs.finish(branch);
+    }
+}
+
+#[test]
+fn shared_tree_lending_cancels_and_never_lends_on_unavailable_or_alone_observations() {
+    use std::cell::Cell;
+    let record = queued_tree_record();
+    let proof = super::SharedTreeMemory::new(&record, super::TreeLintClaim::Waiting).unwrap();
+    for observed in [
+        None,
+        Some(aterm_capacity::Held {
+            admitted_ms: 30,
+            cores: 0,
+            alone: true,
+        }),
+    ] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let jobs = aterm_capacity::BranchShares::new(&dir.path().join("jobs"), 6, 0, [true, true])
+            .unwrap();
+        jobs.reserve_initial().unwrap().release_to_build().unwrap();
+        let stopped = Cell::new(false);
+        assert!(
+            super::await_tree_cpu_lending(
+                &jobs,
+                &proof,
+                &|| stopped.get(),
+                || observed,
+                || stopped.set(true),
+            )
+            .is_none()
+        );
+        assert!(jobs.serial_tree_waiting());
+        assert!(jobs.pool(true).try_acquire().unwrap().is_none());
+    }
+}
+
+#[test]
+fn a_queued_tree_gets_a_core_only_after_its_shared_claim_is_held() {
+    use std::cell::Cell;
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let jobs =
+        aterm_capacity::BranchShares::new(&dir.path().join("jobs"), 6, 1, [true, true]).unwrap();
+    jobs.reserve_initial().unwrap().release_to_build().unwrap();
+    let first = jobs.pool(false).try_acquire().unwrap().unwrap();
+    let second = jobs.pool(false).try_acquire().unwrap().unwrap();
+    let waiting = queued_tree_record();
+    let proof = super::SharedTreeMemory::new(&waiting, super::TreeLintClaim::Waiting).unwrap();
+    let polls = Cell::new(0);
+    let pauses = Cell::new(0);
+    let resumed = super::await_tree_cpu_resumption(
+        &jobs,
+        &proof,
+        &|| false,
+        || {
+            polls.set(polls.get() + 1);
+            (polls.get() == 3).then_some(aterm_capacity::Held {
+                admitted_ms: 30,
+                cores: 0,
+                alone: false,
+            })
+        },
+        || {
+            assert!(jobs.pool(true).try_acquire().unwrap().is_none());
+            pauses.set(pauses.get() + 1);
+        },
+    )
+    .unwrap();
+    assert_eq!(pauses.get(), 2);
+    assert_eq!(resumed["transferred_cores"].as_u64(), Some(1));
+    let tree = jobs.pool(true).try_acquire().unwrap().unwrap();
+    let mut build = Vec::new();
+    while let Some(token) = jobs.pool(false).try_acquire().unwrap() {
+        build.push(token);
+    }
+    let live = [first, second, tree];
+    assert_eq!(
+        build.len() + live.len() + 1,
+        6,
+        "live build clients, tree and export stay within the grant"
+    );
+    drop((live, build));
+    assert!(!jobs.serial_tree_waiting());
+}
+
+#[test]
+fn a_queued_tree_observer_cancels_and_keeps_the_alone_and_one_core_paths() {
+    use std::cell::Cell;
+    let waiting = queued_tree_record();
+    let proof = super::SharedTreeMemory::new(&waiting, super::TreeLintClaim::Waiting).unwrap();
+    for alone in [false, true] {
+        let dir = aterm_tempfile::tempdir().unwrap();
+        let jobs = aterm_capacity::BranchShares::new(&dir.path().join("jobs"), 3, 0, [true, true])
+            .unwrap();
+        jobs.reserve_initial().unwrap().release_to_build().unwrap();
+        let ended = Cell::new(false);
+        assert!(
+            super::await_tree_cpu_resumption(
+                &jobs,
+                &proof,
+                &|| ended.get(),
+                || alone.then_some(aterm_capacity::Held {
+                    admitted_ms: 30,
+                    cores: 0,
+                    alone: true
+                }),
+                || {
+                    assert!(jobs.pool(true).try_acquire().unwrap().is_none());
+                    ended.set(true);
+                },
+            )
+            .is_none()
+        );
+        assert!(jobs.serial_tree_waiting());
+    }
+    let dir = aterm_tempfile::tempdir().unwrap();
+    let jobs =
+        aterm_capacity::BranchShares::new(&dir.path().join("jobs"), 1, 0, [true, true]).unwrap();
+    jobs.reserve_initial().unwrap().release_to_build().unwrap();
+    assert!(
+        super::await_tree_cpu_resumption(
+            &jobs,
+            &proof,
+            &|| false,
+            || Some(aterm_capacity::Held {
+                admitted_ms: 30,
+                cores: 0,
+                alone: false
+            }),
+            || jobs.build_compilers_drained(),
+        )
+        .is_none()
+    );
+    assert!(!jobs.serial_tree_waiting());
+    assert!(jobs.pool(true).try_acquire().unwrap().is_some());
+}
+
 /// Capacity inspection is never a liveness dependency of the all-token barrier. An unread
 /// detector, a held continuous cold parent and a stale shared budget all release the tokens and
 /// wait for build completion before returning; an unread tree detector returns immediately
@@ -1375,6 +1686,7 @@ fn production_build_and_tree_wiring_owns_the_fixture_handoff() {
         real: &real,
         admission_barrier: std::sync::Mutex::new(None),
         tree_index: TreeIndexHandoff::default(),
+        shared_tree: std::sync::Mutex::new(None),
     };
     branches.tree_index.expect();
     let stop = BranchStop::default();
@@ -3478,8 +3790,30 @@ fn engine_audit_rows_use_the_native_expected_main_and_reject_retargeting() {
     let mut real = Real::new(&engine, Some(&engine), true, false).unwrap();
     real.engine_origin = native_engine_fixture;
     std::fs::write(engine.join("verification-log.jsonl"), "{\"row\":1}\n").unwrap();
-    real.engine_fast_forward().unwrap();
+    // Refuse only the audit commit, after its native origin admission and refresh.
+    // A nonexistent signer is deterministic and needs no hook or executable fixture.
+    let absent_signer = root.path().join("absent-audit-signer");
+    crate::ledger::git_ok(
+        &git,
+        &["config", "gpg.program", absent_signer.to_str().unwrap()],
+    )
+    .unwrap();
+    crate::ledger::git_ok(&git, &["config", "commit.gpgsign", "true"]).unwrap();
     let remote = GitCli::new(&bare);
+    let unpublished = crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap();
+    let refused = format!("{:?}", real.engine_fast_forward().unwrap_err());
+    assert!(refused.contains("exited 128"), "{refused}");
+    assert!(refused.contains("absent-audit-signer"), "{refused}");
+    assert_eq!(
+        crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap(),
+        unpublished
+    );
+    assert_eq!(
+        std::fs::read_to_string(engine.join("verification-log.jsonl")).unwrap(),
+        "{\"row\":1}\n"
+    );
+    crate::ledger::git_ok(&git, &["config", "commit.gpgsign", "false"]).unwrap();
+    real.engine_fast_forward().unwrap();
     assert_eq!(
         crate::ledger::git_ok(&remote, &["show", "refs/heads/main:verification-log.jsonl"])
             .unwrap()
@@ -3512,6 +3846,153 @@ fn engine_audit_rows_use_the_native_expected_main_and_reject_retargeting() {
         "{\"row\":1}\n{\"row\":2}\n"
     );
 }
+#[test]
+fn a_moved_engine_main_costs_a_pass_and_any_other_refusal_ends_the_passes() {
+    use crate::ledger::RefWrite;
+    let refusal = || Refusal::new("the records did not land", "run it again");
+    let mut made = 0;
+    landed_within(5, || {
+        made += 1;
+        if made < 3 {
+            Err(NotLanded::Moved(refusal()))
+        } else {
+            Ok(())
+        }
+    })
+    .unwrap();
+    assert_eq!(made, 3, "two lost writes, then the one that landed");
+
+    let mut made = 0;
+    let exhausted = landed_within(5, || {
+        made += 1;
+        Err(NotLanded::Moved(refusal()))
+    })
+    .unwrap_err();
+    assert_eq!(made, 5);
+    assert!(
+        format!("{exhausted:?}").contains("moved before each of 5 writes"),
+        "{exhausted:?}"
+    );
+
+    let mut made = 0;
+    landed_within(5, || {
+        made += 1;
+        Err(NotLanded::Refused(refusal()))
+    })
+    .unwrap_err();
+    assert_eq!(
+        made, 1,
+        "a refusal another pass would meet again is not repeated"
+    );
+
+    let outcome = |written| not_landed(written, "main moved", |why| Refusal::new(why, "again"));
+    assert!(outcome(Ok(RefWrite::Written)).is_ok());
+    assert!(matches!(
+        outcome(Ok(RefWrite::Conflict)),
+        Err(NotLanded::Moved(_))
+    ));
+    assert!(matches!(
+        outcome(Ok(RefWrite::Transient("receive failed".into()))),
+        Err(NotLanded::Refused(_))
+    ));
+    assert!(matches!(
+        outcome(Err("no audit commit".into())),
+        Err(NotLanded::Refused(_))
+    ));
+}
+
+/// The state a lost expected-old write leaves: this release's rows are a commit of the engine,
+/// and its origin's main holds another writer's rows. The pass after it merges that main (the
+/// audit log merges by union, as the engine's own `.gitattributes` says) and lands both.
+#[cfg(unix)]
+#[test]
+fn rows_that_lost_to_a_moved_engine_main_land_with_the_other_writers_rows() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let engine = root.path().join("engine");
+    let bare = root.path().join("engine.git");
+    let other = root.path().join("other");
+    let identity = [
+        ("user.name", "fixture"),
+        ("user.email", "fixture@example.invalid"),
+        ("commit.gpgsign", "false"),
+    ];
+    crate::ledger::testing::init(&engine, &identity);
+    let git = GitCli::new(&engine);
+    std::fs::write(
+        engine.join(".gitattributes"),
+        "verification-log.jsonl merge=union\n",
+    )
+    .unwrap();
+    std::fs::write(engine.join("verification-log.jsonl"), "").unwrap();
+    crate::ledger::git_ok(&git, &["add", ".gitattributes", "verification-log.jsonl"]).unwrap();
+    crate::ledger::git_ok(&git, &["commit", "-qm", "initial audit"]).unwrap();
+    let outside = GitCli::new(root.path());
+    for (from, to, how) in [
+        (&engine, &bare, "--bare"),
+        (&bare, &other, "--no-hardlinks"),
+    ] {
+        crate::ledger::git_ok(
+            &outside,
+            &[
+                "clone",
+                "-q",
+                how,
+                from.to_str().unwrap(),
+                to.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+    }
+    bind_native_engine_fixture(&engine, &bare);
+    let mut real = Real::new(&engine, Some(&engine), true, false).unwrap();
+    real.engine_origin = native_engine_fixture;
+
+    let theirs = GitCli::new(&other);
+    for (key, value) in identity {
+        crate::ledger::git_ok(&theirs, &["config", key, value]).unwrap();
+    }
+    std::fs::write(
+        other.join("verification-log.jsonl"),
+        "{\"row\":\"theirs\"}\n",
+    )
+    .unwrap();
+    crate::ledger::git_ok(&theirs, &["commit", "-qam", "another writer's rows"]).unwrap();
+    crate::ledger::git_ok(&theirs, &["push", "-q", "origin", "HEAD:refs/heads/main"]).unwrap();
+    std::fs::write(
+        engine.join("verification-log.jsonl"),
+        "{\"row\":\"ours\"}\n",
+    )
+    .unwrap();
+    crate::ledger::git_ok(
+        &git,
+        &[
+            "commit",
+            "-qam",
+            "chore(audit): record stage verification rows",
+        ],
+    )
+    .unwrap();
+
+    real.engine_fast_forward().unwrap();
+    let remote = GitCli::new(&bare);
+    let landed =
+        crate::ledger::git_ok(&remote, &["show", "refs/heads/main:verification-log.jsonl"])
+            .unwrap()
+            .stdout_utf8();
+    let mut rows: Vec<&str> = landed.lines().collect();
+    rows.sort_unstable();
+    assert_eq!(
+        rows,
+        ["{\"row\":\"ours\"}", "{\"row\":\"theirs\"}"],
+        "{landed}"
+    );
+    assert_eq!(
+        crate::ledger::rev_parse(&remote, "refs/heads/main").unwrap(),
+        crate::ledger::rev_parse(&git, "HEAD").unwrap()
+    );
+    assert_eq!(real.engine_git(&["status", "--porcelain"]).unwrap(), "");
+}
+
 #[cfg(unix)]
 #[test]
 fn a_valid_retargeted_engine_adapter_cannot_replace_the_captured_authority() {
@@ -5904,15 +6385,13 @@ fn probe_every_tree_the_release_writes_under_a_crlf_config_if_asked() -> bool {
         allow_existing_section: false,
         max_attempts: 1,
         source: &source,
-    };
-    let rolls = |source: &str, main: &str| {
-        crate::changelog::claim_changelogs(source, main, "0.26.0", "2026-10-21")
+        harness_base: None,
     };
     let cut = GitCli::new(&moved.tree);
     bind_native_engine_fixture(&moved.tree, &root.join("aterm.git"));
     let native = native_engine_fixture(&moved.tree, &moved.tree).unwrap();
-    let reserved = crate::ledger::reserve(&cut, &native, &plan, &rolls).unwrap();
-    crate::ledger::claim(&cut, &native, &moved.tree, &plan, &reserved, &rolls).unwrap();
+    let reserved = crate::ledger::reserve(&cut, &native, &plan, "2026-10-21").unwrap();
+    crate::ledger::claim(&cut, &native, &moved.tree, &plan, &reserved).unwrap();
     let rolled = fs::read_to_string(moved.tree.join("CHANGELOG.md")).unwrap();
     assert!(
         rolled.contains("## [0.26.0]") && !rolled.contains('\r'),

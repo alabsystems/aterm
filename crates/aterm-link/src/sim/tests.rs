@@ -18,7 +18,7 @@ const SEEDS: u64 = 64;
 
 const COMMITTED_SEEDS: u64 = 2 * SEEDS;
 
-const CONTROL_SEEDS: u64 = 64;
+pub(super) const CONTROL_SEEDS: u64 = 64;
 
 const SIBLING_SEEDS: u64 = 32;
 
@@ -239,6 +239,64 @@ fn every_seed_holds_every_law_against_a_broker_that_does_not_gap_fence() {
         fenced, 0,
         "a broker that does not gap-fence fenced or lifted"
     );
+}
+
+/// ANOTHER LOG AND A POISONED BROKER (ATERM-KI-1111-4): every committed seed, with logs set aside
+/// (`--retire-log`) and poisoned brokers among its faults ([`Opts::lossy_logs`]), holds every law
+/// across both restarts: the no-duplicate ones (`dup delivery`, `dup post`), sender order
+/// (`order:`), the alarms (`alarm:`), liveness and the broker's own (`bus::law_check`, P4L and
+/// another log's P7 among them). Not vacuous: logs were set aside and more opens settled another
+/// log than that (empty logs and losses that kept none too), each weak tier was poisoned, its
+/// writes refused, and its supervisor restarted it, and the model tap held a slot opened on a log
+/// after a retire to FabricExactlyOnce. The tap follows no slot across a retire, so a record that
+/// spans one is judged by the world's own laws alone.
+#[test]
+fn every_seed_holds_every_law_across_another_log_and_a_poisoned_broker() {
+    let outs = run_all(&Opts::lossy_logs, 1..=COMMITTED_SEEDS);
+    let failures: Vec<String> = outs
+        .iter()
+        .filter(|out| !out.violations.is_empty())
+        .map(report)
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "{} of {} seeds break a law across another log and a poisoned broker:\n{}",
+        failures.len(),
+        outs.len(),
+        failures.join("\n")
+    );
+    let sum = |f: &dyn Fn(&super::world::Stats) -> u64| -> u64 {
+        outs.iter().map(|out| f(&out.stats)).sum()
+    };
+    let (retired, another) = (sum(&|s| s.retired_logs), sum(&|s| s.another_logs));
+    let restarts = sum(&|s| s.poison_restarts);
+    let refusals = sum(&|s| s.poisoned_refusals);
+    let tapped = sum(&|s| s.tap_past_a_retire);
+    eprintln!(
+        "{retired} logs set aside, {another} another logs, {restarts} poisoned restarts, \
+         {refusals} poisoned refusals, {tapped} tap steps past a retire"
+    );
+    assert!(retired > 0, "no log was set aside");
+    // The model tap follows no slot across a retire (`conform::View::retired_logs`): it holds
+    // FabricExactlyOnce to these worlds only on the logs after one, and does.
+    assert!(
+        tapped > 0,
+        "the model tap checked nothing on a log after a retire"
+    );
+    assert!(
+        another > retired,
+        "no open settled another log but a retired one's ({another} of {retired})"
+    );
+    for tier in [Tier::Ordered, Tier::Relaxed] {
+        let poisoned: u64 = outs
+            .iter()
+            .filter(|out| out.tier == tier)
+            .map(|out| out.stats.poisoned)
+            .sum();
+        assert!(poisoned > 0, "no {tier:?} broker was poisoned");
+    }
+    assert!(restarts > 0, "no poisoned broker was restarted");
+    assert!(refusals > 0, "no write met a poisoned broker");
 }
 
 /// A world of the committed seeds whose broker's log is on the state dir's device
@@ -602,7 +660,7 @@ fn first_within(
 }
 
 const WITNESS_DISCOVERY: &str = "ATERM_SIM_DISCOVER_WITNESSES";
-const DISCOVER_WITNESSES: &str = "ATERM_SIM_DISCOVER_WITNESSES=1 targo --unverified test --profile opt-test -p aterm-link --lib sim::tests:: -- --nocapture";
+const DISCOVER_WITNESSES: &str = "ATERM_SIM_DISCOVER_WITNESSES=1 targo --unverified test --profile opt-test -p aterm-link --lib sim:: -- --nocapture";
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WitnessMode {
@@ -693,7 +751,7 @@ fn a_stale_witness_searches_only_in_explicit_discovery_mode() {
 }
 
 /// [`witness_of`], failing on a stale witness.
-fn witnessed(
+pub(super) fn witnessed(
     opts: &(dyn Fn(u64) -> Opts + Sync),
     witness: u64,
     limit: u64,
@@ -1265,6 +1323,46 @@ fn each_rule_switched_off_is_caught() {
             "order:",
             115,
         ),
+        // ATERM-KI-1111-4's, each in a lossy-log world ([`Opts::lossy_logs`]): a log set aside
+        // or emptied by a cut, so the broker settles ANOTHER LOG, whose offsets continue none
+        // the node read. Each is met where another log follows a replay or a keyed re-post, a
+        // seed in the hundreds or the thousands.
+        (
+            "an entry journaled before another log is read back from its start (KI-1111-4)",
+            Box::new(|s| Opts::lossy_logs(s).with(Mutant::NoReadBackOnAnotherLog)),
+            "dup post",
+            4748,
+        ),
+        (
+            "another log brings a pin's head to its start (KI-1111-4)",
+            Box::new(|s| Opts::lossy_logs(s).with(Mutant::PinHeadGoneOnAnotherLog)),
+            "dup post",
+            2201,
+        ),
+        (
+            "another log takes every pin's offset out (KI-1111-4)",
+            Box::new(|s| lossy_keyed(s).with(Mutant::ForgetPinResetsOnAnotherLog)),
+            "key:",
+            536,
+        ),
+        (
+            "a replay that lands a key's winner tells the key where (KI-1111-4)",
+            Box::new(|s| lossy_keyed(s).with(Mutant::ReplayLeavesTheKeysWinnerUntold)),
+            "key:",
+            216,
+        ),
+        (
+            "another log keeps no offset of the old one (KI-1111-4)",
+            Box::new(|s| Opts::lossy_logs(s).with(Mutant::KeepFloorOnAnotherLog)),
+            "lost:|dup|key:|order:",
+            16892,
+        ),
+        (
+            "another log is not read as a move (KI-1111-4)",
+            Box::new(|s| Opts::lossy_logs(s).with(Mutant::AnotherLogAsAMove)),
+            "lost:",
+            974,
+        ),
     ];
     // Critic item F21's other two rules have no sim witness: in 3,000 seeds of the stray world
     // neither `Mutant::HeldRecordWaitsForTheHold` nor `Mutant::HoldPastTheListing` breaks a law
@@ -1320,6 +1418,14 @@ fn each_rule_switched_off_is_caught() {
         // unverifiable answer, or a replay past one, sends a sender's later post ahead of it.
         "an unverifiable answer leaves the link up (F21)",
         "the attach's replay holds an unverifiable entry's lane (F21)",
+        // KI-1111-4's: none within 64 of its world; the first seeds are 4748, 2201, 536, 216,
+        // 16892 and 974 (of the keyed lossy world none within 20,000 meets the kept floor).
+        "an entry journaled before another log is read back from its start (KI-1111-4)",
+        "another log takes every pin's offset out (KI-1111-4)",
+        "another log brings a pin's head to its start (KI-1111-4)",
+        "a replay that lands a key's winner tells the key where (KI-1111-4)",
+        "another log keeps no offset of the old one (KI-1111-4)",
+        "another log is not read as a move (KI-1111-4)",
     ];
     const RAREST: &[&str] = &["the incarnation lease is trusted only in the boot that wrote it"];
     for rare in RARE.iter().chain(RAREST) {
@@ -2152,6 +2258,7 @@ fn the_broker_arm_cuts_exactly_what_the_law_allows() {
     let mut rng = Rng::new(0xa57e);
     let oracle = Escalation::aterm();
     let mut weak_losses = 0;
+    let mut another = 0;
     for round in 0..300 {
         let tier = [Tier::Strict, Tier::Ordered, Tier::Relaxed][round % 3];
         let stop = [Stop::Clean, Stop::Crash, Stop::PowerLoss][(round / 3) % 3];
@@ -2186,6 +2293,25 @@ fn the_broker_arm_cuts_exactly_what_the_law_allows() {
             "round {round}: {:?}",
             bus::law_check(&r, &oracle)
         );
+        // Every open that finds no record is another log: a fresh id at generation 0.
+        assert_eq!(
+            r.another_log,
+            r.kept == 0,
+            "round {round}: kept {} another_log={}",
+            r.kept,
+            r.another_log
+        );
+        if r.another_log {
+            another += 1;
+            let s = broker.state.lock().expect("state");
+            assert!(
+                s.id != bus::LOG_ID && s.generation == 0 && s.lineage.is_empty(),
+                "round {round}: another log named {:?}.{} {:?}",
+                s.id,
+                s.generation,
+                s.lineage
+            );
+        }
         if r.kept < head {
             weak_losses += 1;
         }
@@ -2195,6 +2321,7 @@ fn the_broker_arm_cuts_exactly_what_the_law_allows() {
         weak_losses > 10,
         "the arm lost acked suffixes {weak_losses} times"
     );
+    assert!(another > 0, "no loss kept no record");
     for (mutant, tier, law) in [
         (ArmMutant::CutBelowDurable, Tier::Ordered, "P3"),
         (ArmMutant::LoseWithoutMove, Tier::Relaxed, "P4"),
@@ -2242,42 +2369,156 @@ fn the_broker_arm_cuts_exactly_what_the_law_allows() {
     );
 }
 
-/// ANOTHER LOG (critic item F10): what astream settles for a weak log a power loss left with no
-/// record, a fresh id that continues nothing, is a restart the law admits; at a cut that kept a
-/// record, or at a stop that loses nothing, it is not.
+/// ANOTHER LOG (critic item F10, ATERM-KI-1111-4): what astream settles at every open that finds
+/// no record (a fresh id at generation 0 with no lineage, continuing nothing) is a restart the law
+/// admits at any stop: a power loss that kept none, a clean stop or a crash of an empty log, and a
+/// retired log whatever it held. So is the move a lossy run's reopen makes at a clean stop, and a
+/// power loss of one whose images cut the record its poison held. Refused: another log of a log
+/// that kept records, one that names a generation, a lossy run that kept its identity, and a power
+/// loss that cut an escalated record below the held one.
 #[test]
-fn the_law_admits_another_log_only_for_a_power_loss_that_kept_no_record() {
+fn the_law_admits_another_log_only_where_an_open_finds_no_record() {
     let oracle = Escalation::aterm();
-    let restart = |stop: Stop, kept: u64| {
+    let broker = |n: u64| {
         let broker = bus::Broker::new(Tier::Relaxed, Escalation::aterm());
         broker.name_producer(7, "n-sim");
-        for i in 0..3 {
+        broker.name_producer(8, "h-alice");
+        for i in 0..n {
             broker.publish_as(7, i + 1, "/f/sim/pub/n-sim/s-a/ev", b"v=1");
         }
-        let mut r = broker.stop_keeping_all(stop);
+        broker
+    };
+    let another = |stop: Stop, n: u64, kept: u64| {
+        let mut r = broker(n).stop_keeping_all(stop);
         r.kept = kept;
         r.generation_after = 0;
         r.lineage_after = Vec::new();
         r.another_log = true;
         r
     };
-    let admitted = bus::law_check(&restart(Stop::PowerLoss, 0), &oracle);
-    assert!(
-        admitted.is_empty(),
-        "another log at a cut to 0: {admitted:?}"
-    );
-    let kept = bus::law_check(&restart(Stop::PowerLoss, 2), &oracle);
-    assert!(
-        kept.iter().any(|v| v.starts_with("P7: another log")),
-        "another log that kept 2 records: {kept:?}"
-    );
+    let admitted = |r: &bus::Restart, what: &str| {
+        let bad = bus::law_check(r, &oracle);
+        assert!(bad.is_empty(), "{what}: {bad:?}");
+    };
+    let refused = |r: &bus::Restart, law: &str, what: &str| {
+        let bad = bus::law_check(r, &oracle);
+        assert!(bad.iter().any(|v| v.contains(law)), "{what}: {bad:?}");
+    };
+    admitted(&another(Stop::PowerLoss, 3, 0), "another log at a cut to 0");
     for stop in [Stop::Clean, Stop::Crash] {
-        let moved = bus::law_check(&restart(stop, 3), &oracle);
+        let empty = broker(0).stop_keeping_all(stop);
         assert!(
-            moved.iter().any(|v| v.contains("moved the identity")),
-            "another log at a {stop:?}: {moved:?}"
+            empty.another_log,
+            "the model kept its id at a {stop:?} of an empty log"
         );
+        admitted(&empty, "another log at an empty log's open");
+        let r = another(stop, 3, 3);
+        refused(
+            &r,
+            "P7: another log, 3 records kept",
+            "another log of 3 kept",
+        );
+        refused(&r, "P5/P6: a", "another log of 3 kept moved the identity");
     }
+    let b = broker(3);
+    b.stop_keeping_all(Stop::Clean);
+    let mut retired = b.retire_log().expect("a stopped log is retired");
+    admitted(&retired, "a retired log");
+    refused(
+        &another(Stop::PowerLoss, 3, 2),
+        "P7: another log, 2",
+        "another log that kept 2",
+    );
+    retired.generation_after = 1;
+    refused(&retired, "names generation", "another log at generation 1");
+    // A lossy run: an escalated publish's full flush failed and held its record.
+    let lossy = || {
+        let b = broker(2);
+        b.fail_next_full_flush();
+        b.publish_as(8, 1, "/f/sim/fleet/h-alice/halt", b"v=1");
+        assert!(b.poisoned(), "the escalated flush poisoned nothing");
+        b
+    };
+    let clean = lossy().stop_keeping_all(Stop::Clean);
+    assert!(clean.lossy && clean.held_from == Some(2), "{clean:?}");
+    admitted(
+        &clean,
+        "a lossy run's clean reopen, moved with the step (g + 1, head)",
+    );
+    let mut kept = clean.clone();
+    kept.generation_after = kept.generation_before;
+    kept.lineage_after.clear();
+    refused(&kept, "P4L", "a lossy run that kept its identity");
+    let mut cut = lossy().stop_keeping_all(Stop::PowerLoss);
+    cut.kept = 2;
+    cut.lineage_after = vec![(cut.generation_after, 2)];
+    admitted(&cut, "a power loss that cut the held escalated record");
+    // An escalated record acked below the held one, cut.
+    let below = broker(1);
+    below.publish_as(8, 1, "/f/sim/fleet/h-alice/halt", b"v=1");
+    below.fail_next_full_flush();
+    below.publish_as(8, 2, "/f/sim/fleet/h-alice/halt", b"v=2");
+    let mut r = below.stop_keeping_all(Stop::PowerLoss);
+    r.kept = 1;
+    r.lineage_after = vec![(r.generation_after, 1)];
+    refused(
+        &r,
+        "P3e: escalated record @1",
+        "a cut below the held record",
+    );
+}
+
+/// A POISONED LOG IN THE MODEL (ATERM-KI-1111-4): a failed full flush poisons it until a reopen,
+/// which moves the generation; while it is poisoned a world producer's write, a tick and a cut
+/// do nothing, and the record whose flush failed stays out of sight until the reopen.
+#[test]
+fn a_failed_full_flush_poisons_until_a_reopen_that_moves() {
+    let broker = bus::Broker::new(Tier::Relaxed, Escalation::aterm());
+    broker.retain(Some(crate::broker_rules::default_rules()));
+    broker.name_producer(8, "h-alice");
+    broker.publish_as(7, 1, "/f/sim/pub/n-sim/s-a/ev", b"v=1");
+    broker.fail_next_full_flush();
+    assert!(
+        broker
+            .publish_as(8, 1, "/f/sim/fleet/h-alice/halt", b"on")
+            .is_none(),
+        "the publish whose flush failed was acked"
+    );
+    assert!(
+        broker.poisoned(),
+        "a failed escalated flush poisoned nothing"
+    );
+    assert_eq!(broker.records().len(), 1, "the held record is visible");
+    assert!(
+        broker
+            .publish_as(7, 2, "/f/sim/pub/n-sim/s-a/ev", b"v=2")
+            .is_none(),
+        "a write landed on a poisoned log"
+    );
+    assert!(
+        !broker.tick(u64::MAX / 2),
+        "a tick landed on a poisoned log"
+    );
+    assert!(!broker.cut_to(1), "a cut landed on a poisoned log");
+    let r = broker.stop_keeping_all(Stop::Clean);
+    assert!(
+        r.lossy && r.generation_after == r.generation_before + 1,
+        "{r:?}"
+    );
+    assert_eq!(r.lineage_after.last(), Some(&(r.generation_after, 2)));
+    broker.start();
+    assert!(!broker.poisoned(), "the reopen left the log poisoned");
+    assert_eq!(
+        broker.records().len(),
+        2,
+        "the reopen did not show the held record"
+    );
+    assert!(
+        broker
+            .publish_as(7, 2, "/f/sim/pub/n-sim/s-a/ev", b"v=2")
+            .is_some(),
+        "the reopened log refused a write"
+    );
 }
 
 #[test]
@@ -3948,6 +4189,16 @@ fn keyed(seed: u64) -> Opts {
     Opts {
         keys: true,
         ..Opts::seed(seed)
+    }
+}
+
+/// The lossy-log keyed world (ATERM-KI-1111-4): [`keyed`] over a retained broker, with logs
+/// set aside and poisoned brokers among the faults ([`Opts::lossy_logs`]).
+fn lossy_keyed(seed: u64) -> Opts {
+    Opts {
+        keys: true,
+        retained: true,
+        ..Opts::lossy_logs(seed)
     }
 }
 

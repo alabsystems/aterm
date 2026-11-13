@@ -1310,7 +1310,7 @@ fn next_pipe_write_end() -> (RawFd, Vec<std::fs::File>) {
         }
         low.push(null);
     }
-    let (_rd, wr) = std::io::pipe().expect("a probe pipe");
+    let (_rd, wr) = crate::pipe().expect("a probe pipe");
     (wr.as_raw_fd(), low)
 }
 

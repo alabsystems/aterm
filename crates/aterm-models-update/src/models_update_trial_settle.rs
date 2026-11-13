@@ -15,8 +15,9 @@ use aterm_spec::derive::{Liveness, Model, eq, int, var};
 /// it starts no inherited streak and is counted toward the revert, which alone takes the
 /// build back. `settled` is 1 for a proven settle and 2 for an unproven one.
 ///
-/// Not modelled, and unbounded in the code: a window that never draws asks at no checkpoint;
-/// a sentinel the filesystem will not remove stays armed; a refusal that says the installed
+/// Not modelled, and unbounded in the code: a window that never draws reaches no window
+/// checkpoint, so its trial stays armed until a window of it draws or a relaunch counts; a
+/// sentinel the filesystem will not remove stays armed; a refusal that says the installed
 /// bundle is not the running build, with a predecessor that verifies, is never counted (here
 /// it is no `Refuse`: only `Relaunch` and `Revert` move that trial); and a process with no
 /// awake clock never takes `Elapse`.

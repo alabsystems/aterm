@@ -10,7 +10,7 @@ use std::fmt;
 use std::io::{self, BufRead, Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use aterm_types::machine_name::Number;
@@ -24,10 +24,36 @@ use crate::fleet::{
 use crate::slots::{Claim, HandshakeWatchdog};
 use crate::tls::TlsTransport;
 
+/// A function `$name` that gives its caller the [`KeptParse`] of one book file's `$parsed`, at
+/// most [`KEPT_BOOKS`] state directories of it: this process's one, and in a test each thread's
+/// own, so the directories one test reads never push another test's out of the few kept while
+/// that test counts what it reads.
+macro_rules! kept_parse {
+    ($(#[$doc:meta])* $name:ident: $parsed:ty) => {
+        $(#[$doc])*
+        fn $name<R>(read: impl FnOnce(&KeptParse<$parsed>) -> R) -> R {
+            #[cfg(not(test))]
+            {
+                static KEPT: KeptParse<$parsed> = KeptParse::new(KEPT_BOOKS);
+                read(&KEPT)
+            }
+            #[cfg(test)]
+            {
+                thread_local! {
+                    static KEPT: KeptParse<$parsed> = const { KeptParse::new(KEPT_BOOKS) };
+                }
+                KEPT.with(read)
+            }
+        }
+    };
+}
+
 pub mod fleet_seed;
+mod held;
 pub mod name_record;
 mod seen;
 mod self_entry;
+pub use held::HeldSignatures;
 pub use seen::{SEEN_BEHIND_MS, SEEN_FILE, SEEN_FLUSH_EVERY};
 pub use self_entry::{self_entry, self_entry_while};
 
@@ -1210,6 +1236,30 @@ impl Via {
     }
 }
 
+/// How many book entries' signatures this process has checked ([`Peer::signature_holds`]).
+static SIGNATURE_CHECKS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(any(test, debug_assertions))]
+thread_local! {
+    /// How many of them the calling thread checked ([`signature_checks_here`]).
+    static SIGNATURE_CHECKS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many book entries' signatures this process has checked since it started, by any caller
+/// of [`Peer::signature_holds`]: a count that only rises, read by the process's metrics.
+#[must_use]
+pub fn signature_checks() -> u64 {
+    SIGNATURE_CHECKS.load(Ordering::Relaxed)
+}
+
+/// [`signature_checks`] counted on the calling thread alone, so a test reads its own checks
+/// beside the tests that run with it.
+#[cfg(any(test, debug_assertions))]
+#[must_use]
+pub fn signature_checks_here() -> u64 {
+    SIGNATURE_CHECKS_HERE.with(std::cell::Cell::get)
+}
+
 /// One peer in the book.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
@@ -1278,10 +1328,15 @@ impl Peer {
     }
 
     /// Whether its node signed it, under the key it names, as it stands ([`Signed::holds`]).
+    /// An entry that names a node, a key, a version and a signature is checked, and counted
+    /// ([`signature_checks`]); any other holds nothing and is not.
     #[must_use]
     pub fn signature_holds(&self) -> bool {
         match (&self.node, &self.key, &self.version, &self.signed) {
             (Some(node), Some(key), Some(version), Some(signed)) => {
+                SIGNATURE_CHECKS.fetch_add(1, Ordering::Relaxed);
+                #[cfg(any(test, debug_assertions))]
+                SIGNATURE_CHECKS_HERE.with(|here| here.set(here.get() + 1));
                 signed.holds(((node, key), (&self.host, self.port, version)))
             }
             _ => false,
@@ -2032,8 +2087,7 @@ fn read_book_as_written(
     dir: &Path,
     held: Option<FleetMark>,
 ) -> Result<(Vec<Peer>, Vec<Peer>), PeersError> {
-    static BOOKS: KeptParse<Result<Vec<Peer>, usize>> = KeptParse::new(KEPT_BOOKS);
-    let book = match BOOKS.read(dir, PEERS_FILE, PEERS_FILE_MAX, parse_book) {
+    let book = match kept_books(|kept| kept.read(dir, PEERS_FILE, PEERS_FILE_MAX, parse_book)) {
         Ok(book) => book.map_err(PeersError::Line)?,
         Err(PrivateFileError::Missing) => return Ok((Vec::new(), Vec::new())),
         Err(e) => return Err(PeersError::File(e)),
@@ -2044,9 +2098,19 @@ fn read_book_as_written(
 }
 
 /// The state directories whose book files' parses are kept ([`KeptParse`]): the node's watch
-/// and each connection it admits read the book ([`Keyring::read`]). Every use opens, judges and
-/// reads fresh bytes; identical bytes reuse their parse.
+/// and each connection it admits read the book ([`Keyring::read`]). Every use opens and judges
+/// its file; a file nothing replaced or wrote into since its parse was kept is not read again,
+/// and identical bytes reuse their parse.
 const KEPT_BOOKS: usize = 4;
+
+kept_parse!(
+    /// `read` of the kept parses of [`PEERS_FILE`]: its entries, or its first line that is none.
+    kept_books: Result<Vec<Peer>, usize>
+);
+kept_parse!(
+    /// `read` of the kept parses of [`ISSUER_BOOK_FILE`].
+    kept_copies: IssuerCopy
+);
 
 /// The entries of a book's text other than copies ([`Via::IssuerBook`]), or the number of its
 /// first line that is no peer record.
@@ -2087,9 +2151,8 @@ struct IssuerCopy {
 /// [`ISSUER_BOOK_FILE`] in `dir`, read under [`read_private`]'s rules, each copy's `seen_ms` as
 /// the file itself holds it: `None` when it is missing or refused.
 fn issuer_copy(dir: &Path) -> Option<IssuerCopy> {
-    static COPIES: KeptParse<IssuerCopy> = KeptParse::new(KEPT_BOOKS);
-    COPIES
-        .read(dir, ISSUER_BOOK_FILE, PEERS_FILE_MAX, |bytes| {
+    kept_copies(|kept| {
+        kept.read(dir, ISSUER_BOOK_FILE, PEERS_FILE_MAX, |bytes| {
             let text = String::from_utf8_lossy(bytes);
             let mut lines = text
                 .lines()
@@ -2110,7 +2173,8 @@ fn issuer_copy(dir: &Path) -> Option<IssuerCopy> {
                 }),
             }
         })
-        .ok()
+    })
+    .ok()
 }
 
 /// The member's copy of its issuer's book in `dir` ([`ISSUER_BOOK_FILE`]), at most
@@ -2120,13 +2184,17 @@ fn issuer_copy(dir: &Path) -> Option<IssuerCopy> {
 /// before the copy is read ([`seen::before`]): this takes no lock.
 #[must_use]
 pub fn read_issuer_book(dir: &Path, issuer: &str) -> Vec<Peer> {
-    let (times, copy) = seen::before(dir, || issuer_copy(dir));
-    let mut copies = copy
-        .filter(|copy| copy.issuer.as_deref() == Some(issuer))
-        .and_then(|copy| copy.copies)
-        .unwrap_or_default();
+    let (times, mut copies) = seen::before(dir, || issuer_copies_as_written(dir, issuer));
     times.raise(seen::Of::Copy, &mut copies);
     copies
+}
+
+/// [`read_issuer_book`] with each copy's `seen_ms` as [`ISSUER_BOOK_FILE`] itself holds it.
+fn issuer_copies_as_written(dir: &Path, issuer: &str) -> Vec<Peer> {
+    issuer_copy(dir)
+        .filter(|copy| copy.issuer.as_deref() == Some(issuer))
+        .and_then(|copy| copy.copies)
+        .unwrap_or_default()
 }
 
 /// The word [`ANSWERED_FILE`] keys `peer`'s answers by: `node=<id>`, or `place=<host:port>` for
@@ -3689,7 +3757,14 @@ impl Keyring {
     /// its copy of its issuer's book ([`read_issuer_book`]).
     #[must_use]
     pub fn read(dir: &Path) -> Self {
-        let (peers, copies) = book_and_copies(dir);
+        // No key is part of when an entry was last heard: [`SEEN_FILE`] is not read.
+        let peers = read_book_as_written(dir, held_mark(dir))
+            .map(|(held, _other)| held)
+            .unwrap_or_default();
+        let copies = issuer_of(&peers)
+            .and_then(|issuer| issuer.node.as_deref())
+            .map(|issuer| issuer_copies_as_written(dir, issuer))
+            .unwrap_or_default();
         Self::of(peers.iter().chain(&copies))
     }
 
@@ -8295,16 +8370,18 @@ pub fn survey_all(
     })
 }
 
-/// [`survey_all`] of the one `target`, by a `deadline` set from `within` that a read before it
-/// (its issuer's book, read again for a word no book here holds) may have spent part of.
+/// [`survey_all`] of the one `target` with the survey `request` (`survey` and its words), by a
+/// `deadline` set from `within` that a read before it (its issuer's book, read again for a word
+/// no book here holds) may have spent part of.
 pub fn survey_one_by(
     target: &Target,
     keys: &Keyring,
     (secret, me): (&FleetSecret, Option<&NodeIdentity>),
     deadline: (Instant, Duration),
+    request: &str,
 ) -> Result<Surveyed, Unreached> {
     let held = std::sync::Arc::new(HeldAddrs::default());
-    read_one_by(target, keys, (secret, me), deadline, "survey", &held)
+    read_one_by(target, keys, (secret, me), deadline, request, &held)
 }
 
 /// What [`dial`] takes for `peer`, and the node and key it should be.

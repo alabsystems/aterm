@@ -85,7 +85,6 @@ impl Lab {
             kind: CutKind::Draft,
             lease: None,
             fence: None,
-            notes_section: "Unreleased".into(),
             journal: None,
             adopted: false,
         };

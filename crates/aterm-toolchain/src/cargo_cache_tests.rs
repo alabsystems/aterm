@@ -89,6 +89,36 @@ fn dropped_holders_let_go_while_a_forked_child_holds_their_descriptors() {
 }
 
 #[test]
+fn foreign_cache_guard_neither_claims_current_custody_nor_unlocks_the_original_description() {
+    let home = aterm_tempfile::tempdir().unwrap();
+    let retained = std::cell::RefCell::new(None);
+    let held = imp::acquire_with(home.path(), |_| Ok(()), |file| {
+        *retained.borrow_mut() = Some(file.try_clone()?);
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "owning guard acquisition seam retains a duplicate of the same actual locked open-file description"
+        )]
+        file.try_lock_shared().map_err(io::Error::from)
+    }).unwrap();
+    let mut guard = SourceCacheGuard(held);
+    // Model a foreign process copy without running Rust destructors after a
+    // multithreaded fork. The real kernel lock and release path are exercised;
+    // this is not qualification of an arbitrary post-fork Rust destructor.
+    guard.0.creator = std::process::id().wrapping_add(1);
+    let foreign_check_refused = guard.check_current().is_err();
+    drop(guard);
+    let contender = exclusive(&home.path().join(MUTATE));
+    let original_still_held = matches!(&contender, Err(TryLockError::WouldBlock));
+    drop(contender);
+    drop(retained.into_inner());
+    assert!(
+        foreign_check_refused && original_still_held,
+        "foreign check refused={foreign_check_refused}; original open-file-description lock retained={original_still_held}"
+    );
+    exclusive(&home.path().join(MUTATE)).unwrap();
+}
+
+#[test]
 fn shared_guards_allow_download_and_exclude_mutation_until_last_close() {
     fn send_static<T: Send + 'static>() {}
     send_static::<SourceCacheGuard>();

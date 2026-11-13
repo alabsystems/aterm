@@ -180,6 +180,16 @@ const NOTHING_OWED: &str = "nothing owed";
 /// landed ([`Settling`]): a reading that says the same as before past it is the truth again.
 const SETTLE_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How long a Mac Setup tab that cannot travel with an update's handoff may hold a waiting update
+/// at its password prompt while nobody gives its tab a gesture: aterm's own password sheet's
+/// backstop. Past it an update's apply stops the tab's program, as an unanswered prompt is
+/// recorded and the rest goes on: its attempt is unfinished, asked again by itself. A prompt a
+/// person types in holds for the backstop again from each key. A tab's password prompt, as the
+/// password sheet, is a Mac's alone.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+pub(crate) const UNTOUCHED_PROMPT_BACKSTOP: std::time::Duration =
+    crate::askpass::ASKPASS_UNTOUCHED_BACKSTOP;
+
 /// The durable account-wide record of setup's administrator ask, shared with terminal init
 /// ([`aterm_types::clt_mark`]), as this window reads and changes it: the window claims an
 /// automatic ask only where the record lets one go now, hands its claim to the tab's own program
@@ -826,6 +836,11 @@ pub(crate) struct Terminal {
     /// ([`App::developer_tools_custody_at_exit`], whose disk and keeper reads the watch makes
     /// once a second): what [`App::developer_tools_install_carried`] reads, from memory.
     carried: bool,
+    /// aterm stopped its program because an update waited on it at its password prompt and
+    /// nobody touched its tab for `UNTOUCHED_PROMPT_BACKSTOP`
+    /// (`App::stop_untouched_developer_tools_prompts`): nobody said no, so the stop's code it
+    /// ends with is no decline ([`unattended_tab_end`]).
+    unattended: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -858,11 +873,30 @@ impl Terminal {
             carry: None,
             past_password: false,
             carried: false,
+            unattended: false,
         }
     }
 
     fn tools(&self) -> bool {
         matches!(self.purpose, TerminalPurpose::Tools)
+    }
+}
+
+/// How the record takes the end of a program aterm stopped at an update's backstop, nobody having
+/// touched its password prompt ([`Terminal::unattended`]): the stop's code it exits with, which it
+/// cannot tell from a person's Ctrl-C, is no decline but an unfinished try, asked again by itself
+/// on the record's schedule, and so is an end with no status or by a signal; any other status of
+/// the program's own is its end as [`aterm_types::clt_mark::tab_end`] reads it, a finish just
+/// before the stop included.
+#[must_use]
+fn unattended_tab_end(exit: Option<aterm_types::clt_mark::TabExit>) -> aterm_types::clt_mark::End {
+    let stopped = i32::from(aterm_types::macos_setup::COMMAND_LINE_TOOLS_TAB_STOPPED);
+    match exit {
+        Some(aterm_types::clt_mark::TabExit::Code(code)) if code == stopped => {
+            aterm_types::clt_mark::End::Unfinished
+        }
+        exit => aterm_types::clt_mark::tab_end(exit, false, false)
+            .unwrap_or(aterm_types::clt_mark::End::Unfinished),
     }
 }
 
@@ -2244,6 +2278,7 @@ impl App {
         let told = terminal.told;
         let closed = terminal.closed;
         let quit = terminal.quit;
+        let unattended = terminal.unattended;
         let claim = terminal.claim.take();
         let recovered = terminal.recovered;
         // EOF can precede the child's status. A person may start a retry meanwhile: retain the
@@ -2255,7 +2290,8 @@ impl App {
         let mut read_nothing_owed = false;
         // What the exit says, for the page and this launch's gates; how the attempt ends in the
         // account's record, which decides the next automatic ask, is the record's own decision
-        // ([`aterm_types::clt_mark::tab_end`]).
+        // ([`aterm_types::clt_mark::tab_end`], or [`unattended_tab_end`] for a program aterm
+        // stopped at an update's backstop).
         match exit {
             Some(aterm_pty::ChildExit::Code(0)) => {
                 aterm_log::info!("System State: the Mac Setup tab installed them");
@@ -2272,8 +2308,16 @@ impl App {
                 // A person declined (a Ctrl-C at the password prompt or later), unless aterm's
                 // quit hung the program up, which it cannot tell from a Ctrl-C: then the record
                 // reads the attempt cut off. Until a decline's long pause passes, the way on is
-                // the person's own `aterm init` (or Install…, while the tools are missing).
-                aterm_log::info!("System State: the Mac Setup tab was stopped");
+                // the person's own `aterm init` (or Install…, while the tools are missing). A
+                // stop an update's backstop sent an untouched prompt is no decline: unfinished.
+                if unattended {
+                    aterm_log::info!(
+                        "System State: the Mac Setup tab was stopped at its untouched password \
+                         prompt; its install is asked again by itself"
+                    );
+                } else {
+                    aterm_log::info!("System State: the Mac Setup tab was stopped");
+                }
                 if current {
                     self.workstation_setup.developer_tools_unfinished = true;
                 }
@@ -2384,14 +2428,15 @@ impl App {
                 }
             }
         }
-        let how = aterm_types::clt_mark::tab_end(
-            exit.map(|exit| match exit {
-                aterm_pty::ChildExit::Code(code) => aterm_types::clt_mark::TabExit::Code(code),
-                aterm_pty::ChildExit::Signal(_) => aterm_types::clt_mark::TabExit::Signal,
-            }),
-            closed,
-            quit,
-        );
+        let tab_exit = exit.map(|exit| match exit {
+            aterm_pty::ChildExit::Code(code) => aterm_types::clt_mark::TabExit::Code(code),
+            aterm_pty::ChildExit::Signal(_) => aterm_types::clt_mark::TabExit::Signal,
+        });
+        let how = if unattended {
+            Some(unattended_tab_end(tab_exit))
+        } else {
+            aterm_types::clt_mark::tab_end(tab_exit, closed, quit)
+        };
         match (how, &claim) {
             (Some(how), Some(claim)) => {
                 if self.workstation_setup.developer_tools_mark.end(claim, how)

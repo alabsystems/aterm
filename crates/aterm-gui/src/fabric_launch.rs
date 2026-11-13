@@ -29,8 +29,8 @@ const LANES_END_WAIT: Duration = Duration::from_secs(60);
 pub(crate) type LaneEnded = std::sync::mpsc::Sender<std::convert::Infallible>;
 
 /// What the supervisor tells the link of a generation one of whose lanes it served, on its own
-/// thread: the attach once the lanes are served ([`launch_serving`]), the loss once its bridge
-/// has exited ([`Launched::retire`]). Told there, one generation's attach, its loss and the next
+/// thread: the attach once a lane is served ([`launch_serving`]), the loss when its bridge
+/// exits or cannot serve both lanes ([`Launched::retire`]). Told there, its attach, loss and the next
 /// one's attach reach the link in that order, however its lanes are scheduled and however long
 /// they take to end. Each lane tells the attach too, before it serves a verb, and the loss as it
 /// ends; the link takes a generation's attach once.
@@ -639,8 +639,9 @@ impl Launched {
         self.child.wait()
     }
 
-    /// Hang up the lanes of a bridge that has exited and tell its generation's loss, waiting on
-    /// none of them: what is left is their ending ([`Retiring`]).
+    /// Revoke a bridge's lanes and tell its generation's loss after exit or failed startup.
+    /// Neither lane work nor an unconfirmed child exit delays the next generation: pending
+    /// child custody stays with the reaper, and the lanes finish through [`Retiring`].
     ///
     /// THE ORDER A RELAUNCH AT ONCE RESTS ON: the loss is told here, on the supervisor's thread,
     /// before it launches the next generation ([`Told`]), so the link's hearers read this
@@ -654,15 +655,35 @@ impl Launched {
     /// moves the link nor holds or advises a session the new bridge serves
     /// (`fabric::bridge_lost_waking`).
     fn retire(self) -> Retiring {
-        for lane in &self.near {
+        let Self {
+            mut child,
+            near,
+            generation,
+            lost,
+            lanes_ended,
+        } = self;
+        for lane in &near {
             aterm_uds::hangup::hang_up(lane);
         }
-        if let Some(lost) = self.lost {
-            lost(self.generation);
+        if let Some(lost) = lost {
+            lost(generation);
         }
-        Retiring {
-            lanes_ended: self.lanes_ended,
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let killed = child.kill();
+            let waited = child.try_wait();
+            if !matches!(&waited, Ok(Some(_))) {
+                if killed.is_err() || waited.is_err() {
+                    aterm_log::warn!(
+                        "fabric bridge retirement retains its child after cleanup errors: \
+                         kill={:?}, wait={:?}",
+                        killed.err(),
+                        waited.err()
+                    );
+                }
+                aterm_uds::reaper::hand_off(move || matches!(child.try_wait(), Ok(Some(_))));
+            }
         }
+        Retiring { lanes_ended }
     }
 }
 
@@ -674,7 +695,7 @@ struct Retiring {
 
 impl Retiring {
     /// Wait for every lane to let go of its [`LaneEnded`], warning if one has not `within` the
-    /// bridge's exit: whether all had.
+    /// bridge's retirement: whether all had.
     fn watch(self, within: Duration) -> bool {
         let ended = !matches!(
             self.lanes_ended.recv_timeout(within),
@@ -682,7 +703,7 @@ impl Retiring {
         );
         if !ended {
             aterm_log::warn!(
-                "fabric bridge lanes had not ended {:.1}s after its exit; the next bridge runs \
+                "fabric bridge lanes had not ended {:.1}s after retirement; the next bridge runs \
                  beside them, and their late loss neither moves the link nor holds a session",
                 within.as_secs_f64()
             );
@@ -714,7 +735,7 @@ fn launch_once(argv: &[String]) -> std::io::Result<Launched> {
         crate::control::attach_fabric_bridge,
         Told {
             attached: crate::fabric::bridge_attached,
-            lost: Box::new(crate::control::fabric_bridge_exited),
+            lost: Box::new(crate::control::fabric_bridge_retired),
         },
     )
 }
@@ -762,13 +783,20 @@ fn launch_serving(
     if served {
         (told.attached)(generation);
     }
-    Ok(Launched {
+    let launched = Launched {
         child,
         near,
         generation,
         lost: served.then_some(told.lost),
         lanes_ended,
-    })
+    };
+    if !verb || !push {
+        launched.retire().watch_behind(LANES_END_WAIT);
+        return Err(std::io::Error::other(
+            "fabric bridge needs both lanes served",
+        ));
+    }
+    Ok(launched)
 }
 
 fn filter_child_env(

@@ -12,8 +12,10 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-/// The existing LAN validity and failed-accept retry bound. Ordinary fleet listeners do not
-/// use this as an idle timer; slot displacement also retains this bounded release wait.
+/// The failed-accept retry bound, and how long after a route or interface change it heard a
+/// LAN listener looks once more (`lan::Listener::validity_deadline`). A listener idles on this
+/// only on macOS with no kept read of its attachments (`lan::unheard_look`), and off Unix;
+/// slot displacement also retains this bounded release wait.
 pub(crate) const ACCEPT_POLL: Duration = Duration::from_millis(200);
 
 /// Sources ready in one native listener wait. A timeout has no ready source.

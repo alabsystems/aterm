@@ -214,6 +214,8 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         dial: Instant::now(),
         rotate: Instant::now() + Duration::from_secs(300),
         versions_at: Instant::now(),
+        listened: false,
+        held: aterm_net::fleet_member::HeldSignatures::default(),
         bus: Bus::default(),
         scope: Scope::Loopback,
         port: 0,
@@ -222,6 +224,7 @@ fn one_discovered_address_repairs_both_directions_and_cancellation_drains() {
         push: None,
         failure: None,
         doorbell: None,
+        announced: Arc::default(),
         stand_in: None,
         delivering: None,
         observed: std::collections::BTreeMap::new(),
@@ -387,6 +390,352 @@ fn round_at(
     (dialled, served)
 }
 
+/// The seats read ([`Transport::hear_versions`], which a transport's tick runs every [`SEATS`])
+/// checks an unchanged 85-entry fleet book's signatures once: the transport keeps each verdict,
+/// so its second read checks none, and a read after one entry changed checks that entry alone.
+/// Counted on this thread ([`census::cadence_here`]).
+///
+/// NEGATIVE CONTROL (2026-11-12): with `HeldSignatures::judge` never looking a kept verdict up,
+/// the second read made 85 checks (`the second read checks nothing`: left 85, right 0).
+/// NEGATIVE CONTROL (2026-11-12): with a verdict kept under the node id and key alone, the
+/// changed entry was not checked (`a changed entry is checked alone`: left 0, right 1).
+#[test]
+fn the_seats_read_checks_an_unchanged_books_signatures_once() {
+    let producer = crate::control::advertised_tests::Producer::new();
+    let book = producer.crowd();
+    producer.keep_all(&book);
+    let mut changed = book.clone();
+    changed[0].version = Some("2.0.0".into());
+    let crate::control::advertised_tests::Producer {
+        lab: _lab,
+        active,
+        state,
+        ..
+    } = producer;
+    let mut transport = Transport::unopened(None, Scope::Loopback, 0).unwrap();
+    transport.endpoint = Some(Arc::new(active));
+    let now = Instant::now();
+    let read = |transport: &mut Transport| {
+        let before = census::cadence_here().signature_checks;
+        transport.hear_versions(&state, now);
+        census::cadence_here().signature_checks - before
+    };
+    assert_eq!(
+        read(&mut transport),
+        85,
+        "the first read checks every entry"
+    );
+    assert_eq!(read(&mut transport), 0, "the second read checks nothing");
+    aterm_net::fleet_member::update_peers(&state, |held| {
+        held.clear();
+        held.extend(changed.iter().cloned());
+        Ok::<(), String>(())
+    })
+    .unwrap();
+    assert_eq!(read(&mut transport), 1, "a changed entry is checked alone");
+    assert_eq!(read(&mut transport), 0, "and its verdict kept");
+}
+
+/// Send `datagrams` to `transport`'s first link's multicast socket from one loopback socket, in
+/// order, and return once every one of them waits there. The loopback interface delivers what
+/// is sent through it in the order sent, whichever socket each datagram is for, so the test
+/// sends one more to a socket of its own and waits for that one: a hang detector, never a
+/// budget.
+fn queue(transport: &Transport, datagrams: &[&[u8]]) {
+    let sender = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = transport.links[0].hints.port();
+    for datagram in datagrams {
+        sender
+            .send_to(datagram, (Ipv4Addr::LOCALHOST, port))
+            .unwrap();
+    }
+    let last = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    last.set_read_timeout(Some(aterm_spec::wait::MUST_HAPPEN))
+        .unwrap();
+    sender.send_to(b"last", last.local_addr().unwrap()).unwrap();
+    let mut bytes = [0; 8];
+    assert_eq!(
+        last.recv(&mut bytes).unwrap(),
+        4,
+        "the loopback delivered what was sent before it"
+    );
+}
+
+/// `transport`'s turn at `at`, with how many beacons it read ([`census::Cadence::beacons`]).
+fn beacons_read(transport: &mut Transport, at: Instant, hear: bool) -> u64 {
+    let before = census::cadence_here().beacons;
+    transport.turn(at, hear).unwrap();
+    census::cadence_here().beacons - before
+}
+
+/// A transport past its first turn whose own beacon is not due before `now + BEACON`: its turns
+/// hear only when asked.
+fn settled(now: Instant) -> Transport {
+    let mut transport = loopback_mode(None, 0, [91; 32]);
+    transport.listened = true;
+    transport.beacon = now + BEACON;
+    transport
+}
+
+/// The owner loop waits on its doorbell and on each listener that has room, and on no multicast
+/// socket, however many links it has ([`Transport::waits_on`]): a beacon wakes nothing.
+///
+/// NEGATIVE CONTROL (2026-11-12): with [`Transport::waits_on`] listing each link's multicast
+/// socket again, one link gave three descriptors (`1 link(s)`: left Some(3), right Some(2)).
+#[test]
+fn the_owner_waits_on_its_doorbell_and_listeners_and_no_multicast_socket() {
+    let lab = Lab::new();
+    let mut transport = Transport::unopened(None, Scope::Loopback, 0).unwrap();
+    transport.endpoint = Some(lab.endpoints[0].clone());
+    let link = |listener: bool| Link {
+        source: Ipv4Addr::LOCALHOST.into(),
+        listener: listener
+            .then(|| Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap()),
+        hints: Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap(),
+        delivering: None,
+    };
+    let waits = |transport: &Transport| transport.waits_on().map(|fds| fds.len());
+    assert_eq!(waits(&transport), Some(1), "its doorbell");
+    for links in 1..=3 {
+        transport.links.push(link(true));
+        assert_eq!(waits(&transport), Some(1 + links), "{links} link(s)");
+    }
+    transport.links.push(link(false));
+    assert_eq!(
+        waits(&transport),
+        Some(4),
+        "a link with no listener adds nothing to wait on"
+    );
+    // A beacon that waits in a link's socket leaves the loop's wait unready.
+    queue(&transport, &[&Hints::new([1; 32]).wire(4001)]);
+    assert!(
+        aterm_uds::ready::any_now(&transport.waits_on().unwrap())
+            .unwrap()
+            .is_empty(),
+        "a waiting beacon wakes nothing"
+    );
+}
+
+/// Beacons wait in their socket until a hearing turn, which reads every one of them: with 40
+/// queued, three turns that were not asked to hear read none, the turn that was reads all 40,
+/// and the next finds none left. A transport's first turn hears unasked, and so does the turn
+/// its own beacon is due.
+///
+/// NEGATIVE CONTROL (2026-11-12): with the read's bound back at 16 a turn, the hearing turn read
+/// 16 (`a hearing turn reads every beacon that waits`: left 16, right 40).
+#[test]
+fn a_hearing_turn_reads_every_queued_beacon_and_no_other_turn_reads_one() {
+    use crate::runtime::TICK;
+    let now = Instant::now();
+    let mut transport = settled(now);
+    let wires: Vec<_> = (0..40u8)
+        .map(|n| Hints::new([n + 1; 32]).wire(4000 + u16::from(n)))
+        .collect();
+    let datagrams: Vec<&[u8]> = wires.iter().map(|wire| wire.as_slice()).collect();
+    queue(&transport, &datagrams);
+    for tick in 1..=3 {
+        assert_eq!(
+            beacons_read(&mut transport, now + TICK * tick, false),
+            0,
+            "a turn not asked to hear reads none"
+        );
+    }
+    assert_eq!(
+        beacons_read(&mut transport, now + TICK * 4, true),
+        40,
+        "a hearing turn reads every beacon that waits"
+    );
+    assert_eq!(beacons_read(&mut transport, now + TICK * 5, true), 0);
+
+    // A transport's first turn hears, asked or not.
+    let mut first = settled(now);
+    first.listened = false;
+    queue(&first, &datagrams[..1]);
+    assert_eq!(beacons_read(&mut first, now, false), 1, "the first turn");
+    queue(&first, &datagrams[..1]);
+    assert_eq!(beacons_read(&mut first, now + TICK, false), 0, "the second");
+    // So does the turn its own beacon is due, which may read its own beacon back as well.
+    assert!(
+        beacons_read(&mut first, now + BEACON, false) >= 1,
+        "the turn its own beacon is due"
+    );
+}
+
+/// One hearing turn reads at most [`HEARD`] datagrams from a link, dropped ones included, and
+/// leaves the rest in the socket for the next: with an oversized datagram and seven beacons
+/// more than the bound queued, the first hearing turn reads the dropped one and `HEARD - 1`
+/// beacons, the second the eight left, the third none. The bound is what an unauthenticated
+/// flood can ask of one turn.
+///
+/// NEGATIVE CONTROL (2026-11-12): with the read going on until the socket is empty, the first
+/// turn read all 327 beacons (`the bound's datagrams, then the rest, then none`: `left: [327,
+/// 0, 0]`, `right: [319, 8, 0]`).
+#[test]
+fn a_hearing_turn_reads_no_more_than_its_bound_and_leaves_the_rest() {
+    use crate::runtime::TICK;
+    let now = Instant::now();
+    let mut transport = settled(now);
+    let wires: Vec<_> = (0..HEARD + 7)
+        .map(|n| Hints::new([(n % 250) as u8 + 1; 32]).wire(4000 + n as u16))
+        .collect();
+    // Larger than a discovery datagram may be (`aterm_net::lan::Multicast::hear`).
+    let oversized = [0; 1300];
+    let mut datagrams: Vec<&[u8]> = vec![&oversized];
+    datagrams.extend(wires.iter().map(|wire| wire.as_slice()));
+    queue(&transport, &datagrams);
+    let read: Vec<u64> = (1..=3)
+        .map(|turn| beacons_read(&mut transport, now + TICK * turn, true))
+        .collect();
+    assert_eq!(
+        read,
+        [HEARD as u64 - 1, 8, 0],
+        "the bound's datagrams, then the rest, then none"
+    );
+}
+
+/// The serving loops' polled round is the turn that hears. [`crate::runtime::serve_paced`] runs
+/// a real transport's step ([`crate::runtime::serve_turn`], what `serve_selected` and
+/// `serve_presence` run in their ticks) on a virtual clock, a tick every 500 ms for five
+/// seconds. A beacon that waits from before the first tick is read by the tick of the first
+/// round, two seconds in, and by none before it; one that comes after that round is read by
+/// the tick of the next, and by none between: 0, 0, 0, 0, 1, 0, 0, 0, 1, 0 read by the ten
+/// ticks. A beacon so waits a polled round at most.
+///
+/// NEGATIVE CONTROL (2026-11-12): with `serve_turn` asking no turn to hear, neither round's
+/// tick read its beacon (`each tick's (polled round, beacons read)`: `left` reads `(true, 0)`
+/// for both rounds where `right` reads `(true, 1)`).
+#[test]
+fn the_serving_loops_polled_round_is_the_turn_that_hears() {
+    use crate::runtime::{Flow, Status, serve_paced, serve_turn};
+    let start = Instant::now();
+    let clock = std::cell::Cell::new(start);
+    let mut transport = settled(start);
+    queue(&transport, &[&Hints::new([1; 32]).wire(4001)]);
+    let mut read = Vec::new();
+    let served: std::result::Result<(), Status> = serve_paced(
+        &mut transport,
+        || clock.get(),
+        || clock.get() >= start + BEACON,
+        |transport, floor, _| {
+            let now = clock.get();
+            if now == start + crate::runtime::POLL {
+                queue(transport, &[&Hints::new([2; 32]).wire(4002)]);
+            }
+            clock.set((now + Duration::from_millis(500)).max(floor));
+        },
+        |transport, now, round| {
+            let before = census::cadence_here().beacons;
+            serve_turn(transport, now, round)?;
+            read.push((round, census::cadence_here().beacons - before));
+            Ok(Flow::Serve(Some(transport.next_due(now))))
+        },
+    );
+    assert_eq!(served, Ok(()));
+    let (idle, heard) = ((false, 0), (true, 1));
+    assert_eq!(
+        read,
+        [idle, idle, idle, idle, heard, idle, idle, idle, heard, idle],
+        "each tick's (polled round, beacons read)"
+    );
+}
+
+/// A datagram the socket drops ends no read: with a beacon, an oversized datagram and a second
+/// beacon queued, one hearing turn reads both beacons and admits both endpoints.
+///
+/// NEGATIVE CONTROL (2026-11-12): with a dropped datagram read as an empty socket, the turn read
+/// one beacon (`both beacons, past the dropped datagram`: left 1, right 2).
+#[test]
+fn a_dropped_datagram_does_not_end_a_hearing_turns_read() {
+    use crate::runtime::TICK;
+    let now = Instant::now();
+    let mut transport = settled(now);
+    let (first, second) = (
+        Hints::new([1; 32]).wire(4001),
+        Hints::new([2; 32]).wire(4002),
+    );
+    // Larger than a discovery datagram may be (`aterm_net::lan::Multicast::hear`).
+    let oversized = [0; 1300];
+    queue(&transport, &[&first, &oversized, &second]);
+    assert_eq!(
+        beacons_read(&mut transport, now + TICK, true),
+        2,
+        "both beacons, past the dropped datagram"
+    );
+    assert_eq!(transport.peers(), 2, "both endpoints are candidates");
+}
+
+/// Each round's end adds one to exactly one of the outbound and inbound counts
+/// ([`census::Cadence`]), by who dialled it and whatever it came to, and a round that completed
+/// and moved nothing adds one to the quiet count as well. Read on this thread, which takes each
+/// end ([`census::cadence_here`]).
+///
+/// NEGATIVE CONTROL (2026-11-12): with [`Transport::finish`] counting every end as dialled in as
+/// well as by its direction, the first end read `[1, 1, 0]` where `[1, 0, 0]` was due (`the
+/// dialling side's end is one outbound round`).
+#[test]
+fn a_rounds_end_counts_once_by_who_dialled_it() {
+    let lab = Lab::new();
+    let listener = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let mut dialler = loopback_mode(None, 0, [71; 32]);
+    let mut server = loopback_mode(None, 0, [72; 32]);
+    let now = Instant::now();
+    let read = || {
+        let counts = census::cadence_here();
+        [counts.rounds_out, counts.rounds_in, counts.rounds_quiet]
+    };
+    let start = read();
+    let since = || {
+        let counts = read();
+        [0, 1, 2].map(|at| counts[at] - start[at])
+    };
+    // The first round carries the control history across: neither end is quiet.
+    let (dialled, served) = round_at(
+        &lab.endpoints[1],
+        &lab.endpoints[0],
+        &listener,
+        Repair::default(),
+    );
+    dialler.finish(dialled, now);
+    assert_eq!(
+        since(),
+        [1, 0, 0],
+        "the dialling side's end is one outbound round"
+    );
+    server.finish(served, now);
+    assert_eq!(
+        since(),
+        [1, 1, 0],
+        "the serving side's end is one inbound round"
+    );
+    // The second finds nothing to move: each side's end is quiet.
+    let (dialled, served) = round_at(
+        &lab.endpoints[1],
+        &lab.endpoints[0],
+        &listener,
+        Repair::default(),
+    );
+    dialler.finish(dialled, now);
+    assert_eq!(since(), [2, 1, 1], "a quiet outbound round");
+    server.finish(served, now);
+    assert_eq!(since(), [2, 2, 2], "a quiet inbound round");
+    // A dial nothing answers ends as an outbound round, and is not quiet.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = closed.local_addr().unwrap();
+    drop(closed);
+    let refused = Worker::start(
+        lab.endpoints[1].clone(),
+        None,
+        Some(target),
+        Scope::Loopback,
+        None,
+        Repair::default(),
+        Instant::now(),
+    )
+    .unwrap();
+    dialler.finish(refused, now);
+    assert_eq!(since(), [3, 2, 2], "a refused dial is an outbound round");
+}
+
 /// A peer whose endpoint here keeps refusing (it came back on another port) dials in and completes
 /// a round: its endpoints here drop their backoff, as one this side dialled would (CR1). Once per
 /// failure streak: when the endpoint it pulled in refuses again, it is dead, and the peer's later
@@ -486,6 +835,93 @@ fn an_inbound_round_from_a_peer_ends_its_endpoints_backoff() {
             );
         }
     }
+}
+
+/// C4 through real rounds and [`Transport::finish`], which reads each round dialled in as
+/// quiet or not. A's endpoint for B is verified and at rest. B dials A with nothing to move:
+/// A's own dial of B waits an ordinary interval again from that round. B then takes a record A
+/// lacks and dials again: that round moves it, and A's dial stays where it was.
+///
+/// NEGATIVE CONTROL (2026-11-12): with [`Hints::vouch`] not moving a resting endpoint's next
+/// dial, A's dial stayed inside the interval of its own last round (`a quiet round dialled in
+/// holds this side's dial back`).
+/// NEGATIVE CONTROL (2026-11-12): with [`Transport::finish`] calling every round dialled in
+/// quiet, the round that moved the record held A's dial back again (`a round that moved a
+/// record holds nothing back`).
+#[test]
+fn a_quiet_round_dialled_in_holds_this_sides_dial_back_and_one_that_moved_a_record_does_not() {
+    let lab = Lab::new();
+    let mut a = loopback_mode(None, 0, [71; 32]);
+    let theirs = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let ours = Listener::bind("127.0.0.1:0".parse().unwrap(), Scope::Loopback).unwrap();
+    let address = theirs.local_addr().unwrap();
+    let mut now = Instant::now();
+    a.hints
+        .observe(&Hints::new([72; 32]).wire(address.port()), address, now);
+    // A dials B until a round moves nothing: B's endpoint here is verified and at rest.
+    for _ in 0..3 {
+        let (chosen, repair) = a.hints.next(now).unwrap();
+        assert_eq!(chosen, address);
+        let (dialled, served) = round_at(&lab.endpoints[0], &lab.endpoints[1], &theirs, repair);
+        assert!(served.task.join().unwrap().2);
+        a.finish(dialled, now);
+        if !a.hints.follow_up_contains(address) {
+            break;
+        }
+        now += Duration::from_millis(500);
+    }
+    assert!(a.hints.established(address));
+    let rested = a.hints.next_at(address);
+    assert!(rested < now + Duration::from_secs(5), "its own interval");
+
+    let dial_in = || {
+        let (dialled, served) = round_at(
+            &lab.endpoints[1],
+            &lab.endpoints[0],
+            &ours,
+            Repair::default(),
+        );
+        assert!(dialled.task.join().unwrap().2);
+        served
+    };
+    let heard = now + Duration::from_secs(2);
+    a.finish(dial_in(), heard);
+    let held = a.hints.next_at(address);
+    assert!(
+        held >= heard + Duration::from_secs(3),
+        "a quiet round dialled in holds this side's dial back"
+    );
+
+    let after = Node::test_seal(
+        &[21; 32],
+        [9; 16],
+        Edit::Update {
+            parent: lab.update.id(),
+            hosts: &[],
+            payload: b"written at B",
+        },
+        &[Identity::generate().unwrap().recipient()],
+        0,
+        &[],
+    )
+    .unwrap();
+    Journal::open_existing(&lab.dirs[1], lab.trust)
+        .unwrap()
+        .ingest(after.bytes())
+        .unwrap();
+    a.finish(dial_in(), heard + Duration::from_secs(2));
+    assert!(
+        Journal::open_existing(&lab.dirs[0], lab.trust)
+            .unwrap()
+            .node(&after.id())
+            .is_some(),
+        "the second round dialled in moved B's record to A"
+    );
+    assert_eq!(
+        a.hints.next_at(address),
+        held,
+        "a round that moved a record holds nothing back"
+    );
 }
 
 #[test]
@@ -1043,6 +1479,8 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         dial: now,
         rotate: now + Duration::from_secs(300),
         versions_at: now,
+        listened: false,
+        held: aterm_net::fleet_member::HeldSignatures::default(),
         bus: Bus::default(),
         scope: Scope::Loopback,
         port,
@@ -1051,6 +1489,7 @@ fn loopback_mode(endpoint: Option<Arc<Endpoint>>, port: u16, token: [u8; 32]) ->
         push: None,
         failure: None,
         doorbell: None,
+        announced: Arc::default(),
         stand_in: None,
         delivering: None,
         observed: std::collections::BTreeMap::new(),
@@ -1567,6 +2006,150 @@ fn discovered_commons_tables_repair_without_a_peer_list_and_rejoin_after_offline
     );
 }
 
+/// C3, through two serving transports and the production store, listener and rounds. Once the
+/// two hold the same and nothing is due, a commit on this thread rings A's doorbell; the turn
+/// that ring wakes counts one announce and starts a dial of B with the clock not advanced; and
+/// B comes to hold the record. What B's round thread ingested for it announces nothing at B,
+/// whose listener hears every append to its custody: B's bank stays empty to the end.
+///
+/// NEGATIVE CONTROL (2026-11-12): with the listener noting the table and ringing nothing, A's
+/// wait stayed unready (`the commit rings the owner`).
+/// NEGATIVE CONTROL (2026-11-12): with [`Hints::announce`] leaving each endpoint's next dial
+/// where it was, the woken turn started no dial (`the woken turn dials B at the same instant`:
+/// `left: 0`, `right: 1`).
+/// NEGATIVE CONTROL (2026-11-12): with the listener not reading whether its thread runs a
+/// round, B announced the record its round brought it (`what a round brought B announces
+/// nothing there`: `left: Some(({…}, false))`, `right: None`).
+#[test]
+fn a_local_append_dials_the_peer_at_once_and_what_the_round_brings_announces_nothing() {
+    use crate::{
+        catalog::Directory,
+        table::{
+            Session,
+            store::{Store, claim_dir_of, listen},
+        },
+    };
+    use aterm_secrets::commons::roster::Role;
+    let lab = crate::table::tests::Lab::new(&[Role::Writer, Role::Writer]);
+    let bootstrap = lab.bootstrap(0);
+    let directory = Directory::new(&lab.paths[0], bootstrap.trust());
+    let session = Session::open(&bootstrap).unwrap();
+    let scope = directory
+        .open_application(&session, "accounts", "proposals", 1)
+        .unwrap();
+    drop(session);
+    let commit = |payload: &[u8]| {
+        let session = Session::open(&bootstrap).unwrap();
+        Store::open(&session, &directory.path(scope).unwrap(), scope)
+            .unwrap()
+            .commit_catalog(&session, payload)
+            .unwrap();
+    };
+    commit(b"first proposal");
+    let endpoint = |n| {
+        Arc::new(
+            Endpoint::from_bootstrap(&lab.bootstrap(n))
+                .unwrap()
+                .unwrap()
+                .with_commons(lab.paths[n].clone(), lab.paths[n].home.join("config"))
+                .unwrap(),
+        )
+    };
+    let mut a = loopback(endpoint(0), 0, [61; 32]);
+    a.doorbell = Some(Arc::new(Doorbell::new().unwrap()));
+    let port = a.links[0].hints.port();
+    let mut b = loopback(endpoint(1), port, [62; 32]);
+    let _hearing = [
+        listen(claim_dir_of(&bootstrap).unwrap(), a.announcer()).expect("a free slot"),
+        listen(claim_dir_of(&lab.bootstrap(1)).unwrap(), b.announcer()).expect("a free slot"),
+    ];
+    let b_at = b.links[0].listener.as_ref().unwrap().local_addr().unwrap();
+    // Tick both on one virtual clock until `done` holds with no round running: it advances a
+    // tick while both rest and follows the wall clock while a round runs. Before each of B's
+    // turns its bank is read, and must be empty. The hang detector is a minute with no round
+    // finished on either side.
+    let drive = |a: &mut Transport,
+                 b: &mut Transport,
+                 mut now: Instant,
+                 what: &str,
+                 done: &dyn Fn(&Transport, &Transport, Instant) -> bool| {
+        let mut until = Instant::now() + Duration::from_secs(60);
+        let mut finished = (a.finished_rounds, b.finished_rounds);
+        loop {
+            a.tick(now).unwrap();
+            assert_eq!(
+                b.announced.take(),
+                None,
+                "what a round brought B announces nothing there"
+            );
+            b.tick(now).unwrap();
+            let idle = a.workers.is_empty() && b.workers.is_empty();
+            if idle && done(a, b, now) {
+                return now;
+            }
+            if (a.finished_rounds, b.finished_rounds) != finished {
+                finished = (a.finished_rounds, b.finished_rounds);
+                until = Instant::now() + Duration::from_secs(60);
+            }
+            assert!(Instant::now() < until, "{what}: {:?}", a.hints);
+            if idle {
+                now += crate::runtime::TICK;
+            } else {
+                now = now.max(Instant::now());
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    };
+    let held = |b: &Transport| b.observed.get(&scope.digest()).copied().unwrap_or(0);
+    // B holds the first record, A has B's endpoint established, and neither A's next dial of
+    // it nor its spacing is due.
+    let now = drive(
+        &mut a,
+        &mut b,
+        Instant::now(),
+        "the first record",
+        &|a, b, now| {
+            held(b) >= 1
+                && a.hints.established(b_at)
+                && a.dial <= now
+                && a.hints.next_at(b_at) > now
+        },
+    );
+    a.clear_doorbell();
+    a.turn(now, false).unwrap();
+    assert_eq!(a.workers.len(), 0, "nothing is due before the commit");
+    let ready = |a: &Transport| aterm_uds::ready::any_now(&a.waits_on().unwrap()).unwrap();
+    assert!(ready(&a).is_empty(), "and nothing wakes the owner");
+    let announces = census::cadence_here().announces;
+
+    commit(b"second proposal");
+    assert!(!ready(&a).is_empty(), "the commit rings the owner");
+    a.clear_doorbell();
+    a.turn(now, false).unwrap();
+    assert_eq!(
+        census::cadence_here().announces - announces,
+        1,
+        "the woken turn takes one announce"
+    );
+    assert_eq!(
+        a.workers
+            .iter()
+            .filter(|worker| worker.target == Some(b_at))
+            .count(),
+        1,
+        "the woken turn dials B at the same instant"
+    );
+    drive(&mut a, &mut b, now, "the second record", &|_, b, _| {
+        held(b) >= 2
+    });
+    assert_eq!(b.announced.take(), None);
+    assert_eq!(
+        census::cadence_here().announces - announces,
+        1,
+        "one commit, one announce, on either side"
+    );
+}
+
 #[test]
 fn native_discovery_repairs_two_replicas_and_an_offline_replica_rejoins() {
     let lab = Lab::new();
@@ -2024,9 +2607,9 @@ fn a_rounds_end_rings_its_transports_doorbell() {
     assert!(!success, "nothing listens there");
 }
 
-/// An idle transport keeps no deadline sooner than its next beacon, and waits on its doorbell,
-/// its link's multicast socket and its listener: once a peer it may dial is heard, its next dial
-/// is due at once, and once that peer is in its round, nothing is due before the beacon.
+/// An idle transport keeps no deadline sooner than its next beacon, and waits on its doorbell
+/// and its listener: once a peer it may dial is heard, its next dial is due at once, and once
+/// that peer is in its round, nothing is due before the beacon.
 ///
 /// NEGATIVE CONTROL (2026-11-09): with [`Transport::next_due`] leaving its dial out, the heard
 /// peer was not due (`a heard peer is dialled at once`).
@@ -2042,8 +2625,8 @@ fn an_idle_transport_waits_for_its_beacon_and_a_heard_peer_for_its_dial() {
     assert!(transport.next_due(now) > now, "nothing is due at once");
     assert_eq!(
         transport.waits_on().map(|fds| fds.len()),
-        Some(3),
-        "its doorbell, its multicast socket and its listener"
+        Some(2),
+        "its doorbell and its listener"
     );
     let closed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let target = closed.local_addr().unwrap();

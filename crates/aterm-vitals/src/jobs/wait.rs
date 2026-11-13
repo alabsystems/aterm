@@ -20,6 +20,84 @@ pub const PIPE_FULL_BYTES: u64 = 65_536;
 /// How deep a pipe's peer is followed.
 const PEER_DEPTH: usize = 8;
 
+/// One assessment's pipe graph. The consumer and scene stay fixed while a result is reused;
+/// depth is part of the key because reaching the same process with less reach can cap it.
+/// Every recursive edge increases depth, including a cycle, so at most PEER_DEPTH states per
+/// process are expanded. Shared branches cannot multiply that work.
+struct PeerWalk<'s, 'p> {
+    scene: &'s Scene<'p>,
+    consumer: Option<u32>,
+    standing: HashMap<(u32, usize), Standing>,
+    holders: Option<HashMap<u64, PipeHolders>>,
+    #[cfg(test)]
+    expansions: usize,
+    #[cfg(test)]
+    indexed_fds: usize,
+}
+
+#[derive(Default)]
+struct PipeHolders {
+    all: Vec<u32>,
+    readers: Vec<u32>,
+    writers: Vec<u32>,
+}
+
+impl<'s, 'p> PeerWalk<'s, 'p> {
+    fn new(scene: &'s Scene<'p>, consumer: Option<u32>) -> Self {
+        Self {
+            scene,
+            consumer,
+            standing: HashMap::new(),
+            holders: None,
+            #[cfg(test)]
+            expansions: 0,
+            #[cfg(test)]
+            indexed_fds: 0,
+        }
+    }
+
+    fn holders(&mut self, peer: u64, this: u64, want_write: bool, not: u32) -> Vec<u32> {
+        if self.holders.is_none() {
+            let mut index: HashMap<u64, PipeHolders> = HashMap::new();
+            for (&pid, proc) in self.scene.procs {
+                for fd in proc.fds.as_deref().unwrap_or(&[]) {
+                    #[cfg(test)]
+                    {
+                        self.indexed_fds += 1;
+                    }
+                    if let FdKind::Pipe {
+                        handle, write_end, ..
+                    } = &fd.kind
+                    {
+                        let at = index.entry(*handle).or_default();
+                        at.all.push(pid);
+                        match write_end {
+                            Some(true) => at.writers.push(pid),
+                            Some(false) => at.readers.push(pid),
+                            None => {}
+                        }
+                    }
+                }
+            }
+            for at in index.values_mut() {
+                for pids in [&mut at.all, &mut at.readers, &mut at.writers] {
+                    pids.sort_unstable();
+                    pids.dedup();
+                }
+            }
+            self.holders = Some(index);
+        }
+        let Some(at) = self.holders.as_ref().and_then(|index| index.get(&peer)) else {
+            return Vec::new();
+        };
+        if peer != this {
+            return at.all.clone();
+        }
+        let pids = if want_write { &at.writers } else { &at.readers };
+        pids.iter().copied().filter(|pid| *pid != not).collect()
+    }
+}
+
 /// A Tier B word: what a sampled stack's leaf frame names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum TierB {
@@ -162,6 +240,16 @@ pub fn name_job(
     leaves: &[(u32, String)],
     shell: (u32, &str),
 ) -> Wait {
+    name_job_with(job, leaves, shell, &mut PeerWalk::new(scene, job.consumer))
+}
+
+fn name_job_with(
+    job: &JobFacts,
+    leaves: &[(u32, String)],
+    shell: (u32, &str),
+    peers: &mut PeerWalk<'_, '_>,
+) -> Wait {
+    let scene = peers.scene;
     let first = leaves
         .first()
         .map_or((shell.0, shell.1.to_owned()), |(p, n)| (*p, n.clone()));
@@ -171,7 +259,7 @@ pub fn name_job(
     let mut other_unproven = false;
     let mut admission_blocked = false;
     for (pid, name) in leaves {
-        let Some(w) = leaf_wait(scene, job.consumer, *pid, name, 0) else {
+        let Some(w) = leaf_wait(peers, *pid, name, 0) else {
             other_unproven = true;
             continue;
         };
@@ -236,17 +324,29 @@ pub fn name_job(
     best.unwrap_or_else(|| Wait::bare(WaitName::Unnamed, Standing::Capped, first.0, &first.1))
 }
 
+#[cfg(test)]
+pub(super) fn measured_name_job(
+    scene: &Scene<'_>,
+    job: &JobFacts,
+    leaves: &[(u32, String)],
+    shell: (u32, &str),
+) -> (Wait, usize, usize) {
+    let mut peers = PeerWalk::new(scene, job.consumer);
+    let wait = name_job_with(job, leaves, shell, &mut peers);
+    (wait, peers.expansions, peers.indexed_fds)
+}
+
 /// The wait `pid` names of its own, as a leaf of a job whose consumer is `consumer`.
 #[must_use]
 pub fn wait_of(scene: &Scene<'_>, consumer: Option<u32>, pid: u32, name: &str) -> Option<Wait> {
-    leaf_wait(scene, consumer, pid, name, 0)
+    leaf_wait(&mut PeerWalk::new(scene, consumer), pid, name, 0)
 }
 
 /// Whether `pid` names no wait of its own but its event loop over its terminal (a REPL's loop with
 /// the terminal in its set), as a line read's reader ([`name_job`]'s builtin read).
 #[must_use]
 pub fn reads_line(scene: &Scene<'_>, consumer: Option<u32>, pid: u32, name: &str) -> bool {
-    leaf_wait(scene, consumer, pid, name, 0)
+    wait_of(scene, consumer, pid, name)
         .is_none_or(|w| w.name == WaitName::EventLoop && reads_terminal(scene, pid))
 }
 
@@ -281,13 +381,9 @@ fn reads_terminal(scene: &Scene<'_>, pid: u32) -> bool {
         })
 }
 
-fn leaf_wait(
-    scene: &Scene<'_>,
-    consumer: Option<u32>,
-    pid: u32,
-    name: &str,
-    depth: usize,
-) -> Option<Wait> {
+fn leaf_wait(peers: &mut PeerWalk<'_, '_>, pid: u32, name: &str, depth: usize) -> Option<Wait> {
+    let scene = peers.scene;
+    let consumer = peers.consumer;
     let p = scene.procs.get(&pid)?;
     let wchan = p.wchan.as_deref().unwrap_or("");
     let fds: &[Fd] = p.fds.as_deref().unwrap_or(&[]);
@@ -380,7 +476,7 @@ fn leaf_wait(
         if !(flagged || (linux_reading && named(f))) {
             continue;
         }
-        let writers = holders(scene, *peer, *handle, true, pid);
+        let writers = peers.holders(*peer, *handle, true, pid);
         let writer = writers.first().copied();
         if writer.is_some() && writer == consumer {
             let mut w = mk(WaitName::Serves);
@@ -388,7 +484,7 @@ fn leaf_wait(
             return Some(w);
         }
         let mut w = mk(WaitName::Pipe);
-        (w.peer, w.standing) = pipe_standing(scene, consumer, &writers, depth);
+        (w.peer, w.standing) = pipe_standing(peers, &writers, depth);
         w.pipe = Some((*handle, *peer));
         return Some(w);
     }
@@ -417,9 +513,9 @@ fn leaf_wait(
         if !(full || (linux_writing && *write_end == Some(true) && named(f))) {
             continue;
         }
-        let readers = holders(scene, *peer, *handle, false, pid);
+        let readers = peers.holders(*peer, *handle, false, pid);
         let mut w = mk(WaitName::PipeFull);
-        (w.peer, w.standing) = pipe_standing(scene, consumer, &readers, depth);
+        (w.peer, w.standing) = pipe_standing(peers, &readers, depth);
         w.pipe = Some((*handle, *peer));
         return Some(w);
     }
@@ -577,14 +673,13 @@ pub fn loop_feeders(scene: &Scene<'_>, w: &Wait) -> Vec<u32> {
 /// that works while the first sits idle), named by the first that does; else the best of their
 /// standings (stuck-capable before capped), named by the first holding it; capped with none.
 fn pipe_standing(
-    scene: &Scene<'_>,
-    consumer: Option<u32>,
+    walk: &mut PeerWalk<'_, '_>,
     peers: &[u32],
     depth: usize,
 ) -> (Option<u32>, Standing) {
     let mut best: Option<(u32, Standing)> = None;
     for &peer in peers {
-        match peer_standing(scene, consumer, Some(peer), depth) {
+        match peer_standing(walk, Some(peer), depth) {
             Standing::Legit => return (Some(peer), Standing::Legit),
             Standing::Capable if best.is_none_or(|(_, s)| s == Standing::Capped) => {
                 best = Some((peer, Standing::Capable));
@@ -633,12 +728,8 @@ fn reader_end_full(scene: &Scene<'_>, peer: u64, this: u64, _not: u32) -> bool {
     })
 }
 
-fn peer_standing(
-    scene: &Scene<'_>,
-    consumer: Option<u32>,
-    peer: Option<u32>,
-    depth: usize,
-) -> Standing {
+fn peer_standing(walk: &mut PeerWalk<'_, '_>, peer: Option<u32>, depth: usize) -> Standing {
+    let scene = walk.scene;
     let Some(peer) = peer else {
         return Standing::Capped;
     };
@@ -648,8 +739,17 @@ fn peer_standing(
     if depth >= PEER_DEPTH {
         return Standing::Capped;
     }
+    if let Some(standing) = walk.standing.get(&(peer, depth)) {
+        return *standing;
+    }
+    #[cfg(test)]
+    {
+        walk.expansions += 1;
+    }
     let name = scene.procs.get(&peer).map_or("", |p| p.name.as_str());
-    leaf_wait(scene, consumer, peer, name, depth + 1).map_or(Standing::Capped, |w| w.standing)
+    let standing = leaf_wait(walk, peer, name, depth + 1).map_or(Standing::Capped, |w| w.standing);
+    walk.standing.insert((peer, depth), standing);
+    standing
 }
 
 fn fd_is(fds: &[Fd], ident: u64, pred: fn(&FdKind) -> bool) -> bool {

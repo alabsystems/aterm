@@ -323,8 +323,14 @@ impl Grid {
     fn history_row_key(&self, rev_idx: usize, cols: u16) -> Option<(HistoryEpoch, u64)> {
         Some((
             HistoryEpoch {
-                content_gen: self.storage.content_gen,
+                history_content_gen: self.storage.history_content_gen,
+                clear_gen: self.storage.scrollback_clear_gen,
+                reveal_gen: self.storage.history_reveal_gen,
                 renumber: self.storage.history_renumber_epoch,
+                images_dropped: self.storage.scrollback.as_ref().map_or(
+                    0,
+                    aterm_scrollback::ScrollbackStorage::image_rows_dropped_by_compression,
+                ),
                 cols,
                 visible_rows: self.storage.visible_rows,
             },
@@ -342,7 +348,9 @@ impl Grid {
                 .materialize_scrollback_row_full(rev_idx, cols)
                 .map(Arc::new);
         };
-        if let Some(hit) = self.viewport_cache.lookup(epoch, abs_row) {
+        if let Some(hit) = self.viewport_cache.lookup(epoch, abs_row)
+            && !(rev_idx == 0 && hit.hole)
+        {
             #[cfg(debug_assertions)]
             {
                 let fresh = self.materialize_scrollback_row_full(rev_idx, cols);
@@ -357,7 +365,9 @@ impl Grid {
         #[cfg(any(test, debug_assertions))]
         super::count_viewport_row_materialize();
         let fresh = Arc::new(self.materialize_scrollback_row_full(rev_idx, cols)?);
-        self.viewport_cache.store(epoch, abs_row, &fresh);
+        if !(rev_idx == 0 && fresh.hole) {
+            self.viewport_cache.store(epoch, abs_row, &fresh);
+        }
         Some(fresh)
     }
 

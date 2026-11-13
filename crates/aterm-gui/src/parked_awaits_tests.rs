@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use aterm_vitals::jobs::JobProc;
 
-use super::{Parked, mark, timeout_ms};
+use super::{Parked, elsewhere, is_elsewhere, mark, timeout_ms};
 #[cfg(unix)]
 use super::{birth_of, enter_in};
 
@@ -107,4 +107,33 @@ fn the_server_parks_an_await_for_the_kernels_peer_of_its_connection() {
         "one with no timeout parks no longer than the longest any wait verb waits"
     );
     drop(open);
+}
+
+/// `await elsewhere` holds until its client hangs up, the vouch over: a client still there keeps it
+/// past every poll until its timeout, `OK elsewhere status=timeout`. NEGATIVE CONTROLS: another
+/// await's words are not this form, and a client that hangs up ends it at once, never at its
+/// timeout.
+#[test]
+fn an_await_elsewhere_holds_until_its_client_hangs_up_or_its_timeout() {
+    assert!(is_elsewhere("elsewhere timeout=600000"));
+    assert!(is_elsewhere("elsewhere"));
+    assert!(!is_elsewhere("task @s-1 timeout=600000"));
+    assert!(!is_elsewhere(""));
+    let started = Instant::now();
+    let waited = elsewhere("elsewhere timeout=450", || false);
+    assert_eq!(waited, "OK elsewhere status=timeout\n");
+    assert!(
+        started.elapsed() >= Duration::from_millis(450),
+        "held to its timeout through every poll"
+    );
+    let asked = std::sync::atomic::AtomicU32::new(0);
+    let gone = elsewhere("elsewhere timeout=600000", || {
+        asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2
+    });
+    assert_eq!(gone, crate::control::HUNG_UP_REPLY);
+    assert_eq!(
+        asked.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "it ends at the poll that reads the hangup"
+    );
 }

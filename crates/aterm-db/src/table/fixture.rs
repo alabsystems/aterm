@@ -122,13 +122,6 @@ pub fn repair_commons_among(lab: &Lab, rounds: usize, members: &[usize], now: &[
     repair_commons_with(lab, rounds, members, Some(now), None, false);
 }
 
-/// [`repair_commons`] between the lab's Macs `a` and `b` alone, `a` dialing: for a test whose
-/// third Mac must not hear what these two exchange.
-#[cfg(test)]
-pub fn repair_between(lab: &Lab, a: usize, b: usize, rounds: usize) {
-    repair_commons_with(lab, rounds, &[a, b], None, None, false);
-}
-
 /// [`repair_commons`], handing back each Mac's application report of every exchange, in order.
 pub fn repair_commons_reports(lab: &Lab, rounds: usize) -> Vec<Vec<crate::replica::Report>> {
     let members: Vec<usize> = (0..lab.paths.len()).collect();

@@ -59,22 +59,21 @@ impl Telemetry {
         })
     }
 }
-/// Set the mode only while both fresh descriptions are private. Every receiver
-/// can then verify live-empty with EAGAIN without mutating a shared description.
+/// Set the mode only while both fresh descriptions are private: kept out of every
+/// child ([`aterm_uds::pipe`]) and not yet handed anywhere. Every receiver can then
+/// verify live-empty with EAGAIN without mutating a shared description.
 pub(crate) fn host_pipe() -> io::Result<(io::PipeReader, io::PipeWriter)> {
-    aterm_uds::kept_out(|| {
-        let (reader, writer) = io::pipe()?;
-        // SAFETY: this is the fresh owned read description, not a received slot.
-        let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
-        if flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: no copy has escaped; set nonblocking before any sharing.
-        if unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok((reader, writer))
-    })
+    let (reader, writer) = aterm_uds::pipe()?;
+    // SAFETY: this is the fresh owned read description, not a received slot.
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: no copy has escaped; set nonblocking before any sharing.
+    if unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((reader, writer))
 }
 
 #[cfg(test)]

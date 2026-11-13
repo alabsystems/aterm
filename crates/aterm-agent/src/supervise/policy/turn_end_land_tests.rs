@@ -183,7 +183,7 @@ fn a_needs_you_token_its_clause_has_for_subject_asks_nothing() {
     for said in [
         "NEEDS YOU must log in to the Apple Developer portal and accept the new agreement.",
         "NEEDS YOU should run `gh auth login`, then I can push.",
-        "NEEDS YOU would need to rotate the key.",
+        "NEEDS YOU would need to rotate the nod.",
     ] {
         let reply = format!("Merged and pushed main.\n{said}\n{defense}");
         assert!(!needs::needs_you(&reply).is_empty(), "{reply:?}");
@@ -198,7 +198,7 @@ fn a_needs_you_token_its_clause_has_for_subject_asks_nothing() {
     assert!(needs::needs_you(&reply).is_empty(), "{reply:?}");
     assert!(!clean_defense(Some(&reply)), "{reply:?}");
     for said in [
-        "If you can, rotate the deploy key.",
+        "If you can, rotate the deploy nod.",
         "The signing step needs you: you can run it from the Settings page.",
         "NEEDS YOU can you sign in to GitHub?",
     ] {
@@ -212,10 +212,10 @@ fn a_need_however_headed_holds_the_landing() {
     let defense = "Nothing left: all on origin/main.";
     assert!(clean_defense(Some(defense)));
     for reply in [
-        "Nothing left: all on origin/main.\nNEEDS YOU — the Apple signing key to notarize the release.",
-        "NEEDS YOU - publish the crate (needs the crates.io token).\nNothing left: everything else is on origin/main.",
-        "Nothing left: all on origin/main.\nNEEDS YOU (owner): the Apple signing key.",
-        "Nothing left: all on origin/main.\nNEEDS YOU: nothing, but the tag needs your key.",
+        "Nothing left: all on origin/main.\nNEEDS YOU — the Apple signing nod to ship the release.",
+        "NEEDS YOU - publish the crate (needs the crates.io sayso).\nNothing left: everything else is on origin/main.",
+        "Nothing left: all on origin/main.\nNEEDS YOU (owner): the Apple signing nod.",
+        "Nothing left: all on origin/main.\nNEEDS YOU: nothing, but the tag needs your nod.",
     ] {
         assert!(!clean_defense(Some(reply)), "{reply:?}");
         assert_eq!(needs::needs_you(reply).len(), 1, "{reply:?}");

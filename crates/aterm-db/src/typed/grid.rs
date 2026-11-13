@@ -491,7 +491,7 @@ pub struct Base {
 }
 
 /// A filter of `--where col=val`: a row matches when the column's value (any candidate of a
-/// conflict, any member of a set) reads as `val`.
+/// conflict, any member of a set) reads as `val`. Identity columns use their canonical claims.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Where {
     pub column: String,
@@ -548,6 +548,11 @@ impl Where {
         }
         let wanted = read(&column.ty, &self.text)
             .map_err(|rule| Error::new(&format!("{}.{}: {rule}", collection.name, column.name)))?;
+        if let Some(canonical) = row.claims.get(column.name) {
+            return Ok(canonical
+                .as_ref()
+                .map_or(wanted.is_null(), |value| value == &wanted));
+        }
         Ok(match row.fields.get(column.name) {
             None => wanted.is_null(),
             Some(Field::Value(candidate)) => candidate.value.x == wanted,
@@ -631,15 +636,38 @@ pub fn export_opened(
     reveal: bool,
     opened: Option<&Opened>,
 ) -> Result<Export> {
+    export_projected(
+        table,
+        collection,
+        cells,
+        &cell::project(collection, cells),
+        filters,
+        reveal,
+        opened,
+    )
+}
+
+/// Export canonical row values while retaining the signed cells as the edit baseline.
+///
+/// # Errors
+/// As [`export`].
+pub fn export_projected(
+    table: &Table,
+    collection: &'static Collection,
+    cells: &Cells,
+    projection: &Projection,
+    filters: &[Where],
+    reveal: bool,
+    opened: Option<&Opened>,
+) -> Result<Export> {
     if collection.kind != Kind::Cells {
         return Err(Error::new(&format!(
             "{}: only a cells collection is edited in the grid",
             collection.name
         )));
     }
-    let projection = cell::project(collection, cells);
     let mut registers = registers(collection, cells);
-    let columns = layout_with(collection, &projection, opened.is_some());
+    let columns = layout_with(collection, projection, opened.is_some());
     let header: Vec<String> = columns.iter().map(GridColumn::header).collect();
     let collection_name = collection.name.to_owned();
     let mut raw_lookup = (collection_name.clone(), String::new());
@@ -692,7 +720,14 @@ pub fn export_opened(
                     raw_lookup.1.push_str(&column.name);
                     show_raw(cells.get(&raw_lookup), row.fields.get(&column.name), reveal)
                 }
-                Source::Schema(schema) => show_field(schema, row.fields.get(&column.name), reveal),
+                Source::Schema(schema) => match row.claims.get(&column.name) {
+                    Some(Some(value)) => show(&schema.ty, value, reveal),
+                    Some(None) => format!(
+                        "{CONFLICT}{}",
+                        show_field(schema, row.fields.get(&column.name), reveal)
+                    ),
+                    None => show_field(schema, row.fields.get(&column.name), reveal),
+                },
             };
             seen.insert(
                 column.name.clone(),

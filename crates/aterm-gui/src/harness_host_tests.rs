@@ -7,7 +7,17 @@ mod snapshot_publication_tests;
 #[path = "harness_host_carry_activation_tests.rs"]
 mod carry_activation;
 
+#[path = "harness_host_upgrade_rung_tests.rs"]
+mod upgrade_rung;
+
+#[path = "harness_startup_hold_clock_tests.rs"]
+mod startup_hold_clock;
+
 use super::*;
+
+#[cfg(target_os = "macos")]
+#[path = "restart_task_exit_tests.rs"]
+mod restart_task_exit;
 
 use aterm_agent::harness::upgrade::SessionFile;
 use std::collections::{HashSet, VecDeque};
@@ -41,6 +51,10 @@ mod claude_cold_tests;
 
 #[path = "harness_codex_cold_tests.rs"]
 mod codex_cold_tests;
+
+#[cfg(target_os = "macos")]
+#[path = "restart_account_tests.rs"]
+mod restart_account_tests;
 
 #[path = "harness_claude_live_tests.rs"]
 mod claude_live_tests;
@@ -789,6 +803,7 @@ fn idle_host(sid: &str, agent: Program, switches: Arc<Switches>, hooks: Hooks) -
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
         left_probe: Default::default(),
+        credential_probe: Default::default(),
         restart_left: Mutex::default(),
         group: Arc::default(),
     }
@@ -1603,6 +1618,7 @@ fn restored(sid: &str, place: &str) -> RestoredAgent {
             profile: None,
             tab: sid.to_string(),
             pid: 4242,
+            lifetime: None,
             start: "Sat Sep 27 01:02:03 2026".to_string(),
             shell: 4343,
             program: std::path::PathBuf::from("/opt/claude/bin/claude"),
@@ -4438,6 +4454,85 @@ fn a_self_claimed_restart_waits_for_new_keys_then_hands_back_an_unread_exit() {
     );
 }
 
+/// A SELF-CLAIMED CODEX-ALAB'S ASKED EXIT TIMES ITS HELD LINE BY ITS OWN LINE GRACE
+/// ([`Acts::line_grace`], what `relaunch::carry_line_grace` reads from its stamp's receipt): the
+/// restart's stamp makes the exit asked, a person's key read at the first attempt holds the line,
+/// and the next attempt comes one second after that grace lets the key go, never on the crash
+/// back-off. CONTROL: a crash nobody asked for, held the same way, climbs the back-off.
+#[test]
+fn a_self_claimed_asked_exit_times_its_held_line_by_its_own_line_grace() {
+    use restart_stamp::{Cause, Stamp};
+    const MARK: u32 = 77;
+    let line = vec![
+        "/u/.aterm/agents/codex".to_string(),
+        "resume".to_string(),
+        "0199f2a4-6c1e-7a52-9d3b-2f6c8e1a4b77".to_string(),
+    ];
+    let run = |sid: &str, asked: bool| {
+        let a = Arc::new(Acting::default());
+        *a.line_grace.lock().unwrap() = Some(MARK);
+        *a.self_relaunch_steps.lock().unwrap() = ["wait:held".to_string()].into();
+        a.open.lock().unwrap().insert(sid.to_string());
+        a.set(&[(sid, Program::Codex)]);
+        let copy = self_copy(&a, sid, standing_record(), Ok(line.clone()));
+        a.self_copies
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), copy.clone());
+        let mut h = a.hooks();
+        h.acts.codex_cold = Arc::new(|_, _| Ok(None));
+        let relaunch = Arc::clone(&h.acts.self_relaunch);
+        let held = Arc::clone(&a);
+        h.acts.self_relaunch = Arc::new(move |sid, grace, snap, resume, cause| {
+            // A person's key, read as the attempt's line is held.
+            *held.human_ms.lock().unwrap() = Some(0);
+            relaunch(sid, grace, snap, resume, cause)
+        });
+        let host = HostHandle::start(on(), false, false, h);
+        a.attached(&host, sid);
+        until("its snapshot published", || {
+            published_snapshot(sid).is_some()
+        });
+        if asked {
+            restart_stamp::write(
+                a.stamp_dir(),
+                sid,
+                &Stamp {
+                    pid: copy.pid,
+                    start: copy.start.clone(),
+                    cause: Cause::Asked,
+                    at: aterm_time::unix_secs().unwrap_or(0),
+                    wanted: None,
+                    input: None,
+                },
+            )
+            .expect("the stamp");
+        }
+        a.claims
+            .lock()
+            .unwrap()
+            .insert(sid.to_string(), format!("codex-alab@{}", gone_pid()));
+        a.proven.lock().unwrap().insert(sid.to_string());
+        a.set(&[]);
+        until("the pause after its first attempt chosen", || {
+            a.pauses.lock().unwrap().len() >= 2
+        });
+        host.shutdown_and_join();
+        crate::self_claim::forget(sid);
+        a.pauses.lock().unwrap().clone()
+    };
+    assert_eq!(
+        run("s-self-asked-grace", true)[..2],
+        [Duration::ZERO, Duration::from_secs(u64::from(MARK) + 1)],
+        "the held line is tried again one second past its own grace"
+    );
+    assert_eq!(
+        run("s-self-crash-grace", false)[..2],
+        relaunch::BACKOFF[..2],
+        "CONTROL: a crash nobody asked for climbs the back-off"
+    );
+}
+
 #[test]
 fn a_restarts_carry_its_upgrade_row_answers_is_said_there_alone() {
     let a = Arc::new(Acting::default());
@@ -4513,7 +4608,7 @@ fn a_restarts_carry_that_landed_on_an_agent_gone_again_is_carried_once() {
     h.acts.carry = {
         let (a, slot) = (Arc::clone(&a), Arc::clone(&slot));
         let live = Arc::clone(&h.acts.carry);
-        Arc::new(move |sid, grace, agent, pid, through_hand| {
+        Arc::new(move |sid, grace, agent, pid, through_hand, seen_s| {
             if a.carries.lock().unwrap().is_empty() {
                 let host = slot.lock().unwrap().clone().expect("started");
                 a.set(&[(sid, Program::Claude)]);
@@ -4526,7 +4621,7 @@ fn a_restarts_carry_that_landed_on_an_agent_gone_again_is_carried_once() {
                 });
                 a.set(&[]);
             }
-            live(sid, grace, agent, pid, through_hand)
+            live(sid, grace, agent, pid, through_hand, seen_s)
         })
     };
     let host = HostHandle::start(on(), false, false, h);
@@ -5712,6 +5807,7 @@ fn self_copy(
     let pid = snap(sid).pid;
     self_claimed::Copy {
         pid,
+        lifetime: None,
         start: a.start_of(sid, pid),
         home: "/u/.codex".into(),
         seen,
@@ -7319,6 +7415,11 @@ struct Acting {
     closes: Mutex<VecDeque<&'static str>>,
     /// The closes asked for.
     closed: AtomicUsize,
+    /// What each release of a notice already typed answers ([`Acts::release_notice`]), in turn;
+    /// no notice stands once spent.
+    releases: Mutex<VecDeque<&'static str>>,
+    /// The releases asked for.
+    released: AtomicUsize,
     /// The agent whose record [`Self::owed`] is (`None`: any asker's): a
     /// worker that carries one agent's record alone ([`carries_only`]) is
     /// owed nothing of another's.
@@ -7553,6 +7654,7 @@ fn snap(sid: &str) -> Snapshot {
         profile: None,
         tab: sid.to_string(),
         pid: 4242,
+        lifetime: None,
         start: "Thu Sep 24 01:02:03 2026".to_string(),
         shell: 4241,
         program: std::path::PathBuf::from("/opt/claude"),
@@ -7731,6 +7833,7 @@ impl Acting {
                 start: self.start_of(sid, pid),
                 cause,
                 at: aterm_time::unix_secs().unwrap_or(0),
+                wanted: None,
                 input: None,
             },
         )
@@ -7845,6 +7948,8 @@ impl Acting {
         let (a27, a28, a29) = (w(self), w(self), w(self));
         let (a5e, a5d) = (w(self), w(self));
         let a_close = w(self);
+        let a_release = w(self);
+        let a_stands = w(self);
         Hooks {
             roster: Arc::new(move || {
                 w1.passes.fetch_add(1, Ordering::SeqCst);
@@ -8014,6 +8119,7 @@ impl Acting {
                 }),
                 launch: Arc::new(|_| None),
                 due_read: INERT_POINT_READ,
+                wall_due: Arc::new(|_| false),
                 due: Arc::new(move |_| {
                     a2.due_says.lock().unwrap().pop_front().unwrap_or(
                         if a2.due.load(Ordering::SeqCst) {
@@ -8082,6 +8188,12 @@ impl Acting {
                     let step = a_close.closes.lock().unwrap().pop_front();
                     step.map(str::to_string)
                 }),
+                release_notice: Arc::new(move |_, _| {
+                    a_release.released.fetch_add(1, Ordering::SeqCst);
+                    let step = a_release.releases.lock().unwrap().pop_front();
+                    step.map(str::to_string)
+                }),
+                notice_stands: Arc::new(move |_| !a_stands.releases.lock().unwrap().is_empty()),
                 settle: Arc::new(move |_| {
                     a25.settled.fetch_add(1, Ordering::SeqCst);
                     let (step, owed) = a25
@@ -8097,12 +8209,14 @@ impl Acting {
                 }),
                 notice: Arc::new(move |_, _, _| {
                     a11.noticed.fetch_add(1, Ordering::SeqCst);
-                    a11.notices
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or("wait:background")
-                        .to_string()
+                    UpgradeStep::unknown(
+                        a11.notices
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or("wait:background")
+                            .to_string(),
+                    )
                 }),
                 step: Arc::new(move |sid, _, _| {
                     a3.stepped_for.lock().unwrap().push(sid.to_string());
@@ -8110,12 +8224,14 @@ impl Acting {
                     if let Some(during) = a3.during_step.lock().unwrap().as_ref() {
                         during();
                     }
-                    a3.steps
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or("current")
-                        .to_string()
+                    UpgradeStep::unknown(
+                        a3.steps
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or("current")
+                            .to_string(),
+                    )
                 }),
                 snapshot: Arc::new(move |sid| {
                     let (pid, program) = a6.agent_in(sid)?;
@@ -8192,12 +8308,24 @@ impl Acting {
                          supervisor_proven={proven}"
                     ))
                 }),
-                asked: Arc::new(move |sid, snap| {
-                    restart_stamp::lookup(
+                asked: Arc::new({
+                    let a22 = a22.clone();
+                    move |sid, snap| {
+                        restart_stamp::lookup(
+                            a22.stamp_dir(),
+                            sid,
+                            snap.pid,
+                            &snap.start,
+                            aterm_time::unix_secs().unwrap_or(0),
+                        )
+                    }
+                }),
+                asked_account: Arc::new(move |sid, pid, start| {
+                    restart_stamp::wanted_for(
                         a22.stamp_dir(),
                         sid,
-                        snap.pid,
-                        &snap.start,
+                        pid,
+                        start,
                         aterm_time::unix_secs().unwrap_or(0),
                     )
                 }),
@@ -8354,7 +8482,7 @@ impl Acting {
                         .unwrap()
                         .push((sid.to_string(), take, asked));
                 }),
-                carry: Arc::new(move |sid, _, agent, pid, through_hand| {
+                carry: Arc::new(move |sid, _, agent, pid, through_hand, _| {
                     a19.relaunch_attempts.fetch_add(1, Ordering::SeqCst);
                     a19.carried_through.lock().unwrap().push(through_hand);
                     if let Some(key) = a19.carry_keys.lock().unwrap().pop_front() {
@@ -8415,6 +8543,7 @@ impl Acting {
                 transcript_tail: Arc::new(|_| None),
                 repo_work: Arc::new(|_| Default::default()),
                 leftover: Acts::inert().leftover,
+                credentials: Acts::inert().credentials,
                 work_read: Acts::inert().work_read,
                 work_put: Acts::inert().work_put,
                 work_overlap: Acts::inert().work_overlap,
@@ -8422,6 +8551,7 @@ impl Acting {
                 task_exited: Arc::new(move |sid| {
                     a27.tasks_exited.lock().unwrap().push(sid.to_string());
                 }),
+                task_exit_owner: Acts::inert().task_exit_owner,
                 standing_limit: Arc::new(|_, _| None),
                 needs_told: Arc::new(|_| None),
                 account_wall: Arc::new(|_, _, _| ("inert", None)),
@@ -8748,7 +8878,7 @@ fn a_settled_carry_on_leaves_a_move_due_beside_it_a_look() {
             }),
             step: Arc::new(move |_, _, _| {
                 s.fetch_add(1, Ordering::SeqCst);
-                "wait:settling".to_string()
+                UpgradeStep::unknown("wait:settling")
             }),
             ..Acts::inert()
         };
@@ -8799,7 +8929,7 @@ fn a_point_resting_only_for_the_carry_on_steps_nothing_else() {
         }),
         step: Arc::new(move |_, _, _| {
             u.fetch_add(1, Ordering::SeqCst);
-            "wait:held".to_string()
+            UpgradeStep::unknown("wait:held")
         }),
         ..Acts::inert()
     };
@@ -8846,6 +8976,7 @@ fn a_point_resting_only_for_the_carry_on_steps_nothing_else() {
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
         left_probe: Default::default(),
+        credential_probe: Default::default(),
         restart_left: Mutex::default(),
         group: Arc::default(),
     };
@@ -9039,6 +9170,7 @@ fn a_task_done_under_land_is_carried_on_with_nothing_typed() {
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
         left_probe: Default::default(),
+        credential_probe: Default::default(),
         restart_left: Mutex::default(),
         group: Arc::default(),
     };
@@ -9113,6 +9245,7 @@ fn a_relaunchs_owed_carry_on_is_settled_where_its_loop_takes_a_point() {
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
         left_probe: Default::default(),
+        credential_probe: Default::default(),
         restart_left: Mutex::default(),
         group: Arc::default(),
         activations: Arc::default(),
@@ -9410,11 +9543,11 @@ fn the_worker_keeps_the_guard_its_loop_withheld_and_the_points_it_offered() {
         due: Arc::new(|_| Due::No),
         step: Arc::new(move |_, _, _| {
             s1.lock().unwrap().push("step");
-            "announced:1".to_string()
+            UpgradeStep::unknown("announced:1")
         }),
         notice: Arc::new(move |_, _, _| {
             s2.lock().unwrap().push("notice");
-            "announced:1".to_string()
+            UpgradeStep::unknown("announced:1")
         }),
         ..Acts::inert()
     };
@@ -9498,6 +9631,7 @@ fn the_workers_own_readers_follow_the_agents_record_first() {
             told: AtomicU8::new(0),
             repo_probe: Default::default(),
             left_probe: Default::default(),
+            credential_probe: Default::default(),
             restart_left: Mutex::default(),
             group: Arc::default(),
             beside: Arc::default(),
@@ -9699,6 +9833,7 @@ fn a_landed_agent_missed_is_read_again_a_production_pause_later() {
         profile: None,
         tab: SID.to_string(),
         pid,
+        lifetime: None,
         start: "Thu Oct 8 18:04:23 2026".to_string(),
         shell: 1,
         program: std::path::PathBuf::from("/usr/local/bin/claude"),
@@ -9752,7 +9887,7 @@ fn a_limit_episode_clears_ownership_and_keeps_its_stamp_past_a_held_lock() {
         due: Arc::new(|_| Due::Yes),
         step: Arc::new(move |_, _, _| {
             l1.lock().unwrap().push("step".to_string());
-            "announced:1".to_string()
+            UpgradeStep::unknown("announced:1")
         }),
         hold: Arc::new(move |sid, until| {
             l2.lock().unwrap().push(format!("hold {sid} {until}"));
@@ -10218,6 +10353,49 @@ fn stand_in_agent() -> aterm_uds::spawnfd::Command {
         .env_clear()
         .env(STAND_IN_ENV, "1");
     command
+}
+
+/// A RUNNING LAUNCH NAMES THE CREDENTIAL VARIABLES ITS PROCESS WAS STARTED WITH
+/// ([`RunningLaunch::of_live`]), read from that process's exec environment: a set one is named,
+/// an empty one is not, and no value is kept.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_running_launch_names_the_credentials_its_process_was_started_with() {
+    use aterm_uds::spawnfd::{Child, Stdio};
+    struct Running(Child);
+    impl Drop for Running {
+        fn drop(&mut self) {
+            aterm_uds::deadline::kill_within(&mut self.0, Duration::from_secs(60));
+        }
+    }
+    let ahead = relaunch::ahead_env(accounts::Cli::Codex);
+    let (set, empty) = (ahead[0], ahead.get(1).copied());
+    let mut cmd = stand_in_agent();
+    cmd.env(set, "a-credential")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    if let Some(empty) = empty {
+        cmd.env(empty, "");
+    }
+    let mut running = Running(cmd.spawn().expect("stand-in"));
+    aterm_uds::deadline::prints(&mut running.0, "ready", aterm_uds::deadline::ECHO_HANG);
+    let resume = self_claimed::Resume {
+        argv: vec!["/opt/codex/bin/codex".into()],
+        session: "0badf00d-1111-2222-3333-444455556666".into(),
+        codex_home: None,
+        codex_auth_path: None,
+        cwd: None,
+    };
+    let launch = RunningLaunch::of_live(resume, running.0.id()).expect("its environment read");
+    assert_eq!(launch.ahead, [set]);
+    assert!(
+        launch
+            .login_env()
+            .iter()
+            .all(|(_, value)| *value != "a-credential"),
+        "no credential's value is carried"
+    );
 }
 
 #[test]
@@ -14469,6 +14647,59 @@ fn a_models_wall_is_one_wall_row_per_move() {
     );
 }
 
+/// THE HOST READS FABLE'S WEEK FROM THE ACCOUNT'S RECORD (`IdleHost::fable_week`) for the
+/// account the session's process runs on: the week its screen last said, with the reset a later
+/// read named for it where the read itself named none, which times the return of a session moved
+/// onto Opus at a Fable notice that named no reset. NEGATIVE CONTROLS: no record reads as none,
+/// and another model's week is not Fable's.
+#[test]
+fn the_host_reads_fables_week_from_the_accounts_record() {
+    use aterm_agent::supervise::policy::turn_end::FableWeek;
+    let sid = "s-fable-week";
+    let a = Accts::new();
+    a.spawn(sid, ACCT_TALK_A, "main");
+    let idle = a.worker(sid, &resetting());
+    assert_eq!(idle.fable_week(), None, "no record");
+    let week = |pct, reset, ends_by| accounts::WeekSaid {
+        pct,
+        reset,
+        at: ACCT_NOW - 60,
+        by: "lab".to_string(),
+        wall: true,
+        ends_by,
+    };
+    edited(&a, |state| {
+        state
+            .accounts
+            .entry("main".to_string())
+            .or_default()
+            .weeks_said
+            .insert(
+                accounts::week_bucket(aterm_phase::WeekModel::Sonnet).to_string(),
+                week(Some(100), Some(ACCT_NOW + 600), None),
+            );
+    });
+    assert_eq!(idle.fable_week(), None, "Sonnet's week is not Fable's");
+    edited(&a, |state| {
+        state
+            .accounts
+            .get_mut("main")
+            .expect("the record")
+            .weeks_said
+            .insert(
+                accounts::week_bucket(aterm_phase::WeekModel::Fable).to_string(),
+                week(Some(100), None, Some(ACCT_NOW + 3600)),
+            );
+    });
+    assert_eq!(
+        idle.fable_week(),
+        Some(FableWeek {
+            pct: Some(100),
+            reset: Some(ACCT_NOW + 3600),
+        })
+    );
+}
+
 #[test]
 fn a_limit_resets_outcome_is_the_transcripts_line_since_the_claim() {
     use aterm_agent::supervise::policy::KeepWhy;
@@ -16674,7 +16905,7 @@ fn a_move_the_hosts_carry_lands_is_a_made_move() {
         let mut hooks = a.hooks();
         let world = Arc::clone(a);
         hooks.acts.restarted = Arc::new(|_, _, _| true);
-        hooks.acts.carry = Arc::new(move |sid, _, _, _, _| {
+        hooks.acts.carry = Arc::new(move |sid, _, _, _, _, _| {
             world.exec(sid, ACCT_TALK_A, login.as_deref(), world.clock());
             "adopted".to_string()
         });
@@ -17059,10 +17290,10 @@ fn the_cold_codex_act_judges_the_program_its_resume_line_runs() {
     };
     let no_usage = |_: Cli, _: &std::path::Path, _: Option<&str>, _: i64| -> Option<Usage> { None };
     assert!(
-        codex_cold_at(&seat, &on_default(&old), &no_usage).is_err(),
+        codex_cold_at(&seat, &on_default(&old), &ColdUse::default(), &no_usage).is_err(),
         "that build runs no other row: the relaunch waits instead of reusing a walled login"
     );
-    let moved = codex_cold_at(&seat, &on_default(&new), &no_usage)
+    let moved = codex_cold_at(&seat, &on_default(&new), &ColdUse::default(), &no_usage)
         .unwrap()
         .expect("CONTROL: moved");
     let auth = moved
@@ -20645,6 +20876,142 @@ fn the_upgrades_notice_is_due_where_the_hosts_step_would_type_it() {
     assert!(!no_upgrade.upgrade_due(), "upgrade off");
 }
 
+/// A LOGIN WALL THE LOOP PASSES FOR THE UPGRADE TAKES THE UPGRADE'S STEP ALONE
+/// ([`IdlePoint::walled`]): the door says what the upgrade's record says ([`Acts::wall_due`]) only
+/// under the worker's own gates; at the walled point the upgrade steps, and neither a carry-on, the
+/// resume a full disk owes, nor the release a typed notice is owed with `[harness] upgrade` off is
+/// typed into the wall: each stays owed. NEGATIVE CONTROL: the same point unwalled types each.
+#[test]
+fn a_walled_point_takes_the_upgrades_step_alone() {
+    use aterm_agent::harness::disk::Level;
+    use aterm_phase::disk_full::{Code, DiskFull, Source};
+    static BOARD: Shelf = Shelf::new();
+    let world = Arc::new(World::default());
+    let (says, owed, off) = (
+        Arc::new(AtomicBool::new(true)),
+        Arc::new(AtomicBool::new(false)),
+        Arc::new(AtomicBool::new(false)),
+    );
+    let (resumed, stepped) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let disk_typed = Arc::new(AtomicUsize::new(0));
+    let mut hooks = hooks(&world, parking_body(&world));
+    let (w, o, r, u, d) = (
+        Arc::clone(&says),
+        Arc::clone(&owed),
+        Arc::clone(&resumed),
+        Arc::clone(&stepped),
+        Arc::clone(&disk_typed),
+    );
+    hooks.acts = Acts {
+        due: Arc::new(|_| Due::Yes),
+        wall_due: Arc::new(move |_| w.load(Ordering::SeqCst)),
+        disk_resume: Arc::new(move |_, _| {
+            d.fetch_add(1, Ordering::SeqCst);
+            "typed".to_string()
+        }),
+        disk_board: &BOARD,
+        owed: Arc::new(move |_, _| o.load(Ordering::SeqCst)),
+        resume: Arc::new(move |_, _, _| {
+            r.fetch_add(1, Ordering::SeqCst);
+            "continued".to_string()
+        }),
+        step: Arc::new(move |_, _, _| {
+            u.fetch_add(1, Ordering::SeqCst);
+            UpgradeStep::unknown("wait:login")
+        }),
+        ..Acts::inert()
+    };
+    let word = Arc::clone(&off);
+    hooks.autopilot = Arc::new(move || {
+        let mode = if word.load(Ordering::SeqCst) {
+            Autopilot::Off
+        } else {
+            Autopilot::Cruise
+        };
+        HashMap::from([("s-walled".to_string(), mode)])
+    });
+    let mut idle = idle_host("s-walled", Program::Claude, switched(&on()), hooks);
+    assert!(idle.upgrade_wall_due(), "the record's word");
+    let walled = IdlePoint {
+        walled: true,
+        ..IdlePoint::default()
+    };
+    let step = idle.at_idle_on(walled).expect("the upgrade's step");
+    assert_eq!(step.line, "upgrade step=wait:login");
+    assert_eq!(stepped.load(Ordering::SeqCst), 1);
+    owed.store(true, Ordering::SeqCst);
+    assert_eq!(idle.at_idle_on(walled), None, "nothing into the wall");
+    assert_eq!(resumed.load(Ordering::SeqCst), 0, "the carry-on stays owed");
+    assert_eq!(stepped.load(Ordering::SeqCst), 1);
+    let carried = idle
+        .at_idle_on(IdlePoint::default())
+        .expect("the carry-on's step");
+    assert_eq!(carried.line, "carry-on step=continued");
+    assert_eq!(resumed.load(Ordering::SeqCst), 1);
+    owed.store(false, Ordering::SeqCst);
+    let tmp = aterm_tempfile::Builder::new()
+        .prefix("aterm-host-walled-disk-")
+        .tempdir()
+        .expect("temp dir");
+    let full = (
+        "s-walled".to_string(),
+        DiskFull {
+            code: Code::Enospc,
+            source: Source::Notification,
+            row: 3,
+            message: "the notice".to_string(),
+        },
+    );
+    disk_sightings(
+        &BOARD,
+        &[full],
+        Level::Emergency,
+        Some(0),
+        &tmp.path().join("state"),
+        1,
+    );
+    disk_episode_after(
+        &BOARD,
+        Level::Short,
+        30 << 30,
+        &["30.0 GiB a gone cache".to_string()],
+    );
+    let step = idle.at_idle_on(walled).expect("the upgrade's step");
+    assert_eq!(step.line, "upgrade step=wait:login");
+    assert_eq!(
+        disk_typed.load(Ordering::SeqCst),
+        0,
+        "no resume into the wall"
+    );
+    let resume = idle.at_idle_on(IdlePoint::default()).expect("the resume");
+    assert_eq!(resume.line, "disk-resume@v1 step=typed");
+    assert_eq!(disk_typed.load(Ordering::SeqCst), 1);
+    off.store(true, Ordering::SeqCst);
+    assert!(!idle.upgrade_wall_due(), "the tab's Autopilot Off");
+    off.store(false, Ordering::SeqCst);
+    says.store(false, Ordering::SeqCst);
+    assert!(!idle.upgrade_wall_due(), "the record's word gone");
+    says.store(true, Ordering::SeqCst);
+    let mut no_upgrade = SupervisorConfig::default();
+    no_upgrade.set("upgrade", "false").unwrap();
+    idle.switches = switched(&no_upgrade);
+    assert!(!idle.upgrade_wall_due(), "upgrade off");
+    // The release a notice already typed is owed with the switch off; at a wall it stays owed, as
+    // a carry-on does.
+    let released = Arc::new(AtomicUsize::new(0));
+    let n = Arc::clone(&released);
+    idle.hooks.acts.release_notice = Arc::new(move |_, _| {
+        n.fetch_add(1, Ordering::SeqCst);
+        Some("typed".to_string())
+    });
+    idle.hooks.acts.close_looks = Arc::new(|_| None);
+    assert_eq!(idle.at_idle_on(walled), None, "no release into the wall");
+    assert_eq!(released.load(Ordering::SeqCst), 0, "the release stays owed");
+    let release = idle.at_idle_on(IdlePoint::default()).expect("the release");
+    assert_eq!(release.line, "release step=typed");
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn a_fact_lines_pace_is_refused_where_the_worker_takes_no_step() {
     use aterm_agent::supervise::occupancy::{PaceGrant, PaceRefusal, RuleId};
@@ -21605,11 +21972,13 @@ fn an_unread_look_lets_go_of_a_quiet_rounds_hold_and_keeps_a_ready_sessions() {
                 }
             }),
             step: Arc::new(move |_, _, _| {
-                w.lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("a scripted step")
-                    .to_string()
+                UpgradeStep::unknown(
+                    w.lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("a scripted step")
+                        .to_string(),
+                )
             }),
             ..Acts::inert()
         };
@@ -21728,7 +22097,7 @@ fn a_break_of_the_agents_background_work_takes_the_notice_alone() {
             owed: Arc::new(move |_, _| owed),
             notice: Arc::new(move |_, _, _| {
                 n.fetch_add(1, Ordering::SeqCst);
-                "wait:not-idle".to_string()
+                UpgradeStep::unknown("wait:not-idle")
             }),
             ..Acts::inert()
         };
@@ -22003,7 +22372,7 @@ fn a_carry_on_a_persons_keys_hold_does_not_climb_the_ladder() {
             due: Arc::new(|_| Due::Yes),
             owed: Arc::new(move |_, _| carrying),
             resume: Arc::new(move |_, _, _| word.to_string()),
-            step: Arc::new(move |_, _, _| word.to_string()),
+            step: Arc::new(move |_, _, _| UpgradeStep::unknown(word)),
             ..Acts::inert()
         };
         let idle = idle_host("s-keys", Program::Claude, switched(&on()), hooks);
@@ -22024,6 +22393,60 @@ fn a_carry_on_a_persons_keys_hold_does_not_climb_the_ladder() {
     looks(true, "wait:held", &[HOLD_LOOK; 4]);
     looks(false, "wait:held", &LATER[..3]);
     looks(true, "wait:off", &LATER[..2]);
+}
+
+/// A STEP THAT FINDS THE UPGRADE'S STATE UNUSABLE IS LOOKED AT AGAIN ON THE LADDER'S SLOWEST RUNG
+/// (`busy:state-unwritable`, `busy:lock-unopenable`: [`After::Broken`]). It used to arm no look,
+/// so an idle session whose state folder was unwritable for a moment (a full disk, a permission
+/// put back) was stepped again only at its next activation notice: an idle tab, no turn, no
+/// notice, no move. The release a notice is owed with `[harness] upgrade` off is looked at again
+/// the same way. NEGATIVE CONTROL: a last word (`current`) names no look in either lane.
+#[test]
+fn a_step_that_finds_the_upgrade_state_unusable_is_looked_at_again_on_the_slowest_rung() {
+    use upgrade_drive::LATER;
+    let look = |word: &'static str, upgrade: bool| {
+        let world = Arc::new(World::default());
+        let mut hooks = hooks(&world, parking_body(&world));
+        hooks.pause = Arc::new(|pause| pause);
+        hooks.acts = Acts {
+            due: Arc::new(|_| Due::Yes),
+            step: Arc::new(move |_, _, _| UpgradeStep::unknown(word)),
+            close_looks: Arc::new(|_| None),
+            release_notice: Arc::new(move |_, _| Some(word.to_string())),
+            ..Acts::inert()
+        };
+        let mut cfg = on();
+        if !upgrade {
+            cfg.set("upgrade", "false").unwrap();
+        }
+        let idle = idle_host("s-broken", Program::Claude, switched(&cfg), hooks);
+        let before = Instant::now();
+        let step = idle.at_idle_on(IdlePoint::default()).expect("a step");
+        let after = Instant::now();
+        let what = if upgrade { "upgrade" } else { "release" };
+        assert_eq!(step.line, format!("{what} step={word}"));
+        let at = idle.look_at.lock().unwrap().take();
+        at.map(|at| (at.duration_since(before), after.duration_since(before)))
+    };
+    let slowest = LATER[LATER.len() - 1];
+    for upgrade in [true, false] {
+        for broken in ["busy:state-unwritable", "busy:lock-unopenable"] {
+            assert_eq!(upgrade_drive::after(broken, 0), After::Broken, "{broken}");
+            let (on, slack) = look(broken, upgrade)
+                .unwrap_or_else(|| panic!("{broken} upgrade={upgrade}: no look named"));
+            assert!(
+                slowest <= on && on <= slowest + slack,
+                "{broken} upgrade={upgrade}: a look {slowest:?} on, not {on:?}"
+            );
+        }
+    }
+    for upgrade in [true, false] {
+        assert_eq!(
+            look("current", upgrade),
+            None,
+            "control: a last word names no look (upgrade={upgrade})"
+        );
+    }
 }
 
 /// A QUIET ROUND'S SETTLE HOLDS EACH OF ITS FIRST TURN ENDS FOR ITS OWN LOOKS
@@ -22051,7 +22474,7 @@ fn a_quiet_settle_holds_each_of_its_first_turn_ends_for_its_own_looks() {
         hooks.pause = Arc::new(|pause| pause);
         hooks.acts = Acts {
             due: Arc::new(|_| Due::Yes),
-            step: Arc::new(move |_, _, _| word.to_string()),
+            step: Arc::new(move |_, _, _| UpgradeStep::unknown(word)),
             ..Acts::inert()
         };
         let idle = idle_host("s-settle", Program::Claude, switched(cfg), hooks);
@@ -22117,6 +22540,9 @@ fn a_quiet_settle_holds_each_of_its_first_turn_ends_for_its_own_looks() {
 /// turn end's second look. Two mutants of the worker itself, at those last two places, each fail
 /// the walk against the committed model: `held_points` booked at every held look
 /// (`Some(true) if !self.point_held || true`), and `this_held` dropped from `quiet_settle_owned`.
+/// Rung walks also distinguish spent points kept at a higher rung (`Buggy = 6`), points renewed
+/// on an unchanged, lower or unread rung (`Buggy = 7`), current looks renewed (`Buggy = 8`), and a
+/// currently held point omitted from the new rung's budget (`Buggy = 9`).
 #[test]
 fn the_quiet_settle_conforms_to_its_turn_end_model() {
     use upgrade_drive::{OWNED_SETTLE_LOOKS, QUIET_SETTLE_POINTS, first_look};
@@ -22145,6 +22571,10 @@ fn the_quiet_settle_conforms_to_its_turn_end_model() {
             "OtherWait" => &["OtherWait"],
             "TurnRuns" => &["TurnRuns"],
             "RoundStarts" => &["RoundStarts"],
+            "RungRises" => &["RungRises"],
+            "RungRepeats" => &["RungRepeats"],
+            "RungFalls" => &["RungFalls"],
+            "RungUnread" => &["RungUnread"],
             other => panic!("no action {other}"),
         }
     };
@@ -22173,9 +22603,20 @@ fn the_quiet_settle_conforms_to_its_turn_end_model() {
                 }
             });
         });
+        idle.run
+            .lock()
+            .unwrap()
+            .observe_rung(Some(upgrade::Rung::Prefer));
         let mut st = model.init_state();
         let mut wrong: Vec<_> = mutants.iter().map(|(_, m)| m.init_state()).collect();
         let mut seen = Vec::new();
+        let mut rung = 0;
+        let reported_rung = |rung| match rung {
+            0 => upgrade::Rung::Prefer,
+            1 => upgrade::Rung::Settled,
+            2 => upgrade::Rung::KeysOnly,
+            _ => panic!("no rung {rung}"),
+        };
         for (n, &action) in actions.iter().enumerate() {
             paused.lock().unwrap().clear();
             match action {
@@ -22188,12 +22629,28 @@ fn the_quiet_settle_conforms_to_its_turn_end_model() {
                 }
                 "TurnRuns" => idle.turn_ran(),
                 "RoundStarts" => {
+                    rung = 0;
                     nothing.store(true, Ordering::SeqCst);
                     assert!(
                         idle.at_idle().is_none(),
                         "{actions:?} {n}: nothing due takes no step"
                     );
                     nothing.store(false, Ordering::SeqCst);
+                    idle.run
+                        .lock()
+                        .unwrap()
+                        .observe_rung(Some(upgrade::Rung::Prefer));
+                }
+                "RungRises" | "RungRepeats" | "RungFalls" | "RungUnread" => {
+                    if action == "RungRises" {
+                        rung += 1;
+                    }
+                    let observed = match action {
+                        "RungUnread" => None,
+                        "RungFalls" => Some(upgrade::Rung::Prefer),
+                        _ => Some(reported_rung(rung)),
+                    };
+                    idle.run.lock().unwrap().observe_rung(observed);
                 }
                 other => panic!("no action {other}"),
             }
@@ -22255,20 +22712,56 @@ fn the_quiet_settle_conforms_to_its_turn_end_model() {
             }
         }
     }
+    let points = usize::try_from(QUIET_SETTLE_POINTS).unwrap();
+    let spent: Vec<_> = (0..points)
+        .flat_map(|_| ["HostSettles", "TurnRuns"])
+        .collect();
+    let mut rung_walks = Vec::new();
+    let mut fresh = spent.clone();
+    fresh.extend(["RungRises", "HostSettles"]);
+    rung_walks.push(fresh);
+    for read in ["RungRepeats", "RungFalls", "RungUnread"] {
+        let mut unchanged = vec!["RungRises"];
+        unchanged.extend_from_slice(&spent);
+        unchanged.extend([read, "HostSettles"]);
+        rung_walks.push(unchanged);
+    }
+    let mut lower_then_same = vec!["RungRises"];
+    lower_then_same.extend_from_slice(&spent);
+    lower_then_same.extend(["RungFalls", "RungRepeats", "HostSettles"]);
+    rung_walks.push(lower_then_same);
+    rung_walks.push(vec![
+        "HostSettles",
+        "HostSettles",
+        "RungRises",
+        "HostSettles",
+    ]);
+    let mut held = vec!["HostSettles", "RungRises", "HostSettles"];
+    for _ in 0..points {
+        held.extend(["TurnRuns", "HostSettles"]);
+    }
+    rung_walks.push(held);
+    for actions in &rung_walks {
+        for (owns, said) in walk(actions) {
+            for (first, wrong) in told.iter_mut().zip(said) {
+                if wrong != owns && first.is_none() {
+                    *first = Some(actions.clone());
+                }
+            }
+        }
+    }
     for ((dial, _), first) in mutants.iter().zip(&told) {
         assert!(
             first.is_some(),
-            "NEGATIVE CONTROL Buggy={dial}: no walk of {QUIET_SETTLE_DEPTH} actions tells it from \
-             the worker"
+            "NEGATIVE CONTROL Buggy={dial}: no enumerated or rung walk tells it from the worker"
         );
     }
     assert_eq!(
         mutants.iter().map(|(dial, _)| *dial).collect::<Vec<_>>(),
-        [1, 2, 3, 4, 5],
+        [1, 2, 3, 4, 5, 6, 7, 8, 9],
         "the mutants this test names, each told apart above: {told:?}"
     );
 
-    let points = usize::try_from(QUIET_SETTLE_POINTS).unwrap();
     let mut mixed = vec![
         "OtherWait",
         "HostSettles",
@@ -22353,7 +22846,7 @@ fn attended_worker_with(
         due: Arc::new(|_| Due::Yes),
         step: Arc::new(move |_, g, _| {
             assert_eq!(g, grace, "the worker's grace reaches its step");
-            s1.lock().unwrap().pop_front().expect("a scripted step")
+            UpgradeStep::unknown(s1.lock().unwrap().pop_front().expect("a scripted step"))
         }),
         ..Acts::inert()
     };
@@ -22369,9 +22862,14 @@ fn attended_worker_with(
 
 /// What a quiet upgrade round may type the tab's agent reaches the upgrade's step, at an idle
 /// point and at a break ([`WorkerIdle::upgrade_tell`]): nothing with the tab's Autopilot off or a
-/// guard holding a host's fact there (under Cruise, only the person's grace); no line, but still
-/// a move over what yields, once its task landed under Land ([`upgrade_drive::Tell::Silent`]);
-/// and the restart verb only where the tab offers and promises that restart.
+/// guard holding a host's fact there for a person (their grace under either autopilot, their own
+/// exchange under Land); no line, but still a move over what yields, once its task landed under
+/// Land ([`upgrade_drive::Tell::Silent`]); and the restart verb only where the tab offers and
+/// promises that restart. A manager's wait holds it under neither autopilot, as both type into
+/// a managed worker (`HarnessUpgradeQuiet`'s `ManagersNeverHoldTheCarry`): a Land worker its
+/// manager awaits is told and moved over what yields, and once its task landed it moves with no
+/// line. NEGATIVE CONTROL by mutation: the Cruise-only filter of guards put back reads `Off` for
+/// the managed Land rows.
 #[test]
 fn the_quiet_tell_follows_the_tabs_autopilot_its_guards_and_its_restart_offer() {
     use upgrade_drive::Tell;
@@ -22382,11 +22880,11 @@ fn the_quiet_tell_follows_the_tabs_autopilot_its_guards_and_its_restart_offer() 
         let (idle, _) = attended_worker_with(&world, &[], move |hooks| {
             hooks.acts.step = Arc::new(move |_, _, tell| {
                 t1.lock().unwrap().push(tell);
-                "wait:background".to_string()
+                UpgradeStep::unknown("wait:background")
             });
             hooks.acts.notice = Arc::new(move |_, _, tell| {
                 t2.lock().unwrap().push(tell);
-                "wait:background".to_string()
+                UpgradeStep::unknown("wait:background")
             });
             hooks.acts.offered = Arc::new(move |_| offered);
             hooks.autopilot = Arc::new(move || {
@@ -22444,12 +22942,38 @@ fn the_quiet_tell_follows_the_tabs_autopilot_its_guards_and_its_restart_offer() 
     for guard in [Guard::Person, Guard::Exchange, Guard::Managed] {
         let held = IdlePoint {
             held: Some(guard),
+            theirs: Some(guard),
             ..open
+        };
+        // Land carries a worker its manager awaits at every point; the person's own exchange and
+        // grace are theirs.
+        let (land, landed) = if guard == Guard::Managed {
+            (Tell::Verb, Tell::Silent)
+        } else {
+            (Tell::Off, Tell::Off)
         };
         assert_eq!(
             run(Some(Autopilot::Land), Some(true), held),
-            [Tell::Off; 2],
+            [land; 2],
             "{guard:?}"
+        );
+        assert_eq!(
+            run(
+                Some(Autopilot::Land),
+                Some(true),
+                IdlePoint {
+                    done_under_land: true,
+                    ..held
+                }
+            ),
+            [landed; 2],
+            "landed, {guard:?}"
+        );
+        assert!(
+            run(Some(Autopilot::Off), Some(true), held)
+                .iter()
+                .all(|t| *t == Tell::Off),
+            "the person's switch, {guard:?}"
         );
         // Cruise types its carry into a session its manager waits on, or the person's own
         // exchange holds: the tell goes there too, and only a person's grace holds it.
@@ -22485,11 +23009,11 @@ fn typing_worker(
     let (idle, _) = attended_worker_with(world, &[], move |hooks| {
         hooks.acts.step = Arc::new(move |_, _, _| {
             s1.lock().unwrap().push("step");
-            "wait:background".to_string()
+            UpgradeStep::unknown("wait:background")
         });
         hooks.acts.notice = Arc::new(move |_, _, _| {
             s2.lock().unwrap().push("notice");
-            "wait:background".to_string()
+            UpgradeStep::unknown("wait:background")
         });
         hooks.acts.owed = Arc::new(move |_, _| o1.load(Ordering::SeqCst));
         hooks.acts.carry_owed = Arc::new(move |_, _| o2.load(Ordering::SeqCst));
@@ -22784,11 +23308,13 @@ fn a_ready_after_notices_at_breaks_owns_its_settle() {
             ));
             let typed = Arc::clone(&notices);
             idle.hooks.acts.notice = Arc::new(move |_, _, _| {
-                typed
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("a scripted notice")
+                UpgradeStep::unknown(
+                    typed
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .expect("a scripted notice"),
+                )
             });
             let wrong = aterm_spec::interp::with_consts(&model, &[against]);
             let (mut st, mut w) = (model.init_state(), wrong.init_state());
@@ -25163,6 +25689,43 @@ fn a_relaunched_agent_is_carried_on_where_its_loop_parks() {
     host.shutdown_and_join();
 }
 
+/// A restart the harness already made is finished with both lane switches off: the agent its own
+/// restart ended is relaunched by that restart's carry, never the relaunch on exit's, and the
+/// relaunched agent is carried on at its idle point. The switches hold what may begin: with a
+/// newer build due throughout, no upgrade step is taken, before the exit or after the carry-on.
+#[test]
+fn a_restart_already_made_is_finished_with_the_upgrade_and_relaunch_switched_off() {
+    let a = Arc::new(Acting::default());
+    *a.carry.lock().unwrap() = ["continued", "done"].into();
+    a.due.store(true, Ordering::SeqCst);
+    a.open.lock().unwrap().insert("s-x".to_string());
+    a.set(&[("s-x", Program::Claude)]);
+    let ended = snap("s-x").pid;
+    let mut held = on();
+    held.set("upgrade", "false").unwrap();
+    held.set("relaunch", "false").unwrap();
+    let host = HostHandle::start(held, false, false, a.hooks());
+    a.attached(&host, "s-x");
+    a.restarted_pids.lock().unwrap().push(ended);
+    a.set(&[]);
+    until("its relaunch carried", || {
+        a.carries.lock().unwrap().len() == 1
+    });
+    assert_eq!(*a.carries.lock().unwrap(), [(false, Some(ended))]);
+    assert!(
+        a.relaunched.lock().unwrap().is_empty(),
+        "never the relaunch on exit's"
+    );
+    a.set(&[("s-x", Program::Claude)]); // the relaunched agent
+    until(
+        "carried on, its model read at the next idle point: done",
+        || a.carried.load(Ordering::SeqCst) == 2 && !a.owed.load(Ordering::SeqCst),
+    );
+    assert_eq!(a.stepped.load(Ordering::SeqCst), 0, "no upgrade step");
+    assert!(!a.said_limited(), "{:?}", a.badges.lock().unwrap());
+    host.shutdown_and_join();
+}
+
 /// With `[harness] upgrade` off no upgrade step sweeps, so the idle point that finds nothing owed
 /// closes its tab's looks itself ([`Acts::close_looks`]): a look that ran past its clock is
 /// closed at the next idle point, its lost line told once, and no upgrade step is taken. A close
@@ -25205,6 +25768,229 @@ fn an_idle_point_closes_a_look_past_its_clock_with_the_upgrade_off() {
         host.shutdown_and_join();
         assert_eq!(lost(&a.notes.lock().unwrap()), 1, "told once");
     }
+}
+
+/// With `[harness] upgrade` off, a notice the upgrade already typed is not left standing: the
+/// idle point that finds nothing owed and no look to close asks for its release
+/// ([`Acts::release_notice`]), a release its gates held (`wait:release:settling`, the turn end's
+/// own settle) is looked at again later, and that look types it. While it waits the loop's own
+/// act waits on it ([`WorkerIdle::release_holds`]): an Autopilot's continuation typed at that turn
+/// end would take it; once typed nothing holds the loop. Nothing begins: with a newer build due
+/// throughout, no upgrade step is taken with the switch off. Both ways the switch is off at a
+/// notice are driven: turned off under a worker whose step typed the notice (that step asked for
+/// the next idle point), and off as the worker starts (aterm started again over the record),
+/// where only the record's standing notice asks for its first idle point
+/// ([`Acts::notice_stands`]).
+#[test]
+fn an_idle_point_releases_a_notice_already_typed_with_the_upgrade_off() {
+    for live in [true, false] {
+        let a = Arc::new(Acting::default());
+        *a.releases.lock().unwrap() = ["wait:release:settling", "released:switched-off"].into();
+        a.due.store(true, Ordering::SeqCst);
+        a.open.lock().unwrap().insert("s-r".to_string());
+        a.set(&[("s-r", Program::Claude)]);
+        let mut no_upgrade = on();
+        no_upgrade.set("upgrade", "false").unwrap();
+        let host = if live {
+            // The notice's step, after which the agent works its turn while the person turns
+            // the switch off.
+            *a.steps.lock().unwrap() = ["announced:1"].into();
+            let working = Arc::clone(&a);
+            *a.during_step.lock().unwrap() =
+                Some(Box::new(move || working.busy.store(true, Ordering::SeqCst)));
+            let host = HostHandle::start(on(), false, false, a.hooks());
+            until("the notice typed", || a.stepped.load(Ordering::SeqCst) == 1);
+            assert_eq!(
+                a.released.load(Ordering::SeqCst),
+                0,
+                "none with the switch on"
+            );
+            // The step counts itself as it begins, inside the loop's pass, whose tail (the
+            // agent's work starting, the pass's own reading of the loop's act) must run before
+            // the switch turns: a later pass writes `taskless_seen` first.
+            *a.taskless_seen.lock().unwrap() = None;
+            until("the loop went round past the notice's step", || {
+                a.taskless_seen.lock().unwrap().is_some()
+            });
+            host.set_config(no_upgrade);
+            *a.owns_seen.lock().unwrap() = Some(Vec::new());
+            a.busy.store(false, Ordering::SeqCst);
+            host
+        } else {
+            *a.owns_seen.lock().unwrap() = Some(Vec::new());
+            HostHandle::start(no_upgrade, false, false, a.hooks())
+        };
+        until(
+            &format!("live={live}: the release typed at the look after the one that held it"),
+            || a.released.load(Ordering::SeqCst) >= 2 && a.releases.lock().unwrap().is_empty(),
+        );
+        assert!(
+            a.closed.load(Ordering::SeqCst) >= 2,
+            "live={live}: each asked after the close found no look"
+        );
+        assert_eq!(
+            a.stepped.load(Ordering::SeqCst),
+            usize::from(live),
+            "live={live}: no upgrade step with the switch off"
+        );
+        assert_eq!(
+            a.carried.load(Ordering::SeqCst),
+            0,
+            "live={live}: no carry-on"
+        );
+        host.shutdown_and_join();
+        let owns = a.owns_seen.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            (owns.first(), owns.last()),
+            (Some(&true), Some(&false)),
+            "live={live}: the loop's act waits on the release that waits, and on nothing once \
+             it is typed: {owns:?}"
+        );
+    }
+}
+
+/// The hold a notice's release puts on the loop's own act with `[harness] upgrade` off
+/// ([`release_hold_after`]) runs from the release's first wait and is not renewed by later ones, so
+/// a release nothing takes never parks Cruise or Land; a look that finds a person holding it
+/// renews it, so the bound is not spent while the person holds the loop's act anyway and the turn
+/// end they leave is the release's settle; a release whose state the step could not use, looked at
+/// again only on the ladder's slowest rung past the bound, holds nothing.
+#[test]
+fn a_release_hold_runs_from_its_first_wait_renews_on_a_person_and_needs_a_look_back() {
+    let t0 = Instant::now();
+    let s = Duration::from_secs;
+    let first = release_hold_after(None, "wait:release:settling", true, t0);
+    assert_eq!(first, Some(t0 + RELEASE_HOLD), "the first wait starts it");
+    for later in [
+        "wait:release:settling",
+        "wait:release:not-idle",
+        "busy:another-sweep",
+    ] {
+        assert_eq!(
+            release_hold_after(first, later, true, t0 + s(100)),
+            first,
+            "{later}: not renewed"
+        );
+    }
+    let gone = t0 + RELEASE_HOLD + s(300);
+    for person in ["held", "attended", "box", "draft"] {
+        let step = format!("wait:release:{person}");
+        assert_eq!(
+            release_hold_after(first, &step, true, gone),
+            Some(gone + RELEASE_HOLD),
+            "{step}: renewed from the look that found the person"
+        );
+    }
+    let held = release_hold_after(first, "wait:release:held", true, gone);
+    let settle = release_hold_after(held, "wait:release:settling", true, gone + s(20));
+    assert!(
+        settle.is_some_and(|at| at > gone + s(20)),
+        "the turn end the person leaves holds for the release's settle: {settle:?}"
+    );
+    for broken in ["busy:state-unwritable", "busy:lock-unopenable"] {
+        assert_eq!(
+            upgrade_drive::after(broken, 0),
+            After::Broken,
+            "{broken}: looked at again only on the slowest rung"
+        );
+        assert_eq!(
+            release_hold_after(None, broken, false, t0),
+            None,
+            "{broken}"
+        );
+        assert_eq!(
+            release_hold_after(first, broken, false, t0),
+            None,
+            "{broken}"
+        );
+    }
+    assert_eq!(
+        release_hold_after(first, "wait:release:settling", false, t0),
+        None,
+        "a wait nothing looks at again"
+    );
+    for done in ["released:switched-off", "current", "done"] {
+        assert_eq!(release_hold_after(first, done, true, t0), None, "{done}");
+    }
+}
+
+/// The hold a notice's release puts on the loop's own act with `[harness] upgrade` off
+/// ([`WorkerIdle::release_holds`]) ends once no notice stands in the tab's records, and with the
+/// switch turned on, whose step owns the round again; a later turn of the switch off, or a later
+/// notice, finds none left over, which would park Cruise or Land with no release waiting.
+#[test]
+fn a_release_hold_ends_once_no_notice_stands_or_the_switch_turns_on() {
+    let a = Arc::new(Acting::default());
+    let mut no_upgrade = on();
+    no_upgrade.set("upgrade", "false").unwrap();
+    let switches = switched(&no_upgrade);
+    let idle = idle_host("s-r", Program::Claude, Arc::clone(&switches), a.hooks());
+    let hold = || with_kept_of(&idle.kept, |k| k.release_hold);
+    let arm = || {
+        with_kept_of(&idle.kept, |k| {
+            k.release_hold = Some(Instant::now() + Duration::from_secs(60));
+        });
+    };
+    let stands = |on: bool| {
+        *a.releases.lock().unwrap() = if on {
+            ["released:switched-off"].into()
+        } else {
+            VecDeque::new()
+        };
+    };
+    stands(true);
+    arm();
+    assert!(idle.release_holds(), "a notice stands: the hold holds");
+    stands(false);
+    assert!(!idle.release_holds(), "no notice stands");
+    assert_eq!(hold(), None, "the hold is gone");
+    stands(true);
+    assert!(!idle.release_holds(), "a later notice finds none left over");
+    arm();
+    switches.set(&on(), false);
+    assert!(
+        !idle.release_holds(),
+        "the switch on: its step owns the round"
+    );
+    assert_eq!(hold(), None, "the hold is gone");
+    switches.set(&no_upgrade, false);
+    assert!(!idle.release_holds(), "the switch off again finds none");
+}
+
+/// A notice's release whose step could not use the upgrade's state (`busy:state-unwritable`: it
+/// cannot be written) holds nothing of the loop's own act with `[harness] upgrade` off, though the
+/// notice still stands: nothing asks the release again before the hold's bound, so the hold
+/// would only withhold Cruise's or Land's continuation for five minutes.
+#[test]
+fn a_release_no_look_comes_back_to_holds_the_loops_act_on_nothing() {
+    let a = Arc::new(Acting::default());
+    *a.releases.lock().unwrap() = ["busy:state-unwritable", "released:switched-off"].into();
+    a.open.lock().unwrap().insert("s-r".to_string());
+    a.set(&[("s-r", Program::Claude)]);
+    let mut no_upgrade = on();
+    no_upgrade.set("upgrade", "false").unwrap();
+    *a.owns_seen.lock().unwrap() = Some(Vec::new());
+    let host = HostHandle::start(no_upgrade, false, false, a.hooks());
+    until("the release asked", || {
+        a.released.load(Ordering::SeqCst) >= 1
+    });
+    for _ in 0..2 {
+        *a.owns_now.lock().unwrap() = None;
+        until("the loop went round past the release's point", || {
+            a.owns_now.lock().unwrap().is_some()
+        });
+    }
+    assert_eq!(
+        *a.owns_now.lock().unwrap(),
+        Some(false),
+        "the loop's act is not held"
+    );
+    host.shutdown_and_join();
+    let owns = a.owns_seen.lock().unwrap().clone().unwrap();
+    assert!(
+        !owns.is_empty() && owns.iter().all(|owns| !owns),
+        "nothing held at the release's point: {owns:?}"
+    );
 }
 
 #[test]
@@ -30247,9 +31033,9 @@ impl LookWorld {
             }
             if w3.ready.swap(true, Ordering::SeqCst) {
                 w3.done.store(true, Ordering::SeqCst);
-                "done".to_string()
+                UpgradeStep::unknown("done")
             } else {
-                "announced:1".to_string()
+                UpgradeStep::unknown("announced:1")
             }
         });
         acts.snapshot = Arc::new(|sid| Some(snap(sid)));
@@ -30446,8 +31232,8 @@ fn a_look_lost_by_an_upgrade_step_is_recorded_and_the_move_behind_it_looked_at_a
             }
         })
     };
-    idle.hooks.acts.step = Arc::new(|_, _, _| "done:lost".to_string());
-    idle.hooks.acts.notice = Arc::new(|_, _, _| "done:lost".to_string());
+    idle.hooks.acts.step = Arc::new(|_, _, _| UpgradeStep::unknown("done:lost"));
+    idle.hooks.acts.notice = Arc::new(|_, _, _| UpgradeStep::unknown("done:lost"));
     assert!(idle.wants(), "the attach's look");
     let said = idle.at_idle().expect("the step's word");
     assert_eq!(said.line, "upgrade step=done:lost");
@@ -31314,6 +32100,7 @@ fn the_real_restart_act_conforms_to_its_model() {
                         start: agent.start.clone(),
                         cause: restart_stamp::Cause::Asked,
                         at: aterm_time::unix_secs().expect("clock") - 35,
+                        wanted: None,
                         input: None,
                     },
                 )
@@ -31691,6 +32478,7 @@ fn the_restart_ends_a_survivor_at_its_deadline_whatever_it_heard() {
         start: agent.start.clone(),
         cause: restart_stamp::Cause::Asked,
         at: aterm_time::unix_secs().expect("clock"),
+        wanted: None,
         input: None,
     };
     for (n, (deaf, stalled)) in [(false, false), (true, false), (true, true)]
@@ -31954,6 +32742,7 @@ fn a_stamped_program_stopped_inside_its_grace_is_ended_once_it_leads_again() {
         start: start.clone(),
         cause: restart_stamp::Cause::Stall,
         at: aterm_time::unix_secs().expect("clock") + 1 - aterm_agent::harness::relaunch::STALE_S,
+        wanted: None,
         input: None,
     };
     let watched = crate::restart_act::escalate(
@@ -32160,6 +32949,7 @@ fn stale_stamp(agent: &RealAgent) -> restart_stamp::Stamp {
         start: agent.start.clone(),
         cause: restart_stamp::Cause::Stall,
         at: aterm_time::unix_secs().expect("clock") - aterm_agent::harness::relaunch::STALE_S - 1,
+        wanted: None,
         input: None,
     }
 }
@@ -32695,6 +33485,7 @@ fn a_look_that_carries_an_asked_exit_rings_nothing() {
                 start: agent.start.clone(),
                 cause: restart_stamp::Cause::Asked,
                 at: aterm_time::unix_secs().expect("clock"),
+                wanted: None,
                 input: None,
             },
         )
@@ -32746,6 +33537,7 @@ fn a_watch_lets_its_program_go_once_its_tabs_stamp_names_another() {
         start: restart_stamp::kernel_start(shell).expect("the shell's start"),
         cause: restart_stamp::Cause::Asked,
         at: aterm_time::unix_secs().expect("clock"),
+        wanted: None,
         input: None,
     };
     restart_stamp::write(a.stamp_dir(), &sid, &other).expect("another act's stamp, replacing it");
@@ -33154,6 +33946,7 @@ fn the_restart_acts_kill_waits_out_another_hand() {
             start: agent.start.clone(),
             cause: restart_stamp::Cause::Asked,
             at,
+            wanted: None,
             input: None,
         };
         let said = crate::restart_act::escalate(
@@ -33198,6 +33991,7 @@ fn a_stamp_that_no_longer_stands_is_no_acts_to_finish() {
         start: agent.start.clone(),
         cause: restart_stamp::Cause::Asked,
         at,
+        wanted: None,
         input: None,
     };
     let stale = stamp_at(now - aterm_agent::harness::relaunch::STALE_S - 120);
@@ -33375,6 +34169,7 @@ fn a_restart_after_its_programs_watch_let_go_gets_a_watch_of_its_own() {
         start: agent.start.clone(),
         cause: restart_stamp::Cause::Stall,
         at: stamped + 33 - aterm_agent::harness::relaunch::STALE_S,
+        wanted: None,
         input: None,
     };
     restart_stamp::write(a.stamp_dir(), &agent.sid, &cut).expect("the stamp a Commit cut");
@@ -35295,6 +36090,7 @@ fn a_hosted_relaunch_row_that_moved_the_session_is_one_act_mark() {
     let sid = h.ctx.self_id.as_str().to_string();
     let row = live_row(store.clone());
     let report = |step: &str| upgrade_drive::Report {
+        rung: None,
         pid: 4242,
         tab: sid.clone(),
         session: "c0ffee".to_string(),
@@ -35384,6 +36180,7 @@ impl HostedLog {
                 end,
                 detail: Some(detail.to_string()),
                 detail_final: true,
+                shape: crate::session_status::LineShape::ONE,
             }],
             ..BlockRead::default()
         };
@@ -35402,6 +36199,7 @@ impl HostedLog {
                 end: BlockEnd::Running,
                 detail: Some("claude".to_string()),
                 detail_final: true,
+                shape: crate::session_status::LineShape::ONE,
             }],
             ..BlockRead::default()
         };
@@ -35425,6 +36223,7 @@ impl HostedLog {
         self.ms.store(ms, Ordering::SeqCst);
         let sid = self.sid();
         let r = upgrade_drive::Report {
+            rung: None,
             pid: 4242,
             tab: sid.clone(),
             session: "c0ffee".to_string(),
@@ -35547,6 +36346,7 @@ fn the_loops_resume_hook_writes_each_row_under_its_resumes_kind() {
         tab.ms.store(800, Ordering::SeqCst);
         let sid = tab.sid();
         let report = |step: &str| upgrade_drive::Report {
+            rung: None,
             pid: 4242,
             tab: sid.clone(),
             session: "c0ffee".to_string(),
@@ -36724,7 +37524,23 @@ fn startup_mark_nameless_at(
     record_rev: u64,
     mark: &StartupMark<'_>,
 ) -> Option<(u64, crate::task_record::MarkedWith)> {
-    startup_mark_named(store, sid, record_rev, mark, || None)
+    let nonce = store
+        .read()
+        .unwrap()
+        .by_sid(&aterm_session::SessionId::new(sid))?
+        .ctx
+        .nonce;
+    let worker = Startup {
+        nonce,
+        record_rev,
+        ..startup(
+            sid,
+            StartupState::Other,
+            Instant::now(),
+            StartupSeen::Unread,
+        )
+    };
+    startup_mark_named(store, &worker, mark, || None)
 }
 
 fn startup(sid: &str, state: StartupState, since: Instant, seen: StartupSeen) -> Startup {
@@ -36735,6 +37551,7 @@ fn startup(sid: &str, state: StartupState, since: Instant, seen: StartupSeen) ->
     .then(|| held_at("idle", Progress::default()));
     Startup {
         sid: sid.to_string(),
+        nonce: aterm_session::LaunchNonce::from_bytes([0; 16]),
         state,
         record_rev: 0,
         since,
@@ -36745,6 +37562,7 @@ fn startup(sid: &str, state: StartupState, since: Instant, seen: StartupSeen) ->
         install_mark: 0,
         install_work: None,
         unheld: None,
+        claim_hold: None,
     }
 }
 
@@ -36768,6 +37586,7 @@ fn held_at(word: &str, progress: Progress) -> HeldRead {
 fn held_worker(sid: &str, state: StartupState, read: HeldRead) -> Startup {
     Startup {
         sid: sid.to_string(),
+        nonce: aterm_session::LaunchNonce::from_bytes([0; 16]),
         state,
         record_rev: 0,
         since: Instant::now(),
@@ -36778,6 +37597,7 @@ fn held_worker(sid: &str, state: StartupState, read: HeldRead) -> Startup {
         install_mark: 0,
         install_work: None,
         unheld: None,
+        claim_hold: None,
     }
 }
 
@@ -38728,10 +39548,19 @@ fn a_deadlines_stall_names_the_member_it_was_marked_on() {
         agent: Program::Claude,
     };
     let revision = h.ctx.timeline.lock().unwrap().task().unwrap().rev;
+    let worker = Startup {
+        nonce: h.ctx.nonce,
+        record_rev: revision,
+        ..startup(
+            h.sid.as_str(),
+            StartupState::Working,
+            Instant::now(),
+            StartupSeen::Unread,
+        )
+    };
     startup_mark_named(
         &store,
-        h.sid.as_str(),
-        revision,
+        &worker,
         &StartupMark::Stalled { hold: &hold },
         || Some("m22".to_owned()),
     )
@@ -41963,6 +42792,7 @@ fn an_unnamed_conversation_is_read_again_at_a_look_not_at_once() {
             told: AtomicU8::new(0),
             repo_probe: Default::default(),
             left_probe: Default::default(),
+            credential_probe: Default::default(),
             restart_left: Mutex::default(),
             group: Arc::default(),
             activations: Arc::default(),
@@ -42258,6 +43088,7 @@ fn idle_of(hooks: Hooks, agent: Program, session: Option<String>) -> WorkerIdle 
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
         left_probe: Default::default(),
+        credential_probe: Default::default(),
         restart_left: Mutex::default(),
         group: Arc::default(),
         activations: Arc::default(),
@@ -42433,7 +43264,7 @@ impl HeldDue {
         h.acts.due_read = bound;
         h.acts.step = Arc::new(move |_, _, _| {
             s.fetch_add(1, Ordering::SeqCst);
-            "wait:failed".to_string()
+            UpgradeStep::unknown("wait:failed")
         });
         h.acts.owed = Arc::new(move |_, _| o.load(Ordering::SeqCst));
         h.acts.resume = Arc::new(|_, _, _| "continued".to_string());
@@ -42710,7 +43541,7 @@ fn a_package_activation_invalidates_an_older_upgrade_answer() {
         let took = Arc::clone(&steps);
         h.acts.step = Arc::new(move |_, _, _| {
             took.fetch_add(1, Ordering::SeqCst);
-            "wait:failed".to_string()
+            UpgradeStep::unknown("wait:failed")
         });
         let idle = idle_of(
             h,
@@ -42776,7 +43607,7 @@ fn an_unnamed_conversations_upgrade_wait_climbs_its_ladder() {
                 })
             }),
             due: Arc::new(|_| Due::Yes),
-            step: Arc::new(|_, _, _| "wait:failed".to_string()),
+            step: Arc::new(|_, _, _| UpgradeStep::unknown("wait:failed")),
             ..Acts::inert()
         };
         // Each pause the host asks for, as asked. A rung is read off its ask, never off the clock: a
@@ -43983,7 +44814,7 @@ fn a_stuck_program_check_holds_the_worker_and_keeps_what_it_owes() {
         hooks.acts = Acts {
             program_check: board,
             due: Arc::new(|_| Due::Yes),
-            notice: Arc::new(|_, _, _| "announced:1".to_string()),
+            notice: Arc::new(|_, _, _| UpgradeStep::unknown("announced:1")),
             ..Acts::inert()
         };
         let w = idle_host(sid, Program::Claude, switched(&resetting()), hooks);
@@ -44117,6 +44948,7 @@ fn a_full_disk_withholds_continuations_and_space_back_types_the_resume_once() {
         told: AtomicU8::new(0),
         repo_probe: Default::default(),
         left_probe: Default::default(),
+        credential_probe: Default::default(),
         restart_left: Mutex::default(),
         group: Arc::default(),
         activations: Arc::default(),
@@ -44260,6 +45092,124 @@ fn a_full_disk_withholds_continuations_and_space_back_types_the_resume_once() {
         .collect();
     assert_eq!(kinds, ["full", "full", "over"]);
     let _ = std::fs::remove_dir_all(&state);
+}
+
+/// THE DISK LANES INTO AN OBSERVED AGENT (H6-R1): the server's observe gate withholds both owed
+/// lines, the resume and the ask to free space (`agent_image::WITHHELD`, the step's
+/// `released:unconfirmed`), and each is spent at its first try, so its step is said once and
+/// nothing is typed or retried; a confirmed agent's are typed (CONTROL). NEGATIVE CONTROL (run):
+/// with the resume's withheld step counted as a wait, it is tried again at every look until its
+/// tries run out.
+#[test]
+fn a_disk_line_the_observe_gate_withholds_is_spent_at_once_and_a_confirmed_one_typed() {
+    use aterm_agent::harness::agent_image::WITHHELD;
+    use aterm_agent::harness::disk::Level;
+    use aterm_phase::disk_full::{Code, DiskFull, Source};
+    static BOARD: Shelf = Shelf::new();
+    let state = aterm_tempfile::TempDir::new().expect("owned disk journal");
+    let world = Arc::new(World::default());
+    let tried: Arc<Mutex<Vec<(&'static str, String)>>> = Arc::default();
+    let (r, f) = (Arc::clone(&tried), Arc::clone(&tried));
+    let observed = |sid: &str| sid.ends_with("-observed");
+    let mut hooks = hooks(&world, parking_body(&world));
+    hooks.acts = Acts {
+        due: Arc::new(|_| Due::No),
+        disk_resume: Arc::new(move |sid, _| {
+            r.lock().unwrap().push(("resume", sid.to_string()));
+            if observed(sid) { WITHHELD } else { "typed" }.to_string()
+        }),
+        disk_free: Arc::new(move |sid, _, unfit, _| {
+            assert_eq!(unfit, None, "{sid}: nothing else bars it");
+            f.lock().unwrap().push(("ask", sid.to_string()));
+            if observed(sid) {
+                "released:unconfirmed"
+            } else {
+                "typed"
+            }
+            .to_string()
+        }),
+        disk_board: &BOARD,
+        ..Acts::inert()
+    };
+    let tabs = ["s-dl-observed", "s-dl-confirmed"];
+    let idles: Vec<WorkerIdle> = tabs
+        .iter()
+        .map(|sid| {
+            let mut idle = idle_of(
+                hooks.clone(),
+                Program::Claude,
+                Some("0badf00d-1111-2222-3333-444455556666".to_string()),
+            );
+            idle.sid = (*sid).to_string();
+            idle
+        })
+        .collect();
+    let seen: Vec<(String, DiskFull)> = tabs
+        .iter()
+        .map(|sid| {
+            (
+                (*sid).to_string(),
+                DiskFull {
+                    code: Code::Enospc,
+                    source: Source::Notification,
+                    row: 3,
+                    message: "the notice".to_string(),
+                },
+            )
+        })
+        .collect();
+    disk_sightings(&BOARD, &seen, Level::Emergency, Some(0), state.path(), 1);
+    disk_episode_after(&BOARD, Level::Emergency, 0, &[]);
+    disk_episode_after(&BOARD, Level::Short, 30 << 30, &[]);
+    assert!(
+        tabs.iter().all(|sid| disk_owed(&BOARD, sid).is_some()),
+        "owed"
+    );
+    let observed_idle = &idles[0];
+    assert_eq!(
+        observed_idle.at_idle().map(|s| s.line),
+        None,
+        "withheld: no step typed"
+    );
+    assert!(
+        disk_owed(&BOARD, tabs[0]).is_none(),
+        "the withheld resume is spent at its first try"
+    );
+    for _ in 0..DISK_RESUME_TRIES {
+        assert_eq!(observed_idle.at_idle().map(|s| s.line), None);
+    }
+    let step = idles[1].at_idle().expect("the confirmed agent's resume");
+    assert_eq!(step.line, "disk-resume@v1 step=typed");
+    BOARD.publish(|b| {
+        for sid in tabs {
+            b.asks.insert(
+                sid.to_string(),
+                crate::disk_board::AskOwed {
+                    key: "dev:1".to_string(),
+                    text: "[aterm harness] aterm: the volume is full. (rule disk-free@v1)"
+                        .to_string(),
+                },
+            );
+        }
+    });
+    assert_eq!(observed_idle.at_idle().map(|s| s.line), None, "released");
+    assert!(
+        disk_ask_owed(&BOARD, tabs[0]).is_none(),
+        "the withheld ask is handed on, owed here no more"
+    );
+    assert_eq!(observed_idle.at_idle().map(|s| s.line), None);
+    let step = idles[1].at_idle().expect("the confirmed agent's ask");
+    assert_eq!(step.line, "disk-free@v1 step=typed");
+    assert_eq!(
+        *tried.lock().unwrap(),
+        [
+            ("resume", tabs[0].to_string()),
+            ("resume", tabs[1].to_string()),
+            ("ask", tabs[0].to_string()),
+            ("ask", tabs[1].to_string()),
+        ],
+        "each line tried once"
+    );
 }
 
 #[test]
@@ -46317,6 +47267,7 @@ fn a_vendor_codex_is_shown_and_admitted_to_no_worker() {
     .expect("an ordinary claim");
     let copy = |pid: u32| aterm_agent::harness::self_claimed::Copy {
         pid,
+        lifetime: None,
         start: "a test identity".to_string(),
         home: PathBuf::from("/"),
         seen: aterm_agent::harness::self_claimed::Seen::Removed,
@@ -47110,6 +48061,7 @@ fn a_codex_is_told_no_resume_line_and_claude_codes_is_unchanged() {
             told: AtomicU8::new(0),
             repo_probe: Default::default(),
             left_probe: Default::default(),
+            credential_probe: Default::default(),
             restart_left: Mutex::default(),
             group: Arc::default(),
         };
@@ -47868,6 +48820,7 @@ fn worker_idle_agent_resumed_refreshes_an_uncaptured_foreground_snapshot() {
             auth_observed: true,
             tab: "s-idle".to_string(),
             pid: 8888,
+            lifetime: None,
             start: start.to_string(),
             shell: 100,
             program: PathBuf::from("/p/claude"),

@@ -393,8 +393,22 @@ fn verifier_log(stdout: &str) -> Option<&str> {
     })
 }
 
-fn ledger_member(path: &str) -> bool {
-    path.starts_with("docs/measured/") && relative_member(path)
+/// Where the guest's perf lanes write their ledger entries: aterm-verify's `perf::ledger_dir`, in
+/// the verify state directory under the guest's `CARGO_TARGET_DIR` ([`environment`]), spelled
+/// from the same [`aterm_tempfile::QUIET`] folder name (aterm-lab cannot depend on aterm-verify).
+fn perf_ledgers() -> String {
+    format!(
+        "{ROOT}/target.noindex/verify/{}/perf.noindex",
+        aterm_tempfile::QUIET
+    )
+}
+
+/// `path` relative to [`perf_ledgers`], where it names a file inside it.
+fn ledger_member(path: &str) -> Option<&str> {
+    let relative = path
+        .strip_prefix(perf_ledgers().as_str())?
+        .strip_prefix('/')?;
+    relative_member(relative).then_some(relative)
 }
 
 fn relative_member(path: &str) -> bool {
@@ -408,7 +422,8 @@ fn relative_member(path: &str) -> bool {
 }
 
 /// stdout contains the verifier's summary. Its row values live in the log; perf also writes
-/// structured records beside its source. Bring those back before the disposable disk goes.
+/// structured records into the guest's verify state ([`perf_ledgers`]). Bring those back before
+/// the disposable disk goes.
 fn collect(vm: &Vm, ask: &Ask, name: &str, stdout: &str) -> Result<Value, Fail> {
     let mut artifacts = aterm_json::Map::new();
     if let Some(path) = verifier_log(stdout) {
@@ -420,20 +435,25 @@ fn collect(vm: &Vm, ask: &Ask, name: &str, stdout: &str) -> Result<Value, Fail> 
         return Err(not_run("guest measure named no row-level log to retain"));
     }
     if !matches!(ask.lane.as_str(), "measure" | "cursor") {
+        let ledgers = perf_ledgers();
         let listed = vm.sh(
             &format!(
-                "cd {ROOT}/source && git ls-files --others --exclude-standard -- docs/measured"
+                "if [ -d {l} ]; then find {l} -type f | LC_ALL=C sort; fi",
+                l = q(&ledgers)
             ),
             crate::mac::STEP,
         )?;
-        let files: Vec<_> = listed.lines().collect();
-        if files.iter().any(|f| !ledger_member(f)) {
-            return Err(not_run("guest perf returned a path outside its ledger"));
-        }
+        let files = listed
+            .lines()
+            .map(|f| {
+                ledger_member(f)
+                    .ok_or_else(|| not_run("guest perf returned a path outside its ledger"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if !files.is_empty() {
             let args = files.iter().map(|f| q(f)).collect::<Vec<_>>().join(" ");
             let out = vm.exec(
-                &format!("tar -C {ROOT}/source -cf - -- {args}"),
+                &format!("tar -C {} -cf - -- {args}", q(&ledgers)),
                 crate::mac::STEP,
             )?;
             if !out.status.success() {

@@ -27,6 +27,9 @@ mod history;
 #[path = "build_cache_retired_history_edges_tests.rs"]
 mod history_edges;
 
+#[path = "build_cache_retired_reflog_tests.rs"]
+mod reflog;
+
 /// A scratch home holding the gate's leftovers, removed when the test ends.
 struct Gate {
     dir: aterm_tempfile::TempDir,
@@ -1608,6 +1611,82 @@ fn a_lock_taken_as_its_entry_goes_keeps_the_snapshot_listed() {
         super::pending::read(&g.checkout(), &g.snapshot())
             .unwrap()
             .is_none()
+    );
+}
+
+/// A git that records each directory it is asked about and answers nothing.
+#[derive(Default)]
+struct Asked(std::sync::Mutex<Vec<PathBuf>>);
+
+impl super::Git for Asked {
+    fn run(&self, dir: &Path, _: &[&str]) -> super::Answer {
+        self.0.lock().expect("unpoisoned").push(dir.to_path_buf());
+        super::Answer {
+            code: Some(1),
+            out: String::new(),
+            err: "a recording git".to_owned(),
+        }
+    }
+}
+
+/// A scratch home with a main checkout at `<home>/<folder>/aterm` the build cache names as a
+/// workspace, the retired gate's snapshot beside it: `(scratch, roots, checkout)`.
+fn leftover_in(folder: &str) -> (aterm_tempfile::TempDir, Roots, PathBuf) {
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("retired-fence-")
+        .tempdir()
+        .expect("scratch");
+    let home = std::fs::canonicalize(dir.path())
+        .expect("resolved")
+        .join("home");
+    let checkout = home.join(folder).join("aterm");
+    std::fs::create_dir_all(checkout.join(".git")).expect("a main checkout");
+    std::fs::create_dir_all(home.join(folder).join("aterm-verify.noindex")).expect("a snapshot");
+    let roots = Roots {
+        cache: home.join("cache"),
+        workspaces: vec![checkout.clone()],
+        home,
+    };
+    (dir, roots, checkout)
+}
+
+/// THE DAILY PASS NEVER LOOKS INTO A PROTECTED FOLDER: a workspace in a folder of `$HOME` that
+/// is never looked into (Documents, Desktop, Downloads on macOS) is no checkout of the pass,
+/// though the retired gate's snapshot stands beside it, so no `git` child and no walk reads
+/// there and macOS asks the person nothing. NEGATIVE CONTROL: the same leftover in an ordinary
+/// folder is planned, and git is asked about its checkout.
+#[test]
+fn a_workspace_in_a_folder_never_looked_into_is_no_checkout_of_the_pass() {
+    let now = SystemTime::now();
+    let skipped = crate::build_cache::checkout::HOME_SKIP[0].trim_end_matches('*');
+    let (_scratch, roots, checkout) = leftover_in(skipped);
+    assert!(
+        super::main_checkout(&checkout),
+        "PRECONDITION: only the fence leaves it out"
+    );
+    let git = Asked::default();
+    let planned = plan(&roots, now, &git);
+    assert!(
+        planned
+            .iter()
+            .all(|l| !l.path.starts_with(roots.home.join(skipped))),
+        "{planned:#?}"
+    );
+    assert_eq!(*git.0.lock().expect("unpoisoned"), Vec::<PathBuf>::new());
+
+    let (_scratch, roots, checkout) = leftover_in("src");
+    let git = Asked::default();
+    let planned = plan(&roots, now, &git);
+    assert!(
+        planned.iter().any(|l| l.kind
+            == Kind::Snapshot {
+                checkout: checkout.clone()
+            }),
+        "control: {planned:#?}"
+    );
+    assert!(
+        git.0.lock().expect("unpoisoned").contains(&checkout),
+        "control: git is asked about an ordinary checkout"
     );
 }
 

@@ -3,7 +3,7 @@
 
 use super::{
     ChromeInputToken, INPUT_EDGE_RING, INPUT_SLICE_CAP_NS, Metrics, PendingChromeInputStamp,
-    PresentClock,
+    PresentClock, PresentInput,
 };
 use std::sync::atomic::Ordering;
 
@@ -19,7 +19,12 @@ fn present(
     now: u64,
     epoch: u64,
 ) -> usize {
-    m.record_chrome_input_at(pending, token, PresentClock::at(false, now, epoch, 0, 0))
+    m.record_chrome_input_at(
+        pending,
+        token,
+        PresentClock::at(false, now, epoch, 0, 0),
+        PresentInput::default(),
+    )
 }
 
 #[test]
@@ -141,7 +146,10 @@ fn capture_and_taint_retire_edges_before_any_later_clean_present() {
         let mut pending = PendingChromeInputStamp::default();
         let stale = arm(&m, &mut pending, 10);
         let current = arm(&m, &mut pending, 20);
-        assert_eq!(m.record_chrome_input_at(&mut pending, stale, clock), 0);
+        assert_eq!(
+            m.record_chrome_input_at(&mut pending, stale, clock, PresentInput::default()),
+            0
+        );
         assert_eq!(
             pending.token(),
             None,

@@ -82,7 +82,13 @@ impl Request {
         match &ds.gnu {
             GnuTransport::None => {}
             GnuTransport::NumericPipe { read, write } => descriptors.extend([*read, *write]),
-            GnuTransport::NamedFifo { locator, inode, read, write, .. } => {
+            GnuTransport::NamedFifo {
+                locator,
+                inode,
+                read,
+                write,
+                ..
+            } => {
                 if !absolute(locator)
                     || *inode == 0
                     || std::str::from_utf8(locator)
@@ -113,6 +119,27 @@ impl Request {
             }
             Role::WorkloadQuery => crate::workload::host::validate_query_member(self)?,
             Role::WorkloadProduced => crate::workload::host::produced::validate_member(self)?,
+            Role::CoordinatorCompiler(coordinator) => {
+                if coordinator == [0; 16]
+                    || coordinator == self.binding.root_attempt
+                    || coordinator == self.member_attempt
+                    // SAME native workload compiler layout: SDK5, CPU6,
+                    // Store7. CPU5 remains the separate nondelegating linker.
+                    || ds.cpu.is_none_or(|cpu| cpu.target != 6)
+                    || !ds.fences.is_empty()
+                    || self.timeout_ns.is_none()
+                    || c.arg0.is_some()
+                    || c.args.iter().any(|arg| arg.starts_with(b"@"))
+                    || c.environment.iter().any(|(name, _)| {
+                        matches!(
+                            name.as_slice(),
+                            b"RUSTC_WRAPPER" | b"RUSTC_WORKSPACE_WRAPPER"
+                        )
+                    })
+                {
+                    return Err(invalid());
+                }
+            }
             Role::MachOLinker(loan) if !linker_loan_shape(self, loan) => {
                 return Err(invalid());
             }
@@ -159,7 +186,9 @@ pub(crate) fn validate_session(value: &str) -> io::Result<()> {
     let session = value.strip_prefix("s-").ok_or_else(invalid)?;
     if session.is_empty()
         || session.len() > 62
-        || !session.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        || !session
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
     {
         return Err(invalid());
     }

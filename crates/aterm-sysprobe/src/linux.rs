@@ -6,14 +6,15 @@
 use std::path::{Path, PathBuf};
 
 use crate::jobs::RunState;
-use crate::jobs::linux::parse_stat;
+use crate::jobs::linux::{parse_io, parse_stat};
 use crate::machine::{
     Capacity, Commit, LinkCounters, LinkKind, LinkReading, MAX_LINKS, Throttle, ThrottleLevel,
     kind_by_name, layout_by_rank, level_names,
 };
 use crate::procs::{MAX_PROCESSES, ProcessReading, Sweep, parse_statm_resident};
 use crate::{
-    Cap, CapSource, Caps, Cluster, CoreTicks, CpuLayout, GpuReading, MemoryDetail, MemoryLevel, Why,
+    Cap, CapSource, Caps, Cluster, CoreTicks, CpuLayout, GpuReading, MemoryDetail, MemoryLevel,
+    VmCounters, Why,
 };
 
 #[path = "linux_tcp.rs"]
@@ -48,10 +49,45 @@ pub fn mem_total_kib(text: &str) -> Option<u64> {
     keyed(text, "MemTotal")
 }
 
+/// `MemTotal` and `MemAvailable` from `/proc/meminfo`, KiB: the pair [`machine_pressure`] checks
+/// for room beside PSI.
+#[must_use]
+pub fn mem_room(text: &str) -> Option<(u64, u64)> {
+    Some((keyed(text, "MemTotal")?, keyed(text, "MemAvailable")?))
+}
+
 /// `pswpin + pswpout` from `/proc/vmstat` (pages).
 #[must_use]
 pub fn swap_pages(vmstat: &str) -> Option<u64> {
     Some(keyed(vmstat, "pswpin")?.saturating_add(keyed(vmstat, "pswpout")?))
+}
+
+/// The most of `/proc/vmstat` read: about 3.7 KB on Ubuntu 24.04's 6.8 kernel, more with NUMA's
+/// counters. A text cut there is no reading ([`Root::vm_counters`]): the counters past the cut are
+/// not guessed.
+pub const VMSTAT_CAP: usize = 16 * 1024;
+
+/// `AT_PAGESZ`, the auxiliary vector's page size key.
+pub const AT_PAGESZ: u64 = 6;
+
+/// The VM's cumulative event counters from a whole `/proc/vmstat` with pages of `page_bytes`, as
+/// macOS's `HOST_VM_INFO64` names them (`pswpin`/`pswpout` in bytes, `zswpin`/`zswpout` as
+/// compressor pages — 0 where the kernel has no zswap — and `pgmajfault` as `pageins`). `None`
+/// without the swap or fault counters, or with `page_bytes == 0`.
+#[must_use]
+pub fn vm_counters(vmstat: &str, page_bytes: u64) -> Option<VmCounters> {
+    if page_bytes == 0 {
+        return None;
+    }
+    let pages = |key: &str| keyed(vmstat, key).map(|p| p.saturating_mul(page_bytes));
+    Some(VmCounters {
+        swapin_bytes: pages("pswpin")?,
+        swapout_bytes: pages("pswpout")?,
+        decompressions: keyed(vmstat, "zswpin").unwrap_or(0),
+        compressions: keyed(vmstat, "zswpout").unwrap_or(0),
+        pageins: keyed(vmstat, "pgmajfault")?,
+        page_bytes,
+    })
 }
 
 /// One value of a binary auxiliary vector (`/proc/self/auxv`), ended by `AT_NULL` (`0`).
@@ -197,8 +233,9 @@ impl StatReader {
         self.forks
     }
 
-    /// The threads in uninterruptible sleep now, every user's (`procs_blocked`: state `D`), as the
-    /// last [`Self::sample`] read them; `None` before one, or where that read held no whole line.
+    /// The tasks waiting on I/O now, every user's (`procs_blocked`, the kernel's `nr_iowait()`:
+    /// some of state `D`, never one held on a lock or a mount outside I/O wait), as the last
+    /// [`Self::sample`] read them; `None` before one, or where that read held no whole line.
     #[must_use]
     pub const fn blocked(&self) -> Option<u64> {
         self.blocked
@@ -901,6 +938,32 @@ pub fn psi_level(p: &Psi) -> MemoryLevel {
     }
 }
 
+/// `MemAvailable` at or past this share of `MemTotal` (per mille) is room: the machine is not
+/// short, whatever PSI says ([`machine_pressure`]). A tenth of the machine is several times the
+/// kernel's reclaim watermarks (`min_free_kbytes` and its `low`/`high` steps stay within a few
+/// percent), so with that much available no task stalls in the machine's own reclaim.
+pub const PSI_ROOM_PERMILLE: u64 = 100;
+
+/// The machine's pressure level: [`psi_level`] when the machine is short, normal while
+/// `MemAvailable` holds [`PSI_ROOM_PERMILLE`] of `MemTotal` (`room_kib` is `(total_kib,
+/// available_kib)` from [`mem_room`]).
+///
+/// `/proc/pressure/memory` counts every task's stall, and a task reclaiming inside its own
+/// cgroup's `memory.high` or `memory.max` stalls exactly as one reclaiming for a full machine:
+/// live, one 64 MiB `MemoryHigh` scope drove `full avg10` to 73.81 on a 16 GiB guest with 8.8 GB
+/// free. Without `/proc/meminfo` (`room_kib` `None`, or a zero total) PSI alone decides.
+#[must_use]
+pub fn machine_pressure(p: &Psi, room_kib: Option<(u64, u64)>) -> MemoryLevel {
+    let room = room_kib.is_some_and(|(total, avail)| {
+        total > 0 && u128::from(avail) * 1000 >= u128::from(total) * u128::from(PSI_ROOM_PERMILLE)
+    });
+    if room {
+        MemoryLevel::Normal
+    } else {
+        psi_level(p)
+    }
+}
+
 /// Core layout from present/online cores, hybrid PMU core lists, and per-core `cpu_capacity`, fastest first.
 #[must_use]
 pub fn layout_from(
@@ -1286,30 +1349,49 @@ pub fn parse_uptime_ns(text: &str) -> Option<u64> {
     secs.checked_mul(1_000_000_000)?.checked_add(frac_ns)
 }
 
+/// This process's effective uid, whose processes' `io` the kernel lets it read; `None` where the
+/// platform has no reader here.
+fn effective_uid() -> Option<u32> {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        // SAFETY: `geteuid` takes nothing and cannot fail.
+        Some(unsafe { libc::geteuid() })
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
 /// `/proc`, `/sys` and `/sys/fs/cgroup` under one root directory: `/` on a Linux machine ([`Root::system`]), a fixture tree in tests.
 #[derive(Clone, Debug)]
 pub struct Root {
     base: PathBuf,
     nvidia: NvidiaRead,
     wall_ms: WallMs,
+    euid: Option<u32>,
 }
 
 impl Root {
-    /// The tree under `base`, whose NVIDIA cards are not read ([`no_nvml`]).
+    /// The tree under `base`, whose NVIDIA cards are not read ([`no_nvml`]) and whose uid filter is
+    /// unpinned (`None`).
     #[must_use]
     pub fn new(base: impl Into<PathBuf>) -> Self {
         Self {
             base: base.into(),
             nvidia: no_nvml,
             wall_ms: system_wall_ms,
+            euid: None,
         }
     }
 
-    /// The machine's own tree, `/`, its NVIDIA cards read through NVML.
+    /// The machine's own tree, `/`, its NVIDIA cards read through NVML and its uid filter pinned to
+    /// this process's effective uid.
     #[must_use]
     pub fn system() -> Self {
         Self {
             nvidia: SYSTEM_NVIDIA,
+            euid: effective_uid(),
             ..Self::new("/")
         }
     }
@@ -1326,6 +1408,13 @@ impl Root {
     #[must_use]
     pub(crate) fn with_wall_ms(self, wall_ms: WallMs) -> Self {
         Self { wall_ms, ..self }
+    }
+
+    /// This root with `euid` as the caller's effective uid: the test arm for per-user gating on a fixture tree.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_euid(self, euid: Option<u32>) -> Self {
+        Self { euid, ..self }
     }
 
     /// `rel` under the root.
@@ -1556,16 +1645,53 @@ impl Root {
         })
     }
 
-    /// Memory by class, swap, commit ([`memory_detail`]) and the PSI level ([`psi_level`]; `None` without PSI).
+    /// The machine's pressure level ([`machine_pressure`]: PSI, held to `MemAvailable` from one
+    /// read of `/proc/meminfo`).
+    ///
+    /// # Errors
+    /// `not_enabled:psi` as [`Root::psi`].
+    pub fn pressure(&self) -> Result<MemoryLevel, Why> {
+        let p = self.psi()?;
+        let room = self.read("proc/meminfo", mem_room).flatten();
+        Ok(machine_pressure(&p, room))
+    }
+
+    /// Memory by class, swap, commit ([`memory_detail`]), the machine's pressure level
+    /// ([`machine_pressure`] over the same read of `/proc/meminfo`; `None` without PSI) and the
+    /// VM's counters ([`Root::vm_counters`]). With zswap off, `compressed` and `stored` are `None`.
     #[must_use]
     pub fn memory_detail(&self) -> Option<MemoryDetail> {
-        let mut m = self.read("proc/meminfo", memory_detail).flatten()?;
-        m.pressure = self.psi().ok().as_ref().map(psi_level);
+        let (m, room) = self.read("proc/meminfo", |t| (memory_detail(t), mem_room(t)))?;
+        let mut m = m?;
+        m.pressure = self.psi().ok().map(|p| machine_pressure(&p, room));
+        m.counters = self.vm_counters();
         if self.zswap_enabled() != Some(true) {
             m.compressed = None;
             m.stored = None;
         }
         Some(m)
+    }
+
+    /// The VM's event counters ([`vm_counters`]) from `proc/vmstat`, read into a [`VMSTAT_CAP`]-byte
+    /// buffer; `None` where unread or cut there.
+    #[must_use]
+    pub fn vm_counters(&self) -> Option<VmCounters> {
+        let mut buf = vec![0u8; VMSTAT_CAP];
+        let (n, cut) = crate::read_into(&self.at("proc/vmstat"), &mut buf).ok()?;
+        if cut {
+            return None;
+        }
+        vm_counters(crate::utf8_prefix(&buf[..n]), self.page_bytes())
+    }
+
+    /// The page size, bytes: `AT_PAGESZ` from `proc/self/auxv`, else 4096 (a fixture tree without one).
+    #[must_use]
+    pub fn page_bytes(&self) -> u64 {
+        crate::read_bounded_bytes(&self.at("proc/self/auxv"))
+            .ok()
+            .and_then(|b| auxv_value(&b, AT_PAGESZ))
+            .filter(|b| *b > 0)
+            .unwrap_or(4096)
     }
 
     /// What this process may use.
@@ -1793,6 +1919,56 @@ impl Root {
         }
     }
 
+    /// [`crate::group_memory`] on Linux: `pid`'s group from its `stat` ([`stat_pgrp`]), the
+    /// group's members from one listing of `/proc` (`stat_pgrp` first, then `status`), and each
+    /// member's anonymous memory (`RssAnon + VmSwap`), at most [`crate::MAX_GROUP_PIDS`] members.
+    /// Only this user's processes are measured (every one, for root, or when `euid` is unpinned).
+    /// `None` for group 0, a pid that is gone, or a group none of whose members was measured.
+    #[must_use]
+    pub fn group_memory(&self, pid: u32) -> Option<crate::GroupMemory> {
+        let pgid = self
+            .read(&format!("proc/{pid}/stat"), stat_pgrp)
+            .flatten()
+            .filter(|g| *g != 0)?;
+        let (mut bytes, mut measured, mut members) = (0u64, 0u32, 0usize);
+        for entry in std::fs::read_dir(self.at("proc")).ok()?.flatten() {
+            let Some(member) = entry
+                .file_name()
+                .to_str()
+                .and_then(crate::parse_uint::<u32>)
+            else {
+                continue;
+            };
+            if self
+                .read(&format!("proc/{member}/stat"), stat_pgrp)
+                .flatten()
+                != Some(pgid)
+            {
+                continue;
+            }
+            let Some(Some((uid, mem))) = self.status(member, |t| (status_uid(t), status_memory(t)))
+            else {
+                continue;
+            };
+            if self.euid.is_some_and(|me| me != 0 && uid != Some(me)) {
+                continue;
+            }
+            members += 1;
+            if members > crate::MAX_GROUP_PIDS {
+                break;
+            }
+            if let Some((b, _)) = mem {
+                bytes = bytes.saturating_add(b);
+                measured += 1;
+            }
+        }
+        (measured > 0).then_some(crate::GroupMemory {
+            pgid,
+            footprint_mib: bytes >> 20,
+            measured,
+        })
+    }
+
     /// One sweep of `/proc`.
     #[must_use]
     pub fn processes(&self, hz: u64, page_bytes: u64) -> Option<Sweep> {
@@ -1821,10 +1997,11 @@ impl Root {
             let read_at = Some(std::time::Instant::now());
             let ticks = stat.utime.saturating_add(stat.stime);
             let ns = u128::from(ticks) * 1_000_000_000 / u128::from(hz);
+            let cpu_ns = u64::try_from(ns).unwrap_or(u64::MAX);
             let child_ticks = stat.cutime.saturating_add(stat.cstime);
             let child_ns = u128::from(child_ticks) * 1_000_000_000 / u128::from(hz);
-            let (uid, footprint, resident) = if stat.kernel_thread() {
-                (Some(0), Some(0), None)
+            let (uid, footprint, resident, io, runnable_ns) = if stat.kernel_thread() {
+                (Some(0), Some(0), None, None, None)
             } else {
                 let statm = || {
                     self.read(&format!("proc/{pid}/statm"), parse_statm_resident)
@@ -1840,6 +2017,21 @@ impl Root {
                         Some(None) => (None, None, None),
                         None => (None, statm(), None),
                     };
+                let mine = self.euid.is_none_or(|me| me == 0 || uid == Some(me));
+                // `io` is ptrace-gated: only this user's processes (every one, for root) answer,
+                // so no other user's is asked.
+                let io = mine
+                    .then(|| self.read(&format!("proc/{pid}/io"), parse_io))
+                    .flatten();
+                // Each thread's `schedstat` is readable by anyone, but one file a thread is the
+                // sweep's cost: the same processes as `io`, as macOS reads `ri_runnable_time` of
+                // its own user's alone.
+                let runnable_ns = mine
+                    .then(|| crate::jobs::linux::threads_wait_ns(&self.at(&format!("proc/{pid}"))))
+                    .flatten()
+                    .map(|wait| cpu_ns.saturating_add(wait));
+                // Read again after every other file: a pid reused meanwhile has another start
+                // time, and its readings are not this process's.
                 let Some(confirm) = self.read(&format!("proc/{pid}/stat"), parse_stat).flatten()
                 else {
                     continue;
@@ -1847,7 +2039,7 @@ impl Root {
                 if confirm.start != stat.start {
                     continue;
                 }
-                (uid, footprint, resident)
+                (uid, footprint, resident, io, runnable_ns)
             };
             let start = u64::try_from(u128::from(stat.start) * 1_000_000_000 / u128::from(hz)).ok();
             procs.push(ProcessReading {
@@ -1856,12 +2048,12 @@ impl Root {
                 start,
                 ppid: stat.ppid,
                 exec: Some(stat.exec()),
-                cpu_ns: Some(u64::try_from(ns).unwrap_or(u64::MAX)),
+                cpu_ns: Some(cpu_ns),
                 child_cpu_ns: Some(u64::try_from(child_ns).unwrap_or(u64::MAX)),
                 footprint,
                 resident,
-                disk_read: None,
-                disk_written: None,
+                disk_read: io.and_then(|i| i.read_bytes),
+                disk_written: io.and_then(|i| i.write_bytes),
                 io_read: None,
                 io_written: None,
                 energy_nj: None,
@@ -1876,7 +2068,8 @@ impl Root {
                 session_leader: Some(stat.session == pid),
                 sid: stat.session,
                 has_tty: Some(stat.tty_nr != 0),
-                runnable_ns: None,
+                threads: u32::try_from(stat.threads).ok(),
+                runnable_ns,
                 cores: None,
                 peak_footprint: None,
                 read_at,

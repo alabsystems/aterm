@@ -18,6 +18,10 @@ pub(super) struct Reason {
 }
 
 impl Reason {
+    pub(super) fn classification(&self) -> (&'static str, &[&'static str]) {
+        (self.source, &self.kinds)
+    }
+
     fn new(source: &'static str, mut kinds: Vec<&'static str>, detail: String) -> Self {
         kinds.sort_unstable();
         kinds.dedup();
@@ -32,11 +36,11 @@ impl Reason {
         Self::new("jobserver", vec!["core"], "the private FIFO could not supply the complete core charge; partial tokens were returned".into())
     }
 
-    pub(super) fn partial_core_grant() -> Self {
+    pub(super) fn zero_core_grant() -> Self {
         Self::new(
             "ledger",
             vec!["core"],
-            "the ledger's partial grant was smaller than the binary's complete core charge".into(),
+            "the ledger granted no cores to the binary".into(),
         )
     }
 
@@ -139,8 +143,7 @@ impl Book {
     fn change(&mut self, index: usize, next: Option<Reason>, at: Duration) -> Option<Closed> {
         let slot = self.0.get_mut(index)?;
         if let (Some(current), Some(next)) = (slot.as_mut(), next.as_ref())
-            && current.reason.source == next.source
-            && current.reason.kinds == next.kinds
+            && current.reason.classification() == next.classification()
         {
             current.reason.detail.clone_from(&next.detail);
             return None;

@@ -424,13 +424,20 @@ pub(crate) fn repo_fetch(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
     }
     let reference = inv.flag("--ref");
     let into = inv.flag("--into");
+    let source_object_cache = inv.flag("--source-object-cache").map(Path::new);
     let checkout_closure = inv.has("--checkout-closure");
     let checkout_cache = inv.flag("--checkout-cache").map(Path::new);
     if checkout_cache.is_some() && !checkout_closure {
         return Err(inv.usage("--checkout-cache requires --checkout-closure"));
     }
+    if source_object_cache.is_some() && checkout_closure {
+        return Err(inv.usage("full source and selected checkout scopes are mutually exclusive"));
+    }
     if checkout_closure && !reference.is_some_and(crate::path::is_sha) {
         return Err(inv.usage("--checkout-closure requires an exact immutable --ref OID"));
+    }
+    if source_object_cache.is_some() && !reference.is_some_and(crate::path::is_sha) {
+        return Err(inv.usage("--source-object-cache requires an exact immutable --ref OID"));
     }
     let objects = inv.flag("--objects");
     if objects.is_some() && inv.flag("--input").is_some() {
@@ -486,12 +493,18 @@ pub(crate) fn repo_fetch(ctx: &mut Ctx, inv: &Invocation) -> Result<Outcome> {
         let into = into.ok_or_else(|| inv.usage("--into is required"))?;
         (
             {
-                let run = GitRun::fetch_ref(&slug, &dir, reference, into, inv.global.anonymous);
-                if checkout_closure {
-                    run.with_checkout_closure(checkout_cache)
+                let scope = if let Some(cache) = source_object_cache {
+                    crate::git::FetchScope::FullSource {
+                        cache: cache.to_path_buf(),
+                    }
+                } else if checkout_closure {
+                    crate::git::FetchScope::SelectedCheckout {
+                        cache: checkout_cache.map(Path::to_path_buf),
+                    }
                 } else {
-                    run
-                }
+                    crate::git::FetchScope::NativeExact
+                };
+                GitRun::fetch_ref(&slug, &dir, reference, into, inv.global.anonymous, scope)
             },
             ("ref", into.to_string()),
         )

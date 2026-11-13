@@ -374,8 +374,9 @@ pub fn emit_super(
     let mut counts = SuperCounts::default();
     let mut sink = QuadSink {
         out,
-        grid_w: env.grid_w,
-        grid_h: env.grid_h,
+        // The grid inside the overlay pixel space: the sink narrows its pixels to `u16`.
+        grid_w: env.grid_w.min(crate::cursor_glow::OVERLAY_PX_MAX),
+        grid_h: env.grid_h.min(crate::cursor_glow::OVERLAY_PX_MAX),
         cell_h: env.cell_h,
         budget: budget.min(MAX_SUPER_QUADS_PER),
     };

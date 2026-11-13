@@ -8,29 +8,53 @@ use std::path::PathBuf;
 
 /// Removing the production Census call to the structural guard removes this gate failure.
 #[test]
-fn census_refuses_an_entry_above_unreleased() {
+fn census_refuses_an_entry_a_branch_adds_outside_a_released_section() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let root = dir.path();
+    let env = EnvSnapshot {
+        path: std::env::var_os("PATH").unwrap_or_default(),
+        ..Default::default()
+    };
+    let git = |args: &[&str]| {
+        let out = crate::changed::git(root, &env.path)
+            .args(args)
+            .output()
+            .expect("git runs");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "A"]);
+    git(&["config", "user.email", "a@example.invalid"]);
+    let kept = "## [Unreleased]\n\n### Fixed\n\n- Kept note.\n";
+    std::fs::write(root.join("CHANGELOG.md"), kept).unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "base"]);
+    git(&["branch", "base"]);
     std::fs::create_dir_all(root.join(CHECKOUT_MARKER).parent().unwrap()).unwrap();
     std::fs::write(root.join(CHECKOUT_MARKER), "").unwrap();
-    std::fs::write(
-        root.join("CHANGELOG.md"),
-        "- Stray entry.\n\n## [Unreleased]\n\n- Kept note.\n",
-    )
-    .unwrap();
-    let mut ctx = Ctx::new(
+    let ctx = Ctx::new(
         root.to_path_buf(),
-        Scope::workspace(),
-        EnvSnapshot::default(),
+        Scope::changed("base", vec![], false),
+        env.clone(),
         root.join("scratch"),
     );
-    ctx.input_paths = Some(vec!["CHANGELOG.md".into()]);
-    let mut report = Report::new("census");
-    census(&ctx, &mut report);
-    assert!(report.outcomes().any(|(outcome, label)| outcome
-        == Outcome::Fail(Severity::GateFailed)
-        && label == "changelog structure"));
-    ctx.input_paths = Some(vec!["unrelated.txt".into()]);
+    for stray in [
+        format!("- Stray entry.\n\n{kept}"),
+        format!("{kept}\n- Another note.\n"),
+    ] {
+        std::fs::write(root.join("CHANGELOG.md"), stray).unwrap();
+        let mut report = Report::new("census");
+        census(&ctx, &mut report);
+        assert!(report.outcomes().any(|(outcome, label)| outcome
+            == Outcome::Fail(Severity::GateFailed)
+            && label == "changelog structure"));
+    }
+    std::fs::write(root.join("CHANGELOG.md"), kept).unwrap();
+    std::fs::write(root.join("unrelated.txt"), "work").unwrap();
     let mut report = Report::new("census");
     census(&ctx, &mut report);
     assert!(
@@ -958,7 +982,7 @@ fn compiler_stderr_cannot_supply_unit_artifacts_or_test_executables() {
         };
         let cmd = Cmd::new("/bin/sh").args(["-c", script, "machine-fixture", &code.to_string()]);
         let mut report = Report::new("machine stream");
-        let (ok, exes, artifacts, _) = compile_tests(&c, &mut report, "machine stream", &cmd);
+        let (ok, exes, artifacts) = compile_tests(&c, &mut report, "machine stream", &cmd);
         assert_eq!(ok, code == 0);
         let exes = exes.expect("complete wire");
         let raw = report.render();
@@ -992,7 +1016,7 @@ fn compiler_stderr_cannot_supply_unit_artifacts_or_test_executables() {
             &code.to_string(),
         ]);
         let mut report = Report::new("invalid machine stream");
-        let (ok, exes, artifacts, _) = compile_tests(&c, &mut report, "invalid stream", &cmd);
+        let (ok, exes, artifacts) = compile_tests(&c, &mut report, "invalid stream", &cmd);
         assert!(!ok);
         assert!(exes.is_err() && artifacts.is_empty());
         let raw = report.render();
@@ -2361,6 +2385,7 @@ fn dev_build_reuses_the_typed_test_builds_dependencies() {
         cwd: Some(&root),
         env: &|_| None,
         read: &read_config,
+        read_manifest: &aterm_toolchain::build_cache::read_manifest,
         writable: &|_| Some(true),
     };
     let mut interner = crate::unitgraph::Interner::default();
@@ -3344,15 +3369,15 @@ fn a_refusal_its_selection_keeps_reading_outlives_the_records_churn() {
     std::fs::remove_dir_all(&tmp).ok();
 }
 
-/// THE TEST COMPILE NOTES WHAT IT USED, which a release run over the workspace that passes
-/// keeps ([`crate::disk::keep_used`], `atpkg::build_cache::stale::USED`): from its child's
-/// messages, the unit of a test it built in the build directory, the unit of a bin a test
-/// needs, which cargo named by its copy in the target alone, and the unit of a build script it
-/// ran, with the package it built tests of. NEGATIVE CONTROL: a compile whose child reported
-/// nothing keeps no record.
+/// THE TEST COMPILE'S CALL NOTES WHAT IT USED AND, PASSING WHOLE, CLOSES THE NOTE, which the run
+/// then keeps ([`crate::disk::note_call`], [`crate::disk::close`], [`crate::disk::keep_used`],
+/// `atpkg::build_cache::stale::USED`): from its child's messages, the unit of a test it built in
+/// the build directory, the unit of a bin a test needs, which cargo named by its copy in the
+/// target alone, and the unit of a build script it ran, with the package it built tests of.
+/// NEGATIVE CONTROL: a compile whose child reported nothing keeps no record.
 #[cfg(unix)]
 #[test]
-fn the_test_compile_notes_what_it_used_for_the_release_record() {
+fn the_test_compile_notes_what_it_used_and_closes_the_note() {
     let tmp = std::fs::canonicalize(crate::mktemp_dir("atv-used").expect("mktemp")).expect("real");
     std::fs::create_dir_all(tmp.join("scratch")).expect("scratch");
     let leaf = tmp.join("cache/.cargo-build");
@@ -3428,17 +3453,20 @@ fn the_test_compile_notes_what_it_used_for_the_release_record() {
     };
     let record = leaf.join(atpkg::build_cache::stale::USED);
     let c = compiled("");
-    assert_eq!(
-        crate::disk::keep_used(&c, true),
-        None,
-        "it reported nothing"
-    );
+    assert!(crate::disk::keep_used(&c).is_empty(), "it reported nothing");
     assert!(!record.exists());
 
     let c = compiled(&wire);
-    assert!(crate::disk::keep_used(&c, true).is_some(), "kept");
-    let kept = atpkg::build_cache::stale::Used::decode(&std::fs::read(&record).expect("kept"))
+    let said = crate::disk::keep_used(&c);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(
+        (&said[0].of, said[0].dir.as_path(), said[0].retired),
+        (&crate::disk::Dir::Main, leaf.as_path(), 0),
+        "{said:?}"
+    );
+    let kept = atpkg::build_cache::stale::Kept::decode(&std::fs::read(&record).expect("kept"))
         .expect("a record");
+    let kept = &kept.runs[&crate::disk::run_key(&c)];
     assert_eq!(
         kept.profiles.get("debug").cloned().unwrap_or_default(),
         [test, bin, script].map(str::to_owned).into()
@@ -3999,6 +4027,14 @@ fn a_locked_console_skips_native_drives_but_an_unlocked_one_keeps_findings() {
                 .all(|(outcome, _)| outcome == Outcome::Skip)
         );
     }
+    // Each skipped stage builds into the main lane's build directory when it runs, and no word
+    // of the run's selection says the console was locked: the run's record of that directory
+    // is kept under a scope of its own, so it retires nothing an unlocked run's stages built.
+    assert_ne!(
+        crate::disk::run_key(&locked),
+        crate::disk::run_key(&base()),
+        "a run that skipped a stage that builds is no run of the same scope"
+    );
     let unlocked = base().with_screen_lock_source(|| false);
     let spec = crate::plan::plan(&unlocked)
         .into_iter()

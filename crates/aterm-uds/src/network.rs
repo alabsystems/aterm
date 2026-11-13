@@ -430,11 +430,28 @@ const RTA_GATEWAY: i32 = 0x2;
 const RTA_IFP: i32 = 0x10;
 #[cfg(target_os = "macos")]
 const RTA_IFA: i32 = 0x20;
-/// `RTM_VERSION` and the `RTM_GET` message type (`net/route.h`).
+/// `RTM_VERSION` (`net/route.h`).
 #[cfg(target_os = "macos")]
 const RTM_VERSION: u8 = 5;
+/// `RTM_GET` (`net/route.h`): a route lookup, and the type of the kernel's answer to one. The
+/// kernel delivers the answer, and a lookup it refuses, to every routing socket on the Mac, the
+/// asker's among them.
 #[cfg(target_os = "macos")]
-const RTM_GET: u8 = 0x4;
+pub const RTM_GET: u8 = 0x4;
+/// The route lookup the kernel answers to the asking socket alone: the answer is an ordinary
+/// [`RTM_GET`] message carrying the asker's pid and sequence, and no other routing socket hears
+/// anything. A destination no route takes is that answer's `rtm_errno` (`ESRCH`) on a write that
+/// succeeds, where an [`RTM_GET`] of it fails the write and still delivers the refused message
+/// to every routing socket.
+///
+/// The type is XNU-private: the public `net/route.h` leaves 0x11 out, and its name there
+/// (`RTM_GET_SILENT`, a lookup the kernel keeps for its reachability callers) is recalled, not
+/// read from an SDK. What is relied on was measured on macOS 27.0.1 (2026-11-12), from Apple's
+/// own python and from an ad-hoc-signed Trust build, and is held by the live tests beside
+/// [`route_get`]. A kernel that does not take the type refuses the write, and [`lookup_write`]
+/// then asks with [`RTM_GET`].
+#[cfg(target_os = "macos")]
+pub const RTM_GET_SILENT: u8 = 0x11;
 /// The sockaddr slots a route message's `rtm_addrs` bitmask can name (`RTAX_MAX`, `net/route.h`).
 #[cfg(target_os = "macos")]
 const RTAX_MAX: usize = 8;
@@ -565,8 +582,8 @@ fn route_sockaddr(block: &[u8], addrs: i32, want: i32) -> Option<&[u8]> {
     None
 }
 
-/// How long [`route_source_ipv4`] waits for the kernel's answer to its `RTM_GET`, which the
-/// kernel queues before the write returns: a bound, never a pace.
+/// How long [`route_get`] waits for the kernel's answer to its lookup, which the kernel queues
+/// before the write returns: a bound, never a pace.
 #[cfg(all(target_os = "macos", not(test)))]
 const ROUTE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 /// A unit test's is the one-minute hang detector (`aterm_spec::wait::MUST_HAPPEN`, which this
@@ -576,21 +593,65 @@ const ROUTE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(1)
 const ROUTE_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The local IPv4 address this Mac's kernel sends from toward `to`: the address of the route
-/// `to` takes, as `route -n get` reads it (a `PF_ROUTE` `RTM_GET` that asks for the route's
+/// `to` takes, as `route -n get` reads it (a `PF_ROUTE` lookup that asks for the route's
 /// interface, and so for its address, `RTA_IFA`). A UDP socket connected to `to` gets its
 /// address from the same lookup, but on macOS that connect toward a local-network destination (a
 /// LAN address, a multicast group such as mDNS's) can put macOS's Local Network question on
 /// screen. A routing socket sends no packet and is no network socket, so it asks nothing. `None`
 /// where no route takes `to`, the route has no IPv4 address but loopback's, or the kernel's
-/// answer does not come.
+/// answer does not come ([`route_source_ipv4_asked`] tells the last from the others).
 #[cfg(target_os = "macos")]
 #[must_use]
 pub fn route_source_ipv4(to: Ipv4Addr) -> Option<Ipv4Addr> {
-    route_get(to, None, route_get_answer).flatten()
+    route_source_ipv4_asked(to).flatten()
+}
+
+/// [`route_source_ipv4`] with the ask that failed kept apart from the kernel's own "none":
+/// `Some(found)` is the routing table's word (`Some(None)` where no route takes `to`, or its
+/// route has no IPv4 address but loopback's), and `None` says the table was not read (no routing
+/// socket, a write the kernel refused for anything but the missing route, no answer within
+/// [`ROUTE_ANSWER_WAIT`]), so a caller with another way to ask takes it only then. Unlike a UDP
+/// connect toward a destination no route takes, the ask written as [`RTM_GET_SILENT`] makes no
+/// `RTM_MISS`, which the kernel sends to every routing socket on the Mac, and is heard by no
+/// other socket; a process that has fallen back to [`RTM_GET`] ([`lookup_write`]) is heard by
+/// every routing socket, as any `RTM_GET` is.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn route_source_ipv4_asked(to: Ipv4Addr) -> Option<Option<Ipv4Addr>> {
+    table_word(route_get(to.into(), None, route_get_answer)).map(Option::flatten)
+}
+
+/// Whether a route takes the IPv6 destination `to`, asked of the routing table as
+/// [`route_source_ipv4`] asks, with no scope: `Some(false)` where the kernel answers that none
+/// does, and `None` where the table was not read. A UDP socket connected to a `to` no route
+/// takes fails the same way, and that failure makes the kernel send an `RTM_MISS` to every
+/// routing socket on the Mac; this ask, written as [`RTM_GET_SILENT`], is heard by nobody. In a
+/// process that has fallen back to [`RTM_GET`] ([`lookup_write`]) it is heard by every routing
+/// socket, as any `RTM_GET` is: its answer, or the refused request where no route takes `to`.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn routed_ipv6(to: Ipv6Addr) -> Option<bool> {
+    table_word(route_get(to.into(), None, |message, pid, sequence| {
+        Some(route_get_reply(message, pid, sequence)?.map(|_| ()))
+    }))
+    .map(|found| found.is_some())
+}
+
+/// What a lookup's outcome ([`route_get`]) says the routing table holds: `Some(Some(found))` for
+/// a route, `Some(None)` where the kernel said no route takes the destination (`ESRCH`, as its
+/// answer's `rtm_errno` or as its refusal of an [`RTM_GET`]'s write), `None` for any other
+/// failure, which says nothing of the table.
+#[cfg(target_os = "macos")]
+fn table_word<T>(outcome: std::io::Result<T>) -> Option<Option<T>> {
+    match outcome {
+        Ok(found) => Some(Some(found)),
+        Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Some(None),
+        Err(_) => None,
+    }
 }
 
 /// The hardware address of the kernel's ARP entry for `gateway` on the interface whose index is
-/// `index`: the answer to a routing socket's `RTM_GET` of `gateway` scoped to that interface
+/// `index`: the answer to a routing socket's lookup of `gateway` scoped to that interface
 /// ([`route_get_request`]), read only where it is that interface's neighbour entry for that host
 /// with a hardware address in it ([`route_get_link`]), as `route -n get -ifscope` reads it. It
 /// sends no packet and resolves nothing: `None` before ARP resolves the gateway, where the
@@ -599,32 +660,76 @@ pub fn route_source_ipv4(to: Ipv4Addr) -> Option<Ipv4Addr> {
 /// out.
 #[cfg(target_os = "macos")]
 fn gateway_hardware_asked(gateway: Ipv4Addr, index: u16) -> Option<Box<[u8]>> {
-    route_get(gateway, Some(index), |message, pid, sequence| {
+    route_get(gateway.into(), Some(index), |message, pid, sequence| {
         route_get_link(message, pid, sequence, index)
     })
+    .ok()
     .flatten()
 }
 
-/// Write one `RTM_GET` of `to` ([`route_get_request`], scoped to the interface whose index is
-/// `on` where one is named) to a fresh routing socket and read the kernel's answer: the first
-/// message `read` takes as the answer to this process's lookup (its pid and sequence), `None`
-/// where the socket or the write fails (a destination no route takes fails the write, `ESRCH`) or
-/// no answer comes within [`ROUTE_ANSWER_WAIT`].
+/// Whether `error`, from the write of an [`RTM_GET_SILENT`] lookup, can be the kernel refusing
+/// the message type: `EINVAL` (the socket hears none of its own messages, so the kernel has
+/// nowhere to put a silent answer), `EPERM` (a kernel that knows no such type takes it for a
+/// change to the table, which an unprivileged socket may not make) or `EOPNOTSUPP` (the same
+/// kernel, asked by a privileged socket). The three are recalled from XNU's `route_output`, not
+/// measured: macOS 27.0.1 takes the type. A destination no route takes (`ESRCH`) is the
+/// kernel's answer to the lookup, never a refusal of its type.
 #[cfg(target_os = "macos")]
-fn route_get<T>(
-    to: Ipv4Addr,
-    on: Option<u16>,
-    read: impl Fn(&[u8], i32, i32) -> Option<T>,
-) -> Option<T> {
+fn silent_refused(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::EPERM | libc::EOPNOTSUPP)
+    )
+}
+
+/// Write one route lookup, heard by its asker alone where the kernel allows: `write(kind)`
+/// writes the lookup to a routing socket as message type `kind`, [`RTM_GET_SILENT`] first. Where
+/// the kernel refuses that type ([`silent_refused`]) the same lookup is written once more as
+/// [`RTM_GET`], and where the kernel takes that one, every later lookup of this process starts
+/// there: one latch for the process, which aterm-net's lookups share by writing through here. A
+/// lookup the kernel refuses in both types was refused for what it asks, so it latches nothing.
+/// The answer to either type is an [`RTM_GET`] message with the asker's pid and sequence.
+///
+/// # Errors
+///
+/// The error of the last `write` made: the first where it failed for anything but the type, or
+/// the process had already fallen back to [`RTM_GET`]; else the second.
+#[cfg(target_os = "macos")]
+pub fn lookup_write(write: impl FnMut(u8) -> std::io::Result<()>) -> std::io::Result<()> {
+    static REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    lookup_write_latched(&REFUSED, write)
+}
+
+/// [`lookup_write`] over the latch `refused`, which a test supplies in place of the process's.
+#[cfg(target_os = "macos")]
+fn lookup_write_latched(
+    refused: &std::sync::atomic::AtomicBool,
+    mut write: impl FnMut(u8) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering::Relaxed;
+    if refused.load(Relaxed) {
+        return write(RTM_GET);
+    }
+    match write(RTM_GET_SILENT) {
+        Err(error) if silent_refused(&error) => {
+            let plain = write(RTM_GET);
+            if !plain.as_ref().is_err_and(silent_refused) {
+                refused.store(true, Relaxed);
+            }
+            plain
+        }
+        written => written,
+    }
+}
+
+/// A routing socket that hears the messages of address family `family` (0 for every family), as
+/// each lookup opens one of its own.
+#[cfg(target_os = "macos")]
+fn routing_socket(family: libc::c_int) -> std::io::Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd as _;
-    static SEQUENCE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-    let pid = i32::try_from(std::process::id()).ok()?;
-    let sequence = SEQUENCE
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        .wrapping_add(1);
-    let fd = crate::kept_out(|| {
+    crate::kept_out(|| {
         // SAFETY: socket(2) takes no pointer; a descriptor it returns is owned below.
-        let raw = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, libc::AF_INET) };
+        let raw = unsafe { libc::socket(libc::PF_ROUTE, libc::SOCK_RAW, family) };
         if raw < 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -637,21 +742,79 @@ fn route_get<T>(
         }
         Ok(fd)
     })
-    .ok()?;
+}
+
+/// The sequence number of this process's next lookup ([`route_get`]): no two share one, so an
+/// answer names its lookup.
+#[cfg(target_os = "macos")]
+fn route_get_sequence() -> i32 {
+    static SEQUENCE: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    SEQUENCE
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .wrapping_add(1)
+}
+
+/// Write one lookup of `to` ([`route_get_request`], scoped to the interface whose index is `on`
+/// where one is named) to a fresh routing socket, heard by this socket alone where the kernel
+/// allows ([`lookup_write`]), and read the kernel's answer: what `read` makes of the first
+/// message that answers this process's lookup (its pid and sequence).
+///
+/// # Errors
+///
+/// A destination no route takes is `ESRCH`: the answer's `rtm_errno`, or (asked as [`RTM_GET`])
+/// the write's own failure, and any other `rtm_errno` comes back the same way. Otherwise the
+/// routing socket's or the write's error, or `TimedOut` where no answer comes within
+/// [`ROUTE_ANSWER_WAIT`].
+#[cfg(target_os = "macos")]
+fn route_get<T>(
+    to: IpAddr,
+    on: Option<u16>,
+    read: impl Fn(&[u8], i32, i32) -> Option<Result<T, i32>>,
+) -> std::io::Result<T> {
+    route_get_as(
+        to,
+        on,
+        route_get_sequence(),
+        |write| lookup_write(write),
+        read,
+    )
+}
+
+/// [`route_get`] as lookup `sequence`, written the way `send` says: `send` is handed the writer
+/// of this lookup in a message type of its choosing, which [`route_get`] gives to
+/// [`lookup_write`] and a test calls with one type, or through a stand-in kernel's refusal.
+#[cfg(target_os = "macos")]
+fn route_get_as<T>(
+    to: IpAddr,
+    on: Option<u16>,
+    sequence: i32,
+    send: impl FnOnce(&mut dyn FnMut(u8) -> std::io::Result<()>) -> std::io::Result<()>,
+    read: impl Fn(&[u8], i32, i32) -> Option<Result<T, i32>>,
+) -> std::io::Result<T> {
+    let pid = i32::try_from(std::process::id()).map_err(std::io::Error::other)?;
+    // The socket hears its destination's family alone: an answer written as RTM_GET comes
+    // through that filter, and other families' traffic never fills the room.
+    let fd = routing_socket(match to {
+        IpAddr::V4(_) => libc::AF_INET,
+        IpAddr::V6(_) => libc::AF_INET6,
+    })?;
     let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-    let request = route_get_request(to, sequence, on);
-    // SAFETY: `request` is live and readable for its whole length. A destination no route takes
-    // fails the write (`ESRCH`).
-    let wrote = unsafe { libc::write(raw, request.as_ptr().cast(), request.len()) };
-    if usize::try_from(wrote).ok() != Some(request.len()) {
-        return None;
-    }
+    send(&mut |kind| {
+        let request = route_get_request(to, sequence, on, kind);
+        // SAFETY: `request` is live and readable for its whole length.
+        let wrote = unsafe { libc::write(raw, request.as_ptr().cast(), request.len()) };
+        match usize::try_from(wrote) {
+            Ok(wrote) if wrote == request.len() => Ok(()),
+            Ok(_) => Err(std::io::ErrorKind::WriteZero.into()),
+            Err(_) => Err(std::io::Error::last_os_error()),
+        }
+    })?;
     let deadline = std::time::Instant::now() + ROUTE_ANSWER_WAIT;
     let mut buf = [0u8; 2048];
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
-            return None;
+            return Err(std::io::ErrorKind::TimedOut.into());
         }
         let mut poll = libc::pollfd {
             fd: raw,
@@ -661,8 +824,11 @@ fn route_get<T>(
         let millis = crate::deadline::poll_timeout_ms(left);
         // SAFETY: `poll` is one live pollfd and the count passed is 1.
         let ready = unsafe { libc::poll(&raw mut poll, 1, millis) };
-        if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
-            return None;
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
         }
         if ready <= 0 {
             continue;
@@ -670,26 +836,40 @@ fn route_get<T>(
         // SAFETY: `buf` is live and writable for its whole length.
         let got = unsafe { libc::recv(raw, buf.as_mut_ptr().cast(), buf.len(), 0) };
         let Ok(got) = usize::try_from(got) else {
-            return None;
+            return Err(std::io::Error::last_os_error());
         };
         if let Some(answer) = read(&buf[..got], pid, sequence) {
-            return Some(answer);
+            return answer.map_err(std::io::Error::from_raw_os_error);
         }
     }
 }
 
-/// The `RTM_GET` [`route_get`] writes for `to` as `sequence`: the head, `to` as the destination,
-/// and an empty link-layer sockaddr in the interface's slot, which asks the kernel to name the
-/// route's interface and its address in the answer, as `route -n get` asks. With `on`, the lookup
-/// is scoped to the interface of that index (`RTF_IFSCOPE` and `rtm_index`), as `route -n get
-/// -ifscope` asks: two networks whose gateways share an address keep one entry each.
+/// The lookup [`route_get`] writes for `to` as `sequence`, in message type `kind`
+/// ([`RTM_GET_SILENT`] or [`RTM_GET`]): the head, `to` as the destination (a `sockaddr_in` or a
+/// `sockaddr_in6`), and an empty link-layer sockaddr in the interface's slot, which asks the
+/// kernel to name the route's interface and its address in the answer, as `route -n get` asks.
+/// With `on`, the lookup is scoped to the interface of that index (`RTF_IFSCOPE` and
+/// `rtm_index`), as `route -n get -ifscope` asks: two networks whose gateways share an address
+/// keep one entry each.
 #[cfg(target_os = "macos")]
-fn route_get_request(to: Ipv4Addr, sequence: i32, on: Option<u16>) -> Vec<u8> {
+fn route_get_request(to: IpAddr, sequence: i32, on: Option<u16>, kind: u8) -> Vec<u8> {
     let header = std::mem::size_of::<RtMsghdr>();
-    let mut destination = [0u8; std::mem::size_of::<libc::sockaddr_in>()];
+    let mut destination = match to {
+        IpAddr::V4(to) => {
+            let mut destination = vec![0u8; std::mem::size_of::<libc::sockaddr_in>()];
+            destination[1] = libc::AF_INET as u8;
+            destination[4..8].copy_from_slice(&to.octets());
+            destination
+        }
+        IpAddr::V6(to) => {
+            let mut destination = vec![0u8; std::mem::size_of::<libc::sockaddr_in6>()];
+            destination[1] = libc::AF_INET6 as u8;
+            let at = std::mem::offset_of!(libc::sockaddr_in6, sin6_addr);
+            destination[at..at + 16].copy_from_slice(&to.octets());
+            destination
+        }
+    };
     destination[0] = destination.len() as u8;
-    destination[1] = libc::AF_INET as u8;
-    destination[4..8].copy_from_slice(&to.octets());
     let mut interface = [0u8; std::mem::size_of::<libc::sockaddr_dl>()];
     interface[0] = interface.len() as u8;
     interface[1] = libc::AF_LINK as u8;
@@ -697,7 +877,7 @@ fn route_get_request(to: Ipv4Addr, sequence: i32, on: Option<u16>) -> Vec<u8> {
     let length = (header + destination.len() + interface.len()) as u16;
     message[0..2].copy_from_slice(&length.to_ne_bytes());
     message[std::mem::offset_of!(RtMsghdr, rtm_version)] = RTM_VERSION;
-    message[std::mem::offset_of!(RtMsghdr, rtm_type)] = RTM_GET;
+    message[std::mem::offset_of!(RtMsghdr, rtm_type)] = kind;
     let mut put = |offset: usize, value: i32| {
         message[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
     };
@@ -717,13 +897,19 @@ fn route_get_request(to: Ipv4Addr, sequence: i32, on: Option<u16>) -> Vec<u8> {
     message
 }
 
-/// The answer one message a routing socket read is to the `RTM_GET` process `pid` wrote as
-/// `sequence` ([`route_get_request`]): `None` when it answers something else (another process's
-/// lookup, another of this one's, a change of a route), else `Some((head, block))`, the found
-/// route's head (a [`RtMsghdr`]'s bytes) and its address block, `Some(None)` where the kernel
-/// found no route (`rtm_errno`).
+/// A route as the kernel's answer carries it: the answer's head (a [`RtMsghdr`]'s bytes) and its
+/// address block.
 #[cfg(target_os = "macos")]
-fn route_get_reply(message: &[u8], pid: i32, sequence: i32) -> Option<Option<(&[u8], &[u8])>> {
+type RouteFound<'a> = (&'a [u8], &'a [u8]);
+
+/// The answer one message a routing socket read is to the lookup process `pid` wrote as
+/// `sequence` ([`route_get_request`]): `None` when it answers something else (another process's
+/// lookup, another of this one's, a change of a route), else `Some(Ok((head, block)))`, the
+/// found route's head (a [`RtMsghdr`]'s bytes) and its address block, or `Some(Err(errno))`
+/// where the kernel refused the lookup (`rtm_errno`: `ESRCH` where it found no route). The
+/// answer to either type of lookup is an [`RTM_GET`] message.
+#[cfg(target_os = "macos")]
+fn route_get_reply(message: &[u8], pid: i32, sequence: i32) -> Option<Result<RouteFound<'_>, i32>> {
     let header = std::mem::size_of::<RtMsghdr>();
     let msglen = usize::from(u16::from_ne_bytes([*message.first()?, *message.get(1)?]));
     if msglen < header || msglen > message.len() {
@@ -736,10 +922,11 @@ fn route_get_reply(message: &[u8], pid: i32, sequence: i32) -> Option<Option<(&[
     {
         return None;
     }
-    if read(std::mem::offset_of!(RtMsghdr, rtm_errno)) != 0 {
-        return Some(None);
+    let errno = read(std::mem::offset_of!(RtMsghdr, rtm_errno));
+    if errno != 0 {
+        return Some(Err(errno));
     }
-    Some(Some((&message[..header], &message[header..msglen])))
+    Some(Ok((&message[..header], &message[header..msglen])))
 }
 
 /// The `i32` field at `offset` of a route message's head.
@@ -749,12 +936,17 @@ fn head_i32(head: &[u8], offset: usize) -> i32 {
 }
 
 /// What one message a routing socket read says to [`route_source_ipv4`]'s lookup
-/// ([`route_get_reply`]): `None` when it is not its answer, else the address of the route found
-/// (`RTA_IFA`), `Some(None)` where the kernel found none or that address is no usable IPv4 one.
+/// ([`route_get_reply`]): `None` when it is not its answer, else `Ok` of the address of the
+/// route found (`RTA_IFA`, `None` where that is no usable IPv4 one), or `Err(errno)` where the
+/// kernel refused the lookup.
 #[cfg(target_os = "macos")]
-fn route_get_answer(message: &[u8], pid: i32, sequence: i32) -> Option<Option<Ipv4Addr>> {
+fn route_get_answer(
+    message: &[u8],
+    pid: i32,
+    sequence: i32,
+) -> Option<Result<Option<Ipv4Addr>, i32>> {
     Some(
-        route_get_reply(message, pid, sequence)?.and_then(|(head, block)| {
+        route_get_reply(message, pid, sequence)?.map(|(head, block)| {
             let addrs = head_i32(head, std::mem::offset_of!(RtMsghdr, rtm_addrs));
             sockaddr_ipv4(route_sockaddr(block, addrs, RTA_IFA))
                 .filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
@@ -764,19 +956,20 @@ fn route_get_answer(message: &[u8], pid: i32, sequence: i32) -> Option<Option<Ip
 
 /// What one message a routing socket read says to [`gateway_hardware_asked`]'s lookup on the
 /// interface whose index is `index` ([`route_get_reply`]): `None` when it is not its answer, else
-/// the hardware address of the neighbour entry found, `Some(None)` where the kernel found none or
-/// found anything but that interface's ARP entry for one host with an address in it: a route
-/// that is no host route (`RTF_HOST`) of the link layer (`RTF_LLINFO`), as the interface's own
-/// route answers for a host ARP has not resolved; one on another interface; an incomplete entry.
+/// `Ok` of the hardware address of the neighbour entry found, or `Err(errno)` where the kernel
+/// refused the lookup. `Ok(None)` is anything found but that interface's ARP entry for one host
+/// with an address in it: a route that is no host route (`RTF_HOST`) of the link layer
+/// (`RTF_LLINFO`), as the interface's own route answers for a host ARP has not resolved; one on
+/// another interface; an incomplete entry.
 #[cfg(target_os = "macos")]
 fn route_get_link(
     message: &[u8],
     pid: i32,
     sequence: i32,
     index: u16,
-) -> Option<Option<Box<[u8]>>> {
+) -> Option<Result<Option<Box<[u8]>>, i32>> {
     Some(
-        route_get_reply(message, pid, sequence)?.and_then(|(head, block)| {
+        route_get_reply(message, pid, sequence)?.map(|(head, block)| {
             let flags = head_i32(head, std::mem::offset_of!(RtMsghdr, rtm_flags));
             let at = std::mem::offset_of!(RtMsghdr, rtm_index);
             let on = u16::from_ne_bytes([head[at], head[at + 1]]);
@@ -1252,6 +1445,28 @@ impl RouteChanges {
         Some(changed)
     }
 
+    /// Whether a change of network came since the last read, asked without waiting: one bounded
+    /// batch of what is queued now ([`MAX_DRAIN_MESSAGES`]), and no wait for the rest of a burst,
+    /// which the next ask reads. For an owner that polls nothing and asks before it relies on
+    /// something it read of the network earlier. A batch that did not reach the end of the queue
+    /// says a change came, because a change may be among what it left unread. `None` when the
+    /// socket failed: it tells nothing from then on, so the owner drops it.
+    #[must_use]
+    pub fn changed_now(&self) -> Option<bool> {
+        Self::changed_now_by(|buf| self.receive_now(buf))
+    }
+
+    /// [`Self::changed_now`] over `recv`, one waiting message or the error that ends the batch.
+    fn changed_now_by(mut recv: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> Option<bool> {
+        let mut read = 0_usize;
+        let changed = Self::drain_by(|buf| {
+            let got = recv(buf);
+            read += usize::from(matches!(got, Ok(1..)));
+            got
+        })?;
+        Some(changed || read == MAX_DRAIN_MESSAGES)
+    }
+
     /// Whether a message is waiting by `deadline`; `None` when poll(2) failed otherwise than
     /// by a signal's interruption (which looks again).
     fn readable(&self, deadline: std::time::Instant) -> Option<bool> {
@@ -1295,20 +1510,24 @@ impl RouteChanges {
     /// Read a bounded batch of waiting messages: whether one named a change; `None` when the
     /// socket failed (an overflow, which lost messages, counts as a change).
     fn drain(&self) -> Option<bool> {
+        Self::drain_by(|buf| self.receive_now(buf))
+    }
+
+    /// One waiting message into `buf`, never waiting for one: its length, or the errno
+    /// (`EAGAIN` with nothing queued).
+    fn receive_now(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         use std::os::fd::AsRawFd as _;
-        Self::drain_by(|buf| {
-            // SAFETY: `buf` is live and writable for its whole length. The socket stays
-            // borrowed, and MSG_DONTWAIT keeps an empty receive from blocking.
-            let read = unsafe {
-                libc::recv(
-                    self.0.as_raw_fd(),
-                    buf.as_mut_ptr().cast(),
-                    buf.len(),
-                    libc::MSG_DONTWAIT,
-                )
-            };
-            usize::try_from(read).map_err(|_| std::io::Error::last_os_error())
-        })
+        // SAFETY: `buf` is live and writable for its whole length. The socket stays
+        // borrowed, and MSG_DONTWAIT keeps an empty receive from blocking.
+        let read = unsafe {
+            libc::recv(
+                self.0.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        usize::try_from(read).map_err(|_| std::io::Error::last_os_error())
     }
 
     fn drain_by(mut recv: impl FnMut(&mut [u8]) -> std::io::Result<usize>) -> Option<bool> {
@@ -1342,6 +1561,10 @@ mod route_change_tests;
 #[cfg(all(test, target_os = "macos"))]
 #[path = "network_gateway_tests.rs"]
 mod gateway_tests;
+
+#[cfg(all(test, target_os = "macos"))]
+#[path = "network_route_lookup_tests.rs"]
+mod route_lookup_tests;
 
 #[cfg(test)]
 #[path = "network_linux_gateway_tests.rs"]

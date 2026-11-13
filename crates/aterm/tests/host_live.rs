@@ -1537,11 +1537,29 @@ fn one_supervisor_per_session() {
 fn autopilot_off_keeps_the_hosts_hands_off_until_the_session_opts_in() {
     let inst = boot("ap", "autopilot = \"off\"\n");
     run_fake(&inst, "k1", &["read.txt"]);
-    program_is(&inst, "claude", HANG);
+    // Read the program and its effective policy in one snapshot: separate reads can
+    // straddle startup refreshes. Off must keep the host's hands off throughout the wait.
+    let s = until(
+        HANG,
+        "the fake Claude and its effective Off policy",
+        || {
+            let s = status(&inst);
+            assert_eq!(field(&s, "supervisor"), Some("-"), "{s}");
+            assert!(
+                keys(&inst, "k1").is_empty(),
+                "Off typed into the fake before opt-in"
+            );
+            s
+        },
+        |s| field(s, "program") == Some("claude") && field(s, "autopilot") == Some("off"),
+    );
     assert_eq!(field(&meta(&inst), "autopilot"), Some("-"));
-    let s = status(&inst);
     assert_eq!(field(&s, "supervisor"), Some("-"), "{s}");
     assert_eq!(field(&s, "autopilot"), Some("off"), "{s}");
+    assert!(
+        keys(&inst, "k1").is_empty(),
+        "Off typed into the fake before opt-in"
+    );
     ctl_ok(
         &inst,
         &[

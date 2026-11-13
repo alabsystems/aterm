@@ -1377,18 +1377,8 @@ fn automatic_system_names_keep_their_source_current_after_each_read() {
             .unwrap()
             .unwrap();
         assert_eq!(projection.target.0, "m86");
-        let sys = aterm_machines::port::Fake::root();
-        sys.stat_of(
-            aterm_machines::root_steps::ADMITTED_NAME_RULE,
-            aterm_machines::port::Stat {
-                uid: 0,
-                gid: 0,
-                mode: 0o440,
-                dir: false,
-                symlink: false,
-                len: 1,
-            },
-        );
+        let current_rule = aterm_machines::root_steps::name_rule("alice").unwrap();
+        let sys = naming_rule_mac(RuleFile::Holding(current_rule.as_bytes()));
         let config_to_change = config.clone();
         let state_to_change = state.clone();
         let read = format!("/usr/sbin/scutil --get {field}");
@@ -1481,6 +1471,327 @@ fn automatic_system_names_keep_their_source_current_after_each_read() {
             "{case}: {said:?}; no write may outlive its naming source"
         );
     }
+}
+
+/// What stands at the naming rule's path on a [`naming_rule_mac`].
+#[derive(Clone, Copy)]
+enum RuleFile<'a> {
+    /// No file: setup's password step owes the rule.
+    Missing,
+    /// A rule standing as a stat reads it (root, 0440, nonzero length) whose bytes this account
+    /// cannot read: a rule from before setup granted the account read access.
+    Unreadable,
+    /// A rule standing as a stat reads it, holding these bytes, which the account can read.
+    Holding(&'a [u8]),
+}
+
+/// A Fake Mac where this process's ordinary account (not root), `alice` (uid 501), runs the
+/// pass, with `rule` at the naming rule's path.
+fn naming_rule_mac(rule: RuleFile<'_>) -> aterm_machines::port::Fake {
+    use aterm_machines::root_steps::ADMITTED_NAME_RULE;
+    let mut sys = aterm_machines::port::Fake::root();
+    let alice = aterm_machines::model::User {
+        name: "alice".to_owned(),
+        uid: 501,
+        gid: 20,
+        home: "/Users//alice".to_owned(),
+        shell: "/bin/zsh".to_owned(),
+        admin: true,
+    };
+    sys.logged_in(&alice);
+    sys.euid = alice.uid;
+    let len = match rule {
+        RuleFile::Missing => return sys,
+        RuleFile::Unreadable => 452,
+        RuleFile::Holding(rule) => {
+            sys.file(ADMITTED_NAME_RULE, rule);
+            u64::try_from(rule.len()).unwrap()
+        }
+    };
+    sys.stat_of(
+        ADMITTED_NAME_RULE,
+        aterm_machines::port::Stat {
+            uid: 0,
+            gid: 0,
+            mode: 0o440,
+            dir: false,
+            symlink: false,
+            len,
+        },
+    );
+    sys
+}
+
+/// The naming rule as builds before the nickname targets wrote it (38ecc06f825's `name_rule`):
+/// sudo holds each name to a bare `m<N>`, so it refuses `m16 Global` and `m16-global`.
+fn number_only_rule(user: &str) -> String {
+    let mut text = String::from(
+        "# aterm's setup elevation: lets one account set this Mac's names to a swarm label\n\
+         # (m and a number) with Apple's scutil, and nothing else.\n",
+    );
+    for pref in aterm_machines::root_steps::NAME_PREFS {
+        text.push_str(&format!(
+            "{user} ALL = (root) NOPASSWD: /usr/sbin/scutil ^--set {pref} \
+             m[1-9][0-9]?[0-9]?[0-9]?[0-9]?[0-9]?$\n"
+        ));
+    }
+    text
+}
+
+/// `sys`'s three names (ComputerName, LocalHostName, HostName) in `names`: `scutil --get` reads
+/// one, `sudo -n scutil --set` writes one, or is refused as sudo refuses what no rule admits.
+fn scripted_names(
+    sys: &aterm_machines::port::Fake,
+    names: &std::sync::Arc<std::sync::Mutex<[String; 3]>>,
+    refuse: bool,
+) {
+    use aterm_machines::port::Ran;
+    use aterm_machines::root_steps::{NAME_PREFS, SUDO};
+    let values = std::sync::Arc::clone(names);
+    sys.simulate(move |_, cmd| {
+        let args: Vec<_> = cmd.args.iter().map(|arg| arg.to_str().unwrap()).collect();
+        let slot = |pref: Option<&&str>| NAME_PREFS.iter().position(|p| Some(p) == pref).unwrap();
+        if cmd.program == Path::new(aterm_machines::items::names::SCUTIL)
+            && args.first() == Some(&"--get")
+        {
+            let now = values.lock().unwrap()[slot(args.get(1))].clone();
+            return Some(Ran::ok(&format!("{now}\n")));
+        }
+        if cmd.program == Path::new(SUDO) && args.first() == Some(&"-n") {
+            if refuse {
+                return Some(Ran::exit(1, "sudo: a password is required\n"));
+            }
+            values.lock().unwrap()[slot(args.get(3))] = args[4].to_owned();
+            return Some(Ran::ok(""));
+        }
+        None
+    });
+}
+
+fn own_of(names: &std::sync::Mutex<[String; 3]>) -> OwnNames {
+    let [computer, local_host, host] = names.lock().unwrap().clone();
+    OwnNames {
+        computer: Some(computer),
+        local_host: Some(local_host),
+        host: Some(host),
+    }
+}
+
+fn m16_global() -> GeneratedNames {
+    GeneratedNames::new(
+        Number::parse("m16").unwrap(),
+        &aterm_types::machine_name::Nickname::parse("Global").unwrap(),
+    )
+}
+
+fn bare_m16() -> std::sync::Arc<std::sync::Mutex<[String; 3]>> {
+    std::sync::Arc::new(std::sync::Mutex::new([
+        "m16".to_owned(),
+        "m16".to_owned(),
+        "m16".to_owned(),
+    ]))
+}
+
+/// No naming rule, or one an older build wrote that stands as a stat reads it (root, 0440) but
+/// whose bytes are not this build's (the number-only rule, which sudo holds to a bare `m<N>`)
+/// or this account cannot read (a rule from before setup granted read access). Against
+/// `m16 Global` / `m16-global` with bare `m16` in all three slots, the probe stays current with
+/// its note naming the name still owed, status says setup leaves the missing rule or renews the
+/// older one, and the apply runs no sudo.
+/// NEGATIVE CONTROL: gating on the rule file's metadata alone (the earlier `rule_in_place`)
+/// makes the probe due, and every pass then failed its read-back.
+#[test]
+fn a_naming_rule_this_build_did_not_write_leaves_the_identity_row_quiet() {
+    use aterm_agent::FleetName;
+    let names = m16_global();
+    let own = own_of(&bare_m16());
+    let keys = IdentityRead::Current("label m16 in [ai] and [fleet] machine".to_owned());
+    let read = with_fleet_name(keys, "m16", Some(&names), &FleetName::Current, &own);
+    assert!(
+        matches!(&read, IdentityRead::Current(words) if words.contains("not m16-global")),
+        "{read:?}"
+    );
+    let old = number_only_rule("alice");
+    for (case, rule) in [
+        ("missing", RuleFile::Missing),
+        ("number-only", RuleFile::Holding(old.as_bytes())),
+        ("unreadable", RuleFile::Unreadable),
+    ] {
+        let sys = naming_rule_mac(rule);
+        let values = bare_m16();
+        scripted_names(&sys, &values, true);
+        assert_eq!(
+            own_name_due_through(&sys, read.clone(), "m16", Some(&names), &own),
+            read,
+            "{case}"
+        );
+        match (case, mac_name_pending(&sys, "m16", &names, &own)) {
+            ("missing", Some(MacNamePending::Elevation(why)))
+            | ("number-only", Some(MacNamePending::Renewal(why))) => {
+                assert!(why.contains("not m16-global"), "{why}");
+            }
+            ("unreadable", Some(MacNamePending::Unread(why))) => {
+                assert!(why.contains("not m16-global"), "{why}");
+                assert!(why.contains("could not be read"), "{why}");
+            }
+            (case, other) => panic!("{case}: {other:?}"),
+        }
+        assert_eq!(
+            own_name_by_rule(&sys, &names, &|| Ok(())),
+            Ok(None),
+            "{case}"
+        );
+        assert_eq!(
+            own_names_applied(
+                &sys,
+                "keys; fleet".to_owned(),
+                "m16",
+                Some(&names),
+                || own.clone(),
+                &|| Ok(())
+            ),
+            Ok("keys; fleet".to_owned()),
+            "{case}"
+        );
+        assert!(
+            !sys.calls().iter().any(|call| call.contains("sudo")),
+            "{case}: {:?}",
+            sys.calls()
+        );
+        assert_eq!(*values.lock().unwrap(), ["m16", "m16", "m16"], "{case}");
+    }
+}
+
+/// `aterm status` sends the person to setup's password step for the Mac's names exactly where
+/// that step owes the naming rule ([`aterm_machines::root_steps::owed`]; the window's own
+/// reading owes it on the same metadata): a missing rule. A rule that stands, with an older
+/// build's bytes or bytes this account cannot read, is never owed to that step, so status
+/// sends the person to `aterm init`, which renews it, and never to a password step that will
+/// not come.
+/// NEGATIVE CONTROL: reading every rule but this build's as `Elevation` (the earlier
+/// `with_rule`) promises the password step for the number-only rule, which `owed` holds none
+/// for.
+#[test]
+fn the_name_status_offers_the_password_step_only_where_setup_owes_the_rule() {
+    use aterm_agent::FleetName;
+    use aterm_machines::root_steps::{Owed, owed};
+    let names = m16_global();
+    let own = own_of(&bare_m16());
+    let old = number_only_rule("alice");
+    for (case, rule) in [
+        ("missing", RuleFile::Missing),
+        ("number-only", RuleFile::Holding(old.as_bytes())),
+        ("unreadable", RuleFile::Unreadable),
+    ] {
+        let sys = naming_rule_mac(rule);
+        let owes = owed(&sys).contains(&Owed::NameRule);
+        assert_eq!(owes, case == "missing", "{case}");
+        let area = crate::machine_status::name_area(&Ok(MacName::Named {
+            target: "m16".to_owned(),
+            fleet: FleetName::Current,
+            pending: mac_name_pending(&sys, "m16", &names, &own),
+        }));
+        let act = area.next.map(|step| step.act).unwrap_or_default();
+        assert_eq!(act.contains("password step"), owes, "{case}: {act}");
+        assert!(act.contains("aterm init"), "{case}: {act}");
+    }
+}
+
+/// With this build's rule for the account, the same owed names make the probe due, status
+/// promises the repair, the apply sets all three through `sudo -n`, and the read-back of what
+/// it set is current with no note. NEGATIVE CONTROL: the test above, same names, older rule.
+#[test]
+fn a_current_naming_rule_names_the_mac_and_reads_back_current() {
+    use aterm_agent::FleetName;
+    let names = m16_global();
+    let keys = IdentityRead::Current("label m16 in [ai] and [fleet] machine".to_owned());
+    let rule = aterm_machines::root_steps::name_rule("alice").unwrap();
+    let sys = naming_rule_mac(RuleFile::Holding(rule.as_bytes()));
+    let values = bare_m16();
+    scripted_names(&sys, &values, false);
+    let own = own_of(&values);
+    let read = with_fleet_name(keys.clone(), "m16", Some(&names), &FleetName::Current, &own);
+    match own_name_due_through(&sys, read, "m16", Some(&names), &own) {
+        IdentityRead::Due { from, to } => {
+            assert_eq!(from, "this Mac's own names");
+            assert!(
+                to.ends_with("own names m16 Global, through setup's naming rule"),
+                "{to}"
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        mac_name_pending(&sys, "m16", &names, &own),
+        Some(MacNamePending::ThroughRule(_))
+    ));
+    assert_eq!(
+        own_names_applied(
+            &sys,
+            "keys; fleet".to_owned(),
+            "m16",
+            Some(&names),
+            || own.clone(),
+            &|| Ok(())
+        ),
+        Ok(
+            "keys; fleet; this Mac's ComputerName, LocalHostName, HostName now follow \
+             m16 Global / m16-global"
+                .to_owned()
+        )
+    );
+    assert_eq!(
+        *values.lock().unwrap(),
+        ["m16 Global", "m16-global", "m16-global"]
+    );
+    let back = own_of(&values);
+    let read = with_fleet_name(keys, "m16", Some(&names), &FleetName::Current, &back);
+    assert_eq!(
+        read,
+        IdentityRead::Current("label m16 in [ai] and [fleet] machine; fleet name m16".to_owned())
+    );
+    assert_eq!(
+        own_name_due_through(&sys, read.clone(), "m16", Some(&names), &back),
+        read
+    );
+    assert_eq!(mac_name_pending(&sys, "m16", &names, &back), None);
+}
+
+/// A refusal is a failure: where sudo refuses a name even under this build's rule (its policy
+/// changed, or another rule outranks this one), the apply fails with sudo's own reason after
+/// its first refusal and sets nothing, never an Ok that the read-back then contradicts.
+/// NEGATIVE CONTROL: folding the refusal into the row's text (the earlier `own_name_by_rule`)
+/// answers Ok.
+#[test]
+fn a_refused_naming_attempt_fails_the_identity_row_with_sudos_reason() {
+    let names = m16_global();
+    let rule = aterm_machines::root_steps::name_rule("alice").unwrap();
+    let sys = naming_rule_mac(RuleFile::Holding(rule.as_bytes()));
+    let values = bare_m16();
+    scripted_names(&sys, &values, true);
+    let own = own_of(&values);
+    let failed = own_names_applied(
+        &sys,
+        "keys; fleet".to_owned(),
+        "m16",
+        Some(&names),
+        || own.clone(),
+        &|| Ok(()),
+    )
+    .unwrap_err();
+    assert!(failed.contains("a password is required"), "{failed}");
+    assert!(failed.contains("--set ComputerName"), "{failed}");
+    assert_eq!(*values.lock().unwrap(), ["m16", "m16", "m16"]);
+    let sudo: Vec<_> = sys
+        .calls()
+        .into_iter()
+        .filter(|call| call.contains("sudo"))
+        .collect();
+    assert_eq!(
+        sudo.len(),
+        1,
+        "the first refusal ends the attempt: {sudo:?}"
+    );
 }
 
 /// Design §3 principle 4, "the person's choices win": a machine key the person set (here

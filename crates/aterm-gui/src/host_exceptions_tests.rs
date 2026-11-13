@@ -168,6 +168,22 @@ fn roster() -> Vec<Entry> {
     }
     all.push(mr::accounts_refused_entry());
     all.push(mr::usage_tap_silent_entry());
+    let stranded: Vec<aterm_vitals::jobs::Named> = (0..5)
+        .map(|i| aterm_vitals::jobs::Named {
+            pid: 11_271 + i,
+            exec_version: Some(u64::from(i)),
+            name: format!("band-{}", "d".repeat(60)),
+            tab: None,
+            job: None,
+            for_ms: 1_860_000 + u64::from(i),
+        })
+        .collect();
+    for rows in [&stranded[..1], &stranded[..]] {
+        all.push(
+            mr::stranded_entry(&rows.iter().collect::<Vec<_>>(), u32::MAX)
+                .expect("a stranded row is an entry"),
+        );
+    }
     for spot in places() {
         for cause in ["held", "shell-prompt", "other-tab"] {
             all.push(mr::relaunch_blocked_entry("s-3e79", &spot, cause, false));

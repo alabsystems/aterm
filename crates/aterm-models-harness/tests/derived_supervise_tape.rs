@@ -12,7 +12,15 @@ fn supervise_tape_recovery_fires_every_committed_move() {
     let model = supervise_tape_recovery_model();
     let committed = interp::fired_actions(&model);
     for action in [
-        "Write", "Tear", "Crash", "Rot", "RotLast", "RotMagic", "Misplace", "Recover",
+        "Write",
+        "Tear",
+        "TearNested",
+        "Crash",
+        "Rot",
+        "RotLast",
+        "RotMagic",
+        "Misplace",
+        "Recover",
     ] {
         assert!(
             committed.contains(action),
@@ -31,6 +39,8 @@ fn each_wrong_reader_breaks_its_own_law() {
         (4, "TornSaid"),
         (5, "RotRefused"),
         (6, "MisplacedRefused"),
+        (7, "NestedRefused"),
+        (8, "NestedKept"),
     ] {
         let wrong = interp::with_buggy(&only(&model, law), dial);
         assert!(
@@ -120,6 +130,41 @@ fn supervise_tape_recovery_walks_the_ends_a_tape_meets() {
     }
     let torn = walk(&m, &["Write", "Write", "Tear"]);
     assert!(!m.action_enabled("Misplace", &torn), "{torn:?}");
+
+    let kept = |s: &interp::State| (s["recovered"], s["refused"], s["said_torn"], s["kept"]);
+    let nested = walk(&m, &["Write", "Write", "TearNested", "Recover"]);
+    assert_eq!(
+        kept(&nested),
+        (0, 1, 0, 2),
+        "a cut past a nested frame is refused, and a salvage keeps the frames before it: \
+         {nested:?}"
+    );
+    let plain = walk(&m, &["Write", "Write", "Tear", "Recover"]);
+    assert_eq!(
+        kept(&plain),
+        (2, 0, 1, 2),
+        "a plain tear's salvage: {plain:?}"
+    );
+    let as_torn = walk(
+        &interp::with_buggy(&m, 7),
+        &["Write", "Write", "TearNested", "Recover"],
+    );
+    assert_eq!(
+        kept(&as_torn),
+        (2, 0, 1, 2),
+        "the reader that reads it as torn: {as_torn:?}"
+    );
+    assert!(
+        !m.action_enabled("TearNested", &m.init_state()),
+        "the header nests no frame"
+    );
+    let cut = walk(&m, &["Write", "TearNested"]);
+    for damage in ["Rot", "RotLast", "RotMagic", "Misplace"] {
+        assert!(
+            !m.action_enabled(damage, &cut),
+            "one damage per tape: {damage} after {cut:?}"
+        );
+    }
     assert!(
         !m.action_enabled("Misplace", &damaged),
         "one damage per tape: {damaged:?}"

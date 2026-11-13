@@ -193,6 +193,7 @@ fn only_an_agent_with_a_conversation_is_resumed_and_only_when_relaunching() {
         claude_auth: None,
         word: String::new(),
         pid: 4242,
+        lifetime: None,
         start: "Sat Sep 27 01:02:03 2026".into(),
         program: "/opt/claude/bin/claude".into(),
         argv: vec!["/opt/claude/bin/claude".into()],
@@ -1442,10 +1443,15 @@ fn the_taken_over_image_is_named_until_the_writer_replaces_it() {
 #[test]
 fn a_successors_own_fact_about_a_tab_ends_what_it_carries_for_good() {
     use super::{HandedSession, Runs};
+    let lifetime: aterm_agent::harness::relaunch::ProcessLifetime = aterm_json::from_str(
+        r#"{"host":"darwin:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","boot":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","pid":4242,"birth":456}"#,
+    )
+    .expect("the parent's captured agent lifetime");
     let record = |session: &str| restore::AgentRestore {
         claude_auth: None,
         word: String::new(),
         pid: 4242,
+        lifetime: Some(lifetime.clone()),
         start: "Sat Sep 27 01:02:03 2026".into(),
         program: "/opt/claude/bin/claude".into(),
         argv: vec!["/opt/claude/bin/claude".into()],
@@ -1498,6 +1504,7 @@ fn a_successors_own_fact_about_a_tab_ends_what_it_carries_for_good() {
         let seen = (
             leaf.agent.as_ref().and_then(|agent| agent.session.clone()),
             leaf.cwd.clone(),
+            leaf.agent.as_ref().and_then(|agent| agent.lifetime.clone()),
         );
         lane.offer(manifest, Vec::new(), Instant::now());
         seen
@@ -1511,6 +1518,11 @@ fn a_successors_own_fact_about_a_tab_ends_what_it_carries_for_good() {
         let first = capture(&mut lane, host, runs, false);
         assert_eq!(first.0, host.map(str::to_string), "{fact}: this run's own");
         assert_eq!(
+            first.2,
+            host.map(|_| lifetime.clone()),
+            "{fact}: its lifetime"
+        );
+        assert_eq!(
             capture(&mut lane, None, claude, false).0,
             None,
             "{fact}: the parent's conversation is not named again"
@@ -1519,10 +1531,16 @@ fn a_successors_own_fact_about_a_tab_ends_what_it_carries_for_good() {
 
     let (_dir, mut lane) = successor();
     for runs in [Runs::Unread, claude] {
+        let carried = capture(&mut lane, None, runs, false);
         assert_eq!(
-            capture(&mut lane, None, runs, false).0.as_deref(),
+            carried.0.as_deref(),
             Some("C-parent"),
             "{runs:?}: the parent's record stands"
+        );
+        assert_eq!(
+            carried.2,
+            Some(lifetime.clone()),
+            "{runs:?}: its exact lifetime"
         );
     }
 
@@ -1548,6 +1566,7 @@ fn a_parents_leaf_of_an_agent_with_no_lane_is_no_agent_a_status_read_names() {
         claude_auth: None,
         word: word.into(),
         pid: 4242,
+        lifetime: None,
         start: "Sat Sep 27 01:02:03 2026".into(),
         program: format!("/opt/{word}/bin/{word}"),
         argv: vec![format!("/opt/{word}/bin/{word}")],

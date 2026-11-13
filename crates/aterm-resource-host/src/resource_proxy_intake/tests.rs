@@ -4,14 +4,15 @@ use super::*;
 use aterm_uds::{CtlListener, spawnfd};
 use std::{
     fs::File,
-    io::{Seek, SeekFrom},
-    os::fd::{AsRawFd, FromRawFd},
+    io::{Seek, SeekFrom, Write as _},
+    os::fd::FromRawFd,
 };
 use trust_resource_controller::{
     Channel, CommandSpec, Delegations as WireDelegations, JobBinding, ProducerChallenge, Role,
 };
 const ACTOR: &str = "ATERM_PROXY_INTAKE_FIXTURE";
 const MODE: &str = "ATERM_PROXY_INTAKE_MODE";
+const CONNECTED: &str = "cached intake connected";
 fn deadline() -> Instant {
     crate::fixture_deadline(Instant::now())
 }
@@ -55,6 +56,8 @@ fn cached_intake_actor() {
     let proof = source("ATERM_INTAKE_PROOF_FD");
     let data = source("ATERM_INTAKE_DATA_FD");
     let channel = CtlStream::connect(path).unwrap();
+    println!("{CONNECTED}");
+    std::io::stdout().flush().unwrap();
     transport::write_frame(&channel, &request().encode().unwrap(), deadline()).unwrap();
     let response = transport::read_frame(&channel, deadline()).unwrap();
     if mode == "deny" {
@@ -117,8 +120,6 @@ fn cached_helper_intake_success_deny_wrong_challenge_and_truncated_bundle() {
             .open(root.join(format!("{mode}.data")))
             .unwrap();
         let data_copy = OwnedFd::from(data.try_clone().unwrap());
-        let proof_raw = proof.as_raw_fd();
-        let data_raw = data_copy.as_raw_fd();
         let mut command = spawnfd::command(program.path());
         command
             .args([
@@ -128,16 +129,19 @@ fn cached_helper_intake_success_deny_wrong_challenge_and_truncated_bundle() {
             ])
             .env(ACTOR, &path)
             .env(MODE, mode)
-            .env("ATERM_INTAKE_PROOF_FD", proof_raw.to_string())
-            .env("ATERM_INTAKE_DATA_FD", data_raw.to_string())
             .stdin(spawnfd::Stdio::null())
-            .stdout(spawnfd::Stdio::null())
-            .stderr(spawnfd::Stdio::null());
+            .stdout(spawnfd::Stdio::piped())
+            .stderr(spawnfd::Stdio::inherit());
         command
             .inherit_guards(vec![proof.into(), data_copy])
             .unwrap();
+        let targets: Vec<_> = command.guard_targets().collect();
+        command
+            .env("ATERM_INTAKE_PROOF_FD", targets[0].to_string())
+            .env("ATERM_INTAKE_DATA_FD", targets[1].to_string());
         let mut helper = Helper(command.spawn().unwrap());
         drop(command);
+        aterm_uds::deadline::prints(&mut helper.0, CONNECTED, std::time::Duration::from_secs(60));
         let (channel, _) = aterm_uds::accept(
             &listener,
             aterm_uds::AcceptWait::Until(deadline()),

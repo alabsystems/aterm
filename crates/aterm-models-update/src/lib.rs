@@ -20,6 +20,7 @@ mod models_update_check_coordination;
 mod models_update_editor_carry;
 mod models_update_environment_repair;
 mod models_update_history_carry;
+mod models_update_hold;
 mod models_update_launched_dial_wait;
 mod models_update_parallel_attach;
 mod models_update_parent_diet;
@@ -52,6 +53,7 @@ pub use models_update_check_coordination::{
 pub use models_update_editor_carry::native_update_editor_carry_model;
 pub use models_update_environment_repair::native_update_environment_repair_model;
 pub use models_update_history_carry::native_update_history_carry_model;
+pub use models_update_hold::{native_update_hold_liveness, native_update_hold_model};
 pub use models_update_launched_dial_wait::{
     native_update_launched_dial_wait_liveness, native_update_launched_dial_wait_model,
 };

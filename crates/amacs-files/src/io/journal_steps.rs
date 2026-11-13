@@ -4,12 +4,18 @@
 //! The draft journal's image, format 2: [`MAGIC`], then astream step records from step 0
 //! (`astream_wire::steps`, claim `wire.steps.torn-vs-fault`): the header, then each record in
 //! one frame or more. An append adds a record's frames in place ([`frame_record`]); a read
-//! ([`decode_image`]) keeps the longest prefix of whole records, drops a torn tail and refuses
-//! a fault. A torn tail is what astream's scan calls [`StepEnd::Torn`]: what a crash in the
-//! middle of an append leaves, and equally a last record damaged with nothing decodable after
-//! it, which a read cannot tell from a crash's cut (a crash can leave the file's new length in
-//! place before the frame's bytes). It is dropped with no notice and no copy kept, as a
-//! crash's is. Damage with a whole record after it is a fault.
+//! ([`decode_image`]) keeps the longest prefix of whole records, drops a torn tail and names a
+//! fault beside the whole records before it. A torn tail is what astream's scan calls
+//! [`StepEnd::Torn`]: what a crash in the middle of an append leaves, and equally a last record
+//! damaged with nothing decodable after it, which a read cannot tell from a crash's cut (a
+//! crash can leave the file's new length in place before the frame's bytes). It is dropped
+//! with no notice and no copy kept, as a crash's is. Damage with a whole record after it is a
+//! fault, and so is a cut inside the last record past a whole astream frame its text holds
+//! (`astream_wire::steps`, "A body that holds a frame of its own"): a record's text is any
+//! UTF-8, so a crash's cut can read that way. A fault's image is kept, never cut, and the whole
+//! records before it are still the draft's durable prefix: [`decode_image`] returns them with
+//! the fault, and a host opens them and keeps the image aside. Whole records after damage are
+//! not in that prefix; they survive only in the image kept aside.
 //!
 //! ```text
 //! a frame's body  | tag (1) | prefix (8, LE) | content … |
@@ -37,7 +43,7 @@
 use std::fmt;
 
 use astream_wire::frame::{HEADER_SIZE, MAX_PAYLOAD_LEN};
-use astream_wire::steps::{STEP_HEADER, StepEnd, encode_step, scan_steps_from};
+use astream_wire::steps::{STEP_HEADER, StepEnd, StepFault, encode_step, scan_steps_from};
 use aterm_buffer::Seq;
 
 use super::{
@@ -306,25 +312,32 @@ pub(crate) fn encode_image(
 pub(crate) struct Image {
     /// Its whole records, in order.
     pub(crate) records: Vec<JournalRecord>,
-    /// Where they end: bytes past it are a torn append, dropped.
+    /// Where they end: bytes past it are a torn append, dropped, or with a [`Self::fault`]
+    /// the bytes a crash does not leave, kept.
     pub(crate) tail: JournalTail,
+    /// What astream's scan found after them that is not a crash's signature, if anything.
+    pub(crate) fault: Option<StepFault>,
 }
 
-/// Read a format-2 image: its whole records, a torn tail dropped.
+/// Read a format-2 image: its whole records, a torn tail dropped. A fault astream's scan finds
+/// is named in [`Image::fault`], beside the whole records before it: the scan's kept prefix is
+/// fixed before its end is classified, so they are exactly what a clean read of those bytes
+/// gives.
 ///
 /// # Errors
-/// [`JournalError::Fault`] for what astream's scan finds is not a crash's signature; a frame
-/// whose prefix is not the bytes before it ([`JournalError::PrefixMismatch`]); no header, or a
-/// second; and every record error format 1 has.
+/// [`JournalError::Fault`] for a fault before the header; a frame whose prefix is not the bytes
+/// before it ([`JournalError::PrefixMismatch`]); no header, or a second; and every record error
+/// format 1 has.
 pub(crate) fn decode_image(bytes: &[u8]) -> Result<Image, JournalError> {
     if bytes.len() > MAX_JOURNAL_BYTES {
         return Err(JournalError::TooLarge);
     }
     let steps = bytes.strip_prefix(&MAGIC).ok_or(JournalError::BadMagic)?;
     let scan = scan_steps_from(steps, 0);
-    if let StepEnd::Fault { kind, .. } = scan.end {
-        return Err(JournalError::Fault(kind));
-    }
+    let fault = match scan.end {
+        StepEnd::Fault { kind, .. } => Some(kind),
+        StepEnd::Clean | StepEnd::Torn => None,
+    };
     let mut tail = JournalTail::magic();
     let mut whole = None;
     let mut key = None;
@@ -387,16 +400,35 @@ pub(crate) fn decode_image(bytes: &[u8]) -> Result<Image, JournalError> {
             whole = Some(tail);
         }
     }
-    let tail = whole.ok_or(JournalError::NoHeader)?;
-    Ok(Image { records, tail })
+    let Some(tail) = whole else {
+        return Err(fault.map_or(JournalError::NoHeader, JournalError::Fault));
+    };
+    Ok(Image {
+        records,
+        tail,
+        fault,
+    })
 }
 
-/// The tail of the format-2 image `bytes`: where its whole records end.
+/// Read a format-2 image whole: [`decode_image`], with its fault an error.
 ///
 /// # Errors
-/// [`decode_image`]'s.
+/// [`decode_image`]'s, and [`JournalError::Fault`] for any fault.
+pub(crate) fn decode_whole_image(bytes: &[u8]) -> Result<Image, JournalError> {
+    let image = decode_image(bytes)?;
+    match image.fault {
+        Some(fault) => Err(JournalError::Fault(fault)),
+        None => Ok(image),
+    }
+}
+
+/// The tail of the format-2 image `bytes`: where its whole records end. An image with a fault
+/// has none an appender may follow.
+///
+/// # Errors
+/// [`decode_whole_image`]'s.
 pub fn journal_tail(bytes: &[u8]) -> Result<JournalTail, JournalError> {
-    decode_image(bytes).map(|image| image.tail)
+    decode_whole_image(bytes).map(|image| image.tail)
 }
 
 /// One record from its joined chunks, of the document whose raw key is `document_raw`.

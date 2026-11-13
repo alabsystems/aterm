@@ -8,6 +8,7 @@ use aterm_uds::process::{Birth, Identity};
 
 fn snapshot() -> Snapshot {
     Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         tab: "s-process".into(),

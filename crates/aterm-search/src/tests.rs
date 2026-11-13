@@ -1982,3 +1982,16 @@ fn len_is_a_high_water_mark() {
     index.index_line(6, "test line");
     assert_eq!(index.len(), 7);
 }
+
+#[test]
+fn raw_byte_needle_matches_without_utf8_conversion() {
+    let bytes: Vec<u8> = (0..=255).collect();
+    assert!(super::contains_bytes(&bytes, &[]));
+    assert!(super::contains_bytes(&[], &[]));
+    assert!(!super::contains_bytes(&[], b"x"));
+    for needle in bytes.windows(3) {
+        assert!(super::contains_bytes(&bytes, needle));
+    }
+    assert!(!super::contains_bytes(&bytes, &[254, 255, 0]));
+    assert!(!super::contains_bytes(&bytes, &[255, 255]));
+}

@@ -14,10 +14,7 @@ pub(crate) fn scratch_git(dir: &Path, args: &[&str]) -> String {
 /// [`scratch_git`] with its commits and reflog entries dated `when` (Unix seconds), where given.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn scratch_git_dated(dir: &Path, when: Option<u64>, args: &[&str]) -> String {
-    let mut cmd = aterm_uds::spawnfd::command(crate::test_program::git());
-    if let Some(exec_path) = crate::test_program::git_exec_path() {
-        cmd.env("GIT_EXEC_PATH", exec_path);
-    }
+    let mut cmd = crate::test_program::kept_git_command();
     if let Some(when) = when {
         let stamp = format!("@{when} +0000");
         cmd.env("GIT_COMMITTER_DATE", &stamp)
@@ -3414,15 +3411,27 @@ fn a_sweep_lets_go_of_another_index_s_copy_a_day_after_it_was_made() {
 /// Replacing an index with the same bytes and modification time reuses the same refreshed copy,
 /// regardless of its new inode or change time. Changed bytes in that replacement are read before
 /// choosing a copy: an actual assume-unchanged flag must change the status as the original index
-/// does. A non-private cached copy is not used.
+/// does. A second read with different bytes cannot populate the first read's cache key even
+/// under the same metadata observation. A non-private cached copy is not used.
 /// NEGATIVE CONTROL: the old metadata key makes another copy after the equal-byte replacement;
-/// a path-only key answers the later edit from the earlier index.
+/// a path-only key answers the later edit from the earlier index; omitting the copy's digest
+/// comparison accepts different second-pass bytes.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn an_equal_index_replacement_reuses_a_copy_but_changed_bytes_do_not() {
     use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
     let tmp = aterm_tempfile::tempdir().expect("tmp");
     let work = repo(tmp.path(), false);
+    // Exercise streamed fingerprints across multiple buffers, including a short final read.
+    for i in 0..1000 {
+        std::fs::write(
+            work.join(format!("padding-{i:04}-{}", "x".repeat(100))),
+            "padding\n",
+        )
+        .expect("a tracked file");
+    }
+    scratch_git(&work, &["add", "."]);
+    scratch_git(&work, &["commit", "-qm", "a multi-buffer index"]);
     // Normalize optional index extensions through the same real flag writer before
     // capturing the baseline; the later flag change must preserve that index's length.
     scratch_git(&work, &["update-index", "--assume-unchanged", "a.txt"]);
@@ -3433,6 +3442,7 @@ fn an_equal_index_replacement_reuses_a_copy_but_changed_bytes_do_not() {
     let original = std::fs::File::open(&source).expect("the source index");
     let before = original.metadata().expect("the source identity");
     let bytes = std::fs::read(&source).expect("the current index bytes");
+    assert!(bytes.len() > 2 * 64 * 1024, "a multi-buffer source index");
     let first = private_index(&work, &reads).expect("a private index");
     let first_id = std::fs::metadata(&first.path).expect("the copy").ino();
     let replacement = work.join(".git/index.replacement");
@@ -3460,6 +3470,36 @@ fn an_equal_index_replacement_reuses_a_copy_but_changed_bytes_do_not() {
     let changed = std::fs::read(&source).expect("the changed index bytes");
     assert_ne!(changed, bytes, "the actual index flag changed");
     assert_eq!(changed.len(), bytes.len(), "the index retains its length");
+    // Both passes use one fixed metadata observation, as on a filesystem whose clock cannot
+    // distinguish these writes. Only the bytes prove that the copy matches its fingerprint.
+    let mut fingerprint = index_fingerprint(&before);
+    fingerprint.update(&bytes);
+    let fingerprint = fingerprint.finalize();
+    let mut buffer = [0; INDEX_READ_BUFFER];
+    let mut copied = Vec::new();
+    copy_index_bytes(
+        &mut bytes.as_slice(),
+        &mut copied,
+        &before,
+        fingerprint,
+        &reads,
+        &mut buffer,
+    )
+    .expect("the fingerprinted bytes are copied");
+    assert_eq!(copied, bytes, "every fingerprinted byte is preserved");
+    copied.clear();
+    assert!(
+        copy_index_bytes(
+            &mut changed.as_slice(),
+            &mut copied,
+            &before,
+            fingerprint,
+            &reads,
+            &mut buffer,
+        )
+        .is_err(),
+        "changed bytes cannot be published under the first pass's fingerprint"
+    );
     let held = std::fs::File::open(&source).unwrap();
     std::fs::write(&source, &bytes).unwrap();
     dated(&source, before.modified().unwrap());

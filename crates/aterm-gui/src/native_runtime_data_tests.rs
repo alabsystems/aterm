@@ -9,6 +9,59 @@ const PAYLOAD: &[u8] = b"opaque forest: primary, private child, goal clock, queu
 const CHILD_SOCKET: &str = "ATERM_RUNTIME_DATA_FIXTURE_SOCKET";
 
 #[test]
+fn settled_handover_releases_only_the_exact_sole_retained_snapshot() {
+    let owner = Process::observe(std::process::id()).unwrap();
+    let operation = "a".repeat(32);
+    let slot = Slot::reserved(operation.clone(), owner.clone());
+    let pin = slot.pin(&operation, &owner).unwrap();
+    assert!(
+        pin.release_retained(PAYLOAD.len() as u64, "absent")
+            .is_none()
+    );
+    let (reader, writer) = unlinked(PAYLOAD);
+    drop(writer);
+    let snapshot = Arc::new(Snapshot::copy_from(reader).unwrap());
+    let digest = snapshot.digest.clone();
+    let weak = Arc::downgrade(&snapshot);
+    slot.state.lock().unwrap().outcome = Outcome::Ready(snapshot);
+    assert!(
+        pin.release_retained(PAYLOAD.len() as u64 + 1, &digest)
+            .is_none()
+    );
+    assert!(
+        pin.release_retained(PAYLOAD.len() as u64, "wrong")
+            .is_none()
+    );
+    let other = slot.pin(&operation, &owner).unwrap();
+    assert!(
+        pin.release_retained(PAYLOAD.len() as u64, &digest)
+            .is_none()
+    );
+    drop(other);
+    slot.state.lock().unwrap().sending = true;
+    assert!(
+        pin.release_retained(PAYLOAD.len() as u64, &digest)
+            .is_none()
+    );
+    slot.state.lock().unwrap().sending = false;
+    let released = pin.release_retained(PAYLOAD.len() as u64, &digest).unwrap();
+    assert!(pin.retained().is_none());
+    assert!(
+        weak.upgrade().is_some(),
+        "disposal belongs to the unlocked caller"
+    );
+    assert!(!slot.reusable_by(&"b".repeat(32), &owner));
+    assert!(
+        pin.release_retained(PAYLOAD.len() as u64, &digest)
+            .is_none()
+    );
+    drop(pin);
+    assert!(slot.reusable_by(&"b".repeat(32), &owner));
+    drop(released);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
 fn a_dead_empty_producer_can_be_replaced_but_retained_bytes_cannot() {
     let mut child = aterm_uds::spawnfd::command("/bin/cat")
         .stdin(aterm_uds::spawnfd::Stdio::piped())

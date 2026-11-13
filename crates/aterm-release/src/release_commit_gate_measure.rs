@@ -91,8 +91,9 @@ fn policy(root: &Path) {
     std::fs::write(root.join("policy-source"), revision).unwrap();
 }
 
-// Only the fixture's announcement is derived. Actual source versions and tags
-// remain inputs: a source that owes a bump is not a usable measurement baseline.
+// The measurement baseline is the source's own notes: the release derives the harness
+// announcement itself, so nothing is normalized. Actual source versions and tags remain
+// inputs: a source that owes a bump is not a usable measurement baseline.
 fn baseline_notes(repo: &Path, bare: &Path) -> Result<String, String> {
     if !git(repo, &["status", "--porcelain"]).is_empty() {
         return Err("measurement baseline must start clean".into());
@@ -103,7 +104,7 @@ fn baseline_notes(repo: &Path, bare: &Path) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     let origin = crate::github_remote::claim_fixture(repo, bare);
     let tags = crate::ledger::Origin::tag_catalog(&origin)?;
-    let (release, released) = crate::harness_versions::previous_release(
+    let (_, released) = crate::harness_versions::previous_release(
         &git(repo, &["show", "HEAD:RELEASES.ledger"]),
         &version,
         &tags,
@@ -114,37 +115,6 @@ fn baseline_notes(repo: &Path, bare: &Path) -> Result<String, String> {
         .map_err(|e| e.to_string())?;
     if !owed.is_empty() {
         return Err(format!("measurement source owes harness bumps: {owed:?}"));
-    }
-    let text = std::fs::read_to_string(repo.join("CHANGELOG.md")).map_err(|e| e.to_string())?;
-    let entries: Vec<_> = crate::changelog::note_entries(&text, "Unreleased")
-        .into_iter()
-        .filter(|entry| entry.starts_with(crate::changelog::HARNESS_ENTRY_HEAD))
-        .collect();
-    let (start, end) = aterm_census::changelog::section_span(&text, "Unreleased")
-        .ok_or("missing Unreleased section")?;
-    if entries.len() > 1
-        || entries.len() == 1
-            && !text.lines().take(end).skip(start + 1).any(|line| {
-                line.starts_with(crate::changelog::HARNESS_ENTRY_HEAD)
-                    && line.split_whitespace().collect::<Vec<_>>().join(" ") == entries[0]
-            })
-    {
-        return Err("measurement requires one complete unambiguous announcement".into());
-    }
-    if crate::harness_versions::notes_gate_at(&runner, (&release, &released), &source, &version)
-        .is_ok()
-    {
-        return Ok(text);
-    }
-    if entries.is_empty() {
-        return Err("invalid notes have no unambiguous announcement to normalize".into());
-    }
-    let bumped = crate::harness_versions::bump(repo, &runner, (&release, &released))
-        .map_err(|e| e.to_string())?;
-    if !bumped.is_empty() || git(repo, &["diff", "--name-only", "HEAD"]) != "CHANGELOG.md" {
-        return Err(
-            "baseline normalization must change only CHANGELOG without version bumps".into(),
-        );
     }
     std::fs::read_to_string(repo.join("CHANGELOG.md")).map_err(|e| e.to_string())
 }
@@ -182,8 +152,11 @@ fn orphan_only(found: &[Refusal]) -> bool {
     found.len() == 1 && !found[0].could_not_run && found[0].why.starts_with("changelog — ")
 }
 
+/// THE BASELINE IS THE SOURCE'S OWN NOTES: a stale hand-written harness line stays as it is
+/// (the roll drops it and derives the announcement), versions are untouched, and a source that
+/// owes a harness bump is refused.
 #[test]
-fn baseline_announcement_uses_real_tagged_history_without_changing_versions() {
+fn baseline_notes_are_the_sources_own_and_a_source_owing_a_bump_is_refused() {
     let dir = aterm_tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     crate::ledger::testing::init(&repo, &[]);
@@ -205,7 +178,7 @@ fn baseline_announcement_uses_real_tagged_history_without_changing_versions() {
     let h = aterm_phase::CliHarness::ALL[0];
     let version_path = repo.join(h.version_file());
     std::fs::write(&version_path, crate::harness_versions::version_line((0, 2))).unwrap();
-    commit(&repo, "Advanced source version");
+    let head = commit(&repo, "Advanced source version");
     let bare = dir.path().join("origin.git");
     git(
         &repo,
@@ -217,44 +190,12 @@ fn baseline_announcement_uses_real_tagged_history_without_changing_versions() {
         ],
     );
     tests::bind_native_engine_fixture(&repo, &bare);
-    let derived = baseline_notes(&repo, &bare).unwrap();
-    let announcement = derived
-        .lines()
-        .find(|line| line.starts_with(crate::changelog::HARNESS_ENTRY_HEAD))
-        .unwrap();
-    assert!(announcement.starts_with("- **Harness versions since v0.1.0: "));
-    assert!(announcement.contains(&format!("`alab {} harness 0.2`", h.cli())));
-    assert_eq!(
-        derived,
-        notes.replace("- **Harness versions since v0.2.0: stale.**", announcement)
-    );
+    assert_eq!(baseline_notes(&repo, &bare).unwrap(), notes);
+    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head);
     assert_eq!(
         std::fs::read_to_string(&version_path).unwrap(),
         crate::harness_versions::version_line((0, 2))
     );
-    std::fs::write(repo.join("CHANGELOG.md"), &derived).unwrap();
-    commit(&repo, "Already valid fixture announcement");
-    let valid_head = git(&repo, &["rev-parse", "HEAD"]);
-    assert_eq!(baseline_notes(&repo, &bare).unwrap(), derived);
-    assert_eq!(git(&repo, &["rev-parse", "HEAD"]), valid_head);
-    for body in [
-        format!("{announcement}\n{announcement}\n"),
-        format!("{announcement}\n  continuation\n"),
-        format!("{announcement}\n*italic continuation*\n"),
-        format!("{announcement}\n#literal continuation\n"),
-    ] {
-        let ambiguous = format!("## [Unreleased]\n\n### Changed\n\n{body}\n## [0.1.0]\n");
-        std::fs::write(repo.join("CHANGELOG.md"), &ambiguous).unwrap();
-        let head = commit(&repo, "Ambiguous note must refuse before normalization");
-        assert!(baseline_notes(&repo, &bare).is_err());
-        assert_eq!(git(&repo, &["rev-parse", "HEAD"]), head);
-        assert_eq!(
-            std::fs::read_to_string(repo.join("CHANGELOG.md")).unwrap(),
-            ambiguous
-        );
-    }
-    std::fs::write(repo.join("CHANGELOG.md"), &derived).unwrap();
-    commit(&repo, "Restore unambiguous baseline");
     let unbumped = format!(
         "{}\nfn changed_source() {{}}\n",
         crate::harness_versions::version_line((0, 1))
@@ -334,15 +275,7 @@ fn prepare(root: &Path, source: &Path) {
     commit(&engine, "Local policy identity; no executable engine");
     policy(root);
     let changelog = repo.join("CHANGELOG.md");
-    let before = std::fs::read_to_string(&changelog).unwrap();
-    let notes = baseline_notes(&repo, &bare).unwrap();
-    if notes != before {
-        std::fs::write(&changelog, notes).unwrap();
-        commit(
-            &repo,
-            "Derive fixture announcement from actual release inputs",
-        );
-    }
+    baseline_notes(&repo, &bare).unwrap();
     let base = git(&repo, &["rev-parse", "HEAD"]);
     let baseline = fixture_gates(root, &base);
     assert!(baseline.is_empty(), "invalid baseline: {baseline:?}");
@@ -465,7 +398,39 @@ fn real_backend_commit_gate_prefix() {
     // Warm all takes at the same owned input path. Explicit file transport is
     // confined to preparation; the production input update sees the initialized pin.
     let checkout = crate::input_record::directory(&real.release);
-    crate::input_record::checkout(&real.git(), &checkout, &tip).unwrap();
+    if checkout.exists() {
+        assert!(
+            git(
+                &checkout,
+                &["status", "--porcelain", "--untracked-files=no"]
+            )
+            .is_empty()
+        );
+        git(
+            &checkout,
+            &[
+                "-c",
+                "submodule.recurse=false",
+                "checkout",
+                "--detach",
+                &tip,
+            ],
+        );
+    } else {
+        std::fs::create_dir_all(checkout.parent().unwrap()).unwrap();
+        git(
+            &repo,
+            &[
+                "-c",
+                "submodule.recurse=false",
+                "worktree",
+                "add",
+                "--detach",
+                checkout.to_str().unwrap(),
+                &tip,
+            ],
+        );
+    }
     git(
         &checkout,
         &[
@@ -505,7 +470,9 @@ fn real_backend_commit_gate_prefix() {
             real.seal_inputs().unwrap();
         }
         if work || dry || sample == "red-test" {
-            input = Some(real.input_checks(&base, &tip, &prover));
+            let policy = crate::input_record::EngineInput::local_fixture(&real.engine)
+                .expect("the owned read-only fixture has one immutable policy commit");
+            input = Some(real.input_checks_with_policy(&base, &tip, &prover, policy));
         }
         if sample != "census"
             && let Some(Err(refusal)) = &input

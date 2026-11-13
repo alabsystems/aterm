@@ -853,8 +853,8 @@ fn a_failure_recorded_against_the_running_build_decorates_nothing() {
     let recorded = aterm_update::record_apply_failure(
         current_build,
         current_build,
-        "trial recovery proof failed 3x (receipt missing); disarmed the boot sentinel \
-         to keep updates possible",
+        "update trial for build 1787699398 was unrecoverable across 3 launches of build \
+         1787690000; disarmed the boot sentinel to keep updates possible",
     )
     .expect("the scratch staging root is resolvable under test");
     assert_eq!(recorded.target_build, current_build);
@@ -897,6 +897,8 @@ pub(crate) fn stage_one_build(app: &mut App) -> u64 {
                 installable: Some(true),
                 channel_unreadable: false,
                 checked_at: None,
+                hold: None,
+                behind: false,
             },
         ),
         crate::native_updater_service::CheckCompletion::Reduced,

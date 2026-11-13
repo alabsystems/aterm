@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! What of the release cutter needs none of it: the repair worker a failed cut opens. The cutter
-//! itself is the `aterm-release` binary (src/main.rs), which links this.
+//! What of the release cutter needs none of it: the repair worker a failed cut opens, and the
+//! release pump's decisions. The cutter itself is the `aterm-release` binary (src/main.rs), which
+//! links this.
 
+pub mod pump;
 pub mod repair;

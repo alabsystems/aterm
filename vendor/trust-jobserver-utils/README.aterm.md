@@ -1,14 +1,14 @@
-# Trust scheduling descriptor handoff
+# Maintained native resource sources
 
-Source: Trust `263e40c542b1efd7e4464e9ef191cdea0b7add8f`,
-`src/jobserver_utils`, MIT OR Apache-2.0. Runtime and test sources are unchanged.
+Library sources are imported from published Trust `b27fbd29fd181a19d806fa8c8b9c57a0bc160b76`.
+Local manifests redirect dependencies to this repository and omit standalone
+binaries/examples. Licenses accompany the maintained source. Source bytes and
+protocol data create no CPU, memory, execution, SDK or installed Host authority.
+Consumer qualification is independent of canonical qualification.
 
-The manifest records origin, makes this an isolated vendored package, and
-removes the upstream workspace-relative path from its optional GNU client
-dependency. Aterm disables default features: the host uses only the existing
-std/libc descriptor transport, without constructing a GNU token client.
-
-This is the same authenticated scoped CPU/GNU handoff used by native Targo.
-It preserves actual open descriptions and never grants CPU, memory, execution,
-or settlement from an advertisement. The host must bind an actual stopped
-direct child before GO and retain endpoints through the child's scope closure.
+Source path: `src/jobserver_utils`. The optional client resolves the exact
+maintained GNU library in `jobserver`, including scoped FIFO witness
+validation. Scoped handoff tests retain Aterm's owning-child cleanup and original
+60-second readiness controls. Production Rust sources match canonical source.
+The default-disabled transport can transfer held descriptors without minting
+GNU tokens or asserting a machine claim.

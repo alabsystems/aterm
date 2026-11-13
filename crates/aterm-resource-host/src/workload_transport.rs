@@ -554,7 +554,13 @@ fn register_output(
 
 fn local_request(sealed: &CompilerQuery, peer: transport::Peer) -> io::Result<local::Request> {
     sealed.validate()?;
-    let request = &sealed.member;
+    local_member_request(&sealed.member, peer)
+}
+fn local_member_request(
+    request: &trust_resource_controller::Request,
+    peer: transport::Peer,
+) -> io::Result<local::Request> {
+    request.validate()?;
     let cpu = request
         .delegations
         .cpu
@@ -613,6 +619,33 @@ pub(super) fn receive(
     Ok(Incoming { subgroup, sealed })
 }
 
+pub(crate) struct NativeIncoming {
+    pub(crate) subgroup: AuthorizedSubgroup,
+    pub(crate) sealed: trust_resource_controller::native_job::query::CompilerQuery,
+}
+pub(super) fn receive_native(
+    stream: &CtlStream,
+    job: &Binding,
+    deadline: Instant,
+) -> io::Result<NativeIncoming> {
+    stream.set_nonblocking(true)?;
+    let peer = transport::local_peer(stream)?;
+    let sealed = trust_resource_controller::native_job::query::CompilerQuery::decode(
+        &transport::read_frame(stream, deadline)?,
+    )?;
+    let request = local_member_request(&sealed.member, peer)?;
+    let subgroup = crate::metadata_transport::receive_rights(
+        stream,
+        job,
+        deadline,
+        request,
+        peer,
+        true,
+        |request, peer| crate::actor::authorize_native_job_query(request, peer, &sealed),
+    )?;
+    Ok(NativeIncoming { subgroup, sealed })
+}
+
 pub(super) fn ready(
     stream: &CtlStream,
     peer: transport::Peer,
@@ -661,6 +694,63 @@ pub(super) fn ready(
     )?;
     // Attachment acknowledgement only: it holds the original authenticated
     // connection through the client's provenance check and grants no GO.
+    if transport::read_frame(stream, deadline)? != [1] {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    driver.serve(
+        stream,
+        reply.deadline(),
+        peer,
+        &reply.reply.context.context.session,
+    )
+}
+
+pub(super) fn native_ready(
+    stream: &CtlStream,
+    peer: transport::Peer,
+    hello: &aterm_json::Value,
+    deadline: Instant,
+) -> io::Result<()> {
+    use trust_resource_controller::native_job::{self as native, host};
+    let capabilities: aterm_json::Value = aterm_json::from_str(host::READY_CAPABILITIES_JSON)
+        .map_err(|_| io::ErrorKind::InvalidData)?;
+    if hello["version"].as_u64() != Some(3)
+        || hello["role"].as_str() != Some(native::READY_ROLE)
+        || hello["capabilities"] != capabilities
+        || hello.as_object().is_none_or(|fields| {
+            fields.len() != 4
+                || ["version", "role", "session", "capabilities"]
+                    .iter()
+                    .any(|key| !fields.contains_key(*key))
+        })
+    {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    let request = host::ReadyRequest::decode(&transport::read_frame(stream, deadline)?)?;
+    if hello["session"].as_str() != Some(request.query.binding.session.as_str())
+        || transport::local_peer(stream)? != peer
+    {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    let reply = crate::actor::native_job_ready(peer, request)?;
+    let (link, driver) = Link::pair();
+    crate::actor::install_workload_control(
+        peer,
+        reply.reply.context.context.session.clone(),
+        reply.reply.context.context.root_attempt,
+        link,
+    )?;
+    if transport::local_peer(stream)? != peer {
+        return Err(io::ErrorKind::PermissionDenied.into());
+    }
+    transport::write_frame(stream, &reply.reply.encode()?, deadline)?;
+    let originals = reply.descriptions()?;
+    jobserver_utils::descriptor_transfer::send(
+        stream,
+        &originals.iter().map(|fd| fd.as_fd()).collect::<Vec<_>>(),
+        trust_resource_controller::workload::host::CPU_SET_MARKER,
+        deadline,
+    )?;
     if transport::read_frame(stream, deadline)? != [1] {
         return Err(io::ErrorKind::PermissionDenied.into());
     }

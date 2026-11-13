@@ -13,6 +13,7 @@ fn stamp(pid: u32, start: &str, cause: Cause, at: u64) -> Stamp {
         start: start.to_string(),
         cause,
         at,
+        wanted: None,
         input: None,
     }
 }
@@ -356,6 +357,7 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
         timings: crate::harness::Timings::FAST,
     };
     let snap = Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         route: crate::harness::accounts::AuthRoute::Outside,
@@ -413,4 +415,157 @@ fn the_relaunch_that_files_an_asked_exit_takes_its_stamp() {
         !ends_its_agent(CAUSE_ASKED),
         "its exit is dated as any relaunch's"
     );
+}
+
+/// A stamp names the account its relaunch should start on only when its act asked for one, and a
+/// stamp written before that field existed reads as a plain restart.
+#[test]
+fn a_stamp_carries_the_account_its_act_asked_for() {
+    let plain = stamp(4242, "Wed Sep 23 20:13:55 2026", Cause::Asked, 100);
+    assert!(!plain.to_json().contains("wanted"), "{}", plain.to_json());
+    assert_eq!(Stamp::from_json(&plain.to_json()), Some(plain.clone()));
+    assert_eq!(
+        Stamp::from_json(
+            r#"{"pid":4242,"start":"Wed Sep 23 20:13:55 2026","cause":"asked","at":100}"#
+        ),
+        Some(plain.clone()),
+        "the shape an earlier act wrote"
+    );
+    for wanted in [Wanted::Row("work-2".to_string()), Wanted::Pool] {
+        let asked = Stamp {
+            wanted: Some(wanted.clone()),
+            ..plain.clone()
+        };
+        let read = Stamp::from_json(&asked.to_json()).expect("a stamp");
+        assert_eq!(read.wanted, Some(wanted), "{}", asked.to_json());
+        assert_eq!(read, asked);
+        assert_ne!(read, plain, "another act's stamp");
+    }
+    // A row labelled `auto` and the pool's choice are two asks.
+    let auto_row = Stamp {
+        wanted: Some(Wanted::Row("auto".to_string())),
+        ..plain.clone()
+    };
+    assert_eq!(
+        Stamp::from_json(&auto_row.to_json()).and_then(|s| s.wanted),
+        Some(Wanted::Row("auto".to_string()))
+    );
+}
+
+/// NEGATIVE CONTROL: with the whole stamp refused for an unreadable destination, the lookup names
+/// no cause and the act's own signal exit is read as nobody's, which is never relaunched.
+#[test]
+fn a_destination_a_stamp_cannot_name_is_dropped_and_its_restart_stands() {
+    let tmp = scratch();
+    let state = tmp.path();
+    let start = "Wed Sep 23 20:13:55 2026";
+    let now = 10_000;
+    for bad in [
+        r#"{"row":"Work"}"#,
+        r#"{"row":"help"}"#,
+        r#"{"row":"../x"}"#,
+        r#"{"row":""}"#,
+        r#"{"row":7}"#,
+        r#"{"pool":false}"#,
+        r#"{"row":"b","pool":true}"#,
+        r#"{}"#,
+        r#""pool""#,
+        "null",
+        "7",
+    ] {
+        let text = format!(
+            r#"{{"pid":4242,"start":"{start}","cause":"stall","at":{now},"wanted":{bad}}}"#
+        );
+        let read = Stamp::from_json(&text).unwrap_or_else(|| panic!("still a stamp: {bad}"));
+        assert_eq!(read.wanted, None, "{bad}");
+        assert_eq!(read.cause, Cause::Stall, "{bad}");
+        std::fs::create_dir_all(state.join("upgrade")).expect("dir");
+        std::fs::write(path(state, "s-1").expect("path"), &text).expect("planted");
+        assert_eq!(
+            lookup(state, "s-1", 4242, start, now),
+            Some(Cause::Stall),
+            "its exit is still the act's: {bad}"
+        );
+        assert_eq!(wanted_for(state, "s-1", 4242, start, now), None, "{bad}");
+    }
+}
+
+/// One stamp carries both an act's input receipt and the account it named, and an unreadable one
+/// of them drops alone: the other field and the restart itself still stand.
+#[test]
+fn a_receipt_and_a_destination_share_a_stamp_and_each_drops_alone() {
+    let both = Stamp {
+        wanted: Some(Wanted::Row("work-2".to_string())),
+        input: Some(Input {
+            host: "aterm-harness@42".to_string(),
+            seq: 7,
+        }),
+        ..stamp(4242, "Wed Sep 23 20:13:55 2026", Cause::Asked, 100)
+    };
+    assert_eq!(Stamp::from_json(&both.to_json()), Some(both.clone()));
+    let mut value: aterm_json::Value = aterm_json::from_str(&both.to_json()).expect("stamp");
+    let o = value.as_object_mut().expect("stamp");
+    o.insert("wanted".into(), aterm_json::Value::from("Work"));
+    let read = Stamp::from_json(&aterm_json::to_string(&value).expect("stamp"))
+        .expect("a torn destination leaves the stamp");
+    assert_eq!(read.wanted, None);
+    assert_eq!(
+        read.input, both.input,
+        "the receipt survives a torn destination"
+    );
+    let o = value.as_object_mut().expect("stamp");
+    o.insert(
+        "wanted".into(),
+        aterm_json::from_str(r#"{"pool":true}"#).expect("pool"),
+    );
+    o.insert(
+        "input".into(),
+        aterm_json::from_str(r#"{"host":""}"#).expect("torn"),
+    );
+    let read = Stamp::from_json(&aterm_json::to_string(&value).expect("stamp"))
+        .expect("a torn receipt leaves the stamp");
+    assert_eq!(read.input, None);
+    assert_eq!(
+        read.wanted,
+        Some(Wanted::Pool),
+        "the destination survives a torn receipt"
+    );
+    assert!(read.names(both.pid, &both.start));
+}
+
+#[test]
+fn the_account_asked_for_is_read_only_for_the_process_its_stamp_names() {
+    let tmp = scratch();
+    let state = tmp.path();
+    let now = 10_000;
+    let start = "Wed Sep 23 20:13:55 2026";
+    let row = Wanted::Row("b".to_string());
+    assert_eq!(wanted_for(state, "s-1", 4242, start, now), None, "none yet");
+    let asked = Stamp {
+        wanted: Some(row.clone()),
+        ..stamp(4242, start, Cause::Asked, now - 3)
+    };
+    write(state, "s-1", &asked).expect("written");
+    assert_eq!(wanted_for(state, "s-1", 4242, start, now), Some(row));
+    assert_eq!(wanted_for(state, "s-1", 4243, start, now), None, "a pid");
+    assert_eq!(
+        wanted_for(state, "s-1", 4242, "Wed Sep 23 20:14:00 2026", now),
+        None,
+        "another process by that pid"
+    );
+    assert_eq!(wanted_for(state, "s-2", 4242, start, now), None, "a tab");
+    let later = now - 3 + super::super::relaunch::STALE_S + 1;
+    assert_eq!(wanted_for(state, "s-1", 4242, start, later), None, "stale");
+    assert_eq!(
+        read(state, "s-1"),
+        Some(asked.clone()),
+        "asking removes nothing"
+    );
+    // The relaunch takes the stamp it judged, destination and all, and not a plain one beside it.
+    let plain = stamp(4242, start, Cause::Asked, now - 3);
+    assert_eq!(take_if(state, "s-1", |s| *s == plain), None);
+    assert_eq!(take_if(state, "s-1", |s| *s == asked), Some(asked));
+    assert_eq!(read(state, "s-1"), None, "taken");
+    write(state, "s-1", &plain).expect("a plain restart");
+    assert_eq!(wanted_for(state, "s-1", 4242, start, now), None, "plain");
 }

@@ -38,6 +38,8 @@ aterm-spec-anchor = { workspace = true }
 # Predicate constructors (idle/seq/block/row-match). Agent knowledge lives HERE;
 # the engine core knows nothing of "a turn" or "a Claude prompt".
 aterm-observe = { workspace = true }
+# Exact byte-marker scans use the existing first-party Two-Way search.
+aterm-search = { workspace = true }
 # The one grammar of machine terms (`sys::predicate::AwaitSys`): a declared wake's
 # `need=` and its `when=`'s machine atoms parse through `await sys`'s parser and
 # are kept in its canonical spelling (`supervise::occupancy::wakes`). A pure model

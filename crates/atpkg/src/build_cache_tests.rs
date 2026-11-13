@@ -455,6 +455,7 @@ fn rust(
         cwd: Some(cwd),
         env: &|name| env.get(name).map(OsString::from),
         read: &read_config,
+        read_manifest: &read_manifest,
         writable: &writable,
     };
     match decide(args, tool, &m) {
@@ -1663,8 +1664,15 @@ fn the_shim_and_the_rust_rule_decide_every_case_alike() {
         std::fs::set_permissions(&caches, std::fs::Permissions::from_mode(0o755)).unwrap();
         check(&f, &ws, &[], build, true);
         std::fs::remove_dir(&caches).unwrap();
+        check(&f, &ws, &[], build, true);
+        let library = f.home.join("Library");
+        std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o555)).unwrap();
         check(&f, &ws, &[], build, own);
         check(&f, &f.dir("home/lab.noindex/ws"), &[], build, own);
+        std::fs::set_permissions(&library, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir(&library).unwrap();
+        check(&f, &ws, &[], build, true);
+        check(&f, &f.dir("home/lab.noindex/ws"), &[], build, true);
     }
 }
 
@@ -2089,6 +2097,7 @@ fn a_build_started_at_a_named_folder_gets_that_folders_answer() {
         cwd: Some(&typed_in),
         env: &|name| env.get(name).map(OsString::from),
         read: &read_config,
+        read_manifest: &read_manifest,
         writable: &writable,
     };
     // CONTROL: read with the inherited `$PWD`, the checkout looks reached through a link.
@@ -6219,8 +6228,9 @@ fn a_live_build_directory_loses_only_what_no_build_reads_again() {
     assert!(plan(&root, home, SystemTime::now(), ReclaimAfter::CALM, None).is_empty());
 }
 
-/// THE DAILY BOUND TAKES WHAT THE LAST PASSING RELEASE RUN SUPERSEDED, under every custody
-/// recheck ([`stale::USED`]): a release clone's build directory holds the test unit of the
+/// THE DAILY BOUND TAKES WHAT THE KEPT RUN SUPERSEDED, under every custody recheck
+/// ([`stale::USED`]): a release clone's build directory, whose record keeps one run and retired
+/// nothing, holds the test unit of the
 /// candidate before (unwritten five days, which that run, begun four days ago, did not use), the
 /// test unit it used (unwritten as long: cargo found it fresh) and a test unit built an hour ago,
 /// all of a package the run built tests of. While a build
@@ -6230,7 +6240,7 @@ fn a_live_build_directory_loses_only_what_no_build_reads_again() {
 /// run loses nothing.
 #[cfg(unix)]
 #[test]
-fn the_daily_bound_takes_what_the_last_passing_release_run_superseded() {
+fn the_daily_bound_takes_what_the_kept_run_superseded() {
     let f = Fixture::new("build-cache-superseded");
     let root = cache_root(&f.home);
     let clone = f.dir("home/aterm-cut");
@@ -6259,7 +6269,7 @@ fn the_daily_bound_takes_what_the_last_passing_release_run_superseded() {
     let used = unit("2222222222222222", 5 * DAY);
     let fresh = unit("3333333333333333", Duration::from_secs(60 * 60));
     let began = SystemTime::now() - 4 * DAY - Duration::from_secs(60 * 60);
-    let mut record = stale::Used {
+    let mut run = stale::Used {
         began_ms: u64::try_from(
             began
                 .duration_since(std::time::UNIX_EPOCH)
@@ -6270,7 +6280,9 @@ fn the_daily_bound_takes_what_the_last_passing_release_run_superseded() {
         members: std::collections::BTreeSet::from(["aterm-grid".to_owned()]),
         ..stale::Used::default()
     };
-    record.add(&leaf, &used.join("out/aterm_grid-2222222222222222"));
+    run.add(&leaf, &used.join("out/aterm_grid-2222222222222222"));
+    let mut record = stale::Kept::default();
+    assert_eq!(record.end("verify release", run), 0);
     record.keep(&leaf).unwrap();
     age_by(&leaf.join(stale::USED), 4 * DAY);
     let pass = || {
@@ -6327,4 +6339,210 @@ fn the_daily_bound_takes_what_the_last_passing_release_run_superseded() {
     let went = pass();
     assert!(!took(&went), "{went:?}");
     assert!(again.is_dir() && used.is_dir() && fresh.is_dir());
+}
+
+/// A RUN'S END TRIMS BY THE LOCKS ITS RECORD NAMES ([`trim_run_end`], [`look_recorded`]): a build
+/// directory whose scope's first run used one test unit and whose second, ten minutes ago, used
+/// another in its place, so the record says the first is retired. While a build holds the
+/// profile's cargo lock the trim takes nothing and says the locks kept it; once it is let go the
+/// trim takes the retired unit, an hour old, whole, through a stage of its own inside the
+/// directory, counts the bytes that went, and keeps the lock, the record and the unit the run
+/// used, which nothing wrote for five days, so the record alone keeps it; it makes no inventory
+/// of the directory (no scan in any call). A stage an earlier trim left inside is finished by the
+/// next, whether or not its record retired anything. NEGATIVE CONTROLS: the same directory
+/// reached through a link is refused, nothing read or taken; a trim its caller has called off
+/// takes nothing, and one called off with a stage left leaves that stage as it stood; and a
+/// profile the record names that is a link to a folder elsewhere is not read, so the retired unit
+/// that folder holds stands.
+#[cfg(unix)]
+#[test]
+fn a_run_end_trim_reads_the_locks_its_record_names() {
+    const MINUTE: Duration = Duration::from_secs(60);
+    const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+    let f = Fixture::new("build-cache-run-end");
+    let leaf = f.dir("run-end/build.noindex");
+    let profile = leaf.join("debug");
+    std::fs::create_dir_all(&profile).unwrap();
+    let lock = profile.join(".cargo-build-lock");
+    std::fs::write(&lock, b"").unwrap();
+    let unit_in = |profile: &Path, hash: &str, ago: Duration| {
+        let dir = profile.join("build/aterm-grid").join(hash);
+        std::fs::create_dir_all(dir.join("fingerprint")).unwrap();
+        std::fs::create_dir_all(dir.join("out")).unwrap();
+        std::fs::write(dir.join("fingerprint/test-lib-aterm_grid"), b"h").unwrap();
+        std::fs::write(
+            dir.join("fingerprint/test-lib-aterm_grid.json"),
+            b"{\"rustc\":2,\"features\":\"[]\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(format!("out/aterm_grid-{hash}")),
+            vec![7u8; 64 << 10],
+        )
+        .unwrap();
+        age_tree(&dir, ago);
+        dir
+    };
+    let retired = unit_in(&profile, "1111111111111111", 60 * MINUTE);
+    let used = unit_in(&profile, "2222222222222222", 5 * DAY);
+    // A run of the build directory `leaf` that began `ago` and used the unit `hash` of its
+    // `debug` profile.
+    let ran_in = |leaf: &Path, hash: &str, ago: Duration| {
+        let mut run = stale::Used {
+            began_ms: u64::try_from(
+                (SystemTime::now() - ago)
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            )
+            .unwrap(),
+            members: std::collections::BTreeSet::from(["aterm-grid".to_owned()]),
+            ..stale::Used::default()
+        };
+        run.add(
+            leaf,
+            &leaf.join(format!(
+                "debug/build/aterm-grid/{hash}/out/aterm_grid-{hash}"
+            )),
+        );
+        run
+    };
+    let mut record = stale::Kept::default();
+    assert_eq!(
+        record.end("s", ran_in(&leaf, "1111111111111111", 120 * MINUTE)),
+        0
+    );
+    assert_eq!(
+        record.end("s", ran_in(&leaf, "2222222222222222", 10 * MINUTE)),
+        1
+    );
+    record.keep(&leaf).unwrap();
+    let scans = inventory::scans_here();
+    let go = || true;
+
+    let link = f.root.join("run-end/linked");
+    std::os::unix::fs::symlink(&leaf, &link).unwrap();
+    assert_eq!(
+        trim_run_end(&link, SystemTime::now(), &go),
+        Trimmed::default()
+    );
+    assert!(retired.is_dir(), "a link is refused");
+
+    let trimmed = trim_run_end(&leaf, SystemTime::now(), &|| false);
+    assert!(
+        trimmed.went.is_empty() && trimmed.freed == 0 && trimmed.kept.is_some(),
+        "{trimmed:?}"
+    );
+    assert!(retired.is_dir(), "its caller called the trim off");
+
+    let held = crate::lock::Flock::try_lock(std::fs::File::open(&lock).unwrap()).unwrap();
+    let trimmed = trim_run_end(&leaf, SystemTime::now(), &go);
+    assert!(trimmed.went.is_empty() && trimmed.freed == 0, "{trimmed:?}");
+    assert_eq!(
+        trimmed.kept,
+        Some(KeepReason::CargoLocks.to_string()),
+        "a build holds the profile's lock"
+    );
+    assert!(retired.is_dir());
+    drop(held);
+
+    let stage = leaf.join(DOOMED);
+    let trimmed = trim_run_end(&leaf, SystemTime::now(), &go);
+    assert_eq!(
+        trimmed.went,
+        vec![(
+            stage.clone(),
+            Unused::Stale {
+                incremental: 0,
+                units: 0,
+                superseded: 1,
+                after: RECLAIM_STALE,
+            }
+        )]
+    );
+    assert!(trimmed.freed >= 64 << 10, "{trimmed:?}");
+    assert_eq!(trimmed.kept, None);
+    assert!(!retired.exists() && !stage.exists());
+    assert!(used.join("out/aterm_grid-2222222222222222").is_file() && lock.is_file());
+    assert_eq!(
+        stale::Kept::decode(&std::fs::read(leaf.join(stale::USED)).unwrap()),
+        Some(record.clone())
+    );
+
+    let left = leaf.join(format!("{DOOMED}-3"));
+    std::fs::create_dir_all(left.join("0")).unwrap();
+    std::fs::write(left.join("0/part"), vec![7u8; 8 << 10]).unwrap();
+    let trimmed = trim_run_end(&leaf, SystemTime::now(), &|| false);
+    assert_eq!(
+        trimmed.went,
+        vec![(
+            left.clone(),
+            Unused::Refused {
+                by: Refusal::Staged
+            }
+        )],
+        "called off, the stage an earlier trim left stays staged"
+    );
+    assert!(
+        trimmed.freed == 0 && left.join("0/part").is_file(),
+        "{trimmed:?}"
+    );
+    let trimmed = trim_run_end(&leaf, SystemTime::now(), &go);
+    assert_eq!(trimmed.went, vec![(left.clone(), Unused::Unfinished)]);
+    assert!(trimmed.freed >= 8 << 10 && !left.exists(), "{trimmed:?}");
+    assert!(
+        trimmed.kept.is_some() && used.is_dir(),
+        "the retired unit went with the trim before, so nothing met the rule: {trimmed:?}"
+    );
+
+    // An identical run ends: its record retires nothing, and the trim still finishes a stage.
+    assert_eq!(
+        record.end("s", ran_in(&leaf, "2222222222222222", MINUTE)),
+        0
+    );
+    record.keep(&leaf).unwrap();
+    std::fs::create_dir_all(left.join("0")).unwrap();
+    std::fs::write(left.join("0/part"), vec![7u8; 8 << 10]).unwrap();
+    let trimmed = trim_run_end(&leaf, SystemTime::now(), &go);
+    assert_eq!(trimmed.went, vec![(left.clone(), Unused::Unfinished)]);
+    assert!(
+        trimmed.kept.is_none() && !left.exists() && used.is_dir(),
+        "nothing retired: the stage is finished and nothing is surveyed: {trimmed:?}"
+    );
+
+    // NEGATIVE CONTROL: the record of a second build directory names the profile `debug`, which
+    // is a link to a folder elsewhere laid out as a profile, with cargo's lock and the unit the
+    // record retired.
+    let other = f.dir("run-end/other.noindex");
+    let outside = f.dir("run-end/outside");
+    std::fs::write(outside.join(".cargo-build-lock"), b"").unwrap();
+    let stray = unit_in(&outside, "4444444444444444", 60 * MINUTE);
+    let stays = unit_in(&outside, "5555555555555555", 5 * MINUTE);
+    std::os::unix::fs::symlink(&outside, other.join("debug")).unwrap();
+    let mut record = stale::Kept::default();
+    assert_eq!(
+        record.end("s", ran_in(&other, "4444444444444444", 120 * MINUTE)),
+        0
+    );
+    assert_eq!(
+        record.end("s", ran_in(&other, "5555555555555555", 10 * MINUTE)),
+        1
+    );
+    record.keep(&other).unwrap();
+    let trimmed = trim_run_end(&other, SystemTime::now(), &go);
+    assert!(
+        trimmed.went.is_empty() && trimmed.freed == 0 && trimmed.kept.is_some(),
+        "{trimmed:?}"
+    );
+    assert!(
+        stray.join("out/aterm_grid-4444444444444444").is_file()
+            && stays.is_dir()
+            && stages_in(&other, OsStr::new(DOOMED)).is_empty(),
+        "a profile that is a link is not read"
+    );
+    assert_eq!(
+        inventory::scans_here(),
+        scans,
+        "a trim reads its record's profiles and makes no inventory"
+    );
 }

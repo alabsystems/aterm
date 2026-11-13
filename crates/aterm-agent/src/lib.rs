@@ -302,8 +302,10 @@ thread_local! {
 /// While held, every exchange on this thread but the requests `unanswered` names waits at least
 /// the one-minute hang detector for its reply ([`answered_within`]): the test's stand-in answers
 /// it, so a reply a loaded machine slows is waited for rather than read as unanswered. A request
-/// `unanswered` names keeps its connection's bound ([`RelayClient::bounded`]), the one its test
-/// waits out. Its drop, a panic's unwind included, puts back the predicate it replaced.
+/// `unanswered` names waits its connection's bound alone ([`RelayClient::bounded`]), the one its
+/// test names and waits out: the wait the request names ([`named_timeout`]) is the server's, which
+/// a stand-in that never answers never takes. Its drop, a panic's unwind included, puts back the
+/// predicate it replaced.
 #[cfg(all(test, unix))]
 pub(crate) struct AnsweredBut(Option<Unanswered>);
 
@@ -321,13 +323,15 @@ impl Drop for AnsweredBut {
     }
 }
 
-/// `bound`, or at least the hang detector for a request `line` a test's stand-in answers
-/// ([`AnsweredBut`]).
+/// The wait for the reply to `line` on a connection bounded by `bound` ([`exchange_wait`]) under a
+/// test's [`AnsweredBut`]: at least the hang detector for a request its stand-in answers, and
+/// `bound` alone for one it leaves unanswered.
 #[cfg(all(test, unix))]
 fn answered_within(line: &str, bound: std::time::Duration) -> std::time::Duration {
     match LEFT_UNANSWERED.get() {
-        Some(unanswered) if !unanswered(line) => bound.max(aterm_spec::wait::MUST_HAPPEN),
-        _ => bound,
+        Some(unanswered) if unanswered(line) => bound,
+        Some(_) => exchange_wait(line, bound.max(aterm_spec::wait::MUST_HAPPEN)),
+        None => exchange_wait(line, bound),
     }
 }
 
@@ -619,8 +623,10 @@ impl<S: Read + Write> RelayClient<S> {
         self.reply_started = !self.buf.is_empty();
         if let Some((arm, bound)) = self.bound {
             #[cfg(all(test, unix))]
-            let bound = answered_within(line, bound);
-            let wait = exchange_wait(line, bound).max(std::time::Duration::from_millis(1));
+            let wait = answered_within(line, bound);
+            #[cfg(not(all(test, unix)))]
+            let wait = exchange_wait(line, bound);
+            let wait = wait.max(std::time::Duration::from_millis(1));
             let started = (self.clock)(&self.io);
             arm(&self.io, wait)?;
             self.exchange = Some(ExchangeBudget { started, wait });

@@ -27,7 +27,8 @@ use crate::{
     Error, Result,
     database::Change,
     typed::{
-        Collection, Column, Derive, Kind, Member, OnConflict, Refused, Table, Ty, Writer, Writers,
+        ClaimRule, Collection, Column, Derive, Kind, Member, OnConflict, Refused, Table, Ty,
+        Writer, Writers,
         cell::{self, CellKey, CellValue, Cells},
         keys,
     },
@@ -219,13 +220,13 @@ crate::att_collection!(
     /// identity, minted once. No serial number and no IOPlatformUUID are stored.
     pub MACHINE = Collection {
         name: "machine",
-        version: 2,
+        version: 3,
         kind: Kind::Cells,
         writers: Writers::Owner,
         prefix: "mc",
         derive: Derive::BirthSha256,
         columns: &[
-            Column::new("label", Ty::Label),
+            Column::new("label", Ty::Label).claim(ClaimRule::Label),
             Column::new("aliases", Ty::Set(&Ty::Label)),
             Column::new("status", Ty::Enum(MACHINE_STATUS))
                 .on_conflict(OnConflict::Prefer(&["lost", "parked", "active", "planned"]))
@@ -247,7 +248,7 @@ crate::att_collection!(
             Column::new("clis", Ty::Set(&Ty::Ref("cli"))),
             Column::new("location", Ty::Text(64)).null(),
             Column::new("fleet_node", Ty::Hex(32)).null().writer(Writer::Birth),
-            Column::new("node", Ty::Hex(16)).null().since(2),
+            Column::new("node", Ty::Hex(16)).null().since(2).claim(ClaimRule::One),
             Column::new("hosts", Ty::List(&Ty::Text(64), 4)).null().writer(Writer::Birth),
             // Display-only unless the merged Mac's own facts row names the same target (§6).
             Column::new("merged_into", Ty::Ref("machine")).null(),
@@ -256,9 +257,7 @@ crate::att_collection!(
             src(),
             notes_src(),
         ],
-        // A fleet node names one Mac: two live rows naming it are a finding, and adoption by
-        // node binds neither (`import::Kind::NodeAmbiguous`).
-        unique: &[&["label"], &["node"]],
+        unique: &[],
         max_row: 0,
     }
 );

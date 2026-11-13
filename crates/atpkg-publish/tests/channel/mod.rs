@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use atpkg_publish::channel::Log;
-use atpkg_publish::ctx::Ctx;
+use atpkg_publish::ctx::{Ctx, HostChoice};
 use atpkg_publish::host::fake::FakeHost;
 use atpkg_publish::host::{Hosts, Slug};
 use atpkg_publish::quad::index_tag;
@@ -150,7 +150,8 @@ impl Doc {
     }
 }
 
-/// One machine, one fake GitHub, one hermetic context.
+/// One machine, one fake GitHub, one hermetic context, built for agh (`HostChoice::Agh`): its
+/// pre-claim checks ask the fake's `write_preflight`, and it holds no token file.
 pub struct Rig {
     pub tmp: aterm_tempfile::TempDir,
     pub keys: Keys,
@@ -167,12 +168,11 @@ impl Rig {
         let tmp = scratch(label);
         let home = tmp.path().join("home");
         let host = Arc::new(FakeHost::new());
-        let mut ctx = keys.ctx(&home, host.clone());
+        let mut ctx = keys
+            .ctx(&home, host.clone())
+            .with_host_choice(HostChoice::Agh);
         ctx.repo_root = tmp.path().join("repo");
         ctx.state_dir = tmp.path().join("state");
-        std::fs::create_dir_all(ctx.tokens.channel.parent().expect("secrets dir"))
-            .expect("mkdir secrets");
-        std::fs::write(&ctx.tokens.channel, "channel-token\n").expect("token");
         Self {
             tmp,
             keys,

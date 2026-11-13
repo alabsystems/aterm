@@ -291,6 +291,7 @@ fn collectable(pid: u32) -> bool {
 
 #[test]
 fn the_wait_for_a_shells_retirement_outlasts_a_slow_exit_and_a_stop_ends_it() {
+    use std::os::fd::IntoRawFd;
     let mut shell = aterm_uds::spawnfd::command("/bin/sh")
         .args(["-c", "read _; exit 3"])
         .stdin(aterm_uds::spawnfd::Stdio::piped())
@@ -303,9 +304,9 @@ fn the_wait_for_a_shells_retirement_outlasts_a_slow_exit_and_a_stop_ends_it() {
         watch: Some(aterm_uds::exitwatch::exit_fd(pid).expect("the shell is watched")),
         pid,
     };
-    let mut wake = [0; 2];
-    // SAFETY: a two-int out-param for `pipe(2)`.
-    assert_eq!(unsafe { libc::pipe(wake.as_mut_ptr()) }, 0, "the wake pipe");
+    let wake = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("the wake pipe");
     // SAFETY: one byte from a live buffer into the pipe's write end.
     assert_eq!(unsafe { libc::write(wake[1], [1u8].as_ptr().cast(), 1) }, 1);
     let (ended_tx, ended) = std::sync::mpsc::channel();
@@ -402,12 +403,13 @@ fn a_shell_already_exiting_when_its_reader_attaches_keeps_its_wait() {
 
 #[test]
 fn a_shell_that_could_not_be_watched_is_still_waited_for() {
+    use std::os::fd::IntoRawFd;
     let mut shell = sh("read _; exit 3");
     let pid = shell.id();
     let unwatched = || super::ShellExit { watch: None, pid };
-    let mut wake = [0; 2];
-    // SAFETY: a two-int out-param for `pipe(2)`.
-    assert_eq!(unsafe { libc::pipe(wake.as_mut_ptr()) }, 0, "the wake pipe");
+    let wake = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("the wake pipe");
     // SAFETY: one byte from a live buffer into the pipe's write end.
     assert_eq!(unsafe { libc::write(wake[1], [1u8].as_ptr().cast(), 1) }, 1);
     assert!(

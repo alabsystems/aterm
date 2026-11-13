@@ -7,7 +7,7 @@ use aterm_types::mouse::WheelDir;
 #[cfg(unix)]
 use std::io::Read;
 #[cfg(unix)]
-use std::os::fd::FromRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::sync::Arc;
 
 #[cfg(unix)]
@@ -19,11 +19,10 @@ struct CaptureSink {
 #[cfg(unix)]
 impl CaptureSink {
     fn new() -> Self {
-        let mut fds = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe(2)");
+        let (read, write) = aterm_uds::pipe().expect("pipe");
         Self {
-            read: fds[0],
-            write: fds[1],
+            read: read.into_raw_fd(),
+            write: write.into_raw_fd(),
         }
     }
 

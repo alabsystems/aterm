@@ -354,6 +354,13 @@ pub struct Reading {
     pub version: Option<String>,
     /// The process's model (`model.id`), where it is a model id.
     pub model: Option<String>,
+    /// The effort the process's session is set to (`effort.level`: `high`), where the payload
+    /// names one in a word ([`effort_word`]): Claude Code's own statement of it at this run,
+    /// which an `/effort` typed while a turn runs changes at once, where the transcript's rows
+    /// keep the effort that turn's requests are sent with until its reply lands. `None` from a
+    /// payload that names none (2.1.322 names one only for a model that takes an effort) and
+    /// from a file written before the key.
+    pub effort: Option<String>,
     /// `context_window.remaining_percentage`, rounded: how much of the model's context window
     /// is left, as Claude Code counts it (`None` before the first reply).
     pub ctx_left: Option<u8>,
@@ -414,6 +421,16 @@ fn whole_pct_of(value: &Value) -> Option<u32> {
         .filter(|f| f.is_finite() && (0.0..=100.0).contains(f))?;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     Some(f.round() as u32)
+}
+
+/// An effort level as the status-line payload and the reading's file spell it: one lowercase
+/// word of letters and digits, at most 16 bytes (`low`, `xhigh`, or a level a later build
+/// adds); `None` for anything else.
+fn effort_word(value: Option<&Value>) -> Option<String> {
+    word_of(value, 16).filter(|word| {
+        word.bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+    })
 }
 
 /// `rate_limits.<name>` as a [`Window`]: both fields, or none.
@@ -481,6 +498,7 @@ impl Reading {
             version: word_of(doc.get("version"), 32),
             model: word_of(doc.get("model").and_then(|m| m.get("id")), 64)
                 .filter(|m| super::upgrade::is_model_id(m)),
+            effort: effort_word(doc.get("effort").and_then(|e| e.get("level"))),
             ctx_left: doc
                 .get("context_window")
                 .and_then(|c| c.get("remaining_percentage"))
@@ -564,6 +582,7 @@ impl Reading {
         o.insert("cache".to_owned(), Value::Object(cache));
         o.insert("version".to_owned(), Value::from(self.version.clone()));
         o.insert("model".to_owned(), Value::from(self.model.clone()));
+        o.insert("effort".to_owned(), Value::from(self.effort.clone()));
         o.insert(
             "ctx_left".to_owned(),
             Value::from(self.ctx_left.map(u64::from)),
@@ -634,6 +653,10 @@ impl Reading {
             model: match doc.get("model") {
                 None | Some(Value::Null) => None,
                 Some(v) => Some(word_of(Some(v), 64).filter(|m| super::upgrade::is_model_id(m))?),
+            },
+            effort: match doc.get("effort") {
+                None | Some(Value::Null) => None,
+                Some(v) => Some(effort_word(Some(v))?),
             },
             ctx_left: match doc.get("ctx_left") {
                 None | Some(Value::Null) => None,

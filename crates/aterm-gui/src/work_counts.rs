@@ -5,6 +5,82 @@
 
 use std::cell::Cell;
 
+/// Visits in title observation, drift flush and the complete label refresh.
+/// Probes count retain predicates, not hash-table collisions/capacity scans. Bytes count the two chrome-cache clone_from
+/// writes only; they exclude captured titles, tooltips, presentation and native copies.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TitleRefreshWork {
+    pub drift_tabs: usize,
+    pub drift_cache_probes: usize,
+    pub eligibility_reads: usize,
+    pub identities: usize,
+    pub reads: usize,
+    pub cache_probes: usize,
+    pub cache_writes: usize,
+    pub chrome_bytes: usize,
+}
+
+thread_local! {
+    static TITLE_REFRESH: Cell<TitleRefreshWork> = const { Cell::new(TitleRefreshWork {
+        drift_tabs: 0, drift_cache_probes: 0, eligibility_reads: 0,
+        identities: 0, reads: 0, cache_probes: 0, cache_writes: 0, chrome_bytes: 0,
+    }) };
+}
+
+pub(crate) fn title_drift_tab_visited() {
+    TITLE_REFRESH.with(|c| {
+        let mut v = c.get();
+        v.drift_tabs += 1;
+        c.set(v);
+    });
+}
+pub(crate) fn title_drift_cache_probed() {
+    TITLE_REFRESH.with(|c| {
+        let mut v = c.get();
+        v.drift_cache_probes += 1;
+        c.set(v);
+    });
+}
+pub(crate) fn title_eligibility_read() {
+    TITLE_REFRESH.with(|c| {
+        let mut v = c.get();
+        v.eligibility_reads += 1;
+        c.set(v);
+    });
+}
+pub(crate) fn title_identity_visited() {
+    TITLE_REFRESH.with(|c| {
+        let mut v = c.get();
+        v.identities += 1;
+        c.set(v);
+    });
+}
+pub(crate) fn title_read_visited() {
+    TITLE_REFRESH.with(|c| {
+        let mut v = c.get();
+        v.reads += 1;
+        c.set(v);
+    });
+}
+pub(crate) fn title_cache_probed() {
+    TITLE_REFRESH.with(|c| {
+        let mut v = c.get();
+        v.cache_probes += 1;
+        c.set(v);
+    });
+}
+pub(crate) fn title_cache_copy(bytes: usize) {
+    TITLE_REFRESH.with(|c| {
+        let mut v = c.get();
+        v.cache_writes += 1;
+        v.chrome_bytes += bytes;
+        c.set(v);
+    });
+}
+pub(crate) fn take_title_refresh() -> TitleRefreshWork {
+    TITLE_REFRESH.with(|c| c.replace(TitleRefreshWork::default()))
+}
+
 thread_local! {
     static PLANS_BUILT: Cell<usize> = const { Cell::new(0) };
     static LATENCY_STAMPS_TOUCHED: Cell<usize> = const { Cell::new(0) };
@@ -242,7 +318,6 @@ thread_local! {
     static CARD_TICKS: Cell<usize> = const { Cell::new(0) };
     static CARD_LAYOUTS: Cell<usize> = const { Cell::new(0) };
     static CARD_READS: Cell<usize> = const { Cell::new(0) };
-    static CARD_NOTICE_READS: Cell<usize> = const { Cell::new(0) };
     static AUTOPILOT_READS: Cell<usize> = const { Cell::new(0) };
     static CARD_LINE_INKS: Cell<usize> = const { Cell::new(0) };
     static FOOTER_TIMELINE_LOCKS: Cell<usize> = const { Cell::new(0) };
@@ -299,13 +374,6 @@ pub(crate) fn card_read() {
 }
 pub(crate) fn take_card_reads() -> usize {
     take(&CARD_READS)
-}
-
-pub(crate) fn card_notice_read() {
-    bump(&CARD_NOTICE_READS);
-}
-pub(crate) fn take_card_notice_reads() -> usize {
-    take(&CARD_NOTICE_READS)
 }
 
 pub(crate) fn autopilot_read() {

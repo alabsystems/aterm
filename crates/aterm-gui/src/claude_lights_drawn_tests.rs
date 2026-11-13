@@ -434,7 +434,7 @@ fn a_footer_left_bare_under_an_off_switch_is_switch_only() {
         session,
         face,
         program,
-        label: None,
+        mark: None,
         arrow: None,
         paint: crate::claude_footer::SwitchPaint::bare(
             face,

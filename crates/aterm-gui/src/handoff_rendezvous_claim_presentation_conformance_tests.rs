@@ -8,7 +8,7 @@ use crate::seamless::AttestedParent;
 use aterm_models_update::native_update_rendezvous_claim_model;
 use aterm_spec::derive::Model;
 use aterm_spec::interp::{State, with_buggy};
-use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -159,14 +159,14 @@ impl ForkedListener {
         let addr_len = libc::socklen_t::try_from(std::mem::size_of::<libc::sockaddr_un>())
             .expect("sockaddr_un size");
         addr.sun_len = u8::try_from(addr_len).expect("sockaddr_un fits sun_len");
-        let mut report = [0i32; 2];
-        // SAFETY: `pipe` initializes two file descriptors in `report`.
-        assert_eq!(unsafe { libc::pipe(report.as_mut_ptr()) }, 0, "report pipe");
+        let (read_end, write_end) = aterm_uds::pipe().expect("report pipe");
+        let report = write_end.as_raw_fd();
         let table = aterm_uds::spawnfd::descriptor_bound();
 
         // Held across the fork alone, so the child copies no neighbour's descriptor between
-        // its creation and its close-on-fork mark (`aterm_uds::kept_out`).
-        let spawning = aterm_uds::spawn_lock::spawning();
+        // its creation and its close-on-fork mark (`aterm_uds::kept_out`); the report's write
+        // end, which the child keeps, loses its own mark for this fork alone.
+        let spawning = aterm_uds::spawn_lock::handing(&[report]);
         // SAFETY: child only invokes async-signal-safe syscalls before `_exit`.
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
@@ -174,12 +174,12 @@ impl ForkedListener {
             // SAFETY: async-signal-safe syscalls on child-owned descriptors and stack memory before `_exit`.
             unsafe {
                 for fd in 3..table {
-                    if fd != report[1] {
+                    if fd != report {
                         libc::close(fd);
                     }
                 }
                 let tell = |byte: u8| {
-                    libc::write(report[1], core::ptr::from_ref(&byte).cast(), 1);
+                    libc::write(report, core::ptr::from_ref(&byte).cast(), 1);
                 };
                 let code: i32 = 'serve: {
                     let listener = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
@@ -228,17 +228,10 @@ impl ForkedListener {
             }
         }
         drop(spawning);
-        // SAFETY: `report` holds freshly created pipe descriptors owned exclusively here.
-        let (read_end, write_end) = unsafe {
-            (
-                OwnedFd::from_raw_fd(report[0]),
-                OwnedFd::from_raw_fd(report[1]),
-            )
-        };
         drop(write_end);
         let listener = Self {
             pid,
-            report: read_end,
+            report: read_end.into(),
             path,
             _dir: dir,
         };

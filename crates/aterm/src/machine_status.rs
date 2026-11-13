@@ -784,16 +784,25 @@ pub(crate) fn name_area(name: &Result<crate::converge::MacName, String>) -> Area
         ),
         Some(MacNamePending::Elevation(pending)) => Area::due(
             NAME,
+            format!("{target}; {fleet}; {pending}; setup's naming permission is not in place"),
+            Who::Person,
+            "complete setup's Mac password step, which leaves the naming permission \
+             (or run `aterm init` in your own Mac login)",
+        ),
+        // A rule that stands is never owed to setup's password step, which leaves a missing
+        // one only: setup the person asks for renews an older rule, or an unreadable one that
+        // predates the read access setup now grants. No automatic pass asks for that password.
+        Some(MacNamePending::Renewal(pending)) => Area::due(
+            NAME,
+            format!("{target}; {fleet}; {pending}; setup's naming permission is out of date"),
+            Who::Person,
+            "renew setup's naming permission: run `aterm init` in your own Mac login",
+        ),
+        Some(MacNamePending::Unread(pending)) => Area::due(
+            NAME,
             format!("{target}; {fleet}; {pending}"),
             Who::Person,
-            "complete setup's Mac password step (or run `aterm init` in your own Mac login)",
-        ),
-        Some(MacNamePending::Unread(pending)) => Area::unread(
-            NAME,
-            format!(
-                "{target}; {fleet}; {pending}; the existing naming permission could not be checked"
-            ),
-            "check the Mac's existing naming permission before asking for another password",
+            "renew setup's naming permission: run `aterm init` in your own Mac login",
         ),
         Some(MacNamePending::Collision(pending)) => Area::due(
             NAME,

@@ -20,17 +20,9 @@ fn main() -> std::process::ExitCode {
         return code;
     }
     let raw: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
-    #[cfg(unix)]
-    let mut raw = raw;
-    // SAFETY: CLI entry has not started any other thread.
-    #[cfg(unix)]
-    if let Err(why) = unsafe { aterm_verify::land::own_judgment(&mut raw) } {
-        eprintln!("verify: {why}");
-        std::process::exit(aterm_verify::exit::COULD_NOT_RUN);
-    }
     // Pin reads and writes to one usable provider before any worker dispatch.
     let _ = aterm_verify::git_provider::pin();
-    // SAFETY: entry has started no other thread; the judgment watch leaves a process.
+    // SAFETY: CLI entry has started no other thread.
     if let Some(code) = unsafe { aterm_verify::remote_cli::entry(&raw) } {
         return code;
     }

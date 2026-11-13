@@ -48,6 +48,9 @@ const FENCE: &str = "reservation";
 const STATEMENT: &str = "statement";
 /// Why the statement admitted nothing on the last recovery pass ([`note_statement`]).
 const REFUSED: &str = "statement-refused";
+/// That this home's succession reached its completing save at least once ([`mark_completed`]):
+/// it completed, or was about to.
+const COMPLETED: &str = "completed";
 const MAX_STATE: usize = 16 * 1024;
 const MAX_GENERATIONS: usize = 8;
 const ADVANCE_WITHIN: Duration = Duration::from_secs(20);
@@ -156,6 +159,39 @@ fn fenced(paths: &Paths) -> Result<bool> {
     Ok(false)
 }
 
+/// Record, durably and once, that this home's succession reached its completing save: a file
+/// beside the selection that no write removes. [`import_until`] writes it before the save that
+/// gives the selection its completion, so no home that completes on this release holds a
+/// completed selection without it; a recovery pass ([`advance_at`]) writes it for a selection
+/// that holds a completion and has none, as a home that completed on a release without the
+/// mark has. It is what tells a selection file lost after its import completed, which
+/// [`reserve_until`] writes again with no completion, from the record of a succession that
+/// never completed ([`may_have_completed`]).
+///
+/// Written first, it is also held by a home whose completing save never landed (the process
+/// died between the two, or the save failed): nothing completed there and the successor
+/// authored nothing, and its held reads refuse until a pass completes the import. Removing
+/// the mark after a failed save would not tell that state from a save that landed.
+fn mark_completed(paths: &Paths) -> Result<()> {
+    let root = root(paths);
+    fsx::write_new(&root.join(COMPLETED), b"{\"version\":1}", 0o600)
+        .map_err(crate::table::failure)?;
+    Ok(aterm_durable::durable_dir(&root)?)
+}
+
+/// Whether this home's succession may have completed: it holds the mark ([`mark_completed`]),
+/// which every completion of this release leaves and which a completing save that never
+/// landed leaves too. Where it completed its successor could author from then on, so this
+/// home's records are not known to be its lineage's newest, whatever its selection record
+/// says now. A home with no mark is not shown never to have completed: one that completed on
+/// a release that wrote none and lost its selection before a recovery pass ran here, or that
+/// lost the mark with the selection, holds none.
+fn may_have_completed(paths: &Paths) -> Result<bool> {
+    Ok(fsx::read_private(&root(paths).join(COMPLETED), MAX_STATE)
+        .map_err(crate::table::failure)?
+        .is_some())
+}
+
 #[derive(Clone)]
 struct Selection {
     original: Paths,
@@ -205,14 +241,20 @@ impl Selection {
         })
     }
     fn read(paths: &Paths) -> Result<Option<Self>> {
-        let selection = fsx::read_private(&root(paths).join(STATE), MAX_STATE)
+        Ok(Self::read_record(paths)?.map(|(selection, _)| selection))
+    }
+    /// [`Self::read`], with the record's bytes as the file held them.
+    fn read_record(paths: &Paths) -> Result<Option<(Self, aterm_secrets::SecretBytes)>> {
+        let Some(record) = fsx::read_private(&root(paths).join(STATE), MAX_STATE)
             .map_err(crate::table::failure)?
-            .map(|v| Self::parse(v.as_slice()))
-            .transpose()?;
-        if selection.as_ref().is_some_and(|s| s.original != *paths) {
+        else {
+            return Ok(None);
+        };
+        let selection = Self::parse(record.as_slice())?;
+        if selection.original != *paths {
             return Err(fail());
         }
-        Ok(selection)
+        Ok(Some((selection, record)))
     }
     fn save(&self) -> Result<()> {
         fsx::write_atomic(&root(&self.original).join(STATE), &self.bytes(), 0o600)
@@ -267,12 +309,117 @@ impl Selection {
 }
 
 fn trust(bootstrap: &Bootstrap) -> String {
-    let trust = bootstrap.trust();
+    trust_hex(bootstrap.trust())
+}
+
+/// How a selection record spells a lab's trust: its network, authority and genesis, in hex.
+fn trust_hex(trust: aterm_secrets::commons::journal::Trust) -> String {
     let mut bytes = [0u8; 16 + 32 + 32];
     bytes[..16].copy_from_slice(&trust.network);
     bytes[16..48].copy_from_slice(&trust.authority);
     bytes[48..80].copy_from_slice(&trust.genesis);
     aterm_codec::hex::encode_lower(&bytes)
+}
+
+/// What lets a read answer a displaced table from the records its home still holds
+/// ([`Store::observe_displaced`]): the home's own selection record, as read when it named the
+/// session's writer and lab and held no completion. That is what this gate knows, and no more.
+/// A home with such a record is fenced: nothing authors or mutates a table there any more
+/// ([`Observation::check`], [`allow_mutation`]), so the prefix each of its claims witnesses is
+/// what it holds. Where the record is the one its reservation first wrote, the succession has
+/// never completed, and its successor, whatever part of an import it holds, has authored
+/// nothing, since authoring there needs the completion ([`guard_lineage_until`]). One state
+/// reads the same and is not that one: a selection file lost after its import completed is
+/// written again by [`reserve_until`] with no completion, in the bytes the first reservation
+/// wrote (the kept reservation and link must equal them), so until the import completes again
+/// the successor may hold records it authored that this home does not. The home's completion
+/// mark, where it holds one, tells the two apart ([`may_have_completed`], which names the
+/// homes that hold none): this gate refuses a home that holds one, as [`held_here`], the read
+/// gate of every pending succession (FL-14), does. It names no candidate home, and it grants
+/// nothing but that read: no writer, no binding and no resource right.
+pub(crate) struct Preserving {
+    paths: Paths,
+    record: Vec<u8>,
+}
+
+/// What [`Preserving::of`] refuses a home with whose selection is not the session's standing
+/// fence.
+pub(crate) const NOT_HELD: &str = "this home's writer succession completed or may have, or names another writer or lab; no read is held from it";
+
+/// What [`Preserving::of`] refuses a home with that is fenced ([`fenced`]) and holds no selection
+/// record: the record was lost, or a reservation has written its fence and not yet its selection.
+pub(crate) const UNSELECTED: &str = "this home is fenced but its writer succession's selection record is missing; no read is held from it";
+
+impl Preserving {
+    /// `session`'s home as [`Self`], read with [`Selection::read`]'s own read and parse; none
+    /// where the home has no selection and nothing else fences it ([`fenced`]): no succession
+    /// was reserved there.
+    ///
+    /// The session's currency is not judged here: the read this gates judges it. The claim read
+    /// of [`Store::observe_displaced`] (`claim_read`) takes the source reads of the vault that
+    /// open holds, which a vault writer's moment refuses as busy, and asks the session's
+    /// context under them before it reads the claim; a reader observes a busy read again.
+    /// [`Session::control_context`] judges currency with no source read and takes that moment
+    /// for membership that changed, so asking it here turned a busy read into a refusal. The
+    /// lab compared is the session's own ([`Session::trust`]): the trust its control journal
+    /// was read under, which every session's access holds equal to its bootstrap's, spelled as
+    /// [`reserve_until`] spelled the reserving session's bootstrap's.
+    ///
+    /// # Errors
+    /// The selection, or where there is none the reservation or the candidate link, cannot be
+    /// read; the selection cannot be parsed or names another home; the home is fenced and
+    /// holds no selection ([`UNSELECTED`]); or the selection is not this session's standing
+    /// fence ([`NOT_HELD`]): it holds a completion (an invalidated completion still holds
+    /// one), the home holds a completion mark, so a completion may have preceded this record
+    /// ([`may_have_completed`]), or it names another writer than the session's or another lab
+    /// than its custody's, as [`reserve_until`] wrote them from the reserving session and its
+    /// bootstrap; or that mark cannot be read. The two refusals in words say so, so a reader
+    /// that asked for a held read learns why it got none.
+    pub(crate) fn of(session: &Session<'_>) -> Result<Option<Self>> {
+        #[cfg(test)]
+        seams::reached(seams::Point::HeldGate);
+        let paths = session.paths();
+        let Some((selection, record)) = Selection::read_record(paths)? else {
+            if fenced(paths)? {
+                return Err(Error::new(UNSELECTED));
+            }
+            return Ok(None);
+        };
+        if selection.complete.is_some()
+            || selection.actor != aterm_codec::hex::encode_lower(&session.actor())
+            || selection.trust != trust_hex(session.trust())
+            || may_have_completed(paths)?
+        {
+            return Err(Error::new(NOT_HELD));
+        }
+        Ok(Some(Self {
+            paths: paths.clone(),
+            record: record.as_slice().to_vec(),
+        }))
+    }
+
+    /// Whether the home's selection record is still, byte for byte, the one [`Self::of`] read.
+    /// That is enough to know the record still holds no completion: the one `of` read has none,
+    /// and the only write that gives a selection one is the completing save ([`import_until`]),
+    /// which replaces the file with other bytes. It does not show that none was ever written:
+    /// no write clears a completion in a record, but a selection file that is lost is written
+    /// again without one, in the same bytes ([`reserve_until`]). `of` tells that record from
+    /// the first by the home's completion mark, which is written before the completing save
+    /// and never removed, so in a home that holds its mark a record `of` passed is one no
+    /// completion preceded; in one that holds none ([`may_have_completed`]) neither this check
+    /// nor `of` tells them apart. (An
+    /// invalidated completion is a seal mismatch computed when the record is read, not a
+    /// rewrite of it; it never passes `of`.) A session of a home that is no successor keeps no
+    /// generation observation ([`Session::observe_selected`]), so its own context checks never
+    /// read the selection: for a held read of a displaced table this is the only check that
+    /// does.
+    ///
+    /// # Errors
+    /// The selection cannot be read or parsed, or names another home.
+    pub(crate) fn stands(&self) -> Result<bool> {
+        Ok(Selection::read_record(&self.paths)?
+            .is_some_and(|(_, record)| record.as_slice() == self.record.as_slice()))
+    }
 }
 
 /// Claim bytes are the independently acknowledged prefix commitments. A later
@@ -702,17 +849,29 @@ pub(crate) fn guard_read_until(paths: &Paths, deadline: Instant) -> Result<()> {
 }
 
 /// Whether `paths` still holds the newest records of its lineage, as a read of them needs: it
-/// has no succession of its own, or one whose import has never completed, so its successor has
-/// authored nothing. A completed succession supersedes it, and one whose completion a later
-/// source receipt invalidated may have a successor that authored since: both refuse.
+/// has no selection record, or one that holds no completion, and no completion mark
+/// ([`may_have_completed`]). That is a home with no succession of its own, or one whose import
+/// has never completed, so its successor has authored nothing. A selection file lost after its
+/// import completed reads as no succession, and once [`reserve_until`] has written it again,
+/// as one that never completed, though the successor may have authored: the mark, which
+/// outlives the file, refuses both as a succession still preserving, in a home that holds one
+/// (a home whose completing save never landed holds one too, and refuses until a pass
+/// completes it). A completed succession
+/// supersedes this home, and one whose completion a later source receipt invalidated may have
+/// a successor that authored since: both refuse.
 fn held_here(paths: &Paths) -> Result<()> {
     match Selection::read(paths)? {
-        None => Ok(()),
-        Some(selection) if selection.complete.is_none() => Ok(()),
-        Some(selection) if selection.complete == Some(seal(paths)?) => Err(Error::new(
-            "original Commons writer is fenced by succession",
-        )),
-        Some(_) => Err(preserving()),
+        Some(selection) if selection.complete.is_some() => {
+            if selection.complete == Some(seal(paths)?) {
+                Err(Error::new(
+                    "original Commons writer is fenced by succession",
+                ))
+            } else {
+                Err(preserving())
+            }
+        }
+        _ if may_have_completed(paths)? => Err(preserving()),
+        _ => Ok(()),
     }
 }
 
@@ -812,7 +971,10 @@ pub(crate) fn observed_selection_within(
 /// holds stays readable until its successor has imported them: a writer recovery that cannot
 /// finish (a successor the vault has not admitted, a missing history key) never makes the
 /// records already held unreadable. An incomplete candidate is never named, and a succession
-/// whose completion was invalidated refuses, as its successor may have authored since. No predecessor is
+/// whose completion was invalidated refuses, as its successor may have authored since; so does
+/// a home that holds a completion mark while its selection record is missing or holds no
+/// completion ([`may_have_completed`]): the record was lost after the import completed, or the
+/// completing save has not landed, and the next recovery pass completes it. No predecessor is
 /// observed yet, so this says which home a read opens, never that it may: a reader opens that
 /// home's established custody and then observes it ([`observe_generation`]), so the observation
 /// it keeps is no older than that custody's wait.
@@ -834,6 +996,11 @@ fn generation_until(paths: &Paths, read_by: Instant, completed: bool) -> Result<
     for depth in 0..=MAX_GENERATIONS {
         within(read_by)?;
         let Some(selection) = Selection::read(&selected)? else {
+            // A home whose succession completed and whose selection file is lost names no
+            // successor, and is not known to hold the newest records ([`may_have_completed`]).
+            if may_have_completed(&selected)? {
+                return Err(preserving());
+            }
             break;
         };
         if depth == MAX_GENERATIONS {
@@ -841,9 +1008,10 @@ fn generation_until(paths: &Paths, read_by: Instant, completed: bool) -> Result<
         }
         if selection.complete != Some(seal(&selected)?) {
             // An import that never completed leaves every record where it was; one whose
-            // completion was invalidated may have a successor that authored since, so no home
-            // in this lineage is known to hold the newest records.
-            if completed || selection.complete.is_some() {
+            // completion was invalidated, or whose record was lost and written again without
+            // it, may have a successor that authored since, so no home in this lineage is
+            // known to hold the newest records.
+            if completed || selection.complete.is_some() || may_have_completed(&selected)? {
                 return Err(preserving());
             }
             break;
@@ -1374,6 +1542,9 @@ fn import_until(
     }
     current()?;
     selection.authorize_until(deadline)?;
+    // The mark first: a crash between the two leaves a pending selection whose held reads
+    // refuse until the next pass completes it, never a completed one with no mark.
+    mark_completed(&selection.original)?;
     selection.complete = Some(before);
     selection.save()
 }
@@ -1620,6 +1791,16 @@ fn advance_at(paths: &Paths, config: &Path, depth: usize, budget: &Budget<'_>) -
         return Err(fail());
     }
     let existing = Selection::read(paths)?;
+    if existing
+        .as_ref()
+        .is_some_and(|selection| selection.complete.is_some())
+        && !may_have_completed(paths)?
+    {
+        // A home whose import completed on a release that wrote no mark gets one here, before
+        // any check that can refuse this pass: the mark is a fact of the home, not of this
+        // owner. The link is atomic and answers "taken" to a second writer, so it needs no lock.
+        mark_completed(paths)?;
+    }
     let recovering = fenced(paths)?;
     let bootstrap = match Bootstrap::cached_until(paths, budget.until) {
         Ok(Some(bootstrap)) => bootstrap,

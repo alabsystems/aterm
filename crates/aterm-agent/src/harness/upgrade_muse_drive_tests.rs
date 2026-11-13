@@ -502,6 +502,7 @@ impl Rig {
     /// Snapshot of the running Muse process.
     fn snap(&self, session: Option<&str>) -> Snapshot {
         Snapshot {
+            lifetime: None,
             launch_env: None,
             auth_observed: true,
             route: crate::harness::accounts::AuthRoute::Outside,
@@ -1795,6 +1796,7 @@ fn an_in_flight_muse_relaunch_waits_out_a_hand_and_counts_staleness_from_seen_ex
     let r = carry_in_flight_with(
         &rig.opts,
         Report {
+            rung: None,
             pid: TUI,
             tab: TAB.to_string(),
             session: key(TAB),
@@ -1812,6 +1814,7 @@ fn an_in_flight_muse_relaunch_waits_out_a_hand_and_counts_staleness_from_seen_ex
     let expired_r = carry_in_flight_with(
         &rig.opts,
         Report {
+            rung: None,
             pid: TUI,
             tab: TAB.to_string(),
             session: key(TAB),
@@ -1873,6 +1876,7 @@ fn carry_adopted(rig: &Rig, cause: &str, land: bool) -> Report {
     carry_in_flight_with(
         &opts,
         Report {
+            rung: None,
             pid: TUI,
             tab: TAB.to_string(),
             session: key(TAB),
@@ -1930,6 +1934,7 @@ fn a_late_muse_relaunch_at_the_loops_point_keeps_its_own_carry_on() {
         let r = carry_in_flight_with(
             &at,
             Report {
+                rung: None,
                 pid: TUI,
                 tab: TAB.to_string(),
                 session: key(TAB),
@@ -2066,18 +2071,18 @@ fn a_relaunch_under_land_is_carried_on_as_under_cruise() {
 }
 
 /// A MUSE CODE RELAUNCH INTO A DONE REPORT ASKS THE DONE CHECK, as Claude Code's does
-/// (`a_relaunch_into_a_done_report_in_words_asks_the_done_check`): the resumed session's last
+/// (`a_relaunch_into_a_done_claim_asks_the_done_check`): the resumed session's last
 /// reply claims the work done, so the facts of the relaunch are typed with Cruise's done check
 /// (`continued:check`, the reversible clause where the claim names an irreversible act) in place
 /// of `upgrade::CARRY_ON`. NEGATIVE CONTROL: a reply of work going on still gets the carry-on.
 /// MUTANT: with `relaunch::said_on_screen` answering no claim, the done reports get the carry-on.
 #[test]
-fn a_relaunch_into_a_done_report_in_words_asks_the_done_check() {
+fn a_relaunch_into_a_done_claim_asks_the_done_check() {
     use crate::harness::relaunch::{CAUSE_EXIT, CAUSE_HOST};
     use crate::supervise::policy::turn_end::{DONE_CHECK, DONE_CHECK_REVERSIBLE, HostTurn};
-    let done = "All tasks are complete and verified; nothing is left to do.";
+    let done = "All tasks are complete and verified.\nNothing left: the parser and its tests are on origin/main.";
     let forced = "All tasks are complete and verified. Should I force-push the rewritten history to \
-                  origin main?";
+                  origin main?\nNothing left: the parser and its tests are on origin/main.";
     let going = "Committed the parser; the lexer is next.";
     for cause in [CAUSE_EXIT, CAUSE_HOST] {
         for (said, check, irreversible) in [

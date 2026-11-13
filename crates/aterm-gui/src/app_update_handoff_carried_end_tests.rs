@@ -446,6 +446,7 @@ fn an_unseen_end_and_the_tasks_work_cross_a_seamless_update() {
         .map(|rec| SessionRecord {
             autopilot_end: None,
             wakes: None,
+            agent_act: None,
             ..rec
         })
         .collect();
@@ -498,6 +499,7 @@ fn a_carried_end_is_judged_at_once_and_never_outlives_its_work() {
         sid: sid.to_string(),
         autopilot_end: Some(row.to_string()),
         wakes: None,
+        agent_act: None,
         ..base.clone()
     };
     let unseen = format!("end=landed@{at} seen=0 worked=0");
@@ -586,6 +588,7 @@ fn a_landing_withdrawn_before_the_spend_brings_no_end_back() {
             sid: aterm_session::SessionId::generate().as_str().to_string(),
             autopilot_end: Some(row.clone()),
             wakes: None,
+            agent_act: None,
             ..base.clone()
         };
         let mut app = desk(&host);
@@ -659,6 +662,7 @@ fn prove_self_claim(ctx: &crate::SessionCtx, home: &std::path::Path, thread: &st
         ctx.self_id.as_str(),
         Some(aterm_agent::harness::self_claimed::Copy {
             pid: proven.pid,
+            lifetime: None,
             start: proven.start.clone(),
             home: home.to_path_buf(),
             seen: aterm_agent::harness::self_claimed::Seen::Present(

@@ -93,6 +93,7 @@ fn walled(kind: WallKind, message: &str) -> TurnEndReading {
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,
         leftover: crate::harness::leftover::LeftRead::NotAsked,
+        credentials: crate::supervise::policy::credential_need::CredentialRead::NotAsked,
         login_screen: None,
         login_interrupted: false,
         login_at_wall: None,

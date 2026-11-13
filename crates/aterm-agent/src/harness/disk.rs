@@ -2644,9 +2644,10 @@ pub fn sweep_words(why: atpkg::build_cache::Unused) -> String {
         } => format!(
             "what no build reads again, moved aside from a build directory that stays: \
              {incremental} incremental crate folder(s), {units} unit(s) built by a compiler \
-             that is no longer the store's current one and {superseded} unit(s) its last \
-             passing release run superseded with another build of the same package and kind, \
-             each unwritten for {} or more; no build held its locks",
+             that is no longer the store's current one and {superseded} unit(s) no kept check \
+             run uses beside another build of the same package and kind; each unwritten for {} \
+             or more, or retired by the last check run to end there and unwritten since that \
+             run began; no build held its locks",
             span(after)
         ),
         Unused::Stayed { stayed, freed } => format!(
@@ -3386,13 +3387,18 @@ pub fn resume_text(code: &str, freed: u64, top: &[String]) -> String {
     )
 }
 
-/// Type `text` into tab `sid` of the instance at `sock` as one fenced turn (`upgrade_drive::type_fenced`: under the hand, judged on a fresh read — a box, a draft, a person typing or an owner's hold refuses it), presenting `token` ([`super::upgrade_drive::harness_client`]: a window's harness token reads `by=harness`).
+/// Type `text` into tab `sid` of the instance at `sock` as one fenced turn (`upgrade_drive::type_fenced`: under the hand, judged on a fresh read — a box, a draft, a person typing or an owner's hold refuses it), presenting `token` ([`super::upgrade_drive::harness_client`]: a window's harness token reads `by=harness`) and naming `lane` ([`super::agent_image::Lane::DiskResume`] or [`super::agent_image::Lane::DiskFree`]), which the observe gate does not exempt.
+///
+/// `"typed"` when it went in, [`super::agent_image::WITHHELD`] when the server's observe gate
+/// refused it (the agent's image is unconfirmed, and nothing was typed: the caller spends the
+/// line rather than retrying it), else `wait:<why>`.
 #[must_use]
 pub fn type_resume(
     sock: &str,
     token: Option<&super::upgrade_drive::HarnessToken>,
     sid: &str,
     text: &str,
+    lane: super::agent_image::Lane,
 ) -> String {
     let mut c = match super::upgrade_drive::harness_client(sock, token) {
         Ok(c) => c,
@@ -3405,8 +3411,12 @@ pub fn type_resume(
         super::contract::Scope::TurnEnd,
         super::upgrade_drive::Put::Paste,
         super::Timings::for_build().fence_every,
+        lane,
     ) {
         Ok(()) => "typed".to_owned(),
+        Err(super::upgrade_drive::Typed::Refused(e)) if super::agent_image::observe_refused(&e) => {
+            super::agent_image::WITHHELD.to_owned()
+        }
         Err(why) => format!("wait:{}", why.word()),
     }
 }

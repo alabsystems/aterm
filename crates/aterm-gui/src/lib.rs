@@ -325,6 +325,7 @@ mod control;
 mod control_input_ack;
 mod debugger_access;
 mod deck_face;
+mod desk_door;
 mod devtools_helper;
 #[cfg(target_os = "macos")]
 mod devtools_helper_drive;
@@ -504,7 +505,7 @@ fn mend_secrets_subscriber_once(headless: bool) {
 pub use spawn::OutputWakeWatchProbe;
 pub use system_state_host::{
     CheckBy, CheckStarted, InitialSetupApplyReceipt, InitialSetupHandlers, PhraseJoinReceipt,
-    PhraseOutcome, SetupReadings, initial_setup_readings_undelivered,
+    PhraseOutcome, SetupDisplayHistory, SetupReadings, initial_setup_readings_undelivered,
     publish_initial_setup_readings, publish_initial_setup_status, set_initial_setup_handlers,
     system_state_on_screen,
 };
@@ -532,6 +533,10 @@ pub use trail_frame_reads::WindowTrailReads;
 #[cfg(all(unix, any(test, feature = "bench-support"), debug_assertions))]
 #[doc(hidden)]
 pub use trail_rig::{TrailFrame, TrailRig};
+/// The yield at the host routes that lay the glow's under stream again (a windowed composed
+/// capture, the heterogeneous route), driven on the trail-diff rig at the glass level.
+#[cfg(all(test, unix))]
+mod glass_yield_host_tests;
 /// The host unreachability pin: no dark ground reaches the light fork through the frame path.
 #[cfg(all(test, unix))]
 mod light_fork_pin_tests;
@@ -786,6 +791,7 @@ mod app_restore;
 mod closed_recovery;
 mod deadline_heal;
 mod diagnostics;
+mod restored_worker;
 pub use diagnostics::{
     ThemeListFormat, theme_catalog_entry, theme_font_available, theme_list_report,
     theme_measured_appearance,
@@ -806,6 +812,7 @@ mod fact_menu;
 mod find_bar;
 mod fleet_glance;
 mod fleet_listen;
+mod footer_card_plate;
 mod foreground_handback;
 mod frame_key;
 mod frame_memo;
@@ -1046,8 +1053,6 @@ mod rename_reentry_drive;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use rename_reentry_drive::run_rename_reentry_drive;
-#[cfg(unix)]
-mod credential_needs_host;
 mod diskwalk_host;
 mod resource_jobs;
 mod tray_raster;
@@ -3137,7 +3142,7 @@ enum Wake {
     #[cfg(target_os = "macos")]
     AllocationMonitorChanged,
     HeldAgentMessages(Vec<aterm_messages::Message>),
-    RestoredWorkerEnded(app_restore::RestoredWorkerCheck),
+    RestoredWorkerEnded(restored_worker::RestoredWorkerCheck),
     /// A record a control worker made (`end`'s `proc.end`): logged, never on the glass.
     Record(aterm_messages::Message),
     AccountMenuRead(account_menu_read::Completion),
@@ -4054,6 +4059,12 @@ enum Wake {
         asked: members_desk::Asked,
         reply: std::sync::mpsc::Sender<String>,
     },
+    /// A control verb whose effect lands on the desk asks the door first ([`desk_door::admit`]).
+    DeskAsked {
+        asker: desk_door::Asker,
+        effect: desk_door::Effect,
+        reply: std::sync::mpsc::Sender<Result<(), String>>,
+    },
     /// `aterm ctl devtools hand-over`, bare.
     DevToolsHandOverAsked {
         reply: std::sync::mpsc::Sender<devtools_helper::HandOver>,
@@ -4761,15 +4772,6 @@ impl Backend {
         }
     }
 
-    fn set_font_subpixel(&mut self, mode: &str) {
-        match self {
-            Backend::Cpu(r) => {
-                r.set_font_subpixel(mode);
-            }
-            Backend::Gpu(g) => g.set_font_subpixel(mode),
-        }
-    }
-
     fn set_font_variations(&mut self, requests: &[(u32, f32)], dark_nudge: f32) {
         match self {
             Backend::Cpu(r) => {
@@ -5410,10 +5412,6 @@ impl BackendSlot {
 
     fn set_font_hinting(&mut self, mode: &str) {
         self.ready_mut().set_font_hinting(mode);
-    }
-
-    fn set_font_subpixel(&mut self, mode: &str) {
-        self.ready_mut().set_font_subpixel(mode);
     }
 
     fn set_selection_inactive(&mut self, inactive: bool) {
@@ -8867,6 +8865,10 @@ struct ActivationReplacement {
 struct SupersedeRetry {
     newer: u64,
     at: std::time::Instant,
+    /// Whether a retire for `newer` ran and was refused, so `at` is that refusal's backoff
+    /// (`give_back_refused_release`); false where the retire could not start, so `at` is only
+    /// when the lane looks again (`retain_unstarted_activation_replacement`).
+    refused: bool,
 }
 
 impl AutoApplyStructuralVerdict {
@@ -9117,7 +9119,15 @@ enum UpdateHandoffOutcome {
     VerificationDeferred,
     CaptureRefused,
     ChildDied,
+    /// The proof wait's hang detector expired over a successor whose native launch finished, or a
+    /// pre-proof wait ran out (the dial, the park) without the successor shown hung.
     TimedOut,
+    /// A successor that ran its own code stopped making progress before its proof: after a report
+    /// it went the progress bound with neither another report nor work of its own, or its native
+    /// launch had not finished by the hang detector (`app_update_handoff::ProgressWatch`), or,
+    /// launched, it was still running undialled past the whole dial bound
+    /// (`app_update_handoff::file_undialled_retire`).
+    Stalled,
     AdoptionMismatch,
     ActivityRevoked,
     Rejected,
@@ -9126,9 +9136,21 @@ enum UpdateHandoffOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg(unix)]
 enum ChildDeathEvidence {
+    /// No status this process could read, and nothing showing its end was this process's doing:
+    /// on a `ChildDied` outcome, a candidate gone before any signal of this process with no status
+    /// read. It is also the evidence of every end no death was judged for: an attempt that ended
+    /// otherwise (a stall or a timeout among them) whose candidate this process then killed, an
+    /// emergency reap, a successor nothing ever saw run, and a failure with no candidate.
     Unobserved,
-    Exited { code: i32 },
-    Signalled { signal: i32 },
+    /// It was still running when this process signalled it, and no status showed it had ended
+    /// itself first: its end is this process's doing, and says nothing of its image.
+    EndedHere,
+    Exited {
+        code: i32,
+    },
+    Signalled {
+        signal: i32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -9353,6 +9375,12 @@ struct UpdateHandoffCompletion {
     detail: String,
     input_drain_spins: u32,
     child_death: ChildDeathEvidence,
+    /// How far the successor's progress reports said it got through its start before the wait
+    /// ended (`app_update_handoff::SuccessorProgress::start`): `Presented` where one said it had
+    /// presented its first window (`metrics::ClaimStamp::FirstPresent`), so its bytes start here;
+    /// `Unlaunched` where none said its native launch had finished or none was read (a wait that
+    /// ended before the grant reads none).
+    successor_start: app_update_handoff::SuccessorStart,
 }
 
 #[repr(u8)]
@@ -10008,8 +10036,25 @@ const BOOT_HEALTH_RETRY_MAX: Duration = Duration::from_secs(60);
 /// Boot-health asks in a row that nothing answered (the updater could not be asked, the worker
 /// took none, an answer never came) after which the startup gate opens and the apply lane's own
 /// admission, under the apply lock, decides and names what holds it. An answer that the trial
-/// is pending starts the count again: then the updater holds by name, with its own bound.
+/// is pending starts the count again: then the updater holds by name, and the gate on
+/// [`BOOT_HEALTH_PENDING_PATIENCE`].
 const BOOT_HEALTH_UNANSWERED_TRIES: u32 = 5;
+
+/// How long the startup gate waits on the updater's answer that this build's trial is pending
+/// (`aterm_update::BootHealthVerdict::Pending`), from the first such answer, before it opens as
+/// [`BOOT_HEALTH_UNANSWERED_TRIES`] opens it: the apply lane's own admission, under the apply
+/// lock, then decides and names what holds it, and the trial stays armed. The updater leaves
+/// some of its Pending answers unbounded (a window that never draws, a sentinel it cannot
+/// remove, an installed bundle that is not the running build), and a wait on an answer that
+/// does not change is no bound on the lane. Every answer after the first keeps the clock; only
+/// an answer that opens the gate ends it.
+const BOOT_HEALTH_PENDING_PATIENCE: Duration = Duration::from_secs(5 * 60);
+
+const _: () = assert!(
+    BOOT_HEALTH_PENDING_PATIENCE.as_secs()
+        > aterm_update::BOOT_HEALTH_CONFIRMATION_BOUND.as_secs() + BOOT_HEALTH_RETRY_MAX.as_secs(),
+    "a confirmation that is only slow answers, at its slowest retry, before the gate stops waiting"
+);
 
 /// Whether this process still owes boot-health confirmation work for the image it started.
 ///
@@ -10216,8 +10261,6 @@ struct App {
     proxy: Option<EventLoopProxy<Wake>>,
     vitals: vitals_host::VitalsHost,
     diskwalk: diskwalk_host::DiskwalkHost,
-    #[cfg(unix)]
-    credential_needs: credential_needs_host::CredentialNeedsHost,
     #[cfg(all(test, unix))]
     handoff_reposts: Option<Vec<UpdateHandoffCompletion>>,
     #[cfg(all(test, unix))]
@@ -10339,6 +10382,7 @@ struct App {
     session_log_journal: session_log_journal::Lane,
     session_log_journal_seen: u32,
     restored_agents: Vec<(u64, restore::AgentRestore)>,
+    restored_workers: restored_worker::Workers,
     restored_held: Vec<(u64, restore::AgentRestore, bool, Vec<String>)>,
     handoff_restored_agents: Vec<(u64, restore::AgentRestore)>,
     handoff_supervised_agents: Vec<(u64, restore::AgentRestore)>,
@@ -10418,7 +10462,6 @@ struct App {
     font_thicken: bool,
     stem_gamma: f32,
     font_hinting: String,
-    font_subpixel: String,
     font_variations: Vec<(u32, f32)>,
     font_weight_dark_nudge: f32,
     render_knobs: app_config::RenderKnobs,
@@ -10518,6 +10561,12 @@ struct App {
     boot_health_hold_reason: Option<String>,
     /// Asks in a row nothing answered, at most [`BOOT_HEALTH_UNANSWERED_TRIES`].
     boot_health_unanswered: u32,
+    /// When the updater first answered that the trial is pending, while the gate has not been
+    /// opened by an answer ([`BOOT_HEALTH_PENDING_PATIENCE`]'s clock).
+    boot_health_pending_since: Option<Instant>,
+    /// The gate stopped waiting on the updater's Pending answers at
+    /// [`BOOT_HEALTH_PENDING_PATIENCE`]; it stays open until an answer opens it for good.
+    boot_health_pending_lapsed: bool,
     /// The park has seen this process at its health checkpoint.
     boot_health_checkpoint_seen: bool,
     /// The ask last queued was sent with the checkpoint reached.
@@ -10662,8 +10711,17 @@ struct App {
     auto_apply_capture_refusal: Option<AutoApplyCaptureRefusal>,
     /// The classified schedule and its separate diagnostic context, published together.
     apply_schedule_standing: Option<(String, String)>,
+    /// The stopped automatic lane's last logged verdict, `(build, re-samples)`: its journal line
+    /// is written once per verdict ([`App::announce_automatic_apply_stranded`]).
     auto_apply_stranded_announced: Option<(u64, bool)>,
-    auto_apply_stranded_said: Option<u64>,
+    /// What this process last recorded of its stopped automatic lane, so the record follows the
+    /// latch it reports and a hold keeps the failure the lane stopped on
+    /// ([`App::announce_automatic_apply_stranded`]).
+    auto_apply_stopped_lane: Option<app_native::StoppedLane>,
+    /// The failure that last set the manual-only latch, as its build and stable signature
+    /// ([`App::latch_after_physical_failure`]): the stopped lane's record names it where this
+    /// process recorded none for that build ([`App::announce_automatic_apply_stranded`]).
+    auto_apply_latch_failure: Option<(u64, String)>,
     #[cfg(unix)]
     fork_park_misses: Option<(u64, u8)>,
     #[cfg(unix)]
@@ -10778,6 +10836,11 @@ struct App {
     perf_shed_dwell: std::time::Duration,
     perf_env_at_flip: f32,
     event_loop_failed: bool,
+    /// The run's first window surface could not be created ([`App::first_surface_attached`]), so
+    /// it ends with [`system_quit::EXIT_FIRST_SURFACE_FAILED`] ([`App::end_status`]): a handoff
+    /// parent books that against the bytes it launched, where exit 0 reads as the successor's
+    /// ordinary refusal.
+    first_surface_failed: bool,
     /// The run's end, owed once the event loop runs ([`App::end_run`]); `None` once it ran, and in
     /// an App no `main` built.
     run_end: Option<run_end::RunEnd>,
@@ -10785,6 +10848,7 @@ struct App {
 
 impl Drop for App {
     fn drop(&mut self) {
+        self.restored_workers.clear();
         let _ = self.video_abort_app_shutdown();
     }
 }
@@ -11697,10 +11761,16 @@ impl App {
         }
     }
 
-    /// Automatic steps wait for the keyboard to rest and for another dialog or update handoff
-    /// to finish. They require neither a visit to System State nor a recent-input signal.
+    /// Automatic steps wait for an aterm window to hold keyboard focus, for the keyboard to rest
+    /// and for another dialog or update handoff to finish. A step's page, panel or folder
+    /// question comes up over whatever the person is looking at, so it comes up only while that
+    /// is aterm (owner ruling 2026-11-09: nothing aterm starts by itself takes the screen from
+    /// another app); behind another app the step waits, its row saying so, and goes on at the
+    /// first quiet moment after aterm is in front again. They require neither a visit to System
+    /// State nor a recent-input signal.
     pub(crate) fn step_moment_is_quiet(&self, now: Instant) -> bool {
-        !self.consent_warmup.is_live()
+        self.any_os_window_focused()
+            && !self.consent_warmup.is_live()
             && !self.permission_walk.active()
             && !self.keys_typed_within(devtools_helper::QUIET_FOR, now)
             && self.devtools_helper.settled(now)
@@ -15297,8 +15367,6 @@ impl App {
             harness_progress_next_poll: None,
             vitals: vitals_host::VitalsHost::default(),
             diskwalk: diskwalk_host::DiskwalkHost::default(),
-            #[cfg(unix)]
-            credential_needs: credential_needs_host::CredentialNeedsHost::default(),
             #[cfg(all(test, unix))]
             handoff_reposts: None,
             #[cfg(all(test, unix))]
@@ -15371,7 +15439,6 @@ impl App {
             font_thicken: false,
             stem_gamma: Config::default().stem_gamma_or_default(),
             font_hinting: Config::default().font_hinting_or_default(),
-            font_subpixel: Config::default().font_subpixel_or_default(),
             font_variations: Vec::new(),
             font_weight_dark_nudge: 0.0,
             render_knobs: app_config::RenderKnobs::default(),
@@ -15448,6 +15515,7 @@ impl App {
             session_log_journal: session_log_journal::Lane::inert(),
             session_log_journal_seen: 0,
             restored_agents: Vec::new(),
+            restored_workers: Default::default(),
             restored_held: Vec::new(),
             handoff_restored_agents: Vec::new(),
             handoff_supervised_agents: Vec::new(),
@@ -15569,6 +15637,8 @@ impl App {
             boot_health_confirmation_backoff: BOOT_HEALTH_RETRY_MIN,
             boot_health_hold_reason: None,
             boot_health_unanswered: 0,
+            boot_health_pending_since: None,
+            boot_health_pending_lapsed: false,
             boot_health_checkpoint_seen: true,
             boot_health_asked_at_checkpoint: true,
             boot_health_checkpoint_ask_owed: false,
@@ -15682,7 +15752,8 @@ impl App {
             auto_apply_capture_refusal: None,
             apply_schedule_standing: None,
             auto_apply_stranded_announced: None,
-            auto_apply_stranded_said: None,
+            auto_apply_stopped_lane: None,
+            auto_apply_latch_failure: None,
             #[cfg(unix)]
             fork_park_misses: None,
             #[cfg(unix)]
@@ -15759,6 +15830,7 @@ impl App {
             perf_shed_dwell: crate::app_render::PERF_SHED_DWELL_MIN,
             perf_env_at_flip: 1.0,
             event_loop_failed: false,
+            first_surface_failed: false,
             run_end: None,
         }
     }
@@ -16165,12 +16237,23 @@ impl App {
     /// An unfocused window's wake asks none: the readings' audience counts a window's focus
     /// ([`Self::vitals_audience`]), so that wake changes no cadence, and a reading's frame would
     /// take the GPU's block back for nothing.
+    ///
+    /// A wake of a window that was focused before the event marks its next present a rest wake
+    /// ([`crate::metrics::WindowPresentState::note_rest_wake`]), so the key that woke a resting
+    /// deck, or the first key after a modifier, IME or pointer wake that presents before any
+    /// other frame, counts in `n_rest_wake_key`. The focus that wakes an unfocused window marks
+    /// nothing: that window's deck was already still.
     pub(crate) fn stir_rest(&mut self, wid: WindowId, now: Instant, focusing: bool) {
-        if self
-            .windows
-            .get_mut(&wid)
-            .is_some_and(|ws| ws.rest.stir(now) && (focusing || ws.focused))
-        {
+        let Some(ws) = self.windows.get_mut(&wid) else {
+            return;
+        };
+        if !ws.rest.stir(now) {
+            return;
+        }
+        if ws.focused {
+            ws.present_metrics.note_rest_wake();
+        }
+        if focusing || ws.focused {
             self.vitals_ask_now(now);
         }
     }
@@ -16191,6 +16274,7 @@ impl App {
 
     /// The `Wake::TaskChanged` arm.
     pub(crate) fn on_task_changed(&mut self, session: u64) {
+        self.retain_restored_worker(session);
         self.note_worker_conclusion(session);
         self.mail_worker_news(session);
         self.rebuild_teams();
@@ -16585,11 +16669,12 @@ impl App {
         };
         let previous = std::mem::replace(&mut ws.mods, mods);
         let pointer_inside = ws.pointer_position_known;
-        // A link of the glass's harness words shows the hand to a plain pointer too
-        // (`claude_card::GlassHit`).
+        // A mark on the glass shows the hand to a plain pointer too (`claude_card::GlassHit`,
+        // `claude_lights::GlassAt::Mark`).
         if pointer_inside
             && (app_mouse::link_modifier_held(previous) != app_mouse::link_modifier_held(mods)
-                || (previous.is_empty() != mods.is_empty() && self.pointer_on_glass_link(wid)))
+                || (previous.is_empty() != mods.is_empty()
+                    && (self.pointer_on_glass_link(wid) || self.pointer_on_top_mark(wid))))
         {
             self.update_hover_cursor(wid);
         }
@@ -17179,6 +17264,7 @@ impl App {
         #[cfg(unix)]
         let gate_was_shut = !self.native_boot_health_complete();
         self.expire_boot_health_confirmation(now);
+        self.lapse_boot_health_pending(now);
         self.note_boot_health_checkpoint();
         if self.boot_health_guard_open()
             && self
@@ -17217,14 +17303,47 @@ impl App {
     }
 
     fn boot_health_retry_deadline(&self, now: Instant) -> Option<Instant> {
-        let retry_at = self.boot_health_confirmation_retry_at?;
-        match self.boot_health_confirmation {
-            BootHealthConfirmation::Awaiting => self
-                .boot_health_guard_open()
-                .then_some(retry_at.max(now + BOOT_HEALTH_RETRY_MIN)),
-            BootHealthConfirmation::InFlight(_) => Some(retry_at.max(now + BOOT_HEALTH_RETRY_MIN)),
-            BootHealthConfirmation::Complete => None,
+        let retry = self.boot_health_confirmation_retry_at.and_then(|retry_at| {
+            match self.boot_health_confirmation {
+                BootHealthConfirmation::Awaiting => self
+                    .boot_health_guard_open()
+                    .then_some(retry_at.max(now + BOOT_HEALTH_RETRY_MIN)),
+                BootHealthConfirmation::InFlight(_) => {
+                    Some(retry_at.max(now + BOOT_HEALTH_RETRY_MIN))
+                }
+                BootHealthConfirmation::Complete => None,
+            }
+        });
+        let lapse = self
+            .boot_health_pending_lapse_at()
+            .map(|at| at.max(now + BOOT_HEALTH_RETRY_MIN));
+        match (retry, lapse) {
+            (Some(retry), Some(lapse)) => Some(retry.min(lapse)),
+            (retry, lapse) => retry.or(lapse),
         }
+    }
+
+    /// When the gate stops waiting on the updater's Pending answers
+    /// ([`BOOT_HEALTH_PENDING_PATIENCE`]), while it is still ahead: none once an answer opened
+    /// the gate or the patience already ran out.
+    #[must_use]
+    pub(crate) fn boot_health_pending_lapse_at(&self) -> Option<Instant> {
+        if self.boot_health_pending_lapsed || self.boot_health_confirmation.complete() {
+            return None;
+        }
+        self.boot_health_pending_since
+            .map(|since| since + BOOT_HEALTH_PENDING_PATIENCE)
+    }
+
+    /// The next look a wait on the startup gate needs: the confirmation's retry, or the moment
+    /// the gate stops waiting on a Pending answer, whichever comes first.
+    #[must_use]
+    pub(crate) fn boot_health_next_look(&self, now: Instant) -> Instant {
+        let retry = self
+            .boot_health_confirmation_retry_at
+            .unwrap_or(now + BOOT_HEALTH_RETRY_MIN);
+        self.boot_health_pending_lapse_at()
+            .map_or(retry, |lapse| retry.min(lapse))
     }
 
     /// Recover an idempotent confirmation whose worker died or whose completion wake was lost.
@@ -17852,7 +17971,10 @@ impl App {
                 ws.tab_title_epochs.get(&session).copied() != Some(live_epoch)
                     && ws.tab_set.tabs().iter().any(|tab| {
                         #[cfg(test)]
-                        crate::work_counts::title_tab_touched();
+                        {
+                            crate::work_counts::title_tab_touched();
+                            crate::work_counts::title_drift_tab_visited();
+                        }
                         self.view_store
                             .get(tab.focus)
                             .copied()
@@ -17906,15 +18028,21 @@ impl App {
         self.title_drift.seen.insert(session, live_epoch);
         self.title_drift.last_flush.insert(session, now);
         let pool = &self.pool;
-        self.title_drift
-            .seen
-            .retain(|sid, _| pool.get(*sid).is_some());
-        self.title_drift
-            .last_flush
-            .retain(|sid, _| pool.get(*sid).is_some());
-        self.title_drift
-            .pending
-            .retain(|sid| pool.get(*sid).is_some());
+        self.title_drift.seen.retain(|sid, _| {
+            #[cfg(test)]
+            crate::work_counts::title_drift_cache_probed();
+            pool.get(*sid).is_some()
+        });
+        self.title_drift.last_flush.retain(|sid, _| {
+            #[cfg(test)]
+            crate::work_counts::title_drift_cache_probed();
+            pool.get(*sid).is_some()
+        });
+        self.title_drift.pending.retain(|sid| {
+            #[cfg(test)]
+            crate::work_counts::title_drift_cache_probed();
+            pool.get(*sid).is_some()
+        });
         let cwd_changed = {
             let mut timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
             let cwd_moved = timeline.record_cwd_change(live_cwd.as_deref());
@@ -17932,6 +18060,8 @@ impl App {
             .iter()
             .filter(|(_, ws)| {
                 ws.tab_set.tabs().iter().any(|tab| {
+                    #[cfg(test)]
+                    crate::work_counts::title_drift_tab_visited();
                     self.view_store
                         .get(tab.focus)
                         .copied()
@@ -17950,6 +18080,8 @@ impl App {
                         .iter()
                         .rev()
                         .find(|tab| {
+                            #[cfg(test)]
+                            crate::work_counts::title_drift_tab_visited();
                             self.view_store
                                 .get(tab.focus)
                                 .copied()
@@ -17988,6 +18120,8 @@ impl App {
                 .into_iter()
                 .flat_map(|window| window.tab_set.tabs())
                 .filter_map(|tab| {
+                    #[cfg(test)]
+                    crate::work_counts::title_drift_tab_visited();
                     self.view_store
                         .get(tab.focus)
                         .copied()
@@ -17995,7 +18129,11 @@ impl App {
                 })
                 .collect();
             if let Some(ws) = self.windows.get_mut(&wid) {
-                ws.tab_title_epochs.retain(|sid, _| labels.contains(sid));
+                ws.tab_title_epochs.retain(|sid, _| {
+                    #[cfg(test)]
+                    crate::work_counts::title_drift_cache_probed();
+                    labels.contains(sid)
+                });
                 ws.tab_title_epochs.insert(session, live_epoch);
                 crate::app_tabs::synchronize_captured_title_cache(
                     &mut ws.tab_title_cache,
@@ -18103,8 +18241,6 @@ impl ApplicationHandler<Wake> for App {
         self.service_stats_live(Instant::now());
         self.service_deck_clocks(Instant::now());
         self.service_diskwalk(Instant::now());
-        #[cfg(unix)]
-        self.service_credential_needs(Instant::now());
         let present_now = Instant::now();
         let app_frame_interval = self.frame_interval;
         for ws in self.windows.values_mut() {
@@ -18128,6 +18264,9 @@ impl ApplicationHandler<Wake> for App {
             if let Some(window) = self.windows.get(&wid).and_then(|ws| ws.os_window.as_ref()) {
                 window.request_redraw();
             }
+        }
+        if let Some(wid) = self.card_wash_due(Instant::now()) {
+            self.request_menu_frame(wid);
         }
         self.service_due_scroll_motion(Instant::now());
         if matches!(cause, StartCause::ResumeTimeReached { .. }) {
@@ -18270,6 +18409,7 @@ impl ApplicationHandler<Wake> for App {
             root.loop_ending();
             return;
         }
+        self.service_restored_workers();
         self.settle_update_boundary_latch();
         self.prune_deferred_gpu_captures();
         self.drain_message_inbox();
@@ -18396,11 +18536,6 @@ impl ApplicationHandler<Wake> for App {
             aterm_update::set_automatic_apply(lands_by_itself);
             self.update_lands_by_itself_reported = lands_by_itself;
         }
-        #[cfg(unix)]
-        {
-            let (lane, staged) = self.window_update_lane();
-            fleet_listen::node_serve::WINDOW_APPLIES.note_lane(lane, staged);
-        }
         #[cfg(target_os = "macos")]
         if !auto_apply_on && self.auto_apply_was_on {
             self.end_launch_record_renewal_for_updates_off();
@@ -18438,6 +18573,13 @@ impl ApplicationHandler<Wake> for App {
         self.retry_pending_native_update_reconcile();
         if self.deferred_native_update_reconcile.is_some() {
             self.finish_deferred_native_update_reconcile();
+        }
+        // After this turn's update work (a lapse, a re-arm, a try, a reconcile), so the lane the
+        // node job reads is the one this turn left.
+        #[cfg(unix)]
+        {
+            let (lane, staged) = self.window_update_lane();
+            fleet_listen::node_serve::WINDOW_APPLIES.note_lane(lane, staged);
         }
         self.service_boot_health(now);
         self.settle_reduced_scroll_motion(now);
@@ -18817,6 +18959,14 @@ impl ApplicationHandler<Wake> for App {
                 &mut deadline_owner,
                 d,
                 metrics::DeadlineOwner::ChipWord,
+            );
+        }
+        if let Some(d) = self.card_wash_wake() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                d,
+                metrics::DeadlineOwner::CardWash,
             );
         }
         if let Some(d) = self.harness_acts_wait() {
@@ -19199,6 +19349,14 @@ impl ApplicationHandler<Wake> for App {
                 metrics::DeadlineOwner::Presence,
             );
         }
+        if let Some(wake) = self.restored_worker_wake() {
+            fold_owned_deadline(
+                &mut deadline,
+                &mut deadline_owner,
+                wake,
+                metrics::DeadlineOwner::Presence,
+            );
+        }
         if let Some(off_wake) = self.autopilot_off_wake() {
             fold_owned_deadline(
                 &mut deadline,
@@ -19422,14 +19580,14 @@ impl ApplicationHandler<Wake> for App {
         };
         #[cfg(not(any(windows, target_os = "linux")))]
         let placed_hidden = false;
-        if !self.attach_os_window(el, target_id) {
-            crate::logging::stderr_line!(
-                "aterm-gui: could not create the initial window surface; exiting"
-            );
-            if self.initial_surface_exit_ready() {
+        let attached = self.attach_os_window(el, target_id);
+        match self.first_surface_attached(attached) {
+            system_quit::FirstSurface::Attached => {}
+            system_quit::FirstSurface::ExitNow => {
                 el.exit();
+                return;
             }
-            return;
+            system_quit::FirstSurface::ExitOnceDrained => return,
         }
         metrics::mark_initial_surface_ready();
         let carried_position = self.seamless_position.take();
@@ -20638,6 +20796,13 @@ impl App {
             #[cfg(unix)]
             Wake::Members { asked, reply } => {
                 let _ = reply.send(self.take_members(&asked));
+            }
+            Wake::DeskAsked {
+                asker,
+                effect,
+                reply,
+            } => {
+                let _ = reply.send(self.desk_admits(asker, effect));
             }
             Wake::DevToolsHandOverAsked { reply } => {
                 let _ = reply.send(self.hand_devtools_to_owner(devtools_helper::Origin::Ctl));
@@ -26419,11 +26584,29 @@ pub fn main_entry_with_network(
     let prepared_loop = (out_of_band_handoff && !headless).then(|| {
         use aterm_window::platform::macos::EventLoopExtMacOS as _;
         let started = std::time::Instant::now();
+        // Watched: a launch stuck inside AppKit is reported with a main-thread sample. Past that
+        // report the parent decides (`watchdog::launch_stall_policy`): one that reads progress
+        // judges a hang before the dial itself, so the launch only reports; for one that reads
+        // none, a launch still unfinished at the bound counted from this process's birth (never
+        // under the floor) leaves with a named code, which that parent (serving every session
+        // meanwhile) books against these bytes where LaunchServices named it this pid.
+        let age = metrics::process_age();
+        watchdog::arm();
+        watchdog::launching(watchdog::launch_stall_policy(
+            seamless::parent_reads_progress(&handoff_env),
+            age,
+        ));
         let mut built = build_event_loop(false, true);
         built.event_loop.prepare_launch();
+        watchdog::launch_finished();
         aterm_log::info!(
-            "overlap handoff: AppKit launch finished in {} ms before the dial, with the parent's readers live",
-            started.elapsed().as_millis()
+            "overlap handoff: AppKit launch finished in {} ms before the dial, with the parent's \
+             readers live; it began {} after the process did",
+            started.elapsed().as_millis(),
+            age.map_or_else(
+                || "an unread time".to_string(),
+                |age| format!("{} ms", age.as_millis())
+            )
         );
         built
     });
@@ -26464,6 +26647,7 @@ pub fn main_entry_with_network(
             incoming_exec_fds.parent_pid(),
         ) {
             Ok(claimed) => {
+                let _ = claimed.report_claim(&handoff_env);
                 aterm_log::info!(
                     "overlap handoff: claimed {} PTY(s) plus the readiness and Commit channels \
                      over the rendezvous after holding the dial {} ms; this successor owns a \
@@ -28056,8 +28240,6 @@ pub fn main_entry_with_network(
         harness_progress_next_poll: None,
         vitals: vitals_host::VitalsHost::default(),
         diskwalk: diskwalk_host::DiskwalkHost::default(),
-        #[cfg(unix)]
-        credential_needs: credential_needs_host::CredentialNeedsHost::default(),
         #[cfg(all(test, unix))]
         handoff_reposts: None,
         #[cfg(all(test, unix))]
@@ -28135,7 +28317,6 @@ pub fn main_entry_with_network(
         font_thicken: raster_knobs.font_thicken,
         stem_gamma: raster_knobs.stem_gamma,
         font_hinting: raster_knobs.font_hinting,
-        font_subpixel: config.font_subpixel_or_default(),
         font_variations,
         font_weight_dark_nudge: font_view.font_weight_dark_nudge_or_default(),
         render_knobs: app_config::RenderKnobs::from_config(&font_view, &startup_colors),
@@ -28214,6 +28395,7 @@ pub fn main_entry_with_network(
         session_log_journal,
         session_log_journal_seen: 0,
         restored_agents: Vec::new(),
+        restored_workers: Default::default(),
         restored_held: Vec::new(),
         handoff_restored_agents: Vec::new(),
         handoff_supervised_agents: Vec::new(),
@@ -28258,15 +28440,7 @@ pub fn main_entry_with_network(
             }
             lane
         },
-        permission_walk: {
-            let mut lane = permission_walk::WalkLane::new(headless);
-            if handed_over || relaunch_of_running || JUST_UPDATED.get().copied().unwrap_or(false) {
-                // An update's successor gives this Mac its first walk too, and walks on from
-                // the pages its predecessor's walk kept, as every process does.
-                lane.note_successor();
-            }
-            lane
-        },
+        permission_walk: permission_walk::WalkLane::new(headless),
         debugger_change: debugger_access::DebuggerChangeLane::new(headless),
         access_steps: if !headless && cfg!(target_os = "macos") {
             system_state_access::AccessSteps::new(system_state_access::StepsReach::live())
@@ -28362,6 +28536,8 @@ pub fn main_entry_with_network(
         boot_health_confirmation_backoff: BOOT_HEALTH_RETRY_MIN,
         boot_health_hold_reason: None,
         boot_health_unanswered: 0,
+        boot_health_pending_since: None,
+        boot_health_pending_lapsed: false,
         boot_health_checkpoint_seen: false,
         boot_health_asked_at_checkpoint: false,
         boot_health_checkpoint_ask_owed: false,
@@ -28486,7 +28662,8 @@ pub fn main_entry_with_network(
         auto_apply_capture_refusal: None,
         apply_schedule_standing: None,
         auto_apply_stranded_announced: None,
-        auto_apply_stranded_said: None,
+        auto_apply_stopped_lane: None,
+        auto_apply_latch_failure: None,
         #[cfg(unix)]
         fork_park_misses: None,
         #[cfg(unix)]
@@ -28570,6 +28747,7 @@ pub fn main_entry_with_network(
         perf_shed_dwell: crate::app_render::PERF_SHED_DWELL_MIN,
         perf_env_at_flip: 1.0,
         event_loop_failed: false,
+        first_surface_failed: false,
         run_end: Some(run_end::RunEnd::new(root_sid)),
     };
     // The launch's first tab was built before the App: its open is written now, the restore's
@@ -28705,6 +28883,11 @@ pub fn main_entry_with_network(
         }));
     metrics::mark_gui_ready_for_winit();
     crate::qos::set_self(crate::qos::Role::Interactive);
+    // Judged until the loop's first root: AppKit's launch, where it was not finished before, and
+    // the first `Init` and `Resumed`, which enter no root.
+    if !headless {
+        watchdog::launching(watchdog::OnLaunchStall::Log);
+    }
     let ended = event_loop.run_app(&mut app);
     // The loop has ended: from here nothing beats the watchdog's rest at `about_to_wait`'s park
     // awake, so the teardown is judged at `ShutdownWait` from its first step.
@@ -28712,9 +28895,10 @@ pub fn main_entry_with_network(
     let failed_status = ended.err().map(|error| event_loop_failed(&mut app, &error));
     // The run's end, unless the loop's exit ran it inside AppKit (`run_end`).
     app.end_run();
+    let status = app.end_status(failed_status);
     std::mem::forget(app);
     crate::owned_endpoint::die_of_quit_signal();
-    std::process::exit(failed_status.unwrap_or(0));
+    std::process::exit(status);
 }
 
 /// What a terminating signal does before it ends a windowed instance

@@ -38,7 +38,7 @@ fn covered(login: LoginHalf) -> Covered {
         email: EMAIL.to_owned(),
         label: Some("work".to_owned()),
         logged_in: true,
-        login,
+        login: LoginHere::Half(login),
     }
 }
 
@@ -511,6 +511,120 @@ fn the_doctor_words_count_the_states() {
         doctor_words(&unread),
         "claude tokens: unknown (vault not read)"
     );
+}
+
+/// A ROW IS SAID TO HOLD A LOGIN ONLY WHERE THIS MAC HOLDS ONE: a row's records forecast nothing
+/// both for a login with no end known and for no login at all, so the half alone reads `ok` of
+/// either. The row's login here is that half where the Mac holds a login of it or a record says
+/// one ended, and `none` otherwise; a table row with no roster row is `unread`, and the report
+/// carries each word. CONTROL: a held login keeps its half and reports `ok`.
+#[test]
+fn a_row_with_no_login_here_is_not_said_to_hold_one() {
+    let ended = LoginHalf::Ended { at: None };
+    assert_eq!(LoginHere::of_row(LoginHalf::Ok, false), LoginHere::Absent);
+    assert_eq!(
+        LoginHere::of_row(LoginHalf::Ok, true),
+        LoginHere::Half(LoginHalf::Ok),
+        "CONTROL: a login held here"
+    );
+    assert_eq!(
+        LoginHere::of_row(ended, false),
+        LoginHere::Half(ended),
+        "a recorded end is said of a row with no login now"
+    );
+    let word_of = |login: LoginHere, logged_in: bool| {
+        let covered = Covered {
+            login,
+            logged_in,
+            ..covered(LoginHalf::Ok)
+        };
+        let shown = account(covered, &Lookup::Absent, None, Some(false), NOW);
+        assert_eq!(shown.login, login);
+        shown.json(&PeersShown::NotRead)["login"].clone()
+    };
+    assert_eq!(word_of(LoginHere::Absent, false), Value::from("none"));
+    assert_eq!(word_of(LoginHere::Unread, false), Value::from("unread"));
+    assert_eq!(
+        word_of(LoginHere::Half(LoginHalf::Ok), true),
+        Value::from("ok"),
+        "CONTROL: a login here"
+    );
+}
+
+/// The lab keys of [`the_roster_of_three`]'s accounts, by email.
+fn keyed_by_email(_realm: &str, email: &str) -> Option<String> {
+    let key = match email {
+        "home@example.com" => "ac-0000000000000001",
+        "made@example.com" => "ac-0000000000000002",
+        "bare@example.com" => "ac-0000000000000003",
+        _ => return None,
+    };
+    Some(key.to_owned())
+}
+
+/// A roster under `dir` of three rows: `home` on the default login (no directory), `made`
+/// whose own directory holds a login, and `bare` whose directory holds none.
+fn the_roster_of_three(dir: &Path) -> std::path::PathBuf {
+    let made = dir.join("made");
+    std::fs::create_dir_all(&made).expect("made");
+    std::fs::write(made.join(".claude.json"), "{}").expect("a login file");
+    let roster = dir.join("accounts.toml");
+    let row = |label: &str, at: Option<&Path>| {
+        let at = at.map_or_else(String::new, |at| format!("dir = \"{}\"\n", at.display()));
+        format!(
+            "[[account]]\nlabel = \"{label}\"\nclass = \"dedicated\"\n{at}email =              \"{label}@example.com\"\n\n"
+        )
+    };
+    let text = [
+        row("home", None),
+        row("made", Some(&made)),
+        row("bare", Some(&dir.join("bare"))),
+    ]
+    .concat();
+    std::fs::write(&roster, text).expect("roster");
+    roster
+}
+
+/// THE COVERED ROWS SAY WHICH LOGINS THIS MAC HOLDS: a row's own directory that holds a login,
+/// or a session's login record that names its account, the default login's among them. A row
+/// on the default login has no directory and always counts as enrolled, so with no login record
+/// naming its account it holds none, and neither does a row whose directory is empty: both read
+/// `ok` by their records alone. CONTROL: the row whose directory holds a login reads `ok` with no
+/// session at all, and each of the other two reads `ok`, logged in, once a session's record
+/// names its account, so its offer's pair still says `ok`.
+#[test]
+fn the_covered_rows_say_which_logins_this_mac_holds() {
+    let (dir, store) = scratch();
+    let roster = the_roster_of_three(dir.path());
+    let of = |logins: &[SessionLogin], label: &str| {
+        let rows = journal::with_keyer(keyed_by_email, || {
+            super::covered(&Places {
+                store: &store,
+                roster: Some(&roster),
+                logins,
+                now: i64::try_from(NOW).unwrap(),
+                offers: true,
+            })
+        });
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        let row = rows
+            .into_iter()
+            .find(|row| row.label.as_deref() == Some(label))
+            .expect("the row is covered");
+        (row.login, row.logged_in)
+    };
+    let held = LoginHere::Half(LoginHalf::Ok);
+    assert_eq!(of(&[], "home"), (LoginHere::Absent, false));
+    assert_eq!(of(&[], "bare"), (LoginHere::Absent, false));
+    assert_eq!(of(&[], "made"), (held, false), "CONTROL: its own directory");
+    for label in ["home", "bare"] {
+        let on = [SessionLogin {
+            email: format!("{label}@example.com"),
+            account_id: None,
+            default: true,
+        }];
+        assert_eq!(of(&on, label), (held, true), "CONTROL: {label}'s session");
+    }
 }
 
 /// THE VIEW READS THE VAULT ONCE AND COVERS A ROW-LESS SESSION LOGIN: with no roster, a login

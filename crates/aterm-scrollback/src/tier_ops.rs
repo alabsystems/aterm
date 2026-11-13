@@ -51,6 +51,59 @@ impl Scrollback {
         self.get_line(self.line_count.saturating_sub(1).saturating_sub(rev_idx))
     }
 
+    /// Borrow a line by index (`0` = oldest) without cloning cached warm/cold [`Line`]s.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScrollbackError`] if the underlying warm or cold block fails to decode
+    /// or is quarantined.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn with_line<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(&Line) -> R,
+    ) -> Result<Option<R>, ScrollbackError> {
+        if idx >= self.line_count {
+            return Ok(None);
+        }
+
+        let cold_count = self.cold.line_count();
+        let warm_count = self.warm.line_count();
+
+        if idx < cold_count {
+            self.cold.with_line(idx, f)
+        } else if idx < cold_count.saturating_add(warm_count) {
+            self.warm.with_line(idx.saturating_sub(cold_count), f)
+        } else {
+            let hot_idx = idx.saturating_sub(cold_count).saturating_sub(warm_count);
+            let Some(line) = self.hot.get(hot_idx) else {
+                return Err(ScrollbackError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("in-range line index {idx} mapped to missing hot tier index {hot_idx}"),
+                )));
+            };
+            Ok(Some(f(line)))
+        }
+    }
+
+    /// Borrow a line by reverse index (`0` = newest) without cloning cached warm/cold [`Line`]s.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScrollbackError`] if the underlying warm or cold block fails to decode
+    /// or is quarantined.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub fn with_line_rev<R>(
+        &self,
+        rev_idx: usize,
+        f: impl FnOnce(&Line) -> R,
+    ) -> Result<Option<R>, ScrollbackError> {
+        if rev_idx >= self.line_count {
+            return Ok(None);
+        }
+        self.with_line(self.line_count.saturating_sub(1).saturating_sub(rev_idx), f)
+    }
+
     /// Set the memory budget (bytes).
     pub fn set_memory_budget(&mut self, budget: usize) -> Result<(), ScrollbackError> {
         self.memory_budget = budget.max(1);

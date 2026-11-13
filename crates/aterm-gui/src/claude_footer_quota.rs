@@ -460,6 +460,18 @@ const fn tick_id(session: u64) -> u64 {
     layer_id(session ^ 0x7175_6f74_612d_7469)
 }
 
+/// The stable FX layer id of the frame of the card `session`'s pane has open
+/// ([`crate::footer_card_plate`]).
+pub(crate) const fn card_plate_id(session: u64) -> u64 {
+    layer_id(session ^ 0x6361_7264_2d70_6c74)
+}
+
+/// The stable FX layer id of the wash of the card `session`'s pane has open: the pill under
+/// the row the pointer or the keys rest on ([`crate::footer_card_plate::CardWash`]).
+pub(crate) const fn card_wash_id(session: u64) -> u64 {
+    layer_id(session ^ 0x6361_7264_2d77_7368)
+}
+
 /// One pane's quota row, as the write puts it on the glass.
 #[derive(Debug)]
 pub(super) struct QuotaWrite {

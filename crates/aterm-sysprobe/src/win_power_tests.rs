@@ -248,11 +248,11 @@ mod live {
             .as_millis() as i64
     }
 
-    /// The reading names a source, the one `GetSystemPowerStatus` names when this test asks it
-    /// itself, and the power manager's battery state agrees on the line and on whether there is
-    /// a battery to read.
+    /// Live, N2 (SD-03): the reading names a source, the one `GetSystemPowerStatus` names when
+    /// this test asks it itself, and the power manager's battery state agrees on the line and on
+    /// whether there is a battery to read, so a machine with none (a VM) never reads one.
     #[test]
-    fn this_machine_reads_its_power_source() {
+    fn n2_windows_live_this_machine_reads_its_power_source() {
         let reading = power_reading().expect("a power source");
         assert_eq!(crate::situation::power_sources(), Some(reading));
         let mut status = SystemPowerStatus::default();

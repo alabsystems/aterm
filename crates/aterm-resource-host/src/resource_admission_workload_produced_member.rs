@@ -459,6 +459,7 @@ impl Member {
 }
 
 fn environment(ready: &Ready, request: &wire::ProducedRequest) -> bool {
+    let header = ready.invocation.header();
     let env = &request.member.command.environment;
     let fixed = |key: &[u8], value: &[u8]| {
         env.iter()
@@ -467,9 +468,9 @@ fn environment(ready: &Ready, request: &wire::ProducedRequest) -> bool {
     };
     if !fixed(b"LANG", b"C")
         || !fixed(b"LC_ALL", b"C")
-        || !fixed(b"CARGO", &ready.invocation.program.path)
-        || !fixed(b"RUSTC", &ready.invocation.compiler.path)
-        || !fixed(b"CARGO_HOME", &ready.invocation.cargo_home)
+        || !fixed(b"CARGO", &header.program.path)
+        || !fixed(b"RUSTC", &header.compiler.path)
+        || !fixed(b"CARGO_HOME", header.cargo_home)
         || !fixed(b"CARGO_CACHE_RUSTC_INFO", b"0")
     {
         return false;
@@ -485,21 +486,24 @@ fn environment(ready: &Ready, request: &wire::ProducedRequest) -> bool {
         return false;
     }
     if request.kind != MemberKind::BuildScript {
-        return request.member.command.cwd == ready.invocation.cwd
+        let Some(invocation) = ready.invocation.workload() else {
+            return &request.member.command.cwd == header.cwd;
+        };
+        return request.member.command.cwd == invocation.cwd
             && fixed(
                 b"AY_PB_REFUTATION_PROOF_SRC",
-                &ready.invocation.refutation_step.path,
+                &invocation.refutation_step.path,
             )
             && fixed(
                 b"AY_PB_REFUTATION_LOOP_PROOF_SRC",
-                &ready.invocation.refutation_loop.path,
+                &invocation.refutation_loop.path,
             )
-            && fixed(b"TRUST_SPEC_SRC", &ready.invocation.trust_spec_source.path)
+            && fixed(b"TRUST_SPEC_SRC", &invocation.trust_spec_source.path)
             && fixed(b"TRUST_VC_DISABLE_VC_CACHE", b"1")
             && fixed(b"RUST_TEST_THREADS", b"1")
             && fixed(
                 b"TRUST_TOOLCHAIN_BIN",
-                &[ready.invocation.root.as_slice(), b"/bin"].concat(),
+                &[invocation.root.as_slice(), b"/bin"].concat(),
             );
     }
     // Normal Cargo package/DEP/scalar inputs are retained verbatim. They do
@@ -508,7 +512,7 @@ fn environment(ready: &Ready, request: &wire::ProducedRequest) -> bool {
     let cwd = std::path::Path::new(std::ffi::OsStr::from_bytes(&request.member.command.cwd));
     let under =
         |base: &[u8]| cwd.starts_with(std::path::Path::new(std::ffi::OsStr::from_bytes(base)));
-    under(&ready.invocation.cwd) || under(&ready.invocation.cargo_home)
+    under(header.cwd) || under(header.cargo_home)
 }
 
 impl Owner {
@@ -589,7 +593,7 @@ impl Owner {
         let expected = match request.kind {
             MemberKind::BuildScript => host::phase::Kind::BuildScript,
             MemberKind::Inventory | MemberKind::Sample => host::phase::Kind::Harnesses,
-            MemberKind::CompilerQuery => return false,
+            MemberKind::CompilerQuery | MemberKind::Coordinator => return false,
         };
         if active.kind != expected
             || state.produced.preparing()
@@ -639,9 +643,9 @@ impl Owner {
             MemberKind::BuildScript => CensusKind::BuildScript,
             MemberKind::Inventory => CensusKind::Inventory,
             MemberKind::Sample => CensusKind::Sample,
-            MemberKind::CompilerQuery => {
+            MemberKind::CompilerQuery | MemberKind::Coordinator => {
                 self.jobs.insert(root, job);
-                return Err(refused("query cannot become produced"));
+                return Err(refused("query or coordinator cannot become produced"));
             }
         };
         let result = (|| {

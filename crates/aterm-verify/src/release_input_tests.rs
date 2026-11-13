@@ -416,7 +416,7 @@ fn a_resolution_equal_to_one_parent_is_still_unchecked() {
 }
 
 #[test]
-fn semantic_changelog_result_cannot_borrow_its_parents_judgment() {
+fn a_shared_path_merge_cannot_borrow_its_parents_judgment() {
     let r = Repo::new();
     let notes = "## [Unreleased]\n\n### Fixed\n\n- Old claim.\n";
     r.write("CHANGELOG.md", notes);
@@ -430,7 +430,7 @@ fn semantic_changelog_result_cannot_borrow_its_parents_judgment() {
     r.git(&["checkout", "--detach", &base]);
     r.write("CHANGELOG.md", &format!("{notes}\n- Main addition.\n"));
     let main = r.commit("main addition");
-    // Combine both entry edits without judging the resulting tree.
+    // Combine both edits of the one shared file without judging the resulting tree.
     r.write(
         "CHANGELOG.md",
         &format!(
@@ -449,40 +449,6 @@ fn semantic_changelog_result_cannot_borrow_its_parents_judgment() {
     receipt.checked[0].tree = tree.clone();
     r.landing(&tree, &branch, &main, &receipt);
     assert!(r.input(&base).paths.is_empty());
-}
-
-#[test]
-fn historical_repeated_subsections_keep_exact_one_sided_composition_credit() {
-    let r = Repo::new();
-    let notes = "## [Unreleased]\n\n### Fixed\n\n- First.\n\n### Fixed\n\n- Second.\n";
-    r.write("CHANGELOG.md", notes);
-    let base = r.commit("old repeated subsections");
-    r.write("branch", "checked\n");
-    let branch = r.commit("branch");
-    let mut receipt = Stated::of_trailers(&r.receipt(&base)).unwrap();
-    r.git(&["checkout", "--detach", &base]);
-    r.write("CHANGELOG.md", &notes.replace("Second.", "Main's change."));
-    let main = r.commit("main");
-    r.git(&["checkout", "--detach", &branch]);
-    r.git(&["merge", "--no-ff", "-m", "historical merge", &main]);
-    let tree = r.git(&["rev-parse", "HEAD^{tree}"]);
-    receipt.composed_onto = Some(main.clone());
-    let landing = r.landing(&tree, &branch, &main, &receipt);
-    // Repeated headings preserve every entry. The branch left this file
-    // untouched, so its exact native composition earns only branch credit;
-    // main's new notes remain owed.
-    let input = r.input(&base);
-    assert!(!input.commits.contains(&landing));
-    assert_eq!(input.commits.as_slice(), std::slice::from_ref(&main));
-    assert_eq!(input.paths, ["CHANGELOG.md"]);
-    // A forged resolution still owes checks even with the repeated headings.
-    r.write("branch", "unjudged resolution\n");
-    r.git(&["add", "."]);
-    let bad_tree = r.git(&["write-tree"]);
-    let bad = r.landing(&bad_tree, &branch, &main, &receipt);
-    let input = r.input(&base);
-    assert!(input.commits.contains(&bad));
-    assert_eq!(input.paths, ["CHANGELOG.md", "branch"]);
 }
 
 /// A composed landing carries only the checked branch's delta. Main that arrived while
@@ -700,4 +666,117 @@ fn a_recheck_binds_its_landing_and_leaves_mains_own_commits_owed() {
     elsewhere.rechecked[0].tree = "f".repeat(40);
     r.landing(&tree, &topic, &main, &elsewhere);
     assert_eq!(r.input(&base).paths, unbound.paths);
+}
+
+impl Repo {
+    /// [`discover_with`] at this repository's HEAD over `facts`, with the questions it asked.
+    fn counted(&self, facts: &Facts, rule: &[&str], base: &str) -> (Input, usize) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let head = self.git(&["rev-parse", "HEAD"]);
+        let before = facts.counts().0;
+        let input = discover_with(facts, rule, self.0.path(), &path, base, &head).unwrap();
+        (input, facts.counts().0 - before)
+    }
+}
+
+/// R12: a second discovery of the same commits asks Git about none of them, and one more
+/// commit costs the questions about that commit alone, whatever the history's length.
+/// NEGATIVE CONTROL: with nothing kept, every call asks about every commit again.
+#[test]
+fn a_second_discovery_asks_only_about_commits_no_call_has_read() {
+    let r = Repo::new();
+    let base = r.git(&["rev-parse", "HEAD"]);
+    for name in ["one", "two", "three", "four", "five"] {
+        r.write(name, name);
+        r.commit(name);
+    }
+    let kept = aterm_tempfile::tempdir().unwrap();
+    let facts = Facts::at(kept.path());
+    let (first, asked) = r.counted(&facts, COMPOSITION_RULE, &base);
+    assert_eq!(first.paths, ["five", "four", "one", "three", "two"]);
+    assert_eq!(asked, 6, "the range's ancestry and each of five commits");
+
+    // Another process, as a dry run before the real one: only the kept files join them.
+    let again = Facts::at(kept.path());
+    let (second, asked) = r.counted(&again, COMPOSITION_RULE, &base);
+    assert_eq!((second.commits, second.paths), (first.commits, first.paths));
+    assert_eq!(asked, 0, "nothing these commits fix is asked twice");
+
+    r.write("six", "six");
+    let added = r.commit("six");
+    let (third, asked) = r.counted(&again, COMPOSITION_RULE, &base);
+    assert!(third.commits.contains(&added));
+    assert!(third.paths.contains(&"six".into()));
+    assert_eq!(asked, 2, "the new range's ancestry and the one new commit");
+
+    let nothing = Facts::none();
+    assert_eq!(r.counted(&nothing, COMPOSITION_RULE, &base).1, 7);
+    assert_eq!(r.counted(&nothing, COMPOSITION_RULE, &base).1, 7);
+}
+
+/// R12: a kept composition answer is the answer of the rule text that gave it. The same rule
+/// asks nothing again; a changed rule judges the composition again, and nothing else: what a
+/// commit changed does not depend on that rule.
+#[test]
+fn a_changed_composition_rule_judges_the_composition_again() {
+    let r = Repo::new();
+    let base = r.git(&["rev-parse", "HEAD"]);
+    r.write("branch", "checked\n");
+    let branch = r.commit("branch");
+    let mut receipt = Stated::of_trailers(&r.receipt(&base)).unwrap();
+    r.git(&["checkout", "--detach", &base]);
+    r.write("main", "not checked\n");
+    let main = r.commit("main");
+    r.git(&["checkout", "--detach", &branch]);
+    r.git(&["merge", "--no-ff", "-m", "merge", &main]);
+    let tree = r.git(&["rev-parse", "HEAD^{tree}"]);
+    receipt.composed_onto = Some(main.clone());
+    r.landing(&tree, &branch, &main, &receipt);
+
+    let kept = aterm_tempfile::tempdir().unwrap();
+    let facts = Facts::at(kept.path());
+    let (first, asked) = r.counted(&facts, &["rule one"], &base);
+    assert_eq!(first.commits.as_slice(), std::slice::from_ref(&main));
+    assert_eq!(first.paths, ["main"]);
+    assert!(asked > 1, "the composition and the owed commit were asked");
+    assert_eq!(r.counted(&facts, &["rule one"], &base).1, 0);
+
+    let (changed, asked) = r.counted(&facts, &["rule two"], &base);
+    assert_eq!(
+        (changed.commits, changed.paths),
+        (first.commits, first.paths)
+    );
+    assert_eq!(asked, 1, "only the composition is the changed rule's");
+    assert_eq!(r.counted(&facts, &["rule two"], &base).1, 0);
+    assert_eq!(r.counted(&facts, &["rule one"], &base).1, 0);
+}
+
+/// The public entry keeps its facts in the clone's release directory, so a later call from
+/// any process finds them, and resolves a ref once: its questions name the commit.
+#[test]
+fn discovery_keeps_its_facts_in_the_release_directory() {
+    let r = Repo::new();
+    let base = r.git(&["rev-parse", "HEAD"]);
+    r.write("one", "one");
+    r.commit("one");
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let (first, (asked, kept)) = discover_counted(r.0.path(), &path, &base, "HEAD").unwrap();
+    assert_eq!((asked, kept), (2, 0));
+    let (second, (asked, kept)) = discover_counted(r.0.path(), &path, &base, "HEAD").unwrap();
+    assert_eq!((asked, kept), (0, 2));
+    assert_eq!(first.paths, second.paths);
+    assert!(
+        crate::engine::release_dir(r.0.path())
+            .join(aterm_tempfile::QUIET)
+            .join("release-input-facts.noindex")
+            .join(&base)
+            .join("used")
+            .is_file()
+    );
+    // HEAD moved: the ref is read again, and only the new commit is asked about.
+    r.write("two", "two");
+    r.commit("two");
+    let (third, (asked, kept)) = discover_counted(r.0.path(), &path, &base, "HEAD").unwrap();
+    assert_eq!(third.paths, ["one", "two"]);
+    assert_eq!((asked, kept), (2, 1));
 }

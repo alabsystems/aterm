@@ -64,11 +64,12 @@ fn offload_metrics_and_repeated_empty_padding_keep_direct_route_evidence() {
 #[test]
 fn malformed_route_attributes_do_not_authorize_or_allocate() {
     let bytes = reply();
-    assert!(route_changed(&bytes).unwrap());
+    assert_eq!(route_changed(&bytes).unwrap(), Heard::Routes);
     let mut joined = bytes.clone();
     joined.extend_from_slice(&bytes);
-    assert!(
+    assert_eq!(
         route_changed(&joined).unwrap(),
+        Heard::Routes,
         "all messages in one datagram are consumed"
     );
     for end in 0..bytes.len() {
@@ -94,6 +95,43 @@ fn malformed_route_attributes_do_not_authorize_or_allocate() {
         route_changed(&error).is_err(),
         "NLMSG_OVERRUN loses validity events"
     );
+}
+
+/// What each rtnetlink type tells a listener: a link or an address message can change its
+/// attachment, a route or a rule message cannot, and the most any message of a datagram tells
+/// stands for the datagram, in either order.
+///
+/// NEGATIVE CONTROL (2026-11-12): with `moves_interfaces` true of every type, `RTM_NEWROUTE`
+/// (24) reads `Attachments`, not `Routes`.
+#[test]
+fn a_route_or_rule_message_moves_no_attachment_and_a_link_or_address_one_does() {
+    let of = |kind: u16| {
+        let mut bytes = reply();
+        bytes[4..6].copy_from_slice(&kind.to_ne_bytes());
+        bytes
+    };
+    // NLMSG_NOOP and NLMSG_DONE.
+    for kind in [1, 3] {
+        assert_eq!(route_changed(&of(kind)).unwrap(), Heard::Nothing, "{kind}");
+    }
+    // RTM_NEWROUTE to RTM_GETROUTE, and RTM_NEWRULE to RTM_GETRULE.
+    for kind in (24..=27).chain(32..=35) {
+        assert_eq!(route_changed(&of(kind)).unwrap(), Heard::Routes, "{kind}");
+    }
+    // RTM_NEWLINK, RTM_DELLINK, RTM_SETLINK, RTM_NEWADDR, RTM_DELADDR, RTM_NEWNEIGH, and a
+    // type this build does not know.
+    for kind in [16, 17, 19, 20, 21, 28, 0x400] {
+        assert_eq!(
+            route_changed(&of(kind)).unwrap(),
+            Heard::Attachments,
+            "{kind}"
+        );
+    }
+    for (first, second) in [(24, 20), (20, 24)] {
+        let mut joined = of(first);
+        joined.extend_from_slice(&of(second));
+        assert_eq!(route_changed(&joined).unwrap(), Heard::Attachments);
+    }
 }
 
 #[test]

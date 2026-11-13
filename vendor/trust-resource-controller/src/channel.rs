@@ -72,6 +72,27 @@ impl Channel {
         }
         Ok(result > 0)
     }
+    pub(crate) fn send_fixed<const N: usize>(
+        &mut self,
+        mut bytes: [u8; N],
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.begin()?;
+        self.transfer(&mut bytes, true, deadline)?;
+        self.poisoned = false;
+        Ok(())
+    }
+    pub(crate) fn receive_fixed<const N: usize>(&mut self, deadline: Instant) -> io::Result<[u8; N]> {
+        self.begin()?;
+        let mut bytes = [0; N];
+        self.transfer(&mut bytes, false, deadline)?;
+        self.poisoned = false;
+        Ok(bytes)
+    }
+    #[cfg(feature = "bootstrap-receiver")]
+    pub(crate) fn native_peer(&self) -> io::Result<trust_resource_provenance::process::Identity> {
+        trust_resource_provenance::process::connected_identity(&self.stream)
+    }
     /// Send one bounded frame without SIGPIPE. A failure means unknown delivery.
     pub fn send(&mut self, payload: &[u8], deadline: Instant) -> io::Result<()> {
         self.begin()?;

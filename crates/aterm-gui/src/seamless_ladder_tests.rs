@@ -992,8 +992,9 @@ fn dropping_carried_history_equals_the_engines_visible_only_carry() {
 #[cfg(unix)]
 fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
     use super::tests::{
-        StageCarry, child_proof_from, env_alone, pipe_pair, restore_env, stage_ladder_handoff,
+        StageCarry, child_proof_from, env_alone, restore_env, stage_ladder_handoff,
     };
+    use std::os::fd::IntoRawFd as _;
 
     let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
@@ -1067,8 +1068,10 @@ fn a_producer_repaint_reaches_the_successor_and_the_proof_still_matches() {
         );
     }
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(
         ready_write,
         commit_read,
@@ -1200,8 +1203,9 @@ fn the_self_check_commits_a_saved_primarys_history_past_its_screens_byte_cap() {
 #[cfg(unix)]
 fn the_saved_primarys_carried_history_is_read_past_its_screens_byte_cap() {
     use super::tests::{
-        StageCarry, child_proof_from, env_alone, pipe_pair, restore_env, stage_ladder_handoff,
+        StageCarry, child_proof_from, env_alone, restore_env, stage_ladder_handoff,
     };
+    use std::os::fd::IntoRawFd as _;
 
     let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
@@ -1214,8 +1218,10 @@ fn the_saved_primarys_carried_history_is_read_past_its_screens_byte_cap() {
         render_debts: Vec::new(),
     };
     let staged = stage_ladder_handoff("saved-primary", &stage, &[]);
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(
         ready_write,
         commit_read,

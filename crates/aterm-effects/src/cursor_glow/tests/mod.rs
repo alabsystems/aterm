@@ -125,16 +125,15 @@ fn cfg(style: GlowStyle, enabled: bool) -> GlowConfig {
     }
 }
 
-/// The rainbow engine's config with the tall ribbon body. The one `rainbow` theme draws the
-/// underline; the tall body is a shape no built-in theme picks, and these tests keep it drawing
-/// as theme data.
+/// The `rainbow` theme's config: the tall ribbon body, its band behind the words.
 fn tall_rainbow_cfg() -> GlowConfig {
     let c = cfg(GlowStyle::RainbowKitty, true);
     assert!(c.ribbon_tall && !c.ribbon_flat);
     c
 }
 
-/// The `rainbow` theme's config: the underline.
+/// The rainbow engine's config with the underline body, a shape no built-in theme picks, which
+/// these tests keep drawing as theme data.
 fn underline_rainbow_cfg() -> GlowConfig {
     let mut c = cfg(GlowStyle::RainbowKitty, true);
     c.ribbon_tall = false;

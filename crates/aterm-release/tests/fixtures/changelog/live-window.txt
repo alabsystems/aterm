@@ -1,0 +1,118 @@
+<!-- A live-shaped release window (crates/aterm-release/tests/it/changelog_golden.rs): entries
+from the 0.199.0 window as written by hand, the harness line mid-Changed. -->
+# Changelog
+
+Head prose.
+
+## [Unreleased]
+
+### Added
+
+- **Fleet access: each machine decides what the other machines of its fleet may do to it, and
+  starts at Read Only.** A machine's fleet access is one of three levels. Read Only: the others
+  read it (`survey`, `await task`, a session's status, text, screen, result and inbox), and none
+  starts a job, sends a message or types into a session there. Read and Write, No New Tabs: they
+  also message, type into, take over and close the sessions already there. Full Access: they
+  also start new jobs and tabs. `aterm fleet access` prints the level and `aterm fleet access
+  read|write|full` sets it, on that machine only; a worker another machine started there can
+  lower it and never raise it. A level is chosen for one fleet: `aterm fleet leave`, and an
+  `init`, a `join` or a `sync` that writes another fleet's key (an `init --rotate` included),
+  put it back to Read Only and say so, while the same fleet joined or synced again and its
+  rotated secret keep it. It caps the
+  drive grants without changing them, so raising a machine to Full Access brings back what its
+  grants allowed before. Every `survey` header says the level (`access=read|write|full`), and
+  `aterm ctl --host any spawn` picks only machines at Full Access. `aterm help fleet` (FLEET
+  ACCESS) has the whole table, the four fleet services the level does not govern (vault
+  approval, service repair, account renewal, the sign-in challenge relay), and what it does not
+  cover: ssh, Screen Sharing and any process running as the account.
+
+- **Windows: `aterm update` installs a build staged on this PC.** Windows downloads nothing and
+  still has no network updater or public build: a build loop on the PC (`aterm-winship update`,
+  below) stages one under `%LOCALAPPDATA%\aterm\dist`. `aterm update status` and `aterm update
+  check` name the build you run and the staged one: its version, commit, build number, when it was
+  staged and its smoke-test verdict. `aterm update apply` installs it and stops nothing: open
+  windows keep running the build they started with, and new windows and shells use the new one.
+  `aterm update apply --restart` saves the open windows, installs and starts aterm again. While a
+  staged build is not what is installed, did not fail its smoke test and can be installed over
+  this copy, the tab strip's version label is marked and the Version menu and the command palette
+  offer "Install ... now". Once it is installed under an open window (by the loop, by `apply` in a
+  shell or by another window), the offer comes down and the window says the build is installed and
+  to restart aterm to move onto it; `apply` then answers that it is already installed. An offer
+  whose build failed or went missing comes down without a message. A copy `apply` cannot install
+  over (one in an MSIX package, one run from a dist folder or a cargo build folder, or a dist with
+  no `install.ps1`) is told why, and `aterm ctl update status` says the same (`staged=`,
+  `installed_build=`, `outcome=`).
+
+### Changed
+
+- **`targo --unverified verify land` stops a judgment main has already outdated.** While the
+  dev set runs, the land reads origin's main at each stage the run reports and at least every
+  3 minutes. The first main tip whose new commits touch the branch's files ends the run there
+  (an `INTERRUPTED` line, and an `Aterm-Interrupted` trailer rather than an `Aterm-Checked`
+  one), and the land merges that tip and judges it at once, as one of its three re-judges.
+  Before, the run went on to its end, often an hour or more, only to be judged again. A tip
+  that still composes, and a run that has already reported a red, are left to finish.
+
+- **A crate whose edits are only comments is judged alone.** `targo --unverified verify`
+  counted a changed comment as changed code, so a comment edit in a widely used crate ran
+  every crate that depends on it. A crate whose files now differ only in plain or doc comments,
+  every other token on its line and column, runs its own full rows (lint too, which reads
+  `SAFETY` comments) and its dependents run nothing; the cone names it `<crate> (alone)`. A
+  member `Cargo.toml` edited without changing its parsed value counts the same way. A comment a
+  macro may read (in a macro's arguments or body, on an item with a derive, an attribute macro
+  or a `#[doc = …]`, in a Trust `clean` island or an `include!` target) still selects the
+  dependents, as does any edit that moves code.
+
+- **Harness versions since v0.198.0: `alab claude harness 0.34`, `alab agy harness 0.18`, `alab grok harness 0.20`, `alab muse harness 0.21`.** Each harness's minor moves once per release in which it changed.
+
+- **The footer's folder, branch and context no longer take a click, and everything that does
+  looks one way under the pointer.** A click on `⌂` the folder, `⎇` the branch or `◐` the
+  context used to hide it; it now does nothing, the pointer stays an arrow there and the fact
+  looks as it does at rest, so a stray click can no longer take a fact off the line. A
+  right-click still opens each one's card (copy, a new tab there, compact), and so do Return
+  and Space on one the keyboard selected. Every part of the footer a click acts on (the chips,
+  the model, the effort, the account and usage, the quota row, the harness switch, the
+  top-effort key) now shows it the same way under the pointer or the keyboard's selection: its
+  words in the lit ink over one underline that runs from its first glyph to its last, with no
+  change of weight; a warning keeps its warning ink and a chart is left as it was. The hand
+  shows over exactly the underlined cells: the blanks around the harness switch's `● on`, and
+  before and after the quota row's words, are no longer part of the click.
+
+### Removed
+
+- **Click-to-hide on the footer's folder, branch and context, and the Hide rows on their
+  cards.** Nothing on those three hides them any more. Where a program starts with one of them
+  off the line (Muse and Kimi show their own), its dimmed mark still brings it back with a
+  click, and there its card keeps the one row that puts it away again. The `▸` the top-effort
+  key wore while the keyboard had it is gone too: the key now takes the same look as every
+  other selected part.
+
+### Fixed
+
+- **`agh repo fetch-ref --checkout-closure` works with Ubuntu 24.04's git.** Its filtered
+  fetch makes agh's scratch repository a promisor of the source, and with lazy fetching off
+  git 2.43.0 stops a presence read at the first blob the checkout cache lacks ("could not
+  fetch … from promisor remote") where git 2.56.0 answers `missing`, so every closure
+  over a cache missing a blob failed with "could not inspect the complete checkout cache
+  batch". agh reads blob presence through an empty repository whose object store is the
+  scratch's and which names no promisor, so a git answers `missing` and cannot fetch.
+
+- **A newly installed build whose recovery proof keeps being refused no longer holds every
+  update forever.** After a swap the new build proves its rollback copy before it settles its
+  boot trial; when that proof was refused every time (a rollback bundle it could not verify or
+  remove), the trial stayed armed and each later update waited behind it with no end. The
+  running build now counts the refusals: after 3 of them across 30 awake minutes it settles the
+  trial without the proof, keeps the build (it is never reverted for this) and lets updates
+  continue; `aterm update status` says so while it waits. A confirmation the updater cannot
+  answer (its worker is busy or gone, an answer never arrives) is retried 5 times and then
+  leaves the decision to the apply itself, which names what holds it. The previous build then
+  stays on disk until the next update replaces it. Some holds are left without a bound on
+  purpose: a window that never draws its first frame, a trial file the filesystem will not
+  remove, and an installed bundle that no longer verifies as the running build while the
+  previous one does, which the third launch still reverts.
+
+## [0.198.0] - 2026-11-09
+
+### Fixed
+
+- **An older release.** Shipped.

@@ -1665,8 +1665,9 @@ fn command_step(
 ) -> Result<(), Fail> {
     let agent = h.name();
     let (command, pasted) = command_draft(h);
-    // The composer's row as the reader takes it, or its text told from a placeholder by its cell
-    // (`stand_on`): agy's and Muse Code's empty composers draw a grey hint.
+    // The composer's row as the reader takes it, or its text told from a placeholder by
+    // `stand_on`: Muse Code's empty composer draws a grey hint, told by its cell (the harness's
+    // rule); agy's permission-mode hint is read as the empty draft by agy's own composer reader.
     let standing = |text: &str| {
         at_composer(door, &tab.sid, agent).as_deref() == Some(text)
             || super::stand_on(door, &tab.sid, agent, &on(door, &tab.sid, &["text"]))

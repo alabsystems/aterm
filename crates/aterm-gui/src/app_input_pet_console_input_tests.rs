@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
 use aterm_effects::kitty_pet::PetInputKind;
@@ -15,12 +15,9 @@ const CTL: Source = Source::Controller;
 
 /// Returns a headless `App` whose session writes into a pipe, and the pipe's read end.
 pub(super) fn observing_app() -> (App, OwnedFd) {
-    let mut pipe = [-1; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-    let (reader, writer) =
-        unsafe { (OwnedFd::from_raw_fd(pipe[0]), OwnedFd::from_raw_fd(pipe[1])) };
-    let app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer)));
-    (app, reader)
+    let (reader, writer) = aterm_uds::pipe().expect("pipe");
+    let app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer.into())));
+    (app, reader.into())
 }
 
 fn press(key: Key) -> InputEvent {

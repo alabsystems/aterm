@@ -110,6 +110,10 @@ mod import_comparison;
 pub use import_comparison::import_comparison_model;
 mod alab_cells;
 pub use alab_cells::alab_cells_model;
+mod alab_claims;
+pub use alab_claims::{
+    alab_claim_revival_model, alab_claim_undo_model, alab_identity_claims_model,
+};
 mod alab_journal;
 pub use alab_journal::alab_journal_model;
 mod storage_release;
@@ -985,8 +989,9 @@ pub fn historical_publication_model() -> Model {
     }
 }
 
-/// Only an intact witnessed prefix may retain discarded-source ciphertext.
-/// Current projection, transfer and liability admission stay separate.
+/// Only an intact witnessed prefix may retain opaque ciphertext. An observer may hold bytes
+/// awaiting membership, without materializing them or admitting writes, transfers or liabilities.
+/// Discarded-source classification stays separate from unavailable membership evidence.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn table_quarantine_model() -> Model {
@@ -1019,7 +1024,8 @@ pub fn table_quarantine_model() -> Model {
                 scenario = 5; opened = if Buggy == 7 { 1 } else { 0 };
             }
             action MissingSelectedKey when (scenario == 0) {
-                scenario = 6; opened = if Buggy == 8 { 1 } else { 0 };
+                scenario = 6; opened = 1; retained = 1;
+                visible = if Buggy == 8 { 1 } else { 0 };
             }
             action RemoteDiscarded when (scenario == 0) {
                 scenario = 7; opened = 1; complete = 1;
@@ -1048,7 +1054,8 @@ pub fn table_quarantine_model() -> Model {
             invariant NoQuarantineProjection: (scenario == 0 || scenario == 1 || scenario == 4 || scenario == 5 || scenario == 6 || scenario == 7 || scenario == 9 || scenario > 9) || visible == 0;
             invariant WitnessedBytesRetained: quarantined == 0 || retained > 0;
             invariant TaintedChainBlocked: (scenario == 0 || scenario == 1 || scenario == 2 || scenario == 4 || scenario == 5 || scenario == 6 || scenario == 7 || scenario == 9 || scenario > 9) || writable == 0;
-            invariant UnsafeSourcesClosed: (scenario == 0 || scenario == 1 || scenario == 2 || scenario == 3 || scenario == 7 || scenario == 8 || scenario > 9) || opened == 0;
+            invariant UnsafeSourcesClosed: (scenario == 0 || scenario == 1 || scenario == 2 || scenario == 3 || scenario == 6 || scenario == 7 || scenario == 8 || scenario > 9) || opened == 0;
+            invariant MissingMembershipOpaque: scenario <= 5 || scenario > 6 || (opened == 1 && retained == 1 && visible == 0 && offered == 0 && writable == 0 && complete == 0);
             invariant MissingParentWithholdsLiability: scenario <= 9 || scenario > 10 || complete == 0;
             invariant RepairedParentRestoresLiability: scenario <= 10 || complete == 1;
             invariant NoOpaqueAck: received == 0;

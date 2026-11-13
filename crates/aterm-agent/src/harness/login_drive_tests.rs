@@ -252,7 +252,7 @@ fn uncertain_provider_wait_retains_the_real_signin_lock_and_app_scope() {
 #[test]
 fn provider_pipe_reader_keeps_the_same_scope_until_its_actual_io_retires() {
     let lifetime = super::super::account_work::Lifetime::default();
-    let (mut read, write) = std::io::pipe().unwrap();
+    let (mut read, write) = aterm_uds::pipe().unwrap();
     let reader = spawn_reader(lifetime.enter(), move || {
         let mut bytes = Vec::new();
         std::io::Read::read_to_end(&mut read, &mut bytes).unwrap();

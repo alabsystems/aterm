@@ -2,7 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 //! Test helpers for hanging up control sockets, reading to EOF under a hang detector, and leaving
-//! a socket file nothing listens on.
+//! a socket file nothing listens on ([`never_listening_socket`], [`leave_no_listener`]).
 
 use std::thread::JoinHandle;
 
@@ -157,6 +157,22 @@ pub(crate) fn never_listening_socket(path: &std::path::Path) -> std::os::fd::Own
         std::io::Error::last_os_error()
     );
     socket
+}
+
+/// Leave `path` as a stand-in host that is done serving must leave it: a socket file nothing
+/// listens on ([`never_listening_socket`], bound and closed; the file refuses every connect
+/// whether that descriptor is held, copied into a child or closed). The stand-in calls this
+/// before it ends the connection it served, since that end starts the relay's look at `path`.
+/// Dropping its listener is not the going: a child another test forked while the listener was
+/// open holds a copy of it, the look's connect is queued on that copy's backlog, and a client
+/// the relay cannot see gone (the same child holds a copy of its end too) is owed the look's
+/// whole wait, which is as long as a test's hang detector. Off Unix no child copies a listener,
+/// and its drop is the going.
+pub(crate) fn leave_no_listener(path: &std::path::Path) {
+    #[cfg(unix)]
+    drop(never_listening_socket(path));
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 #[cfg(unix)]

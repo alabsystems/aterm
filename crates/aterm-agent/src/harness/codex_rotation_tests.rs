@@ -1986,6 +1986,116 @@ fn native_exec_proposal_hands_off_at_a_five_hour_wall() {
     assert_eq!(world.load(Cli::Codex).rotations, [NOW]);
 }
 
+/// AN EXEC RUN REFUSED NEAR A FIVE-HOUR RESET IS HANDED OFF AT ITS NEXT WALL: a headless run is one
+/// root turn that keeps its request, so the same session asks again at each wall it meets. Asked at
+/// a five-hour wall ten minutes from its reset it is refused as not walled, with its own login
+/// read alone and nothing recorded that would hold a later read. Asked again once that reset and
+/// its grace have passed, the time its control lets that refusal stand, with its week now spent,
+/// it is proposed the fresh row, and the wall on the row it leaves is the week's.
+#[test]
+#[cfg(unix)]
+fn an_exec_session_refused_near_a_five_hour_reset_is_handed_off_at_its_next_wall() {
+    use crate::harness::codex_exec_handoff::ExecCommand;
+    use codex_rotation::{NoHandoff, prepare_refusal_stands};
+    let (world, mut reader) = fixture("exec-quota-asked-again");
+    let main = main_of(&world);
+    let work = world.work_dir(Cli::Codex).join("auth.json");
+    let program = std::env::current_exe().unwrap();
+    let image = crate::harness::native_act::Image::at(&program).unwrap();
+    let source = Identity::from_native("source", "user");
+    let ask = |reader: &Reader, at: i64| {
+        let asked = asked_session(&world);
+        let request = Session {
+            cli: asked.cli,
+            sid: asked.sid,
+            supervisor: asked.supervisor,
+            env: asked.env,
+            seen: &crate::harness::observe::Observation::Unread,
+            sample: asked.sample,
+            point: codex_rotation::wall_asked(at),
+            mode: asked.mode,
+            relaunch: (),
+        };
+        let seat = Seat {
+            now: at,
+            ..world.seat()
+        };
+        codex_rotation::prepare_exec(
+            &seat,
+            &request,
+            &world.exe,
+            &source,
+            reader,
+            Duration::from_secs(60),
+            |row| {
+                Some(ExecCommand {
+                    argv0: "codex".into(),
+                    image: image.clone(),
+                    program: program.to_str().unwrap().into(),
+                    argv: vec!["exec".into(), "--json".into(), "original\ninput".into()],
+                    auth_path: row
+                        .dir
+                        .as_ref()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| world.home.join(".codex"))
+                        .join("auth.json")
+                        .to_str()
+                        .unwrap()
+                        .into(),
+                    cwd: None,
+                })
+            },
+        )
+    };
+
+    reader.answers.insert(
+        main.clone(),
+        usage_resetting("source", (100, 40), Some(NOW + 600), NOW),
+    );
+    let why = ask(&reader, NOW).expect_err("a reset ten minutes away is waited out");
+    assert_eq!(why, "not-walled");
+    assert_eq!(prepare_refusal_stands(why), Some(NoHandoff::NoWallToLeave));
+    assert_eq!(
+        reader.calls.borrow().as_slice(),
+        std::slice::from_ref(&main),
+        "its own login alone"
+    );
+    let state = world.load(Cli::Codex);
+    assert!(state.rotations.is_empty());
+    assert!(
+        state
+            .accounts
+            .get("main")
+            .is_none_or(|account| account.walls.is_empty()),
+        "the refusal records no wall"
+    );
+
+    let again = NOW + accounts::RESET_SOON_S + accounts::RESET_GRACE_S;
+    reader.answers.insert(
+        main.clone(),
+        usage_resetting("source", (0, 100), Some(again + 5 * HOUR), again),
+    );
+    reader
+        .answers
+        .insert(work.clone(), usage_read_at("target", false, again));
+    reader.calls.borrow_mut().clear();
+    let proposal = ask(&reader, again)
+        .unwrap()
+        .expect("the same session, asked again at its weekly wall");
+    assert_eq!(proposal.source_identity, source);
+    assert_eq!(proposal.destination.label, "work");
+    assert_eq!(*reader.calls.borrow(), [main, work]);
+    let state = world.load(Cli::Codex);
+    assert!(
+        state.rotations.is_empty(),
+        "nothing is charged before commit"
+    );
+    assert_eq!(
+        state.accounts["main"].walls.keys().collect::<Vec<_>>(),
+        [accounts::WEEK_LIMIT]
+    );
+}
+
 /// A SESSION WHOSE ROW'S LOGIN NAMES ANOTHER ACCOUNT IS TOLD AT ONCE: however often it is asked no
 /// read of that login hands it off, so its control answers that no handoff is coming, and nothing is
 /// read of the provider. CONTROL: the same session with a login of its row's own is proposed one.

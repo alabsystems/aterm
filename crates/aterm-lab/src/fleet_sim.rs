@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! `targo --unverified lab fleet-sim [--n N] [--runs R] [--keep] [--record]`.
+//! `targo --unverified lab fleet-sim [--n N] [--runs R] [--keep]`. Every run writes its record
+//! to the lab's state, `results/fleet-sim-<N>-<time>.md` ([`Sim::write_record`]).
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -60,7 +61,6 @@ struct Args {
     n: usize,
     runs: usize,
     keep: bool,
-    record: bool,
 }
 
 fn parse(args: &[String]) -> Result<Args, Fail> {
@@ -68,7 +68,6 @@ fn parse(args: &[String]) -> Result<Args, Fail> {
         n: 30,
         runs: 3,
         keep: false,
-        record: false,
     };
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -93,7 +92,6 @@ fn parse(args: &[String]) -> Result<Args, Fail> {
                     .ok_or_else(|| Fail::usage("--runs is 1 to 20"))?;
             }
             "--keep" => a.keep = true,
-            "--record" => a.record = true,
             other => return Err(Fail::usage(format!("unknown argument `{other}`"))),
         }
     }
@@ -138,12 +136,9 @@ pub fn cmd(args: &[String]) -> Res {
     }
     println!("\n{passed}/{all} assertions held");
     let green = passed == all;
-    match sim.write_record(&checks, args.record && green) {
+    match sim.write_record(&checks) {
         Ok(path) => println!("written: {path}"),
         Err(e) => println!("could not write the record: {e}"),
-    }
-    if args.record && !green {
-        println!("not recorded under docs/measured: a run where an assertion failed never is");
     }
     if green {
         Ok(0)
@@ -721,6 +716,9 @@ impl Sim {
         let host = format!("127.0.0.1:{}", inst.port);
         let boot = format!("@{}", inst.boot_sid());
         let home = format!("cwd={}", inst.home().display());
+        // A plain fleet shell says what it is for, or the driving CLI refuses it before it dials
+        // and no spawn reaches the member's lock.
+        let why = "why=graduation";
         let member = |args: &[&str]| -> Result<String, Fail> {
             let out = self.world.aterm_in(&inst.root, args, None);
             if out.code == 0 {
@@ -794,7 +792,7 @@ impl Sim {
         let mut checks = Vec::new();
 
         let (read_ok, head, before) = seen();
-        let spawn = drive(&["spawn", &home]);
+        let spawn = drive(&["spawn", &home, why]);
         let line = drive(&[&boot, "send", "x"]);
         let (_, _, after) = seen();
         checks.push(Check::new(
@@ -807,8 +805,8 @@ impl Sim {
                 && locked(&line, "read", "write")
                 && after == before,
             format!(
-                "m{i:02} `fleet access`: {} / header: {head} / spawn: {} / send: {} / sessions \
-                 {before} → {after}",
+                "m{i:02} `fleet access`: {} / spawn: {} / send: {} / sessions {before} → {after} \
+                 / header: {head}",
                 one_line(&began),
                 said(&spawn),
                 said(&line)
@@ -819,7 +817,7 @@ impl Sim {
         let (_, head, _) = seen();
         let line = drive(&[&boot, "send", "x"]);
         let erased = drive(&[&boot, "key", "backspace"]);
-        let spawn = drive(&["spawn", &home]);
+        let spawn = drive(&["spawn", &home, why]);
         let (_, _, after) = seen();
         checks.push(Check::new(
             "fleet access: at Read and Write the line is typed and the spawn is refused",
@@ -829,7 +827,7 @@ impl Sim {
                 && locked(&spawn, "write", "full")
                 && after == before,
             format!(
-                "header: {head} / send exited {}: {} / spawn: {} / sessions {before} → {after}",
+                "send exited {}: {} / spawn: {} / sessions {before} → {after} / header: {head}",
                 line.code,
                 said(&line),
                 said(&spawn)
@@ -838,7 +836,7 @@ impl Sim {
 
         member(&["fleet", "access", "full"])?;
         let (_, head, _) = seen();
-        let spawn = drive(&["spawn", &home]);
+        let spawn = drive(&["spawn", &home, why]);
         let worker = spawn
             .stdout
             .split_whitespace()
@@ -856,7 +854,7 @@ impl Sim {
                 && line.as_ref().is_some_and(|out| out.code == 0)
                 && after == before + 1,
             format!(
-                "header: {head} / spawn: {} / send: {} / sessions {before} → {after}",
+                "spawn: {} / send: {} / sessions {before} → {after} / header: {head}",
                 said(&spawn),
                 line.as_ref().map_or_else(|| "not sent".to_owned(), said)
             ),
@@ -878,7 +876,7 @@ impl Sim {
                     .is_some_and(|out| locked(out, "read", "write"))
                 && left == after,
             format!(
-                "header: {head} / status exited {} / send: {} / sessions {after} → {left}",
+                "status exited {} / send: {} / sessions {after} → {left} / header: {head}",
                 status.as_ref().map_or(-1, |out| out.code),
                 line.as_ref().map_or_else(|| "not sent".to_owned(), said)
             ),
@@ -1040,43 +1038,27 @@ impl Sim {
         Ok(c)
     }
 
-    /// Write the simulation record under `docs/measured/` when `to_docs` is true, or `results/` otherwise.
-    fn write_record(&self, checks: &[Check], to_docs: bool) -> Result<String, String> {
+    /// Write the simulation record, green or red, to the lab's state:
+    /// `results/fleet-sim-<N>-<UTC time>.md`, one file per run.
+    fn write_record(&self, checks: &[Check]) -> Result<String, String> {
         let n = self.world.insts.len();
         let now = crate::util::now_secs();
         let stamp = crate::util::utc_stamp(now);
         let date = stamp.get(..10).unwrap_or("undated").to_owned();
-        let path = if to_docs {
-            paths()
-                .repo
-                .join("docs/measured")
-                .join(format!("fleet-sim-{n}-{date}.md"))
-        } else {
-            let dir = paths().need_state()?.join("results");
-            dir.join(format!(
-                "fleet-sim-{n}-{}.md",
-                stamp.get(..19).unwrap_or(&stamp).replace(':', "")
-            ))
-        };
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
+        let dir = paths().need_state()?.join("results");
+        let path = dir.join(format!(
+            "fleet-sim-{n}-{}.md",
+            stamp.get(..19).unwrap_or(&stamp).replace(':', "")
+        ));
+        std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let machine = Machine::read();
-        let before = crate::util::read_regular_text(&path).unwrap_or_default();
-        let earlier = Kept {
-            rows: between(&before, INVOCATIONS)
-                .into_iter()
-                .filter(|l| l.starts_with("| "))
-                .collect(),
-            notes: between(&before, NOTES),
-        };
         let row = self.invocation_row(checks, &stamp, &machine);
-        let body = self.record_body(checks, &date, &machine, &earlier, &row, to_docs);
+        let body = self.record_body(checks, &date, &machine, &row);
         crate::util::write_fresh(&path, body).map_err(|e| e.to_string())?;
         Ok(path.to_string_lossy().into_owned())
     }
 
-    /// One invocation's row of the record's invocations table.
+    /// The invocation's row of the record's invocation table.
     fn invocation_row(&self, checks: &[Check], stamp: &str, machine: &Machine) -> String {
         let walls: Vec<String> = self
             .runs
@@ -1104,15 +1086,7 @@ impl Sim {
     }
 
     /// Render the simulation record Markdown.
-    fn record_body(
-        &self,
-        checks: &[Check],
-        date: &str,
-        machine: &Machine,
-        earlier: &Kept,
-        row: &str,
-        recorded: bool,
-    ) -> String {
+    fn record_body(&self, checks: &[Check], date: &str, machine: &Machine, row: &str) -> String {
         use std::fmt::Write as _;
         let hide = |t: &str| t.replace(&self.host, "<host>");
         let n = self.world.insts.len();
@@ -1123,22 +1097,16 @@ impl Sim {
         let held = checks.iter().all(|c| c.ok);
         let _ = writeln!(
             s,
-            "Written by `targo --unverified lab fleet-sim --n {n} --runs {}{}` \
+            "Written by `targo --unverified lab fleet-sim --n {n} --runs {}` \
              (`crates/aterm-lab/src/fleet_sim.rs`) at the end of a run where {}, {:.0} s after \
-             it began{}. The survey below is synthetic: fixtures, not people.\n",
+             it began. The survey below is synthetic: fixtures, not people.\n",
             self.runs.len(),
-            if recorded { " --record" } else { "" },
             if held {
                 "every assertion held"
             } else {
                 "AN ASSERTION FAILED"
             },
             self.started.elapsed().as_secs_f64(),
-            if recorded {
-                ""
-            } else {
-                " (a scratch record, not under docs/measured)"
-            }
         );
         let _ = writeln!(s, "## Machine\n");
         let _ = writeln!(
@@ -1209,31 +1177,12 @@ impl Sim {
              idle turn's cut `said:` keeps its end.\n",
             peer = hostile_peer(n)
         );
-        let _ = writeln!(
-            s,
-            "## Invocations (each a whole simulation, recorded only when green)\n"
-        );
+        let _ = writeln!(s, "## Invocation (the whole simulation)\n");
         s.push_str(
             "| at (UTC) | commit | clean walls | chars | member fds (max) | fault wall | fault \
              reader fds | assertions |\n|---|---|---|---|---|---|---|---|\n",
         );
-        let _ = writeln!(s, "<!-- {INVOCATIONS} -->");
-        for r in &earlier.rows {
-            let _ = writeln!(s, "{r}");
-        }
-        let _ = writeln!(s, "{row}");
-        let _ = writeln!(s, "<!-- /{INVOCATIONS} -->\n");
-        let _ = writeln!(s, "## Notes\n");
-        let _ = writeln!(
-            s,
-            "Written by hand between the markers below; every recorded invocation keeps them.\n"
-        );
-        let _ = writeln!(s, "<!-- {NOTES} -->");
-        for l in &earlier.notes {
-            let _ = writeln!(s, "{l}");
-        }
-        let _ = writeln!(s, "<!-- /{NOTES} -->\n");
-        let _ = writeln!(s, "The sections below are the latest invocation's.\n");
+        let _ = writeln!(s, "{row}\n");
         let _ = writeln!(s, "## Survey runs (`aterm ctl survey --fleet`)\n");
         s.push_str(
             "| run | wall | chars | text bytes | json bytes | reader fds | member fds (max) |\n",
@@ -1496,34 +1445,6 @@ fn build_kind(aterm: &Path) -> &'static str {
         Some("release") => "a release build",
         _ => "a build",
     }
-}
-
-/// The record's marker around the invocations table's rows.
-const INVOCATIONS: &str = "invocations";
-/// The record's marker around its hand-written notes.
-const NOTES: &str = "notes";
-
-/// What a record carries forward from the file it replaces.
-#[derive(Default)]
-struct Kept {
-    /// The earlier invocations' rows.
-    rows: Vec<String>,
-    /// The hand-written notes.
-    notes: Vec<String>,
-}
-
-/// Lines of `text` between `<!-- <mark> -->` and `<!-- /<mark> -->`.
-fn between(text: &str, mark: &str) -> Vec<String> {
-    let (open, close) = (format!("<!-- {mark} -->"), format!("<!-- /{mark} -->"));
-    if !text.lines().any(|l| l == close) {
-        return Vec::new();
-    }
-    text.lines()
-        .skip_while(|l| *l != open)
-        .skip(1)
-        .take_while(|l| *l != close)
-        .map(str::to_owned)
-        .collect()
 }
 
 /// The boot session's sid of `inst` (the one session a fresh instance has).

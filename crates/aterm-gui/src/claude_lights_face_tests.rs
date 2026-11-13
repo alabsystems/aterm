@@ -1517,7 +1517,7 @@ fn lands_letters_read_on_every_builtin_theme() {
         );
     }
     assert!(
-        under.contains(&"Aterm Day"),
+        under.contains(&"aterm Day"),
         "NEGATIVE CONTROL: the fixed amber fails a light ground: {under:?}"
     );
 }

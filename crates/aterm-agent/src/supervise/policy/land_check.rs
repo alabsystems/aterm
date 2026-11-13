@@ -193,7 +193,7 @@ pub fn land_check_answer(
     let needs_said = [Some(tail), turn_said.as_deref()]
         .into_iter()
         .flatten()
-        .any(|t| !needs::needs_you(t).is_empty());
+        .any(|t| !needs::persons_needs(t).is_empty());
     let body = needs::without_needs(tail);
     let body = body.trim();
     let word = !cut && landed_word(body);

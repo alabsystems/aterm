@@ -59,6 +59,30 @@ impl Tools {
         }
     }
 
+    /// For a content key's mirror of a child (a command hashed, never spawned): name the
+    /// held command directory on its PATH by what it exposes. The directory is a temporary
+    /// path of this run alone, so a key that hashed it could match no other run's, while
+    /// what a child runs from it is fixed by each tool's signed build and payload root.
+    pub(crate) fn name_in_mirror(&self, mirror: &mut Command) {
+        match self {
+            Self::Store(held) => {
+                let Some(path) = mirror
+                    .get_envs()
+                    .find(|(name, _)| *name == "PATH")
+                    .and_then(|(_, value)| value.map(std::ffi::OsStr::to_owned))
+                else {
+                    return;
+                };
+                mirror.env(
+                    "PATH",
+                    path_naming(&path, held.directory(), &held.identity()),
+                );
+            }
+            #[cfg(test)]
+            Self::Simulated => {}
+        }
+    }
+
     /// The engine is a Python script with a shell launcher. Running the held
     /// interpreter directly prevents that launcher's PATH fallback from
     /// selecting another Python when its first probe fails. Isolated imports
@@ -104,6 +128,28 @@ impl Tools {
             Self::Simulated => Ok(Path::new("/fixture/openssl")),
         }
     }
+}
+
+/// `path` with each entry that is the directory `held` replaced by `<signed prerequisites:
+/// identity>`. Every other entry, and the order, stays: a PATH that differs in any other
+/// directory is another PATH.
+pub(crate) fn path_naming(
+    path: &std::ffi::OsStr,
+    held: &Path,
+    identity: &str,
+) -> std::ffi::OsString {
+    let mut named = std::ffi::OsString::new();
+    for (index, entry) in std::env::split_paths(path).enumerate() {
+        if index > 0 {
+            named.push(":");
+        }
+        if entry == held {
+            named.push(format!("<signed prerequisites: {identity}>"));
+        } else {
+            named.push(entry);
+        }
+    }
+    named
 }
 
 /// Ask only the launcher's interpreter-independent capability. An old launcher

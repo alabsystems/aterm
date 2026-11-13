@@ -6,8 +6,9 @@
 //! `acted` and `restarted`) driven along every reachable state of the model, so the
 //! answer to Fable's own limit (the move onto Opus asked for until the host can make
 //! it, the continuation first at the reset, a return to the launch's own model only at
-//! a named reset that was ahead when the move was made, and nothing at all for a launch
-//! that names another model) is the model's, state for state.
+//! a named reset that was ahead when the move was made or as a `/usage` sample of Fable's
+//! week reads it where the notice named none, and nothing at all for a launch that names
+//! another model) is the model's, state for state.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
@@ -15,8 +16,9 @@ use std::time::{Duration, Instant};
 use aterm_agent::supervise::SupervisorConfig;
 use aterm_agent::supervise::phase::Phase;
 use aterm_agent::supervise::policy::turn_end::{
-    Composer, FABLE_FALLBACK, LaunchModel, ModelSwitch, RULE_LIMIT_RESUME, Restart, TurnEndAction,
-    TurnEndReading, TurnEndState, TurnEndTiming, decide_turn_end,
+    BackBy, Composer, FABLE_FALLBACK, LaunchModel, ModelSwitch, RULE_LIMIT_RESUME, Restart,
+    Sampled, TurnEndAction, TurnEndReading, TurnEndState, TurnEndTiming, decide_turn_end,
+    fable_rung,
 };
 use aterm_models_harness::supervisor_model_switch_model;
 use aterm_phase::WallKind;
@@ -137,6 +139,7 @@ fn base_reading() -> TurnEndReading {
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
+        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
         fact: None,
         wake: None,
     }
@@ -178,6 +181,17 @@ struct Real {
     st: TurnEndState,
     now: Instant,
     appeared: Instant,
+    /// The strict walk's: a mirror the real switch disagrees with fails it, never prunes it.
+    strict: bool,
+    /// When the last return made on a sample's room left was made.
+    last_room: Option<Instant>,
+}
+
+/// The instant the rung of `roomed` returns made on room left ends after the last one, as the
+/// real switch paces the next ([`fable_rung`]); `roomed` 0 is no rung.
+fn rung_end(real: &Real, roomed: i64) -> Instant {
+    let n = u32::try_from(roomed.max(1) - 1).unwrap();
+    real.last_room.map_or(real.now, |last| last + fable_rung(n))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -222,7 +236,9 @@ fn expected(m: &Model, st: &State) -> Verdict {
         } else {
             Verdict::Other
         }
-    } else if st["on"] == 1 && st["back"] == 1 && st["clock"] >= cnst(m, "ResetAt") {
+    } else if st["on"] == 1
+        && ((st["back"] == 1 && st["clock"] >= cnst(m, "ResetAt")) || st["back"] == 2)
+    {
         Verdict::Return
     } else {
         Verdict::Other
@@ -241,7 +257,7 @@ fn mirror(
     let now = real.now;
     match action {
         "JobsStart" | "JobsEnd" | "LaunchUnnamed" | "LaunchFable" | "LaunchOther" => {}
-        "BucketLifts" => {
+        "BucketLifts" | "BucketLiftsUnnamed" => {
             if before["on"] == 0 {
                 let r = reading(m, after, real.appeared, Some(REAL_WORK), mislabel);
                 real.st.observe(&r, now);
@@ -296,10 +312,60 @@ fn mirror(
                 return false;
             }
             real.st.restarted(why, true, &r, now);
+            if before["back"] == 2 {
+                real.last_room = Some(now);
+            }
             if after["bucket"] == 1 {
                 real.appeared = now;
                 let again = reading(m, after, now, Some(Duration::from_secs(3)), mislabel);
                 real.st.observe(&again, now);
+            }
+        }
+        // A `/usage` sample of Fable's week, told the switch as the loop tells it: a row with room
+        // left (right or wrong: the bucket may stand), or one at its limit naming the reset
+        // `ResetAt` ticks after the wall the model's clock counts from. In the strict walk the real switch must time the return
+        // as the model does (a room-left return at once once its rung has passed, else at the
+        // rung's end; the spent row's at its reset): a disagreement fails it, never prunes it.
+        "SampleRoom" | "SampleSpent" => {
+            let (read, want) = if action == "SampleRoom" {
+                let at = if after["back"] == 2 {
+                    now
+                } else {
+                    rung_end(real, before["roomed"])
+                };
+                (Some((40, None)), Sampled::Room { at })
+            } else {
+                // `ResetAt` ticks after the wall the model's `clock` counts from.
+                let ahead = cnst(m, "ResetAt") - before["clock"];
+                let reset = now + MIN * u32::try_from(ahead).unwrap();
+                (Some((100, Some(reset))), Sampled::Reset { at: reset })
+            };
+            let got = real.st.model_sampled(read, now);
+            if got != Some(want) {
+                assert!(
+                    !real.strict,
+                    "{action} at {before:?}: {got:?}, not {want:?}"
+                );
+                return false;
+            }
+        }
+        // The `Buggy = 2` model's room-left row returned on at once inside its rung: told the
+        // real switch as any room-left row is, so the walk judges the real answer, not the
+        // model's wish.
+        "SampleUnpaced" => {
+            let _ = real.st.model_sampled(Some((40, None)), now);
+        }
+        // The rung since the last return made on room left passes; the wall's clock moves with
+        // it, so a reset it names stays the same ticks ahead.
+        "RungPasses" => {
+            let to = rung_end(real, before["roomed"]).max(now);
+            real.appeared += to - now;
+            real.now = to;
+        }
+        // The last return made on room left held the longest rung.
+        "RoomHolds" => {
+            if let Some(last) = real.last_room {
+                real.now = real.now.max(last + fable_rung(u32::MAX));
             }
         }
         "GuessedReturn" | "GivesUp" | "ReturnBlocks" | "MovesAnother" => {}
@@ -315,6 +381,8 @@ fn walk(m: &Model, strict: bool, mislabel: bool) -> (usize, Vec<State>) {
         st: TurnEndState::new(timing()),
         now: base,
         appeared: base,
+        strict,
+        last_room: None,
     };
     let mut seen: BTreeSet<Vec<i64>> = BTreeSet::new();
     let mut queue = VecDeque::from([(m.init_state(), init)]);
@@ -362,9 +430,12 @@ fn tier1_the_real_decider_switches_and_returns_exactly_where_the_model_allows() 
 }
 
 /// Negative controls: the `Buggy = 1` model (a return guessed at a switch nothing
-/// scheduled one for) is not the real decider; and a switch seeded with a guessed
-/// half hour's `back_at` makes the real decider return where the committed switch
-/// owes none.
+/// scheduled one for) and the `Buggy = 2` one (a return made on a row with room left inside the
+/// rung since the last such return, which a row misread while the bucket stands turns into a
+/// `NoPingPong`) are not the real decider, the latter judged by what the real switch answers that
+/// row; and
+/// a switch seeded with a guessed half hour's `back_at` makes the real decider return where
+/// the committed switch owes none until a sample times it.
 #[test]
 fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
     let m = supervisor_model_switch_model();
@@ -373,6 +444,19 @@ fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
     assert!(
         off.iter().any(|st| st["on"] == 0 && st["flips"] >= 2),
         "no disagreement after a guessed return: {} states",
+        off.len()
+    );
+    let unpaced = aterm_spec::interp::with_buggy(&m, 2);
+    assert_eq!(
+        aterm_spec::interp::violated_invariants(&unpaced),
+        std::collections::BTreeSet::from(["NoPingPong"]),
+        "a room-left row returned on inside its rung ping-pongs on a misread bucket"
+    );
+    let (_, off) = walk(&unpaced, false, false);
+    assert!(
+        off.iter()
+            .any(|st| st["on"] == 1 && st["back"] == 2 && st["roomed"] >= 1 && st["paced"] == 0),
+        "no disagreement at a return owed inside its rung: {} states",
         off.len()
     );
     let (_, mislabelled) = walk(&m, false, true);
@@ -392,6 +476,9 @@ fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
         from: Some("fable".to_string()),
         to: FABLE_FALLBACK.to_string(),
         back_at: Some(t + 30 * MIN),
+        back_by: Some(BackBy::Notice),
+        sample_at: None,
+        samples: 0,
         proc: None,
         unproven: false,
     });
@@ -430,4 +517,8 @@ fn the_guessed_return_and_the_old_half_hour_disagree_with_the_real_code() {
             ..
         }
     ));
+    assert!(
+        committed.model_sample_due(later),
+        "a sample is owed instead"
+    );
 }

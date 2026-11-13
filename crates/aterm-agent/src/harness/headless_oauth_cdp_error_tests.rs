@@ -64,8 +64,8 @@ mod late_write {
 
     #[test]
     fn a_late_write_holds_later_commands_back_until_it_finishes_and_poisons_none() {
-        let (commands, command_write) = std::io::pipe().unwrap();
-        let (event_read, replies) = std::io::pipe().unwrap();
+        let (commands, command_write) = aterm_uds::pipe().unwrap();
+        let (event_read, replies) = aterm_uds::pipe().unwrap();
         let slept = Arc::new(AtomicU64::new(0));
         let (go, start) = std::sync::mpsc::channel();
         let browser = unread_until(commands, replies, slept.clone(), start);
@@ -103,8 +103,8 @@ mod late_write {
 
 #[test]
 fn a_failed_write_refuses_every_later_command() {
-    let (commands, command_write) = std::io::pipe().unwrap();
-    let (event_read, _replies) = std::io::pipe().unwrap();
+    let (commands, command_write) = aterm_uds::pipe().unwrap();
+    let (event_read, _replies) = aterm_uds::pipe().unwrap();
     // The browser is gone: a write fails.
     drop(commands);
     let mut client = CdpClient::new(command_write, event_read);

@@ -57,8 +57,9 @@ pub struct PrefixEvidence {
     pub acknowledged_records: u64,
     /// Their original custody-side commitment, not an operation inventory hash.
     pub custody_commitment: Digest,
-    /// Records covered by the data journal's durable checkpoint. At most one
-    /// may await its custody-side acknowledgment; this inspection never adopts it.
+    /// Records covered by the data journal's durable checkpoint. One record or an
+    /// independently permitted exact group may await custody acknowledgment; this
+    /// inspection never adopts it.
     pub committed_records: usize,
 }
 
@@ -214,7 +215,7 @@ impl WitnessedPrefix {
                 conflicts.get(&entry.receipt.id).copied() == Some(entry.wire.wire())
             } else {
                 store.records.get(&entry.receipt.id).is_some_and(|stored| {
-                    stored.quarantine.is_none() && stored.wire.as_slice() == entry.wire.wire()
+                    stored.payload.is_ready() && stored.wire.as_slice() == entry.wire.wire()
                 })
             };
             if !retained {
@@ -297,8 +298,8 @@ pub(crate) fn witnessed_prefix(
             ));
         }
     };
-    let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
-    let replay = replay::read_observed(records, acknowledged)?;
+    let boundary = super::group::read(&claims, &name, &claim)?;
+    let replay = replay::read_observed(records, boundary)?;
     let prefix = WitnessedPrefix {
         scope,
         entries: replay.entries,
@@ -379,7 +380,8 @@ fn inspect_parts(
         volume_witness_present: volume.is_some(),
         binding_error,
     };
-    let prefix = verify_prefix.then(|| inspect_prefix(&dir, &claim).map_err(reason));
+    let prefix = verify_prefix
+        .then(|| inspect_prefix(&dir, &claim_dir, &claim_name, &claim).map_err(reason));
     after_prefix();
     session.context(scope)?;
     if private_file::read_private(&claim_dir, &claim_name, CLAIM_LEN)
@@ -403,7 +405,12 @@ fn reason(error: Error) -> String {
     aterm_codec::tty::one_line(&error.to_string(), 512)
 }
 
-fn inspect_prefix(dir: &std::path::Path, claim: &[u8]) -> Result<PrefixEvidence> {
+fn inspect_prefix(
+    dir: &std::path::Path,
+    claims: &std::path::Path,
+    name: &str,
+    claim: &[u8],
+) -> Result<PrefixEvidence> {
     let acknowledged = Witness::decode(&claim[WITNESS_AT..])?;
     let records = match aterm_journal::read_committed(
         dir,
@@ -420,9 +427,10 @@ fn inspect_prefix(dir: &std::path::Path, claim: &[u8]) -> Result<PrefixEvidence>
         }
     };
     let committed_records = records.len();
-    // The ordinary receipt verifier checks the entire independently acknowledged
-    // prefix and its single-tail bound. It discards the tail in memory alone.
-    replay::read_observed(records, acknowledged)?;
+    // Check physical facts before their current independent group permission. Inspection
+    // retains only the acknowledged prefix and never adopts its permitted tail.
+    let boundary = super::group::read(claims, name, claim)?;
+    replay::read_observed(records, boundary)?;
     Ok(PrefixEvidence {
         acknowledged_records: acknowledged.count,
         custody_commitment: claim[WITNESS_AT + 8..]

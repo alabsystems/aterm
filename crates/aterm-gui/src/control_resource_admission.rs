@@ -25,6 +25,7 @@ enum Command<'a> {
     Attach,
     AttachAccounted,
     AttachAccountedExpected,
+    AttachNativeExpected,
     Inspect(&'a str),
     Enroll(&'a str),
 }
@@ -47,6 +48,7 @@ fn parse(rest: &str) -> Option<Command<'_>> {
         ["attach"] => Some(Command::Attach),
         ["attach-accounted-v1"] => Some(Command::AttachAccounted),
         ["attach-accounted-original-store-v1"] => Some(Command::AttachAccountedExpected),
+        ["attach-accounted-native-job-original-store-v1"] => Some(Command::AttachNativeExpected),
         ["enroll", field] => {
             let nonce = field.strip_prefix("nonce=")?;
             aterm_codec::hex::is_lower(nonce, 64).then_some(Command::Enroll(nonce))
@@ -202,7 +204,10 @@ pub(crate) fn serve(
                 }
                 json_reply("inspect", observation)
             }
-            Command::Attach | Command::AttachAccounted | Command::AttachAccountedExpected => {
+            Command::Attach
+            | Command::AttachAccounted
+            | Command::AttachAccountedExpected
+            | Command::AttachNativeExpected => {
                 let accounted = !matches!(command, Command::Attach);
                 let admitted = Cell::new(None);
                 let authorize = |request: &aterm_types::resource_admission::Submission,
@@ -235,10 +240,14 @@ pub(crate) fn serve(
                         crate::resource_admission_host::submit(authorized)
                     }
                 };
-                if matches!(command, Command::AttachAccountedExpected) {
+                if matches!(
+                    command,
+                    Command::AttachAccountedExpected | Command::AttachNativeExpected
+                ) {
                     let address = stream.local_addr()?;
                     let endpoint = address.as_pathname().ok_or_else(denied)?;
                     crate::resource_admission_attach::attach_accounted_expected(
+                        matches!(command, Command::AttachNativeExpected),
                         stream,
                         true,
                         deadline,

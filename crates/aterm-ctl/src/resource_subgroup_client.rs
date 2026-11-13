@@ -133,7 +133,7 @@ fn prepare_output(mode: Stdio, index: u8) -> io::Result<(OwnedFd, Option<File>)>
         Stdio::Null => Ok((null(false)?, None)),
         Stdio::Fd(fd) => Ok((fd, None)),
         Stdio::Piped => {
-            let (reader, writer) = aterm_uds::kept_out(io::pipe)?;
+            let (reader, writer) = aterm_uds::pipe()?;
             Ok((writer.into(), Some(File::from(OwnedFd::from(reader)))))
         }
     }

@@ -38,7 +38,7 @@ const HEARD_BACK_S: u64 = 14 * 86_400;
 
 /// How a journal record's Mac is shown: its machine label where its facts row binds a live
 /// machine with one, else `uuid:<first 8 hex>`.
-fn mac(view: &LabView, uuid: &str) -> String {
+pub(crate) fn mac(view: &LabView, uuid: &str) -> String {
     view.bound
         .get(uuid)
         .and_then(|pk| view.machine_label(pk))
@@ -215,6 +215,29 @@ fn journal_view(
     }
 }
 
+/// What one registry read is to the fleet tables, beside the view the journal names Macs by
+/// ([`journal_view`], which holds a projection in `last`). A projection, and the one held while
+/// the registry's operations have not moved, are the registry as it is now. A partial history
+/// says nothing of the lab: the tables keep the rows of the last projection and say they are
+/// held, as of the read that projected them, however long the history stays partial. No lab is
+/// no registry.
+fn lab_offer(
+    read: Option<LabRead>,
+    last: &mut Option<(Arc<LabView>, Inventory)>,
+) -> (Arc<LabView>, aterm_db::fleet::Reading<Arc<LabView>>) {
+    use aterm_db::fleet::{HELD_PARTIAL, Reading};
+    let partial = read.as_ref().map(|read| matches!(read, LabRead::Partial));
+    let view = journal_view(read, last);
+    let reading = match (partial, last.as_ref()) {
+        (None, _) => Reading::Off,
+        (Some(false), Some((held, _))) => Reading::Read(Arc::clone(held)),
+        // An unmoved inventory is read only against a projection held, so `(Some(false),
+        // None)` is no read `Registry::lab` gives; like a partial history, it is no registry.
+        (Some(_), _) => Reading::Held(HELD_PARTIAL),
+    };
+    (view, reading)
+}
+
 struct Cache {
     paths: Paths,
     config: PathBuf,
@@ -227,11 +250,30 @@ struct Cache {
 
 impl Cache {
     /// One read of the registry and the journal window ([`journal_view`] names the Macs); a
-    /// failed or unheld read keeps what was held.
+    /// failed or unheld read keeps what was held. What the read made of each is offered to this
+    /// process's fleet tables ([`Self::read_into`]).
     fn read(&self) {
+        self.read_into(aterm_db::fleet::folder());
+    }
+
+    /// [`Self::read`], offering what the read made of the registry and of the journal to the
+    /// fleet tables `fleet` (`aterm_db::fleet`), which fold both and read neither themselves: a
+    /// policy that cannot be read and a registry that cannot be read hold what was read, a
+    /// partial history holds the registry ([`lab_offer`]), and a lab turned off, or none, drops
+    /// it.
+    fn read_into(&self, fleet: &aterm_db::fleet::Folder) {
+        use aterm_db::fleet::{HELD_POLICY, HELD_UNREADABLE, Reading};
+        let now_ms = aterm_time::unix_millis().unwrap_or(0);
         match crate::alab_view::roster_policy(&self.config) {
             crate::alab_view::LocalRosterPolicy::Enabled => {}
-            crate::alab_view::LocalRosterPolicy::Unavailable => return,
+            crate::alab_view::LocalRosterPolicy::Unavailable => {
+                fleet.offer_lab(
+                    Reading::Held(HELD_POLICY),
+                    Reading::Held(HELD_POLICY),
+                    now_ms,
+                );
+                return;
+            }
             crate::alab_view::LocalRosterPolicy::Disabled => {
                 *self
                     .held
@@ -241,38 +283,50 @@ impl Cache {
                     .lab
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                fleet.offer_lab(Reading::Off, Reading::Off, now_ms);
                 return;
             }
         }
-        let now = aterm_time::unix_millis().unwrap_or(0) / 1000;
+        let now = now_ms / 1000;
         let mut last = self
             .lab
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let held = last.as_ref().map(|(_, inventory)| *inventory);
-        let view = match Registry::at(self.paths.clone()).lab(&self.config, held) {
-            Ok(read) => journal_view(read, &mut last),
+        let read = match Registry::at(self.paths.clone()).lab(&self.config, held) {
+            Ok(read) => read,
             Err(why) => {
                 aterm_log::debug!("journal view: {why}");
+                fleet.offer_lab(
+                    Reading::Held(HELD_UNREADABLE),
+                    Reading::Held(HELD_UNREADABLE),
+                    now_ms,
+                );
                 return;
             }
         };
+        let (view, lab) = lab_offer(read, &mut last);
         drop(last);
         let heard = self
             .spool
             .as_ref()
             .map(|spool| (spool, now.saturating_sub(HEARD_BACK_S)));
-        match seen::read(&self.paths, heard, now) {
+        let journal = match seen::read(&self.paths, heard, now) {
             Ok(Some(seen)) => {
                 let fresh = Arc::new(harness_seen(&view, &seen));
                 *self
                     .held
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh);
+                Reading::Read(Arc::new(seen))
             }
-            Ok(None) => {}
-            Err(why) => aterm_log::debug!("journal view: {why}"),
-        }
+            Ok(None) => Reading::Off,
+            Err(why) => {
+                aterm_log::debug!("journal view: {why}");
+                Reading::Held(HELD_UNREADABLE)
+            }
+        };
+        fleet.offer_lab(lab, journal, now_ms);
     }
 
     fn start_reader(&'static self) {
@@ -340,6 +394,11 @@ pub(crate) fn install() {
         reader: OnceLock::new(),
     });
     let _ = alab_seen::install(Box::new(cache));
+    // The fleet tables read the registry and the journal through this cache's reads: its
+    // reader starts when something first asks for them. Naming the folder here starts nothing
+    // (its fold thread starts on that first ask too), so a command that only passes through
+    // pays one empty table.
+    let _ = aterm_db::fleet::folder().install_lab_reader(Box::new(|| cache.start_reader()));
 }
 
 #[cfg(test)]

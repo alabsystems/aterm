@@ -549,8 +549,8 @@ impl Grid {
 
         if self.storage.scrollback.is_some() {
             self.drop_fill_debt();
-            self.reconcile_pending_scrollback_settings();
             self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
+            self.reconcile_pending_scrollback_settings();
             return;
         }
 
@@ -560,18 +560,23 @@ impl Grid {
             self.storage.scrollback = Some(store);
             self.drop_fill_debt();
             self.settle_fill(0);
-            self.reconcile_pending_scrollback_settings();
             self.drain_lazy_buffer();
+            self.reconcile_pending_scrollback_settings();
             self.storage.display_offset = 0;
             self.storage.damage = Damage::Full;
             self.storage.content_gen += 1;
+            self.storage.history_content_gen += 1;
             return;
         }
 
         self.storage.scrollback = Some(reflowed.store);
-        self.reconcile_pending_scrollback_settings();
+        // History returns in write order (the job's ring history, then the window's staged
+        // output), and only then do the settings changed meanwhile replay: each setter settles
+        // whatever is staged into the store, which ahead of the seat put the window's output
+        // before the older ring history for good.
         self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
         self.drain_lazy_buffer();
+        self.reconcile_pending_scrollback_settings();
         if reflowed.new_cols == self.storage.cols {
             let pulled = self.pay_fill_debt();
             self.settle_fill(pulled);
@@ -590,6 +595,7 @@ impl Grid {
         }
         self.storage.damage = Damage::Full;
         self.storage.content_gen += 1;
+        self.storage.history_content_gen += 1;
         self.cover_retained_rows();
     }
 
@@ -621,11 +627,14 @@ impl Grid {
         let counter_at_reattach = self.storage.absolute_row_counter;
 
         self.storage.scrollback = Some(reflowed.store);
+        // The window's staged output leaves with the job's ring history before the settings
+        // replay, so no setter settles it into the store ahead of those older lines; the run
+        // then meets the settings now in force.
+        let mut staged = Box::new(self.storage.lazy_buffer.take_staged());
         self.reconcile_pending_scrollback_settings();
 
         let (lazy_lines, lazy_staged) = if self.storage.store_retains_lines() {
             let mut ring_out = reflowed.ring_out;
-            let mut staged = Box::new(self.storage.lazy_buffer.take_staged());
             if let Some(store) = self.storage.scrollback.as_mut()
                 && let Some(max) = store.line_limit()
             {
@@ -645,6 +654,7 @@ impl Grid {
             }
             (ring_out, staged)
         } else {
+            self.storage.lazy_buffer.restore_staged(*staged);
             self.reattach_ring_history(reflowed.ring_out, reflowed.new_cols);
             self.drain_lazy_buffer();
             let rest = self.storage.lazy_buffer.drain_all().collect();
@@ -666,6 +676,7 @@ impl Grid {
         }
         self.storage.damage = Damage::Full;
         self.storage.content_gen += 1;
+        self.storage.history_content_gen += 1;
         let retained = u64::from(self.storage.visible_rows).saturating_add(sb as u64);
         if self.storage.absolute_row_counter < retained {
             self.renumber_rows(retained);
@@ -776,7 +787,9 @@ impl Grid {
         }
     }
 
-    /// Replay scrollback settings changed while the tiered store was detached.
+    /// Replay scrollback settings changed while the tiered store was detached. Each setter
+    /// settles anything staged into the store, so a re-attach calls this once the window's
+    /// staged output is seated after the job's ring history, or moved out with it.
     fn reconcile_pending_scrollback_settings(&mut self) {
         let Some(settings) = self.storage.pending_scrollback_settings.take() else {
             return;
@@ -905,6 +918,7 @@ impl Grid {
         }
         self.storage.damage = Damage::Full;
         self.storage.content_gen += 1;
+        self.storage.history_content_gen += 1;
         debug_assert!(
             !self.storage.scrollback_detached_for_reflow,
             "abort_reflow_offload must close the detach window on every exit"

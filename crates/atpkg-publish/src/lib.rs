@@ -19,6 +19,8 @@ pub mod host;
 pub mod hosts_check;
 pub mod identity;
 pub mod lane;
+#[cfg(unix)]
+pub mod package_campaign;
 pub mod pins;
 pub mod programs;
 pub mod project_toolchain;

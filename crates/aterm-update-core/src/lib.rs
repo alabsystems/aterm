@@ -14,8 +14,9 @@
 //! only anonymously, as [`release_asset`]'s API route;
 //! [`ensure_private_dir`]; [`sha256_file`]; the release-tag grammar
 //! ([`tag`]) the publisher and the updater both classify with; the trust anchors ([`pins`]);
-//! the master-signed machine [`roster`]; and the Developer ID requirement with its bounded
-//! `/usr/bin/codesign` check ([`codesign`]).
+//! the master-signed machine [`roster`]; the Developer ID requirement with its bounded
+//! `/usr/bin/codesign` check ([`codesign`]); and the [`update_record`], the one place an
+//! updater copy keeps its verdict on a release, every hold in it expiring.
 //!
 //! `app_swap` supplies macOS atomic directory placement. `aterm-update` layers the remaining
 //! `.app` pieces (DMG mount, spctl, re-exec and staging layout) on top. Roster verification is
@@ -26,6 +27,9 @@
 // `#[cfg_attr(trust_verify, trust::skip)]` opt-outs resolve; inert under plain rustc.
 #![cfg_attr(trust_verify, feature(register_tool))]
 #![cfg_attr(trust_verify, register_tool(trust))]
+// On a Trust compiler the update record's anchors are `macro_rules!` attributes
+// (crates/aterm-spec-anchor/anchor_rules.rs), which only test and debug builds expand.
+#![cfg_attr(all(anchor_rules, any(test, debug_assertions)), feature(macro_attr))]
 
 #[cfg(test)]
 aterm_durable::plain_durable_flushes_in_tests!();
@@ -51,6 +55,7 @@ pub mod seal_guard;
 pub mod service_image;
 pub mod settings;
 pub mod tag;
+pub mod update_record;
 
 mod durable;
 mod hash;

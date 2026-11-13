@@ -892,7 +892,7 @@ fn live_member_coverage_and_outer_timeout_preserve_original_scope() {
     let mut fixture = Fixture::new();
     let dropped = Arc::new(AtomicUsize::new(0));
     let (events, _client) = event_pair();
-    let (read, write) = std::io::pipe().unwrap();
+    let (read, write) = aterm_uds::pipe().unwrap();
     let mut command = spawnfd::command("/bin/cat");
     command
         .stdin(spawnfd::Stdio::from(std::fs::File::from(OwnedFd::from(
@@ -969,7 +969,7 @@ fn exited_leader_keeps_group_pin_until_other_members_are_positively_exited() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let (events, _client) = event_pair();
     let marker = fixture._scratch.path().join("background-held");
-    let (input, mut hold) = aterm_uds::kept_out(std::io::pipe).unwrap();
+    let (input, mut hold) = aterm_uds::pipe().unwrap();
     let shell = aterm_uds::deadline::stand_in(std::path::Path::new("/bin/sh"));
     let mut command = spawnfd::command(shell);
     command
@@ -1173,7 +1173,7 @@ fn metadata_cannot_return_original_resources_while_a_setsid_child_survives() {
             original: Resources(dropped.clone(), None),
             prelude,
             gnu: {
-                let (read, write) = aterm_uds::kept_out(std::io::pipe).unwrap();
+                let (read, write) = aterm_uds::pipe().unwrap();
                 [read.into(), write.into()]
             },
         },
@@ -1319,7 +1319,7 @@ fn native_producer_return_control(lose_owner: bool) {
         .stdin(spawnfd::Stdio::null())
         .stdout(spawnfd::Stdio::null())
         .stderr(spawnfd::Stdio::null());
-    let (read, write) = aterm_uds::kept_out(std::io::pipe).unwrap();
+    let (read, write) = aterm_uds::pipe().unwrap();
     let mut member = OwnedAttempt::launch(
         &mut fixture,
         command,
@@ -1460,7 +1460,7 @@ fn escaped_closed_stream_descendant_cannot_create_producer_retirement() {
     }
     let mut fixture = Fixture::new();
     let marker = fixture._scratch.path().join("escaped");
-    let (reader, writer) = aterm_uds::kept_out(std::io::pipe).unwrap();
+    let (reader, writer) = aterm_uds::pipe().unwrap();
     let dropped = Arc::new(AtomicUsize::new(0));
     let (events, _client) = event_pair();
     let mut command = spawnfd::command(std::env::current_exe().unwrap());

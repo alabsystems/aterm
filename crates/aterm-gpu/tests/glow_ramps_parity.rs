@@ -1280,7 +1280,7 @@ fn glass_tails(
         let spine = (top + (band + 1) * ch) as f32;
         let verts: Vec<aterm_render::RibbonVertex> = (0..=8u8)
             .map(|k| {
-                let up = 0.96 * ch as f32 * aterm_render::smoothstep01(f32::from(k) / 2.5);
+                let up = 0.96 * ch as f32 * aterm_render::smoothstep(f32::from(k) / 2.5);
                 aterm_render::RibbonVertex {
                     x: (pad + (4 + usize::from(k)) * cw) as f32 + 0.25,
                     spine,

@@ -995,9 +995,22 @@ impl Row {
                  press of its update arrow"
             }
             AGENT_OFF => "it moves once its agent is switched on again (Settings ▸ Harness)",
-            "limited" if self.spend_held() => "it moves once you add credits or raise the cap",
-            "limited" => "it moves once the limit resets",
-            "login" => "it moves once it is logged in again",
+            // The words name `upgrade::LIMIT_WALL_S`.
+            "limited" if self.spend_held() => {
+                const _: () = assert!(upgrade::LIMIT_WALL_S == 60 * 60);
+                "it moves once you add credits or raise the cap, or once its conversation has \
+                 shown the limit an hour with nobody at it"
+            }
+            "limited" => {
+                "it moves once the limit resets, or once its conversation has shown the limit an \
+                 hour with nobody at it"
+            }
+            "login" => {
+                // The words name `upgrade::LOGIN_WALL_S`.
+                const _: () = assert!(upgrade::LOGIN_WALL_S == 30 * 60);
+                "it moves once it is logged in again, or once its conversation has shown the wall \
+                 half an hour with nobody at it"
+            }
             crate::harness::upgrade_drive::UNREAD_VERSION => {
                 "each look reads it again, and it moves once it is read"
             }
@@ -1006,15 +1019,19 @@ impl Row {
                  word to upgrade now"
             }
             w if w.starts_with("announce-refused:cut-") => {
-                "the part it left in its prompt waits to be sent or cleared there"
+                "aterm takes back the part its prompt kept and tries again: nothing to do"
             }
             "left-typed:mixed" => "it moves once that draft is sent or cleared",
             "left-typed:screen-unreadable" => "it moves once aterm can read the tab again",
-            w if w.starts_with("left-typed:") => match self.agent {
-                upgrade::Agent::Claude | upgrade::Agent::Codex => {
+            w if w.starts_with("left-typed:") => match (self.agent, w) {
+                (upgrade::Agent::Claude, "left-typed:unsent") => {
+                    "aterm takes them back once its tab has been left alone for a minute, or \
+                     clear them there"
+                }
+                (upgrade::Agent::Claude | upgrade::Agent::Codex, _) => {
                     "it moves once they are sent or cleared in its tab"
                 }
-                upgrade::Agent::Muse | upgrade::Agent::Agy => QUIET_LANE_WORDS,
+                (upgrade::Agent::Muse | upgrade::Agent::Agy, _) => QUIET_LANE_WORDS,
             },
             w if w.starts_with("announce-refused:") => {
                 "it tries again at the next quiet moment: nothing to do"
@@ -1911,7 +1928,8 @@ fn unworded_waiting_line(wait: &str) -> &'static str {
                  they are done"
             }
             WaitClass::Limit => {
-                "a usage limit holds it until its reset; it moves once the limit resets"
+                "a usage limit holds it until its reset, or for an hour its conversation shows the \
+                 limit with nobody at it; it moves once either is past"
             }
             WaitClass::TabUnread => {
                 "aterm cannot yet read its tab well enough to move it; it moves on its own once it \
@@ -4297,6 +4315,7 @@ fn ask_with_wait(
             ..opts.clone()
         };
         let r = Report {
+            rung: None,
             pid: st.pid,
             tab: sid.to_string(),
             session: session.clone(),
@@ -4467,6 +4486,7 @@ fn ask_with_wait(
         &st,
     );
     let report = Report {
+        rung: None,
         pid: st.pid,
         tab: sid.to_string(),
         session: session.clone(),

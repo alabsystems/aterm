@@ -47,6 +47,11 @@ fn only_a_death_the_bytes_answer_for_keeps_its_counted_trial_launch() {
             "and an unattributed death least of all: this is the majority \
              answer on the shipping lane, and it is retried six times",
         ),
+        (
+            Death::EndedHere,
+            false,
+            "nor a launch this process ended itself",
+        ),
     ] {
         assert_eq!(forgives(death), !keeps_its_count, "{death:?}: {why}");
     }

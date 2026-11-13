@@ -47,12 +47,12 @@ fn found_in(rel: &str, source: &str) -> Vec<String> {
 }
 
 /// Each read the rule names: an include, a `../` literal leaving the crate, a crate-rooted
-/// chain to the root and on, a folder under docs/, another member's spec table, a build
-/// script's literal, a const of the crate, the crate's own SPECS.md by every root, and a
-/// root followed through `let` bindings.
+/// chain to the root and on (to CHANGELOG.md as to any root Markdown), a folder under docs/,
+/// another member's spec table, a build script's literal, a const of the crate, the crate's own
+/// SPECS.md by every root, and a root followed through `let` bindings.
 #[test]
 fn each_read_of_no_reach_text_is_named() {
-    let cases: [(&str, &str, &str); 12] = [
+    let cases: [(&str, &str, &str); 13] = [
         (
             "include_str!(\"../../../docs/notes.md\")",
             "docs/notes.md",
@@ -61,6 +61,11 @@ fn each_read_of_no_reach_text_is_named() {
         (
             "include_str!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../../AGENTS.md\"))",
             "AGENTS.md",
+            "",
+        ),
+        (
+            "fn t() { manifest_dir().join(\"../..\").join(\"CHANGELOG.md\"); }",
+            "CHANGELOG.md",
             "",
         ),
         (
@@ -254,8 +259,7 @@ fn a_read_from_the_crate_directory_a_helper_or_a_doctest_is_named() {
 
 /// NEGATIVE CONTROLS: what reads nothing no-reach. A tempdir's README.md, a provenance or
 /// fixture literal, a crate-owned asset, a `../docs` path that stays inside the crate, a
-/// comment, a root read of a file outside the class, CHANGELOG.md through a root chain
-/// (outside the class until changelog fragments), a directory under docs/ holding none, an
+/// comment, a root read of a file outside the class, a directory under docs/ holding none, an
 /// excluded crate's spec table, a binding shadowed before its use, a const another crate
 /// defines, a join of an unknown value, and a no-reach name the tree does not hold (a
 /// scratch repository's symlink target).
@@ -271,7 +275,6 @@ fn what_reads_no_no_reach_text_is_no_finding() {
         "// std::fs::read(manifest_dir().join(\"../../docs/x.md\"))",
         "/* include_str!(\"../../../AGENTS.md\") */",
         "fn t() { manifest_dir().join(\"../..\").join(\".gitleaks.toml\"); }",
-        "fn t() { manifest_dir().join(\"../..\").join(\"CHANGELOG.md\"); }",
         "fn t() { manifest_dir().join(\"../..\").join(\"docs/empty\"); }",
         "fn t() { std::fs::read(\"../forked/SPECS.md\"); }",
         "fn t() { let root = manifest_dir().join(\"../..\"); let root = other(); \

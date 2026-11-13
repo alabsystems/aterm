@@ -116,7 +116,8 @@ mod unix {
     fn make_pipe() -> Option<(RawFd, RawFd)> {
         let mut fds = [0 as libc::c_int; 2];
         // SAFETY: `fds` is a writable array of two descriptors.
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        let made = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        if made != 0 {
             return None;
         }
         // SAFETY: `pipe` just returned two fresh open descriptors in `fds`.

@@ -577,11 +577,13 @@ impl TabOne {
         let sf = session_file_of(&opts.home, pid).expect("the file parses");
         let project = opts.home.join(".claude/projects/p");
         std::fs::create_dir_all(&project).expect("project");
+        // Its weekly limit answered 15 minutes before [`NOW_28TH`]: a wall within the bound a
+        // limit nobody lifts holds the round (`upgrade::LIMIT_WALL_S`), so the watch reads it.
         std::fs::write(
             project.join(format!("{SESSION}.jsonl")),
             format!(
                 r#"{{"type":"user","message":{{"role":"user","content":"keep the disk watch going"}}}}
-{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"u","timestamp":"2026-09-28T00:49:50.000Z","message":{{"id":"m","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":"You've hit your weekly limit · resets Oct 4 at 12am (America/Los_Angeles)"}}]}},"requestId":"req_0","quotaLimits":{{"status":"rejected","resetsAt":{RESETS},"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","isUsingOverage":false}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"version":"2.1.280"}}
+{{"parentUuid":"p","isSidechain":false,"type":"assistant","uuid":"u","timestamp":"2026-09-28T21:45:22.000Z","message":{{"id":"m","model":"<synthetic>","role":"assistant","stop_reason":"stop_sequence","type":"message","usage":{{"input_tokens":0,"output_tokens":0}},"content":[{{"type":"text","text":"You've hit your weekly limit · resets Oct 4 at 12am (America/Los_Angeles)"}}]}},"requestId":"req_0","quotaLimits":{{"status":"rejected","resetsAt":{RESETS},"unifiedRateLimitFallbackAvailable":false,"rateLimitType":"seven_day","overageStatus":"rejected","isUsingOverage":false}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429,"version":"2.1.280"}}
 "#
             ),
         )
@@ -898,6 +900,7 @@ fn a_record_with_no_recorded_tab_is_watched_where_the_read_finds_it() {
         &looker(),
         NOW_28TH,
         &|o: &Opts| Report {
+            rung: None,
             pid: 0,
             tab: o.only_sid.clone().unwrap_or_default(),
             session: "-".to_string(),
@@ -922,6 +925,7 @@ fn a_word_the_acts_own_last_check_recorded_stands_over_a_read_short_of_it() {
     let one = TabOne::new("t1c-past-go", "2.1.283");
     let said = |step: &'static str| {
         move |o: &Opts| Report {
+            rung: None,
             pid: 0,
             tab: o.only_sid.clone().unwrap_or_default(),
             session: SESSION.to_string(),
@@ -1205,4 +1209,136 @@ fn with_latch(s: &aterm_spec::interp::State, name: &'static str) -> aterm_spec::
     let mut s = s.clone();
     s.insert(name, 1);
     s
+}
+
+/// The door the loop asks at a wall ([`wall_due`]) opens exactly where the watch's own look found
+/// the round's move to be the aged wall's own, held by the loop's wall guard alone: a dry read
+/// that would restart past the wall ([`WALL_RESTART`]), recorded as waiting for the next
+/// point under a wall's guard (the `wall` guard; at a usage limit its episode's, or the notice
+/// the loop reads as no idle point). A wet restart the step then refused leaves its word, and the
+/// next such dry look opens the door again. NEGATIVE CONTROLS: a read that waits on the login
+/// wall, any other move (a plain restart, an announcement) under the wall's guard, the same
+/// read with no wall guard standing or a prompt's, a plain restart after the refusal, and a mark
+/// another conversation left in the tab once a look names the live one keep it shut.
+#[test]
+fn the_wall_door_opens_where_the_watch_found_the_move_held_by_the_wall_alone() {
+    let said = |step: &'static str| {
+        move |o: &Opts| Report {
+            rung: None,
+            pid: 0,
+            tab: o.only_sid.clone().unwrap_or_default(),
+            session: SESSION.to_string(),
+            from: "2.1.281".to_string(),
+            to: "2.1.283(managed)".to_string(),
+            step: step.to_string(),
+        }
+    };
+    let one = TabOne::new("t1c-wall-door", "2.1.283");
+    assert!(!wall_due(&one.opts, TAB_ONE), "no look yet");
+    let w = watch_with(&one.opts, TAB_ONE, &looker(), NOW_28TH, &said("wait:login"));
+    assert!(w.wrote(), "{w:?}");
+    assert_eq!(one.record().wait, "login");
+    assert!(!wall_due(&one.opts, TAB_ONE), "the wall within its bound");
+    for other in ["would-restart", "would-restart:fresh", "would-announce"] {
+        let at = watch_at(&one.record()).expect("owed a watch");
+        let w = watch_with(&one.opts, TAB_ONE, &looker(), at, &said(other));
+        assert!(w.wrote(), "{other}: {w:?}");
+        let st = one.record();
+        assert_eq!(st.guard, "wall", "{other}");
+        assert!(
+            !st.wall_move && !wall_due(&one.opts, TAB_ONE),
+            "{other}: no aged wall's move"
+        );
+    }
+    let at = watch_at(&one.record()).expect("owed a watch");
+    let w = watch_with(&one.opts, TAB_ONE, &looker(), at, &said(WALL_RESTART));
+    assert!(w.wrote(), "{w:?}");
+    let st = one.record();
+    assert_eq!(
+        (st.wait.as_str(), st.guard.as_str(), st.wall_move),
+        (upgrade::NEXT_POINT, "wall", true)
+    );
+    assert!(wall_due(&one.opts, TAB_ONE), "held by the wall guard alone");
+    // The walled point's wet restart was refused (a hand another driver held): its word stands,
+    // and the next dry look past the wall opens the door again; a plain restart's would not.
+    for (dry, opens) in [("would-restart", false), (WALL_RESTART, true)] {
+        let refused = St {
+            wait: "held".to_string(),
+            restart_look: true,
+            wall_move: false,
+            ..one.record()
+        };
+        std::fs::write(state_path(&one.opts, SESSION), refused.to_json()).expect("record");
+        assert!(
+            !wall_due(&one.opts, TAB_ONE),
+            "{dry}: shut after the refusal"
+        );
+        let at = watch_at(&one.record()).expect("owed a watch");
+        let w = watch_with(&one.opts, TAB_ONE, &looker(), at, &said(dry));
+        assert!(w.wrote(), "{dry}: {w:?}");
+        let st = one.record();
+        assert_eq!(
+            (st.wait == upgrade::NEXT_POINT, st.restart_look),
+            (opens, !opens),
+            "{dry}: {st:?}"
+        );
+        assert_eq!(wall_due(&one.opts, TAB_ONE), opens, "{dry}");
+    }
+    assert!(!wall_due(&one.opts, "s-elsewhere"), "another tab's");
+    let at = watch_at(&one.record()).expect("owed a watch");
+    let unguarded = Watcher {
+        guard: String::new(),
+        point_at: at,
+        ..looker()
+    };
+    let w = watch_with(&one.opts, TAB_ONE, &unguarded, at, &said(WALL_RESTART));
+    assert!(w.wrote(), "{w:?}");
+    assert_eq!(one.record().guard, "", "the later point cleared the guard");
+    assert!(!wall_due(&one.opts, TAB_ONE), "no wall guard stands");
+    // A usage limit's point: the loop reads its notice as no idle point, or holds it for the
+    // limit's episode; a prompt's guard is no wall's.
+    use crate::supervise::Guard;
+    for (guard, opens) in [
+        (Guard::NotIdle, true),
+        (Guard::LimitEpisode, true),
+        (Guard::Prompt, false),
+    ] {
+        let at = watch_at(&one.record()).expect("owed a watch");
+        let by = Watcher {
+            guard: guard.word().to_string(),
+            point_at: at,
+            ..looker()
+        };
+        let w = watch_with(&one.opts, TAB_ONE, &by, at, &said(WALL_RESTART));
+        assert!(w.wrote(), "{w:?}");
+        assert_eq!(wall_due(&one.opts, TAB_ONE), opens, "{guard:?}");
+    }
+    // A record another conversation left in the tab (its agent exited, a new one started there)
+    // with its mark standing, not owed a look: the next look, naming the tab's live conversation,
+    // clears its mark, so the door it opened shuts.
+    let at = watch_at(&one.record()).expect("owed a watch");
+    let gone = "0f1e2d3c-4b5a-4978-8796-a5b4c3d2e1f0";
+    let left = St {
+        wall_move: true,
+        wait: upgrade::NEXT_POINT.to_string(),
+        guard: "wall".to_string(),
+        looked_at: at,
+        ..one.record()
+    };
+    std::fs::write(state_path(&one.opts, gone), left.to_json()).expect("record");
+    assert!(wall_due(&one.opts, TAB_ONE), "the left record's mark");
+    let by = Watcher {
+        guard: crate::supervise::Guard::Prompt.word().to_string(),
+        point_at: at,
+        ..looker()
+    };
+    let w = watch_with(&one.opts, TAB_ONE, &by, at, &said(WALL_RESTART));
+    assert!(w.wrote(), "{w:?}");
+    let left = load_record(&one.opts, gone).expect("read").expect("kept");
+    assert!(!left.wall_move, "{left:?}");
+    assert!(
+        !wall_due(&one.opts, TAB_ONE),
+        "the live conversation's look decides"
+    );
+    assert_eq!(one.hands(), Vec::<String>::new(), "ZERO input requests");
 }

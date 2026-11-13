@@ -751,6 +751,7 @@ impl LiveRig {
     fn carry(&self) -> Report {
         let st = self.record().expect("a record in flight");
         let r = Report {
+            rung: None,
             pid: st.pid,
             tab: TAB.to_string(),
             session: key(TAB),

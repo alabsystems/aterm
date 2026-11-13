@@ -16,7 +16,8 @@
 //!   (`aterm_sysprobe::dstate`) reads this user's processes on its own worker every
 //!   [`CENSUS_PERIOD_MS`], and a process is held once two passes running found it so. On Linux
 //!   the sweep's own state `D` covers every user, held once seen for [`KERNEL_WAIT_MS`], and
-//!   `/proc/stat`'s `procs_blocked` counts the machine's blocked tasks now.
+//!   `/proc/stat`'s `procs_blocked` counts the machine's tasks waiting on I/O now (the kernel's
+//!   `nr_iowait()`, which leaves out a task in `D` on a lock or a mount outside I/O wait).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -149,7 +150,7 @@ pub enum DStateRead {
     /// reading, where one did.
     Census(Option<Arc<CensusPass>>),
     /// Linux: the sweep's process states (`D`), every user's, and `/proc/stat`'s
-    /// `procs_blocked`, the machine's tasks blocked now, where read.
+    /// `procs_blocked`, the machine's tasks waiting on I/O now, where read.
     Sweep {
         /// `procs_blocked`.
         blocked: Option<u64>,
@@ -233,7 +234,7 @@ pub struct DStateView {
     pub scope: DScope,
     /// The processes found so, pid ascending.
     pub procs: Vec<DStuck>,
-    /// Linux: the machine's tasks blocked now (`procs_blocked`); `None` elsewhere or unread.
+    /// Linux: the machine's tasks waiting on I/O now (`procs_blocked`); `None` elsewhere or unread.
     pub blocked: Option<u64>,
     /// How long before this reading the pass or sweep behind [`Self::procs`] ran, ms.
     pub age_ms: u64,

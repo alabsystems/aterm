@@ -115,6 +115,10 @@ fn the_template_fills_every_field() {
         &l,
     );
     assert_eq!(out, "# D1 — 2026-10-15\nm 27.0 abc sha256=x ghostty\n");
+    // The entry head's every field is one a ledger fills.
+    let head = fill_template(TEMPLATE, &l);
+    assert!(!head.contains("{{"), "{head}");
+    assert!(head.contains("# Arena: D1 — 2026-10-15"), "{head}");
 }
 
 /// Every socket a lane makes fits `sun_path` whatever `$TMPDIR` is, and

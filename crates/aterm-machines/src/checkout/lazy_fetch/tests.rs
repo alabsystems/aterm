@@ -22,14 +22,11 @@ fn a_git_that_takes_the_option_is_asked_nothing_more() {
     let (sys, who) = fake();
     let asked = git(&sys, &who, None).args(["--no-lazy-fetch", "--version"]);
     sys.on(&asked.display(), Ran::ok("git version 2.56.0\n"));
-    assert_eq!(
-        NoLazyFetch::of(&sys, &who).unwrap(),
-        Some(NoLazyFetch::Flag)
-    );
+    assert_eq!(of(&sys, &who).unwrap(), Some(NoLazyFetch::Flag));
     assert_eq!(sys.calls(), [asked.display()]);
     let at = Path::new("/Users//alice/work");
     for (off, flagged) in [(NoLazyFetch::Flag, true), (NoLazyFetch::Variable, false)] {
-        let read = off.git(&sys, &who, Some(at)).display();
+        let read = guarded(off, &sys, &who, Some(at)).display();
         assert_eq!(read.contains("--no-lazy-fetch"), flagged, "{read}");
         assert!(read.contains("GIT_NO_LAZY_FETCH=1"), "{read}");
         assert!(
@@ -54,7 +51,7 @@ fn a_git_that_refuses_the_option_is_judged_by_what_its_read_did() {
     for (obeys, expected) in [(true, Some(NoLazyFetch::Variable)), (false, None)] {
         let (sys, who) = fake();
         sys.simulate(move |sys, command| before_the_option(sys, command, obeys));
-        assert_eq!(NoLazyFetch::of(&sys, &who).unwrap(), expected, "{obeys}");
+        assert_eq!(of(&sys, &who).unwrap(), expected, "{obeys}");
         let calls = sys.calls();
         let scratch = Fake::scratch_path(None, LABEL, 0);
         assert!(
@@ -111,7 +108,7 @@ fn a_git_that_refuses_the_option_is_judged_by_what_its_read_did() {
 #[test]
 fn a_question_that_could_not_be_asked_or_set_up_is_an_error_never_a_verdict() {
     let (sys, who) = fake();
-    assert!(NoLazyFetch::of(&sys, &who).is_err(), "no --version answer");
+    assert!(of(&sys, &who).is_err(), "no --version answer");
     let (sys, who) = fake();
     sys.simulate(|_, command| {
         command
@@ -120,7 +117,7 @@ fn a_question_that_could_not_be_asked_or_set_up_is_an_error_never_a_verdict() {
             .any(|arg| arg == "--no-lazy-fetch")
             .then(|| Ran::exit(129, "unknown option: --no-lazy-fetch"))
     });
-    assert!(NoLazyFetch::of(&sys, &who).is_err(), "no probe answer");
+    assert!(of(&sys, &who).is_err(), "no probe answer");
     let answering = |step: &'static str, answer: Ran| {
         let (sys, who) = fake();
         sys.simulate(move |sys, command| {
@@ -132,7 +129,7 @@ fn a_question_that_could_not_be_asked_or_set_up_is_an_error_never_a_verdict() {
             }
             before_the_option(sys, command, true)
         });
-        let of = NoLazyFetch::of(&sys, &who);
+        let of = of(&sys, &who);
         let read = sys.calls().iter().any(|call| call.contains(" cat-file "));
         let scratch = Fake::scratch_path(None, LABEL, 0);
         assert!(
@@ -198,7 +195,7 @@ fn a_privileged_probe_gives_its_private_scratch_to_the_git_actor_before_running_
         }
         before_the_option(sys, command, true)
     });
-    assert_eq!(NoLazyFetch::of(&sys, &who), Ok(Some(NoLazyFetch::Variable)));
+    assert_eq!(of(&sys, &who), Ok(Some(NoLazyFetch::Variable)));
 }
 
 #[test]
@@ -225,7 +222,7 @@ fn an_aborted_git_probe_defers_instead_of_classifying_the_program() {
             }
             Some(answer)
         });
-        assert!(NoLazyFetch::of(&sys, &who).is_err(), "{stage}");
+        assert!(of(&sys, &who).is_err(), "{stage}");
         let reads = sys
             .calls()
             .iter()
@@ -252,7 +249,7 @@ fn a_failed_fetch_attempt_is_refused_even_when_a_control_would_succeed() {
         }
         Some(answer)
     });
-    assert_eq!(NoLazyFetch::of(&sys, &who), Ok(None));
+    assert_eq!(of(&sys, &who), Ok(None));
     assert_eq!(
         sys.calls()
             .iter()
@@ -285,11 +282,11 @@ fn missing_trace_and_failed_controls_defer_the_capability_decision() {
             }
             Some(answer)
         });
-        assert!(NoLazyFetch::of(&sys, &who).is_err(), "{fault}");
+        assert!(of(&sys, &who).is_err(), "{fault}");
     }
 }
 
-/// A stand-in for a git before 2.44 over this host's native git: `--no-lazy-fetch` refused as
+/// A stand-in for a git before 2.45 over this host's native git: `--no-lazy-fetch` refused as
 /// unknown (129), every other run handed to the native git after `prelude`.
 fn stand_in(dir: &Path, name: &str, native: &str, prelude: &str) -> PathBuf {
     let path = dir.join(name);
@@ -332,12 +329,22 @@ fn a_native_git_guard_prevents_lazy_fetch_and_reads_without_evidence_are_not_adm
     let refused = live
         .run_complete_stdout(&Cmd::new(&ignoring).args(["--no-lazy-fetch", "--version"]))
         .unwrap();
-    assert_eq!(refused.status, Some(129), "control: a git before 2.44");
-    let of = |git: &Path| NoLazyFetch::of_git(&live, &|| Cmd::new(git)).unwrap();
-    let read = |git: &Path| asked(&live, &|| Cmd::new(git)).unwrap();
+    assert_eq!(refused.status, Some(129), "control: a git before 2.45");
+    let of = |git: &Path| of_git(&live, Cmd::new(git)).unwrap();
+    let asked = |git: &Path, guard| {
+        shared::guarded_read(
+            &Asked {
+                sys: &live,
+                git: Cmd::new(git),
+            },
+            guard,
+        )
+        .unwrap()
+    };
+    let read = |git: &Path| asked(git, NoLazyFetch::Variable);
 
     assert_eq!(of(Path::new(native)), Some(off));
-    let shown = asked_with_guard(&live, &|| Cmd::new(native), off).unwrap();
+    let shown = asked(Path::new(native), off);
     assert!(
         shown.read.status.is_some_and(|code| code != 0) && shown.no_fetch,
         "the selected {off:?} guard prevents fetching: {}",

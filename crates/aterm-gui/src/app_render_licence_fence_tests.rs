@@ -18,7 +18,7 @@ fn lit_app() -> App {
 /// read end that keeps the pipe open.
 #[cfg(unix)]
 fn lit_app_writing() -> (App, std::io::PipeReader) {
-    let (reader, writer) = std::io::pipe().expect("a pipe for the session's writes");
+    let (reader, writer) = aterm_uds::pipe().expect("a pipe for the session's writes");
     let sink = aterm_session::sink::SinkWriter::new_owned(std::os::fd::OwnedFd::from(writer));
     let app = crate::scripted_redraw_fixture::scripted_app_with_sink(std::sync::Arc::new(sink));
     (lit(app), reader)

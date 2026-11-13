@@ -662,6 +662,7 @@ fn a_restore_leaves_a_program_in_an_ended_workers_tab() {
             profile: None,
             tab: sid.clone(),
             pid: 4242,
+            lifetime: None,
             start: "Sat Sep 27 01:02:03 2026".into(),
             shell: 4343,
             program: std::path::PathBuf::from("/opt/claude/bin/claude"),

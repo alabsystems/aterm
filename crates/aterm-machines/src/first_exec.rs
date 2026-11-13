@@ -3,7 +3,7 @@
 
 //! A started program's folder stays until the program showed it ran: macOS 27.0.1's
 //! syspolicyd crashes when a file it is assessing at its first exec goes, and every exec
-//! then waiting on it is stranded until a restart. This module reads and writes
+//! then waiting on it is stranded. This module reads and writes
 //! [`aterm_uds::deadline`]'s stamp and marker through the [`System`] port.
 
 use crate::port::{Cmd, Ran, System};

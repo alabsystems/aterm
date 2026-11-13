@@ -110,7 +110,7 @@ fn generous_slack_raster(pen: &PathPen, w: usize, h: usize) -> Vec<u8> {
     const SLACK: usize = 4;
     let (x_min, y_max) = (pen.min_x.floor(), pen.max_y.ceil());
     let mut ras = crate::raster::Rasterizer::new(w + 2 * SLACK, h + 2 * SLACK);
-    pen.fill(&mut ras, x_min - SLACK as f32, y_max + SLACK as f32, 1.0);
+    pen.fill(&mut ras, x_min - SLACK as f32, y_max + SLACK as f32);
     let gw = w + 2 * SLACK;
     let mut cov = vec![0u8; w * h];
     ras.for_each_pixel(|i, a| {

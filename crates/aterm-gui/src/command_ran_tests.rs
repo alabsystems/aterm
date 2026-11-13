@@ -797,6 +797,69 @@ fn an_execs_steers_are_read_once_per_process_and_once_per_place_of_one_file() {
     );
 }
 
+/// M2 land (audit 4 review): an image whose file is gone is heard by the exec name the kernel
+/// keeps alone, at a sampled edge as at a restore. Linux's `/proc/<pid>/exe` names a gone file's
+/// path marked ` (deleted)`: that path is no path of the image (it names another file now, or
+/// none), and the file name it keeps, unmarked, is the exec's name ([`linux_image`]); an unmarked
+/// link is the image's path. A sampled edge that read the image's path unmarked
+/// (`holder_image::kept_exe`) but whose read finds the file gone hears no file name and no file,
+/// so the image confirms only a word equal to its kernel name and never stands in. NEGATIVE
+/// CONTROLS (scratch): a link kept marked fails the first assertion; the sampled image heard by
+/// its path's name (as before the land) fails the last.
+#[cfg(unix)]
+#[test]
+fn an_image_whose_file_is_gone_is_heard_by_the_name_the_kernel_keeps() {
+    assert_eq!(
+        [
+            linux_image(Some(PathBuf::from("/usr/bin/nvim (deleted)"))),
+            linux_image(Some(PathBuf::from("/usr/bin/nvim"))),
+            linux_image(None),
+        ],
+        [
+            (None, Some("nvim".into())),
+            (Some(PathBuf::from("/usr/bin/nvim")), None),
+            (None, None),
+        ],
+        "a marked link is no path, and names the exec"
+    );
+    fn gone(_: i32, _: Steering<'_>) -> ExecNames {
+        ExecNames::gone(Some("nvim".into()))
+    }
+    fn there(_: i32, _: Steering<'_>) -> ExecNames {
+        ExecNames {
+            image: Some("nvim".into()),
+            file: Some(test_id("nvim")),
+            ..ExecNames::default()
+        }
+    }
+    let heard = |read: fn(i32, Steering<'_>) -> ExecNames| {
+        let ran = Arc::new(Ran::default());
+        RanFeed::reading(Arc::clone(&ran), 63_000, read)
+            .sampled(63_001, Path::new("/opt/nvim/bin/nvim"));
+        ran.handed_on(1);
+        parse(&ran, 1, 1, |_| None, 7);
+        ran.within(Some(Window { from: 0, to: None }))
+            .iter()
+            .map(|e| {
+                (
+                    e.names.shown().map(str::to_owned),
+                    e.names.iter().map(str::to_owned).collect(),
+                )
+            })
+            .collect::<Vec<(Option<String>, Vec<String>)>>()
+    };
+    assert_eq!(
+        heard(there),
+        [(Some("nvim".into()), vec!["nvim".to_owned()])],
+        "PRECONDITION: an image whose file is there is heard by its file's name"
+    );
+    assert_eq!(
+        heard(gone),
+        [(None, vec!["nvim".to_owned()])],
+        "a gone file's image confirms by its kernel name and never stands in"
+    );
+}
+
 /// A dataless file (a cloud placeholder) is never opened for its `#!` line: reading it would
 /// download it. NEGATIVE CONTROL (scratch): ignoring the flag fails the second assertion.
 #[test]

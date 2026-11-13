@@ -9,6 +9,8 @@ use crate::restore::{
 };
 #[cfg(unix)]
 use crate::session_store::SessionRecord;
+#[cfg(unix)]
+use std::os::fd::IntoRawFd as _;
 use std::sync::{Mutex, PoisonError};
 
 #[test]
@@ -104,18 +106,34 @@ fn carried_empty_title_slots_survive_the_handoff_wire() {
 /// Held by a test that writes the handoff variables, `HOME` or `XDG_RUNTIME_DIR`, in its own child ([`env_alone`]): the lib-test process writes none of them.
 pub(crate) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// For a test that writes the process environment: runs it alone in a child ([`crate::test_alone::alone`]), where it holds [`ENV_LOCK`], so the lib-test process's environment is never written.
-pub(crate) fn env_alone() -> Option<std::sync::MutexGuard<'static, ()>> {
-    crate::test_alone::alone().then(|| ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner))
+/// Holds the environment lock and the inherited admission for the test's whole fixture.
+pub(crate) struct EnvGuard {
+    _environment: std::sync::MutexGuard<'static, ()>,
+    #[cfg(unix)]
+    _fixture: Option<std::os::fd::OwnedFd>,
+}
+
+/// Run a test that writes the process environment alone in its child, holding [`ENV_LOCK`].
+pub(crate) fn env_alone() -> Option<EnvGuard> {
+    crate::test_alone::alone().then(|| EnvGuard {
+        _environment: ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner),
+        #[cfg(unix)]
+        _fixture: std::env::var_os(crate::test_alone::DENSE_LEASE)
+            .map(|_| crate::test_alone::handed(crate::test_alone::DENSE_LEASE)),
+    })
 }
 
 /// Admit a dense fixture before starting its isolated child's progress watchdog. The parent
-/// retains admission until the child exits and has closed every PTY; the child never takes it.
+/// retains admission until the child exits and has closed every PTY; the child shares it without
+/// acquiring the same lock again.
 #[cfg(unix)]
-pub(crate) fn env_alone_with_ptys() -> Option<std::sync::MutexGuard<'static, ()>> {
-    let _lease = (!crate::test_alone::in_child())
-        .then(|| aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease"));
-    env_alone()
+pub(crate) fn env_alone_with_ptys() -> Option<EnvGuard> {
+    if crate::test_alone::in_child() {
+        return env_alone();
+    }
+    let lease = aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease");
+    crate::test_alone::spawn_alone_with_lease(&[], &lease).passed();
+    None
 }
 
 /// RAII save/RESTORE of one env var: puts the prior value BACK on drop, unwind included.
@@ -214,8 +232,8 @@ pub(crate) fn run_in_children(marker: &str, children: usize) -> Vec<String> {
     (0..children)
         .map(|index| {
             let index = std::ffi::OsString::from(index.to_string());
-            let _lease = aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease");
-            crate::test_alone::spawn_alone_with(&[(marker, &index)])
+            let lease = aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease");
+            crate::test_alone::spawn_alone_with_lease(&[(marker, &index)], &lease)
                 .passed()
                 .stdout
         })
@@ -314,7 +332,8 @@ fn shipped_parent_reads(
     use crate::ChildDeathEvidence as Death;
     use crate::app_native::PhysicalFailureShape as Shape;
     match death {
-        Death::Unobserved => Shape::Unexplained,
+        // A shipped parent read its own kill as `Unobserved`: it had no `EndedHere`.
+        Death::Unobserved | Death::EndedHere => Shape::Unexplained,
         Death::Exited { .. } => Shape::Structural,
         Death::Signalled { signal } => {
             if matches!(
@@ -501,8 +520,10 @@ fn a_refused_intake_of_the_producers_content_gives_back_its_counted_trial_launch
     let (_, toml) = body.split_once('\n').expect("nonce header");
     std::fs::write(&staged.manifest_path, format!("{}\n{toml}", "f".repeat(32)))
         .expect("republish under another attempt's nonce");
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, None);
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert!(incoming.adopted.is_empty() && incoming.nonce.is_none());
@@ -560,33 +581,6 @@ fn a_refused_intake_of_the_producers_content_gives_back_its_counted_trial_launch
         aterm_pty::close_fd(fd);
     }
     staged.teardown();
-}
-
-#[cfg(unix)]
-fn cloexec_pipe() -> (i32, i32) {
-    let mut fds = [-1i32; 2];
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        assert_eq!(
-            // SAFETY: `pipe2` fills the two-element array this frame owns.
-            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
-            0,
-            "pipe2"
-        );
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        assert_eq!(
-            // SAFETY: `pipe` fills the two-element array this frame owns.
-            unsafe { libc::pipe(fds.as_mut_ptr()) },
-            0,
-            "pipe"
-        );
-        for fd in fds {
-            aterm_pty::set_cloexec(fd, true).expect("pipe end cloexec");
-        }
-    }
-    (fds[0], fds[1])
 }
 
 #[cfg(unix)]
@@ -725,6 +719,7 @@ fn zsh_record(local_id: u64, sid: &str) -> SessionRecord {
         status_seen: None,
         autopilot_end: None,
         wakes: None,
+        agent_act: None,
     }
 }
 
@@ -2073,7 +2068,8 @@ fn malformed_named_fd_is_closed_on_authority_rejection() {
     let _restore_fds = RestoreVar::new(ENV_FDS);
     let _restore_manifest = RestoreVar::new(ENV_MANIFEST);
     let _restore_nonce = RestoreVar::new(ENV_NONCE);
-    let (peer, named) = cloexec_pipe();
+    let (peer, named) = aterm_uds::pipe().expect("pipe");
+    let (peer, named) = (peer.into_raw_fd(), named.into_raw_fd());
     assert!(
         peer >= 3 && named >= 3,
         "handoff descriptors are never stdio"
@@ -2098,7 +2094,8 @@ fn invalid_prearm_alias_closes_once_clears_authority_and_cannot_close_reused_fd(
     let _restore_ready = RestoreVar::new(ENV_READY_FD);
     let _restore_commit = RestoreVar::new(ENV_COMMIT_FD);
 
-    let (peer, writer) = cloexec_pipe();
+    let (peer, writer) = aterm_uds::pipe().expect("pipe");
+    let (peer, writer) = (peer.into_raw_fd(), writer.into_raw_fd());
     let isolated = claim_isolated_fd_slot(writer);
     let aliased = isolated.map_or(writer, |slot| {
         aterm_pty::close_fd(writer);
@@ -2132,7 +2129,11 @@ fn invalid_prearm_alias_closes_once_clears_authority_and_cannot_close_reused_fd(
         assert!(std::env::var_os(key).is_none(), "{key} cleared");
     }
 
-    let (replacement_peer, replacement_writer) = cloexec_pipe();
+    let (replacement_peer, replacement_writer) = aterm_uds::pipe().expect("pipe");
+    let (replacement_peer, replacement_writer) = (
+        replacement_peer.into_raw_fd(),
+        replacement_writer.into_raw_fd(),
+    );
     let reclaimed = unsafe { libc::fcntl(replacement_writer, libc::F_DUPFD_CLOEXEC, aliased) };
     aterm_pty::close_fd(replacement_writer);
     assert!(
@@ -2419,12 +2420,11 @@ fn valid_overlap_prearm_scrubs_ambient_parent_but_restores_it_for_exec() {
     let _restore_parent = RestoreVar::new(ENV_PARENT_PID);
     let _restore_birth = RestoreVar::new(ENV_PARENT_BIRTH);
 
-    let mut master_pipe = [0i32; 2];
-    let mut ready_pipe = [0i32; 2];
-    let mut commit_pipe = [0i32; 2];
-    assert_eq!(unsafe { libc::pipe(master_pipe.as_mut_ptr()) }, 0, "pipe");
-    assert_eq!(unsafe { libc::pipe(ready_pipe.as_mut_ptr()) }, 0, "pipe");
-    assert_eq!(unsafe { libc::pipe(commit_pipe.as_mut_ptr()) }, 0, "pipe");
+    let pipe = || {
+        let (read, write) = aterm_uds::pipe().expect("pipe");
+        [read.into_raw_fd(), write.into_raw_fd()]
+    };
+    let (master_pipe, ready_pipe, commit_pipe) = (pipe(), pipe(), pipe());
     let parent = unsafe { libc::getppid() };
     assert!(parent > 1, "test harness must have a real parent");
     aterm_log::env::set(ENV_MANIFEST, "/tmp/not-consumed-by-prearm");
@@ -2533,10 +2533,8 @@ fn take_ready_fd_fails_closed() {
 fn a_refused_target_identity_closes_the_readiness_channel_as_child_death() {
     let Some(_env) = env_alone() else { return };
     let _restore = RestoreVar::new("ATERM_HANDOFF_READY_FD");
-    let mut fds = [0i32; 2];
-    // SAFETY: plain pipe(2) into a valid 2-slot out-array.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-    let (rd, wr) = (fds[0], fds[1]);
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
     aterm_log::env::set("ATERM_HANDOFF_READY_FD", wr.to_string());
     assert!(
         take_ready_fd(
@@ -2564,10 +2562,8 @@ fn a_refused_target_identity_closes_the_readiness_channel_as_child_death() {
 fn take_ready_fd_adopts_a_pipe_and_rearms_cloexec() {
     let Some(_env) = env_alone() else { return };
     let _restore = RestoreVar::new("ATERM_HANDOFF_READY_FD");
-    let mut fds = [0i32; 2];
-    // SAFETY: plain pipe(2) into a valid 2-slot out-array.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-    let (rd, wr) = (fds[0], fds[1]);
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
     let _ = aterm_pty::set_cloexec(wr, false);
     aterm_log::env::set("ATERM_HANDOFF_READY_FD", wr.to_string());
     let owned = take_ready_fd(
@@ -2663,10 +2659,8 @@ fn commit_parent_death_helper() {
         let watched = std::path::PathBuf::from(
             std::env::var_os(PARENT_DEATH_WATCHED).expect("launcher watched marker"),
         );
-        let mut raw = [0i32; 2];
-        assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0, "commit pipe");
-        assert!(aterm_pty::set_cloexec(raw[0], true).is_ok());
-        assert!(aterm_pty::set_cloexec(raw[1], true).is_ok());
+        let (read, write) = aterm_uds::pipe().expect("commit pipe");
+        let raw = [read.into_raw_fd(), write.into_raw_fd()];
 
         let mut watcher =
             crate::test_alone::StandIn::helper(module_path!(), "commit_parent_death_helper");
@@ -2775,7 +2769,7 @@ fn watching_stand_in(
     use std::os::fd::AsRawFd as _;
     let ready = scratch.join("reader.ready");
     let watched = scratch.join("reader.watched");
-    let (read, write) = std::io::pipe().expect("commit pipe");
+    let (read, write) = aterm_uds::pipe().expect("commit pipe");
     let mut reader =
         crate::test_alone::StandIn::helper(module_path!(), "commit_parent_death_helper");
     reader
@@ -2917,7 +2911,7 @@ fn a_commit_nobody_can_take_stops_the_watcher_with_74_its_pipe_closed_first() {
         return;
     }
     let scratch = aterm_tempfile::TempDir::new().expect("a receiver-gone scratch dir");
-    let (said, said_by_stand_in) = std::io::pipe().expect("the stand-in's stderr pipe");
+    let (said, said_by_stand_in) = aterm_uds::pipe().expect("the stand-in's stderr pipe");
     let filler = said_by_stand_in
         .try_clone()
         .expect("a writer to fill it with");
@@ -3340,14 +3334,6 @@ impl StagedHandoff {
     }
 }
 
-#[cfg(unix)]
-pub(super) fn pipe_pair(label: &str) -> (i32, i32) {
-    let mut fds = [0i32; 2];
-    // SAFETY: plain pipe(2) into a valid 2-slot out-array.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "{label} pipe");
-    (fds[0], fds[1])
-}
-
 /// Everything the child half holds at the instant it is ready to publish: the proof it computed, the still-unfired ready channel it will publish on, and the adopted session set that proof commits to.
 #[cfg(unix)]
 pub(super) type ReadyChild = (AdoptionProof, ReadySignal, Vec<SessionIdentity>);
@@ -3397,8 +3383,10 @@ fn a_full_seamless_handoff_completes_and_commits() {
     let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("ok", 3, None);
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
 
     let (proof, ready, adopted) = child_proof().expect("the child adopts and proves");
@@ -3454,8 +3442,10 @@ fn take_incoming_carries_the_tokenless_connection_triples() {
             .any(|w| w.iter().all(u8::is_ascii_hexdigit)),
         "no bearer-token-width hex blob may ride the manifest"
     );
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
 
     let incoming = take_incoming();
@@ -3505,8 +3495,10 @@ fn a_handoff_across_a_version_boundary_still_completes() {
         "REVERTING fix #1 (re-serializing the parse) provably breaks the proof"
     );
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
     let (proof, _ready, _adopted) = child_proof().expect("the child adopts and proves");
     assert_eq!(
@@ -3532,8 +3524,10 @@ fn a_handoff_across_a_screen_meta_version_boundary_still_completes() {
     };
     let staged = stage_outgoing_handoff_with("xvermeta", 2, None, Some(&newer_meta_codec));
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
     let (proof, _ready, adopted) = child_proof().expect("the child adopts and proves");
     assert_eq!(
@@ -3656,8 +3650,10 @@ fn a_hold_and_the_titles_cross_the_real_wire() {
     )
     .expect("republish");
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(incoming.adopted.len(), 3, "every session adopts");
@@ -3766,8 +3762,10 @@ fn a_workers_task_record_crosses_the_real_wire() {
     )
     .expect("republish");
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(
         ready_write,
         commit_read,
@@ -3841,8 +3839,10 @@ fn a_sessions_wake_book_crosses_the_real_wire() {
     )
     .expect("republish");
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(
         ready_write,
         commit_read,
@@ -3871,6 +3871,7 @@ fn a_sessions_wake_book_crosses_the_real_wire() {
             a.task.as_deref(),
             a.autopilot_end.as_deref(),
             a.wakes.as_deref(),
+            a.agent_act.as_deref(),
         );
         let fields = crate::occupancy_wakes::status_fields(Some(handle.ctx.self_id.as_str()));
         let want = if a.wakes.is_some() {
@@ -3884,6 +3885,73 @@ fn a_sessions_wake_book_crosses_the_real_wire() {
 
     drop(ready);
     for fd in [ready_read, commit_read, commit_write] {
+        aterm_pty::close_fd(fd);
+    }
+    staged.teardown();
+}
+
+/// A SESSION'S CONFIRMED AGENT CROSSES THE REAL WIRE (RV1, the review of H6-R3): the record's
+/// `agent_act` row rides its own session through the successor's intake, and the adopted
+/// session's carried rows keep it as the successor host's read ([`crate::agent_act::cached`]),
+/// so a Claude Code whose image was unlinked while it ran stays confirmed across the update.
+/// NEGATIVE CONTROL: the session that carried no row keeps nothing.
+#[test]
+#[cfg(unix)]
+fn a_sessions_confirmed_agent_crosses_the_real_wire() {
+    let Some(_env) = env_alone() else { return };
+    let _restore = restore_env();
+    let staged = stage_outgoing_handoff("actwire", 2, None);
+    let body = std::fs::read_to_string(&staged.manifest_path).expect("read manifest");
+    let (file_nonce, toml) = body.split_once('\n').expect("nonce header");
+    let mut published = SessionHandoff::from_toml(toml).expect("parse the manifest");
+    let row = "group=4343 start=80 version=7 agent=claude proof=team".to_string();
+    published.sessions[0].agent_act = Some(row.clone());
+    std::fs::write(
+        &staged.manifest_path,
+        format!("{file_nonce}\n{}", published.to_toml().expect("toml")),
+    )
+    .expect("republish");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
+    staged.publish_env(ready_write, commit_read, Some(own_target()));
+    let incoming = take_incoming_as(ReceiverShape::Current);
+    let rows: Vec<Option<&str>> = incoming
+        .adopted
+        .iter()
+        .map(|a| a.agent_act.as_deref())
+        .collect();
+    assert_eq!(
+        rows,
+        [Some(row.as_str()), None],
+        "the confirmation rides its own session"
+    );
+    for a in &incoming.adopted {
+        let handle = crate::session_store::test_handle(a.local_id);
+        let sid = handle.ctx.self_id.as_str().to_string();
+        crate::spawn::seed_adopted_rows(
+            &handle.ctx,
+            a.local_id,
+            None,
+            None,
+            None,
+            a.agent_act.as_deref(),
+        );
+        let want = a
+            .agent_act
+            .is_some()
+            .then_some(aterm_agent::harness::agent_image::Act::On);
+        assert_eq!(
+            crate::agent_act::cached(&sid, 4343),
+            want,
+            "session {}",
+            a.local_id
+        );
+        crate::agent_act::forget_kept_for_test(&sid);
+    }
+    drop(incoming);
+    for fd in [ready_read, ready_write, commit_read, commit_write] {
         aterm_pty::close_fd(fd);
     }
     staged.teardown();
@@ -3920,8 +3988,10 @@ fn an_older_producers_tab_takes_its_park_title_not_the_records_stale_copy() {
         )
         .expect("republish");
 
-        let (ready_read, ready_write) = pipe_pair("ready");
-        let (commit_read, commit_write) = pipe_pair("commit");
+        let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+        let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+        let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+        let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
         staged.publish_env(ready_write, commit_read, Some(own_target()));
         let mut incoming = take_incoming_as(ReceiverShape::Current);
         assert_eq!(incoming.adopted.len(), 2, "every session adopts");
@@ -4123,8 +4193,10 @@ fn a_manifest_an_older_producer_wrote_past_the_write_cap_is_still_adopted() {
         "PRECONDITION — past the write cap by more than a rounding error ({size})"
     );
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     let publish = |staged: &StagedHandoff| {
         staged.publish_env(ready_write, commit_read, Some(own_target()));
     };
@@ -4186,8 +4258,10 @@ fn a_semantically_refused_session_adopts_blank_and_the_proof_still_matches() {
     };
     restage_session(&mut staged, 1, &hostile_meta, &non_canonical_grid);
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(
@@ -4262,8 +4336,10 @@ fn an_unparseable_layout_still_adopts_every_session_and_proves() {
         wire.replacen("schema = 2", "schema = 99", 1)
     };
     let staged = stage_outgoing_handoff("badlayout", 2, Some(&future_schema));
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert!(
@@ -4319,8 +4395,10 @@ fn a_layout_naming_an_exited_pane_is_still_placed() {
         layout.to_toml().expect("the desk serializes")
     };
     let staged = stage_outgoing_handoff("heldpane", 2, Some(&held_desk));
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(incoming.adopted.len(), 2, "both live sessions adopt");
@@ -4379,8 +4457,10 @@ fn an_unplaced_layout_hands_over_the_drafts_it_carried() {
         layout.to_toml().expect("the desk serializes")
     };
     let staged = stage_outgoing_handoff("missingone", 2, Some(&missing_one));
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert!(
@@ -4518,8 +4598,10 @@ fn a_sessionless_handoff_with_no_layout_to_place_is_the_producers_refusal() {
         staged.fds_wire.is_empty(),
         "PRECONDITION: no session is handed"
     );
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, None);
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert!(incoming.adopted.is_empty() && incoming.layout.is_none());
@@ -4552,8 +4634,10 @@ fn a_sessionless_handoff_of_a_bare_window_is_the_producers_refusal() {
         wire
     };
     let staged = stage_outgoing_handoff("barewindow", 0, Some(&bare_desk));
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, None);
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert!(incoming.adopted.is_empty() && incoming.layout.is_none());
@@ -4595,8 +4679,10 @@ fn a_sessionless_handoff_with_a_lone_workers_list_is_taken_over() {
         staged.fds_wire.is_empty(),
         "PRECONDITION: no session is handed"
     );
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, None);
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(incoming.refusal, None, "the list alone is a handoff");
@@ -4685,8 +4771,10 @@ fn a_sessionless_handoff_with_a_native_tab_is_taken_over() {
         staged.fds_wire.is_empty(),
         "PRECONDITION: no session is handed"
     );
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, None);
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert_eq!(incoming.refusal, None, "the windows alone are a handoff");
@@ -4709,8 +4797,10 @@ fn a_descriptor_list_that_misses_a_session_is_the_producers_refusal() {
     let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("missingfd", 2, None);
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, None);
     let first = staged
         .fds_wire
@@ -4803,8 +4893,10 @@ fn a_refused_handoff_closes_every_master_it_was_handed() {
         }
     };
 
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, None);
     let incoming = take_incoming_as(ReceiverShape::Current);
     assert!(
@@ -4911,6 +5003,299 @@ fn a_repaint_checkpoint_is_admitted_by_this_builds_own_predicates() {
     assert!(repaint_checkpoint(None, &mut 0).is_none());
 }
 
+/// A repaint carry is a blank screen, so it carries none of the line sizes and protected runs of the screen it leaves behind: either on a blank row would hand the redrawing program a half-width or protected row it never drew there.
+/// The exact carry of the same screen has them.
+#[test]
+fn a_repaint_carry_keeps_none_of_the_screens_cell_facts() {
+    use aterm_core::grid::row::{LineSize, Row};
+    let mut t = aterm_core::terminal::Terminal::new(6, 30);
+    t.process(b"\x1b#6WIDE\r\n\x1b[1\"qKEEP\x1b[0\"q\r\n\x1b[?1049h\x1b#6\x1b[1\"qALT\x1b[0\"q");
+    let cp = t.checkpoint_carry(0).expect("parser is Ground");
+    assert!(
+        !cp.visible_cells.is_empty() && !cp.alt_visible_cells.is_empty(),
+        "PRECONDITION: both screens' facts are carried exactly"
+    );
+    let meta = CheckpointMeta::from_checkpoint(&cp);
+    let blank = repaint_checkpoint(Some(&meta), &mut 0).expect("a repaint carry exists");
+    assert!(
+        blank.visible_cells.is_empty() && blank.alt_visible_cells.is_empty(),
+        "{:?} {:?}",
+        blank.visible_cells,
+        blank.alt_visible_cells
+    );
+    let mut adopted = aterm_core::terminal::Terminal::new(6, 30);
+    adopted.restore_checkpoint(&blank);
+    for screen in ["the alternate screen", "the saved primary"] {
+        for r in 0..6 {
+            assert_eq!(
+                adopted.grid().row(r).map(Row::line_size),
+                Some(LineSize::SingleWidth),
+                "row {r} of {screen}"
+            );
+        }
+        adopted.process(b"\x1b[?1049l");
+    }
+}
+
+/// A terminal whose top `rows - 1` rows alternate a DECSCA-protected cell and an unprotected one: a protected run for every other column, the heaviest screen a carry's protected runs describe.
+fn striped(rows: u16, cols: u16) -> aterm_core::terminal::Terminal {
+    let mut terminal = aterm_core::terminal::Terminal::new(rows, cols);
+    let pairs = usize::from(cols / 2) * usize::from(rows - 1);
+    terminal.process("\x1b[1\"qx\x1b[0\"q ".repeat(pairs).as_bytes());
+    terminal
+}
+
+/// Protected runs past the meta budget are shed, not screens: a desk of wide tabs striped with protected cells puts the metas past their share of the manifest, the runs give way before any other shed, every screen's grid blob is kept and every carry stays at the Full rung.
+#[test]
+fn cell_facts_past_the_meta_budget_are_shed_not_screens() {
+    let mut pool = meta_pool((0..48).map(|_| striped(24, 800)).collect());
+    assert!(
+        metas_cost(&pool) > MAX_HANDOFF_AGGREGATE_META_BYTES,
+        "PRECONDITION: past the budget ({})",
+        metas_cost(&pool)
+    );
+    assert!(
+        pool.iter()
+            .all(|carry| !carry.checkpoint.visible_cells.protected.is_empty()),
+        "PRECONDITION: every screen carries its protected runs"
+    );
+    let grids = pool
+        .iter()
+        .map(|carry| carry.checkpoint.grid.clone())
+        .collect::<Vec<_>>();
+    settle_wire_carries(&mut pool, WireCaps::current())
+        .unwrap_or_else(|refusal| panic!("the pool commits: {refusal}"));
+    assert!(metas_cost(&pool) <= MAX_HANDOFF_AGGREGATE_META_BYTES);
+    let mut shed = 0;
+    for (carry, grid) in pool.iter().zip(&grids) {
+        assert_eq!(&carry.checkpoint.grid, grid, "session {}", carry.local_id);
+        assert_eq!(carry.rung, CarryRung::Full, "session {}", carry.local_id);
+        if carry.checkpoint.visible_cells.is_empty() {
+            shed += 1;
+        }
+    }
+    assert!(
+        (1..pool.len()).contains(&shed),
+        "some sessions' facts, not all, were shed ({shed})"
+    );
+}
+
+/// The line sizes and protected runs go before anything a build before them carried.
+///
+/// Shell tabs, each with 120 carried OSC 133 commands and a screen striped with protected cells, one more than fit the meta budget with their protected runs and all of which fit without them: every tab keeps every command mark and output block and its screen, and only as many tabs' runs are shed as the budget needs.
+#[test]
+fn a_desk_that_fits_without_cell_facts_keeps_every_mark() {
+    let one = {
+        let mut terminal = aterm_core::terminal::Terminal::new(24, 240);
+        for n in 0..120 {
+            terminal.process(
+                format!(
+                    "\x1b]133;A\x07$ \x1b]133;B\x07make target-{n}\x1b]133;C\x07\r\n\
+                     \x1b]133;D;0\x07"
+                )
+                .as_bytes(),
+            );
+        }
+        terminal.process("\x1b[1\"qx\x1b[0\"q ".repeat(120 * 23).as_bytes());
+        terminal.checkpoint_carry(256).expect("carried")
+    };
+    assert!(
+        one.shell.command_marks.len() > 100 && !one.shell.output_blocks.is_empty(),
+        "PRECONDITION: carried marks and blocks"
+    );
+    assert!(!one.visible_cells.is_empty(), "PRECONDITION: runs");
+    let with = meta_manifest_cost(&one);
+    let mut bare = one.clone();
+    bare.visible_cells = aterm_core::grid::VisibleCells::default();
+    let without = meta_manifest_cost(&bare);
+    let n = MAX_HANDOFF_AGGREGATE_META_BYTES / with + 1;
+    assert!(
+        n * without <= MAX_HANDOFF_AGGREGATE_META_BYTES && n > 2 * (with / (with - without) + 1),
+        "PRECONDITION: {n} tabs fit without the runs ({without} bytes each), not with them \
+         ({with}), and shedding a few tabs' runs is enough"
+    );
+    let mut pool = (0..n)
+        .map(|local_id| WireCarry {
+            local_id,
+            checkpoint: one.clone(),
+            rung: CarryRung::Full,
+        })
+        .collect::<Vec<_>>();
+    settle_wire_carries(&mut pool, WireCaps::current())
+        .unwrap_or_else(|refusal| panic!("the pool commits: {refusal}"));
+    assert!(metas_cost(&pool) <= MAX_HANDOFF_AGGREGATE_META_BYTES);
+    for carry in &pool {
+        let (id, cp) = (carry.local_id, &carry.checkpoint);
+        assert_eq!(carry.rung, CarryRung::Full, "session {id}");
+        assert_eq!(cp.grid, one.grid, "session {id}: its screen");
+        assert_eq!(
+            cp.shell.command_marks, one.shell.command_marks,
+            "session {id}: every command mark"
+        );
+        assert_eq!(
+            cp.shell.output_blocks, one.shell.output_blocks,
+            "session {id}: every output block"
+        );
+    }
+    let shed = pool
+        .iter()
+        .filter(|carry| carry.checkpoint.visible_cells.is_empty())
+        .count();
+    assert!(
+        (1..pool.len()).contains(&shed),
+        "some tabs' runs, not all, were shed ({shed} of {n})"
+    );
+}
+
+/// A held pane past the held bound only with its protected runs crosses without them, its text exact: a 60x300 pane striped with protected cells has a meta past the 64 KiB a held pane's meta may put in the manifest, and one well under it without the runs.
+/// A 24x80 pane of the same stripes fits with its runs and keeps them.
+#[cfg(unix)]
+#[test]
+fn a_held_pane_past_the_bound_only_with_its_cell_facts_crosses_without_them() {
+    for (rows, cols, keeps_facts) in [(60_u16, 300_u16, false), (24, 80, true)] {
+        let live = striped(rows, cols);
+        let (cp, rung, cause) = carry_for_wire(&live, 0, 0, &mut 0, WireCaps::current());
+        assert_eq!(rung, CarryRung::Full, "{rows}x{cols}: {cause:?}");
+        assert!(!cp.visible_cells.is_empty(), "PRECONDITION: runs");
+        let meta = held_screen_meta(&cp)
+            .unwrap_or_else(|why| panic!("{rows}x{cols}: the pane is carried, not {why}"));
+        assert!(meta.len() <= MAX_HELD_META_BYTES, "{}", meta.len());
+        let read = parse_checkpoint_meta(&ScreenCarry {
+            schema: ScreenCarry::SCHEMA,
+            meta,
+            grid_file: "unused".to_string(),
+            alt_grid_file: None,
+            repaint: false,
+        })
+        .expect("the successor parses the meta")
+        .into_checkpoint(cp.grid.clone(), cp.alt_grid.clone());
+        assert_eq!(
+            read.visible_cells.is_empty(),
+            !keeps_facts,
+            "{rows}x{cols}: the runs cross only where they fit"
+        );
+        let mut adopted = aterm_core::terminal::Terminal::new(rows, cols);
+        adopted.restore_checkpoint(&read);
+        for r in 0..usize::from(rows) {
+            assert_eq!(
+                adopted.row_text(r),
+                live.row_text(r),
+                "{rows}x{cols}: row {r}'s text is exact"
+            );
+        }
+    }
+}
+
+/// The held panes' line sizes and protected runs give way before a connection or the pane under the manifest cap.
+///
+/// One tab, one held pane whose striped screen carries protected runs, and a description that puts the manifest over the cap by half of what the pane's runs weigh: the pane crosses without its runs, and so does every connection row, when there are rows whose weight alone covers the excess.
+#[test]
+#[cfg(unix)]
+fn held_panes_cell_facts_give_way_before_a_connection_or_the_pane() {
+    let Some(_env) = env_alone() else { return };
+    let _scratch = ScratchEnv::home("held-facts-cap");
+    let sid = "s-00000000010000050505";
+    let controller = "s-00000000010000030303";
+    let row = ConnectionCarry {
+        src: controller.to_string(),
+        dst: sid.to_string(),
+        op: "read-screen".to_string(),
+    };
+    let manifest_with = |connections: Vec<ConnectionCarry>, pad: u64| SessionHandoff {
+        connections,
+        ..bare_manifest(vec![SessionRecord {
+            description: Some("x".repeat(usize::try_from(pad).expect("a pad in memory"))),
+            ..zsh_record(0, sid)
+        }])
+    };
+    let screens = {
+        let mut terminal = aterm_core::terminal::Terminal::new(24, 80);
+        terminal.process(b"$ ls");
+        vec![(0, terminal.checkpoint_visible().expect("parser is Ground"))]
+    };
+    let held = vec![held_screen(
+        1,
+        SessionId::generate(),
+        striped(24, 80).checkpoint_carry_abandoning_partial(0).0,
+    )];
+    let fds = HandoffFds {
+        entries: vec![(0, 100, 4000)],
+    };
+    let nonce_bytes = mint_outgoing_nonce().len() as u64;
+    let bytes = |manifest: &SessionHandoff| {
+        nonce_bytes + 1 + manifest.to_toml().expect("serializes").len() as u64
+    };
+    let write = |manifest: &SessionHandoff| {
+        let nonce = mint_outgoing_nonce();
+        assert_eq!(nonce.len() as u64, nonce_bytes, "every nonce is one length");
+        let outgoing = write_outgoing_with_held(
+            manifest,
+            &fds,
+            &screens,
+            &[],
+            None,
+            &[],
+            &held,
+            crate::handoff_history::HeldExports::default(),
+            &nonce,
+        )
+        .expect("the manifest is written");
+        let body = std::fs::read_to_string(&outgoing.manifest_path).expect("written");
+        let read = SessionHandoff::from_toml(body.split_once('\n').expect("nonce line").1)
+            .expect("the successor reads it");
+        (outgoing, body.len() as u64, read)
+    };
+    let held_facts = |read: &SessionHandoff| {
+        let pane = read.held.first()?;
+        Some(
+            !parse_checkpoint_meta(&pane.screen)?
+                .visible_cells
+                .is_empty(),
+        )
+    };
+
+    let (_, whole, read) = write(&manifest_with(Vec::new(), 0));
+    assert_eq!(
+        held_facts(&read),
+        Some(true),
+        "PRECONDITION — the pane crosses with its runs"
+    );
+    let mut lighter = read;
+    lighter.held[0].screen.meta =
+        held_meta_json(&held[0].checkpoint, false).expect("the meta serializes");
+    let facts = whole - bytes(&lighter);
+    let excess = facts / 2;
+    assert!(excess > 0, "PRECONDITION — the runs weigh ({facts} bytes)");
+    let rows = vec![row.clone(); usize::try_from(facts / connection_row_cost(&row) * 2).unwrap()];
+
+    for connections in [Vec::new(), rows] {
+        let (_, whole, read) = write(&manifest_with(connections.clone(), 0));
+        assert_eq!(read.connections, connections, "PRECONDITION — rows carried");
+        let real = whole
+            - bytes(&SessionHandoff {
+                connections: Vec::new(),
+                ..read
+            });
+        assert!(
+            connections.is_empty() || real >= excess,
+            "PRECONDITION — the rows ({real} bytes) cover the excess ({excess})"
+        );
+        let (outgoing, written, read) = write(&manifest_with(
+            connections.clone(),
+            MAX_HANDOFF_MANIFEST_BYTES + excess - whole,
+        ));
+        let label = connections.len();
+        assert!(written <= MAX_HANDOFF_MANIFEST_BYTES, "{label}: {written}");
+        assert_eq!(
+            held_facts(&read),
+            Some(false),
+            "{label} rows: the pane crosses, without its runs"
+        );
+        assert_eq!(read.connections, connections, "{label}: every row crosses");
+        assert!(outgoing.connections_left_out.is_empty(), "{label}");
+    }
+}
+
 #[test]
 fn a_repaint_checkpoint_owes_no_rows_back() {
     let mut owing = CheckpointMeta::from_checkpoint(&{
@@ -4945,8 +5330,10 @@ fn a_wrong_build_child_refuses_the_handoff() {
     let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("wrongbuild", 1, None);
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     let own = own_build();
     staged.publish_env(
         ready_write,
@@ -4972,8 +5359,10 @@ fn a_wrong_session_set_cannot_match_the_parent_expectation() {
     let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("wrongset", 3, None);
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
     let (_proof, ready, adopted) = child_proof().expect("the child adopts and proves");
 
@@ -5010,8 +5399,10 @@ fn a_missing_or_foreign_commit_never_releases_the_readers() {
     let Some(_env) = env_alone() else { return };
     let _restore = restore_env();
     let staged = stage_outgoing_handoff("nocommit", 2, None);
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     staged.publish_env(ready_write, commit_read, Some(own_target()));
     let (proof, _ready, adopted) = child_proof().expect("the child adopts and proves");
 
@@ -5108,4 +5499,60 @@ fn packed_tab_stops_round_trip_and_refuse_what_no_window_writes() {
     assert!(refused(8, Some("0g")), "not hex");
     assert!(refused(5, Some("02")), "a stop past the length");
     assert!(!refused(5, Some("01")), "the last column's own stop");
+}
+
+/// 0.177.0's `PhysicalFailureShape::of_child_death`, as `git show
+/// v0.177.0:crates/aterm-gui/src/app_native.rs` holds it: a successor's exit with
+/// `EXIT_SUCCESSOR_PASSING` (75) is a moment, every other exit (76 included: 0.177.0 has no such
+/// code) is structural, and a death unobserved or by signal reads as 0.98.0's
+/// ([`shipped_parent_reads`]: a signal is structural only when it is the image faulting). It is
+/// the oldest outgoing build that hands off to this one (`watchdog::OLDEST_DIAL_BOUND`), and one
+/// that reads no progress.
+#[cfg(unix)]
+fn v0_177_parent_reads(
+    death: crate::ChildDeathEvidence,
+) -> crate::app_native::PhysicalFailureShape {
+    use crate::ChildDeathEvidence as Death;
+    use crate::app_native::PhysicalFailureShape as Shape;
+    match death {
+        Death::Exited { code } if code == EXIT_SUCCESSOR_PASSING => Shape::Transient,
+        _ => shipped_parent_reads(death),
+    }
+}
+
+/// A SUCCESSOR WHOSE LAUNCH STALLED UNDER A PARENT THAT READS NO PROGRESS LEAVES AS A STRUCTURAL
+/// DEATH: only such a parent is sent the launch watch's exit (`watchdog::launch_stall_policy`),
+/// and its code is none that 0.177.0, the oldest of them, reads as a moment (75), so 0.177.0 books
+/// it against the bytes; this build's parent, which reads progress and so is never sent it, would
+/// read it the same. The code is distinct from every other exit of this binary's handoff lane.
+#[cfg(unix)]
+#[test]
+fn a_stalled_launchs_exit_is_structural_to_a_parent_that_reads_no_progress() {
+    use crate::app_native::PhysicalFailureShape as Shape;
+    let death = crate::ChildDeathEvidence::Exited {
+        code: EXIT_SUCCESSOR_LAUNCH_STALLED,
+    };
+    assert_eq!(
+        v0_177_parent_reads(crate::ChildDeathEvidence::Exited {
+            code: EXIT_SUCCESSOR_PASSING
+        }),
+        Shape::Transient,
+        "PRECONDITION: 0.177.0 reads 75 as a moment"
+    );
+    assert_eq!(
+        v0_177_parent_reads(death),
+        Shape::Structural,
+        "0.177.0 books the stalled launch's exit against the bytes"
+    );
+    assert_eq!(Shape::of_child_death(death), Shape::Structural);
+    for other in [
+        0,
+        1,
+        EXIT_SUCCESSOR_PASSING,
+        EXIT_SUCCESSOR_VERIFICATION,
+        crate::system_quit::EXIT_WINDOW_SYSTEM_GONE,
+        crate::system_quit::EXIT_EVENT_LOOP_FAILED,
+    ] {
+        assert_ne!(EXIT_SUCCESSOR_LAUNCH_STALLED, other);
+    }
 }

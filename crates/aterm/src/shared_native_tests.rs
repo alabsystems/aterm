@@ -1764,7 +1764,7 @@ fn a_piped_native_key_past_its_bound_is_refused_not_cut() {
     }
 }
 
-/// The Gemini CLI is handed its profile folder byte for byte: a name with `=` in it through the
+/// agy is handed its profile folder byte for byte: a name with `=` in it through the
 /// launch, and one that is not UTF-8, which `display()` would have turned into another folder.
 #[test]
 fn the_gemini_profile_folder_is_handed_over_byte_for_byte() {

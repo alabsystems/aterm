@@ -213,6 +213,18 @@ fn who_is_the_sessions_row_an_outside_address_the_active_row_or_unknown() {
         },
         "CONTROL: a contradicted label is not taken, nor the active row"
     );
+    // A label whose row names another address the roster lists (a footer still naming the
+    // old row after a /login): the session is the row its address names, never outside.
+    read.email = Some("beta.m21.1@example.test");
+    assert_eq!(
+        read.card().who,
+        Who::Pool {
+            label: "beta".into(),
+            name: "beta.m21.1@example.test".into(),
+            enrolled: false,
+        },
+        "the address's row, not an outside login"
+    );
     read.label = None;
     read.email = None;
     assert_eq!(read.card().who, Who::Unknown);
@@ -1126,6 +1138,72 @@ fn with_no_series_row_the_history_is_the_journals_week() {
         read.cli = Cli::Codex;
         read.state.active = Some("alpha".into());
         assert_eq!(read.card().history.from, HistoryFrom::NotKept);
+    });
+}
+
+/// A JOURNAL STAND-IN KEEPS THE SERIES' FIRST ROW. A series here with rows of the account but no
+/// week reading inside the span (its plan alone) gives way to the journal's readings, and the
+/// history kept from that build keeps the series' oldest row: when the journal later says
+/// nothing, the kept history is the series' "nothing in the span", never "no row kept here"
+/// (the defect: the journal stand-in dropped `since`, so a kept one later read as no row at
+/// all). CONTROL: the same journal over a series with no row at all keeps no `since`.
+#[test]
+fn a_journal_stand_in_keeps_the_series_first_row() {
+    crate::harness::journal::with_keyer(keyer, || {
+        let reset = NOW + 2 * D;
+        let mut read = Read::new();
+        read.journal = journal_of(
+            "ac-00000000000000a1",
+            AccountSeen {
+                history: vec![week_line(NOW - 3 * D, "m15", 100, reset)],
+                ..Default::default()
+            },
+        );
+        let planned = HistoryRead {
+            oldest: Some(NOW - 30 * D),
+            ..HistoryRead::default()
+        };
+        let lab = read.card_with(HistoryIn::Read {
+            read: &planned,
+            stamp: 11,
+        });
+        assert_eq!(
+            (lab.history.from, lab.history.since),
+            (HistoryFrom::Journal, Some(NOW - 30 * D)),
+            "the journal stands in, the series' first row kept"
+        );
+        read.journal = journal_of("ac-00000000000000a1", AccountSeen::default());
+        let later = read.card_with(HistoryIn::Kept(Arc::clone(&lab.history)));
+        assert_eq!(
+            (later.history.from, later.history.since),
+            (HistoryFrom::Nothing, Some(NOW - 30 * D)),
+            "kept, then the journal silent: rows here, none in the span"
+        );
+        let fresh = read.card_with(HistoryIn::Read {
+            read: &planned,
+            stamp: 11,
+        });
+        assert_eq!(
+            fresh.history.since, later.history.since,
+            "the kept history says what a fresh fold says"
+        );
+        let empty = HistoryRead::default();
+        read.journal = journal_of(
+            "ac-00000000000000a1",
+            AccountSeen {
+                history: vec![week_line(NOW - 3 * D, "m15", 100, reset)],
+                ..Default::default()
+            },
+        );
+        let none = read.card_with(HistoryIn::Read {
+            read: &empty,
+            stamp: 9,
+        });
+        assert_eq!(
+            (none.history.from, none.history.since),
+            (HistoryFrom::Journal, None),
+            "CONTROL: no row here, no first row"
+        );
     });
 }
 

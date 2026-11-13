@@ -360,8 +360,59 @@ fn transferred_handles_conserve_the_original_pool_and_keep_cloexec() {
     assert_eq!(server.client().available().unwrap(), 1, "transfer lost or duplicated a token");
 }
 
+// The complete200-rights census needs its own actual descriptor table at
+// the inherited limit. Other parallel fixtures keep their default concurrency.
+fn isolated_assertions(name: &str, body: impl FnOnce()) {
+    const SCOPE: &str = "TRUST_JOBSERVER_ISOLATED_ASSERTIONS";
+    const MARKER: &str = "JOBSERVER_ISOLATED_ASSERTIONS_COMPLETE";
+    if std::env::var(SCOPE).as_deref() == Ok(name) {
+        body();
+        println!("{MARKER}");
+        return;
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", name, "--nocapture"])
+        .env(SCOPE, name)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("isolated descriptor assertions did not finish in60seconds");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "isolated assertions failed: {}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).lines().any(|line| line == MARKER),
+        "isolated process did not reach its post-assertion marker"
+    );
+}
+
 #[test]
 fn wrong_count_and_oversized_rights_close_every_received_descriptor() {
+    isolated_assertions(
+        "handoff::tests::wrong_count_and_oversized_rights_close_every_received_descriptor",
+        || {
+            wrong_count_and_oversized_rights_body();
+        },
+    );
+}
+
+fn wrong_count_and_oversized_rights_body() {
     for count in [1, 3, 40, 200] {
         let [read, write] = pipe();
         let (left, right) = streams();

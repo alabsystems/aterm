@@ -24,6 +24,7 @@ const MODEL_WIDE_END: &str = "Opus 5.5 \u{b7} Claude Ma\u{4E2D}";
 
 const GRAY: [u8; 3] = [130, 130, 130];
 
+#[cfg(unix)]
 const SITE_URL: &str = aterm_types::identity::SITE_URL;
 const SITE: &str = aterm_types::identity::SITE;
 
@@ -943,14 +944,13 @@ fn the_cards_line_names_no_autopilot_and_no_task_end() {
     }
 }
 
-/// The card line's ladder, widest first, for each harness: `enhanced by alab <cli> harness
-/// v<version>`, then the harness and its version, then the harness, each with the site's name;
-/// then the site's name, then `alab`; never aterm's own build signature.
+/// The card line's ladder, widest first, for each harness: `enhanced by ALab <cli> harness`,
+/// then `ALab <cli> harness`, then the mark alone; no version, no site name, never aterm's own
+/// build signature; the mark is every rung's link.
 #[test]
-fn the_cards_line_ladder_names_the_harness_and_the_site() {
+fn the_cards_line_ladder_names_the_mark_and_the_harness() {
     use aterm_phase::CliHarness;
-    let site = aterm_types::identity::SITE;
-    assert_eq!(site, "alab.systems");
+    assert_eq!(HERO_WORD, "ALab");
     let build = crate::menu::version_signature(
         crate::menu::VersionFacts::this_build(),
         crate::menu::VersionRung::Full,
@@ -961,18 +961,14 @@ fn the_cards_line_ladder_names_the_harness_and_the_site() {
         (4, CliHarness::Agy, "agy"),
         (1, CliHarness::Muse, "muse"),
     ] {
-        assert_eq!(harness.cli(), cli, "the brand names {harness:?}");
-        let ver = harness.version_str();
-        let brand = format!("alab {cli} harness");
+        assert_eq!(harness.cli(), cli, "the line names {harness:?}");
         let texts = line_texts_for(rows_kind);
         assert_eq!(
             texts,
             [
-                format!("enhanced by {brand} v{ver} \u{b7} alab.systems"),
-                format!("{brand} v{ver} \u{b7} alab.systems"),
-                format!("{brand} \u{b7} alab.systems"),
-                "alab.systems".to_owned(),
-                "alab".to_owned(),
+                format!("enhanced by ALab {cli} harness"),
+                format!("ALab {cli} harness"),
+                "ALab".to_owned(),
             ],
             "{harness:?}"
         );
@@ -984,30 +980,23 @@ fn the_cards_line_ladder_names_the_harness_and_the_site() {
                 !text.contains(&build),
                 "never aterm's build ({build}): {text:?}"
             );
-            let link = line_link(text);
-            match text.strip_suffix(site) {
-                Some(lead) => {
-                    let start = text_cells(lead);
-                    assert_eq!(link, Some(start..start + 12), "{text:?}");
-                }
-                None => assert_eq!(link, None, "{text:?}: no link"),
-            }
+            assert!(
+                !text.contains(harness.version_str()) && !text.contains(SITE),
+                "no version and no site name: {text:?}"
+            );
+            let at = text.find(HERO_WORD).expect("the mark");
+            assert_eq!(
+                line_link(text),
+                Some(at..at + 4),
+                "{text:?}: the mark links"
+            );
         }
     }
+    assert_eq!(line_link("ALab"), Some(0..4), "the bare mark is all link");
     assert_eq!(
-        line_link("alab.systems"),
-        Some(0..12),
-        "the bare site is all link"
-    );
-    assert_eq!(
-        line_link("alab alab.systems"),
+        line_link("enhanced by ALabs"),
         None,
-        "NEGATIVE CONTROL: no separator"
-    );
-    assert_eq!(
-        line_link("alab \u{b7} alab.systemsx"),
-        None,
-        "NEGATIVE CONTROL"
+        "NEGATIVE CONTROL: no mark, no link"
     );
 }
 
@@ -1081,7 +1070,7 @@ fn unsupervised_switched_off_another_build_scrolled_back_no_host_or_master_off_d
     let bare = |app: &App, wid: WindowId| {
         let strip = strip_rows(app, wid);
         !card_drew(app, wid)
-            && !glass_text(app, wid, strip + 4, 0..120).contains("alab claude harness")
+            && !glass_text(app, wid, strip + 4, 0..120).contains("ALab claude harness")
             && !app.windows[&wid]
                 .claude_card
                 .entries
@@ -1223,7 +1212,7 @@ fn off_wears_the_white_card_without_a_claim() {
         let strip = strip_rows(&app, wid);
         assert!(!card_drew(&app, wid), "{what}: no light");
         assert!(
-            !glass_text(&app, wid, strip + 4, 0..120).contains("alab claude harness"),
+            !glass_text(&app, wid, strip + 4, 0..120).contains("ALab claude harness"),
             "{what}: no line"
         );
         host.shutdown_and_join();
@@ -1336,7 +1325,7 @@ fn capture_resplice(tab_strip: u16) {
     assert_eq!(strip, usize::from(tab_strip), "CONTROL: the strip's rows");
     assert_eq!(
         glass_text(&app, wid, strip + 4, 0..120)
-            .matches("alab claude harness")
+            .matches("ALab claude harness")
             .count(),
         1
     );
@@ -1694,7 +1683,7 @@ fn a_light_theme_card_is_ink() {
         assert!(
             glass_text(&app, wid, line_row, 0..120)
                 .trim_end()
-                .ends_with(aterm_types::identity::SITE),
+                .ends_with(line_texts_for(3)[0].as_str()),
             "{osc}: CONTROL: the whole line"
         );
         let start = 11 + LINE_LEAD;
@@ -1858,7 +1847,7 @@ fn a_split_pane_decorates_its_own_card_only() {
             .take(pane_cols)
             .map(|c| c.ch)
             .collect::<String>()
-            .contains("alab claude harness")),
+            .contains("ALab claude harness")),
         "the line, inside the pane"
     );
     host.shutdown_and_join();
@@ -2547,7 +2536,7 @@ fn serious_mode_keeps_a_still_border_only() {
     );
     assert_eq!(app.claude_card_deadline(Instant::now()), None, "still");
     let strip = strip_rows(&app, wid);
-    assert!(glass_text(&app, wid, strip + 4, 0..120).contains("alab claude harness"));
+    assert!(glass_text(&app, wid, strip + 4, 0..120).contains("ALab claude harness"));
     host.shutdown_and_join();
 }
 
@@ -3016,7 +3005,7 @@ fn tab_status_off_hides_every_card() {
     assert!(!app.windows[&wid].claude_card.any_shown());
     assert_eq!(app.claude_card_deadline(t0), None);
     let strip = strip_rows(&app, wid);
-    assert!(!glass_text(&app, wid, strip + 4, 0..120).contains("alab claude harness"));
+    assert!(!glass_text(&app, wid, strip + 4, 0..120).contains("ALab claude harness"));
     set_now(None);
     host.shutdown_and_join();
 }
@@ -3240,7 +3229,6 @@ struct PassCost {
     reads: usize,
     autopilot_reads: usize,
     line_inks: usize,
-    notice_reads: usize,
     timeline_locks: usize,
     probe_locks: usize,
     text_rebuilds: usize,
@@ -3261,7 +3249,6 @@ fn pass_cost(app: &mut App, wid: WindowId) -> PassCost {
         crate::work_counts::take_card_reads(),
         crate::work_counts::take_autopilot_reads(),
         crate::work_counts::take_card_line_inks(),
-        crate::work_counts::take_card_notice_reads(),
         crate::work_counts::take_footer_timeline_locks(),
         crate::work_counts::take_card_probe_locks(),
         crate::work_counts::take_pane_text_rebuilds(),
@@ -3285,7 +3272,6 @@ fn pass_cost(app: &mut App, wid: WindowId) -> PassCost {
         reads: crate::work_counts::take_card_reads(),
         autopilot_reads: crate::work_counts::take_autopilot_reads(),
         line_inks: crate::work_counts::take_card_line_inks(),
-        notice_reads: crate::work_counts::take_card_notice_reads(),
         timeline_locks: crate::work_counts::take_footer_timeline_locks(),
         probe_locks: crate::work_counts::take_card_probe_locks(),
         text_rebuilds: crate::work_counts::take_pane_text_rebuilds(),
@@ -3678,7 +3664,7 @@ fn the_chips_write_no_rule_glyph() {
     let payload = "∞ yolo".chars().count() + 2 + continuation.chars().count() + 2;
     let line = painted(&app, wid).ink.len();
     assert!(
-        line > 40,
+        line > 20,
         "CONTROL: the card's line is on the glass ({line})"
     );
     // Under the card's palette line D's `─` run wears the arc (Claude's grey on the bare
@@ -3777,7 +3763,7 @@ fn costs_the_floor(
     );
     let line = glass_text(&app.0, wid, strip_rows(&app.0, wid) + 4, 0..120);
     assert!(
-        line.contains("alab claude harness"),
+        line.contains("ALab claude harness"),
         "{what}: the line: {line:?}"
     );
     for i in WARM..WARM + passes {
@@ -4155,7 +4141,6 @@ struct CardGlass {
     ink: Vec<InkCell>,
     decos: Vec<WordDecoration>,
     lines: Vec<(usize, usize, Vec<RenderCell>)>,
-    notices: Vec<(usize, usize, Vec<RenderCell>)>,
 }
 
 fn card_glass(app: &App, wid: WindowId) -> CardGlass {
@@ -4168,11 +4153,6 @@ fn card_glass(app: &App, wid: WindowId) -> CardGlass {
             .claude_card
             .lines()
             .map(|l| (l.frame_row, l.col, l.cells.clone()))
-            .collect(),
-        notices: app.windows[&wid]
-            .claude_card
-            .banner_edits()
-            .map(|(row, col, cells, _)| (row, col, cells.to_vec()))
             .collect(),
     }
 }
@@ -5209,230 +5189,101 @@ fn every_rung_of_the_line_names_alab() {
             "widest first: {texts:?}"
         );
     }
-    assert_eq!(rungs, 15, "CONTROL: the rungs were walked");
+    assert_eq!(rungs, 9, "CONTROL: the rungs were walked");
     assert_eq!(
-        hero_cells("enhanced by malab claude harness"),
+        hero_cells("enhanced by mALab claude harness"),
         None,
         "NEGATIVE CONTROL"
     );
     assert_eq!(
-        hero_cells("enhanced by alabs claude harness"),
+        hero_cells("enhanced by ALabs claude harness"),
         None,
         "NEGATIVE CONTROL"
     );
     assert_eq!(hero_cells("no word"), None, "NEGATIVE CONTROL");
     assert_eq!(
-        hero_cells("\u{4E2D} alab"),
+        hero_cells("\u{4E2D} ALab"),
         Some(3..7),
         "a wide glyph, two cells"
     );
 }
 
+/// A measured launch screen: its capture, the pane it is fed into, the card's first row and its
+/// rows, the build the card names, and the words of the vendor's row that carries its link.
 #[derive(Clone, Copy, Debug)]
-struct NoticeCapture {
+struct Capture {
     name: &'static str,
     text: &'static str,
     rows: usize,
     cols: usize,
     card: usize,
     card_rows: usize,
-    top: usize,
-    summary: usize,
-    details: usize,
-    end: usize,
+    version: &'static str,
+    #[cfg(unix)]
+    link: &'static str,
 }
 
-impl NoticeCapture {
+impl Capture {
+    /// The capture's rows laid in a pane of `rows` rows: the rows over its composer at the
+    /// top, its composer and mode row (its last four rows with words) at the bottom.
     fn screen(&self) -> Vec<String> {
-        self.text.lines().skip(1).map(str::to_owned).collect()
+        let mut screen: Vec<String> = self.text.lines().skip(1).map(str::to_owned).collect();
+        while screen.last().is_some_and(String::is_empty) {
+            screen.pop();
+        }
+        let foot = screen.split_off(screen.len() - 4);
+        assert!(
+            foot[0].starts_with('\u{2500}') && foot[2].starts_with('\u{2500}'),
+            "{}: CONTROL: the composer's rules",
+            self.name
+        );
+        assert!(screen.len() + foot.len() <= self.rows, "{}", self.name);
+        screen.resize(self.rows - foot.len(), String::new());
+        screen.extend(foot);
+        screen
     }
 
-    fn notice(&self) -> std::ops::Range<usize> {
-        self.top..self.top + self.summary + self.details
+    /// The row the card's line is laid on: the blank row under the card.
+    const fn line(&self) -> usize {
+        self.card + self.card_rows
     }
 }
 
-const CAPTURED: &str = "2.1.304";
+/// Claude Code 2.1.304's update notice under its card ("Updated to latest", then the changelog
+/// link), measured at 120 columns.
+const WIDE: Capture = Capture {
+    name: "update-notice-fullscreen-120col",
+    text: include_str!(
+        "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-fullscreen-120col.txt"
+    ),
+    rows: 40,
+    cols: 120,
+    card: 1,
+    card_rows: 3,
+    version: "2.1.304",
+    #[cfg(unix)]
+    link: "code.claude.com/docs/en/changelog",
+};
 
-const NOTICE_CAPTURES: [NoticeCapture; 5] = [
-    NoticeCapture {
-        name: "fullscreen-120col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-fullscreen-120col.txt"
-        ),
-        rows: 40,
-        cols: 120,
-        card: 1,
-        card_rows: 3,
-        top: 5,
-        summary: 1,
-        details: 1,
-        end: 74,
-    },
-    NoticeCapture {
-        name: "fullscreen-50col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-fullscreen-50col.txt"
-        ),
-        rows: 40,
-        cols: 50,
-        card: 1,
-        card_rows: 3,
-        top: 5,
-        summary: 2,
-        details: 1,
-        end: 47,
-    },
-    NoticeCapture {
-        name: "fullscreen-44col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-fullscreen-44col.txt"
-        ),
-        rows: 40,
-        cols: 44,
-        card: 1,
-        card_rows: 3,
-        top: 5,
-        summary: 2,
-        details: 2,
-        end: 41,
-    },
-    NoticeCapture {
-        name: "inline-workspace-120col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-inline-workspace-120col.txt"
-        ),
-        rows: 40,
-        cols: 120,
-        card: 0,
-        card_rows: 3,
-        top: 4,
-        summary: 1,
-        details: 1,
-        end: 74,
-    },
-    NoticeCapture {
-        name: "inline-50col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-inline-50col.txt"
-        ),
-        rows: 40,
-        cols: 50,
-        card: 0,
-        card_rows: 3,
-        top: 4,
-        summary: 2,
-        details: 1,
-        end: 47,
-    },
-];
-
-const WIDE: NoticeCapture = NOTICE_CAPTURES[0];
-
-const NARROW_CAPTURES: [NoticeCapture; 7] = [
-    NoticeCapture {
-        name: "narrow-workspace-fullscreen-50col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-workspace-fullscreen-50col.txt"
-        ),
-        rows: 40,
-        cols: 50,
-        card: 1,
-        card_rows: 4,
-        top: 6,
-        summary: 2,
-        details: 1,
-        end: 47,
-    },
-    NoticeCapture {
-        name: "narrow-workspace-fullscreen-34col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-workspace-fullscreen-34col.txt"
-        ),
-        rows: 40,
-        cols: 34,
-        card: 1,
-        card_rows: 4,
-        top: 6,
-        summary: 3,
-        details: 2,
-        end: 34,
-    },
-    NoticeCapture {
-        name: "narrow-workspace-fullscreen-33col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-workspace-fullscreen-33col.txt"
-        ),
-        rows: 40,
-        cols: 33,
-        card: 1,
-        card_rows: 4,
-        top: 6,
-        summary: 3,
-        details: 2,
-        end: 33,
-    },
-    NoticeCapture {
-        name: "narrow-workspace-inline-50col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-workspace-inline-50col.txt"
-        ),
-        rows: 40,
-        cols: 50,
-        card: 0,
-        card_rows: 4,
-        top: 5,
-        summary: 2,
-        details: 1,
-        end: 47,
-    },
-    NoticeCapture {
-        name: "narrow-workspace-inline-33col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-workspace-inline-33col.txt"
-        ),
-        rows: 40,
-        cols: 33,
-        card: 0,
-        card_rows: 4,
-        top: 5,
-        summary: 3,
-        details: 2,
-        end: 33,
-    },
-    NoticeCapture {
-        name: "narrow-xhigh-fullscreen-50col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-xhigh-fullscreen-50col.txt"
-        ),
-        rows: 40,
-        cols: 50,
-        card: 1,
-        card_rows: 4,
-        top: 6,
-        summary: 2,
-        details: 1,
-        end: 47,
-    },
-    NoticeCapture {
-        name: "narrow-xhigh-fullscreen-31col",
-        text: include_str!(
-            "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-narrow-xhigh-fullscreen-31col.txt"
-        ),
-        rows: 40,
-        cols: 31,
-        card: 1,
-        card_rows: 4,
-        top: 6,
-        summary: 3,
-        details: 2,
-        end: 31,
-    },
-];
+/// Claude Code 2.1.312's startup news under its card, its accent bar off (a title, the words,
+/// and a footer with a link), measured at 100 columns.
+#[cfg(unix)]
+const NEWS: Capture = Capture {
+    name: "startup-news-bar-off",
+    text: include_str!(
+        "../../aterm-phase/src/fixtures/claude-2.1.312-startup-news-bar-off-measured.txt"
+    ),
+    rows: 24,
+    cols: 100,
+    card: 0,
+    card_rows: 3,
+    version: "2.1.312",
+    link: "example.invalid",
+};
 
 fn notice_rows() -> [String; 2] {
     let screen = WIDE.screen();
-    let rows = [screen[WIDE.top].clone(), screen[WIDE.top + 1].clone()];
+    let rows = [screen[NOTICE_TOP].clone(), screen[NOTICE_TOP + 1].clone()];
     assert!(rows[0].starts_with(&format!("  {}", aterm_phase::anchor!("notice.updated"))));
     assert_eq!(
         rows[1],
@@ -5451,34 +5302,13 @@ fn notice_screen(rows: usize, cols: usize, details: &str) -> Vec<String> {
     screen
 }
 
-#[cfg(unix)]
-fn capture_at(rows: usize, cols: usize, details: &str) -> Vec<String> {
-    assert!(cols >= WIDE.end && rows >= 12, "the notice fits the pane");
-    let screen = WIDE.screen();
-    let fit = |row: &String| {
-        if !row.is_empty() && row.chars().all(|c| c == '\u{2500}') {
-            "\u{2500}".repeat(cols)
-        } else {
-            row.clone()
-        }
-    };
-    let mut out: Vec<String> = screen[..WIDE.notice().end].iter().map(fit).collect();
-    out[WIDE.top + WIDE.summary] = details.to_string();
-    let foot = &screen[screen.len() - 4..];
-    out.resize(rows - foot.len(), String::new());
-    out.extend(foot.iter().map(fit));
-    out
-}
-
-fn feed_capture(app: &App, session: u64, c: &NoticeCapture, rows: &[String]) {
+/// Feed `rows` as capture `c`'s screen: the card's lower rows in the vendor's gray, the caret on
+/// the composer's prompt row.
+fn feed_capture(app: &App, session: u64, c: &Capture, rows: &[String]) {
     let mut out = String::from("\x1b[2J");
     for (i, row) in rows.iter().enumerate() {
         let sgr = if (c.card + 2..c.card + c.card_rows).contains(&i) {
             format!("\x1b[38;2;{};{};{}m", GRAY[0], GRAY[1], GRAY[2])
-        } else if (c.top..c.top + c.summary).contains(&i) {
-            "\x1b[1m".to_string()
-        } else if c.notice().contains(&i) {
-            "\x1b[38;2;153;153;153m".to_string()
         } else {
             String::new()
         };
@@ -5493,16 +5323,6 @@ fn feed_capture(app: &App, session: u64, c: &NoticeCapture, rows: &[String]) {
     crate::term_lock(&term).process(out.as_bytes());
 }
 
-fn capture_glass(c: &NoticeCapture) -> (App, WindowId, u64) {
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    let session = app.focused_session_id(wid).expect("the front session");
-    assert!(app.apply_term_resize(wid, u16_of(c.rows), u16_of(c.cols)));
-    publish(&app, session, CAPTURED);
-    feed_capture(&app, session, c, &c.screen());
-    (app, wid, session)
-}
-
 fn engine_rows(app: &App, session: u64) -> Vec<String> {
     let mut fresh = RenderInput::empty();
     let term = app.pool.get(session).unwrap().term.clone();
@@ -5514,351 +5334,6 @@ fn engine_rows(app: &App, session: u64) -> Vec<String> {
         .iter()
         .map(|row| row.iter().map(|c| c.ch).collect::<String>())
         .collect()
-}
-
-fn capture_bare(app: &App, wid: WindowId, c: &NoticeCapture) -> bool {
-    let strip = strip_rows(app, wid);
-    let screen = c.screen();
-    c.notice()
-        .all(|r| glass_text(app, wid, strip + r, 0..text_cells(&screen[r])) == screen[r])
-}
-
-fn capture_banner(app: &App, wid: WindowId, c: &NoticeCapture) -> bool {
-    let strip = strip_rows(app, wid);
-    let words = text_cells(SITE_URL);
-    let at = 2 + LINE_LEAD;
-    let blank = |r: usize, from: usize| {
-        glass_text(app, wid, strip + r, from..c.end) == " ".repeat(c.end - from)
-    };
-    glass_text(app, wid, strip + c.top, 0..at) == " ".repeat(at)
-        && glass_text(app, wid, strip + c.top, at..at + words) == SITE_URL
-        && blank(c.top, at + words)
-        && c.notice().skip(1).all(|r| blank(r, 0))
-}
-
-fn notice_bare(app: &App, wid: WindowId) -> bool {
-    capture_bare(app, wid, &WIDE)
-}
-
-fn banner_shown(app: &App, wid: WindowId) -> bool {
-    capture_banner(app, wid, &WIDE)
-}
-
-#[test]
-fn the_update_notice_wears_the_harness_notice_on_the_glass_only() {
-    let mut rungs = [0; 2];
-    for c in NOTICE_CAPTURES.iter().chain(&NARROW_CAPTURES) {
-        let name = c.name;
-        let (mut app, wid, session) = capture_glass(c);
-        let before = engine_rows(&app, session);
-        let screen = c.screen();
-        for r in c.notice() {
-            assert!(
-                before[r].starts_with(&screen[r]),
-                "{name}: CONTROL: the vendor's notice is in the terminal"
-            );
-        }
-        frame(&mut app, wid);
-        assert!(
-            capture_bare(&app, wid, c),
-            "{name}: CONTROL: no host, the vendor's notice"
-        );
-        let vendor = {
-            let ws = app.windows.get_mut(&wid).unwrap();
-            assert!(crate::claude_footer::undo(
-                &mut ws.claude_footer_undo,
-                &mut ws.input_scratch
-            ));
-            ws.input_scratch.cells.clone()
-        };
-        let host = supervise(&mut app, session);
-        frame(&mut app, wid);
-        assert!(
-            capture_banner(&app, wid, c),
-            "{name}: the banner over the notice"
-        );
-        assert_eq!(
-            decorated(&app, wid).map(|p| (p.top, p.rows)),
-            Some((c.card, c.card_rows)),
-            "{name}: the card on the glass"
-        );
-        let chrome = strip_rows(&app, wid);
-        let line = glass_text(&app, wid, chrome + c.card + c.card_rows, 0..c.cols);
-        let words = line.trim_start().trim_start_matches('\u{2726}').trim();
-        let short = !words.starts_with("enhanced by ");
-        assert!(
-            words.starts_with(HERO_WORD) == short && line.contains(HERO_WORD),
-            "{name}: the card's line: {line:?}"
-        );
-        let lead = line.chars().take_while(|&ch| ch == ' ').count();
-        let rung = line_texts_for(3)
-            .iter()
-            .find(|t| lead + text_cells(t) < c.cols)
-            .expect("a rung fits");
-        assert_eq!(words, rung, "{name}: the widest rung that fits: {line:?}");
-        rungs[usize::from(short)] += 1;
-        let hero = line[..line.find(HERO_WORD).expect("the hero")]
-            .chars()
-            .count();
-        let line_row = &app.windows[&wid].input_scratch.cells[chrome + c.card + c.card_rows];
-        assert!(
-            line_row
-                .iter()
-                .take(c.cols)
-                .enumerate()
-                .all(|(col, cell)| cell.bold == (hero..hero + HERO_WORD.len()).contains(&col)),
-            "{name}: bold on the hero word alone, on every rung"
-        );
-        let (row, at, words) = (chrome + c.top, 2 + LINE_LEAD, text_cells(SITE_URL));
-        let scratch = &app.windows[&wid].input_scratch;
-        let blank = scratch.implicit_blank;
-        assert_eq!(
-            scratch.cells[row][at].fg,
-            crate::claude_footer::value_fg(GRAY, blank.fg),
-            "{name}: the line's value colour under the ink"
-        );
-        let underlined: Vec<usize> = (0..c.end)
-            .filter(|&col| scratch.cells[row][col].underline != UnderlineStyle::None)
-            .collect();
-        assert_eq!(
-            underlined,
-            (at..at + words).collect::<Vec<_>>(),
-            "{name}: the link's letters underlined, not the star's cells or the rest of the row"
-        );
-        assert!(
-            scratch.cells[row][at..at + words]
-                .iter()
-                .all(|cell| cell.underline == UnderlineStyle::Single
-                    && cell.underline_color.is_none()),
-            "{name}: a single underline in each letter's own ink"
-        );
-        let inked: Vec<u16> = scratch
-            .ink
-            .iter()
-            .filter(|c| usize::from(c.row) == row)
-            .map(|c| c.col)
-            .collect();
-        assert_eq!(
-            inked,
-            (at..at + words).map(|c| c as u16).collect::<Vec<_>>(),
-            "{name}: every letter inked, and nothing else on the row"
-        );
-        let hidden: Vec<usize> = c.notice().skip(1).map(|r| chrome + r).collect();
-        assert!(
-            scratch
-                .ink
-                .iter()
-                .all(|i| !hidden.contains(&usize::from(i.row))),
-            "{name}: nothing inked on the blanked rows"
-        );
-        let star = scratch
-            .word_decorations
-            .iter()
-            .find(|d| usize::from(d.row) == row)
-            .expect("the banner's star");
-        let first = scratch
-            .ink
-            .iter()
-            .find(|c| (usize::from(c.row), usize::from(c.col)) == (row, at))
-            .expect("the first letter's ink");
-        assert_eq!(
-            (usize::from(star.col), star.glyph, star.blend, star.color),
-            (2, DecoGlyph::Star4, DecoBlend::Add, pack(first.color)),
-            "{name}: the star leads the words in the first letter's colour"
-        );
-        let hits = &app.windows[&wid].claude_card.glass_hits;
-        let mut want = vec![
-            (session, row, 2..at + words, Some(NOTICE.url)),
-            (session, row, 2..c.end, None),
-        ];
-        want.extend(hidden.iter().map(|&r| (session, r, 2..c.end, None)));
-        assert_eq!(
-            hits.iter()
-                .filter(|h| h.link == GlassLink::Notice)
-                .map(|h| (h.session, h.frame_row, h.cols.clone(), h.url))
-                .collect::<Vec<_>>(),
-            want,
-            "{name}: the link on the star and its words, nothing on the rest"
-        );
-        assert_eq!(
-            engine_rows(&app, session),
-            before,
-            "{name}: the terminal's text"
-        );
-        let ws = app.windows.get_mut(&wid).unwrap();
-        assert!(crate::claude_footer::undo(
-            &mut ws.claude_footer_undo,
-            &mut ws.input_scratch
-        ));
-        strip(&mut ws.claude_card, &mut ws.input_scratch);
-        assert_eq!(
-            ws.input_scratch.cells, vendor,
-            "{name}: every cell the vendor's"
-        );
-        assert!(
-            ws.input_scratch
-                .word_decorations
-                .iter()
-                .all(|d| usize::from(d.row) != row),
-            "{name}: the banner's star taken back"
-        );
-        host.shutdown_and_join();
-    }
-    assert!(
-        rungs[0] > 0 && rungs[1] > 0,
-        "CONTROL: the captures hold a versioned rung and a short one ({rungs:?})"
-    );
-    assert_eq!(NOTICE.url, "https://alab.systems");
-    assert_eq!(
-        NOTICE.rungs.iter().map(|w| w.lead).collect::<Vec<_>>(),
-        ["", ""],
-        "the banner reads as the link it opens"
-    );
-    assert_eq!((SITE_URL, SITE), ("https://alab.systems", "alab.systems"));
-    let url = text_cells(SITE_URL);
-    let link = |room: usize| NOTICE.words_within(room).map(|w| w.link);
-    assert_eq!(link(url), Some(SITE_URL), "the link whole");
-    assert_eq!(
-        link(url - 1),
-        Some(SITE),
-        "where the link cannot fit, the site's name"
-    );
-    assert_eq!(NOTICE.words_within(text_cells(SITE) - 1), None);
-}
-
-#[test]
-fn the_box_strokes_no_glyph_in_the_panes_last_column() {
-    let mut open = 0;
-    let mut closed = 0;
-    for c in &NARROW_CAPTURES {
-        let name = c.name;
-        let (mut app, wid, session) = capture_glass(c);
-        let host = supervise(&mut app, session);
-        frame(&mut app, wid);
-        assert_eq!(
-            decorated(&app, wid).map(|p| (p.top, p.rows)),
-            Some((c.card, c.card_rows)),
-            "{name}: the card is boxed"
-        );
-        let (cw, ch) = app.win_cell_size(wid);
-        let (pad, grid_top) = (app.win_pad(wid), app.win_pad_top(wid) + app.win_head(wid));
-        let chrome = strip_rows(&app, wid);
-        let screen = c.screen();
-        let last = c.cols - 1;
-        let column = pad + last * cw..pad + (last + 1) * cw;
-        let stroked = |row: usize| {
-            let y = grid_top + row * ch + ch / 2;
-            card_marks(&app, wid).0.iter().any(|m| {
-                let y = pixel(y);
-                (m.at.y0..m.at.y1).contains(&y)
-                    && m.at.x0 < pixel(column.end)
-                    && m.at.x1 > pixel(column.start)
-            })
-        };
-        let full = |r: usize| screen[r].chars().nth(last).is_some_and(|ch| ch != ' ');
-        let boxed = c.card..c.card + c.card_rows;
-        if boxed.clone().any(full) {
-            for r in boxed.filter(|&r| full(r)) {
-                assert!(
-                    !stroked(chrome + r),
-                    "{name}: row {r}'s last glyph under the border"
-                );
-            }
-            open += 1;
-        } else if screen[c.card].chars().count() == last {
-            for r in boxed {
-                assert!(stroked(chrome + r), "{name}: CONTROL: the side at row {r}");
-            }
-            closed += 1;
-        }
-        host.shutdown_and_join();
-    }
-    assert_eq!(
-        (open, closed),
-        (3, 1),
-        "CONTROL: the captures hold both edges"
-    );
-}
-
-type NoticeCase = (&'static str, bool, fn(&mut App, u64));
-
-#[test]
-fn the_vendors_notice_stays_bare_where_the_banner_may_not_go() {
-    let cases: [NoticeCase; 5] = [
-        ("unsupervised", false, |app, session| {
-            let ctx = app.pool.get(session).unwrap().ctx.clone();
-            crate::session_timeline::release_supervisor(
-                &ctx,
-                None,
-                crate::metrics::now_us(),
-                aterm_slog::Actor::Ctl,
-            );
-        }),
-        ("switched off", false, |app, _| {
-            app.config.claude_footer = Some(crate::app_config::ClaudeFooterConfig {
-                card: Some(false),
-                ..Default::default()
-            });
-        }),
-        ("master switch off", false, |app, _| {
-            app.harness_policy = crate::harness_policy_cell::HarnessPolicyCell::new(
-                crate::app_config::HarnessPolicy::read("[harness]\nenabled = false\n"),
-            );
-        }),
-        ("reworded", true, |app, session| {
-            let mut rows = WIDE.screen();
-            rows[WIDE.top + 1] =
-                format!("  see {}", aterm_phase::anchor!("notice.updated_details"));
-            feed_capture(app, session, &WIDE, &rows);
-        }),
-        ("find bar up", true, |app, _| app.search_enter()),
-    ];
-    for (what, line, case) in cases {
-        let (mut app, wid, session) = capture_glass(&WIDE);
-        let host = supervise(&mut app, session);
-        frame(&mut app, wid);
-        assert!(banner_shown(&app, wid), "{what}: CONTROL, the banner");
-        case(&mut app, session);
-        frame(&mut app, wid);
-        let strip = strip_rows(&app, wid);
-        assert!(
-            what == "reworded" || notice_bare(&app, wid),
-            "{what}: the vendor's notice bare"
-        );
-        assert!(!banner_shown(&app, wid), "{what}: no banner");
-        assert!(
-            !app.windows[&wid]
-                .claude_card
-                .glass_hits
-                .iter()
-                .any(|h| h.link == GlassLink::Notice),
-            "{what}: no banner to press"
-        );
-        assert_eq!(
-            glass_text(&app, wid, strip + WIDE.card + 3, 0..120).contains("alab claude harness"),
-            line,
-            "{what}: the card's line"
-        );
-        host.shutdown_and_join();
-    }
-    let (mut app, wid, session) = capture_glass(&WIDE);
-    let host = supervise(&mut app, session);
-    let ctx = app.pool.get(session).unwrap().ctx.clone();
-    app.set_session_autopilot(
-        session,
-        Some(Autopilot::Off),
-        crate::autopilot::Surface::Chip,
-    );
-    crate::session_timeline::release_supervisor(
-        &ctx,
-        None,
-        crate::metrics::now_us(),
-        aterm_slog::Actor::Ctl,
-    );
-    assert!(!app.session_autopilot(session).2, "the claim is given back");
-    frame(&mut app, wid);
-    assert!(banner_shown(&app, wid), "Off's white card wears the banner");
-    host.shutdown_and_join();
 }
 
 #[cfg(unix)]
@@ -5885,16 +5360,6 @@ fn link_modifier() -> aterm_window::keyboard::ModifiersState {
     {
         aterm_window::keyboard::ModifiersState::CONTROL
     }
-}
-
-#[cfg(unix)]
-fn click(
-    app: &mut App,
-    wid: WindowId,
-    at: (usize, usize),
-    mods: aterm_window::keyboard::ModifiersState,
-) {
-    click_when(app, wid, at, mods, Instant::now());
 }
 
 /// A click on `at` with `mods` held whose button went down and up at `when`.
@@ -5963,885 +5428,302 @@ fn pty(reader: &mut std::os::unix::net::UnixStream, want: usize) -> Vec<u8> {
     got
 }
 
+/// The card lines' marks the last frame laid: each one's session, frame row and cells.
+fn mark_hits(app: &App, wid: WindowId) -> Vec<(u64, usize, std::ops::Range<usize>)> {
+    app.windows[&wid]
+        .claude_card
+        .glass_hits
+        .iter()
+        .map(|h| (h.session, h.frame_row, h.cols.clone()))
+        .collect()
+}
+
+/// The glass's text of `row`, its implicit blanks past its last cell and its trailing blanks
+/// dropped, a wide glyph's second cell and an unwritten cell read as the engine's rows read them.
+#[cfg(unix)]
+fn glass_row(app: &App, wid: WindowId, row: usize, cols: usize) -> String {
+    glass_text(app, wid, row, 0..cols).trim_end().to_owned()
+}
+
+/// THE ROWS UNDER THE CARD ARE THE VENDOR'S, ON THE GLASS AS ON THE GRID. Over Claude Code's
+/// update notice and over its startup news, with the harness carrying the session and the card
+/// decorated: the line is the one row the glass rewrites; every row under it down to the
+/// composer shows exactly the terminal's cells; the only mark the glass lays is the line's; the
+/// vendor's link on its own row is the link under the pointer, the hand and its caption under
+/// the link modifier, and with the mouse tracked a plain press on that row is reported to the
+/// program.
 #[cfg(unix)]
 #[test]
-fn a_press_on_the_notice_never_reaches_the_vendors_link() {
+fn the_rows_under_the_card_are_the_vendors_on_the_glass() {
     use aterm_session::sink::SinkWriter;
-    let changelog = aterm_phase::anchor!("notice.changelog");
-    let vendor_url = format!("https://{changelog}");
-    let tail = aterm_phase::anchor!("notice.updated_details")
-        .strip_prefix(changelog)
-        .expect("the details row opens with the changelog link");
-    let details = format!("  \x1b]8;;{vendor_url}\x1b\\{changelog}\x1b]8;;\x1b\\{tail}");
-    let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("PTY observer");
-    reader.set_nonblocking(true).expect("nonblocking observer");
-    let mut reader = reader;
-    let mut app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer.into())));
-    let wid = WindowId(0);
-    let session = app.focused_session_id(wid).expect("the front session");
-    assert!(app.apply_term_resize(wid, u16_of(WIDE.rows), u16_of(WIDE.cols)));
-    publish(&app, session, CAPTURED);
-    feed_capture(&app, session, &WIDE, &WIDE.screen());
-    frame(&mut app, wid);
-    let strip = strip_rows(&app, wid);
-    let (words, hidden) = ((strip + NOTICE_TOP, 6), (strip + NOTICE_TOP + 1, 10));
-    let (x, y) = cell_px(&app, wid, hidden);
+    use aterm_window::keyboard::ModifiersState;
+    for c in [WIDE, NEWS] {
+        let name = c.name;
+        let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("PTY observer");
+        reader.set_nonblocking(true).expect("nonblocking observer");
+        let mut reader = reader;
+        let mut app =
+            App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer.into())));
+        let wid = WindowId(0);
+        let session = app.focused_session_id(wid).expect("the front session");
+        assert!(app.apply_term_resize(wid, u16_of(c.rows), u16_of(c.cols)));
+        publish(&app, session, c.version);
+        let mut screen = c.screen();
+        let link_row = screen
+            .iter()
+            .position(|row| row.contains(c.link))
+            .unwrap_or_else(|| panic!("{name}: CONTROL: the vendor's link row"));
+        assert!(link_row > c.line(), "{name}: under the line");
+        let vendor_url = format!("https://{}", c.link);
+        screen[link_row] = screen[link_row].replace(
+            c.link,
+            &format!("\x1b]8;;{vendor_url}\x1b\\{}\x1b]8;;\x1b\\", c.link),
+        );
+        feed_capture(&app, session, &c, &screen);
+        let host = supervise(&mut app, session);
+        frame(&mut app, wid);
+        let strip = strip_rows(&app, wid);
+        let grid = engine_rows(&app, session);
+        let line = glass_row(&app, wid, strip + c.line(), c.cols);
+        assert_eq!(
+            line.trim_start(),
+            line_texts_for(3)[0],
+            "{name}: CONTROL: the card is decorated, its line on the blank row under it"
+        );
+        assert_eq!(
+            grid[c.line()].trim_end(),
+            "",
+            "{name}: CONTROL: the line is the glass's alone"
+        );
+        let composer = c.rows - 4;
+        let mut words = 0;
+        for (r, vendor) in grid.iter().enumerate().take(composer).skip(c.line() + 1) {
+            let vendor = vendor.trim_end();
+            assert_eq!(
+                glass_row(&app, wid, strip + r, c.cols),
+                vendor,
+                "{name}: row {r} is the vendor's on the glass"
+            );
+            words += usize::from(!vendor.is_empty());
+        }
+        assert!(words >= 2, "{name}: CONTROL: the vendor's rows hold words");
+        let scratch = &app.windows[&wid].input_scratch;
+        assert!(
+            scratch
+                .ink
+                .iter()
+                .all(|cell| !(strip + c.line() + 1..strip + composer)
+                    .contains(&usize::from(cell.row))),
+            "{name}: no ink of the harness on the vendor's rows"
+        );
+        let marks = mark_hits(&app, wid);
+        assert_eq!(marks.len(), 1, "{name}: one mark: {marks:?}");
+        assert_eq!(
+            (marks[0].0, marks[0].1),
+            (session, strip + c.line()),
+            "{name}: the line's"
+        );
+        let col = grid[link_row]
+            .find(c.link)
+            .map(|at| text_cells(&grid[link_row][..at]) + 2)
+            .expect("the link's cells");
+        let at = (strip + link_row, col);
+        let (x, y) = cell_px(&app, wid, at);
+        app.on_cursor_moved(wid, x, y);
+        assert_eq!(
+            app.link_under_pointer(wid).as_deref(),
+            Some(vendor_url.as_str()),
+            "{name}: the vendor's link under the pointer"
+        );
+        assert_eq!(
+            app.claude_glass_hit_at(wid, x, y),
+            None,
+            "{name}: no mark of the harness's over it"
+        );
+        app.windows.get_mut(&wid).unwrap().mods = link_modifier();
+        app.update_hover_cursor(wid);
+        assert!(
+            app.windows[&wid].hover_pointer && app.windows[&wid].link_hover.is_some(),
+            "{name}: under the link modifier the hand and the vendor's link's caption"
+        );
+        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
+        let _ = crate::platform::take_opened_urls();
+        let mut when = a_minute_ago();
+        let _ = pty(&mut reader, 0);
+        click_when(&mut app, wid, at, ModifiersState::empty(), when);
+        assert!(
+            pty(&mut reader, 0).is_empty(),
+            "{name}: CONTROL: nothing tracks the mouse yet"
+        );
+        {
+            let term = app.pool.get(session).unwrap().term.clone();
+            crate::term_lock(&term).process(b"\x1b[?1000h\x1b[?1006h");
+        }
+        frame(&mut app, wid);
+        let _ = pty(&mut reader, 0);
+        when += apart();
+        click_when(&mut app, wid, at, ModifiersState::empty(), when);
+        let report = pty(&mut reader, 6);
+        assert!(
+            report.starts_with(b"\x1b[<0;"),
+            "{name}: a press on the vendor's link row reaches the program: {report:?}"
+        );
+        assert!(
+            crate::platform::take_opened_urls().is_empty(),
+            "{name}: and opens nothing of the harness's"
+        );
+        host.shutdown_and_join();
+    }
+}
+
+#[cfg(unix)]
+fn hand_at(
+    app: &mut App,
+    wid: WindowId,
+    at: (usize, usize),
+    mods: aterm_window::keyboard::ModifiersState,
+) -> bool {
+    let (x, y) = cell_px(app, wid, at);
+    app.windows.get_mut(&wid).unwrap().mods = mods;
     app.on_cursor_moved(wid, x, y);
-    assert_eq!(
-        app.link_under_pointer(wid),
-        None,
-        "the measured row: no link"
-    );
-    let mut rows = WIDE.screen();
-    rows[NOTICE_TOP + 1] = details;
-    feed_capture(&app, session, &WIDE, &rows);
-    frame(&mut app, wid);
-    assert!(notice_bare(&app, wid), "CONTROL: the same text");
-    app.on_cursor_moved(wid, x, y);
-    assert_eq!(
-        app.link_under_pointer(wid).as_deref(),
-        Some(vendor_url.as_str()),
-        "CONTROL: the vendor's link on its row"
-    );
+    app.update_hover_cursor(wid);
+    let hand = app.windows[&wid].hover_pointer;
+    app.windows.get_mut(&wid).unwrap().mods = aterm_window::keyboard::ModifiersState::empty();
+    hand
+}
+
+/// THE CARD'S MARK LINKS THE SITE: the mark's letters alone carry a single underline in their own
+/// ink, one hit on exactly those cells; the hand shows over them and a plain press opens the
+/// site, once per double click; a Shift press and a press elsewhere on the line open nothing.
+#[cfg(unix)]
+#[test]
+fn the_cards_mark_links_the_site() {
+    use aterm_window::keyboard::ModifiersState;
+    let (mut app, wid, session) = glass(120);
     let host = supervise(&mut app, session);
     frame(&mut app, wid);
-    assert!(banner_shown(&app, wid), "the banner over the notice");
-    app.on_cursor_moved(wid, x, y);
-    assert_eq!(app.link_under_pointer(wid), None, "the hidden row's link");
-    assert!(app.path_link_under_pointer(wid).is_none());
-    let (wx, wy) = cell_px(&app, wid, words);
-    app.on_cursor_moved(wid, wx, wy);
+    let row = strip_rows(&app, wid) + 4;
+    let start = 11 + LINE_LEAD;
+    let want = expected_line(11, 120);
+    assert_eq!(want, line_texts_for(3)[0], "CONTROL: the widest rung");
     assert_eq!(
-        app.link_under_pointer(wid).as_deref(),
-        Some(NOTICE.url),
-        "the banner's link"
+        glass_text(&app, wid, row, start..start + want.chars().count()),
+        want
     );
-    assert!(app.path_link_under_pointer(wid).is_none());
-    let probe = |app: &mut App, mods| {
-        app.windows.get_mut(&wid).unwrap().mods = mods;
-        app.update_hover_cursor(wid);
-        let ws = &app.windows[&wid];
-        (
-            ws.hover_pointer,
-            ws.native_text_cursor,
-            ws.link_hover.is_some(),
-        )
-    };
+    let mark = start + 12..start + 12 + HERO_WORD.len();
+    assert_eq!(glass_text(&app, wid, row, mark.clone()), "ALab");
+    let scratch = &app.windows[&wid].input_scratch;
+    let underlined: Vec<usize> = (0..scratch.cells[row].len())
+        .filter(|&col| scratch.cells[row][col].underline != UnderlineStyle::None)
+        .collect();
     assert_eq!(
-        probe(&mut app, link_modifier()),
-        (true, false, false),
-        "the hand, and no caption of the hidden link"
+        underlined,
+        mark.clone().collect::<Vec<_>>(),
+        "the mark's letters alone underlined"
     );
-    assert_eq!(
-        probe(&mut app, aterm_window::keyboard::ModifiersState::empty()),
-        (true, false, false),
-        "the hand without the modifier too: a plain press opens the link"
-    );
-    for other in [
-        aterm_window::keyboard::ModifiersState::SHIFT,
-        aterm_window::keyboard::ModifiersState::ALT,
-    ] {
-        assert_eq!(
-            probe(&mut app, other),
-            (false, true, false),
-            "{other:?}: the I-beam, as a press with it selects"
-        );
-    }
-    assert_eq!(
-        probe(&mut app, aterm_window::keyboard::ModifiersState::empty()),
-        (true, false, false),
-        "CONTROL: the hand again"
-    );
-    app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::SHIFT);
     assert!(
-        !app.windows[&wid].hover_pointer,
-        "Shift going down over the still link takes the hand away"
+        scratch.cells[row][mark.clone()]
+            .iter()
+            .all(|c| c.underline == UnderlineStyle::Single && c.underline_color.is_none()),
+        "a single underline in each letter's own ink"
     );
-    app.on_modifiers_changed(wid, aterm_window::keyboard::ModifiersState::empty());
+    assert_eq!(
+        mark_hits(&app, wid),
+        [(session, row, mark.clone())],
+        "one link, on the mark's letters"
+    );
     assert!(
-        app.windows[&wid].hover_pointer,
-        "and its release gives it back"
+        hand_at(&mut app, wid, (row, mark.start), ModifiersState::empty()),
+        "the hand over the mark"
     );
-    app.on_cursor_moved(wid, x, y);
-    assert_eq!(
-        probe(&mut app, link_modifier()),
-        (false, true, false),
-        "no hand on the hidden row, and no caption of its link"
+    assert!(
+        hand_at(&mut app, wid, (row, mark.end - 1), link_modifier()),
+        "and with the link modifier"
     );
-    assert_eq!(
-        probe(&mut app, aterm_window::keyboard::ModifiersState::empty()),
-        (false, true, false),
-        "CONTROL: the I-beam on the hidden row without the modifier"
+    assert!(
+        !hand_at(&mut app, wid, (row, start), ModifiersState::empty()),
+        "CONTROL: no hand on the rest of the line"
     );
-    app.windows.get_mut(&wid).unwrap().mods = aterm_window::keyboard::ModifiersState::empty();
+    assert!(
+        !hand_at(&mut app, wid, (row, mark.start), ModifiersState::SHIFT),
+        "CONTROL: no hand under Shift"
+    );
     let _ = crate::platform::take_opened_urls();
-    // Each press states when it happened, so how long the work between presses takes never
-    // moves one across a double click's interval.
     let mut when = a_minute_ago();
-    click_when(&mut app, wid, words, link_modifier(), when);
-    assert_eq!(
-        crate::platform::take_opened_urls(),
-        vec![NOTICE.url.to_string()],
-        "a modifier press on the words opens the banner's link"
-    );
-    when += apart();
-    click_when(&mut app, wid, hidden, link_modifier(), when);
-    assert!(
-        crate::platform::take_opened_urls().is_empty(),
-        "a modifier press on the hidden row opens nothing"
-    );
-    when += apart();
-    for (k, opens) in [1, 0, 0].into_iter().enumerate() {
+    for k in 0..3 {
         if k > 0 {
             when += interval();
         }
         click_when(
             &mut app,
             wid,
-            words,
-            aterm_window::keyboard::ModifiersState::empty(),
+            (row, mark.start + 1),
+            ModifiersState::empty(),
             when,
         );
-        assert_eq!(
-            crate::platform::take_opened_urls().len(),
-            opens,
-            "press {k} of a triple click, each at the interval's last instant after the one \
-             before: a plain press on the words opens the banner's link once"
-        );
+        frame(&mut app, wid);
     }
-    when += apart();
-    click_when(
-        &mut app,
-        wid,
-        words,
-        aterm_window::keyboard::ModifiersState::empty(),
-        when,
-    );
     assert_eq!(
         crate::platform::take_opened_urls(),
-        vec![NOTICE.url.to_string()],
-        "CONTROL: a click a millisecond after the interval opens it again"
+        vec![SITE_URL.to_string()],
+        "a triple click opens the site once"
     );
-    for other in [
-        aterm_window::keyboard::ModifiersState::SHIFT,
-        aterm_window::keyboard::ModifiersState::ALT,
+    when += apart();
+    click_when(&mut app, wid, (row, mark.start), link_modifier(), when);
+    assert_eq!(
+        crate::platform::take_opened_urls(),
+        vec![SITE_URL.to_string()],
+        "a link-modifier press opens it"
+    );
+    frame(&mut app, wid);
+    for (at, mods) in [
+        (mark.start, ModifiersState::SHIFT),
+        (start, ModifiersState::empty()),
+        (mark.end + 1, ModifiersState::empty()),
     ] {
         when += apart();
-        app.windows.get_mut(&wid).unwrap().last_press = None;
-        click_when(&mut app, wid, words, other, when);
+        click_when(&mut app, wid, (row, at), mods, when);
+        frame(&mut app, wid);
         assert!(
             crate::platform::take_opened_urls().is_empty(),
-            "{other:?}: a press with another modifier opens nothing"
-        );
-        assert!(
-            app.windows[&wid].last_press.is_some(),
-            "{other:?}: the press is the grid's, as on the hidden row"
+            "col {at} {mods:?}: nothing opened"
         );
     }
-    let _ = pty(&mut reader, 0);
-    when += apart();
-    click_when(
-        &mut app,
-        wid,
-        hidden,
-        aterm_window::keyboard::ModifiersState::empty(),
-        when,
-    );
-    assert!(pty(&mut reader, 0).is_empty(), "nothing tracks the mouse");
-    assert!(
-        crate::platform::take_opened_urls().is_empty(),
-        "a plain press on the hidden row opens nothing"
-    );
-    {
-        let term = app.pool.get(session).unwrap().term.clone();
-        crate::term_lock(&term).process(b"\x1b[?1000h\x1b[?1006h");
-    }
-    assert!(
-        app.pool
-            .get(session)
-            .unwrap()
-            .ctx
-            .modes
-            .mouse_tracking_enabled()
-    );
-    frame(&mut app, wid);
-    assert!(banner_shown(&app, wid), "the banner stays");
-    let _ = pty(&mut reader, 0);
-    let _ = crate::platform::take_opened_urls();
-    for at in [words, hidden] {
-        let opens = if at == words {
-            vec![NOTICE.url.to_string()]
-        } else {
-            Vec::new()
-        };
-        when += apart();
-        click_when(
-            &mut app,
-            wid,
-            at,
-            aterm_window::keyboard::ModifiersState::empty(),
-            when,
-        );
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "{at:?}: a plain press on the banner reaches no PTY"
-        );
-        assert_eq!(
-            crate::platform::take_opened_urls(),
-            opens,
-            "{at:?}: under tracking a plain press opens the link alone"
-        );
-        when += apart();
-        click_when(&mut app, wid, at, link_modifier(), when);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "{at:?}: nor does a modifier press"
-        );
-        assert_eq!(crate::platform::take_opened_urls(), opens, "{at:?}");
-    }
-    when += apart();
-    app.windows.get_mut(&wid).unwrap().last_press = None;
-    click_when(
-        &mut app,
-        wid,
-        words,
-        aterm_window::keyboard::ModifiersState::ALT,
-        when,
-    );
-    assert!(
-        pty(&mut reader, 0).is_empty() && crate::platform::take_opened_urls().is_empty(),
-        "under tracking an Option press on the link reports nothing and opens nothing"
-    );
-    assert!(
-        app.windows[&wid].last_press.is_some(),
-        "it takes a local selection, as on the hidden row"
-    );
-    when += apart();
-    click_when(
-        &mut app,
-        wid,
-        (strip + 10, 40),
-        aterm_window::keyboard::ModifiersState::empty(),
-        when,
-    );
-    let report = pty(&mut reader, 6);
-    assert!(
-        report.starts_with(b"\x1b[<0;"),
-        "CONTROL: the press reported: {report:?}"
-    );
     host.shutdown_and_join();
 }
 
-#[cfg(unix)]
+/// A NARROW LINE KEEPS ITS MARK: at 44 columns, too narrow for the whole line, it steps down to
+/// `ALab claude harness`, the mark's letters still underlined and one hit.
 #[test]
-fn a_press_on_the_notice_in_a_mixed_tab_is_the_banners() {
-    use aterm_session::sink::SinkWriter;
-    use aterm_window::keyboard::ModifiersState;
-    let mut app = App::headless_for_test();
-    let wid = WindowId(0);
-    assert!(app.open_settings_tab(crate::native_settings::SettingsRoute::Home));
-    assert!(app.apply_term_resize(wid, 30, 240));
-    let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("PTY observer");
-    reader.set_nonblocking(true).expect("nonblocking observer");
-    let mut reader = reader;
-    let (session, _) = app.split_active_with_stub_terminal_with_sink(
-        wid,
-        crate::tab_model::SplitAxis::Vertical,
-        Arc::new(SinkWriter::new_owned(writer.into())),
-    );
-    let (rows, cols) = {
-        let term = crate::term_lock(&app.pool.get(session).unwrap().term);
-        (usize::from(term.rows()), usize::from(term.cols()))
-    };
-    assert!(cols >= 100, "the pane holds the notice whole ({cols})");
-    let changelog = aterm_phase::anchor!("notice.changelog");
-    let tail = aterm_phase::anchor!("notice.updated_details")
-        .strip_prefix(changelog)
-        .expect("the details row opens with the changelog link");
-    let details = format!("  \x1b]8;;https://{changelog}\x1b\\{changelog}\x1b]8;;\x1b\\{tail}");
-    publish(&app, session, CAPTURED);
-    feed(&app, session, &capture_at(rows, cols, &details));
-    let host = supervise(&mut app, session);
-    let mixed_frame = |app: &mut App| {
-        let Some((plan, crate::VisibleContentRoute::Heterogeneous)) =
-            app.active_visible_frame_layout(wid)
-        else {
-            panic!("a mixed tab");
-        };
-        assert!(app.prepare_heterogeneous_input_scratch(wid).is_some());
-        app.splice_claude_footer(wid, &plan, crate::VisibleContentRoute::Heterogeneous);
-    };
-    mixed_frame(&mut app);
-    let hits = app.windows[&wid].claude_card.glass_hits.clone();
-    let words = hits
-        .iter()
-        .find(|h| h.link == GlassLink::Notice && h.url.is_some())
-        .map(|h| (h.frame_row, h.cols.end - 1))
-        .expect("the banner on the mixed tab's glass");
-    let hidden = hits
-        .iter()
-        .find(|h| h.frame_row == words.0 + 1)
-        .map(|h| (h.frame_row, h.cols.start + 8))
-        .expect("the hidden details row");
-    assert_eq!(
-        app.focused_session_id(wid),
-        Some(session),
-        "CONTROL: the terminal pane has the focus"
-    );
-    let hand = |app: &mut App, at, mods| {
-        let (x, y) = cell_px(app, wid, at);
-        app.windows.get_mut(&wid).unwrap().mods = mods;
-        app.on_cursor_moved(wid, x, y);
-        app.update_hover_cursor(wid);
-        let hand = app.windows[&wid].hover_pointer;
-        app.windows.get_mut(&wid).unwrap().mods = ModifiersState::empty();
-        hand
-    };
-    assert!(
-        hand(&mut app, words, ModifiersState::empty()),
-        "the hand on the mixed tab's link without the modifier"
-    );
-    assert!(hand(&mut app, words, link_modifier()), "and with it");
-    assert!(
-        !hand(&mut app, hidden, ModifiersState::empty()),
-        "CONTROL: no hand on the hidden row"
-    );
-    let _ = crate::platform::take_opened_urls();
-    let mut when = a_minute_ago();
-    click_when(&mut app, wid, words, link_modifier(), when);
-    assert_eq!(
-        crate::platform::take_opened_urls(),
-        vec![NOTICE.url.to_string()],
-        "the banner's link"
-    );
-    mixed_frame(&mut app);
-    when += apart();
-    click_when(&mut app, wid, hidden, link_modifier(), when);
-    assert!(
-        crate::platform::take_opened_urls().is_empty(),
-        "nothing from the hidden row"
-    );
-    {
-        let term = app.pool.get(session).unwrap().term.clone();
-        crate::term_lock(&term).process(b"\x1b[?1000h\x1b[?1006h");
-    }
-    mixed_frame(&mut app);
-    let _ = pty(&mut reader, 0);
-    for at in [words, hidden] {
-        when += apart();
-        click_when(&mut app, wid, at, ModifiersState::empty(), when);
-        assert!(
-            pty(&mut reader, 0).is_empty(),
-            "{at:?}: a plain press on the banner reaches no PTY"
-        );
-        let opens = if at == words {
-            vec![NOTICE.url.to_string()]
-        } else {
-            Vec::new()
-        };
-        assert_eq!(
-            crate::platform::take_opened_urls(),
-            opens,
-            "{at:?}: a plain press opens the banner's link, and nothing from the hidden row"
-        );
-    }
-    when += apart();
-    click_when(
-        &mut app,
-        wid,
-        (words.0 + 6, words.1),
-        ModifiersState::empty(),
-        when,
-    );
-    let report = pty(&mut reader, 6);
-    assert!(
-        report.starts_with(b"\x1b[<0;"),
-        "CONTROL: the press reported: {report:?}"
-    );
-    host.shutdown_and_join();
-}
-
-#[cfg(unix)]
-#[test]
-fn a_press_on_an_unfocused_panes_banner_focuses_the_pane() {
-    use aterm_session::sink::SinkWriter;
-    use aterm_window::keyboard::ModifiersState;
-    let (reader, writer) = std::os::unix::net::UnixStream::pair().expect("PTY observer");
-    reader.set_nonblocking(true).expect("nonblocking observer");
-    let mut reader = reader;
-    let mut app = App::headless_for_test_with_sink(Arc::new(SinkWriter::new_owned(writer.into())));
-    let wid = WindowId(0);
-    let session = app.focused_session_id(wid).expect("the front session");
-    assert!(app.apply_term_resize(wid, 24, 160));
-    let other = app.split_active_stub_tab(wid);
-    assert_eq!(
-        app.focused_session_id(wid),
-        Some(other),
-        "CONTROL: the new pane has the focus"
-    );
-    let (rows, cols) = {
-        let term = crate::term_lock(&app.pool.get(session).unwrap().term);
-        (usize::from(term.rows()), usize::from(term.cols()))
-    };
-    let [_, details] = notice_rows();
-    publish(&app, session, CAPTURED);
-    feed(&app, session, &capture_at(rows, cols, &details));
-    let host = supervise(&mut app, session);
-    {
-        let term = app.pool.get(session).unwrap().term.clone();
-        crate::term_lock(&term).process(b"\x1b[?1000h\x1b[?1006h");
-    }
-    frame(&mut app, wid);
-    let words = app.windows[&wid]
-        .claude_card
-        .glass_hits
-        .iter()
-        .find(|h| h.link == GlassLink::Notice && h.url.is_some())
-        .map(|h| (h.frame_row, h.cols.end - 1))
-        .expect("the banner on the unfocused pane");
-    let hand = |app: &mut App| {
-        let (x, y) = cell_px(app, wid, words);
-        app.on_cursor_moved(wid, x, y);
-        app.update_hover_cursor(wid);
-        app.windows[&wid].hover_pointer
-    };
-    assert!(
-        !hand(&mut app),
-        "no hand on an unfocused pane's link: a press there only focuses"
-    );
-    let _ = pty(&mut reader, 0);
-    let _ = crate::platform::take_opened_urls();
-    click(&mut app, wid, words, ModifiersState::empty());
-    assert_eq!(
-        app.focused_session_id(wid),
-        Some(session),
-        "the press on the banner focuses its pane"
-    );
-    assert!(
-        pty(&mut reader, 0).is_empty(),
-        "the focus click reports nothing"
-    );
-    assert!(
-        crate::platform::take_opened_urls().is_empty(),
-        "the focus click opens nothing"
-    );
-    frame(&mut app, wid);
-    app.refresh_glass_cursor_for_frame(wid);
-    assert!(
-        app.windows[&wid].hover_pointer,
-        "focused, the hand on the link without pointer motion"
-    );
-    assert!(hand(&mut app), "focused, the hand on the link");
-    app.windows
-        .get_mut(&wid)
-        .unwrap()
-        .chrome_rows
-        .push(0..(words.0 + 1));
-    app.evict_stale_glass_hover(wid);
-    app.refresh_glass_cursor_for_frame(wid);
-    assert!(
-        !app.windows[&wid].hover_pointer,
-        "covered by a band, no hand on the link"
-    );
-    frame(&mut app, wid);
-    app.refresh_glass_cursor_for_frame(wid);
-    assert!(
-        app.windows[&wid].hover_pointer,
-        "uncovered again, the hand returns without pointer motion"
-    );
-    click(&mut app, wid, words, ModifiersState::empty());
-    assert!(
-        pty(&mut reader, 0).is_empty(),
-        "focused, a plain press on the banner reaches no PTY"
-    );
-    assert_eq!(
-        crate::platform::take_opened_urls(),
-        vec![NOTICE.url.to_string()],
-        "focused, a plain press on the banner opens its link"
-    );
-    assert_eq!(app.focused_session_id(wid), Some(session));
-    click(
-        &mut app,
-        wid,
-        (words.0 + 6, words.1),
-        ModifiersState::empty(),
-    );
-    let report = pty(&mut reader, 6);
-    assert!(
-        report.starts_with(b"\x1b[<0;"),
-        "CONTROL: the press reported: {report:?}"
-    );
-    host.shutdown_and_join();
-}
-
-#[cfg(unix)]
-#[test]
-fn a_press_on_the_banners_link_settles_a_tab_name_being_edited() {
-    use crate::app_rename::RenameSurface;
-    use aterm_window::keyboard::ModifiersState;
-    for mods in [ModifiersState::empty(), link_modifier()] {
-        let (mut app, wid, session) = capture_glass(&WIDE);
-        app.tab_strip_rows = 1;
-        let host = supervise(&mut app, session);
-        frame(&mut app, wid);
-        assert!(
-            banner_shown(&app, wid),
-            "{mods:?}: the banner over the notice"
-        );
-        let words = app.windows[&wid]
-            .claude_card
-            .glass_hits
-            .iter()
-            .find(|h| h.link == GlassLink::Notice && h.url.is_some())
-            .map(|h| (h.frame_row, h.cols.end - 1))
-            .expect("the banner's link");
-        let tab = app.windows[&wid].tab_set.active_id().expect("Claude's tab");
-        assert!(app.begin_session_rename(wid, tab));
-        assert_eq!(
-            app.inline_rename_edit(wid).map(|edit| edit.surface),
-            Some(RenameSurface::InGrid),
-            "{mods:?}: CONTROL: a tab name being edited"
-        );
-        let _ = crate::platform::take_opened_urls();
-        click(&mut app, wid, words, mods);
-        assert!(
-            app.inline_rename_edit(wid).is_none(),
-            "{mods:?}: the press on the link settled the edit"
-        );
-        assert_eq!(
-            crate::platform::take_opened_urls(),
-            vec![NOTICE.url.to_string()],
-            "{mods:?}: and opened the link"
-        );
-        host.shutdown_and_join();
-    }
-}
-
-#[test]
-fn a_notice_too_narrow_for_the_url_draws_the_sites_name_inside_its_end() {
-    let (mut app, wid, session) = capture_glass(&WIDE);
+fn a_narrow_line_keeps_its_mark() {
+    let (mut app, wid, session) = glass(44);
     let host = supervise(&mut app, session);
     frame(&mut app, wid);
-    assert!(
-        banner_shown(&app, wid),
-        "CONTROL: the banner over the notice"
-    );
-    let pane = PaneGeom {
-        strip: strip_rows(&app, wid),
-        row_off: 0,
-        col_off: 0,
-        rows: WIDE.rows,
-        cols: WIDE.cols,
-    };
-    let ws = &app.windows[&wid];
-    let gate = app
-        .pool
-        .get(session)
-        .unwrap()
-        .ctx
-        .timeline
-        .lock()
-        .unwrap()
-        .card_gate();
-    let mut check = GateCheck::new(gate, FenceFrame::of(&ws.input_scratch));
-    let leaf = card_leaf(
-        &ws.claude_footer_texts.borrow(),
-        app.config.claude_footer_card(),
-        0,
-        session,
-        pane,
-        RenderCell::default(),
-        AutopilotView::Cruise,
-        true,
-        &mut check,
-    );
-    let (read, _, _) = leaf.card.as_ref().expect("the decorated card's reading");
-    let place = leaf.notice.expect("the notice beside the card");
-    let card = &ws.claude_card.entries[0].card;
-    let drawn = |room: usize| {
-        let place = NoticePlace {
-            end: place.text_col + LINE_LEAD + room,
-            ..place
-        };
-        let mut notice = BannerGlass::default();
-        make_banner(
-            &mut notice,
-            NOTICE,
-            BannerPlace::notice(&place),
-            card,
-            Some(read),
-            pane,
-            RenderCell::default(),
-            &ws.input_scratch,
-            CardPalette::default(),
-            None,
-            false,
-        );
-        (notice, place)
-    };
-    let (url, short) = (text_cells(SITE_URL), text_cells(SITE));
-    for room in short..=url + 1 {
-        let want = if room >= url { SITE_URL } else { SITE };
-        let words = text_cells(want);
-        let (notice, place) = drawn(room);
-        assert!(notice.on, "{room}: a banner");
-        let row = &notice.rows()[0];
-        let end = pane.frame_col(place.end);
-        assert_eq!(
-            row.col + row.cells.len(),
-            end,
-            "{room}: the row ends at the notice's end"
-        );
-        let letters: String = row.cells[LINE_LEAD..LINE_LEAD + words]
-            .iter()
-            .map(|c| c.ch)
-            .collect();
-        assert_eq!(letters, want, "{room}: the widest words that fit");
-        let underlined: Vec<usize> = (0..row.cells.len())
-            .filter(|&k| row.cells[k].underline == UnderlineStyle::Single)
-            .collect();
-        assert_eq!(
-            underlined,
-            (LINE_LEAD..LINE_LEAD + words).collect::<Vec<_>>(),
-            "{room}: those letters underlined, nothing else"
-        );
-        assert_eq!(
-            notice.link,
-            row.col..row.col + LINE_LEAD + words,
-            "{room}: the link spans the star and the words drawn"
-        );
-        assert!(notice.link.end <= end, "{room}: the link inside the end");
-        assert!(
-            notice.ink.len() == words && notice.ink.iter().all(|c| usize::from(c.col) < end),
-            "{room}: the words' ink, inside the end"
-        );
-    }
-    assert!(
-        !drawn(short - 1).0.on,
-        "neither of the banner's words fits: no banner"
-    );
-    host.shutdown_and_join();
-}
-
-#[test]
-fn a_settled_notice_at_rest_costs_the_frame_nothing() {
-    let [summary, details] = notice_rows();
-    let notice = format!(
-        "\x1b7\x1b[{};1H{summary}\x1b[{};1H{details}\x1b8",
-        NOTICE_TOP + 1,
-        NOTICE_TOP + 2
-    );
-    costs_the_floor("notice", 12, |i, app, bare| {
-        if i == 0 {
-            feed_both(app, bare, notice.as_bytes());
-            return;
-        }
-        assert!(banner_shown(&app.0, app.1), "pass {i}: the banner");
-        let spinner = ['\u{2722}', '\u{2733}', '\u{2736}', '\u{273B}'][i % 4];
-        let bytes = format!(
-            "\x1b7\x1b[9;1H\u{23FA} streamed line {i}\x1b[K\
-             \x1b[12;1H{spinner} Thinking\u{2026} ({i}s)\x1b[K\x1b8"
-        );
-        feed_both(app, bare, bytes.as_bytes());
-    });
-    let t0 = Instant::now();
-    let (mut app, wid, session, host) = settled_glass(120, t0);
-    let term = app.pool.get(session).unwrap().term.clone();
-    let step = |app: &mut App, bytes: &[u8]| {
-        crate::term_lock(&term).process(bytes);
-        app.capture_words(wid, Instant::now());
-        app.splice_tab_strip(wid);
-        pass_cost(app, wid)
-    };
+    let row = strip_rows(&app, wid) + 3;
+    let want = expected_line(11, 44);
+    assert_eq!(want, line_texts_for(3)[1], "CONTROL: the harness alone");
     assert_eq!(
-        step(&mut app, notice.as_bytes()).notice_reads,
-        1,
-        "it comes"
+        glass_text(&app, wid, row, 13..13 + want.chars().count()),
+        want
     );
-    assert!(banner_shown(&app, wid));
-    assert_eq!(step(&mut app, b"x").notice_reads, 0, "kept");
-    let reworded = format!(
-        "\x1b7\x1b[{};1H  see {}\x1b8",
-        NOTICE_TOP + 2,
-        aterm_phase::anchor!("notice.updated_details")
+    let mark = line_link(&want).expect("the mark's letters");
+    assert_eq!(mark, 0..4, "the rung opens with the mark");
+    let mark = 13 + mark.start..13 + mark.end;
+    let underlined: Vec<usize> = app.windows[&wid].input_scratch.cells[row]
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.underline != UnderlineStyle::None)
+        .map(|(col, _)| col)
+        .collect();
+    assert_eq!(
+        underlined,
+        mark.clone().collect::<Vec<_>>(),
+        "the mark's letters alone underlined"
     );
     assert_eq!(
-        step(&mut app, reworded.as_bytes()).notice_reads,
-        1,
-        "CONTROL: a change to its rows is scanned again"
-    );
-    assert!(!banner_shown(&app, wid), "CONTROL: and the banner goes");
-    set_now(None);
-    host.shutdown_and_join();
-}
-
-const SCROLLED_29: &str = include_str!(
-    "../../aterm-phase/src/fixtures/claude-2.1.304-update-notice-scrolled-29rows-fullscreen-120col.txt"
-);
-
-#[test]
-fn the_banner_stays_while_the_card_scrolls_off() {
-    let cut: Vec<String> = SCROLLED_29.lines().skip(1).map(str::to_owned).collect();
-    let mut whole = vec![format!(
-        " \u{2590}\u{259B}\u{2588}\u{2588}\u{2588}\u{259B}\u{2588}   {}{CAPTURED}",
-        banner()
-    )];
-    whole.extend(cut.iter().cloned());
-    assert_eq!(whole.len(), 30, "CONTROL: the derived whole screen");
-    let scrolled = |k: usize| -> Vec<String> {
-        let mut rows = whole[k..].to_vec();
-        rows.resize(whole.len(), String::new());
-        rows
-    };
-    let paint = |app: &App, session: u64, rows: &[String]| {
-        let mut out = String::from("\x1b[2J");
-        for (i, row) in rows.iter().enumerate() {
-            let sgr = if row.ends_with("/proj") {
-                format!("\x1b[38;2;{};{};{}m", GRAY[0], GRAY[1], GRAY[2])
-            } else if row.starts_with(&format!("  {}", aterm_phase::anchor!("notice.updated"))) {
-                "\x1b[1m".to_string()
-            } else if row.contains(aterm_phase::anchor!("notice.updated_details")) {
-                "\x1b[38;2;153;153;153m".to_string()
-            } else {
-                String::new()
-            };
-            out.push_str(&format!("\x1b[{};1H{sgr}{row}\x1b[0m", i + 1));
-        }
-        let term = app.pool.get(session).expect("session").term.clone();
-        crate::term_lock(&term).process(out.as_bytes());
-    };
-    let words = text_cells(SITE_URL);
-    let at = 2 + LINE_LEAD;
-    let banner_on = |app: &App, wid: WindowId, top: usize| {
-        let strip = strip_rows(app, wid);
-        glass_text(app, wid, strip + top, at..at + words) == SITE_URL
-            && glass_text(app, wid, strip + top + 1, 0..74)
-                .trim()
-                .is_empty()
-    };
-    let bare_on = |app: &App, wid: WindowId, rows: &[String], top: usize| {
-        let strip = strip_rows(app, wid);
-        (top..top + 2).all(|r| glass_text(app, wid, strip + r, 0..text_cells(&rows[r])) == rows[r])
-    };
-    let window = || {
-        let mut app = App::headless_for_test();
-        let wid = WindowId(0);
-        let session = app.focused_session_id(wid).expect("the front session");
-        assert!(app.apply_term_resize(wid, 30, 120));
-        publish(&app, session, CAPTURED);
-        let host = supervise(&mut app, session);
-        (app, wid, session, host)
-    };
-    let (mut app, wid, session, host) = window();
-    for k in 0..=3 {
-        let rows = scrolled(k);
-        paint(&app, session, &rows);
-        frame(&mut app, wid);
-        let top = 4 - k;
-        assert!(
-            rows[top].starts_with(&format!("  {}", aterm_phase::anchor!("notice.updated"))),
-            "CONTROL: the notice at row {top}: {rows:#?}"
-        );
-        assert_eq!(
-            banner_on(&app, wid, top),
-            k < 3,
-            "scrolled {k}: the banner while a row of the card stands"
-        );
-        assert_eq!(bare_on(&app, wid, &rows, top), k == 3, "scrolled {k}");
-        assert_eq!(
-            decorated(&app, wid).map(|p| p.top),
-            (k == 0).then_some(0),
-            "scrolled {k}: the box only round the whole card"
-        );
-        assert!(
-            engine_rows(&app, session)
-                .iter()
-                .zip(&rows)
-                .all(|(drawn, fed)| drawn.starts_with(fed.as_str())),
-            "scrolled {k}: GLASS ONLY"
-        );
-        frame(&mut app, wid);
-        assert_eq!(banner_on(&app, wid, top), k < 3, "scrolled {k}: kept");
-    }
-    host.shutdown_and_join();
-    let (mut app, wid, session, host) = window();
-    for k in [0, 2, 1, 0] {
-        paint(&app, session, &scrolled(k));
-        frame(&mut app, wid);
-        assert!(
-            banner_on(&app, wid, 4 - k),
-            "scrolled back to {k}: the banner"
-        );
-    }
-    assert_eq!(
-        decorated(&app, wid).map(|p| p.top),
-        Some(0),
-        "whole again: the box"
-    );
-    paint(&app, session, &scrolled(2));
-    frame(&mut app, wid);
-    let mut other = scrolled(1);
-    other[0] = other[0].replace("API Usage Billing", "Claude Max");
-    paint(&app, session, &other);
-    frame(&mut app, wid);
-    assert!(
-        bare_on(&app, wid, &other, 3) && !banner_on(&app, wid, 3),
-        "NEGATIVE CONTROL: another card's row scrolled back"
-    );
-    host.shutdown_and_join();
-    let (mut app, wid, session, host) = window();
-    let rows = scrolled(1);
-    paint(&app, session, &rows);
-    frame(&mut app, wid);
-    assert!(
-        bare_on(&app, wid, &rows, 3) && !banner_on(&app, wid, 3),
-        "NEGATIVE CONTROL: no card was whole on this window"
-    );
-    host.shutdown_and_join();
-    let (mut app, wid, session, host) = window();
-    paint(&app, session, &whole);
-    frame(&mut app, wid);
-    assert!(banner_on(&app, wid, 4), "CONTROL: the whole card's banner");
-    let mut quoted = scrolled(1);
-    quoted[0] = "\u{23FA} The notice read:".into();
-    quoted[1] = String::new();
-    paint(&app, session, &quoted);
-    frame(&mut app, wid);
-    assert!(
-        bare_on(&app, wid, &quoted, 3) && !banner_on(&app, wid, 3),
-        "NEGATIVE CONTROL: a reply quoting the notice is never hidden"
-    );
-    host.shutdown_and_join();
-    let (mut app, wid, session, host) = window();
-    paint(&app, session, &whole);
-    frame(&mut app, wid);
-    assert!(banner_on(&app, wid, 4), "CONTROL: the whole card's banner");
-    let rows = scrolled(1);
-    paint(&app, session, &rows);
-    frame(&mut app, wid);
-    assert!(banner_on(&app, wid, 3), "CONTROL: scrolled, the banner");
-    assert!(app.set_session_autopilot(
-        session,
-        Some(Autopilot::Land),
-        crate::autopilot::Surface::Chip
-    ));
-    frame(&mut app, wid);
-    assert!(
-        banner_on(&app, wid, 3),
-        "the mode moved while the card is scrolled: the banner stays"
-    );
-    host.shutdown_and_join();
-    let (mut app, wid, session, host) = window();
-    paint(&app, session, &whole);
-    frame(&mut app, wid);
-    app.windows.get_mut(&wid).unwrap().search = Some(Default::default());
-    frame(&mut app, wid);
-    app.windows.get_mut(&wid).unwrap().search = None;
-    paint(&app, session, &rows);
-    frame(&mut app, wid);
-    assert!(
-        banner_on(&app, wid, 3),
-        "a find bar opened and closed over the whole card: the banner"
+        mark_hits(&app, wid),
+        [(session, row, mark)],
+        "one hit, on the mark's letters"
     );
     host.shutdown_and_join();
 }
@@ -6876,7 +5758,7 @@ fn a_build_drift_is_one_entry_and_leaves_the_decoration_alone() {
         app.on_claude_footer_changed(session);
         frame(&mut app, wid);
         let strip = strip_rows(&app, wid);
-        let line = glass_text(&app, wid, strip + 4, 0..120).contains("alab claude harness");
+        let line = glass_text(&app, wid, strip + 4, 0..120).contains("ALab claude harness");
         let entries = app
             .messages
             .digest()
@@ -7002,6 +5884,3 @@ mod a11y_tests;
 
 #[path = "claude_card_gate_tests.rs"]
 mod gate;
-
-#[path = "claude_card_banner_tests.rs"]
-mod banner;

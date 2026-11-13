@@ -5,13 +5,13 @@
 
 /// Done claims, each after real work and each in words of its own, so no reply is said twice.
 const CLAIMS: [&str; 7] = [
-    "Fixed the lexer and pushed it. All done.",
-    "Fixed the parser and pushed it. All done.",
-    "Fixed the printer and pushed it. All done.",
-    "Fixed the loader and pushed it. All done.",
-    "Fixed the docs and pushed them. All done.",
-    "Fixed the cache and pushed it. All done.",
-    "Fixed the config and pushed it. All done.",
+    "Fixed the lexer and pushed it. All done.\n\nATERM-TASK-DONE",
+    "Fixed the parser and pushed it. All done.\n\nATERM-TASK-DONE",
+    "Fixed the printer and pushed it. All done.\n\nATERM-TASK-DONE",
+    "Fixed the loader and pushed it. All done.\n\nATERM-TASK-DONE",
+    "Fixed the docs and pushed them. All done.\n\nATERM-TASK-DONE",
+    "Fixed the cache and pushed it. All done.\n\nATERM-TASK-DONE",
+    "Fixed the config and pushed it. All done.\n\nATERM-TASK-DONE",
 ];
 
 const WORK: &str = "Stage 3 is in; the lexer is next.";
@@ -137,7 +137,7 @@ fn six_done_claims_ask_six_kinds_of_work_then_the_first_again() {
 fn every_angles_act_fits_the_verbatim_bound_with_every_suffix() {
     let rules = rules_of(400);
     let claim = "All done.\nStill open: the lexer.\nRemaining work: the e2e suite.\nNEEDS YOU: \
-                 approve the force-push to main";
+                 approve the force-push to main\n\nATERM-TASK-DONE";
     let mut kept = [false; 2];
     for n in 0..DONE_ANGLES.len() {
         let mut st = TurnEndState::default();
@@ -395,7 +395,10 @@ fn every_angles_composed_act_asks_only_for_the_agents_own_work() {
         crate::harness::repo_work::RepoRead::Found(theirs.clone()),
         crate::harness::repo_work::RepoRead::Unread,
     ] {
-        for claim in ["All done.", "All done.\nStill open: the lexer."] {
+        for claim in [
+            "All done.\n\nATERM-TASK-DONE",
+            "All done.\nStill open: the lexer.\n\nATERM-TASK-DONE",
+        ] {
             for rules in [None, Some("never push to main")] {
                 for n in 0..DONE_ANGLES.len() {
                     let mut st = TurnEndState::default();

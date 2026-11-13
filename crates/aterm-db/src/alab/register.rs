@@ -8,7 +8,9 @@
 //! Commons runtime completes repair rounds, so a Mac alone on its LAN writes nothing and no timer
 //! wakes anything.
 //!
-//! A Mac's identity here is its Commons uuid, its fleet node and its membership label. The
+//! A Mac's identity here is its Commons uuid, its fleet node and its membership label. A writer
+//! succession gives it a new uuid and a new seat: the earlier writers of its verified lineage
+//! ([`Me::former`]) are this Mac too, so it keeps the machine row and the label they held. The
 //! IOPlatformUUID stays in this process: only a keyed digest of it ([`keys::hw_hint`]) is written.
 //! A Mac publishes its own node once on the machine row it adopted. A hint match without the §6 evidence is a finding,
 //! never an adoption, because VM clones share a machine identifier.
@@ -78,7 +80,8 @@ pub struct ThisMac {
 pub struct Me {
     /// The Commons machine uuid, 32 hex: the only key a facts row of this Mac can have.
     pub uuid: String,
-    /// The membership log's label, clash suffix included.
+    /// The membership log's label, clash suffix included: this writer's own seat's. A successor
+    /// goes by an earlier seat's where [`Me::former`] gives one ([`resolved`]).
     pub label: Option<String>,
     /// The label derived from a holder-signed number choice, its fallback during a conflict
     /// included. Never an OS-name hint.
@@ -87,6 +90,19 @@ pub struct Me {
     pub hw_hint: String,
     /// When the vault's roster says this Mac was admitted, where it says.
     pub enrolled_ms: Option<u64>,
+    /// The earlier writers of this enrollment's verified writer lineage, oldest first. A writer
+    /// succession gives a Mac a new uuid and seat, and the lineage proves one home held them all:
+    /// the same Mac, unless the home was copied to other hardware ([`resolved`]).
+    pub former: Vec<Former>,
+}
+
+/// An earlier writer in an enrollment's writer lineage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Former {
+    /// Its Commons machine uuid, 32 hex.
+    pub uuid: String,
+    /// Its seat's membership label, where the vault still seats it.
+    pub label: Option<String>,
 }
 
 /// What a plan reads besides the registry.
@@ -105,6 +121,8 @@ pub struct Input<'a> {
 /// Which step of the §6 rule bound this enrollment to its machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rule {
+    /// 0: the machine an earlier writer of this enrollment's own lineage is bound to.
+    Succession,
     /// 1: an earlier enrollment's row with this hint, with the reinstall evidence.
     Reinstall,
     /// 2: the machine row names this Mac's fleet node.
@@ -379,17 +397,40 @@ fn own_node(input: &Input<'_>, machines: &Projection, mac: &str) -> Result<Vec<C
     Ok(vec![automatic(&MACHINE, mac, "node", Value::from(node))?])
 }
 
-/// Follow the authenticated choice on this Mac's bound row. A nodeless sheet row may share
-/// the number until `merge` folds it in; another real holder always prevents the move.
-fn chosen_number(
+/// Follow a signed choice, or replace an automatic label that lost its claim. A nodeless
+/// sheet row may share a signed choice until `merge` folds it in.
+fn number_change(
     input: &Input<'_>,
     machines: &Projection,
     facts: &OwnedRead,
     mac: &str,
 ) -> Result<Vec<Change>> {
     let Some(label) = input.me.chosen.as_deref() else {
+        if machines.rows.get(mac).is_some_and(|row| {
+            row.claims.get("label").is_some_and(|canonical| {
+                canonical.as_ref() != row.fields.get("label").and_then(|field| field.value())
+            }) && row.fields.get("label").is_some_and(|field| {
+                !field.conflicted() && field.candidates().iter().all(|candidate| candidate.value.a)
+            })
+        }) {
+            return Ok(vec![automatic(
+                &MACHINE,
+                mac,
+                "label",
+                Value::from(birth_label(input, machines)?),
+            )?]);
+        }
         return Ok(Vec::new());
     };
+    if machines.rows.get(mac).is_some_and(|row| {
+        row.claims
+            .get("label")
+            .and_then(Option::as_ref)
+            .and_then(Value::as_str)
+            == Some(label)
+    }) {
+        return Ok(Vec::new());
+    }
     let bound = bound_elsewhere(input, facts);
     if machines.rows.iter().any(|(pk, row)| {
         pk != mac
@@ -658,7 +699,99 @@ fn only(
     }
 }
 
-/// What adoption picks: rules 1 to 3 of §6, in order, then 4.
+/// This enrollment as the rule reads it, and what it found on the way. The lineage proves one
+/// home held every writer in it, and a home can be copied to another Mac (a migration, a restored
+/// backup, a cloned disk), where the copy's writer succeeds the original's by itself. So an
+/// earlier writer whose facts row states other hardware than this Mac's is another Mac's: the
+/// newest such is a finding. A writer whose row states this Mac's hardware is this Mac's wherever
+/// it sits, a home that came back to its first Mac included. One that never registered states no
+/// hardware: it is this Mac's where no writer states other hardware, and nobody's where one
+/// does, since nothing then says which Mac the home was on when it ran. The Mac goes by the
+/// first seat's label among its own writers, unless it signed a number: a successor is seated
+/// under a new label while the seat it succeeded stands, and the Mac's machine row was planned
+/// under the earlier one.
+///
+/// Only rule 0 and the label read this. A copy is a stranger to the rules after it as any Mac
+/// is: while the original's uuid is seated its machine is bound elsewhere, and once that seat
+/// is gone a copy carrying the original's fleet node adopts the row by rule 2, as a Mac that
+/// replaced another does.
+fn resolved(me: &Me, facts: &OwnedRead) -> (Me, Vec<Finding>) {
+    let stated = |writer: &Former| {
+        facts
+            .rows
+            .get(&writer.uuid)
+            .and_then(|row| text(&row.value, "hw_hint"))
+    };
+    let cut = me
+        .former
+        .iter()
+        .rposition(|writer| stated(writer).is_some_and(|hint| hint != me.hw_hint));
+    let former: Vec<Former> = me
+        .former
+        .iter()
+        .filter(|writer| match stated(writer) {
+            Some(hint) => hint == me.hw_hint,
+            None => cut.is_none(),
+        })
+        .cloned()
+        .collect();
+    let findings = cut
+        .map(|at| {
+            finding(
+                "succession-other-hardware",
+                MACHINE_FACTS.name,
+                vec![me.uuid.clone(), me.former[at].uuid.clone()],
+            )
+        })
+        .into_iter()
+        .collect();
+    let seat = me
+        .chosen
+        .is_none()
+        .then(|| former.iter().find_map(|writer| writer.label.clone()))
+        .flatten();
+    (
+        Me {
+            label: seat.or_else(|| me.label.clone()),
+            former,
+            ..me.clone()
+        },
+        findings,
+    )
+}
+
+/// Rule 0: the machine the newest earlier writer of this enrollment's lineage is bound to, with
+/// that writer's uuid. The lineage, less the writers [`resolved`] found on other hardware, is the proof a
+/// reinstall's hint and dates stand in for, so nothing waits 30 days and the earlier uuid may
+/// still be seated. `Err` names a machine row the owner ended: the binding is for good, exactly
+/// as for this uuid's own row.
+fn succession(
+    input: &Input<'_>,
+    machines: &Projection,
+    facts: &OwnedRead,
+    found: &mut Vec<Finding>,
+) -> std::result::Result<Option<(String, String)>, ()> {
+    for uuid in input.me.former.iter().rev().map(|writer| &writer.uuid) {
+        let Some(mac) = facts.rows.get(uuid).and_then(|row| text(&row.value, "mac")) else {
+            continue;
+        };
+        return match machines.rows.get(mac) {
+            Some(row) if row.live() => Ok(Some((mac.to_owned(), uuid.clone()))),
+            Some(_) => {
+                found.push(finding(
+                    "bound-machine-retired",
+                    MACHINE.name,
+                    vec![mac.to_owned()],
+                ));
+                Err(())
+            }
+            None => continue,
+        };
+    }
+    Ok(None)
+}
+
+/// What adoption picks: rule 0, then rules 1 to 3 of §6, in order, then 4.
 enum Pick {
     Machine {
         rule: Rule,
@@ -678,6 +811,17 @@ fn pick(
     let bound = bound_elsewhere(input, facts);
     let me = input.me;
     let probe = input.probe;
+    match succession(input, machines, facts, found) {
+        Err(()) => return Pick::Held,
+        Ok(Some((mac, predecessor))) => {
+            return Pick::Machine {
+                rule: Rule::Succession,
+                mac,
+                predecessor: Some(predecessor),
+            };
+        }
+        Ok(None) => {}
+    }
     match reinstall(input, machines, facts, &bound, found) {
         Err(()) => return Pick::Held,
         Ok(Some((mac, predecessor))) => {
@@ -785,13 +929,28 @@ fn pick(
 /// # Errors
 /// `hw.model` makes no model key, all machine numbers are reserved, or a cell this Mac would
 /// write breaks its column's rules.
-pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan> {
+pub fn plan(input: &Input<'_>, view: &crate::typed::View) -> Result<Plan> {
+    if !view.complete {
+        return Ok(Plan::quiet(Outcome::Incomplete, Vec::new()));
+    }
+    let empty = OwnedRead::default();
+    let facts = view.owned.get(MACHINE_FACTS.name).unwrap_or(&empty);
+    plan_projected(input, &view.cells, facts, &view.project(&MACHINE))
+}
+
+fn plan_projected(
+    input: &Input<'_>,
+    cells: &Cells,
+    facts: &OwnedRead,
+    machines: &Projection,
+) -> Result<Plan> {
+    let (me, mut findings) = resolved(input.me, facts);
+    let input = &Input { me: &me, ..*input };
     let me = input.me;
     let today = day_of(input.now_ms);
     if let Some(own) = facts.rows.get(&me.uuid)
         && let Some(mac) = text(&own.value, "mac")
     {
-        let machines = cell::project(&MACHINE, cells);
         // A binding is for good, so a machine row the owner ended holds this Mac rather than
         // have it restate facts under a row nobody uses any more; only the owner moves it.
         if machines.rows.get(mac).is_some_and(|row| !row.live()) {
@@ -805,22 +964,35 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
             ));
         }
         let seen = own.value.get("seen").and_then(Value::as_u64).unwrap_or(0);
-        let mut node = own_node(input, &machines, mac)?;
-        let renamed = chosen_number(input, &machines, facts, mac)?;
+        let mut node = own_node(input, machines, mac)?;
+        let renamed = number_change(input, machines, facts, mac)?;
         let moves = !renamed.is_empty();
+        let moved_label = renamed
+            .iter()
+            .find(|change| change.key == format!("{mac}.label"))
+            .and_then(|change| change.value.as_ref())
+            .and_then(|value| CellValue::decode(value).ok())
+            .and_then(|value| value.x.as_str().map(str::to_owned));
         node.extend(renamed);
-        let label = input.me.chosen.as_deref().or_else(|| {
-            machines
-                .rows
-                .get(mac)
-                .filter(|row| {
-                    row.fields
-                        .get("label")
-                        .is_some_and(|field| !field.conflicted())
-                })
-                .and_then(|row| row.get("label"))
-                .and_then(Value::as_str)
-        });
+        let label = moved_label
+            .as_deref()
+            .or(input.me.chosen.as_deref())
+            .or_else(|| {
+                machines
+                    .rows
+                    .get(mac)
+                    .filter(|row| {
+                        row.fields
+                            .get("label")
+                            .is_some_and(|field| !field.conflicted())
+                    })
+                    .and_then(|row| row.get("label"))
+                    .and_then(Value::as_str)
+            })
+            // The machine's label is in conflict: the row keeps the one it states. This
+            // enrollment's seat is no evidence here, since a successor's is a later label for
+            // the same Mac and its lineage is read only until it is bound.
+            .or_else(|| own.value.get("label").and_then(Value::as_str));
         let row = stated(input, Some(&own.value), mac, None, label)?;
         // Host names move without the Mac changing (a Bonjour clash renames the local host), and a
         // change spends a record of a lifetime quota, so they ride the 30-day rewrite. The other
@@ -874,16 +1046,14 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
             findings: Vec::new(),
         });
     }
-    let mut findings = Vec::new();
     // A first row binds this enrollment for good, and a partial history can show a machine row
     // without the facts row that binds it, so every first row waits for the round, not only a
     // birth (design §6, as built).
     if !input.heard {
         return Ok(Plan::quiet(Outcome::Deferred, findings));
     }
-    let machines = cell::project(&MACHINE, cells);
     let own_pk = keys::machine_pk(&me.uuid);
-    let (outcome, mac, predecessor, births) = match pick(input, &machines, facts, &mut findings) {
+    let (outcome, mac, predecessor, births) = match pick(input, machines, facts, &mut findings) {
         Pick::Held => return Ok(Plan::quiet(Outcome::Held, findings)),
         Pick::Machine {
             rule,
@@ -915,14 +1085,14 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
                 return Ok(Plan::quiet(Outcome::Held, findings));
             }
             None => {
-                let label = birth_label(input, &machines)?;
+                let label = birth_label(input, machines)?;
                 (
                     Outcome::Born {
                         mac: own_pk.clone(),
                     },
                     own_pk.clone(),
                     None,
-                    machine_birth(input, &machines, &own_pk, &label)?,
+                    machine_birth(input, machines, &own_pk, &label)?,
                 )
             }
         },
@@ -947,14 +1117,14 @@ pub fn plan(input: &Input<'_>, cells: &Cells, facts: &OwnedRead) -> Result<Plan>
         });
     let label = match label {
         Some(label) => label.to_owned(),
-        None => birth_label(input, &machines)?,
+        None => birth_label(input, machines)?,
     };
     let label = input.me.chosen.as_deref().unwrap_or(&label);
     let row = stated(input, None, &mac, predecessor.as_deref(), Some(label))?;
     let mut changes = model_birth(cells, input.probe)?;
     if births.is_empty() {
-        changes.extend(own_node(input, &machines, &mac)?);
-        changes.extend(chosen_number(input, &machines, facts, &mac)?);
+        changes.extend(own_node(input, machines, &mac)?);
+        changes.extend(number_change(input, machines, facts, &mac)?);
         if input.me.chosen.is_none()
             && machines
                 .rows
@@ -990,10 +1160,31 @@ mod run {
         time::{Duration, Instant},
     };
 
-    /// How long after one pass another waits, unless a round brings the first evidence that a
-    /// peer holds the registry. A pass reads the host, so it is bounded; rounds, not a timer,
-    /// wake it.
+    /// How long after a pass that decided something another waits, unless a round brings the
+    /// first evidence that a peer holds the registry. A pass reads the host, so it is bounded;
+    /// rounds, not a timer, wake it.
     pub(super) const PASS_EVERY: Duration = Duration::from_secs(6 * 60 * 60);
+
+    /// How long after a pass that decided nothing the next waits, at first: one that failed, or
+    /// that found this Mac's history of the registry incomplete. Either is more often a passing
+    /// state than a standing one (a writer succession still pending, a table that moved under
+    /// the read, a record still on its way), and resting [`PASS_EVERY`] on it leaves a Mac out
+    /// of the registry for six hours behind one unlucky read. Each one after another doubles the
+    /// rest ([`rest_after`]), so a standing one (a Mac that is no Writer) settles at
+    /// [`PASS_EVERY`], where it was.
+    pub(super) const RETRY_EVERY: Duration = Duration::from_secs(5 * 60);
+
+    /// The rest after `undecided` passes in a row that decided nothing: [`PASS_EVERY`] after a
+    /// pass that decided, else [`RETRY_EVERY`] doubled for each one after the first, never more
+    /// than [`PASS_EVERY`].
+    pub(super) fn rest_after(undecided: u32) -> Duration {
+        match undecided {
+            0 => PASS_EVERY,
+            n => RETRY_EVERY
+                .saturating_mul(1u32.checked_shl(n - 1).unwrap_or(u32::MAX))
+                .min(PASS_EVERY),
+        }
+    }
 
     /// What one pass did: its outcome, the owner's findings, the records it appended.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1011,6 +1202,8 @@ mod run {
         table: T,
         heard: bool,
         last: Option<Instant>,
+        /// The passes in a row that decided nothing ([`rest_after`]).
+        undecided: u32,
     }
 
     /// The registry's table here, as [`Passes`] reads it: [`super::super::Registry::table`].
@@ -1029,6 +1222,7 @@ mod run {
                 table,
                 heard: false,
                 last: None,
+                undecided: 0,
             }
         }
 
@@ -1041,9 +1235,10 @@ mod run {
             now_ms: u64,
         ) -> Option<Result<Registered>> {
             let news = news(self.heard, drained, &mut self.table);
+            let rest = rest_after(self.undecided);
             let rested = self
                 .last
-                .is_none_or(|last| now.saturating_duration_since(last) >= PASS_EVERY);
+                .is_none_or(|last| now.saturating_duration_since(last) >= rest);
             if !news && !rested {
                 return None;
             }
@@ -1051,7 +1246,16 @@ mod run {
             self.heard |= news;
             self.last = Some(now);
             let registry = super::super::Registry::at(self.paths.clone());
-            Some(registry.register(&self.config, &probe, self.heard, now_ms))
+            let pass = registry.register(&self.config, &probe, self.heard, now_ms);
+            let decided = pass
+                .as_ref()
+                .is_ok_and(|done| done.outcome != Outcome::Incomplete);
+            self.undecided = if decided {
+                0
+            } else {
+                self.undecided.saturating_add(1)
+            };
+            Some(pass)
         }
     }
 

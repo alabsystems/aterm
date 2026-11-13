@@ -11,77 +11,33 @@
 //! data is never adopted as a live owner or reclaim permission. A full resident
 //! protocol still needs host-failure quarantine covering every resource provider.
 
-use super::{Held, Owner, RetainedAccepted, RetainedRefused};
-use crate::{
-    cargo_cache::SourceCacheGuard,
-    private_input::{InputUse, Refused},
-};
+use super::{Held, Owner, PreparationInputs, RetainedAccepted, RetainedRefused};
 use aterm_uds::spawnfd;
-use std::{
-    io,
-    time::{Duration, Instant},
-};
-
-const MAX_INPUTS: usize = 8;
-
-/// Original guards, not input roles or content credentials. Neither serialization
-/// nor an existing path constructs one of its actual private-input use guards.
-#[must_use = "retain the actual input guards through native cohort settlement"]
-pub struct PreparationInputs {
-    inputs: Vec<InputUse>,
-    cache: SourceCacheGuard,
-    deadline: Instant,
-}
-
-impl PreparationInputs {
-    /// Bind a bounded actual guard bundle to the caller's original endpoint.
-    /// Input names/bytes are not examined or certified here.
-    ///
-    /// # Errors
-    /// Empty/over-limit bundle, expired endpoint, or original guard drift. A
-    /// refusal returns every original input; it has dispatched no target.
-    pub fn new(
-        inputs: Vec<InputUse>,
-        cache: SourceCacheGuard,
-        deadline: Instant,
-    ) -> Result<Self, Refused<(Vec<InputUse>, SourceCacheGuard)>> {
-        let bundle = Self {
-            inputs,
-            cache,
-            deadline,
-        };
-        match bundle.check_current() {
-            Ok(()) => Ok(bundle),
-            Err(error) => Err(Refused::new(error, (bundle.inputs, bundle.cache))),
-        }
-    }
-
-    /// Recheck the same original guards under the same finite endpoint.
-    /// This does not inspect recursive content or establish execution authority.
-    /// # Errors
-    /// The bundle bound, deadline or any original lifecycle/cache guard refuses.
-    pub fn check_current(&self) -> io::Result<()> {
-        if self.inputs.is_empty() || self.inputs.len() > MAX_INPUTS {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "retained input bundle requires 1..=8 actual uses",
-            ));
-        }
-        if Instant::now() >= self.deadline {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        for input in &self.inputs {
-            input.check_current()?;
-        }
-        self.cache.check_current()?;
-        if Instant::now() >= self.deadline {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
-        Ok(())
-    }
-}
+use std::time::Duration;
 
 impl Owner {
+    /// Retain the same fresh materialization producer and private cache before
+    /// dispatch. Only this native job's successful completion and original
+    /// cohort settlement can return that exact bundle through
+    /// `Completion::try_into_retained`. No content, source or SDK is certified.
+    ///
+    /// # Errors
+    /// Original guards/deadline or native pre-dispatch admission refuses. The
+    /// original admission and attempt are returned; accepted failures stay owned.
+    pub fn submit_materialization(
+        &mut self,
+        held: Held,
+        command: &mut spawnfd::Command,
+        grace: Duration,
+        attempt: crate::private_input::MaterializationAttempt,
+    ) -> Result<RetainedAccepted, RetainedRefused<crate::private_input::MaterializationAttempt>>
+    {
+        if let Err(error) = attempt.check_current() {
+            return Err(RetainedRefused::new(error, held, attempt));
+        }
+        self.submit_returning(held, command, grace, attempt)
+    }
+
     /// Install actual input guards before the native target can be born.
     /// The caller still supplies independently admitted `Held`. Publication,
     /// launch, wait or client loss does not release accepted resources before

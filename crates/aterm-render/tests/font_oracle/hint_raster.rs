@@ -11,8 +11,9 @@ pub(crate) const SIZES: [f32; 9] = [10.0, 12.0, 13.0, 13.5, 14.0, 16.0, 17.0, 19
 /// The recorder's raster modes; LCD modes are recorded only at the default instance.
 pub(crate) const MODES: [&str; 4] = ["full", "light", "lcd", "lcd-unhinted"];
 
-/// The grid fits aterm-render asks for: `full` and `light` (the grayscale
-/// raster, `font_hinting`) and `lcd` (the subpixel raster).
+/// The grid fits the oracle checks: `full` and `light` (aterm-render's
+/// grayscale raster, `font_hinting`) and `lcd` (the LCD target,
+/// `FT_LOAD_TARGET_LCD`, through this file's 3x subpixel raster).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mode {
     Full,
@@ -251,7 +252,11 @@ enum Cmd {
 }
 
 /// src/hinted.rs `PathPen`: a recorded outline (pixels, y up) and its ink
-/// bounds, replayed into a raster grid (y down).
+/// bounds, replayed into a raster grid (y down). Where it differs from src:
+/// it has `digest`, the command stream the oracle hashes; `fill` takes the x
+/// oversample this file's 3x LCD raster (`subpixel_glyph_raster`) passes as
+/// `3.0`, where `hinted_glyph_raster` passes `1.0`, an exact identity; and the
+/// recording calls are inherent methods, not an `aterm_font::OutlineSink` impl.
 #[derive(Default)]
 pub(crate) struct PathPen {
     cmds: Vec<Cmd>,

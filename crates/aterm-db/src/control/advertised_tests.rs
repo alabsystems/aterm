@@ -5,18 +5,18 @@
 //! witness-bound signed descriptors and local IP observations, never endpoint authentication.
 
 use super::*;
-use aterm_net::fleet_member::{Peer, record, update_peers};
+use aterm_net::fleet_member::{HeldSignatures, Peer, record, signature_checks_here, update_peers};
 use aterm_secrets::{client, membership_log::NodeStanding};
 use std::{collections::BTreeMap, net::IpAddr};
 
-struct Producer {
-    lab: enrollment::tests::Lab,
-    active: Endpoint,
+pub(crate) struct Producer {
+    pub(crate) lab: enrollment::tests::Lab,
+    pub(crate) active: Endpoint,
     pending: Endpoint,
     legacy: Endpoint,
-    node: NodeIdentity,
+    pub(crate) node: NodeIdentity,
     actor: Actor,
-    state: PathBuf,
+    pub(crate) state: PathBuf,
 }
 
 fn publish_node(lab: &enrollment::tests::Lab, node: &NodeIdentity) {
@@ -36,7 +36,7 @@ fn publish_node(lab: &enrollment::tests::Lab, node: &NodeIdentity) {
 }
 
 impl Producer {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let lab = enrollment::tests::Lab::new(true);
         let legacy = Endpoint::from_bootstrap(&lab.bootstrap(0))
             .unwrap()
@@ -79,7 +79,7 @@ impl Producer {
         }
     }
 
-    fn contact(node: &NodeIdentity) -> Peer {
+    pub(crate) fn contact(node: &NodeIdentity) -> Peer {
         let mut peer = Peer::own(node, ("member.invalid", 7100, "1.0.0"), 7);
         // This field represents this book's local contact observation. It is
         // deliberately separate from the actual node-signed descriptor.
@@ -94,28 +94,59 @@ impl Producer {
         })
         .unwrap();
     }
+
+    /// A book of 85 signed entries: the member's own contact, then 84 nodes the witness binds
+    /// to no seat, each at an address of its own.
+    pub(crate) fn crowd(&self) -> Vec<Peer> {
+        let mut book = vec![Self::contact(&self.node)];
+        for n in 100..184u8 {
+            let node = NodeIdentity::from_seed(&format!("{n:032x}"), &[n; 32]).unwrap();
+            let mut peer = Peer::own(&node, ("member.invalid", 7100, "1.0.0"), 7);
+            peer.addr = Some(IpAddr::from([198, 51, 100, n]));
+            book.push(peer);
+        }
+        book
+    }
+
+    /// Keep `book` as the fleet book, whole.
+    pub(crate) fn keep_all(&self, book: &[Peer]) {
+        update_peers(&self.state, |held| {
+            held.clear();
+            held.extend(book.iter().cloned());
+            Ok::<(), String>(())
+        })
+        .unwrap();
+    }
 }
 
+/// NEGATIVE CONTROL (2026-11-12): with a kept verdict filed under the node id and key alone
+/// (`HeldSignatures`), the entry whose version changed under its old signature took the old
+/// verdict and was advertised (the read after `tampered` was not empty).
 #[test]
 fn advertised_versions_reads_signed_witness_descriptors_and_local_contacts() {
     let producer = Producer::new();
+    // One memo for every read of the member's, as its transport holds one: each entry below
+    // differs from the one kept before it in a field the check reads or in none.
+    let mut held = HeldSignatures::default();
     let contact = Producer::contact(&producer.node);
     assert!(contact.signature_holds());
     producer.keep(contact.clone());
     assert_eq!(
-        producer.active.advertised_versions(&producer.state),
+        producer
+            .active
+            .advertised_versions(&producer.state, &mut held),
         BTreeMap::from([(producer.actor, (contact.addr.unwrap(), "1.0.0".into()))])
     );
     assert!(
         producer
             .pending
-            .advertised_versions(&producer.state)
+            .advertised_versions(&producer.state, &mut HeldSignatures::default())
             .is_empty()
     );
     assert!(
         producer
             .legacy
-            .advertised_versions(&producer.state)
+            .advertised_versions(&producer.state, &mut HeldSignatures::default())
             .is_empty()
     );
 
@@ -126,7 +157,7 @@ fn advertised_versions_reads_signed_witness_descriptors_and_local_contacts() {
     assert!(
         producer
             .active
-            .advertised_versions(&producer.state)
+            .advertised_versions(&producer.state, &mut held)
             .is_empty()
     );
 
@@ -137,7 +168,7 @@ fn advertised_versions_reads_signed_witness_descriptors_and_local_contacts() {
     assert!(
         producer
             .active
-            .advertised_versions(&producer.state)
+            .advertised_versions(&producer.state, &mut held)
             .is_empty()
     );
 
@@ -146,7 +177,7 @@ fn advertised_versions_reads_signed_witness_descriptors_and_local_contacts() {
     assert!(
         producer
             .active
-            .advertised_versions(&producer.state)
+            .advertised_versions(&producer.state, &mut held)
             .is_empty()
     );
 
@@ -158,7 +189,9 @@ fn advertised_versions_reads_signed_witness_descriptors_and_local_contacts() {
     assert!(moved.signature_holds());
     producer.keep(moved);
     assert_eq!(
-        producer.active.advertised_versions(&producer.state),
+        producer
+            .active
+            .advertised_versions(&producer.state, &mut held),
         BTreeMap::from([(
             producer.actor,
             (IpAddr::from([192, 0, 2, 18]), "1.0.0".into())
@@ -188,6 +221,7 @@ fn advertised_versions_is_historical_witness_evidence_not_a_full_current_roster(
     // Construct again from current local custody: the minimal historical seat
     // witness still predates the later fleet-key rotation in the full log.
     let fresh = Endpoint::from_bootstrap(&bootstrap).unwrap().unwrap();
+    let mut held = HeldSignatures::default();
     let witness = fresh.snapshot_log.as_ref().unwrap().membership();
     assert_eq!(
         witness.node(producer.node.key().bytes()),
@@ -195,7 +229,63 @@ fn advertised_versions_is_historical_witness_evidence_not_a_full_current_roster(
     );
     assert_eq!(witness.node(rotated.key().bytes()), NodeStanding::Unknown);
     producer.keep(Producer::contact(&producer.node));
-    assert_eq!(fresh.advertised_versions(&producer.state).len(), 1);
+    assert_eq!(
+        fresh.advertised_versions(&producer.state, &mut held).len(),
+        1
+    );
     producer.keep(Producer::contact(&rotated));
-    assert!(fresh.advertised_versions(&producer.state).is_empty());
+    assert!(
+        fresh
+            .advertised_versions(&producer.state, &mut held)
+            .is_empty()
+    );
+}
+
+/// The member's read of an unchanged 85-entry book checks each signature once: a second read
+/// checks none and answers as the first did. An entry whose version changed under its old
+/// signature is checked and refused, and stays refused unchecked; the entry it was, put back,
+/// is checked again, since only the last book's verdicts are kept. Counted on this thread
+/// (`signature_checks_here`).
+///
+/// NEGATIVE CONTROL (2026-11-12): with `HeldSignatures::judge` never looking a kept verdict up,
+/// the second read made 85 checks (`an unchanged book is not checked again`: left 85, right 0).
+/// NEGATIVE CONTROL (2026-11-12): with a verdict kept under the node id and key alone, the
+/// changed entry took the old verdict and was advertised (`a changed entry is checked`: left 0,
+/// right 1).
+#[test]
+fn an_unchanged_book_is_checked_once_and_a_changed_entry_again() {
+    let producer = Producer::new();
+    let book = producer.crowd();
+    assert_eq!(book.len(), 85);
+    producer.keep_all(&book);
+    let mut held = HeldSignatures::default();
+    let mut read = || {
+        let before = signature_checks_here();
+        let advertised = producer
+            .active
+            .advertised_versions(&producer.state, &mut held);
+        (advertised, signature_checks_here() - before)
+    };
+    let member = BTreeMap::from([(producer.actor, (book[0].addr.unwrap(), "1.0.0".to_owned()))]);
+    let (first, checks) = read();
+    assert_eq!(checks, 85, "a book not read before is checked whole");
+    assert_eq!(first, member);
+    let (second, checks) = read();
+    assert_eq!(checks, 0, "an unchanged book is not checked again");
+    assert_eq!(second, member);
+
+    let mut changed = book.clone();
+    changed[0].version = Some("2.0.0".into());
+    producer.keep_all(&changed);
+    let (refused, checks) = read();
+    assert_eq!(checks, 1, "a changed entry is checked");
+    assert!(refused.is_empty(), "and refused: {refused:?}");
+    let (refused, checks) = read();
+    assert_eq!(checks, 0, "a failed verdict is kept");
+    assert!(refused.is_empty(), "as a failure: {refused:?}");
+
+    producer.keep_all(&book);
+    let (back, checks) = read();
+    assert_eq!(checks, 1, "only the last book's verdicts are kept");
+    assert_eq!(back, member);
 }

@@ -84,8 +84,8 @@ pub enum WaitFor {
 pub enum MemberWritten {
     /// Signed, and a server took it.
     Posted,
-    /// Signed into this Mac's log, and no server took it yet: not yet in vault. This Mac's vault
-    /// pass posts what a server lacks.
+    /// Signed into this Mac's log, and no server took it yet: not yet in vault. This Mac's next
+    /// records pass posts what a server lacks; its vault pass posts only what that pass signs.
     SignedHere,
     /// Not signed yet: it waits in `everyone.waiting` for this Mac's vault pass. Not yet in vault.
     Waiting(WaitFor),
@@ -693,7 +693,7 @@ pub enum MemberUnset {
     /// The `Delete` is signed under a fresh `[everyone]` epoch, and a server took it.
     Posted,
     /// The `Delete` is signed into this Mac's log, and no server took it yet: not yet in vault.
-    /// This Mac's vault pass posts what a server lacks.
+    /// This Mac's next records pass posts what a server lacks.
     SignedHere,
     /// The log holds no value of the name, and this Mac's own write of it, which still waited to
     /// be signed, is taken back: nothing was ever in the vault.

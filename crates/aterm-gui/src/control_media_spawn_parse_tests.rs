@@ -3,7 +3,7 @@
 
 #[cfg(unix)]
 use super::spawn_cwd_refusal;
-use super::{AgentSpec, SpawnForm, parse_spawn_args, spawn_retired_refusal, split_quoted_tokens};
+use super::{AgentSpec, SpawnForm, parse_spawn_args, split_quoted_tokens};
 use crate::connections::{ConnectedSpawnKind, ConnectedSpawnPlace};
 
 #[cfg(unix)]
@@ -211,13 +211,8 @@ fn a_worker_spawn_parses_agent_model_and_its_frame() {
         "autopilot=land",
         too_long.as_str(),
         "agent=claude connected=controlled place=tab of=s-a",
-        "agent=gemini connected=controlled place=tab of=s-a",
-        "agent=Gemini len=1",
-        "agent=gemini len=1",
-        "agent=gemini-cli len=1",
         "agent=codex-old len=1",
         "agent=muse model=a/b len=1",
-        "agent=gemini model=--yolo len=1",
         "agent=muse model=-x len=1",
         "agent=claude model=- len=1",
         "agent=Grok len=1",
@@ -356,41 +351,6 @@ fn program_parses_as_a_program_worker_and_a_spawn_naming_none_is_refused() {
         super::spawn_usage().contains("| program=<pct> [arg=<pct>]... [from=<sid>] len=<n>]"),
         "the usage line names the form"
     );
-}
-
-/// A SPAWN NAMING THE RETIRED GEMINI CLI IS REFUSED BY NAME, with agy, which
-/// replaces it, named; never the usage line and never another worker.
-#[test]
-fn a_spawn_of_the_retired_gemini_cli_is_refused_with_agy_named() {
-    for (rest, word) in [
-        ("agent=gemini len=3", "gemini"),
-        ("cwd=/w agent=Gemini model=m-1 len=1", "Gemini"),
-        ("agent=gemini-cli", "gemini-cli"),
-    ] {
-        assert_eq!(
-            spawn_retired_refusal(rest).as_deref(),
-            Some(
-                format!(
-                    "ERR spawn agent={word}: Gemini CLI is no longer supported: agy \
-                     replaces it (agent=agy)\n"
-                )
-                .as_str()
-            ),
-            "{rest}"
-        );
-        assert!(
-            parse_spawn_args(rest).is_err(),
-            "{rest}: no worker of any agent"
-        );
-    }
-    for rest in [
-        "agent=agy len=1",
-        "agent=geminix len=1",
-        "agent=/bin/gemini len=1",
-        "",
-    ] {
-        assert_eq!(spawn_retired_refusal(rest), None, "the control: {rest}");
-    }
 }
 
 /// A SPAWN'S REFUSAL NAMES THE WORD IT REFUSES: the bare usage line left its caller, a fleet
@@ -583,6 +543,23 @@ fn spawn_aim_prefers_the_explicit_window_over_the_selector() {
     assert!(!SpawnAim::Front.is_aimed());
     assert!(SpawnAim::Window(0).is_aimed());
     assert!(SpawnAim::Session(0).is_aimed());
+}
+
+/// A SPAWN FROM A TAB BEHIND OPENS BEHIND: a tab asked to land in front does so only for a
+/// client the desk door admits, and one that asked for no raise never asks the door.
+/// NEGATIVE CONTROL: an admitted client's raise stands.
+#[test]
+fn a_spawned_tab_lands_in_front_only_for_a_client_the_desk_admits() {
+    use super::lands_in_front;
+    assert!(!lands_in_front(true, &|| false), "its own tab is behind");
+    assert!(
+        lands_in_front(true, &|| true),
+        "control: its tab is in front"
+    );
+    assert!(
+        !lands_in_front(false, &|| panic!("no raise asks the door nothing")),
+        "raise=false"
+    );
 }
 
 #[test]

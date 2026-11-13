@@ -6,7 +6,11 @@
 //! CPU/GNU descriptions and retained memory before launching a member.
 
 #![cfg_attr(
-    all(trust_std, feature = "client", any(target_os = "linux", target_os = "macos")),
+    all(
+        trust_std,
+        feature = "client",
+        any(target_os = "linux", target_os = "macos")
+    ),
     feature(trust_process_inherit_fds)
 )]
 
@@ -16,6 +20,7 @@ mod context;
 mod helper_fds;
 pub mod linker;
 mod locator;
+pub mod native_job;
 pub mod paired_qualification;
 pub mod resolver;
 pub mod runtime_input_retention;
@@ -45,10 +50,20 @@ pub use channel::Channel;
 #[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "channel", any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    test,
+    feature = "channel",
+    any(target_os = "linux", target_os = "macos")
+))]
 fn fixture_deadline(started: std::time::Instant) -> std::time::Instant {
     started + std::time::Duration::from_secs(60)
 }
 
 #[cfg(all(feature = "client", any(target_os = "linux", target_os = "macos")))]
 pub mod client;
+
+#[cfg(all(unix, feature = "client"))]
+pub mod descriptors;
+
+/// Private solver bootstrap data and authenticated final-image receiver.
+pub mod solver_bootstrap;

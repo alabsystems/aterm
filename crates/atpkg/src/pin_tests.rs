@@ -9,6 +9,89 @@ fn layout(label: &str) -> crate::testdir::ScratchLayout {
     crate::testdir::layout(&format!("atpkg-pin-{label}-"))
 }
 
+thread_local! {
+    static BEFORE_PUBLISH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn before_publish() {
+    let callback = BEFORE_PUBLISH.with(|slot| slot.take());
+    if let Some(callback) = callback {
+        callback();
+    }
+}
+
+#[test]
+fn concurrent_pin_edits_preserve_both_changes() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    for pinning in [true, false] {
+        let l = layout("concurrent-edits");
+        set_pinned(&l, "keep", true).unwrap();
+        if !pinning {
+            set_pinned(&l, "ay", true).unwrap();
+            set_pinned(&l, "trust", true).unwrap();
+        }
+        let lock_path = l.prefix.join("pins.lock");
+        let open_lock = || {
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap()
+        };
+        drop(open_lock());
+        let (ready, first_read) = mpsc::channel();
+        let (go, release) = mpsc::channel();
+        let held = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                BEFORE_PUBLISH.with(|slot| {
+                    slot.replace(Some(Box::new(move || {
+                        ready.send(()).unwrap();
+                        release.recv_timeout(Duration::from_secs(60)).unwrap();
+                    })));
+                });
+                set_pinned(&l, "ay", pinning).unwrap()
+            });
+            first_read.recv_timeout(Duration::from_secs(60)).unwrap();
+            let held = match crate::lock::Flock::try_lock(open_lock()) {
+                Err(std::fs::TryLockError::WouldBlock) => true,
+                Ok(guard) => {
+                    drop(guard);
+                    false
+                }
+                Err(error) => panic!("probe the pin writer lock: {error}"),
+            };
+            let second = scope.spawn(|| set_pinned(&l, "trust", pinning).unwrap());
+            // Without serialization, force the second publication before the first stale
+            // snapshot. With serialization, release the first so the second can read it.
+            if held {
+                go.send(()).unwrap();
+                assert!(first.join().unwrap());
+                assert!(second.join().unwrap());
+            } else {
+                assert!(second.join().unwrap());
+                go.send(()).unwrap();
+                assert!(first.join().unwrap());
+            }
+            held
+        });
+        let expected = if pinning {
+            BTreeSet::from(["ay".to_string(), "keep".to_string(), "trust".to_string()])
+        } else {
+            BTreeSet::from(["keep".to_string()])
+        };
+        assert_eq!(pinned_set(&l).unwrap(), expected, "pinning={pinning}");
+        assert!(
+            held,
+            "the first snapshot must remain locked through publication"
+        );
+    }
+}
+
 #[test]
 fn an_unreadable_pin_file_cannot_be_replaced_by_a_pin_edit() {
     let l = layout("unreadable-edit");

@@ -892,6 +892,7 @@ fn set_rollout_claim(ctx: &crate::SessionCtx, target: &crate::self_claim::Rollou
         ctx.self_id.as_str(),
         Some(Copy {
             pid: target.pid,
+            lifetime: None,
             start: target.start.clone(),
             home: target.home.clone(),
             seen: Seen::Present(Record {

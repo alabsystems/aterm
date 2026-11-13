@@ -78,6 +78,8 @@ pub(crate) const HANDOFF_ENV_KEYS: &[HandoffName] = &[
     crate::seamless::ENV_PARENT_BIRTH,
     #[cfg(unix)]
     crate::seamless::ENV_EXIT_CAPS,
+    #[cfg(unix)]
+    crate::seamless::ENV_READY_CAPS,
     #[cfg(target_os = "macos")]
     crate::handoff_rendezvous::ENV_GRANT_CAPS,
     #[cfg(target_os = "macos")]

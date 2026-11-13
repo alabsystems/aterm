@@ -230,10 +230,10 @@ fn spellings_drive_glow_style_parse() {
     assert_eq!(GlowStyle::parse("pack:synthwave"), GlowStyle::Lumen);
     assert_eq!(GlowStyle::parse("plasma"), GlowStyle::Lumen);
     assert_eq!(GlowSpelling::parse("\u{00a0}OFF\u{2003}").style, None);
-    // The one rainbow theme is the underline; no other style reads the shape.
+    // The one rainbow theme is the tall band behind the words; no other style reads the shape.
     let rainbow = GlowSpelling::parse("\u{3000}Rainbow\u{202f}");
     assert_eq!(rainbow.style, Some(GlowStyle::RainbowKitty));
-    assert!(!rainbow.ribbon_tall && !rainbow.ribbon_flat);
+    assert!(rainbow.ribbon_tall && !rainbow.ribbon_flat);
     for mono in [
         "classic mono",
         "Classic Lumen",

@@ -775,7 +775,7 @@ impl Machine for Vz {
             return Err("this helper already booted its VM".into());
         }
         let (mut reader, writer) =
-            std::io::pipe().map_err(|e| format!("the console's pipe: {e}"))?;
+            aterm_uds::pipe().map_err(|e| format!("the console's pipe: {e}"))?;
         let cpus = limits.cpus(plan.cpus);
         let queue = Raw(self.queue.as_id());
         let sink = events.clone();

@@ -6,25 +6,12 @@
 #![cfg(unix)]
 
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 
 use aterm_session::sink::{ImmediateWrite, Seam, SinkWriter};
 use aterm_spec::wait::MUST_HAPPEN;
-
-fn pipe_pair() -> (OwnedFd, OwnedFd) {
-    let mut fds = [-1; 2];
-    // SAFETY: `fds` points to two initialized c_int slots; on success pipe(2) replaces both with
-    // owned descriptors, each wrapped exactly once below.
-    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "pipe: {}", std::io::Error::last_os_error());
-    // SAFETY: successful pipe(2) returned two fresh, independently-owned fds.
-    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    // SAFETY: same as above, for the distinct write descriptor.
-    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    (read, write)
-}
 
 fn fill_nonblocking(fd: i32) -> usize {
     aterm_pty::set_nonblocking(fd, true).expect("nonblocking pipe writer");
@@ -42,7 +29,7 @@ fn fill_nonblocking(fd: i32) -> usize {
 
 #[test]
 fn initial_eagain_is_busy_zero_and_never_appears_later() {
-    let (read, write) = pipe_pair();
+    let (read, write) = aterm_uds::pipe().expect("pipe");
     let filled = fill_nonblocking(write.as_raw_fd());
     let sink = SinkWriter::new(write.as_raw_fd());
     sink.note_master_nonblocking(true);
@@ -53,7 +40,7 @@ fn initial_eagain_is_busy_zero_and_never_appears_later() {
         "initial EAGAIN must be an exact zero-byte refusal"
     );
 
-    let mut reader = std::fs::File::from(read);
+    let mut reader = read;
     let mut old = vec![0_u8; filled];
     reader.read_exact(&mut old).expect("drain original fill");
     assert!(old.iter().all(|byte| *byte == b'.'));
@@ -69,11 +56,11 @@ fn initial_eagain_is_busy_zero_and_never_appears_later() {
 
 #[test]
 fn short_write_is_partial_in_doubt_and_tail_is_never_injected() {
-    let (read, write) = pipe_pair();
+    let (read, write) = aterm_uds::pipe().expect("pipe");
     let filled = fill_nonblocking(write.as_raw_fd());
     let sink = SinkWriter::new(write.as_raw_fd());
     sink.note_master_nonblocking(true);
-    let mut reader = std::fs::File::from(read);
+    let mut reader = read;
 
     let room = filled.min(8 * 1024);
     let mut prefix = vec![0_u8; room];
@@ -106,11 +93,11 @@ fn short_write_is_partial_in_doubt_and_tail_is_never_injected() {
 
 #[test]
 fn the_guarded_write_queues_the_rest_of_a_short_write_and_delivers_it_whole() {
-    let (read, write) = pipe_pair();
+    let (read, write) = aterm_uds::pipe().expect("pipe");
     let filled = fill_nonblocking(write.as_raw_fd());
     let sink = SinkWriter::new(write.as_raw_fd());
     sink.note_master_nonblocking(true);
-    let mut reader = std::fs::File::from(read);
+    let mut reader = read;
 
     assert_eq!(
         sink.try_write_frame_whole_with_receipt(b"REJECTED"),
@@ -170,7 +157,7 @@ fn the_guarded_write_queues_the_rest_of_a_short_write_and_delivers_it_whole() {
 fn a_blocking_frame_behind(
     write: impl FnOnce(&SinkWriter, &[u8]) -> ImmediateWrite,
 ) -> (ImmediateWrite, Vec<u8>, Vec<u8>) {
-    let (read, pipe) = pipe_pair();
+    let (read, pipe) = aterm_uds::pipe().expect("pipe");
     let filled = fill_nonblocking(pipe.as_raw_fd());
     let sink = Arc::new(SinkWriter::new(pipe.as_raw_fd()));
     sink.note_master_nonblocking(true);
@@ -190,7 +177,7 @@ fn a_blocking_frame_behind(
             .recv_timeout(MUST_HAPPEN)
             .expect("the test lets the blocking frame go on");
     });
-    let mut reader = std::fs::File::from(read);
+    let mut reader = read;
     let room = filled.min(8 * 1024);
     let mut made = vec![0_u8; room];
     reader.read_exact(&mut made).expect("make partial room");

@@ -63,6 +63,12 @@ impl<'s> Scratch<'s> {
     }
 }
 
+impl AsRef<Path> for Scratch<'_> {
+    fn as_ref(&self) -> &Path {
+        self.path()
+    }
+}
+
 impl std::fmt::Debug for Scratch<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Scratch")

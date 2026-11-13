@@ -16,12 +16,12 @@ use crate::durable::Flush;
 use crate::native_document_host::{replace_file, sync_directory};
 use crate::native_document_io::{
     ContentFingerprint, DraftJournalReducer, DurableCheckpoint, DurableSource, JOURNAL_FRAME_HEAD,
-    JOURNAL_SECRET_LEN, JournalAppendPlan, JournalAppendProof, JournalAppendResult,
-    JournalDocumentKey, JournalEdit, JournalError, JournalImageGeneration, JournalLanding,
-    JournalOwnerId, JournalRecord, JournalReduction, JournalSecret, JournalStage, JournalTail,
-    LegacyJournal, MAX_INSERT_BYTES, MAX_JOURNAL_BYTES, StoredJournalRecovery, compact_journal,
-    encode_journal_image, encode_journal_image_v1, frame_record, journal_is_format_1,
-    recover_journal_for, recover_journal_image_for,
+    JOURNAL_SECRET_LEN, JournalAppendPlan as RawJournalAppendPlan, JournalAppendProof,
+    JournalAppendResult, JournalDocumentKey, JournalEdit, JournalError, JournalImageGeneration,
+    JournalLanding, JournalOwnerId, JournalRecord, JournalReduction, JournalSecret, JournalStage,
+    JournalTail, LegacyJournal, MAX_INSERT_BYTES, MAX_JOURNAL_BYTES, StepFault,
+    StoredJournalRecovery, compact_journal, encode_journal_image, encode_journal_image_v1,
+    frame_record, journal_is_format_1, recover_journal_for, recover_journal_image_for,
 };
 
 #[cfg(any(unix, windows))]
@@ -32,7 +32,7 @@ mod owner;
 #[cfg(not(any(unix, windows)))]
 mod owner {
     use std::fs::File;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::{ContentFingerprint, JournalDocumentKey, JournalImageGeneration, JournalOwnerId};
 
@@ -43,9 +43,48 @@ mod owner {
         pub(crate) fn id(&self) -> JournalOwnerId {
             match *self {}
         }
+        pub(super) fn run<T: Send + 'static>(
+            &self,
+            _work: impl FnOnce(&mut Custody) -> T + Send + 'static,
+        ) -> Result<T, String> {
+            match *self {}
+        }
     }
 
-    pub(super) enum Candidate {}
+    #[derive(Clone, Debug)]
+    pub(crate) enum Registration {}
+    pub(super) struct Custody;
+    impl Custody {
+        pub(super) fn revoke(&mut self, _paths: &[std::path::PathBuf]) {}
+        pub(super) fn register(
+            &mut self,
+            _owner: &std::sync::Arc<JournalOwner>,
+            _path: &Path,
+            _key: JournalDocumentKey,
+        ) -> Result<Registration, String> {
+            Err("journal ownership unavailable".into())
+        }
+    }
+    impl Registration {
+        pub(super) fn live(&self) -> bool {
+            match *self {}
+        }
+        pub(super) fn run<T: Send + 'static>(
+            &self,
+            _work: impl FnOnce(&mut Custody, u64) -> T + Send + 'static,
+        ) -> Result<T, String> {
+            match *self {}
+        }
+    }
+    pub(super) fn operate<T>(
+        path: &Path,
+        _key: JournalDocumentKey,
+        patience: super::JournalLockPatience,
+        _custody: Option<(&mut Custody, u64)>,
+        work: impl FnOnce() -> Result<T, String>,
+    ) -> Result<T, String> {
+        super::with_journal_lock(path, patience, work)
+    }
 
     pub(crate) fn establish(_root: &Path) -> Result<JournalOwner, String> {
         Err("journal owners need extended attributes or streams".to_string())
@@ -81,14 +120,6 @@ mod owner {
     }
 
     pub(super) fn adopt(_path: &Path, _image: ContentFingerprint, _owner: Option<JournalOwnerId>) {}
-
-    pub(super) fn released(_path: PathBuf, _key: JournalDocumentKey) -> Option<Candidate> {
-        None
-    }
-
-    pub(super) fn settle_releases(owner: JournalOwnerId, _released: Vec<Candidate>) {
-        match owner {}
-    }
 }
 
 /// An append that would leave an image of more records than this compacts it instead.
@@ -101,6 +132,8 @@ const COMPACT_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RecoveryNotice {
     Recovered,
+    /// The journal's whole records before a fault were recovered; the image is kept aside.
+    Partial,
     DiskConflict,
     /// The journal did not decode.
     Corrupt,
@@ -110,6 +143,9 @@ impl RecoveryNotice {
     pub(crate) fn message(&self) -> String {
         match self {
             Self::Recovered => "Recovered an unsaved draft — the file on disk is unchanged",
+            Self::Partial => {
+                "Recovered an unsaved draft up to a part that could not be read; the file on disk is unchanged (the journal is kept)"
+            }
             Self::DiskConflict => {
                 "An unsaved draft conflicts with newer disk content; showing the file on disk (the draft is kept)"
             }
@@ -141,6 +177,8 @@ pub(crate) struct JournalOpenDecision {
 
 #[derive(Clone, Debug)]
 pub(crate) struct InitializedJournal {
+    /// Shared one-shot transfer: cloned preparation results cannot adopt twice.
+    ownership: Arc<std::sync::Mutex<ProvisionalOwnership>>,
     pub(crate) key: JournalDocumentKey,
     pub(crate) path: PathBuf,
     pub(crate) durable_seq: Seq,
@@ -152,11 +190,73 @@ pub(crate) struct InitializedJournal {
     legacy: Option<LegacyJournal>,
 }
 
+#[derive(Debug)]
+enum ProvisionalOwnership {
+    Available(Option<owner::Registration>),
+    Adopted,
+}
+
+impl InitializedJournal {
+    /// Transfer provisional ownership once, in memory. Dropping an undelivered result
+    /// releases its registration through the same asynchronous path as document close.
+    fn take_registration(&self) -> Result<Option<owner::Registration>, String> {
+        let mut ownership = self
+            .ownership
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if matches!(&*ownership, ProvisionalOwnership::Available(Some(registration)) if !registration.live())
+        {
+            return Err("prepared journal registration was revoked".into());
+        }
+        match std::mem::replace(&mut *ownership, ProvisionalOwnership::Adopted) {
+            ProvisionalOwnership::Available(registration) => Ok(registration),
+            ProvisionalOwnership::Adopted => {
+                Err("prepared journal ownership already adopted".into())
+            }
+        }
+    }
+}
+
+/// The appender's content plan and the same per-open custody used at retirement.
+#[derive(Clone, Debug)]
+pub(crate) struct JournalAppendPlan {
+    raw: RawJournalAppendPlan,
+    registration: Option<owner::Registration>,
+}
+
+impl std::ops::Deref for JournalAppendPlan {
+    type Target = RawJournalAppendPlan;
+    fn deref(&self) -> &Self::Target {
+        &self.raw
+    }
+}
+
+pub(crate) trait AppendWork {
+    fn raw(&self) -> &RawJournalAppendPlan;
+    fn registration(&self) -> Option<&owner::Registration> {
+        None
+    }
+}
+impl AppendWork for RawJournalAppendPlan {
+    fn raw(&self) -> &RawJournalAppendPlan {
+        self
+    }
+}
+impl AppendWork for JournalAppendPlan {
+    fn raw(&self) -> &RawJournalAppendPlan {
+        &self.raw
+    }
+    fn registration(&self) -> Option<&owner::Registration> {
+        self.registration.as_ref()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct JournalRewriteGeneration(pub(crate) u64);
 
 #[derive(Clone, Debug)]
 pub(crate) struct JournalRewritePlan {
+    registration: Option<owner::Registration>,
     pub(crate) generation: JournalRewriteGeneration,
     pub(crate) key: JournalDocumentKey,
     pub(crate) base_durable: Seq,
@@ -221,6 +321,7 @@ struct InflightRewrite {
 
 #[derive(Clone, Debug)]
 struct JournalEntry {
+    registration: Option<owner::Registration>,
     key: JournalDocumentKey,
     path: PathBuf,
     reducer: DraftJournalReducer,
@@ -269,6 +370,7 @@ pub(crate) enum JournalEffect {
 /// Re-establish this process's journal after an update's successor wrote over it.
 #[derive(Clone, Debug)]
 pub(crate) struct JournalReseatPlan {
+    registration: Option<owner::Registration>,
     pub(crate) generation: JournalRewriteGeneration,
     pub(crate) document: DocumentId,
     pub(crate) key: JournalDocumentKey,
@@ -395,6 +497,7 @@ impl DocumentJournalStore {
         self.entries.insert(
             current.id,
             JournalEntry {
+                registration: initialized.take_registration()?,
                 key: initialized.key,
                 path: initialized.path.clone(),
                 reducer: DraftJournalReducer::new_with_key(
@@ -467,7 +570,9 @@ impl DocumentJournalStore {
             .iter()
             .filter(|(_, entry)| {
                 !entry_busy(entry)
-                    && (entry.reseat_owed || entry.desired.seq > entry.reducer.durable_seq())
+                    && (entry.reseat_owed
+                        || entry.pending_checkpoint.is_some()
+                        || entry.desired.seq > entry.reducer.durable_seq())
             })
             .map(|(document, _)| *document)
             .collect()
@@ -602,6 +707,7 @@ impl DocumentJournalStore {
                 .checked_add(1)
                 .ok_or_else(|| "journal re-seat generation exhausted".to_string())?;
             let plan = JournalReseatPlan {
+                registration: entry.registration.clone(),
                 generation,
                 document,
                 key: entry.key,
@@ -640,6 +746,7 @@ impl DocumentJournalStore {
             .map_err(|error| format!("could not encode journal checkpoint: {error:?}"))?;
             plan.retire_legacy = entry.legacy.clone();
             plan.owner = self.host.owner_id();
+            plan.registration = entry.registration.clone();
             entry.rewrite_inflight = Some(InflightRewrite {
                 plan: plan.clone(),
                 checkpoint: saved,
@@ -673,7 +780,10 @@ impl DocumentJournalStore {
         Ok(Some(JournalEffect::Append {
             path: entry.path.clone(),
             key: entry.key,
-            plan,
+            plan: JournalAppendPlan {
+                raw: plan,
+                registration: entry.registration.clone(),
+            },
         }))
     }
 
@@ -820,14 +930,26 @@ impl DocumentJournalStore {
                     seq: plan.target_seq,
                 }
             }
-            JournalRewriteResult::Committed(_) => JournalCompletion::Failed {
-                document,
-                message: "journal checkpoint proof did not match the pending image".to_string(),
-            },
-            JournalRewriteResult::Failed(message) => JournalCompletion::Failed {
-                document,
-                message: format!("journal checkpoint failed: {message}"),
-            },
+            result => {
+                // A failed or unproved checkpoint still owns its retirement work. Keep
+                // the newest intent, including one queued while this write was inflight.
+                if entry
+                    .pending_checkpoint
+                    .as_ref()
+                    .is_none_or(|pending| checkpoint.seq > pending.seq)
+                {
+                    entry.pending_checkpoint = Some(checkpoint);
+                }
+                let message = match result {
+                    JournalRewriteResult::Committed(_) => {
+                        "journal checkpoint proof did not match the pending image".to_string()
+                    }
+                    JournalRewriteResult::Failed(message) => {
+                        format!("journal checkpoint failed: {message}")
+                    }
+                };
+                JournalCompletion::Failed { document, message }
+            }
         }
     }
 
@@ -925,25 +1047,25 @@ impl DocumentJournalStore {
         })
     }
 
-    /// Drop the entries of released documents, whose journals are [`Self::settled`].
-    pub(crate) fn forget(&mut self, documents: &[DocumentId]) {
-        let entries = documents
-            .iter()
-            .filter_map(|document| {
-                debug_assert!(self.settled(*document));
-                self.declined.remove(document);
-                self.entries.remove(document)
-            })
-            .collect::<Vec<_>>();
-        let Some(owner) = self.host.owner_id() else {
-            return;
-        };
-        let released = entries
-            .into_iter()
-            .filter_map(|entry| owner::released(entry.path, entry.key))
-            .collect::<Vec<_>>();
-        if !released.is_empty() {
-            owner::settle_releases(owner, released);
+    /// Retire only entries whose durable work has settled. A canceled caller cannot
+    /// discard a reducer, dirty head or inflight write merely by losing its last view.
+    pub(crate) fn forget(&mut self, documents: &[DocumentId]) -> bool {
+        if documents.iter().any(|document| !self.settled(*document)) {
+            return false;
+        }
+        for document in documents {
+            self.declined.remove(document);
+            self.entries.remove(document);
+        }
+        true
+    }
+
+    /// Wait for previously enqueued custody work in tests; execution still happens on
+    /// the production worker, never inline on the test's calling thread.
+    #[cfg(test)]
+    pub(crate) fn await_worker_for_test(&self) {
+        if let Some(owner) = &self.host.owner {
+            owner.run(|_| ()).expect("journal custody worker barrier");
         }
     }
 
@@ -992,7 +1114,7 @@ pub(crate) fn hold_journal_lock_for_test(
 
 #[cfg(all(test, unix))]
 thread_local! {
-    static FORKED_LOCK_COPIES: std::cell::RefCell<Option<Vec<File>>> =
+    static FORKED_LOCK_COPIES: std::cell::RefCell<Option<Arc<std::sync::Mutex<Vec<File>>>>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -1003,13 +1125,20 @@ pub(crate) struct ForkedJournalLockCopies(());
 #[cfg(all(test, unix))]
 impl ForkedJournalLockCopies {
     pub(crate) fn start() -> Self {
-        FORKED_LOCK_COPIES.with(|copies| *copies.borrow_mut() = Some(Vec::new()));
+        FORKED_LOCK_COPIES.with(|copies| {
+            *copies.borrow_mut() = Some(Arc::new(std::sync::Mutex::new(Vec::new())))
+        });
         Self(())
     }
 
     /// How many held locks have been copied so far.
     pub(crate) fn copied(&self) -> usize {
-        FORKED_LOCK_COPIES.with(|copies| copies.borrow().as_ref().map_or(0, Vec::len))
+        FORKED_LOCK_COPIES.with(|copies| {
+            copies
+                .borrow()
+                .as_ref()
+                .map_or(0, |copies| copies.lock().unwrap().len())
+        })
     }
 }
 
@@ -1045,7 +1174,10 @@ fn lock_opened_for_test() {
 fn copy_held_lock_for_test(lock: &File) {
     FORKED_LOCK_COPIES.with(|copies| {
         if let Some(copies) = copies.borrow_mut().as_mut() {
-            copies.push(lock.try_clone().expect("copy the held journal lock"));
+            copies
+                .lock()
+                .unwrap()
+                .push(lock.try_clone().expect("copy the held journal lock"));
         }
     });
 }
@@ -1109,8 +1241,14 @@ fn read_for_open(recovered: &StoredJournalRecovery, disk_bytes: &[u8]) -> OpenRe
     }
 }
 
+/// What a legacy draft that wins the open says of the keyed image it sets aside: a keyed draft
+/// other than the legacy one is [`RecoveryNotice::DiskConflict`]; a keyed image that did not
+/// decode, or one with a fault after its whole records ([`report_fault`]'s case) whose prefix
+/// holds no other draft, is [`RecoveryNotice::Corrupt`], so a damaged keyed image is never set
+/// aside unsaid.
 fn keyed_set_aside_by_legacy(
     keyed: &Result<StoredJournalRecovery, crate::native_document_io::JournalError>,
+    keyed_fault: Option<&StepFault>,
     legacy: &StoredJournalRecovery,
 ) -> Option<RecoveryNotice> {
     match keyed {
@@ -1118,6 +1256,7 @@ fn keyed_set_aside_by_legacy(
         Ok(keyed) if !holds_no_draft(keyed) && keyed.text != legacy.text => {
             Some(RecoveryNotice::DiskConflict)
         }
+        Ok(_) if keyed_fault.is_some() => Some(RecoveryNotice::Corrupt),
         Ok(_) => None,
     }
 }
@@ -1135,6 +1274,22 @@ impl OpenReading {
             decision.notice = Some(RecoveryNotice::DiskConflict);
         }
     }
+}
+
+/// An open read the whole records before `fault` (a cut astream reads as a fault, such as one
+/// past a frame nested in a record's text, or damage): it says so. A recovered draft is
+/// [`RecoveryNotice::Partial`]; one kept aside for disk content still says that; anything else
+/// recovered nothing and is [`RecoveryNotice::Corrupt`]. The caller keeps the image aside.
+fn report_fault(decision: &mut JournalOpenDecision, fault: &StepFault) {
+    aterm_log::warn!(
+        "recovery journal has a fault after its whole records ({fault:?}); they were read and \
+         the journal is kept aside"
+    );
+    decision.notice = Some(match decision.notice {
+        Some(RecoveryNotice::Recovered) => RecoveryNotice::Partial,
+        Some(RecoveryNotice::DiskConflict) => RecoveryNotice::DiskConflict,
+        _ => RecoveryNotice::Corrupt,
+    });
 }
 
 fn journal_baseline_text(key: JournalDocumentKey, bytes: &[u8]) -> Option<String> {
@@ -1163,10 +1318,34 @@ pub(crate) fn execute_journal_reseat(
     plan: &JournalReseatPlan,
     patience: JournalLockPatience,
 ) -> JournalReseatResult {
+    if let Some(registration) = &plan.registration {
+        let mut plan = plan.clone();
+        plan.registration = None;
+        let path = path.to_path_buf();
+        return registration
+            .run(move |custody, id| {
+                reseat_owned(
+                    &path,
+                    &plan,
+                    JournalLockPatience::Worker,
+                    Some((custody, id)),
+                )
+            })
+            .unwrap_or_else(JournalReseatResult::Failed);
+    }
+    reseat_owned(path, plan, patience, None)
+}
+
+fn reseat_owned(
+    path: &Path,
+    plan: &JournalReseatPlan,
+    patience: JournalLockPatience,
+    custody: Option<(&mut owner::Custody, u64)>,
+) -> JournalReseatResult {
     if let Err(message) = retire_owed_legacy(plan.retire_legacy.as_ref(), patience) {
         return JournalReseatResult::Failed(message);
     }
-    let result = with_journal_lock(path, patience, || {
+    let result = owner::operate(path, plan.key, patience, custody, || {
         let existing = read_journal_image(path).map_err(|error| format!("preflight: {error}"))?;
         let found = existing
             .as_deref()
@@ -1181,10 +1360,11 @@ pub(crate) fn execute_journal_reseat(
         let recovered = existing.as_deref().and_then(|bytes| {
             recover_journal_image_for(plan.key, bytes)
                 .ok()
-                .map(|(read, tail)| {
+                .map(|(read, tail, fault)| {
                     (
                         read,
-                        tail.is_none_or(|tail| tail.byte_len() == bytes.len() as u64),
+                        fault.is_none()
+                            && tail.is_none_or(|tail| tail.byte_len() == bytes.len() as u64),
                     )
                 })
         });
@@ -1346,6 +1526,20 @@ impl DraftJournalHost {
         canonical_uri: &str,
         disk_bytes: &[u8],
     ) -> Result<JournalOpenDecision, String> {
+        if let Some(owner) = &self.owner {
+            let host = self.clone();
+            let uri = canonical_uri.to_string();
+            let bytes = disk_bytes.to_vec();
+            return owner.run(move |_| host.inspect_owned(&uri, &bytes))?;
+        }
+        self.inspect_owned(canonical_uri, disk_bytes)
+    }
+
+    fn inspect_owned(
+        &self,
+        canonical_uri: &str,
+        disk_bytes: &[u8],
+    ) -> Result<JournalOpenDecision, String> {
         let key = self.key_for(canonical_uri);
         let path = self.path_for(key);
         let mut decision = JournalOpenDecision {
@@ -1362,11 +1556,13 @@ impl DraftJournalHost {
         let keyed = read_journal_image(&path)
             .map_err(|error| format!("could not read recovery journal: {error}"))?;
         decision.keyed_format_1 = keyed.as_deref().is_some_and(journal_is_format_1);
+        let mut keyed_fault = None;
         let keyed_recovery = keyed.as_deref().map(|bytes| {
             decision.expected_image = JournalImageGeneration::of(bytes);
-            recover_journal_image_for(key, bytes).map(|(recovered, tail)| {
-                decision.preserve_existing |=
-                    tail.is_some_and(|tail| tail.byte_len() < bytes.len() as u64);
+            recover_journal_image_for(key, bytes).map(|(recovered, tail, fault)| {
+                decision.preserve_existing |= fault.is_some()
+                    || tail.is_some_and(|tail| tail.byte_len() < bytes.len() as u64);
+                keyed_fault = fault;
                 recovered
             })
         });
@@ -1381,8 +1577,9 @@ impl DraftJournalHost {
         if let Some(legacy_bytes) = legacy {
             let image = JournalImageGeneration::of(&legacy_bytes);
             match recover_journal_image_for(legacy_key, &legacy_bytes) {
-                Ok((recovered, tail)) => {
-                    let torn = tail.is_some_and(|tail| tail.byte_len() < legacy_bytes.len() as u64);
+                Ok((recovered, tail, fault)) => {
+                    let torn = fault.is_some()
+                        || tail.is_some_and(|tail| tail.byte_len() < legacy_bytes.len() as u64);
                     let reading = read_for_open(&recovered, disk_bytes);
                     if reading.made_against_disk || reading.keep_aside {
                         decision.legacy = Some(LegacyJournal {
@@ -1391,10 +1588,19 @@ impl DraftJournalHost {
                             carried: reading.made_against_disk,
                             keep_aside: reading.keep_aside || torn,
                         });
-                        let set_aside = keyed_recovery
-                            .as_ref()
-                            .and_then(|keyed| keyed_set_aside_by_legacy(keyed, &recovered));
+                        let set_aside = keyed_recovery.as_ref().and_then(|keyed| {
+                            keyed_set_aside_by_legacy(keyed, keyed_fault.as_ref(), &recovered)
+                        });
+                        if let Some(fault) = &keyed_fault {
+                            aterm_log::warn!(
+                                "recovery journal has a fault after its whole records \
+                                 ({fault:?}); a legacy draft wins the open and it is kept aside"
+                            );
+                        }
                         reading.apply(&mut decision, recovered);
+                        if let Some(fault) = fault {
+                            report_fault(&mut decision, &fault);
+                        }
                         if let Some(notice) = set_aside {
                             aterm_log::warn!(
                                 "a legacy recovery journal was written after this document's \
@@ -1436,6 +1642,9 @@ impl DraftJournalHost {
                 let reading = read_for_open(&recovered, disk_bytes);
                 decision.preserve_existing |= reading.keep_aside;
                 reading.apply(&mut decision, recovered);
+                if let Some(fault) = keyed_fault {
+                    report_fault(&mut decision, &fault);
+                }
             }
             Err(error) => {
                 aterm_log::warn!("recovery journal did not decode; kept aside: {error:?}");
@@ -1452,6 +1661,24 @@ impl DraftJournalHost {
         decision: JournalOpenDecision,
         disk: &DocumentSnapshot,
         current: &DocumentSnapshot,
+    ) -> Result<InitializedJournal, String> {
+        if let Some(owner) = &self.owner {
+            let host = self.clone();
+            let disk = disk.clone();
+            let current = current.clone();
+            return owner.run(move |custody| {
+                host.initialize_owned(decision, &disk, &current, Some(custody))
+            })?;
+        }
+        self.initialize_owned(decision, disk, current, None)
+    }
+
+    fn initialize_owned(
+        &self,
+        decision: JournalOpenDecision,
+        disk: &DocumentSnapshot,
+        current: &DocumentSnapshot,
+        custody: Option<&mut owner::Custody>,
     ) -> Result<InitializedJournal, String> {
         if disk.id != current.id {
             return Err("journal initialization mixed document identities".to_string());
@@ -1470,22 +1697,32 @@ impl DraftJournalHost {
             encode_journal_image(&records)
         };
         let (bytes, tail) = encoded.map_err(|error| format!("{error:?}"))?;
-        with_journal_lock(&decision.path, JournalLockPatience::EventLoop, || {
-            let current = observe_journal_image(&decision.path)?;
-            let swept = decision.expected_clean && !current.exists;
-            if current != decision.expected_image && !swept {
-                return Err(format!(
-                    "journal changed after recovery inspection (expected {:?}, found {:?}); reopen \
+        let registration = with_journal_lock(
+            &decision.path,
+            JournalLockPatience::EventLoop,
+            || {
+                let current = observe_journal_image(&decision.path)?;
+                let swept = decision.expected_clean && !current.exists;
+                if current != decision.expected_image && !swept {
+                    return Err(format!(
+                        "journal changed after recovery inspection (expected {:?}, found {:?}); reopen \
                      the document before initializing recovery",
-                    decision.expected_image, current
-                ));
-            }
-            if decision.preserve_existing && current.exists {
-                self.preserve_locked(&decision.path, current)?;
-            }
-            atomic_replace_locked(&decision.path, &bytes, current, self.owner_id())
-                .map_err(|error| error.to_string())
-        })?;
+                        decision.expected_image, current
+                    ));
+                }
+                if decision.preserve_existing && current.exists {
+                    self.preserve_locked(&decision.path, current)?;
+                }
+                atomic_replace_locked(&decision.path, &bytes, current, self.owner_id())
+                    .map_err(|error| error.to_string())?;
+                match (custody, &self.owner) {
+                    (Some(custody), Some(owner)) => custody
+                        .register(owner, &decision.path, decision.key)
+                        .map(Some),
+                    _ => Ok(None),
+                }
+            },
+        )?;
         let legacy = decision.legacy.filter(|legacy| {
             if legacy.carried {
                 return true;
@@ -1502,6 +1739,9 @@ impl DraftJournalHost {
             }
         });
         Ok(InitializedJournal {
+            ownership: Arc::new(std::sync::Mutex::new(ProvisionalOwnership::Available(
+                registration,
+            ))),
             key: decision.key,
             path: decision.path,
             durable_seq: current.seq,
@@ -1524,12 +1764,31 @@ impl DraftJournalHost {
     /// Remove every file of `canonical_uri`'s journals from the root: the keyed and the legacy
     /// journal, each one's preserved copies (`<stem>.preserved-<n>.atdj`), lock (`.<name>.lock`)
     /// and write temporaries (`.<name>.<pid>-<nonce>.tmp`), then sync the root. A file already
-    /// gone is no error.
+    /// gone is no error. Registered cleanup is an acknowledged worker operation,
+    /// ordered with releases and writes; it is not the UI retirement/drop path.
     fn purge(&self, canonical_uri: &str) -> Result<(), String> {
-        let journals = [
+        if let Some(owner) = &self.owner {
+            let host = self.clone();
+            let uri = canonical_uri.to_owned();
+            return owner.run(move |custody| {
+                let paths = host.journal_paths(&uri);
+                custody.revoke(&paths);
+                host.purge_paths(paths)
+            })?;
+        }
+        self.purge_paths(self.journal_paths(canonical_uri))
+    }
+
+    fn journal_paths(&self, canonical_uri: &str) -> [PathBuf; 2] {
+        [
             self.path_for(self.key_for(canonical_uri)),
             self.legacy_path_for(JournalDocumentKey::legacy_unkeyed(canonical_uri)),
-        ];
+        ]
+    }
+
+    fn purge_paths(&self, journals: [PathBuf; 2]) -> Result<(), String> {
+        #[cfg(all(test, any(unix, windows)))]
+        owner::check_fs_thread();
         let mut doomed = Vec::new();
         for journal in &journals {
             let (Some(name), Some(stem)) = (
@@ -1842,12 +2101,41 @@ fn open_journal_secret(path: &Path) -> std::io::Result<File> {
     File::open(path)
 }
 
-/// `patience` is the caller's declaration of its thread, the only place that is known.
+/// Registered appends execute on their lease's custody worker. For an unregistered
+/// content plan, `patience` declares the thread executing the disk primitive.
 pub(crate) fn execute_journal_append(
     path: &Path,
     key: JournalDocumentKey,
-    plan: &JournalAppendPlan,
+    plan: &impl AppendWork,
     patience: JournalLockPatience,
+) -> JournalAppendResult {
+    if let Some(registration) = plan.registration() {
+        let plan = plan.raw().clone();
+        let path = path.to_path_buf();
+        return registration
+            .run(move |custody, id| {
+                append_owned(
+                    &path,
+                    key,
+                    &plan,
+                    JournalLockPatience::Worker,
+                    Some((custody, id)),
+                )
+            })
+            .unwrap_or_else(|message| JournalAppendResult::Failed {
+                stage: JournalStage::Append,
+                message,
+            });
+    }
+    append_owned(path, key, plan.raw(), patience, None)
+}
+
+fn append_owned(
+    path: &Path,
+    key: JournalDocumentKey,
+    plan: &RawJournalAppendPlan,
+    patience: JournalLockPatience,
+    custody: Option<(&mut owner::Custody, u64)>,
 ) -> JournalAppendResult {
     if let Err(message) = retire_owed_legacy(plan.retire_legacy.as_ref(), patience) {
         return JournalAppendResult::Failed {
@@ -1855,7 +2143,7 @@ pub(crate) fn execute_journal_append(
             message,
         };
     }
-    let result = with_journal_lock(path, patience, || {
+    let result = owner::operate(path, key, patience, custody, || {
         let tail = plan
             .expected_tail
             .ok_or_else(|| "preflight: journal plan has no bound disk image".to_string())?;
@@ -1882,7 +2170,10 @@ pub(crate) fn execute_journal_append(
         }
         // In place after the last whole record, then durable before acknowledging the new
         // checkpoint. An ordering barrier alone would allow power loss to discard a record
-        // after its durable sequence had advanced. Interrupted appends retain a readable prefix.
+        // after its durable sequence had advanced. An interrupted append leaves the whole
+        // records before it readable: astream reads most cuts as a torn tail, dropped, and a
+        // cut past a frame nested in the record's text as a fault, which an open reads past
+        // to those records while it keeps the image aside (`DraftJournalHost::inspect_open`).
         let landed = write_at(&file, &frames, tail.byte_len())
             .and_then(|()| crate::durable::finish(&file, Flush::Durable));
         if let Err(error) = landed {
@@ -1956,7 +2247,7 @@ fn write_at(mut file: &File, bytes: &[u8], at: u64) -> std::io::Result<()> {
 fn compact_appending(
     path: &Path,
     key: JournalDocumentKey,
-    plan: &JournalAppendPlan,
+    plan: &RawJournalAppendPlan,
     tail: JournalTail,
 ) -> Result<JournalAppendProof, String> {
     let existing = read_existing_journal(path, "preflight")?;
@@ -1989,10 +2280,34 @@ pub(crate) fn execute_journal_rewrite(
     plan: &JournalRewritePlan,
     patience: JournalLockPatience,
 ) -> JournalRewriteResult {
+    if let Some(registration) = &plan.registration {
+        let mut plan = plan.clone();
+        plan.registration = None;
+        let path = path.to_path_buf();
+        return registration
+            .run(move |custody, id| {
+                rewrite_owned(
+                    &path,
+                    &plan,
+                    JournalLockPatience::Worker,
+                    Some((custody, id)),
+                )
+            })
+            .unwrap_or_else(JournalRewriteResult::Failed);
+    }
+    rewrite_owned(path, plan, patience, None)
+}
+
+fn rewrite_owned(
+    path: &Path,
+    plan: &JournalRewritePlan,
+    patience: JournalLockPatience,
+    custody: Option<(&mut owner::Custody, u64)>,
+) -> JournalRewriteResult {
     if let Err(message) = retire_owed_legacy(plan.retire_legacy.as_ref(), patience) {
         return JournalRewriteResult::Failed(message);
     }
-    let result = with_journal_lock(path, patience, || {
+    let result = owner::operate(path, plan.key, patience, custody, || {
         let existing = read_existing_journal(path, "preflight")?;
         let actual = JournalImageGeneration::of(&existing);
         if actual.fingerprint == plan.fingerprint {
@@ -2043,6 +2358,7 @@ pub(crate) fn checkpoint_plan(
     let (bytes, tail) = encode_journal_image(&records)?;
     let fingerprint = tail.fingerprint();
     Ok(JournalRewritePlan {
+        registration: None,
         generation,
         key,
         base_durable,
@@ -2128,6 +2444,8 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
 }
 
 fn journal_lock_path(path: &Path) -> Result<PathBuf, String> {
+    #[cfg(all(test, any(unix, windows)))]
+    owner::check_fs_thread();
     let parent = path
         .parent()
         .ok_or_else(|| "journal has no parent directory".to_string())?;
@@ -2243,6 +2561,8 @@ fn with_journal_lock<T>(
     patience: JournalLockPatience,
     operation: impl FnOnce() -> Result<T, String>,
 ) -> Result<T, String> {
+    #[cfg(all(test, any(unix, windows)))]
+    owner::check_fs_thread();
     let parent = path
         .parent()
         .ok_or_else(|| "journal has no parent directory".to_string())?;

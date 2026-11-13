@@ -13,7 +13,7 @@ use super::*;
 fn only_claudes_twin_carries_the_block() {
     let atpkg = Path::new("/Applications/aterm.app/Contents/MacOS/atpkg");
     assert!(of("claude"));
-    for other in ["codex", "agy", "muse", "gemini", "codex-old", "claudex"] {
+    for other in ["codex", "agy", "muse", "codex-old", "claudex"] {
         assert!(!of(other), "{other}");
         assert_eq!(sh_prelude(other, Some(atpkg)), "", "{other}");
     }

@@ -25,6 +25,10 @@ fn ledger() -> aterm_update::UpdateStatus {
         failing_persistent: false,
         failing_checks_kind: String::new(),
         channel_unreadable: false,
+        hold: None,
+        last: None,
+        offered: None,
+        behind: false,
         linux: None,
     }
 }

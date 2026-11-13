@@ -7,7 +7,10 @@ use crate::*;
 
 const MAGIC: &[u8; 8] = b"TRPCV003";
 pub(crate) fn invalid() -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, "invalid private resource controller frame")
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        "invalid private resource controller frame",
+    )
 }
 pub(crate) struct Encoder(pub(crate) Vec<u8>, usize);
 impl Encoder {
@@ -54,7 +57,11 @@ impl Encoder {
         self.number(d.target.into());
     }
     pub(crate) fn finish(self) -> io::Result<Vec<u8>> {
-        if self.0.len() > self.1 { Err(invalid()) } else { Ok(self.0) }
+        if self.0.len() > self.1 {
+            Err(invalid())
+        } else {
+            Ok(self.0)
+        }
     }
 }
 pub(crate) struct Decoder<'a>(&'a [u8]);
@@ -65,7 +72,9 @@ impl<'a> Decoder<'a> {
         Ok(value)
     }
     pub(crate) fn number(&mut self) -> io::Result<u64> {
-        Ok(u64::from_be_bytes(self.take(8)?.try_into().map_err(|_| invalid())?))
+        Ok(u64::from_be_bytes(
+            self.take(8)?.try_into().map_err(|_| invalid())?,
+        ))
     }
     pub(crate) fn narrow(&mut self) -> io::Result<u32> {
         self.number()?.try_into().map_err(|_| invalid())
@@ -99,10 +108,17 @@ impl<'a> Decoder<'a> {
         self.take(N)?.try_into().map_err(|_| invalid())
     }
     fn descriptor(&mut self) -> io::Result<Descriptor> {
-        Ok(Descriptor { source: self.narrow()?, target: self.narrow()? })
+        Ok(Descriptor {
+            source: self.narrow()?,
+            target: self.narrow()?,
+        })
     }
     pub(crate) fn done(self) -> io::Result<()> {
-        if self.0.is_empty() { Ok(()) } else { Err(invalid()) }
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(invalid())
+        }
     }
 }
 pub(crate) fn header(bytes: &[u8], kind: u64) -> io::Result<Decoder<'_>> {
@@ -146,7 +162,11 @@ impl Request {
             Role::ResolverQuery => crate::resolver::RESOLVER_REQUEST_ROLE,
             Role::WorkloadQuery => crate::workload::host::QUERY_ROLE,
             Role::WorkloadProduced => crate::workload::host::produced::ROLE,
+            Role::CoordinatorCompiler(_) => crate::workload::host::coordinator::COMPILER_ROLE,
         });
+        if let Role::CoordinatorCompiler(coordinator) = self.role {
+            e.0.extend(coordinator);
+        }
         if let Role::MachOLinker(loan) = self.role {
             e.0.extend(loan.parent_attempt);
             e.0.extend(loan.nonce);
@@ -179,7 +199,13 @@ impl Request {
                 e.descriptor(*read);
                 e.descriptor(*write);
             }
-            GnuTransport::NamedFifo { locator, device, inode, read, write } => {
+            GnuTransport::NamedFifo {
+                locator,
+                device,
+                inode,
+                read,
+                write,
+            } => {
                 e.number(2);
                 e.bytes(locator)?;
                 e.number(*device);
@@ -203,8 +229,11 @@ impl Request {
     }
     fn decode_profile(bytes: &[u8], paired_query: bool) -> io::Result<Self> {
         let mut d = header(bytes, 1)?;
-        let binding =
-            JobBinding { session: d.text()?, root_attempt: d.array()?, capability: d.array()? };
+        let binding = JobBinding {
+            session: d.text()?,
+            root_attempt: d.array()?,
+            capability: d.array()?,
+        };
         let member_attempt = d.array()?;
         let role = match d.number()? {
             0 => Role::MetadataVersion,
@@ -219,6 +248,9 @@ impl Request {
             crate::resolver::RESOLVER_REQUEST_ROLE => Role::ResolverQuery,
             crate::workload::host::QUERY_ROLE => Role::WorkloadQuery,
             crate::workload::host::produced::ROLE => Role::WorkloadProduced,
+            crate::workload::host::coordinator::COMPILER_ROLE => {
+                Role::CoordinatorCompiler(d.array()?)
+            }
             _ => return Err(invalid()),
         };
         let timeout = d.number()?;
@@ -244,7 +276,10 @@ impl Request {
         };
         let gnu = match d.number()? {
             0 => GnuTransport::None,
-            1 => GnuTransport::NumericPipe { read: d.descriptor()?, write: d.descriptor()? },
+            1 => GnuTransport::NumericPipe {
+                read: d.descriptor()?,
+                write: d.descriptor()?,
+            },
             2 => GnuTransport::NamedFifo {
                 locator: d.bytes()?,
                 device: d.number()?,
@@ -263,7 +298,13 @@ impl Request {
             binding,
             member_attempt,
             role,
-            command: CommandSpec { program, arg0, args, environment, cwd },
+            command: CommandSpec {
+                program,
+                arg0,
+                args,
+                environment,
+                cwd,
+            },
             delegations: Delegations { cpu, gnu, fences },
             timeout_ns: (timeout != 0).then_some(timeout),
         };
@@ -299,7 +340,11 @@ fn started_decode(d: &mut Decoder<'_>) -> io::Result<Started> {
         _ => return Err(invalid()),
     };
     let s = Started {
-        identity: Identity { pid, birth, birth_kind },
+        identity: Identity {
+            pid,
+            birth,
+            birth_kind,
+        },
         monotonic_ns: d.number()?,
         unix_ns: d.number()?,
     };
@@ -324,7 +369,11 @@ impl StatusFrame {
                 e.number(1);
                 started_encode(&mut e, *s)?;
             }
-            Status::Finished { outcome, cause, runtime_ns } => {
+            Status::Finished {
+                outcome,
+                cause,
+                runtime_ns,
+            } => {
                 e.number(2);
                 match outcome {
                     Outcome::Exit(code) => {
@@ -396,7 +445,11 @@ impl StatusFrame {
                     4 => CompletionCause::HostFault,
                     _ => return Err(invalid()),
                 };
-                Status::Finished { outcome, cause, runtime_ns: d.number()? }
+                Status::Finished {
+                    outcome,
+                    cause,
+                    runtime_ns: d.number()?,
+                }
             }
             3 => Status::Refused { reason: d.text()? },
             4 => {
@@ -411,7 +464,11 @@ impl StatusFrame {
             _ => return Err(invalid()),
         };
         d.done()?;
-        let frame = Self { root_attempt, member_attempt, status };
+        let frame = Self {
+            root_attempt,
+            member_attempt,
+            status,
+        };
         frame.encode()?;
         Ok(frame)
     }
@@ -438,7 +495,10 @@ impl Cancel {
     }
     pub fn decode(bytes: &[u8], expected: Self) -> io::Result<Self> {
         let mut d = header(bytes, 3)?;
-        let value = Self { root_attempt: d.array()?, member_attempt: d.array()? };
+        let value = Self {
+            root_attempt: d.array()?,
+            member_attempt: d.array()?,
+        };
         d.done()?;
         if value != expected {
             return Err(invalid());
@@ -510,7 +570,11 @@ impl ProducerChallenge {
         let value = Self {
             root_attempt,
             member_attempt,
-            helper: Identity { pid, birth, birth_kind },
+            helper: Identity {
+                pid,
+                birth,
+                birth_kind,
+            },
             nonce: d.array()?,
         };
         d.done()?;

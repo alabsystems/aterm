@@ -473,7 +473,9 @@ pub use models_harness_policy_writer::{
     harness_policy_one_writer_liveness, harness_policy_one_writer_model,
 };
 pub use models_harness_progress::*;
-pub use models_harness_quiet::{harness_upgrade_quiet_liveness, harness_upgrade_quiet_model};
+pub use models_harness_quiet::{
+    harness_upgrade_quiet_liveness, harness_upgrade_quiet_model, harness_upgrade_wall_liveness,
+};
 pub use models_harness_snapshot_read::harness_snapshot_read_model;
 pub use models_harness_state_collection::{
     harness_upgrade_state_collection_liveness, harness_upgrade_state_collection_model,
@@ -502,7 +504,7 @@ pub use models_sources::{
     owner_tell_model, source_episode_liveness, source_episode_model, workflow_step_model,
 };
 pub use models_supervise::{
-    supervisor_box_ask_model, supervisor_box_hold_model, supervisor_break_offer_model,
+    supervisor_box_ask_model, supervisor_box_settle_model, supervisor_break_offer_model,
     supervisor_claim_model, supervisor_condition_resume_model, supervisor_credits_hold_liveness,
     supervisor_credits_hold_model, supervisor_cruise_model, supervisor_decline_keys_model,
     supervisor_focus_choice_model, supervisor_host_turn_end_model, supervisor_land_liveness,

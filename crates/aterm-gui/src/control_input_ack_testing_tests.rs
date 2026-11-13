@@ -3,23 +3,12 @@
 
 use super::*;
 use std::io::Read;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 
 pub(crate) fn owned_handle(local: u64) -> (crate::session_store::SessionHandle, std::fs::File) {
-    let mut fds = [-1; 2];
-    // SAFETY: pipe writes two fresh descriptors on success.
-    let result = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    assert_eq!(result, 0, "private pipe");
-    // SAFETY: both descriptors were just created, and each is adopted once.
-    let reader = unsafe { std::fs::File::from_raw_fd(fds[0]) };
-    let writer = unsafe { OwnedFd::from_raw_fd(fds[1]) };
-    for fd in [reader.as_raw_fd(), writer.as_raw_fd()] {
-        // SAFETY: an owned descriptor remains alive across this call.
-        assert_eq!(
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
-            0
-        );
-    }
+    let (reader, writer) = aterm_uds::pipe().expect("private pipe");
+    let reader = std::fs::File::from(OwnedFd::from(reader));
+    let writer = OwnedFd::from(writer);
     let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(

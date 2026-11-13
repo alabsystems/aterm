@@ -52,8 +52,7 @@ pub mod seeds;
 #[cfg(unix)]
 pub(super) mod store;
 pub mod view;
-#[cfg(unix)]
-pub use crate::att::View;
+pub use crate::typed::View;
 #[cfg(unix)]
 pub use roll::Rolled;
 #[cfg(unix)]

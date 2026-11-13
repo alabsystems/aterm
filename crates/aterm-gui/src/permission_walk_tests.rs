@@ -7,12 +7,14 @@ const fn facts() -> StartFacts {
     StartFacts {
         cold: true,
         typing: false,
+        in_front: true,
     }
 }
 
-/// Automatic acquisition starts without opening System State or a recent-input requirement.
+/// Automatic acquisition starts without opening System State or a recent-input requirement,
+/// once the keyboard rests in an aterm window the person is looking at.
 #[test]
-fn the_walk_starts_automatically_after_the_keyboard_rests() {
+fn the_walk_starts_automatically_after_the_keyboard_rests_with_aterm_in_front() {
     assert!(starts(facts()));
     assert!(
         !starts(StartFacts {
@@ -26,7 +28,14 @@ fn the_walk_starts_automatically_after_the_keyboard_rests() {
             cold: false,
             ..facts()
         }),
-        "a process that may not start one by itself never"
+        "an update's successor, which the owner did not start, never (owner ruling 2026-11-09)"
+    );
+    assert!(
+        !starts(StartFacts {
+            in_front: false,
+            ..facts()
+        }),
+        "behind another app System Settings would come up over it: the walk waits"
     );
 }
 

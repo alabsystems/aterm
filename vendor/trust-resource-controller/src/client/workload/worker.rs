@@ -6,6 +6,7 @@
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::Arc;
 use std::time::Instant;
 
 use super::{identity, live_context, receive};
@@ -17,6 +18,7 @@ pub struct AuthenticatedWorkerCpu {
     reply: wire::Reply,
     original: OwnedFd,
     loan: WorkerLoan,
+    origin: Arc<super::MemberOriginalContext>,
 }
 impl AuthenticatedWorkerCpu {
     pub fn observation(&self) -> &wire::Reply {
@@ -25,12 +27,18 @@ impl AuthenticatedWorkerCpu {
     pub fn into_original(self) -> (wire::Reply, File, WorkerLoan) {
         (self.reply, File::from(self.original), self.loan)
     }
+    pub fn into_retained_original(
+        self,
+    ) -> (wire::Reply, File, WorkerLoan, Arc<super::MemberOriginalContext>) {
+        (self.reply, File::from(self.original), self.loan, self.origin)
+    }
 }
 /// Non-Clone and not deserializable. A saved Return frame has no access to this
 /// live owner. Drop has NO RPC/return/settlement action, on every error path.
 pub struct WorkerLoan {
     client: Client,
     returned: wire::Return,
+    origin: Arc<super::MemberOriginalContext>,
 }
 impl WorkerLoan {
     pub fn slot(&self) -> u32 {
@@ -58,6 +66,9 @@ impl WorkerLoan {
         self.settle(deadline)
     }
     fn settle(self, deadline: Instant) -> Result<(), CallError> {
+        self.origin
+            .validate(deadline)
+            .map_err(|error| CallError { delivery: Delivery::Unknown, error })?;
         let payload = self.returned.encode().map_err(super::super::before)?;
         let original = self.client.host.connect(deadline).map_err(super::super::before)?;
         let mut channel =
@@ -75,6 +86,10 @@ impl WorkerLoan {
                 Some(self.returned.request.original.member_attempt),
             )?;
             crate::client::sdk::validate_sdk_keeper(&reply.context.context)?;
+            if &reply.context.context != self.origin.observation() {
+                return Err(super::refused());
+            }
+            self.origin.validate(deadline)?;
             original.revalidate(deadline)?;
             channel.send(&[1], deadline)?;
             Ok(())
@@ -118,11 +133,22 @@ impl Client {
             };
             original.revalidate(deadline)?;
             channel.send(&[1], deadline)?;
-            Ok(granted.map(|(fd, loan, slot)| AuthenticatedWorkerCpu {
+            let Some((fd, loan, slot)) = granted else {
+                return Ok(None);
+            };
+            let origin = super::MemberOriginalContext::capture(
+                self.clone(),
+                request.original.clone(),
+                reply.context.context.clone(),
+                deadline,
+            )?;
+            Ok(Some(AuthenticatedWorkerCpu {
                 reply,
                 original: fd,
+                origin: origin.clone(),
                 loan: WorkerLoan {
                     client: self.clone(),
+                    origin,
                     returned: wire::Return {
                         request: request.clone(),
                         loan,

@@ -8,8 +8,7 @@ fn a_verb_with_no_help_of_its_own_answers_help_with_its_usage() {
     let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
     let refused = Fail::usage("instance: unexpected '--help'");
     let usage = help_instead("instance", &words(&["--help"]), &refused).expect("its usage");
-    assert!(usage.starts_with("  instance [--window]"), "{usage}");
-    assert!(usage.contains("[-- PROGRAM ARGS]") && usage.contains("--scene band-icons"));
+    assert!(usage.starts_with("  instance "), "{usage}");
     assert!(!usage.contains("abrew-admission"), "{usage}");
     assert!(help_instead("instance", &words(&["-h", "--keep"]), &refused).is_some());
     for (rest, fail) in [

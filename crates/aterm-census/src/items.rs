@@ -3,8 +3,9 @@
 // Author: Andrew Yates
 
 //! A Rust source file read as token trees: what a build without `cfg(test)` compiles of it, its
-//! code ([`Source::code`]) apart from its comments ([`Source::comments`]), and each place in it
-//! that can bring another file into a build ([`Source::mounts`], [`Source::includes`]).
+//! code ([`Source::code`]) apart from its comments ([`Source::comments`], and the one that holds a
+//! byte, [`Source::comment_at`]), and each place in it that can bring another file into a build
+//! ([`Source::mounts`], [`Source::includes`]).
 //!
 //! The census lexer ([`crate::lex::spans`]) finds the comments and literals; the rest of the file
 //! is split into identifiers, lifetimes, numbers, punctuation and the delimiters that nest them, so
@@ -81,6 +82,20 @@ pub struct Comment<'a> {
     pub gap: usize,
     /// A macro, or another front end, may read it (the module's carriers).
     pub carried: bool,
+    /// It is a doc comment (`///` but not `////`, `//!`, `/** */` but not `/***` or `/**/`, and
+    /// `/*! */`): a `#[doc]` attribute, which the member's own lint and doctests read. A plain
+    /// comment is no token at all.
+    pub doc: bool,
+}
+
+/// A file's code and comments outside its test-only items, in order ([`Source::code`],
+/// [`Source::comments`]), with each comment's byte range.
+#[derive(Default)]
+struct Split<'a> {
+    code: Vec<Shipped<'a>>,
+    comments: Vec<Comment<'a>>,
+    /// The byte range of each of `comments`, in its order.
+    spans: Vec<(usize, usize)>,
 }
 
 /// A `mod <name>;` declaration: a module from another file.
@@ -319,6 +334,21 @@ impl Source {
         self.split().1
     }
 
+    /// The comment of [`Source::comments`] whose text holds the byte at `at`, or `None` where that
+    /// byte is code, a literal, between tokens, or in a test-only item.
+    #[must_use]
+    pub fn comment_at(&self, at: usize) -> Option<Comment<'_>> {
+        let mut out = Split::default();
+        if !self.whole {
+            self.flatten(&self.trees, &mut out);
+        }
+        let index = out
+            .spans
+            .iter()
+            .position(|&(start, end)| (start..end).contains(&at))?;
+        Some(out.comments[index])
+    }
+
     /// Whether a macro, or another front end, may read the byte at `at` (the module's carriers).
     #[must_use]
     pub fn carried(&self, at: usize) -> bool {
@@ -327,14 +357,14 @@ impl Source {
     }
 
     fn split(&self) -> (Vec<Shipped<'_>>, Vec<Comment<'_>>) {
-        let mut out = (Vec::new(), Vec::new());
+        let mut out = Split::default();
         if !self.whole {
             self.flatten(&self.trees, &mut out);
         }
-        out
+        (out.code, out.comments)
     }
 
-    fn flatten<'a>(&'a self, trees: &'a [Tree], out: &mut (Vec<Shipped<'a>>, Vec<Comment<'a>>)) {
+    fn flatten<'a>(&'a self, trees: &'a [Tree], out: &mut Split<'a>) {
         for tree in trees {
             match tree {
                 Tree::Leaf(tok) => self.push(tok, out),
@@ -351,7 +381,7 @@ impl Source {
         }
     }
 
-    fn push<'a>(&'a self, tok: &Tok, (code, comments): &mut (Vec<Shipped<'a>>, Vec<Comment<'a>>)) {
+    fn push<'a>(&'a self, tok: &Tok, out: &mut Split<'a>) {
         if self.test_only(tok.start) {
             return;
         }
@@ -362,13 +392,15 @@ impl Source {
             before: &self.text[self.line_starts[line - 1]..tok.start],
         };
         if matches!(tok.kind, Kind::Comment | Kind::OuterDoc | Kind::InnerDoc) {
-            comments.push(Comment {
+            out.comments.push(Comment {
                 at,
-                gap: code.len(),
+                gap: out.code.len(),
                 carried: self.carried(tok.start),
+                doc: tok.kind != Kind::Comment,
             });
+            out.spans.push((tok.start, tok.end));
         } else {
-            code.push(at);
+            out.code.push(at);
         }
     }
 

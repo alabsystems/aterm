@@ -57,6 +57,9 @@ pub fn write_private_durable(dir: &Path, name: &str, bytes: &[u8]) -> io::Result
 /// Conservative framing allowance per append, in addition to body and subject.
 pub const APPEND_OVERHEAD: usize = 256;
 
+/// Maximum records covered by one application checkpoint and dependent write.
+pub const MAX_APPEND_RECORDS: usize = 256;
+
 /// Decoded-record cache budget for each local history log. The newest record stays
 /// resident even if larger; retained indexes and records held by readers are outside this budget.
 pub const DECODED_WINDOW_BYTES: usize = 16 * 1024 * 1024;
@@ -463,6 +466,38 @@ impl Log {
         self.append_inner(subject, body, Some((dir, write)))
     }
 
+    /// Append 1 through [`MAX_APPEND_RECORDS`] records under one checkpoint, commit,
+    /// and dependent write. Input and aggregate capacity are checked before publication.
+    /// The result and `write`'s offset identify the first record; subsequent offsets are
+    /// consecutive, in input order. The dependent write follows the entire durable group.
+    ///
+    /// Like [`Self::append_then`], the dependent write may remain Ordered on the log's
+    /// device. A crash can therefore leave this entire group beyond the caller's last
+    /// independent witness. Callers must authorize recovery of that exact group before
+    /// appending; a single-record recovery allowance is insufficient. This method does
+    /// not supply application custody or authenticate its records.
+    /// # Errors
+    /// Empty or oversized groups, invalid subjects, and capacity exhaustion refuse before
+    /// mutation. Uncertain publication, checkpoint, commit, or dependent writes fence the
+    /// handle; reopen and recover before retrying.
+    pub fn append_many_then(
+        &mut self,
+        mut records: Vec<(&str, Vec<u8>)>,
+        dir: &Path,
+        write: impl FnOnce(Offset, Flush) -> io::Result<()>,
+    ) -> io::Result<Offset> {
+        self.append_group_inner(&mut records, Some((dir, write)))
+    }
+
+    /// Check a group's input, aggregate capacity, and first offset without publishing
+    /// or reserving anything. A caller can refuse before writing an independent recovery
+    /// permit. [`Self::append_many_then`] checks the then-current state again.
+    /// # Errors
+    /// As the pre-publication checks of [`Self::append_many_then`].
+    pub fn check_append_many(&self, records: &[(&str, Vec<u8>)]) -> io::Result<Offset> {
+        self.check_group(records).map(Offset)
+    }
+
     #[cfg_attr(
         any(test, debug_assertions),
         aterm_spec_anchor::spec_unmodeled(
@@ -565,6 +600,10 @@ impl Log {
         body: Vec<u8>,
         then: Option<(&Path, impl FnOnce(Offset, Flush) -> io::Result<()>)>,
     ) -> io::Result<Offset> {
+        self.append_group_inner(&mut [(subject, body)], then)
+    }
+
+    fn check_group(&self, records: &[(&str, Vec<u8>)]) -> io::Result<u64> {
         if self.is_poisoned() {
             return Err(io::Error::other(
                 "uncertain journal: reopen and retry exact bytes",
@@ -575,44 +614,78 @@ impl Log {
                 "authenticate replay and finish opening before append",
             ));
         }
-        if subject.is_empty() || astream_broker::store::is_hidden_subject(subject) {
+        if records.is_empty() || records.len() > MAX_APPEND_RECORDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "invalid journal subject",
+                "invalid journal group size",
             ));
         }
         let stats = self.log.stats();
-        let framed = body
-            .len()
-            .saturating_add(subject.len())
-            .saturating_add(APPEND_OVERHEAD);
-        if body.len() > self.layout.limits.record_bytes
-            || framed > astream_broker::MAX_RECORD_PAYLOAD
-            || stats.retained_records >= self.layout.limits.records
-            || stats.retained_bytes.saturating_add(framed) > self.layout.limits.bytes
+        let mut bytes = stats.retained_bytes;
+        for (subject, body) in records.iter() {
+            if subject.is_empty() || astream_broker::store::is_hidden_subject(subject) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "invalid journal subject",
+                ));
+            }
+            let framed = body
+                .len()
+                .saturating_add(subject.len())
+                .saturating_add(APPEND_OVERHEAD);
+            if body.len() > self.layout.limits.record_bytes
+                || framed > astream_broker::MAX_RECORD_PAYLOAD
+            {
+                return Err(io::Error::other("journal capacity exhausted"));
+            }
+            bytes = bytes.saturating_add(framed);
+        }
+        if stats.retained_records.saturating_add(records.len()) > self.layout.limits.records
+            || bytes > self.layout.limits.bytes
         {
             return Err(io::Error::other("journal capacity exhausted"));
         }
-        let sequence = stats
-            .head
-            .0
-            .checked_add(1)
+        let head = stats.head.0;
+        head.checked_add(records.len() as u64)
             .ok_or_else(|| io::Error::other("journal sequence exhausted"))?;
-        let offset = match self.log.publish_checked(1, sequence, subject.into(), body) {
-            Ok((offset, _)) => offset,
-            Err(_) => {
-                self.poisoned = true;
-                return Err(io::Error::other(
-                    "uncertain journal append: reopen and retry exact bytes",
-                ));
+        Ok(head)
+    }
+
+    fn append_group_inner(
+        &mut self,
+        records: &mut [(&str, Vec<u8>)],
+        then: Option<(&Path, impl FnOnce(Offset, Flush) -> io::Result<()>)>,
+    ) -> io::Result<Offset> {
+        let head = self.check_group(records)?;
+        for (index, (subject, body)) in records.iter_mut().enumerate() {
+            match self.log.publish_checked(
+                1,
+                head + index as u64 + 1,
+                (*subject).into(),
+                std::mem::take(body),
+            ) {
+                Ok((offset, false)) if offset.0 == head + index as u64 => {}
+                Ok(_) => {
+                    self.poisoned = true;
+                    return Err(io::Error::other(
+                        "journal append did not advance its physical prefix; reopen",
+                    ));
+                }
+                Err(_) => {
+                    self.poisoned = true;
+                    return Err(io::Error::other(
+                        "uncertain journal append: reopen and retry exact bytes",
+                    ));
+                }
             }
-        };
-        if self.intact().is_err() {
-            self.poisoned = true;
-            return Err(io::Error::other("journal changed during append; reopen"));
+            if self.intact().is_err() {
+                self.poisoned = true;
+                return Err(io::Error::other("journal changed during append; reopen"));
+            }
+            #[cfg(test)]
+            tests::append_step(tests::Step::Published, self.log.flush_counts());
         }
-        #[cfg(test)]
-        tests::append_step(tests::Step::Published, self.log.flush_counts());
+        let offset = Offset(head);
         // Read after the publish, which latches the log to Strict when the device refuses
         // its barrier. A Strict record is durable already, so the commit's full flush
         // below finds nothing to cover and skips: there the checkpoint is flushed in full
@@ -1597,6 +1670,8 @@ fn recover_uncommitted(dir: &Path, layout: &Layout, fresh: bool) -> io::Result<(
 
 #[cfg(test)]
 mod append_tests;
+#[cfg(test)]
+mod group_tests;
 #[cfg(test)]
 mod open_tests;
 #[cfg(test)]

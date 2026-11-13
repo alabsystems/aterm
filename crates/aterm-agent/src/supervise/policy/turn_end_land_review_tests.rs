@@ -193,14 +193,14 @@ fn a_landed_tasks_own_wake_over_open_work_gets_the_nudge() {
         (
             "a need",
             land(idle(
-                "The monitor fired: the deploy needs a key.\nNEEDS YOU: the deploy key",
+                "The monitor fired: the deploy needs a nod.\nNEEDS YOU: the deploy nod",
                 worked,
             )),
         ),
         (
             "a need said earlier in the wake",
             land(TurnEndReading {
-                turn_said: Some("NEEDS YOU: the deploy key".to_string()),
+                turn_said: Some("NEEDS YOU: the deploy nod".to_string()),
                 ..idle(quiet, worked)
             }),
         ),
@@ -589,12 +589,12 @@ fn a_report_read_in_part_or_a_need_said_earlier_lands_nothing() {
     let (st, a) = after_instruction(cut);
     assert!(!st.landed(), "cut: {a:?}");
     let earlier = TurnEndReading {
-        turn_said: Some("Merged the lexer.\nNEEDS YOU: the signing credential".to_string()),
+        turn_said: Some("Merged the lexer.\nNEEDS YOU: the signing permission".to_string()),
         ..idle(DEFENSE, Some(3 * MIN))
     };
     let (st, a) = after_instruction(earlier);
     assert!(!st.landed(), "a need said earlier: {a:?}");
-    assert_eq!(st.standing_needs(), ["the signing credential"]);
+    assert_eq!(st.standing_needs(), ["the signing permission"]);
     assert!(
         matches!(&a, TurnEndAction::Type { text, rule_id }
             if *rule_id == RULE_LAND_CHECK && text.contains(NEEDS_ACK)),
@@ -665,7 +665,7 @@ fn every_land_status_row_is_open_under_land_and_not_under_cruise() {
             "to review" => "the docs are up to review".to_string(),
             "awaiting" => "the docs are awaiting a reviewer".to_string(),
             "pending" => "the docs are pending".to_string(),
-            "blocked" => "the docs are blocked on the key".to_string(),
+            "blocked" => "the docs are blocked on the nod".to_string(),
             "wip" => "the WIP docs sit on a branch".to_string(),
             "parked" | "unlanded" | "unpushed" | "unmerged" | "uncommitted" => {
                 format!("the docs are {row}")
@@ -706,7 +706,7 @@ fn land_reads_a_reason_as_no_excuse_and_a_landed_thing_as_landed() {
         "the docs branch is not merged, because no reviewer was available",
         "there is no reviewer so the docs branch is not merged",
         "the docs are not pushed: no remote is set",
-        "the docs are blocked on the signing key",
+        "the docs are blocked on the signing nod",
         "the docs are pending a review",
         "the docs are awaiting a reviewer",
         "the docs still has to be written",
@@ -761,7 +761,7 @@ fn every_act_fits_the_verbatim_bound_with_all_its_suffixes() {
     };
     let claim = "All done.\nStill open: the lexer.\nLeft: the docs.\nRemaining work: the e2e \
                  suite.\nNext steps: port the reader.\nTODO: wire the flag.\nNEEDS YOU: approve \
-                 the force-push to main";
+                 the force-push to main\n\nATERM-TASK-DONE";
     let rules = "keep each commit small and name the stage it lands ".repeat(8);
     let rules = rules.trim_end();
     // Under Cruise the check's reversible clause and NEEDS YOU's acknowledgment leave the
@@ -882,7 +882,7 @@ fn a_land_done_claim_gets_the_nudge_without_the_readers_words() {
         assert!(!st.landed(), "{reply}");
         a
     };
-    let claim = "Merged the parser. All done.\nThe docs are still open.";
+    let claim = "Merged the parser. All done.\nThe docs are still open.\n\nATERM-TASK-DONE";
     assert!(!clean_defense(Some(claim)) && says_done(Some(claim)));
     let open = land_open_words(Some(claim));
     assert_eq!(open, ["still open"], "{claim}");
@@ -891,8 +891,11 @@ fn a_land_done_claim_gets_the_nudge_without_the_readers_words() {
         land_nudged(),
         "the reader's words name nothing"
     );
-    assert_eq!(nudge_at("Merged the parser. All done."), land_nudged());
-    let needs_only = "Merged the parser. All done.\nNEEDS YOU: the docs' sign-off is still open";
+    assert_eq!(
+        nudge_at("Merged the parser. All done.\n\nATERM-TASK-DONE"),
+        land_nudged()
+    );
+    let needs_only = "Merged the parser. All done.\nNEEDS YOU: the docs' sign-off is still open\n\nATERM-TASK-DONE";
     assert!(land_open_words(Some(needs_only)).is_empty());
     assert_eq!(
         nudge_at(needs_only),
@@ -910,7 +913,7 @@ fn cruise_reads_no_open_work_out_of_a_needs_you_line() {
         act(&mut st, &idle("Stage 1 landed.", Some(3 * MIN)), t0());
         past_backoff(&mut st, &idle(reply, Some(3 * MIN)), t0() + 3 * MIN).0
     };
-    let needs_only = "Merged the parser. All done.\nNEEDS YOU: the docs' sign-off is still open";
+    let needs_only = "Merged the parser. All done.\nNEEDS YOU: the docs' sign-off is still open\n\nATERM-TASK-DONE";
     assert_eq!(
         check_at(needs_only),
         TurnEndAction::Type {
@@ -918,7 +921,8 @@ fn cruise_reads_no_open_work_out_of_a_needs_you_line() {
             rule_id: RULE_DONE_CHECK,
         }
     );
-    let plain = "Merged the parser. All done.\nThe docs' sign-off is still open.";
+    let plain =
+        "Merged the parser. All done.\nThe docs' sign-off is still open.\n\nATERM-TASK-DONE";
     let open = open_work(Some(plain));
     assert_eq!(open, ["still open"]);
     assert_eq!(
@@ -949,7 +953,7 @@ fn a_seeded_landings_own_words_hold_over_a_turn_read_cut() {
     st.seed_landed(said_mark(Some(DEFENSE)));
     let r = TurnEndReading {
         said_cut: true,
-        turn_said: Some("NEEDS YOU: the signing credential".to_string()),
+        turn_said: Some("NEEDS YOU: the signing permission".to_string()),
         ..land(idle(DEFENSE, None))
     };
     let (a, _) = until_acted(&mut st, &r, t0());
@@ -994,7 +998,7 @@ fn a_landing_seeded_with_no_words_holds_nothing_on_a_defense_read_in_part() {
 fn a_seeded_landings_own_words_hold_past_a_need_the_turn_retracted() {
     let retracted = format!("{DEFENSE}\nNEEDS YOU: nothing at this point.");
     let read = |tail: &str| TurnEndReading {
-        turn_said: Some("NEEDS YOU: the signing credential".to_string()),
+        turn_said: Some("NEEDS YOU: the signing permission".to_string()),
         ..land(idle(tail, None))
     };
     let mut st = TurnEndState::default();

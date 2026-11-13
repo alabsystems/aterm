@@ -426,6 +426,7 @@ fn carried_agent(session: &str) -> Box<restore::AgentRestore> {
     Box::new(restore::AgentRestore {
         claude_auth: None,
         pid: 4242,
+        lifetime: None,
         start: "Sat Sep 27 01:02:03 2026".to_string(),
         program: "/opt/claude/bin/claude".to_string(),
         argv: vec!["/opt/claude/bin/claude".to_string()],
@@ -531,6 +532,7 @@ fn a_system_quit_inside_the_drain_keeps_each_owed_tabs_own_agent_and_hold() {
         profile: None,
         tab: sid.clone(),
         pid: 5151,
+        lifetime: None,
         start: "Sat Sep 27 02:02:03 2026".into(),
         shell: 4343,
         program: std::path::PathBuf::from("/opt/claude/bin/claude"),

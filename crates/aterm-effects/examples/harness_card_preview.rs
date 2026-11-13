@@ -72,7 +72,7 @@ const FLOW_AT: [u64; 4] = [
     2 * GLINT_PERIOD_MS + 18 * FLOW_STEP_MS,
 ];
 
-const HERO: std::ops::Range<u16> = 12..17;
+const HERO: std::ops::Range<u16> = 12..16;
 
 /// When a panel shows the card.
 #[derive(Clone, Copy)]
@@ -131,9 +131,9 @@ const HI_ROWS: [&str; 3] = [
 const HI_LONG_PATH: &str =
     "/private/tmp/at.dFeo/proj/a-working-directory-whose-name-runs-on-past-the-trail";
 
-/// The card's line, the same under every palette: the harness's brand and version, then the
-/// site's name (a link on the glass).
-const LINE: &str = "enhanced by alab claude harness v0.4 \u{b7} alab.systems";
+/// The card's line, the same under every palette: the mark (a link on the glass) and the CLI
+/// the harness carries.
+const LINE: &str = "enhanced by ALab claude harness";
 
 const fn line_of(_palette: CardPalette) -> &'static str {
     LINE

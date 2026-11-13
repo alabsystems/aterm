@@ -10,6 +10,13 @@ use std::time::Duration;
 
 use super::*;
 use crate::schema::Record;
+#[path = "tests/control_transfer.rs"]
+mod control_transfer;
+#[path = "tests/lifecycle.rs"]
+mod lifecycle;
+use lifecycle::{
+    FixtureRoot, HANG, OwnedFixtureChild, STARTED, bounded_child, prove_child_started,
+};
 
 fn write(path: &Path, bytes: &[u8]) {
     let mut file =
@@ -19,98 +26,6 @@ fn write(path: &Path, bytes: &[u8]) {
 struct Fixture {
     root: FixtureRoot,
     image: Option<PathBuf>,
-}
-
-enum FixtureRoot {
-    Unstarted(Option<tempfile::TempDir>),
-    Started(aterm_uds::deadline::KeptUntilRan),
-}
-
-impl FixtureRoot {
-    fn path(&self) -> &Path {
-        match self {
-            Self::Unstarted(root) => root.as_ref().unwrap().path(),
-            Self::Started(root) => root.path(),
-        }
-    }
-
-    fn arm(&mut self) {
-        if let Self::Unstarted(root) = self {
-            *self = Self::Started(aterm_uds::deadline::KeptUntilRan::new(root.take().unwrap().keep()));
-        }
-    }
-
-    fn ran(&mut self) {
-        let Self::Started(root) = self else { panic!("cached fixture was not armed") };
-        root.ran();
-    }
-}
-
-const FIXTURE_STARTED: &str = "native-provenance-fixture-running";
-
-const PARENT_HANG: Duration = Duration::from_secs(60);
-const ACCEPT_HANG: Duration = Duration::from_secs(60);
-const DISCOVERY_HANG: Duration = Duration::from_secs(60);
-const OWNER_READ_HANG: Duration = Duration::from_secs(60);
-const CLIENT_READ_HANG: Duration = Duration::from_secs(60);
-const CLOSE_HANG: Duration = Duration::from_secs(60);
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Phase { Fresh, Parent, Accept, Discovery, OwnerRead, ClientRead, Close }
-impl Phase {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Fresh => "fresh", Self::Parent => "parent", Self::Accept => "accept",
-            Self::Discovery => "discovery", Self::OwnerRead => "owner-read",
-            Self::ClientRead => "client-read", Self::Close => "close",
-        }
-    }
-    fn received() -> Self {
-        match std::env::var("PROVENANCE_FIXTURE_AGED").as_deref() {
-            Err(std::env::VarError::NotPresent) | Ok("fresh") => Self::Fresh,
-            Ok("parent") => Self::Parent, Ok("accept") => Self::Accept,
-            Ok("discovery") => Self::Discovery, Ok("owner-read") => Self::OwnerRead,
-            Ok("client-read") => Self::ClientRead, Ok("close") => Self::Close,
-            other => panic!("invalid fixture phase: {other:?}"),
-        }
-    }
-    fn start(self, phase: Self) -> Instant {
-        let age = if self != phase { 0 } else {
-            match phase {
-                Self::Fresh => 0, Self::Parent => 16, Self::Accept => 9,
-                Self::Discovery | Self::OwnerRead | Self::Close => 5, Self::ClientRead => 4,
-            }
-        };
-        Instant::now() - Duration::from_secs(age)
-    }
-}
-
-fn remaining(started: Instant, hang: Duration) -> Duration {
-    hang.checked_sub(started.elapsed()).filter(|left| !left.is_zero())
-        .expect("required native fixture hang detector expired")
-}
-
-struct OwnedFixtureChild(Option<std::process::Child>);
-impl OwnedFixtureChild {
-    fn new(child: std::process::Child) -> Self { Self(Some(child)) }
-    fn wait_with_output(mut self) -> io::Result<std::process::Output> {
-        self.0.take().unwrap().wait_with_output()
-    }
-}
-impl std::ops::Deref for OwnedFixtureChild {
-    type Target = std::process::Child;
-    fn deref(&self) -> &Self::Target { self.0.as_ref().unwrap() }
-}
-impl std::ops::DerefMut for OwnedFixtureChild {
-    fn deref_mut(&mut self) -> &mut Self::Target { self.0.as_mut().unwrap() }
-}
-impl Drop for OwnedFixtureChild {
-    fn drop(&mut self) {
-        if let Some(child) = &mut self.0 && let Ok(None) = child.try_wait() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-    }
 }
 impl Fixture {
     fn new() -> Self {
@@ -128,7 +43,7 @@ impl Fixture {
             &root.path().join("instances/book.json"),
             &Book { version: 1, instances: vec![] }.encode().unwrap(),
         );
-        Self { root: FixtureRoot::Unstarted(Some(root)), image: None }
+        Self { root: FixtureRoot::new(root), image: None }
     }
     fn cache(&mut self) -> PathBuf {
         let source = std::env::current_exe().unwrap();
@@ -148,15 +63,17 @@ impl Fixture {
     fn completed(&mut self, output: &std::process::Output) {
         assert!(output.status.success(), "{output:?}");
         assert!(
-            String::from_utf8_lossy(&output.stdout).lines().any(|line| line.ends_with(FIXTURE_STARTED)),
-            "cached fixture supplied no execution proof: {output:?}"
+            String::from_utf8_lossy(&output.stdout).lines().any(|line| line.ends_with(STARTED)),
+            "cached native fixture supplied no execution proof: {output:?}"
         );
         self.root.ran();
     }
 }
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if let Some(path) = &self.image {
+        if self.root.may_remove()
+            && let Some(path) = &self.image
+        {
             let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
         }
     }
@@ -213,11 +130,71 @@ fn run_cached_host(tamper: bool) {
     run_cached_host_phase(tamper, Phase::Fresh);
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    Fresh,
+    Parent,
+    Accept,
+    Discovery,
+    OwnerRead,
+    ClientRead,
+    Close,
+}
+
+impl Phase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Fresh => "fresh",
+            Self::Parent => "parent",
+            Self::Accept => "accept",
+            Self::Discovery => "discovery",
+            Self::OwnerRead => "owner-read",
+            Self::ClientRead => "client-read",
+            Self::Close => "close",
+        }
+    }
+
+    fn received() -> Self {
+        match std::env::var("PROVENANCE_FIXTURE_AGED").as_deref() {
+            Err(std::env::VarError::NotPresent) | Ok("fresh") => Self::Fresh,
+            Ok("parent") => Self::Parent,
+            Ok("accept") => Self::Accept,
+            Ok("discovery") => Self::Discovery,
+            Ok("owner-read") => Self::OwnerRead,
+            Ok("client-read") => Self::ClientRead,
+            Ok("close") => Self::Close,
+            other => panic!("invalid fixture phase: {other:?}"),
+        }
+    }
+
+    fn start(self, phase: Self) -> Instant {
+        let age = if self == phase {
+            match phase {
+                Self::Fresh => 0,
+                Self::Parent => 16,
+                Self::Accept => 9,
+                Self::Discovery | Self::OwnerRead | Self::Close => 5,
+                Self::ClientRead => 4,
+            }
+        } else {
+            0
+        };
+        Instant::now() - Duration::from_secs(age)
+    }
+}
+
+fn remaining(started: Instant) -> Duration {
+    HANG.checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+        .expect("required native fixture hang detector expired")
+}
+
 fn run_cached_host_phase(tamper: bool, phase: Phase) {
     let mut fixture = Fixture::new();
     let helper = fixture.cache();
     let mut command = Command::new(&helper);
-    command.args(["--exact", "reader::tests::fixture_role", "--nocapture"])
+    command
+        .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
         .env("PROVENANCE_FIXTURE_ROLE", "host")
         .env("PROVENANCE_FIXTURE_ROOT", fixture.root.path())
         .env("PROVENANCE_FIXTURE_CLIENT", std::env::current_exe().unwrap())
@@ -230,21 +207,8 @@ fn run_cached_host_phase(tamper: bool, phase: Phase) {
     } else {
         command.env_remove("PROVENANCE_FIXTURE_PINNED");
     }
-    let mut child = OwnedFixtureChild::new(command.spawn().unwrap());
-    let deadline = phase.start(Phase::Parent) + PARENT_HANG;
-    assert!(Instant::now() < deadline, "parent fixture hang detector expired");
-    loop {
-        if child.try_wait().unwrap().is_some() {
-            break;
-        }
-        if Instant::now() >= deadline {
-            let _ = child.kill();
-            let output = child.wait_with_output().unwrap();
-            panic!("owned provenance fixture exceeded deadline: {output:?}");
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let output = child.wait_with_output().unwrap();
+    let child = OwnedFixtureChild::new(command.spawn().unwrap());
+    let output = bounded_child(child, phase.start(Phase::Parent) + HANG);
     fixture.completed(&output);
 }
 
@@ -255,7 +219,14 @@ fn actual_cached_ancestor_connects_for_a_different_loaded_client_image() {
 
 #[test]
 fn required_native_reader_phases_keep_original_starts_without_latency_budgets() {
-    for phase in [Phase::Parent, Phase::Accept, Phase::Discovery, Phase::OwnerRead, Phase::ClientRead, Phase::Close] {
+    for phase in [
+        Phase::Parent,
+        Phase::Accept,
+        Phase::Discovery,
+        Phase::OwnerRead,
+        Phase::ClientRead,
+        Phase::Close,
+    ] {
         run_cached_host_phase(false, phase);
     }
 }
@@ -264,10 +235,34 @@ fn required_native_reader_phases_keep_original_starts_without_latency_budgets() 
 fn a_cached_image_without_native_execution_proof_is_kept() {
     let mut fixture = Fixture::new();
     let helper = fixture.cache();
-    let root = fixture.root.path().to_path_buf();
+    let root = fixture.root.path().to_owned();
     assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(fixture))).is_err());
     assert!(helper.is_file());
-    // No process was launched in this cleanup control; this image was never assessed.
+    // No process was launched by this cleanup control. Its image was never assessed.
+    fs::set_permissions(helper.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn successful_status_without_child_written_execution_proof_is_refused() {
+    use std::os::unix::process::ExitStatusExt as _;
+    let mut fixture = Fixture::new();
+    let helper = fixture.cache();
+    let root = fixture.root.path().to_owned();
+    let output = std::process::Output {
+        status: std::process::ExitStatus::from_raw(0),
+        stdout: b"status supplied no execution proof".to_vec(),
+        stderr: vec![],
+    };
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            fixture.completed(&output);
+        }))
+        .is_err()
+    );
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(fixture))).is_err());
+    assert!(helper.is_file());
+    // This control constructed output DATA and launched no executable.
     fs::set_permissions(helper.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_dir_all(root).unwrap();
 }
@@ -278,8 +273,10 @@ fn post_reply_validation_refuses_a_changed_immutable_helper() {
 
 #[test]
 fn fixture_role() {
-    let Ok(role) = std::env::var("PROVENANCE_FIXTURE_ROLE") else { return };
-    println!("{FIXTURE_STARTED}");
+    let Ok(role) = std::env::var("PROVENANCE_FIXTURE_ROLE") else {
+        return;
+    };
+    println!("{STARTED}");
     std::io::stdout().flush().unwrap();
     let root = PathBuf::from(std::env::var_os("PROVENANCE_FIXTURE_ROOT").unwrap());
     let tamper = std::env::var("PROVENANCE_FIXTURE_TAMPER").unwrap() == "yes";
@@ -319,16 +316,17 @@ fn host_role(root: &Path, tamper: bool) {
         Book { version: 1, instances: vec![record] }.encode().unwrap(),
     )
     .unwrap();
-    let mut child = OwnedFixtureChild::new(Command::new(std::env::var_os("PROVENANCE_FIXTURE_CLIENT").unwrap())
-        .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
-        .env("PROVENANCE_FIXTURE_ROLE", "client")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap());
+    let mut child = OwnedFixtureChild::new(
+        Command::new(std::env::var_os("PROVENANCE_FIXTURE_CLIENT").unwrap())
+            .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
+            .env("PROVENANCE_FIXTURE_ROLE", "client")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
     listener.set_nonblocking(true).unwrap();
-    let deadline = phase.start(Phase::Accept) + ACCEPT_HANG;
-    assert!(Instant::now() < deadline, "accept fixture hang detector expired");
+    let deadline = phase.start(Phase::Accept) + HANG;
     let mut stream = loop {
         match listener.accept() {
             Ok((stream, _)) => break stream,
@@ -336,14 +334,14 @@ fn host_role(root: &Path, tamper: bool) {
                 if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
             {
                 if child.try_wait().unwrap().is_some() {
-                    let output = child.wait_with_output().unwrap();
+                    let output = bounded_child(child, Instant::now() + HANG);
                     panic!("owned client exited before acceptance: {output:?}");
                 }
                 std::thread::sleep(Duration::from_millis(5))
             }
             result => {
                 let _ = child.kill();
-                let output = child.wait_with_output().unwrap();
+                let output = bounded_child(child, Instant::now() + HANG);
                 panic!("owned accept: {result:?}; {output:?}");
             }
         }
@@ -370,7 +368,7 @@ fn host_role(root: &Path, tamper: bool) {
         let mut ack = [0];
         bounded_read(&mut stream, &mut ack, deadline, false);
         assert_eq!(ack, [1]);
-        let output = child.wait_with_output().unwrap();
+        let output = bounded_child(child, Instant::now() + HANG);
         assert!(output.status.success(), "{output:?}");
         return;
     }
@@ -379,8 +377,7 @@ fn host_role(root: &Path, tamper: bool) {
         // Use the same nonblocking/deadline pattern as production discovery;
         // this fixture's native SO_RCVTIMEO setter refuses EINVAL here.
         stream.set_nonblocking(true).unwrap();
-        let deadline = phase.start(Phase::Close) + CLOSE_HANG;
-        assert!(Instant::now() < deadline, "close fixture hang detector expired");
+        let deadline = phase.start(Phase::Close) + HANG;
         loop {
             match stream.read(&mut [0]) {
                 Ok(0) => break,
@@ -392,12 +389,12 @@ fn host_role(root: &Path, tamper: bool) {
                 other => panic!("discovery stream did not close before deadline: {other:?}"),
             }
         }
-        let output = child.wait_with_output().unwrap();
+        let output = bounded_child(child, Instant::now() + HANG);
         assert!(output.status.success(), "{output:?}");
         return;
     }
     stream.set_nonblocking(false).unwrap();
-    stream.set_read_timeout(Some(remaining(phase.start(Phase::OwnerRead), OWNER_READ_HANG))).unwrap();
+    stream.set_read_timeout(Some(remaining(phase.start(Phase::OwnerRead)))).unwrap();
     let mut request = [0; 4];
     stream.read_exact(&mut request).unwrap();
     assert_eq!(&request, b"ping");
@@ -412,12 +409,12 @@ fn host_role(root: &Path, tamper: bool) {
         stream.read_exact(&mut ack).unwrap();
         assert_eq!(ack, [1]);
     }
-    let output = child.wait_with_output().unwrap();
+    let output = bounded_child(child, Instant::now() + HANG);
     assert!(output.status.success(), "{output:?}");
 }
 fn client_role(root: &Path, tamper: bool) {
     let phase = Phase::received();
-    let deadline = phase.start(Phase::Discovery) + DISCOVERY_HANG;
+    let deadline = phase.start(Phase::Discovery) + HANG;
     let host = Store::open_at(root).unwrap().connect_ancestor(deadline).unwrap();
     if std::env::var("PROVENANCE_FIXTURE_PINNED").as_deref() == Ok("reconnect") {
         let pinned = host.into_helper(deadline).unwrap();
@@ -447,24 +444,28 @@ fn client_role(root: &Path, tamper: bool) {
             libc::O_RDONLY
         );
         assert!(pinned.duplicate_original_store(Instant::now()).is_err());
-        let mut helper = Command::new(pinned.helper_path())
-            .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
-            .env("PROVENANCE_FIXTURE_ROLE", "helper")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut helper = OwnedFixtureChild::new(
+            Command::new(pinned.helper_path())
+                .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
+                .env("PROVENANCE_FIXTURE_ROLE", "helper")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
         let helper_output = prove_child_started(&mut helper);
         assert_eq!(pinned.validate_child(&helper, deadline).unwrap().pid, helper.id());
-        let mut unrelated = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
-            .env("PROVENANCE_FIXTURE_ROLE", "helper")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut unrelated = OwnedFixtureChild::new(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
+                .env("PROVENANCE_FIXTURE_ROLE", "helper")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
         let unrelated_output = prove_child_started(&mut unrelated);
         assert!(pinned.validate_child(&unrelated, deadline).is_err());
         helper.stdin.take().unwrap().write_all(&[1]).unwrap();
@@ -478,7 +479,7 @@ fn client_role(root: &Path, tamper: bool) {
     assert_ne!(std::env::current_exe().unwrap(), host.helper_path());
     let mut stream = host.stream();
     stream.set_nonblocking(false).unwrap();
-    stream.set_read_timeout(Some(remaining(phase.start(Phase::ClientRead), CLIENT_READ_HANG))).unwrap();
+    stream.set_read_timeout(Some(remaining(phase.start(Phase::ClientRead)))).unwrap();
     stream.write_all(b"ping").unwrap();
     let mut reply = [0; 4];
     stream.read_exact(&mut reply).unwrap();
@@ -495,38 +496,21 @@ fn client_role(root: &Path, tamper: bool) {
 fn pinned_helper_requires_original_loaded_image_after_idle_discovery_closes() {
     let mut fixture = Fixture::new();
     let helper = fixture.cache();
-    let output = Command::new(&helper)
-        .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
-        .env("PROVENANCE_FIXTURE_ROLE", "host")
-        .env("PROVENANCE_FIXTURE_ROOT", fixture.root.path())
-        .env("PROVENANCE_FIXTURE_CLIENT", std::env::current_exe().unwrap())
-        .env("PROVENANCE_FIXTURE_TAMPER", "no")
-        .env("PROVENANCE_FIXTURE_PINNED", "1")
-        .output()
-        .unwrap();
+    let child = OwnedFixtureChild::new(
+        Command::new(&helper)
+            .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
+            .env("PROVENANCE_FIXTURE_ROLE", "host")
+            .env("PROVENANCE_FIXTURE_ROOT", fixture.root.path())
+            .env("PROVENANCE_FIXTURE_CLIENT", std::env::current_exe().unwrap())
+            .env("PROVENANCE_FIXTURE_TAMPER", "no")
+            .env("PROVENANCE_FIXTURE_PINNED", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let output = bounded_child(child, Instant::now() + HANG);
     fixture.completed(&output);
-}
-
-fn prove_child_started(child: &mut std::process::Child) -> std::thread::JoinHandle<()> {
-    use std::io::BufRead as _;
-    let out = child.stdout.take().unwrap();
-    let (sent, received) = std::sync::mpsc::sync_channel(1);
-    let reader = std::thread::spawn(move || {
-        let mut sent = Some(sent);
-        for line in std::io::BufReader::new(out).lines() {
-            let line = line.unwrap();
-            if line.ends_with(FIXTURE_STARTED) && let Some(sent) = sent.take() {
-                sent.send(()).unwrap();
-            }
-        }
-    });
-    if let Err(error) = received.recv_timeout(Duration::from_secs(60)) {
-        let _ = child.kill();
-        let _ = child.wait();
-        reader.join().unwrap();
-        panic!("owned native fixture did not prove execution: {error}");
-    }
-    reader
 }
 
 fn bounded_read(stream: &mut impl Read, bytes: &mut [u8], deadline: Instant, eof: bool) {
@@ -549,14 +533,19 @@ fn bounded_read(stream: &mut impl Read, bytes: &mut [u8], deadline: Instant, eof
 fn pinned_host_reconnect_keeps_original_image_and_native_peer_through_ack() {
     let mut fixture = Fixture::new();
     let helper = fixture.cache();
-    let output = Command::new(&helper)
-        .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
-        .env("PROVENANCE_FIXTURE_ROLE", "host")
-        .env("PROVENANCE_FIXTURE_ROOT", fixture.root.path())
-        .env("PROVENANCE_FIXTURE_CLIENT", std::env::current_exe().unwrap())
-        .env("PROVENANCE_FIXTURE_TAMPER", "no")
-        .env("PROVENANCE_FIXTURE_PINNED", "reconnect")
-        .output()
-        .unwrap();
+    let child = OwnedFixtureChild::new(
+        Command::new(&helper)
+            .args(["--exact", "reader::tests::fixture_role", "--nocapture"])
+            .env("PROVENANCE_FIXTURE_ROLE", "host")
+            .env("PROVENANCE_FIXTURE_ROOT", fixture.root.path())
+            .env("PROVENANCE_FIXTURE_CLIENT", std::env::current_exe().unwrap())
+            .env("PROVENANCE_FIXTURE_TAMPER", "no")
+            .env("PROVENANCE_FIXTURE_PINNED", "reconnect")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let output = bounded_child(child, Instant::now() + HANG);
     fixture.completed(&output);
 }

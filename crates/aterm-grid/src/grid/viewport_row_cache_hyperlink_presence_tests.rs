@@ -11,8 +11,11 @@ use std::sync::Arc;
 fn a_hyperlink_fact_requires_the_same_epoch_and_absolute_row() {
     let cache = ViewportRowCache::default();
     let epoch = HistoryEpoch {
-        content_gen: 1,
+        history_content_gen: 1,
+        clear_gen: 0,
+        reveal_gen: 0,
         renumber: 2,
+        images_dropped: 0,
         cols: 8,
         visible_rows: 3,
     };
@@ -32,11 +35,23 @@ fn a_hyperlink_fact_requires_the_same_epoch_and_absolute_row() {
     );
     for changed in [
         HistoryEpoch {
-            content_gen: 2,
+            history_content_gen: 2,
+            ..epoch
+        },
+        HistoryEpoch {
+            clear_gen: 1,
+            ..epoch
+        },
+        HistoryEpoch {
+            reveal_gen: 1,
             ..epoch
         },
         HistoryEpoch {
             renumber: 3,
+            ..epoch
+        },
+        HistoryEpoch {
+            images_dropped: 1,
             ..epoch
         },
         HistoryEpoch { cols: 9, ..epoch },

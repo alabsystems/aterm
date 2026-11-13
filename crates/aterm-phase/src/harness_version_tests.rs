@@ -55,20 +55,8 @@ fn every_cli_harness_names_itself_and_reads_its_own_version() {
     ] {
         assert_eq!(CliHarness::for_name(name), Some(harness), "{name:?}");
     }
-    for retired in [
-        "gemini",
-        "gemini-cli",
-        "Gemini CLI",
-        "codex",
-        "codex-alab",
-        "codex-cli",
-        "codex-old",
-    ] {
-        assert_eq!(
-            CliHarness::for_name(retired),
-            None,
-            "{retired:?}: agy replaces it"
-        );
+    for retired in ["codex", "codex-alab", "codex-cli", "codex-old"] {
+        assert_eq!(CliHarness::for_name(retired), None, "{retired:?}");
     }
 }
 

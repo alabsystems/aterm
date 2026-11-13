@@ -1211,7 +1211,7 @@ fn drive_chromium(
         .map_err(|e| Stop::CouldNotRun(format!("could not create {}: {e}", profile.display())))?;
     let log = work.join("browser.log");
     let (out, err) = log_stdio(&log)?;
-    let pipe = || std::io::pipe().map_err(|e| Stop::CouldNotRun(format!("no pipe: {e}")));
+    let pipe = || aterm_uds::pipe().map_err(|e| Stop::CouldNotRun(format!("no pipe: {e}")));
     let ((cmd_read, cmd_write), (out_read, out_write)) = (pipe()?, pipe()?);
     let mut cmd = LaneCommand::new(&browser.path);
     cmd.args(chromium::launch_args(browser, profile, angle, &[]))

@@ -498,9 +498,9 @@ mod native {
                 _ => "Could not lock the private mail browser profile",
             })?;
             let (command_read, command_write) =
-                std::io::pipe().map_err(|_| "Could not create browser command pipe")?;
+                aterm_uds::pipe().map_err(|_| "Could not create browser command pipe")?;
             let (event_read, event_write) =
-                std::io::pipe().map_err(|_| "Could not create browser event pipe")?;
+                aterm_uds::pipe().map_err(|_| "Could not create browser event pipe")?;
             let command = browser::headless_browser_command(&executable, profile, &|key| {
                 std::env::var_os(key)
             });

@@ -189,6 +189,182 @@ fn owner_hold(store: &Store, rest: &str) -> String {
     cmd_hold(store, rest, HoldIssuer::Owner)
 }
 
+#[test]
+fn a_coalesced_hold_release_is_visible_without_an_intermediate_observation() {
+    let store = new_store();
+    let (sid, ctx) = registered(&store);
+    let before = ctx.fabric.hold_observation();
+    assert!(!before.is_held());
+    assert_eq!(before.released_at(), None);
+
+    assert_eq!(
+        owner_hold(&store, &format!("{sid} on reason=wait")),
+        "OK hold=1\n"
+    );
+    assert_eq!(owner_hold(&store, &format!("{sid} off")), "OK hold=0\n");
+
+    let after = ctx.fabric.hold_observation();
+    assert!(!after.is_held());
+    assert!(after.released_at().is_some());
+    assert!(!after.agrees_unheld(before));
+    assert!(after.agrees_unheld(after));
+    assert_eq!(
+        ctx.fabric
+            .run_unfenced(std::time::Duration::ZERO, |observed| observed),
+        Some(after),
+        "the task transaction receives the same locked hold history"
+    );
+}
+
+#[test]
+fn slot_edits_direct_resets_and_fences_do_not_create_aggregate_release_time() {
+    let store = new_store();
+    let (sid, ctx) = registered(&store);
+    assert_eq!(
+        owner_hold(&store, &format!("{sid} on reason=first")),
+        "OK hold=1\n"
+    );
+    let held = ctx.fabric.hold_observation();
+    let serial = ctx.fabric.hold_serial();
+
+    assert!(
+        ctx.fabric
+            .note_direct_reset(Some(std::time::Duration::ZERO))
+    );
+    assert_ne!(
+        ctx.fabric.hold_serial(),
+        serial,
+        "the existing handoff serial still moves"
+    );
+    assert_eq!(ctx.fabric.hold_observation(), held);
+    assert_eq!(
+        owner_hold(&store, &format!("{sid} on reason=second")),
+        "OK hold=1\n"
+    );
+    assert_eq!(
+        owner_hold(&store, &format!("{sid} on reason=second")),
+        "OK hold=1\n"
+    );
+    assert_eq!(ctx.fabric.hold_observation(), held);
+
+    assert_eq!(
+        apply_hold(
+            &ctx,
+            HoldAct::Set(Hold {
+                origin: "fleet".into(),
+                reason: "bridge".into()
+            }),
+            HoldIssuer::Bridge,
+            Some(std::time::Duration::ZERO),
+            &|| {},
+        ),
+        Applied::Changed { held: true }
+    );
+    assert_eq!(ctx.fabric.hold_observation(), held);
+    assert_eq!(owner_hold(&store, &format!("{sid} off")), "OK hold=1\n");
+    assert_eq!(
+        ctx.fabric.hold_observation(),
+        held,
+        "the fleet slot still holds it"
+    );
+
+    ctx.fabric.fence_hold(true);
+    assert_eq!(ctx.fabric.hold_observation(), held);
+    assert_eq!(
+        ctx.fabric
+            .run_unfenced(std::time::Duration::ZERO, |_| panic!(
+                "the fence must refuse"
+            )),
+        None::<()>
+    );
+    ctx.fabric.lift_hold_fence();
+    assert_eq!(ctx.fabric.hold_observation(), held);
+    assert_eq!(
+        apply_hold(
+            &ctx,
+            HoldAct::Lift("fleet"),
+            HoldIssuer::Bridge,
+            Some(std::time::Duration::ZERO),
+            &|| {},
+        ),
+        Applied::Changed { held: false }
+    );
+    let released = ctx.fabric.hold_observation();
+    assert!(released.released_at().is_some());
+    assert!(!released.is_held());
+    assert!(!released.agrees_unheld(held));
+}
+
+#[test]
+fn seeding_holds_preserves_the_release_clock_until_the_whole_hold_clears() {
+    let store = new_store();
+    let (sid, ctx) = registered(&store);
+    let initial = ctx.fabric.hold_observation();
+    ctx.fabric.seed_holds(Holds::default(), &ctx.timeline);
+    assert_eq!(ctx.fabric.hold_observation(), initial);
+
+    let local = parse_holds(["local carried"]);
+    ctx.fabric.seed_holds(local.clone(), &ctx.timeline);
+    let held = ctx.fabric.hold_observation();
+    assert!(held.is_held());
+    assert_eq!(held.released_at(), None);
+    ctx.fabric.seed_holds(local, &ctx.timeline);
+    ctx.fabric
+        .seed_holds(parse_holds(["fleet another"]), &ctx.timeline);
+    assert_eq!(ctx.fabric.hold_observation(), held);
+    assert_eq!(owner_hold(&store, &format!("{sid} off")), "OK hold=1\n");
+    assert_eq!(ctx.fabric.hold_observation(), held);
+    assert!(apply_hold_for_test(&ctx, None));
+
+    let released = ctx.fabric.hold_observation();
+    let release_time = released
+        .released_at()
+        .expect("the aggregate really cleared");
+    assert!(released.agrees_unheld(released));
+    ctx.fabric
+        .seed_holds(parse_holds(["local later"]), &ctx.timeline);
+    let held_again = ctx.fabric.hold_observation();
+    assert!(held_again.is_held());
+    assert_eq!(held_again.released_at(), Some(release_time));
+    assert!(!held_again.agrees_unheld(released));
+}
+
+#[test]
+fn a_person_replacing_a_remote_hold_does_not_invent_a_release() {
+    let store = new_store();
+    let (sid, ctx) = registered(&store);
+    let driver = Driver {
+        node: "03".repeat(16),
+        host: "mac-03".into(),
+    };
+    {
+        let _driving = DrivingAs::enter(driver);
+        assert_eq!(
+            cmd_hold(
+                &store,
+                &format!("{sid} on reason=drive"),
+                HoldIssuer::Remote
+            ),
+            "OK hold=1\n"
+        );
+    }
+    let remote = ctx.fabric.hold_observation();
+    assert!(remote.is_held());
+    assert_eq!(person_hold(&ctx, true, &|| {}), PersonHoldOutcome::Moved);
+    assert!(
+        ctx.fabric.holds().remote().is_none(),
+        "the person actually replaced the remote slot"
+    );
+    assert!(ctx.fabric.holds().person().is_some());
+    assert_eq!(ctx.fabric.hold_observation(), remote);
+
+    assert_eq!(person_hold(&ctx, false, &|| {}), PersonHoldOutcome::Moved);
+    let released = ctx.fabric.hold_observation();
+    assert!(!released.is_held());
+    assert!(released.released_at().is_some());
+    assert!(!released.agrees_unheld(remote));
+}
+
 #[cfg(unix)]
 #[test]
 fn a_committing_update_holds_every_hold_back_and_drops_none() {

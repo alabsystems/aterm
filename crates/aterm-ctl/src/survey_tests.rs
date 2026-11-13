@@ -134,6 +134,7 @@ fn the_arguments_parse_and_a_stray_one_is_the_usage_line() {
             host: None,
             within: FLEET_WITHIN,
             brief: false,
+            holder: None,
         })
     );
     let brief = parse_args(&parts(&["survey", "--brief"])).unwrap();

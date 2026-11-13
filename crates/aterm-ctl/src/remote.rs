@@ -524,8 +524,12 @@ fn any_host_node(
         ));
     };
     let within = survey_within_for_any(total);
-    let read =
-        fleet_survey(&survey::FleetAsk { host: None, within }).map_err(fleet_survey_error)?;
+    let read = fleet_survey(&survey::FleetAsk {
+        host: None,
+        within,
+        holder: None,
+    })
+    .map_err(fleet_survey_error)?;
     let members = any_host::members_of(&read.peers);
     let chosen = any_host::pick(program, &needs, &members).map_err(|counts| {
         refused(any_host::none_able(
@@ -934,6 +938,7 @@ pub(crate) fn resolve_any_sid_hosts(
         let read = survey_fn(&survey::FleetAsk {
             host: None,
             within: survey_within_for_any(total),
+            holder: None,
         })
         .map_err(fleet_survey_error)?;
         for peer in &read.peers {

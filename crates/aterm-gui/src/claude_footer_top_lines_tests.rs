@@ -126,6 +126,7 @@ fn copy_for(app: &App, session: u64) -> CopyGuard {
         &sid,
         Some(Copy {
             pid: PGID as u32,
+            lifetime: None,
             start: "Mon Oct 20 16:37:58 2026".to_string(),
             home: std::path::PathBuf::from("/nonexistent/codex-home"),
             seen: Seen::Never,
@@ -485,8 +486,8 @@ fn agys_lit_switch_is_one_switch_and_its_press_turns_it_off() {
 }
 
 /// AGY'S LABEL WEARS THE MOONBOW UNDER AUTOPILOT OFF: on the moonbow's line (`CardPalette::Off`)
-/// the label's `alab` is drawn bold in the moonbow's hero (the Off card's settled hero letters),
-/// and the switch's words keep the pane's inks. CONTROL: under Cruise `alab` is another ink.
+/// the label's `ALab` is drawn bold in the moonbow's hero (the Off card's settled hero letters),
+/// and the switch's words keep the pane's inks. CONTROL: under Cruise `ALab` is another ink.
 #[test]
 fn agys_label_wears_the_moonbow_under_autopilot_off() {
     let rows = fixture_rows(include_str!(
@@ -506,7 +507,7 @@ fn agys_label_wears_the_moonbow_under_autopilot_off() {
         let b = switch_of(app, wid, session).expect("agy's switch");
         assert_eq!(b.face, HarnessSwitch::On, "lit");
         let row = &app.windows[&wid].input_scratch.cells[b.frame_row];
-        let label = b.label.clone().expect("the label");
+        let label = b.mark.clone().expect("the label");
         (
             row[label.start..label.start + 4].to_vec(),
             row[b.cols.clone()].to_vec(),
@@ -520,7 +521,7 @@ fn agys_label_wears_the_moonbow_under_autopilot_off() {
     ));
     settle(&mut app);
     let (white, switch) = read(&app);
-    assert_eq!(white.iter().map(|c| c.ch).collect::<String>(), "alab");
+    assert_eq!(white.iter().map(|c| c.ch).collect::<String>(), "ALab");
     let ground = app.windows[&wid].input_scratch.implicit_blank.bg;
     let ground = u32::from_be_bytes([0, ground[0], ground[1], ground[2]]);
     for (k, c) in white.iter().enumerate() {
@@ -538,7 +539,7 @@ fn agys_label_wears_the_moonbow_under_autopilot_off() {
     );
     assert_ne!(
         cruise[0].fg, white[0].fg,
-        "CONTROL: under Cruise `alab` is Cruise's hero"
+        "CONTROL: under Cruise `ALab` is Cruise's hero"
     );
 }
 
@@ -581,7 +582,7 @@ fn another_clis_account_chip_never_names_the_row_claude_codes_roster_judges() {
 
 /// EVERY CLI HARNESS SHARES THE SWITCH AND ITS LABEL: Claude Code, Antigravity, Muse Code and
 /// Kimi Code all paint ` ● on ` when lit and ` ○ off ` when off, ending in the same cell, each
-/// followed by its own label (`alab v0.5 (v<cli build>)`), every cell on the line's ground, the
+/// followed by its own label (`ALab v0.5 (v<cli build>)`), every cell on the line's ground, the
 /// switch never bold; when off no cell wears the theme's active green accent.
 #[test]
 fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
@@ -665,7 +666,7 @@ fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
             let face: String = row[b.cols.clone()].iter().map(|c| c.ch).collect();
             assert_eq!(face, want, "{prog}: the switch");
             let label = b
-                .label
+                .mark
                 .clone()
                 .unwrap_or_else(|| panic!("{prog}: the label"));
             let words: String = row[label.clone()].iter().map(|c| c.ch).collect();
@@ -709,8 +710,8 @@ fn every_cli_harness_shares_the_switch_and_never_glows_green_when_off() {
         assert_eq!(off.face, HarnessSwitch::Off(SwitchOff::Master), "{prog}");
         let cells = read(&app, &off, OFF_SWITCH);
         assert_eq!(
-            (on.cols.end, on.label.clone()),
-            (off.cols.end, off.label.clone()),
+            (on.cols.end, on.mark.clone()),
+            (off.cols.end, off.mark.clone()),
             "{prog}: ON and OFF end in the same cell, the label unmoved"
         );
         for c in &cells {

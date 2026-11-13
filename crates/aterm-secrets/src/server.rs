@@ -499,7 +499,13 @@ pub fn serve_with_role(
         options.store.display(),
         running.addr
     ));
-    let unheld = unheld_note(&running.shared.lock_server_state(), &options.pins);
+    let bonjour = Bonjour::here(role_decide.is_some() || options.advertise.is_some());
+    let unheld = unheld_note(
+        &running.shared.lock_server_state(),
+        &options.pins,
+        bonjour,
+        role_decide.is_some(),
+    );
     if let Some(line) = unheld {
         note(&line);
     }
@@ -922,7 +928,7 @@ fn launch(listener: TcpListener, options: &Options, tuning: Tuning) -> crate::Re
         &mut state.heard,
     )?);
     let _ = aterm_uds::keep_out_of_children(&listener);
-    let (cancelled, cancel) = aterm_uds::kept_out(io::pipe)?;
+    let (cancelled, cancel) = aterm_uds::pipe()?;
     let addr = listener.local_addr()?;
     let shared = Arc::new(Shared {
         store: options.store.clone(),
@@ -1466,22 +1472,86 @@ fn note(line: &str) {
     crate::log_line(&format!("aterm secrets serve: {line}"));
 }
 
-/// What [`serve`] logs at start when its store holds no vault yet ([`refuse_unheld`]).
-fn unheld_note(state: &State, pins: &[(String, [u8; 32])]) -> Option<String> {
+/// Whether a server pulls from the servers it finds over Bonjour and is found by them there
+/// ([`Children::tend_with_role`]), which an empty store's note names ([`unheld_note`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bonjour {
+    /// It advertises on macOS: it browses, and pulls from what it finds.
+    Advertised,
+    /// It advertises nothing (`--no-advertise`, or an address the ALab URL does not reach).
+    Unadvertised,
+    /// Off macOS, where aterm advertises and browses nothing ([`aterm_uds::lan`]).
+    Absent,
+}
+
+impl Bonjour {
+    /// This server's: on macOS, by whether it advertises a name.
+    fn here(advertises: bool) -> Bonjour {
+        match (cfg!(target_os = "macos"), advertises) {
+            (false, _) => Bonjour::Absent,
+            (true, true) => Bonjour::Advertised,
+            (true, false) => Bonjour::Unadvertised,
+        }
+    }
+}
+
+/// What [`serve`] logs at start when its store holds no vault yet: who may give it a first
+/// version ([`refuse_unheld`]), and how one comes. `pins` are this start's; where a role decider
+/// runs (`decided`, on an advertising Mac) it can pin a vault later ([`tend_role_targets`]).
+fn unheld_note(
+    state: &State,
+    pins: &[(String, [u8; 32])],
+    bonjour: Bonjour,
+    decided: bool,
+) -> Option<String> {
     if !state.vaults.is_empty() {
         return None;
     }
-    let from = if pins.is_empty() {
-        "only from this Mac, since no --pin names a vault".to_string()
+    let names: Vec<&str> = pins.iter().map(|(name, _)| name.as_str()).collect();
+    let names = names.join(", ");
+    let pins_later = decided && bonjour == Bonjour::Advertised;
+    let from = if pins.is_empty() && pins_later {
+        "only from this machine until it pins a vault, as a server that decides its ALab role \
+         pins alab once it reads this machine's membership"
+            .to_string()
+    } else if pins.is_empty() {
+        "only from this machine, since no --pin names a vault".to_string()
     } else {
-        let names: Vec<&str> = pins.iter().map(|(name, _)| name.as_str()).collect();
-        format!(
-            "from this Mac, or from another for a vault this server pins ({})",
-            names.join(", ")
-        )
+        format!("from this machine, or from another for a vault this server pins ({names})")
+    };
+    // A pull is never this machine's put ([`pull_from_peer`]), so it brings a first version
+    // only for a pinned name.
+    let pulled = match bonjour {
+        Bonjour::Advertised if pins.is_empty() && pins_later => {
+            "; it pulls a first version from the servers it finds over Bonjour only for a vault \
+             it comes to pin, since a pull is never this machine's"
+                .to_owned()
+        }
+        Bonjour::Advertised if pins.is_empty() => {
+            "; it pulls no first version from the servers it finds over Bonjour, since a pull is \
+             never this machine's"
+                .to_owned()
+        }
+        Bonjour::Advertised => {
+            format!(", or, for {names}, pulled from a server this one finds over Bonjour")
+        }
+        Bonjour::Unadvertised => {
+            "; this server advertises nothing, so no server finds it over Bonjour and it pulls \
+             from none"
+                .to_owned()
+        }
+        Bonjour::Absent => {
+            "; aterm advertises and browses Bonjour on macOS only, so here this server finds no \
+             server to pull from and none finds it: only a machine that names its address \
+             reaches it"
+                .to_owned()
+        }
     };
     Some(format!(
-        "the store holds no vault yet: a Mac in the vault puts its copy here (its subscriber does, and any aterm secrets admin command there), and until then a machine that asks to join finds none; a first version is taken {from}"
+        "the store holds no vault yet, so a machine that asks here for one finds none; a first \
+         version is taken {from}, put here by an aterm secrets admin command that publishes to \
+         this server or by a subscriber whose vault source is this server (it puts its own copy \
+         back){pulled}"
     ))
 }
 
@@ -1766,6 +1836,29 @@ pub(crate) fn holds_alab(store: &Path) -> bool {
         return false;
     };
     is_alab_vault(&bytes)
+}
+
+/// The vaults `store` holds, in name order: each `<name>.vault` there that names `name` and
+/// verifies, as a server started on the store takes it ([`load_vault`]). A store not made yet
+/// holds none.
+/// # Errors
+/// The store cannot be listed.
+pub(crate) fn held_vaults(store: &Path) -> crate::Result<Vec<String>> {
+    let entries = match std::fs::read_dir(store) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::new(format!("{}: {e}", store.display()))),
+    };
+    let mut held: Vec<String> = entries
+        .filter_map(|entry| {
+            let file = entry.ok()?.file_name().into_string().ok()?;
+            let name = file.strip_suffix(".vault")?;
+            (envelope::valid_name(name) && load_vault(&store.join(&file), name).is_ok())
+                .then(|| name.to_owned())
+        })
+        .collect();
+    held.sort();
+    Ok(held)
 }
 
 /// Whether `bytes` are a version of the ALab vault by [`holds_alab`]'s rule: one that verifies,
@@ -5032,9 +5125,32 @@ pub fn route_sources() -> [Option<IpAddr>; 3] {
     ]
 }
 
-/// Primary IPv4 address of the default-route interface.
+/// Primary IPv4 address of the default-route interface: the address this Mac sends from toward
+/// TEST-NET-1 (`192.0.2.1`), which only a default route takes.
+///
+/// On macOS it is read from that route in the routing table
+/// ([`aterm_uds::network::route_source_ipv4_asked`]), which is the address a UDP socket
+/// connected there takes, and the connect is made only where the table could not be read. On a
+/// Mac with no default route that connect fails, and each failure makes the kernel send an
+/// `RTM_MISS` to every routing socket on the Mac; every converge pass, vault subscriber and
+/// advertiser reads these routes.
 pub fn primary_ipv4() -> Option<Ipv4Addr> {
-    source_ipv4(Ipv4Addr::new(192, 0, 2, 1), 9)
+    #[cfg(target_os = "macos")]
+    let asked = aterm_uds::network::route_source_ipv4_asked;
+    #[cfg(not(target_os = "macos"))]
+    let asked = |_| None;
+    primary_ipv4_by(asked, |to| source_ipv4(to, 9))
+}
+
+/// [`primary_ipv4`] over its two readers: `asked` is the routing table's word for a destination
+/// (`None` where the table was not read), and `connected` the address a UDP socket connected to
+/// it takes, called only where `asked` has no word.
+fn primary_ipv4_by(
+    asked: impl FnOnce(Ipv4Addr) -> Option<Option<Ipv4Addr>>,
+    connected: impl FnOnce(Ipv4Addr) -> Option<Ipv4Addr>,
+) -> Option<Ipv4Addr> {
+    let to = Ipv4Addr::new(192, 0, 2, 1);
+    asked(to).unwrap_or_else(|| connected(to))
 }
 
 /// LAN IPv4 address at which `<name>.local` is advertised ([`primary_ipv4`]).
@@ -5064,12 +5180,42 @@ fn source_ipv4(to: Ipv4Addr, port: u16) -> Option<Ipv4Addr> {
     }
 }
 
-/// The IPv6 address the default route leaves by, found as [`primary_ipv4`] finds its own.
+/// The IPv6 address the default route leaves by: the address a UDP socket connected to the
+/// documentation prefix (`2001:db8::1`) takes, which is the kernel's own choice of source (the
+/// route's own address is not it: IPv6 source selection weighs more than the route).
+///
+/// On macOS the routing table is asked first whether any route takes that destination
+/// ([`aterm_uds::network::routed_ipv6`]), and where it says none does, no connect is made: the
+/// connect would fail, and each failure makes the kernel send an `RTM_MISS` to every routing
+/// socket on the Mac (a Mac with no IPv6 default route is the common case, and every converge
+/// pass, vault subscriber and advertiser reads these routes). Where a route takes it, or the
+/// table could not be read, the connect is made as before.
 fn primary_ipv6() -> Option<Ipv6Addr> {
+    #[cfg(target_os = "macos")]
+    let routed = aterm_uds::network::routed_ipv6;
+    #[cfg(not(target_os = "macos"))]
+    let routed = |_| None;
+    primary_ipv6_by(routed, source_ipv6)
+}
+
+/// [`primary_ipv6`] over its two readers: `routed` is the routing table's word on whether a
+/// route takes a destination (`None` where the table was not read), and `connected` the address
+/// a UDP socket connected to it takes, never called where `routed` says no route does.
+fn primary_ipv6_by(
+    routed: impl FnOnce(Ipv6Addr) -> Option<bool>,
+    connected: impl FnOnce(Ipv6Addr) -> Option<Ipv6Addr>,
+) -> Option<Ipv6Addr> {
+    let to = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+    if routed(to) == Some(false) {
+        return None;
+    }
+    connected(to)
+}
+
+/// The local address a UDP socket connected to `to` gets (no packet is sent).
+fn source_ipv6(to: Ipv6Addr) -> Option<Ipv6Addr> {
     let socket = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0)).ok()?;
-    socket
-        .connect((Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), 9))
-        .ok()?;
+    socket.connect((to, 9)).ok()?;
     match socket.local_addr().ok()?.ip() {
         IpAddr::V6(ip) if !ip.is_unspecified() && !ip.is_loopback() => Some(ip),
         _ => None,

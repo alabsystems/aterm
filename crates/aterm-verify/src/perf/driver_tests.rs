@@ -68,6 +68,104 @@ fn a_cached_workspace_plan_prepares_its_original_target_after_config_changes() {
     }
 }
 
+struct FailedLauncherFixture(Option<aterm_tempfile::TempDir>);
+
+impl Drop for FailedLauncherFixture {
+    fn drop(&mut self) {
+        if (std::thread::panicking()
+            || std::env::var_os("ATERM_VERIFY_LAUNCHER_KEEP").as_deref()
+                == Some(std::ffi::OsStr::new("1")))
+            && let Some(directory) = self.0.take()
+        {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "launcher reuse fixture retained at {}",
+                directory.keep().display()
+            );
+        }
+    }
+}
+
+fn record_launcher_context(
+    command: &aterm_uds::spawnfd::Command,
+    driver: &CargoDriver,
+    root: &std::path::Path,
+) {
+    const KEYS: &[&str] = &[
+        "PATH",
+        "HOME",
+        "TMPDIR",
+        "RUSTC",
+        "RUSTDOC",
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CARGO_HOME",
+        "CARGO_TARGET_DIR",
+        "CARGO_BUILD_BUILD_DIR",
+        "CARGO_MANIFEST_DIR",
+        "OUT_DIR",
+        "TRUST_STAGE2_BIN",
+        "SDKROOT",
+        "DEVELOPER_DIR",
+        "MACOSX_DEPLOYMENT_TARGET",
+        "CC",
+        "CXX",
+        "LD",
+        "AR",
+        "RANLIB",
+    ];
+    let inherited: Vec<_> = KEYS
+        .iter()
+        .map(|key| (*key, std::env::var_os(key)))
+        .collect();
+    let command_environment: Vec<_> = command
+        .get_envs()
+        .filter(|(key, _)| KEYS.iter().any(|name| *key == std::ffi::OsStr::new(name)))
+        .collect();
+    std::fs::write(
+        root.join("build.context"),
+        format!(
+            "program: {:?}\ncwd: {root:?}\narguments: {:?}\ninherited native-tool variables: {inherited:#?}\ncommand overrides: {command_environment:#?}\n",
+            driver.program,
+            command.get_args().collect::<Vec<_>>()
+        ),
+    )
+    .unwrap();
+}
+
+fn snapshot_launcher_metadata(root: &std::path::Path, launcher: &str) {
+    let destination = root.join("launcher-evidence").join(launcher);
+    for directory in ["target.noindex", "build.noindex"] {
+        let mut pending = vec![root.join(directory)];
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    if entry.file_name() != "incremental" {
+                        pending.push(path);
+                    }
+                } else if kind.is_file() {
+                    let metadata = path
+                        .extension()
+                        .is_some_and(|extension| extension == "json" || extension == "d")
+                        || path.components().any(|component| {
+                            component.as_os_str() == "fingerprint"
+                                || component.as_os_str() == ".fingerprint"
+                        });
+                    if metadata {
+                        let copy = destination.join(path.strip_prefix(root).unwrap());
+                        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+                        std::fs::copy(path, copy).unwrap();
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn write_launcher_fixture(root: &std::path::Path) {
     std::fs::create_dir(root.join("src")).unwrap();
     std::fs::write(
@@ -111,22 +209,37 @@ fn nested_build_reuses_artifacts_across_launcher_metadata() {
         };
         // The process inherited launcher metadata before the production constructor ran.
         let mut cmd = driver.command("build");
-        cmd.args(["--offline", "--message-format=json"])
+        cmd.args(["--offline", "--message-format=json", "--verbose"])
             .current_dir(&root);
+        record_launcher_context(&cmd, &driver, &root);
         let output = aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN)
             .expect("Cargo completed");
+        std::fs::write(root.join("build.json"), &output.stdout).unwrap();
+        std::fs::write(root.join("build.stderr"), &output.stderr).unwrap();
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        std::fs::write(root.join("build.json"), output.stdout).unwrap();
         return;
     }
     let driver = cargo_driver()
         .unwrap_or_else(|why| aterm_spec::host::could_not_run(format_args!("pinned targo: {why}")));
-    let scratch = aterm_tempfile::tempdir().expect("isolated Cargo fixture");
-    let root = scratch.path();
+    // Declared-input windows retain ancestor stamps. Other tests' system-temp
+    // directory creation must not change this fixture's input namespace.
+    let test_binary = std::env::current_exe().unwrap();
+    let fixtures = test_binary
+        .parent()
+        .unwrap()
+        .join("launcher-reuse-fixtures.noindex");
+    std::fs::create_dir_all(&fixtures).unwrap();
+    let scratch = FailedLauncherFixture(Some(
+        aterm_tempfile::Builder::new()
+            .prefix("launcher-")
+            .tempdir_in(fixtures)
+            .expect("isolated Cargo fixture"),
+    ));
+    let root = scratch.0.as_ref().unwrap().path();
     write_launcher_fixture(root);
     let mut executable = None;
     for (launcher, want_fresh) in [("first", false), ("second", true)] {
@@ -146,6 +259,14 @@ fn nested_build_reuses_artifacts_across_launcher_metadata() {
             "{launcher}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        for extension in ["json", "stderr", "context"] {
+            std::fs::copy(
+                root.join(format!("build.{extension}")),
+                root.join(format!("build-{launcher}.{extension}")),
+            )
+            .unwrap();
+        }
+        snapshot_launcher_metadata(root, launcher);
         let built = std::fs::read_to_string(root.join("build.json")).unwrap();
         let mut artifacts = 0;
         for line in built.lines() {

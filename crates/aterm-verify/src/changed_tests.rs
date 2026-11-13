@@ -78,12 +78,14 @@ fn select(
 ) -> Selection {
     super::select(
         paths,
+        &BTreeSet::new(),
         manifests,
         members,
         path_packages,
         &|name| dependents(name).map(linking),
         &|_| replan_everything(),
         &|_, _| false,
+        &BTreeMap::new,
     )
 }
 
@@ -260,12 +262,14 @@ fn a_replanning_change_narrows_to_what_it_reaches() {
     let pick = |replan: Replan| {
         super::select(
             &paths(&["Cargo.toml"]),
+            &BTreeSet::new(),
             &manifests(),
             &m,
             &no_packages,
             &|name| graph(edges)(name).map(linking),
             &|_| replan.clone(),
             &|_, _| false,
+            &BTreeMap::new,
         )
     };
     assert_eq!(narrowed(&pick(Replan::Nothing)), (vec![], vec![]));
@@ -295,12 +299,14 @@ fn only_what_the_change_touched_has_all_its_targets_linted() {
     let forks = || Some(vec![("ring".to_string(), "vendor/ring".to_string())]);
     let all_targets = |changed: &[&str], replan: Replan| match super::select(
         &paths(changed),
+        &BTreeSet::new(),
         &manifests(),
         &m,
         &forks,
         &|name| graph(edges)(name).map(linking),
         &|_| replan.clone(),
         &|_, _| false,
+        &BTreeMap::new,
     ) {
         Selection::Narrowed { all_targets, .. } => all_targets,
         Selection::Widened(why) => panic!("widened unexpectedly: {why}"),
@@ -384,12 +390,14 @@ fn a_crate_the_cone_holds_only_by_a_dev_edge_leaves_the_lint() {
         let manifests: Manifests = ["crates/seed", "crates/seed-two"].into_iter().collect();
         super::select(
             &paths(changed),
+            &BTreeSet::new(),
             &manifests,
             &m,
             &forks,
             &reach,
             &|_| Replan::Nothing,
             &|_, _| false,
+            &BTreeMap::new,
         )
     };
     let touched = [
@@ -458,12 +466,14 @@ fn the_direct_dependents_of_a_seed_reach_the_scope() {
     let manifests: Manifests = ["crates/seed"].into_iter().collect();
     let selection = super::select(
         &paths(&["crates/seed/src/lib.rs"]),
+        &BTreeSet::new(),
         &manifests,
         &m,
         &|| Some(Vec::new()),
         &reach,
         &|_| Replan::Nothing,
         &|_, _| false,
+        &BTreeMap::new,
     );
     let Selection::Narrowed {
         direct_dependents, ..
@@ -649,15 +659,17 @@ const EDGES: &[(&str, &str)] = &[
 #[test]
 fn a_change_confined_to_its_own_tests_judges_its_member_alone() {
     let m = members(&["aterm-grid", "aterm-gui", "aterm-cli", "aterm-bench"]);
-    let pick = |changed: &[&str], confined: &dyn Fn(&str, &[&str]) -> bool, replan: Replan| {
+    let pick = |changed: &[&str], judge: &dyn Fn(&str, &[&str]) -> bool, replan: Replan| {
         super::select(
             &paths(changed),
+            &BTreeSet::new(),
             &manifests(),
             &m,
             &no_packages,
             &|name| graph(EDGES)(name).map(linking),
             &|_| replan.clone(),
-            confined,
+            judge,
+            &BTreeMap::new,
         )
     };
     let grid = [
@@ -728,63 +740,375 @@ fn a_change_confined_to_its_own_tests_judges_its_member_alone() {
     );
 }
 
-/// End to end on a real checkout and graph: a change inside a member's test module, to a file
-/// only its tests mount, or to a comment no macro reads, plain or doc, selects that member alone;
-/// a change to a shipped line selects its dependent too, and so does a doc comment that moves the
-/// code after it, sits on a derived item or in a macro's body; a test-only change to a file
-/// another member embeds by a `../` literal keeps that reader in the cone with its own dependents
-/// but leaves the member's linker out, and the reader stays whole when its own change is
-/// test-only. CONTROL: a file another member names by its repo path, or a change gathered from no
-/// one tree, keeps every dependent.
+/// How a member observes a changed path decides what it brings: one whose tests alone observe
+/// it joins with all of its targets and no dependent; one whose linked code observes a path of a
+/// seed judged whole joins the same way, since that seed's dependents are walked already; one
+/// whose linked code observes a path no member owns is a seed whose dependents are walked; one
+/// that observes nothing, or is no member, adds nothing. `observe` is asked once, and its answer
+/// stands whichever seeds are judged alone. CONTROL: with no observer, the confined seed is alone
+/// and the whole one walks its dependent.
 #[test]
-fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
-    let made = crate::mktemp_dir("atv-changed-own-tests").expect("mktemp");
+fn an_observer_is_walked_or_joins_by_how_it_observes() {
+    use crate::own_tests::Observed;
+    let m = members(&["u", "ud", "v", "w", "wd", "x", "xd", "y", "yd", "z", "zd"]);
+    let manifests: Manifests = m.0.iter().map(|member| member.dir.clone()).collect();
+    const LINKS: &[(&str, &str)] = &[
+        ("u", "ud"),
+        ("w", "wd"),
+        ("x", "xd"),
+        ("y", "yd"),
+        ("z", "zd"),
+    ];
+    let (x, y) = ("crates/x/src/lib.rs", "crates/y/src/lib.rs");
+    let changed = paths(&[x, y]);
+    let asked = std::cell::RefCell::new(Vec::new());
+    let observed = std::cell::Cell::new(0);
+    let pick = |observers: &[(&str, &str, Observed)]| {
+        super::select(
+            &changed,
+            &BTreeSet::new(),
+            &manifests,
+            &m,
+            &no_packages,
+            &|name| graph(LINKS)(name).map(linking),
+            &|_| replan_everything(),
+            &|member, _| {
+                asked.borrow_mut().push(member.to_string());
+                member == "x"
+            },
+            &|| {
+                observed.set(observed.get() + 1);
+                let mut by: BTreeMap<String, BTreeMap<String, Observed>> = BTreeMap::new();
+                for (namer, path, how) in observers {
+                    by.entry((*namer).to_string())
+                        .or_default()
+                        .insert((*path).to_string(), *how);
+                }
+                by
+            },
+        )
+    };
+    let sel = pick(&[
+        ("v", x, Observed::Nothing),
+        ("z", x, Observed::Tests),
+        ("w", y, Observed::Linked),
+        ("u", "tools/r/src/main.rs", Observed::Linked),
+        ("outsider", x, Observed::Linked),
+    ]);
+    assert_eq!(asked.take(), ["x", "y"]);
+    assert_eq!(observed.replace(0), 1);
+    let Selection::Narrowed {
+        seeds,
+        crates,
+        all_targets,
+        alone,
+        ..
+    } = sel
+    else {
+        panic!("widened: {sel:?}");
+    };
+    assert_eq!(seeds, paths(&["u", "x", "y"]));
+    assert_eq!(crates, paths(&["u", "ud", "w", "x", "y", "yd", "z"]));
+    assert_eq!(all_targets, paths(&["u", "w", "x", "y", "z"]));
+    assert_eq!(alone, paths(&["x"]));
+    let control = pick(&[]);
+    assert_eq!(observed.get(), 1);
+    assert!(
+        matches!(&control, Selection::Narrowed { crates, alone, .. }
+            if *crates == paths(&["x", "y", "yd"]) && *alone == paths(&["x"])),
+        "{control:?}"
+    );
+}
+
+/// A confined seed whose changed path a namer's linked code spells is judged whole, with the
+/// namer's own rows, unless walking the namer adds strictly fewer members than the seed's own
+/// dependents: a namer with a wide closure keeps the seed whole, and a seed with a wide closure
+/// goes alone with a narrow namer walked. Neither side counts the seed or its namers, which the
+/// cone holds either way; several namers count each member they add once; and a dev-only
+/// dependent counts as one the cone holds. `dependents` is asked once of the seed and of each
+/// namer, whichever wins. CONTROL: a namer that adds nothing walks beside the narrow seed, and
+/// namers that add as many members as the wide seed keep it whole, as main judged it.
+#[test]
+fn a_confined_seeds_namers_walk_only_where_that_adds_fewer_members() {
+    use crate::own_tests::Observed;
+    let m = members(&[
+        "a", "ad1", "b", "bd1", "bd2", "e", "ed", "m", "md1", "o", "o2", "p1", "p2", "px", "w",
+        "wd1", "wd2",
+    ]);
+    let manifests: Manifests = m.0.iter().map(|member| member.dir.clone()).collect();
+    const LINKS: &[(&str, &str)] = &[
+        ("a", "ad1"),
+        ("b", "bd1"),
+        ("b", "bd2"),
+        ("m", "md1"),
+        ("p1", "px"),
+        ("p2", "px"),
+        ("w", "wd1"),
+        ("w", "wd2"),
+    ];
+    const DEV: &[(&str, &str)] = &[("e", "ed")];
+    let asked = std::cell::RefCell::new(Vec::new());
+    let pick = |seed: &str, namers: &[&str]| {
+        let path = format!("crates/{seed}/src/lib.rs");
+        let selection = super::select(
+            &paths(&[path.as_str()]),
+            &BTreeSet::new(),
+            &manifests,
+            &m,
+            &no_packages,
+            &|name| {
+                asked.borrow_mut().push(name.to_string());
+                graph(LINKS)(name).map(|links| Reach {
+                    links,
+                    dev_only: DEV
+                        .iter()
+                        .filter(|(dep, _)| *dep == name)
+                        .map(|(_, user)| (*user).to_string())
+                        .collect(),
+                    ..Reach::default()
+                })
+            },
+            &|_| replan_everything(),
+            &|_, _| true,
+            &|| {
+                namers
+                    .iter()
+                    .map(|namer| {
+                        (
+                            (*namer).to_string(),
+                            BTreeMap::from([(path.clone(), Observed::Linked)]),
+                        )
+                    })
+                    .collect()
+            },
+        );
+        let mut dependents = asked.take();
+        dependents.sort();
+        (picked(selection), dependents)
+    };
+    let all = |seed: &str, namers: &[&str]| {
+        let mut all = paths(namers);
+        all.push(seed.to_string());
+        all.sort();
+        all
+    };
+    // `w` adds two members, `a` one: `a` is whole and `w` brings its own rows.
+    assert_eq!(
+        pick("a", &["w"]),
+        (
+            (paths(&["a"]), paths(&["a", "ad1", "w"]), Vec::new()),
+            all("a", &["w"])
+        )
+    );
+    // CONTROL: `o` adds none, fewer than `a`'s one: `a` is alone and `o` is walked.
+    assert_eq!(
+        pick("a", &["o"]),
+        (
+            (paths(&["a", "o"]), paths(&["a", "o"]), paths(&["a"])),
+            all("a", &["o"])
+        )
+    );
+    // `b` adds two members, `m` one: `b` is alone and `m` walks its dependent.
+    assert_eq!(
+        pick("b", &["m"]),
+        (
+            (paths(&["b", "m"]), paths(&["b", "m", "md1"]), paths(&["b"])),
+            all("b", &["m"])
+        )
+    );
+    // CONTROL: `w` adds two, as many as `b`: the tie keeps `b` whole.
+    assert_eq!(
+        pick("b", &["w"]),
+        (
+            (paths(&["b"]), paths(&["b", "bd1", "bd2", "w"]), Vec::new()),
+            all("b", &["w"])
+        )
+    );
+    // `o` and `o2` add none, counted without themselves, against `a`'s `ad1`: `a` is alone.
+    assert_eq!(
+        pick("a", &["o", "o2"]),
+        (
+            (
+                paths(&["a", "o", "o2"]),
+                paths(&["a", "o", "o2"]),
+                paths(&["a"])
+            ),
+            all("a", &["o", "o2"])
+        )
+    );
+    // `p1` and `p2` add one member between them, `px`, fewer than `b`'s two: `b` is alone.
+    assert_eq!(
+        pick("b", &["p1", "p2"]),
+        (
+            (
+                paths(&["b", "p1", "p2"]),
+                paths(&["b", "p1", "p2", "px"]),
+                paths(&["b"])
+            ),
+            all("b", &["p1", "p2"])
+        )
+    );
+    // CONTROL: `a` and `m` add one each, two between them, as many as `b`: `b` is whole.
+    assert_eq!(
+        pick("b", &["a", "m"]),
+        (
+            (
+                paths(&["b"]),
+                paths(&["a", "b", "bd1", "bd2", "m"]),
+                Vec::new()
+            ),
+            all("b", &["a", "m"])
+        )
+    );
+    // `e`'s one dependent is dev-only, more than `o`'s none: `e` is alone and `o` is walked.
+    assert_eq!(
+        pick("e", &["o"]),
+        (
+            (paths(&["e", "o"]), paths(&["e", "o"]), paths(&["e"])),
+            all("e", &["o"])
+        )
+    );
+}
+
+/// A confined seed whose own linked code observes another changed path is judged whole where
+/// main judged it whole, so the cone walks its dependents, which may read that path through it:
+/// where another member spells one of its paths, in any class (a plain comment, a test, linked
+/// code), or one of its paths reads another package's changed path. `confined` is not asked of
+/// it. CONTROL: such a seed whose paths no member spells or reads is alone, as main judged it,
+/// and a seed whose path is spelled but whose code observes nothing goes alone too.
+#[test]
+fn a_seed_whose_linked_code_observes_another_change_is_whole_where_main_kept_it_whole() {
+    use crate::own_tests::Observed;
+    let m = members(&["a", "ad", "b", "c"]);
+    let manifests: Manifests = m.0.iter().map(|member| member.dir.clone()).collect();
+    const LINKS: &[(&str, &str)] = &[("a", "ad")];
+    let (a, b) = ("crates/a/src/lib.rs", "crates/b/src/lib.rs");
+    let reader = "crates/a/tests/peek.rs";
+    let asked = std::cell::RefCell::new(Vec::new());
+    let pick = |changed: &[&str],
+                readers: &[&str],
+                judged: &[&str],
+                observers: &[(&str, &str, Observed)]| {
+        let selection = super::select(
+            &paths(changed),
+            &readers.iter().map(|path| (*path).to_string()).collect(),
+            &manifests,
+            &m,
+            &no_packages,
+            &|name| graph(LINKS)(name).map(linking),
+            &|_| replan_everything(),
+            &|member, _| {
+                asked.borrow_mut().push(member.to_string());
+                judged.contains(&member)
+            },
+            &|| {
+                let mut by: BTreeMap<String, BTreeMap<String, Observed>> = BTreeMap::new();
+                for (namer, path, how) in observers {
+                    by.entry((*namer).to_string())
+                        .or_default()
+                        .insert((*path).to_string(), *how);
+                }
+                by
+            },
+        );
+        (picked(selection), asked.take())
+    };
+    let whole = (paths(&["a", "b"]), paths(&["a", "ad", "b"]), Vec::new());
+    // Each spells the other's path in its library: main kept both whole, and `ad`, whose tests
+    // call `a`, which reads `b`'s file, ran.
+    assert_eq!(
+        pick(
+            &[a, b],
+            &[],
+            &["a", "b"],
+            &[("a", b, Observed::Linked), ("b", a, Observed::Linked)]
+        ),
+        (whole.clone(), Vec::new())
+    );
+    for how in [Observed::Nothing, Observed::Tests] {
+        let (selection, asked) = pick(
+            &[a, b],
+            &[],
+            &["a"],
+            &[("a", b, Observed::Linked), ("c", a, how)],
+        );
+        let mut crates = whole.1.clone();
+        if how == Observed::Tests {
+            crates.push("c".to_string());
+        }
+        assert_eq!(selection, (whole.0.clone(), crates, Vec::new()), "{how:?}");
+        assert_eq!(asked, paths(&["b"]), "{how:?}");
+    }
+    // `a`'s test reads another package's changed file: main's reader veto kept it whole.
+    assert_eq!(
+        pick(
+            &[reader, b],
+            &[reader],
+            &["a"],
+            &[("a", b, Observed::Linked)]
+        ),
+        (whole.clone(), paths(&["b"]))
+    );
+    // CONTROL: no member spells or reads `a`'s path, so main judged it alone and ran no `ad`.
+    assert_eq!(
+        pick(&[a, b], &[], &["a"], &[("a", b, Observed::Linked)]),
+        (
+            (paths(&["a", "b"]), paths(&["a", "b"]), paths(&["a"])),
+            paths(&["a", "b"])
+        )
+    );
+    // CONTROL: `c` spells `a`'s path in a plain comment, and `a` observes nothing.
+    assert_eq!(
+        pick(&[a, b], &[], &["a"], &[("c", a, Observed::Nothing)]),
+        (
+            (paths(&["a", "b"]), paths(&["a", "b"]), paths(&["a"])),
+            paths(&["a", "b"])
+        )
+    );
+}
+
+/// A fixture member: its folder under `crates/`, its manifest rows, and its files by
+/// package-relative path.
+type Package<'a> = (&'a str, &'a str, Vec<(&'a str, String)>);
+
+/// A fixture workspace at a fresh path: each `(dir, manifest rows, files)` is a member under
+/// `crates/`, `extra` are other files by repo-relative path, and cargo has written the lock.
+fn workspace(
+    prefix: &str,
+    packages: &[Package<'_>],
+    extra: &[(&str, &str)],
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let made = crate::mktemp_dir(prefix).expect("mktemp");
     let root = std::fs::canonicalize(&made).expect("the fixture's own path");
+    let members: Vec<String> = packages
+        .iter()
+        .map(|(dir, _, _)| format!("'crates/{dir}'"))
+        .collect();
     std::fs::write(
         root.join("Cargo.toml"),
-        "[workspace]\nresolver='2'\nmembers=['crates/a','crates/b','crates/c']\n",
+        format!(
+            "[workspace]\nresolver='2'\nmembers=[{}]\n",
+            members.join(",")
+        ),
     )
     .expect("workspace manifest");
-    let services = "/// The tester.\npub fn tester() -> &'static str {\n    // The name.\n    \"tester\"\n}\n\n/// A record.\n#[derive(Debug)]\npub struct Record;\n\nmacro_rules! one {\n    () => {\n        // One.\n        1\n    };\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn names() {\n        assert_eq!(super::tester(), \"tester\");\n    }\n}\n";
-    let untested = "#[cfg(test)]\nmod tests {}\n";
-    let tested = "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
-    let reader = "pub const PEEK: &str = include_str!(\"../../a/src/peek.rs\");\npub const TEST_PEEK: &str = include_str!(\"../../a/tests/peek.rs\");\npub const NAMED: &str = \"crates/a/src/named.rs\";\n";
-    for (dir, rest, files) in [
-        (
-            "a",
-            "",
-            vec![
-                (
-                    "src/lib.rs",
-                    "pub mod services;\n\n#[cfg(test)]\n#[path = \"lib_tests.rs\"]\nmod tests;\n",
-                ),
-                ("src/services.rs", services),
-                ("src/lib_tests.rs", "#[test]\nfn one() {}\n"),
-                ("src/peek.rs", untested),
-                ("src/named.rs", untested),
-                ("tests/integration.rs", "#[test]\nfn one() {}\n"),
-                ("tests/peek.rs", "#[test]\nfn one() {}\n"),
-            ],
-        ),
-        (
-            "b",
-            "[dependencies]\na={path='../a'}\n",
-            vec![("src/lib.rs", "pub use a::services::tester;\n")],
-        ),
-        ("c", "", vec![("src/lib.rs", reader)]),
-    ] {
+    let write = |path: &Path, text: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).expect("fixture dir");
+        std::fs::write(path, text).expect("fixture file");
+    };
+    for (dir, rest, files) in packages {
         let package = root.join("crates").join(dir);
-        std::fs::create_dir_all(package.join("src")).expect("fixture source dir");
+        write(&package.join("src/lib.rs"), "");
         for (path, text) in files {
-            std::fs::create_dir_all(package.join(path).parent().unwrap())
-                .expect("fixture target dir");
-            std::fs::write(package.join(path), text).expect("fixture source");
+            write(&package.join(path), text);
         }
-        std::fs::write(
-            package.join("Cargo.toml"),
-            format!("[package]\nname='{dir}'\nversion='0.1.0'\nedition='2021'\n{rest}"),
-        )
-        .expect("package manifest");
+        write(
+            &package.join("Cargo.toml"),
+            &format!("[package]\nname='{dir}'\nversion='0.1.0'\nedition='2021'\n{rest}"),
+        );
+    }
+    for (path, text) in extra {
+        write(&root.join(path), text);
     }
     let path = std::env::var_os("PATH").unwrap_or_default();
     targo_tree(
@@ -794,8 +1118,20 @@ fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
         &["tree", "--workspace"],
     )
     .expect("cargo writes the lock");
-    let checkout = Committed::new(&root);
-    let picked = |selection: Selection| match selection {
+    (made, root)
+}
+
+/// A selection's members whose test, bench and example targets the lint compiles.
+fn all_targets(selection: &Selection) -> Vec<String> {
+    match selection {
+        Selection::Narrowed { all_targets, .. } => all_targets.clone(),
+        Selection::Widened(why) => panic!("widened: {why}"),
+    }
+}
+
+/// A selection's seeds, crates and alone seeds.
+fn picked(selection: Selection) -> (Vec<String>, Vec<String>, Vec<String>) {
+    match selection {
         Selection::Narrowed {
             seeds,
             crates,
@@ -803,7 +1139,144 @@ fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
             ..
         } => (seeds, crates, alone),
         Selection::Widened(why) => panic!("widened: {why}"),
+    }
+}
+
+/// End to end on a real checkout and graph: a change inside a member's test module, to a file
+/// only its tests mount, or to a comment no macro reads, plain or doc, selects that member alone;
+/// a change to a shipped line selects its dependents too, and so does a doc comment that moves the
+/// code after it, sits on a derived item or in a macro's body; a test-only change to a file
+/// another member embeds by a `../` literal keeps that reader in the cone with its own dependents
+/// but leaves the member's linkers out, and the reader stays whole when its own change is
+/// test-only. A member that spells another member's changed path observes it, whether that
+/// member is judged alone or whole: where its library spells it beside a member judged alone,
+/// whose two dependents are more than its one, as a seed with its dependents; where only its
+/// tests do, with all of its own targets alone, and so does a member whose tests mount the file
+/// that spells it; where a plain comment does, not at all; where a nested package under its
+/// folder that no member is spells it, as a seed with its dependents, since its tests may run
+/// that package; and where it spells two changed paths, one in its library and one in its tests,
+/// in either order, as the library spelling. Beside a member judged whole, whose dependents the
+/// cone walks already, a library spelling joins with its own rows and walks nothing. CONTROL: the
+/// test spelling of the pair alone walks nothing, a nested package under no member is no member's
+/// spelling, and a change gathered from no one tree keeps every dependent.
+#[test]
+fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
+    let services = "/// The tester.\npub fn tester() -> &'static str {\n    // The name.\n    \"tester\"\n}\n\n/// A record.\n#[derive(Debug)]\npub struct Record;\n\nmacro_rules! one {\n    () => {\n        // One.\n        1\n    };\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn names() {\n        assert_eq!(super::tester(), \"tester\");\n    }\n}\n";
+    let untested = "#[cfg(test)]\nmod tests {}\n";
+    let tested = "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n";
+    let reader = "pub const PEEK: &str = include_str!(\"../../a/src/peek.rs\");\npub const TEST_PEEK: &str = include_str!(\"../../a/tests/peek.rs\");\npub const NAMED: &str = \"crates/a/src/named.rs\";\n";
+    let recorder =
+        "[package]\nname = \"recorder\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n";
+    let recorded = |path: &str| {
+        format!(
+            "const SRC: &str = \"{path}\";\n\nfn main() {{\n    let _ = std::fs::read_to_string(SRC);\n}}\n"
+        )
     };
+    let owned = |files: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+        files
+            .iter()
+            .map(|(path, text)| (*path, (*text).to_string()))
+            .collect()
+    };
+    let (made, root) = workspace(
+        "atv-changed-own-tests",
+        &[
+            (
+                "a",
+                "",
+                owned(&[
+                    (
+                        "src/lib.rs",
+                        "pub mod services;\n\n#[cfg(test)]\n#[path = \"lib_tests.rs\"]\nmod tests;\n",
+                    ),
+                    ("src/services.rs", services),
+                    ("src/lib_tests.rs", "#[test]\nfn one() {}\n"),
+                    ("src/peek.rs", untested),
+                    ("src/named.rs", untested),
+                    ("src/named_tests.rs", untested),
+                    ("src/named_support.rs", untested),
+                    ("src/named_comment.rs", untested),
+                    ("src/named_nested.rs", untested),
+                    ("src/named_outside.rs", untested),
+                    ("src/pair_a1.rs", untested),
+                    ("src/pair_a2.rs", untested),
+                    ("src/pair_b1.rs", untested),
+                    ("src/pair_b2.rs", untested),
+                    ("tests/integration.rs", "#[test]\nfn one() {}\n"),
+                    ("tests/peek.rs", "#[test]\nfn one() {}\n"),
+                ]),
+            ),
+            (
+                "b",
+                "[dependencies]\na={path='../a'}\n",
+                owned(&[("src/lib.rs", "pub use a::services::tester;\n")]),
+            ),
+            ("b2", "[dependencies]\na={path='../a'}\n", Vec::new()),
+            ("c", "", owned(&[("src/lib.rs", reader)])),
+            ("d", "[dependencies]\nc={path='../c'}\n", Vec::new()),
+            (
+                "n",
+                "",
+                owned(&[
+                    (
+                        "src/lib.rs",
+                        "#[cfg(test)]\nmod tests {\n    const NAMED: &str = \"crates/a/src/named_tests.rs\";\n}\n",
+                    ),
+                    ("tests/n.rs", "mod support;\n"),
+                    (
+                        "tests/support/mod.rs",
+                        "pub const NAMED: &str = \"crates/a/src/named_support.rs\";\n",
+                    ),
+                ]),
+            ),
+            (
+                "p",
+                "",
+                owned(&[("src/lib.rs", "// See crates/a/src/named_comment.rs.\n")]),
+            ),
+            (
+                "q",
+                "",
+                owned(&[(
+                    "tests/q.rs",
+                    "#[path = \"../../n/tests/support/mod.rs\"]\nmod support;\n",
+                )]),
+            ),
+            (
+                "o",
+                "",
+                owned(&[
+                    (
+                        "tests/run.rs",
+                        "#[test]\nfn run() {\n    let _ = \"tests/recorder\";\n}\n",
+                    ),
+                    ("tests/recorder/Cargo.toml", recorder),
+                    (
+                        "tests/recorder/src/main.rs",
+                        &recorded("crates/a/src/named_nested.rs"),
+                    ),
+                ]),
+            ),
+            ("od", "[dependencies]\no={path='../o'}\n", Vec::new()),
+            (
+                "t",
+                "",
+                owned(&[(
+                    "src/lib.rs",
+                    "pub const FIRST: &str = \"crates/a/src/pair_a1.rs\";\npub const LAST: &str = \"crates/a/src/pair_b2.rs\";\n\n#[cfg(test)]\nmod tests {\n    const SECOND: &str = \"crates/a/src/pair_a2.rs\";\n    const FIRST: &str = \"crates/a/src/pair_b1.rs\";\n}\n",
+                )]),
+            ),
+            ("u", "[dependencies]\nt={path='../t'}\n", Vec::new()),
+        ],
+        &[
+            ("tools/rec/Cargo.toml", recorder),
+            (
+                "tools/rec/src/main.rs",
+                &recorded("crates/a/src/named_outside.rs"),
+            ),
+        ],
+    );
+    let checkout = Committed::new(&root);
     let test_hunk = services.replace("\"tester\");", "\"probe\");");
     let tests = picked(checkout.change(&[("crates/a/src/services.rs", &test_hunk)]));
     let mounted =
@@ -823,6 +1296,29 @@ fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
         ("crates/c/src/lib.rs", &reader_tests),
     ]));
     let named = picked(checkout.change(&[("crates/a/src/named.rs", tested)]));
+    let named_shipped = checkout.change(&[("crates/a/src/named.rs", "pub fn x() {}\n")]);
+    let shipped_rows = all_targets(&named_shipped);
+    let named_shipped = picked(named_shipped);
+    let named_tests = checkout.change(&[("crates/a/src/named_tests.rs", tested)]);
+    let named_support = checkout.change(&[("crates/a/src/named_support.rs", tested)]);
+    let watched = [&named_tests, &named_support].map(all_targets);
+    let (named_tests, named_support) = (picked(named_tests), picked(named_support));
+    // `t` spells one of each pair in its library and the other in its tests, the library's
+    // first in one pair and last in the other: it observes each pair as the most of the two.
+    let pair_a = picked(checkout.change(&[
+        ("crates/a/src/pair_a1.rs", tested),
+        ("crates/a/src/pair_a2.rs", tested),
+    ]));
+    let pair_b = picked(checkout.change(&[
+        ("crates/a/src/pair_b1.rs", tested),
+        ("crates/a/src/pair_b2.rs", tested),
+    ]));
+    let pair_tests = checkout.change(&[("crates/a/src/pair_b1.rs", tested)]);
+    let pair_watched = all_targets(&pair_tests);
+    let pair_tests = picked(pair_tests);
+    let named_comment = picked(checkout.change(&[("crates/a/src/named_comment.rs", tested)]));
+    let named_nested = picked(checkout.change(&[("crates/a/src/named_nested.rs", tested)]));
+    let named_outside = picked(checkout.change(&[("crates/a/src/named_outside.rs", tested)]));
     let gathered = picked(checkout.gathered(&[("crates/a/src/services.rs", &test_hunk)]));
     let commented = |from: &str, to: &str| {
         picked(checkout.change(&[("crates/a/src/services.rs", &services.replace(from, to))]))
@@ -834,22 +1330,347 @@ fn a_test_only_change_on_a_real_checkout_selects_its_member_alone() {
     let in_macro = commented("// One.", "// The one.");
     let _ = std::fs::remove_dir_all(&made);
     let a = paths(&["a"]);
-    let ab = paths(&["a", "b"]);
+    let ab = paths(&["a", "b", "b2"]);
     let ac = paths(&["a", "c"]);
+    let acd = paths(&["a", "c", "d"]);
     assert_eq!(tests, (a.clone(), a.clone(), a.clone()));
     assert_eq!(mounted, (a.clone(), a.clone(), a.clone()));
     assert_eq!(integration, (a.clone(), a.clone(), a.clone()));
-    assert_eq!(integration_reader, (ac.clone(), ac.clone(), a.clone()));
+    assert_eq!(integration_reader, (ac.clone(), acd.clone(), a.clone()));
     assert_eq!(shipped, (a.clone(), ab.clone(), Vec::new()));
-    assert_eq!(embedded, (ac.clone(), ac.clone(), a.clone()));
-    assert_eq!(both, (ac.clone(), ac, a.clone()));
-    assert_eq!(named, (a.clone(), ab.clone(), Vec::new()));
+    assert_eq!(embedded, (ac.clone(), acd.clone(), a.clone()));
+    assert_eq!(both, (ac.clone(), acd.clone(), a.clone()));
+    // `c`'s library spells `named.rs`: walking `c` adds `d`, fewer than `a`'s `b` and `b2`, so
+    // `a` is alone and `c` is a seed whose dependent `d` is walked; `b` and `b2` are not.
+    assert_eq!(named, (ac.clone(), acd, a.clone()));
+    // A seed whose own change reaches its dependents brings its namers too, with their own rows:
+    // `c` still spells the path, but the cone walks `a`'s dependents already, so `d` stays out.
+    assert_eq!(
+        named_shipped,
+        (a.clone(), paths(&["a", "b", "b2", "c"]), Vec::new())
+    );
+    assert_eq!(shipped_rows, ac);
+    assert_eq!(named_tests, (a.clone(), paths(&["a", "n"]), a.clone()));
+    // A member whose tests alone observe the path joins with all of its targets.
+    assert_eq!(watched, [paths(&["a", "n"]), paths(&["a", "n", "q"])]);
+    let at = paths(&["a", "t"]);
+    let atu = paths(&["a", "t", "u"]);
+    assert_eq!(pair_a, (at.clone(), atu.clone(), a.clone()));
+    assert_eq!(pair_b, (at.clone(), atu, a.clone()));
+    // CONTROL: the test spelling alone adds `t` with its rows and walks nothing.
+    assert_eq!(pair_tests, (a.clone(), at.clone(), a.clone()));
+    assert_eq!(pair_watched, at);
+    // `q`'s tests mount the file of `n` that spells the path: a reader, judged where it compiles.
+    assert_eq!(
+        named_support,
+        (
+            paths(&["a", "q"]),
+            paths(&["a", "n", "q"]),
+            paths(&["a", "q"])
+        )
+    );
+    assert_eq!(named_comment, (a.clone(), a.clone(), a.clone()));
+    // `o`'s test runs a nested package no member is, whose code reads the path it spells: that
+    // package is `o`'s, so `o` is a seed and `od`, which links it, is walked.
+    assert_eq!(
+        named_nested,
+        (paths(&["a", "o"]), paths(&["a", "o", "od"]), a.clone())
+    );
+    // CONTROL: the same package under no member is no member's spelling.
+    assert_eq!(named_outside, (a.clone(), a.clone(), a.clone()));
     assert_eq!(doc, (a.clone(), a.clone(), a.clone()));
     assert_eq!(plain, (a.clone(), a.clone(), a.clone()));
     for control in [shifted, derived, in_macro] {
         assert_eq!(control, (a.clone(), ab.clone(), Vec::new()));
     }
     assert_eq!(gathered, (a, ab, Vec::new()));
+}
+
+/// End to end: a member that reads another's changed file only from its benches, examples or
+/// tests is judged alone with its own rows, and so is one whose test mounts a file of a nested
+/// package no member owns, with or without a `../`; one whose library or build script reads it
+/// keeps its dependents, and so does one whose nested package holds a reader of it. A
+/// file a foreign `#[path]` mount compiles through the mounted file's own declarations, its
+/// test-only ones among them, makes the mounter a reader as the mounted file does, and a
+/// declaration of that file whose default file is not there names only its own default files.
+/// A test that embeds a module file by `include_str!` reads only that file's bytes, so it is no
+/// reader of the module's children nor of a default file the module names: deleting one leaves
+/// the embedder out. CONTROL: the member that owns the mounted file judges its own change by its
+/// own placement, a library reader brings its dependent, a bench's `include_str!` of a file
+/// outside every member reaches the bench's member alone, a test that mounts the same module
+/// file by `#[path]` is a reader of the default file deleted under it, and the nested package's
+/// copy under no member is no member's. A nested package's reader of its enclosing member's own
+/// test-only file adds nothing to that member's own judgment, which stays alone; one that reads
+/// another member's file, or a source that spells another member's changed path, makes the
+/// enclosing member observe that path, joining with its own rows where its member is whole.
+#[test]
+fn a_member_whose_reads_reach_only_its_own_targets_is_judged_alone() {
+    let mount = |path: &str| format!("#[path = \"{path}\"]\nmod support;\n");
+    let support = "../../a/benches/support/mod.rs";
+    let support_mods = "mod timing;\n#[cfg(test)]\nmod t;\n";
+    let nested_package = "[package]\nname='gen'\nversion='0.1.0'\nedition='2021'\n\n[workspace]\n";
+    let (made, root) = workspace(
+        "atv-changed-readers",
+        &[
+            (
+                "a",
+                "",
+                vec![
+                    (
+                        "src/lib.rs",
+                        "#[cfg(all(test, unix))]\n#[path = \"../benches/support/mod.rs\"]\npub mod runner;\n".to_string(),
+                    ),
+                    (
+                        "benches/support/mod.rs",
+                        format!("/// Doc.\npub fn run() {{}}\n{support_mods}"),
+                    ),
+                    ("benches/support/timing.rs", "pub fn now() {}\n".to_string()),
+                    ("benches/support/t.rs", "pub fn t() {}\n".to_string()),
+                ],
+            ),
+            (
+                "r",
+                "\n[[bench]]\nname = \"x\"\nharness = false\n",
+                vec![(
+                    "benches/x.rs",
+                    format!(
+                        "{}const S: &str = include_str!(\"../../../tools/s.sh\");\nfn main() {{}}\n",
+                        mount(support)
+                    ),
+                )],
+            ),
+            ("d", "[dependencies]\nr={path='../r'}\n", Vec::new()),
+            (
+                "l",
+                "",
+                vec![(
+                    "src/lib.rs",
+                    format!("#[path = \"{support}\"]\npub mod support;\n"),
+                )],
+            ),
+            ("e", "[dependencies]\nl={path='../l'}\n", Vec::new()),
+            (
+                "k",
+                "",
+                vec![(
+                    "build.rs",
+                    format!(
+                        "{}fn main() {{\n    println!(\"cargo:rerun-if-changed=build.rs\");\n}}\n",
+                        mount("../a/benches/support/mod.rs")
+                    ),
+                )],
+            ),
+            (
+                "w",
+                "",
+                vec![
+                    ("tests/s.rs", "#[path = \"../gen/src/g.rs\"]\nmod g;\n".to_string()),
+                    ("gen/Cargo.toml", nested_package.to_string()),
+                    ("gen/src/g.rs", "pub fn g() {}\n".to_string()),
+                ],
+            ),
+            (
+                "g",
+                "",
+                vec![
+                    ("src/lib.rs", "pub mod page;\npub mod part;\n".to_string()),
+                    ("src/part.rs", "pub fn part() {}\n".to_string()),
+                    ("src/page.rs", "mod inner;\nmod part;\n".to_string()),
+                    ("src/page/inner.rs", "pub fn inner() {}\n".to_string()),
+                    ("src/page/part.rs", "pub fn part() {}\n".to_string()),
+                ],
+            ),
+            (
+                "m",
+                "",
+                vec![(
+                    "tests/m.rs",
+                    "const P: &str = include_str!(\"../../g/src/page.rs\");\n".to_string(),
+                )],
+            ),
+            (
+                "q",
+                "",
+                vec![(
+                    "tests/q.rs",
+                    "#[path = \"../../g/src/page.rs\"]\nmod page;\n".to_string(),
+                )],
+            ),
+            (
+                "u",
+                "",
+                vec![
+                    ("tests/s.rs", "#[path = \"gen/src/g.rs\"]\nmod g;\n".to_string()),
+                    ("tests/gen/Cargo.toml", nested_package.to_string()),
+                    ("tests/gen/src/g.rs", "pub fn g() {}\n".to_string()),
+                    (
+                        "tests/gen/src/peek.rs",
+                        "pub const S: &str = include_str!(\"../../../../../tools/s.sh\");\n"
+                            .to_string(),
+                    ),
+                ],
+            ),
+            (
+                "y",
+                "",
+                vec![
+                    (
+                        "src/lib.rs",
+                        "#[cfg(test)]\n#[path = \"../tests/oracle/corpus.rs\"]\nmod corpus;\n"
+                            .to_string(),
+                    ),
+                    ("tests/oracle/corpus.rs", "pub fn c() {}\n".to_string()),
+                    ("tests/recorder/Cargo.toml", nested_package.to_string()),
+                    (
+                        "tests/recorder/src/main.rs",
+                        "#[path = \"../../oracle/corpus.rs\"]\nmod corpus;\n#[path = \"../../../../z/src/lib.rs\"]\nmod z;\n#[path = \"../../../../v/src/names.rs\"]\nmod names;\n\nfn main() {}\n"
+                            .to_string(),
+                    ),
+                ],
+            ),
+            ("yd", "[dependencies]\ny={path='../y'}\n", Vec::new()),
+            (
+                "z",
+                "",
+                vec![
+                    ("src/lib.rs", "pub fn z() {}\n".to_string()),
+                    ("data/table.txt", "one\n".to_string()),
+                ],
+            ),
+            (
+                "v",
+                "",
+                vec![
+                    ("src/lib.rs", "pub mod names;\n".to_string()),
+                    (
+                        "src/names.rs",
+                        "pub const TABLE: &str = \"crates/z/data/table.txt\";\n".to_string(),
+                    ),
+                ],
+            ),
+        ],
+        &[
+            ("tools/s.sh", "#!/bin/sh\n"),
+            ("tools/gen/Cargo.toml", nested_package),
+            ("tools/gen/src/g.rs", "pub fn g() {}\n"),
+        ],
+    );
+    let checkout = Committed::new(&root);
+    let doc = picked(checkout.change(&[(
+        "crates/a/benches/support/mod.rs",
+        &format!("/// The doc.\npub fn run() {{}}\n{support_mods}"),
+    )]));
+    let script = picked(checkout.change(&[("tools/s.sh", "#!/bin/sh\nexit 0\n")]));
+    let nested = picked(checkout.change(&[(
+        "crates/a/benches/support/timing.rs",
+        "pub fn now() { let _ = 1; }\n",
+    )]));
+    let nested_test = picked(checkout.change(&[(
+        "crates/a/benches/support/t.rs",
+        "pub fn t() { let _ = 1; }\n",
+    )]));
+    let generated = picked(checkout.change(&[("crates/w/gen/src/g.rs", "pub fn g() { }\n")]));
+    let below = picked(checkout.change(&[("crates/u/tests/gen/src/g.rs", "pub fn g() { }\n")]));
+    let outside = picked(checkout.change(&[("tools/gen/src/g.rs", "pub fn g() { }\n")]));
+    let child = picked(checkout.change(&[("crates/g/src/page/inner.rs", "pub fn inner() { }\n")]));
+    let deleted = picked(checkout.deleted(&["crates/g/src/part.rs"]));
+    let own_oracle =
+        picked(checkout.change(&[("crates/y/tests/oracle/corpus.rs", "pub fn c() { }\n")]));
+    let foreign = picked(checkout.change(&[("crates/z/src/lib.rs", "pub fn z() { }\n")]));
+    let spelled = picked(checkout.change(&[("crates/z/data/table.txt", "two\n")]));
+    let _ = std::fs::remove_dir_all(&made);
+    let (seeds, crates) = (
+        paths(&["a", "k", "l", "r"]),
+        paths(&["a", "e", "k", "l", "r"]),
+    );
+    assert_eq!(doc, (seeds.clone(), crates.clone(), paths(&["a", "r"])));
+    // `u`'s nested package reads the script too: no declaration of `u` places that reader, which
+    // `u`'s tests may build and run, so `u` is a seed with its dependents.
+    assert_eq!(
+        script,
+        (paths(&["r", "u"]), paths(&["r", "u"]), paths(&["r"]))
+    );
+    assert_eq!(nested, (seeds.clone(), crates.clone(), paths(&["a", "r"])));
+    // A test build of each mounter compiles the mounted file's `#[cfg(test)]` child.
+    assert_eq!(nested_test, (seeds, crates, paths(&["a", "r"])));
+    assert_eq!(generated, (paths(&["w"]), paths(&["w"]), paths(&["w"])));
+    // A mount with no `../` reads its member's nested package as well.
+    assert_eq!(below, (paths(&["u"]), paths(&["u"]), paths(&["u"])));
+    // CONTROL: the same package under no member is no member's.
+    assert_eq!(outside, (Vec::new(), Vec::new(), Vec::new()));
+    assert_eq!(child, (paths(&["g"]), paths(&["g"]), Vec::new()));
+    // `m` embeds `page.rs` and `q` mounts it: `page.rs`'s `mod part;` names `part.rs` beside it,
+    // which only the mount compiles.
+    assert_eq!(
+        deleted,
+        (paths(&["g", "q"]), paths(&["g", "q"]), paths(&["q"]))
+    );
+    // `y`'s recorder mounts the oracle file `y`'s own tests mount: no dependent of `y` reads it.
+    assert_eq!(own_oracle, (paths(&["y"]), paths(&["y"]), paths(&["y"])));
+    // The recorder mounts `z`'s library, whose change keeps `z` whole: `y` joins with its rows.
+    assert_eq!(foreign, (paths(&["z"]), paths(&["y", "z"]), Vec::new()));
+    // The recorder mounts `v`'s source that spells `z`'s changed table: `y` observes the table,
+    // as `v`, which spells it, does.
+    assert_eq!(
+        spelled,
+        (paths(&["z"]), paths(&["v", "y", "z"]), Vec::new())
+    );
+}
+
+/// End to end: a foreign file a test mounts whose declarations this reader cannot settle (one
+/// inside an inline module) makes its mounter a reader of any change in that file's package, and
+/// one in no package makes its mounter a reader of any change at all. CONTROL: a mounted file of
+/// the same package whose closure settles, and holds no changed path, makes its mounter no
+/// reader, and a change outside the unsettled file's package makes its mounter none either.
+#[test]
+fn a_mounted_file_this_reader_cannot_settle_reads_its_whole_package() {
+    let mount = |path: &str, name: &str| format!("#[path = \"{path}\"]\nmod {name};\n");
+    let shim = "mod inner {\n    mod deep;\n}\n";
+    let deep = "pub fn d() {}\n";
+    let (made, root) = workspace(
+        "atv-changed-unsettled",
+        &[
+            (
+                "h",
+                "",
+                vec![
+                    (
+                        "src/lib.rs",
+                        "pub mod other;\npub mod plain;\npub mod shim;\n".to_string(),
+                    ),
+                    ("src/other.rs", "pub fn o() {}\n".to_string()),
+                    ("src/plain.rs", "pub fn p() {}\n".to_string()),
+                    ("src/shim.rs", shim.to_string()),
+                    ("src/shim/inner/deep.rs", deep.to_string()),
+                ],
+            ),
+            (
+                "j",
+                "",
+                vec![("tests/j.rs", mount("../../h/src/shim.rs", "shim"))],
+            ),
+            (
+                "s",
+                "",
+                vec![("tests/s.rs", mount("../../h/src/plain.rs", "plain"))],
+            ),
+            (
+                "v",
+                "",
+                vec![("tests/v.rs", mount("../../../tools/shim.rs", "shim"))],
+            ),
+            ("x", "", Vec::new()),
+        ],
+        &[("tools/shim.rs", shim), ("tools/shim/inner/deep.rs", deep)],
+    );
+    let checkout = Committed::new(&root);
+    let package = picked(checkout.change(&[("crates/h/src/other.rs", "pub fn o() { }\n")]));
+    let elsewhere = picked(checkout.change(&[("crates/x/src/lib.rs", "pub fn x() {}\n")]));
+    let _ = std::fs::remove_dir_all(&made);
+    let hjv = paths(&["h", "j", "v"]);
+    assert_eq!(package, (hjv.clone(), hjv, paths(&["j", "v"])));
+    let vx = paths(&["v", "x"]);
+    assert_eq!(elsewhere, (vx.clone(), vx, paths(&["v"])));
 }
 
 fn narrowed(sel: &Selection) -> (Vec<String>, Vec<String>) {
@@ -1242,6 +2063,16 @@ impl<'a> Committed<'a> {
         })
     }
 
+    /// What [`resolve`] selects with `files` deleted from the working tree.
+    fn deleted(&self, files: &[&str]) -> Selection {
+        for file in files {
+            std::fs::remove_file(self.root.join(file)).expect("the deletion");
+        }
+        let selection = resolve(self.root, &self.tools, &self.path, "base");
+        self.git(&["checkout", "-q", "--", "."]);
+        selection
+    }
+
     fn written(&self, files: &[(&str, &str)], select: impl FnOnce() -> Selection) -> Selection {
         for (file, text) in files {
             std::fs::write(self.root.join(file), text).expect("the change");
@@ -1421,12 +2252,14 @@ fn a_seed_this_hosts_graph_does_not_hold_widens() {
     let pick = |dependents: &dyn Fn(&str) -> Option<Vec<String>>| {
         super::select(
             &paths(&["Cargo.lock"]),
+            &BTreeSet::new(),
             &manifests(),
             &m,
             &no_packages,
             &|name| dependents(name).map(linking),
             &|_| row.clone(),
             &|_, _| false,
+            &BTreeMap::new,
         )
     };
     for answer in [vec![], vec!["offhost".to_string()]] {
@@ -1454,6 +2287,7 @@ fn a_root_lint_config_widens_and_a_members_own_selects_that_member() {
     let pick = |changed: &str| {
         super::select(
             &paths(&[changed]),
+            &BTreeSet::new(),
             &manifests(),
             &m,
             &no_packages,
@@ -1468,6 +2302,7 @@ fn a_root_lint_config_widens_and_a_members_own_selects_that_member() {
                 )
             },
             &|_, _| false,
+            &BTreeMap::new,
         )
     };
     for config in ["clippy.toml", ".clippy.toml", "rust-toolchain"] {
@@ -1766,6 +2601,120 @@ fn shared_source_and_asset_consumers_join_the_change_cone_transitively() {
     std::fs::remove_dir_all(repo).unwrap();
 }
 
+/// A member's spec table is no member's ([`owning_member`]), so a source that spells one is no
+/// namer of it: no build, include or test reads one. CONTROL: the same source spelling a source
+/// file of that member is its namer.
+#[test]
+fn a_spelled_spec_table_makes_no_namer() {
+    let repo = crate::mktemp_dir("atv-spelled-specs").expect("mktemp");
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let write = |path: &str, text: &str| {
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    };
+    write("crates/x/SPECS.md", "# x\n");
+    write("crates/x/src/lib.rs", "pub fn x() {}\n");
+    write(
+        "crates/y/src/lib.rs",
+        "pub const SPEC: &str = \"crates/x/SPECS.md\";\npub const LIB: &str = \"crates/x/src/lib.rs\";\n",
+    );
+    assert!(
+        git(&repo, &path_env)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let m = members(&["x", "y"]);
+    let listed = listed_files(&repo, &path_env).expect("the fixture lists");
+    let namers = |changed: &str| -> Vec<String> {
+        with_shared_inputs(&repo, &listed, paths(&[changed]), &m)
+            .unwrap()
+            .named
+            .into_keys()
+            .collect()
+    };
+    let spec = namers("crates/x/SPECS.md");
+    let lib = namers("crates/x/src/lib.rs");
+    std::fs::remove_dir_all(&repo).unwrap();
+    assert!(spec.is_empty(), "{spec:?}");
+    assert_eq!(lib, ["y"]);
+}
+
+/// A build script's `rerun-if-changed` value that names a directory, with no trailing `/`, reads
+/// every file under it, as Cargo watches it and the seed's own build inputs read it; and so does
+/// a `#[path]` on an inline module, whose `mod y;` loads from the directory it names. CONTROL: a
+/// value that names an existing file reads no path under that name, and a plain literal naming
+/// the same directory still names one file.
+#[test]
+fn a_declared_or_mounted_directory_reads_every_file_under_it() {
+    let repo = crate::mktemp_dir("atv-declared-folder").expect("mktemp");
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let write = |path: &str, text: &str| {
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, text).unwrap();
+    };
+    let script = |value: &str| {
+        format!("fn main() {{\n    println!(\"cargo:rerun-if-changed={value}\");\n}}\n")
+    };
+    write("crates/a/assets/t.txt", "t\n");
+    write("crates/a/data", "d\n");
+    write("crates/b/src/y.rs", "pub fn y() {}\n");
+    write("crates/k/build.rs", &script("../a/assets"));
+    write("crates/j/build.rs", &script("../a/data"));
+    write(
+        "crates/h/src/lib.rs",
+        "#[path = \"../../b/src\"]\nmod shim {\n    mod y;\n}\n",
+    );
+    write(
+        "crates/g/src/lib.rs",
+        "pub const SRC: &str = \"../../b/src\";\n",
+    );
+    assert!(
+        git(&repo, &path_env)
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let m = members(&["a", "b", "g", "h", "j", "k"]);
+    let listed = listed_files(&repo, &path_env).expect("the fixture lists");
+    let readers = |changed: &str| -> Vec<String> {
+        with_shared_inputs(&repo, &listed, paths(&[changed]), &m)
+            .unwrap()
+            .readers
+            .into_iter()
+            .collect()
+    };
+    let asset = readers("crates/a/assets/t.txt");
+    let under_file = readers("crates/a/data/x");
+    let module = readers("crates/b/src/y.rs");
+    std::fs::remove_dir_all(&repo).unwrap();
+    assert_eq!(asset, ["crates/k/build.rs"]);
+    assert!(under_file.is_empty(), "{under_file:?}");
+    assert_eq!(module, ["crates/h/src/lib.rs"]);
+}
+
+/// Whether `text`, the source at `source` of the member at `member`, a folder no other package
+/// sits under, reads one of `changed` from outside it ([`literal_targets`],
+/// [`changed_inputs`]).
+fn shares(
+    source: &Path,
+    text: &str,
+    member: &Path,
+    changed: &BTreeSet<std::path::PathBuf>,
+) -> bool {
+    changed_inputs(
+        &literal_targets(source, text, member, false),
+        &|target| target.starts_with(member),
+        changed,
+    )
+    .next()
+    .is_some()
+}
+
 #[test]
 fn a_directory_literal_seeds_its_consumer() {
     let root = Path::new("/repo");
@@ -1774,13 +2723,13 @@ fn a_directory_literal_seeds_its_consumer() {
     let build = member.join("build.rs");
     let test = member.join("src/tests.rs");
     let folder = "let pack = dir.join(\"../../contrib/themes/pack/\");";
-    assert!(shares_changed_input(&build, folder, &member, &changed));
-    assert!(shares_changed_input(&test, folder, &member, &changed));
+    assert!(shares(&build, folder, &member, &changed));
+    assert!(shares(&test, folder, &member, &changed));
     let path = "let pack = dir.join(\"../../contrib/themes/pack\");";
-    assert!(!shares_changed_input(&build, path, &member, &changed));
-    assert!(!shares_changed_input(&test, path, &member, &changed));
+    assert!(!shares(&build, path, &member, &changed));
+    assert!(!shares(&test, path, &member, &changed));
     let elsewhere = BTreeSet::from([root.join("contrib/fonts/x.ttf")]);
-    assert!(!shares_changed_input(&build, folder, &member, &elsewhere));
+    assert!(!shares(&build, folder, &member, &elsewhere));
 }
 
 /// A literal that continues the manifest directory, by `concat!` or a format argument, names
@@ -1805,7 +2754,7 @@ fn a_literal_that_continues_the_manifest_dir_starts_at_the_member() {
     ] {
         for source in [&test, &lib] {
             assert!(
-                shares_changed_input(source, text, &member, &changed),
+                shares(source, text, &member, &changed),
                 "{text} in {}",
                 source.display()
             );
@@ -1815,21 +2764,16 @@ fn a_literal_that_continues_the_manifest_dir_starts_at_the_member() {
     let continued = "concat!(dir, \"/../../b/x\");";
     let relative = "include_str!(\"../../b/x\");";
     let above = BTreeSet::from([root.join("b/x")]);
-    assert!(shares_changed_input(&lib, relative, &member, &changed));
-    assert!(shares_changed_input(&lib, relative, &member, &above));
-    assert!(!shares_changed_input(&lib, continued, &member, &changed));
-    assert!(shares_changed_input(&lib, continued, &member, &above));
+    assert!(shares(&lib, relative, &member, &changed));
+    assert!(shares(&lib, relative, &member, &above));
+    assert!(!shares(&lib, continued, &member, &changed));
+    assert!(shares(&lib, continued, &member, &above));
 
     let under_a_folder = BTreeSet::from([root.join("crates/b/steps/one.jsonl")]);
     let folder = "concat!(dir, \"/../b/steps/\");";
     let no_slash = "concat!(dir, \"/../b/steps\");";
-    assert!(shares_changed_input(&lib, folder, &member, &under_a_folder));
-    assert!(!shares_changed_input(
-        &lib,
-        no_slash,
-        &member,
-        &under_a_folder
-    ));
+    assert!(shares(&lib, folder, &member, &under_a_folder));
+    assert!(!shares(&lib, no_slash, &member, &under_a_folder));
 
     for text in [
         "concat!(dir, \"/../c/x\");",
@@ -1838,10 +2782,114 @@ fn a_literal_that_continues_the_manifest_dir_starts_at_the_member() {
         "format!(\"{}../b/x\", dir);",
         "format!(\"{{}}/../b/x\");",
     ] {
+        assert!(!shares(&test, text, &member, &changed), "{text}");
+    }
+}
+
+/// A literal names what rustc or Cargo resolves it to: a build script's
+/// `cargo:rerun-if-changed=` value from its package, and a `#[path]` inside inline modules from a
+/// folder below the source's, which takes up leading `..` segments. CONTROL: no target keeps the
+/// key, a value under any other key names nothing that changed, the inline literal resolved from
+/// the source's folder or the member alone names another path, and a path that stays in the
+/// member is no read of another's.
+#[test]
+fn a_literal_names_what_rustc_and_cargo_resolve_it_to() {
+    let root = Path::new("/repo");
+    let member = root.join("crates/m");
+    let (script, lib) = (member.join("build.rs"), member.join("src/lib.rs"));
+    let changed = BTreeSet::from([root.join("crates/t/src/x.rs")]);
+    for key in ["cargo:rerun-if-changed=", "cargo::rerun-if-changed="] {
+        let declared = format!("println!(\"{key}../t/src/x.rs\");");
+        assert!(shares(&script, &declared, &member, &changed), "{declared}");
+        let targets = literal_targets(&script, &declared, &member, false);
         assert!(
-            !shares_changed_input(&test, text, &member, &changed),
-            "{text}"
+            targets
+                .iter()
+                .all(|target| !target.path.to_string_lossy().contains("rerun-if-changed")),
+            "the key is no part of any path: {targets:?}"
         );
+    }
+    let other = "println!(\"other:rerun-if-changed=../t/src/x.rs\");";
+    assert!(
+        !shares(&script, other, &member, &changed),
+        "only Cargo's own key is dropped"
+    );
+    let inline = "mod shim {\n    #[path = \"../../../t/src/x.rs\"]\n    mod x;\n}\n";
+    assert!(shares(&lib, inline, &member, &changed));
+    let from_folder = literal_targets(&lib, inline, &member, false);
+    assert!(
+        from_folder
+            .iter()
+            .any(|target| target.path == root.join("crates/t/src/x.rs")),
+        "{from_folder:?}"
+    );
+    assert_eq!(
+        from_folder[..2]
+            .iter()
+            .map(|target| target.path.clone())
+            .collect::<Vec<_>>(),
+        [
+            root.join("t/src/x.rs"),
+            Path::new("/t/src/x.rs").to_path_buf()
+        ],
+        "the source's folder and the member name other paths"
+    );
+    let stays = "#[path = \"../src/y.rs\"]\nmod y;\n";
+    assert!(!shares(
+        &lib,
+        stays,
+        &member,
+        &BTreeSet::from([member.join("src/y.rs")])
+    ));
+}
+
+/// Only a `#[path]` value or an `include!` argument hands rustc a module file, whose own
+/// declarations make its mounter a reader of their files; an `include_str!` or `include_bytes!`
+/// argument and a run-time literal read only the file they name. A literal this reader cannot
+/// tell from a module's path (in a comment, a `concat!` piece of an `include!`, or anywhere in a
+/// file whose declaration paths it cannot settle) may be one. CONTROL: the same plain literal
+/// beside a `cfg_attr` path is a module's.
+#[test]
+fn only_a_path_or_include_literal_names_a_module() {
+    let root = Path::new("/repo");
+    let member = root.join("crates/m");
+    let lib = member.join("src/lib.rs");
+    let module = |text: &str| -> Vec<bool> {
+        let mut seen: Vec<bool> = literal_targets(&lib, text, &member, false)
+            .iter()
+            .map(|target| target.module)
+            .collect();
+        seen.dedup();
+        seen
+    };
+    for (text, want) in [
+        ("#[path = \"../../t/src/x.rs\"]\nmod x;\n", true),
+        ("include!(\"../../t/src/x.rs\");\n", true),
+        (
+            "include!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../t/src/x.rs\"));\n",
+            true,
+        ),
+        ("include!(concat!(\"../../t/\", \"src/x.rs\"));\n", true),
+        ("// See \"../../t/src/x.rs\".\n", true),
+        (
+            "const X: &str = include_str!(\"../../t/src/x.rs\");\n",
+            false,
+        ),
+        (
+            "const X: &[u8] = include_bytes!(concat!(env!(\"CARGO_MANIFEST_DIR\"), \"/../t/src/x.rs\"));\n",
+            false,
+        ),
+        ("const X: &str = \"../../t/src/x.rs\";\n", false),
+        (
+            "const X: &str = \"../../t/src/x.rs\";\n#[path = \"../../t/src/x.rs\"]\nmod x;\n",
+            true,
+        ),
+        (
+            "const X: &str = \"../../t/src/x.rs\";\n#[cfg_attr(unix, path = \"u.rs\")]\nmod u;\n",
+            true,
+        ),
+    ] {
+        assert_eq!(module(text), [want], "{text}");
     }
 }
 
@@ -1861,21 +2909,19 @@ fn a_bare_parent_literal_seeds_nothing() {
         "format!(\"{}/../\", dir);",
         "format!(\"{dir}/../../\");",
     ] {
-        assert!(
-            !shares_changed_input(&lib, text, &member, &changed),
-            "{text}"
-        );
+        assert!(!shares(&lib, text, &member, &changed), "{text}");
     }
     let named = "let y = dir.join(\"../y/\");";
-    assert!(shares_changed_input(&lib, named, &member, &changed));
+    assert!(shares(&lib, named, &member, &changed));
 }
 
-/// The trie finds exactly the paths `text.contains` finds: nested and overlapping paths, a
-/// path repeated in the list, one that only a later start spells, prefixes that never
-/// complete, and text around multi-byte characters.
+/// The trie finds exactly the paths `text.contains` finds, each at every offset it starts at:
+/// nested and overlapping paths, a path repeated in the list, one that only a later start spells,
+/// prefixes that never complete, and text around multi-byte characters.
 ///
 /// NEGATIVE CONTROL: walk from the first byte only, or report only the deepest path of a
-/// walk, and `b/c` or `a` goes missing from what this asserts.
+/// walk, and `b/c` or `a` goes missing from what this asserts; record one offset per path and
+/// `aaaa/b/c` holds `a` once, not four times.
 #[test]
 fn the_path_trie_finds_what_contains_finds() {
     let paths = [
@@ -1906,8 +2952,22 @@ fn the_path_trie_finds_what_contains_finds() {
             .filter(|(_, p)| text.contains(*p))
             .map(|(i, _)| i)
             .collect();
-        assert_eq!(trie.contained(text), want, "{text:?}");
+        let found = trie.found(text);
+        assert_eq!(
+            found.keys().copied().collect::<BTreeSet<_>>(),
+            want,
+            "{text:?}"
+        );
+        for (index, offsets) in &found {
+            let path = paths[*index];
+            let every: Vec<usize> = (0..text.len())
+                .filter(|&at| text.is_char_boundary(at) && text[at..].starts_with(path))
+                .collect();
+            assert_eq!(offsets, &every, "{path} in {text:?}");
+        }
     }
+    assert_eq!(trie.found("aaaa/b/c")[&0], [0, 1, 2, 3]);
+    assert_eq!(trie.found("aaaa/b/c")[&1], [3]);
 }
 
 /// The set lookups answer what the scan over every changed path answered: a changed path at
@@ -1973,7 +3033,7 @@ fn changed_set_lookups_match_the_scan_they_replace() {
         let changed: BTreeSet<_> = list.iter().cloned().collect();
         for text in texts {
             assert_eq!(
-                shares_changed_input(&lib, text, &member, &changed),
+                shares(&lib, text, &member, &changed),
                 scan(text, &list),
                 "{text} with {set:?}"
             );

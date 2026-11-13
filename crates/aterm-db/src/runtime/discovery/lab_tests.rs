@@ -185,7 +185,7 @@ fn another_labs_beacon_from_a_peers_address_is_no_kin() {
         let now = Instant::now();
         let mut node = fresh(1);
         let host: SocketAddr = "10.1.6.6:5000".parse().unwrap();
-        node.vouch(host.ip(), [7; 48], now);
+        node.vouch(host.ip(), [7; 48], false, now);
         with(&UNTAGGED, untagged, || {
             node.observe(&beacon(Some(OTHER), 5, host.port()), host, now);
         });
@@ -247,7 +247,7 @@ fn forged_tags_lead_one_dial_per_address_and_a_stall_keeps_its_lead() {
             "it waits its turn"
         );
         // A peer authenticates from there: its tagged ports lead again, as kin.
-        node.vouch(forged(2001).ip(), [7; 48], now);
+        node.vouch(forged(2001).ip(), [7; 48], false, now);
         assert_eq!(node.peers[&forged(2001)].lead(), Lead::Kin);
 
         // Forged beacons at a real peer's endpoint: another lab's tag is dropped, and one naming

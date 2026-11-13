@@ -421,3 +421,96 @@ fn roundtrip_scrollback_fills() {
     assert_eq!(visible_text(&rebuilt)[0], "visible0");
     assert_eq!(visible_text(&rebuilt)[2], "visible2");
 }
+
+/// The visible rows' facts are the line sizes and the protected runs, a wide
+/// glyph's spacer is protected only with its lead, and the Lines carry neither.
+#[test]
+fn visible_cells_carry_line_sizes_and_protected_runs() {
+    use crate::LineSize;
+    let (fg, bg) = (PackedColor::DEFAULT_FG, PackedColor::DEFAULT_BG);
+    let wide = |flags| Cell::with_style('世', fg, bg, flags);
+    let spacer = Cell::with_style(' ', fg, bg, CellFlags::WIDE_CONTINUATION);
+    let mut g = Grid::new(4, 10);
+    write_text(&mut g, 0, "plain");
+    g.set_cell(1, 0, wide(CellFlags::WIDE));
+    g.set_cell(1, 1, spacer);
+    g.set_cell(2, 0, wide(CellFlags::WIDE.union(CellFlags::PROTECTED)));
+    g.set_cell(2, 1, spacer);
+    g.set_cell(2, 2, Cell::new('x'));
+    write_text(&mut g, 3, "ab");
+    if let Some(row) = g.row_mut(3) {
+        if let Some(cell) = row.get_mut(1) {
+            cell.set_flags(cell.flags().union(CellFlags::PROTECTED));
+        }
+        row.set_line_size(LineSize::DoubleWidth);
+    }
+
+    let cells = g.checkpoint_visible_cells();
+    assert_eq!(cells.protected, vec![(2, 0, 2), (3, 1, 2)]);
+    assert_eq!(cells.line_sizes, vec![(3, LineSize::DoubleWidth)]);
+
+    let mut back = Grid::new(4, 10);
+    back.restore_visible_from_lines(&g.checkpoint_visible_lines());
+    assert!(
+        back.checkpoint_visible_cells().is_empty(),
+        "NEGATIVE CONTROL: the Lines carry neither fact"
+    );
+    back.restore_visible_cells(&cells);
+    assert_eq!(back.checkpoint_visible_cells(), cells);
+}
+
+/// A crafted list (out of order, overlapping, out of the grid) is applied
+/// where it fits and skipped where it does not, and the cells keep their text.
+#[test]
+fn crafted_visible_cells_apply_where_they_fit() {
+    use crate::LineSize;
+    let lines = [
+        plain_line("abcdef"),
+        plain_line("ghijkl"),
+        plain_line("mnopqr"),
+    ];
+    let cells = VisibleCells {
+        line_sizes: vec![
+            (1, LineSize::DoubleWidth),
+            (1, LineSize::DoubleHeightTop),
+            (0, LineSize::DoubleWidth),
+            (9, LineSize::DoubleWidth),
+        ],
+        protected: vec![
+            (0, 1, 3),
+            (0, 2, 5),
+            (0, 4, u16::MAX),
+            (2, 0, 1),
+            (1, 0, 2),
+            (7, 0, 2),
+        ],
+    };
+    let mut g = Grid::new(3, 8);
+    g.restore_visible_from_lines(&lines);
+    g.restore_visible_cells(&cells);
+
+    let sizes: Vec<_> = (0..3).map(|r| g.row(r).unwrap().line_size()).collect();
+    assert_eq!(
+        sizes,
+        [
+            LineSize::SingleWidth,
+            LineSize::DoubleWidth,
+            LineSize::SingleWidth,
+        ]
+    );
+    let protected: Vec<(u16, u16)> = (0..3)
+        .flat_map(|r| (0..8).map(move |c| (r, c)))
+        .filter(|&(r, c)| g.row(r).unwrap().is_cell_protected(c))
+        .collect();
+    assert_eq!(
+        protected,
+        [(0, 1), (0, 2), (0, 4), (0, 5), (0, 6), (0, 7), (2, 0)]
+    );
+    let text: Vec<String> = (0..3)
+        .map(|r| {
+            let row = g.row(r).unwrap();
+            (0..6).map(|c| row.get(c).unwrap().char()).collect()
+        })
+        .collect();
+    assert_eq!(text, ["abcdef", "ghijkl", "mnopqr"]);
+}

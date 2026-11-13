@@ -355,6 +355,8 @@ fn a_document_table_reads_a_cutoff_as_no_refusal() {
 /// The one entry point every removal path takes signs a cutoff in each table this Mac holds,
 /// once; a table it cannot open for writing keeps the frontier it read for the repair, which
 /// signs it and forgets it.
+/// NEGATIVE CONTROL: with `Session::try_open` refusing a journal nobody holds, the last removal
+/// keeps a frontier.
 #[test]
 fn the_removal_entry_point_cuts_each_held_table_once() {
     use aterm_secrets::client::CutPass;
@@ -399,6 +401,11 @@ fn the_removal_entry_point_cuts_each_held_table_once() {
         store::cut_removed_writer(&table.lab.paths[0], &m2, CutPass::BeforeRemove),
         0,
         "the same frontier is not signed twice"
+    );
+    assert_eq!(
+        std::fs::read_dir(&kept).unwrap().count(),
+        0,
+        "nor kept: a journal nobody holds opens"
     );
 }
 

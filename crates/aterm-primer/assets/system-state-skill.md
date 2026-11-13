@@ -116,23 +116,37 @@ job` fires only when a verdict changes (`task=` is your tool call, `code=` its e
 
 ## When new programs do not start
 
-macOS's program check (`syspolicyd`) can hold a program before its first instruction. One held
-past 20 s reads `wait=program-check` in `sys jobs` (never `stuck`) with a `finding
-kind=program-check` row; `status`'s `program_check=<n>:<oldest_ms>` counts this tab's held
-programs (its jobs' members and what they left running) and the oldest's wait, `0` with none,
-`-` off macOS or with no recent reading. While programs of your tool calls wait there, aterm
-adds one sentence to the next prompt it types, once until none waits: `aterm: macOS's program
-check is holding 2 programs this tab started (pid 72955, pid 72960), the oldest for 19 m; a retry
+macOS's program check (`syspolicyd`) can hold a program before its first instruction, and
+nothing it would print appears. aterm calls a program held there only on per-process evidence of
+its check, which no reader of macOS gives yet: on a real Mac a native program the check holds
+reads a `finding kind=not-started … cause=unknown program_check=unconfirmed` row in `sys jobs`
+once 20 s past its launch (never `stuck`). One aterm calls held reads `wait=program-check` with
+a `finding kind=program-check` row; `status`'s `program_check=<n>:<oldest_ms>` counts this tab's
+held programs (its jobs' members and what they left running) and the oldest's wait, `0` with
+none, `-` off macOS or with no recent reading. While programs of your tool calls are held, aterm
+adds one sentence to the next prompt it types, once until none is: `aterm: macOS's program check
+is holding 2 programs this tab started (pid 72955, pid 72960), the oldest for 19 m; a retry
 waits in the same line`. A busy check drains by itself. Developer Tools access spares most
-checks: `aterm doctor`'s `devtools:` row says whether aterm has it. An x86_64 program Rosetta
-is still translating past 20 s reads `wait=translating` the same way, with a `finding
-kind=translating` row: in line, never stuck, and Developer Tools access does not reach it.
+checks: `aterm doctor`'s `devtools:` row says whether aterm has it. An x86_64 program Rosetta is
+still translating past 20 s reads `wait=translating` with a `finding kind=translating` row: in
+line, never stuck, and Developer Tools access does not reach it.
 
 `status` carries `syspolicyd=<-|ok|full|stuck>`. `full`: at macOS's thread limit now. `stuck`:
 full for five minutes, deadlocked with `tccd`, and only a restart of the Mac ends it. Until then
 most new programs cannot start (macOS's own, such as `ps`, still do) and a retry only joins
 the queue. Stop starting programs on that Mac, preserve the work, and record the restart
 requirement. Continue useful work on another available machine or task without alerting the owner.
+
+A `syspolicyd` that crashes is not that: launchd starts another at once and new programs start,
+but a program the crashed one was checking can stay unstarted while `status` reads
+`syspolicyd=ok`. `syspolicyd_pid=` and `syspolicyd_up_ms=` name the `syspolicyd` aterm's last
+look at it read and how long it has run, so a `kind=not-started` row whose `for_ms=` is longer
+than `syspolicyd_up_ms=` was already waiting when that one started. `program_check_stranded=`
+and `sys jobs`' `finding kind=program-check-stranded` rows name such a program only among the
+held ones above, so on a real Mac the count reads `0` or `-` and no such row appears. Whether
+such a program ever starts is unmeasured, and nothing ends it for you. Do not restart the Mac for
+it, and do not rebuild or delete its file to unstick it (removing a file macOS is checking can
+crash `syspolicyd`): stop what started it and run it again.
 
 A tab kept across an aterm update (`attribution=adopted` in `status`) makes macOS check aterm's
 earlier copy at every program it starts: run builds and tests from a new tab.

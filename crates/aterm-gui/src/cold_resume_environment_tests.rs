@@ -99,6 +99,7 @@ fn trial_program(case: i64, carried: i64, custom_home: bool, supported: bool) ->
     let restore = AgentRestore {
         claude_auth: None,
         pid: 4242,
+        lifetime: None,
         start: "fixture".into(),
         // The recorded self-claim's argv, not this outer process label, is executed.
         program: "/absent/outer-codex".into(),

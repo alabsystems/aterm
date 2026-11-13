@@ -83,7 +83,7 @@ pub(crate) fn write_fresh(path: &Path, bytes: impl AsRef<[u8]>) -> std::io::Resu
 }
 
 const USAGE: &str = "\
-aterm-libc-oracle — check crates/aterm-libc against reference libc 0.2.186 on the native ABI cell
+aterm-libc-oracle — check crates/aterm-libc against reference libc 0.2.191 on the native ABI cell
 (`targo --unverified verify libc` runs this gate)
 
 usage: targo --unverified run -q -p aterm-libc-oracle -- [--root <checkout>] [--target-dir <dir>]
@@ -103,7 +103,7 @@ Trust; remaining cells use stock rustup with target std installed (STOCK EXCEPTI
   --out <dir>         write into this checkout-shaped directory instead of --root
   --cell <key>        regenerate only mac, macx, linux or linuxa (native cell needs no stock)
   --work <dir>        scratch dir (default: <checkout>/libc-oracle/target.noindex/regen)
-  --docs <dir>        use prebuilt libc-0.2.186-<triple>.json rustdoc dumps from <dir>
+  --docs <dir>        use prebuilt libc-0.2.191-<triple>.json rustdoc dumps from <dir>
   --stock <toolchain> rustup toolchain for non-host cells (default: the checkout's stock pin)
   --no-format         skip trustfmt on emitted files
 

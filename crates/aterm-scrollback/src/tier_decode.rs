@@ -166,12 +166,19 @@ impl WarmBlock {
             None => std::mem::take(&mut self.compressed),
         };
         self.compressed.clear();
+        self.encoded_line_count = 0;
         let line_count = std::mem::take(&mut self.line_count);
         Ok((compressed, line_count))
     }
 
     /// `None` means the validated original payload already represents every live line.
     fn try_cold_serialized_suffix(&self) -> Result<Option<Vec<u8>>, ScrollbackError> {
+        if self.encoded_line_count > 0
+            && self.encoded_line_count == self.line_count
+            && self.decompress_failures.get() == 0
+        {
+            return Ok(None);
+        }
         let decompressed = decompress_lz4_bounded(&self.compressed)?;
         let stored_line_count = Self::stored_line_count(&decompressed)?;
         if stored_line_count == self.line_count {

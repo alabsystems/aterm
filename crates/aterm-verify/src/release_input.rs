@@ -4,6 +4,7 @@
 //! The release's early judgment of commits without a landing receipt. Receipts describe a
 //! delta from a base, not every ancestor of their tree: main imported at the base stays owed.
 
+use crate::release_input_facts::Facts;
 use crate::{Ctx, EnvSnapshot, Show, checks::Check};
 use aterm_types::land_trailer::{Checked, Stated};
 use std::collections::{BTreeMap, BTreeSet};
@@ -118,6 +119,24 @@ fn git(root: &Path, path: &OsStr, args: &[&str]) -> Result<String, String> {
     String::from_utf8(out.stdout).map_err(|e| e.to_string())
 }
 
+/// A Git read whose arguments name objects by ID only (`objects`), so its answer never
+/// changes: asked once, then answered from `facts`. Its question is the whole argument list.
+fn git_fact(
+    facts: &Facts,
+    root: &Path,
+    path: &OsStr,
+    args: &[&str],
+    objects: &[&str],
+) -> Result<String, String> {
+    let mut question: Vec<&[u8]> = vec![b"git"];
+    question.extend(args.iter().map(|arg| arg.as_bytes()));
+    facts.answer(&question, objects, || git(root, path, args))
+}
+
+/// The source text that decides whether a composed receipt's merge holds
+/// ([`crate::land::receipt_composition`]): a kept answer is one this text gave.
+const COMPOSITION_RULE: &[&str] = &[include_str!("land.rs"), include_str!("land_version.rs")];
+
 /// Every judgment a receipt states that read the source readers' input, in order: each full
 /// judgment, and each recheck (`Aterm-Rechecked`) as the judgment of its merge over the cone
 /// since the main it merged, so it credits the branch's delta from that main and leaves main's
@@ -161,6 +180,7 @@ struct Coverage {
 }
 
 fn coverage(
+    facts: &Facts,
     root: &Path,
     path: &OsStr,
     nodes: &BTreeMap<String, Commit>,
@@ -215,10 +235,12 @@ fn coverage(
             let judged = ancestors(nodes, target);
             if !judged.contains(&checked.base)
                 && (nodes.contains_key(&checked.base)
-                    || git(
+                    || git_fact(
+                        facts,
                         root,
                         path,
                         &["merge-base", "--is-ancestor", &checked.base, target],
+                        &[&checked.base, target],
                     )
                     .is_err())
             {
@@ -242,6 +264,7 @@ fn coverage(
 /// actual judged delta whose complete Git entry (content, mode and presence) still agrees
 /// with the candidate. A path name alone cannot authorize an edit after that judgment.
 fn remaining_paths(
+    facts: &Facts,
     root: &Path,
     path: &OsStr,
     tip: &str,
@@ -249,7 +272,8 @@ fn remaining_paths(
     judgments: &[Checked],
 ) -> Result<BTreeSet<String>, String> {
     let diff = |a: &str, b: &str| -> Result<BTreeSet<String>, String> {
-        Ok(git(
+        Ok(git_fact(
+            facts,
             root,
             path,
             &[
@@ -264,6 +288,7 @@ fn remaining_paths(
                 b,
                 "--",
             ],
+            &[a, b],
         )?
         .split('\0')
         .filter(|p| !p.is_empty())
@@ -284,11 +309,72 @@ fn remaining_paths(
     Ok(paths)
 }
 
+/// `rev` as the commit it names now; an object ID is its own name. Everything after this
+/// asks about that one commit, whatever a ref does meanwhile.
+fn commit_id(root: &Path, path: &OsStr, rev: &str) -> Result<String, String> {
+    if aterm_types::land_trailer::object_id(rev) {
+        return Ok(rev.to_owned());
+    }
+    let commit = format!("{rev}^{{commit}}");
+    Ok(git(
+        root,
+        path,
+        &["rev-parse", "--verify", "--end-of-options", &commit],
+    )?
+    .trim()
+    .to_owned())
+}
+
 /// Read Git's actual landing trailers and union only the unjudged commits' changed paths.
 /// Merge commits contribute differences from their automatic merge, including resolutions
 /// equal to one parent's content, rather than the already-counted parent diffs.
+///
+/// What a commit's ID fixes (the paths it changed, a landing's judged delta, whether a
+/// composed receipt's merge holds) is asked once per release window and then answered from
+/// the facts kept in the clone's release directory ([`Facts::of`]): a second call, a dry run
+/// before a real one and the next head of a line ask only about commits no call has read.
+///
+/// # Errors
+/// `base` or `tip` names no commit, `base` is not `tip`'s ancestor, or a Git read failed.
 pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Input, String> {
-    git(root, path, &["merge-base", "--is-ancestor", base, tip])?;
+    discover_counted(root, path, base, tip).map(|(input, _)| input)
+}
+
+/// [`discover`], with how many of its questions about commits it asked and how many it
+/// answered from the kept facts.
+///
+/// # Errors
+/// As [`discover`].
+pub fn discover_counted(
+    root: &Path,
+    path: &OsStr,
+    base: &str,
+    tip: &str,
+) -> Result<(Input, (usize, usize)), String> {
+    let base = commit_id(root, path, base)?;
+    let tip = commit_id(root, path, tip)?;
+    let facts = Facts::of(root, &base).read_by(&git(root, path, &["--version"])?);
+    let input = discover_with(&facts, COMPOSITION_RULE, root, path, &base, &tip)?;
+    Ok((input, facts.counts()))
+}
+
+/// [`discover`] over `facts`, with `composition_rule` the text a kept composition answer is
+/// bound to.
+fn discover_with(
+    facts: &Facts,
+    composition_rule: &[&str],
+    root: &Path,
+    path: &OsStr,
+    base: &str,
+    tip: &str,
+) -> Result<Input, String> {
+    git_fact(
+        facts,
+        root,
+        path,
+        &["merge-base", "--is-ancestor", base, tip],
+        &[base, tip],
+    )?;
     let range = format!("{base}..{tip}");
     let log = git(
         root,
@@ -314,6 +400,20 @@ pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Inpu
             },
         );
     }
+    // A receipt whose composition its git evidence does not establish (a conflicted or
+    // shared-path merge, an unreadable object) grants no coverage; the ordinary source checks
+    // still judge those commits. A read that failed is asked again by the next call.
+    let composes = |parent: &str, onto: &str, tree: &str| {
+        let mut question: Vec<&[u8]> = vec![b"composition"];
+        question.extend(composition_rule.iter().map(|text| text.as_bytes()));
+        question.extend([parent.as_bytes(), onto.as_bytes(), tree.as_bytes()]);
+        facts
+            .answer(&question, &[parent, onto, tree], || {
+                crate::land::receipt_composition(root, path, parent, onto, tree)
+                    .map(|holds| if holds { "holds" } else { "refused" }.to_owned())
+            })
+            .is_ok_and(|answer| answer == "holds")
+    };
     let mut composed = BTreeSet::new();
     for (id, commit) in &nodes {
         let Some(receipt) = &commit.receipt else {
@@ -328,16 +428,12 @@ pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Inpu
         };
         if onto == main
             && nodes.get(parent).is_some_and(|c| c.tree == checked.tree)
-            // Historical receipts can predate the current entry grammar. Failure to
-            // establish composition grants no coverage; the ordinary source checks
-            // still judge these commits rather than being blocked by old evidence.
-            && crate::land::receipt_composition(root, path, parent, onto, &commit.tree)
-                .unwrap_or(false)
+            && composes(parent, onto, &commit.tree)
         {
             composed.insert(id.clone());
         }
     }
-    let covered = coverage(root, path, &nodes, &composed);
+    let covered = coverage(facts, root, path, &nodes, &composed);
     let commits: Vec<_> = nodes
         .keys()
         .filter(|id| !covered.commits.contains(*id))
@@ -347,8 +443,11 @@ pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Inpu
     for commit in &commits {
         let parents = &nodes[commit].parents;
         let parents: Vec<_> = parents.iter().map(String::as_str).collect();
+        let objects: Vec<&str> = std::iter::once(commit.as_str())
+            .chain(parents.iter().copied())
+            .collect();
         let changed = crate::git_paths::commit(
-            &mut |args| git(root, path, args).map(String::into_bytes),
+            &mut |args| git_fact(facts, root, path, args, &objects).map(String::into_bytes),
             commit,
             &parents,
             crate::git_paths::MergeDiff::Resolutions,
@@ -360,7 +459,7 @@ pub fn discover(root: &Path, path: &OsStr, base: &str, tip: &str) -> Result<Inpu
     }
     Ok(Input {
         commits,
-        paths: remaining_paths(root, path, tip, paths, &covered.judgments)?
+        paths: remaining_paths(facts, root, path, tip, paths, &covered.judgments)?
             .into_iter()
             .collect(),
     })
@@ -404,13 +503,15 @@ fn judge_with_inputs(
     }
     let began = std::time::Instant::now();
     let env = EnvSnapshot::capture();
-    let input = discover(root, &env.path, base, tip).map_err(|why| (false, why))?;
+    let (input, (asked, kept)) =
+        discover_counted(root, &env.path, base, tip).map_err(|why| (false, why))?;
     if let Some(note) = input.no_work_note() {
         return Ok(format!("{note} ({:.3}s)", began.elapsed().as_secs_f64()));
     }
     writeln!(
         log,
-        "release input discovery: {:.3}s",
+        "release input discovery: {:.3}s ({asked} question(s) asked of Git, {kept} answered \
+         from this release window's kept facts)",
         began.elapsed().as_secs_f64()
     )
     .map_err(|e| (false, e.to_string()))?;

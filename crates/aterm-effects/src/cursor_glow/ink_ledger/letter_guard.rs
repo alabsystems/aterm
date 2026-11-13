@@ -398,6 +398,8 @@ type ClearMemo = ((u32, u32, u32), (f32, f32));
 /// [`LetterGuard::judge`]'s last text pair `(ink, ground)` and its solid
 /// ink, luminances and bar.
 type SolidMemo = ((u32, u32), (u32, f32, f32, f32));
+/// A frame's cuts `(col, share)` and each row's span `(from, to)` in them.
+type LaidCuts = (Vec<(i32, f32)>, Vec<(usize, usize)>);
 
 /// The guard's resident scratch ([`CursorGlow::guard_letters`]).
 pub(crate) struct LetterGuard {
@@ -482,6 +484,10 @@ pub(crate) struct LetterGuard {
     ),
     verify_under: Vec<GlowQuad>,
     verify_ramps: GlowRamps,
+    /// The cuts the frame a verify pass reads was laid with, and each row's place in them
+    /// ([`CursorGlow::verify_cuts`]): a cell the pass lowers lowers the cuts the next pass lays,
+    /// never what a later cell of this pass was laid at.
+    verify_laid: LaidCuts,
     /// The ledger's rail and light-owned spans as the frame noted them, which a cut spends
     /// ([`InkLedger::guard_mask_stream`]): a cut laid again reads them as noted.
     seen_spans: (
@@ -543,6 +549,15 @@ pub(crate) struct LetterGuard {
     pub(crate) verify_passes: u64,
     #[cfg(any(test, debug_assertions))]
     pub(crate) verify_idle: u64,
+    /// A test's counter: the cells a verify pass lowered whose row's ramp lays them no lower for
+    /// it ([`CursorGlow::verify_cuts`]).
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) verify_vain: u64,
+    /// A test's negative control: a verify pass lowers a cell's own cut, not the share its row's
+    /// ramp laid it at ([`ramp_share`]), and its passes' factor reads its cut over its weighed
+    /// share, as before CT-44's review.
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) lowered_by_cut: bool,
     /// A test's negative control: every cell judged afresh every frame,
     /// and no frame taken back whole.
     #[cfg(any(test, debug_assertions))]
@@ -656,6 +671,7 @@ impl LetterGuard {
         ),
         verify_under: Vec::new(),
         verify_ramps: GlowRamps::EMPTY,
+        verify_laid: (Vec::new(), Vec::new()),
         seen_spans: (Vec::new(), Vec::new(), Vec::new(), Vec::new()),
         ramp_rows: RampRows {
             under: Vec::new(),
@@ -681,6 +697,10 @@ impl LetterGuard {
         verify_passes: 0,
         #[cfg(any(test, debug_assertions))]
         verify_idle: 0,
+        #[cfg(any(test, debug_assertions))]
+        verify_vain: 0,
+        #[cfg(any(test, debug_assertions))]
+        lowered_by_cut: false,
         #[cfg(any(test, debug_assertions))]
         no_reuse: false,
         #[cfg(any(test, debug_assertions))]
@@ -759,78 +779,129 @@ fn ramp_row(
     let (Some(&(lo, _)), Some(&(hi, _))) = (cuts.first(), cuts.last()) else {
         return;
     };
-    #[inline]
-    const fn cut_share_of(cuts: &[(i32, f32)], col: i32) -> f32 {
-        match find_cut(cuts, col) {
-            Some(i) => cuts[i].1,
-            None => 1.0,
-        }
-    }
     let reach = WORD_GAP_COLS + 1;
     let mut col = (lo - reach).max(0);
     let col_end = hi + reach;
     while col <= col_end {
-        if skip == Some(col) {
-            col += 1;
-            continue;
-        }
-        let own = cut_share_of(cuts, col);
-        let mut eased = own;
-        if col >= lo && col <= hi {
-            let mut ci = 0;
-            while ci < cuts.len() {
-                let (c, s) = cuts[ci];
-                eased = eased.min(s + RAMP_SLOPE * (c - col).abs() as f32);
-                ci += 1;
+        if skip != Some(col) {
+            let own = cut_share_of(cuts, col);
+            let eased = eased_share(cuts, (lo, hi), climb, &lettered, col, own);
+            if eased < own {
+                cut(col, eased);
             }
-        }
-        if !climb && !lettered(col) {
-            let mut left = None;
-            let mut d = 1;
-            while d <= reach {
-                let c = col - d;
-                if c < 0 {
-                    break;
-                }
-                if lettered(c) {
-                    left = Some(c);
-                    break;
-                }
-                d += 1;
-            }
-            if let Some(a) = left {
-                let max_b = (col + reach).min(a + 1 + WORD_GAP_COLS);
-                let mut right = None;
-                let mut c = col + 1;
-                while c <= max_b {
-                    if lettered(c) {
-                        right = Some(c);
-                        break;
-                    }
-                    c += 1;
-                }
-                if let Some(b) = right {
-                    let (sa, sb) = (cut_share_of(cuts, a), cut_share_of(cuts, b));
-                    if sa.min(sb) < 1.0 {
-                        let u = (col - a) as f32 / (b - a) as f32;
-                        eased = eased.min(sa + (sb - sa) * u);
-                    }
-                }
-            }
-        }
-        if eased < own {
-            cut(col, eased);
         }
         col += 1;
     }
 }
 
+/// The share column `col` of a row whose cuts are `cuts` takes: its cut's, `1.0` uncut.
+#[inline]
+const fn cut_share_of(cuts: &[(i32, f32)], col: i32) -> f32 {
+    match find_cut(cuts, col) {
+        Some(i) => cuts[i].1,
+        None => 1.0,
+    }
+}
+
+/// The share [`ramp_row`] lays column `col` of a row at: the ramp's where that is under the
+/// column's own cut, else its own (`1.0` uncut), and the caret's column's own.
+#[inline]
+fn ramp_share(
+    cuts: &[(i32, f32)],
+    skip: Option<i32>,
+    climb: bool,
+    lettered: &impl Fn(i32) -> bool,
+    col: i32,
+) -> f32 {
+    let own = cut_share_of(cuts, col);
+    let (Some(&(lo, _)), Some(&(hi, _))) = (cuts.first(), cuts.last()) else {
+        return own;
+    };
+    let reach = WORD_GAP_COLS + 1;
+    if skip == Some(col) || col < (lo - reach).max(0) || col > hi + reach {
+        return own;
+    }
+    eased_share(cuts, (lo, hi), climb, lettered, col, own)
+}
+
+/// Column `col`'s share on its row's ramp ([`ramp_row`]), its own `own` at most: `cuts` are the
+/// row's, their columns `lo..=hi`.
+#[inline]
+fn eased_share(
+    cuts: &[(i32, f32)],
+    (lo, hi): (i32, i32),
+    climb: bool,
+    lettered: &impl Fn(i32) -> bool,
+    col: i32,
+    own: f32,
+) -> f32 {
+    let reach = WORD_GAP_COLS + 1;
+    let mut eased = own;
+    if col >= lo && col <= hi {
+        let mut ci = 0;
+        while ci < cuts.len() {
+            let (c, s) = cuts[ci];
+            eased = eased.min(s + RAMP_SLOPE * (c - col).abs() as f32);
+            ci += 1;
+        }
+    }
+    if !climb && !lettered(col) {
+        let mut left = None;
+        let mut d = 1;
+        while d <= reach {
+            let c = col - d;
+            if c < 0 {
+                break;
+            }
+            if lettered(c) {
+                left = Some(c);
+                break;
+            }
+            d += 1;
+        }
+        if let Some(a) = left {
+            let max_b = (col + reach).min(a + 1 + WORD_GAP_COLS);
+            let mut right = None;
+            let mut c = col + 1;
+            while c <= max_b {
+                if lettered(c) {
+                    right = Some(c);
+                    break;
+                }
+                c += 1;
+            }
+            if let Some(b) = right {
+                let (sa, sb) = (cut_share_of(cuts, a), cut_share_of(cuts, b));
+                if sa.min(sb) < 1.0 {
+                    let u = (col - a) as f32 / (b - a) as f32;
+                    eased = eased.min(sa + (sb - sa) * u);
+                }
+            }
+        }
+    }
+    eased
+}
+
 /// The passes [`CursorGlow::guard_letters`] reads a cell read by its glyph's own pixels again on
-/// the frame its cuts make, each lowering the share of a cell under its bar there by
-/// [`VERIFY_STEP`]; after the last such a cell keeps none of its light.
+/// the frame its cuts make, each lowering the share that frame laid a cell under its bar there
+/// at (its row's ramp's, [`ramp_share`]) to what the frame lets it keep
+/// ([`LetterGuard::frame_keeps`]), and a cell a pass of the frame lowered already by what the
+/// passes took already at least ([`Check::kept`]); after the last such a cell keeps none of its
+/// light.
+///
+/// What [`LetterGuard::frame_keeps`] finds scales every light the cell reads, and a cut lowers
+/// only the lights the guard cuts (a foot rail, a light-owned light and the edge of a
+/// neighbour's ramp keep theirs) and rounds each light it lowers to a whole step, so the cut
+/// frame can read the cell under its bar where the scaled one read it over. Lowered again only
+/// that far, Fire's `h` past the wrapped line's margin on Solarized Dark crept down a hundredth a
+/// pass, read 4.107 to 4.118 of its own 4.222 against its bar of 4.152 over six passes, and the
+/// last cut it to none on a frame no pass read again, where it read 4.03; lowered by a quarter,
+/// the band behind a just-typed `g` at a bottom prompt on a dark page, which a hundredth left a
+/// few thousandths under its bar of 4.6 on some frames, lost a quarter of its light on those
+/// and dimmed and lit again (13 px over in aterm-render's `flash_probe`). Giving up again what
+/// it gave up, the share squares each pass it reads under: the `h` holds in two or three, the
+/// `g` 1.6% down.
 const VERIFY_PASSES: usize = 6;
-/// What a share a cell under its bar on the frame its cuts make keeps of it, a pass.
-const VERIFY_STEP: f32 = 0.75;
 /// The share under which a cell under its bar on the frame its cuts make keeps none.
 const VERIFY_FLOOR: f32 = 1.0 / 64.0;
 
@@ -846,7 +917,8 @@ struct RowCut {
 
 /// A cell read by its glyph's own pixels, read again on the frame its cuts make
 /// ([`CursorGlow::verify_cuts`]): its row's index among the [`RowCut`]s, its column, its ink and
-/// ground, the share it was weighed at and its verdict's key.
+/// ground, the share it was weighed at, its verdict's key, and the share of its laid light the
+/// frame's passes have left it.
 #[derive(Clone, Copy)]
 struct Check {
     row: usize,
@@ -855,6 +927,9 @@ struct Check {
     ground: u32,
     share: f32,
     key: u64,
+    /// What this frame's verify passes left of the share the frame laid the cell at, the product
+    /// of the factors each lowering took (`1.0` until one lowers it, [`VERIFY_PASSES`]).
+    kept: f32,
 }
 
 /// A stream of lights as the guard reads it: its quads and its ramps.
@@ -1690,6 +1765,31 @@ impl LetterGuard {
         }
         self.px_ground = ground;
         self.px_text = text;
+    }
+
+    /// The share of its lights a cell [`Self::lay_lights`] laid from the frame its cuts make, and
+    /// that reads under its bar there, keeps: the most of them it holds its bar under
+    /// ([`Self::holds_ring`]), to [`STEPS`] bisections. A cell its weighing left at the edge of
+    /// its bar can read a hair under it on that frame, for lights its weighing's key does not
+    /// hold (a neighbour's ramp, a foot rail): it gives up that hair. Lowered by a fixed quarter
+    /// there, it lost a quarter of its light on the frames that read the hair under and none on
+    /// those that read it over, and the band behind a just-typed `g` at a bottom prompt on a dark
+    /// page dimmed and lit again from frame to frame. A cell this lowered that reads under its bar
+    /// again on a later pass gives up at least as much again ([`VERIFY_PASSES`]).
+    #[inline]
+    fn frame_keeps(&mut self, j: Judge, bar: f32, has_over: bool) -> f32 {
+        let (mut lo, mut hi) = (0.0f32, 1.0f32);
+        let mut step = 0;
+        while step < STEPS {
+            let mid = 0.5 * (lo + hi);
+            if self.holds_ring(j, mid, bar, has_over) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+            step += 1;
+        }
+        lo
     }
 
     /// Whether a cell read by its glyph's own pixels ([`Judge::ring`]) reads at least `bar`
@@ -4703,6 +4803,7 @@ impl CursorGlow {
                             ground,
                             share,
                             key,
+                            kept: 1.0,
                         });
                     }
                     if share < 1.0 {
@@ -4746,7 +4847,7 @@ impl CursorGlow {
             let lowered = self.verify_cuts(
                 &mut guard,
                 over,
-                (&checks, &mut rows_cut),
+                (&mut checks, &mut rows_cut),
                 &mut cuts,
                 (geom, cfg, night),
                 ((caret, caret_block), trail),
@@ -5036,7 +5137,7 @@ impl CursorGlow {
         &mut self,
         guard: &mut LetterGuard,
         over: &[GlowQuad],
-        (checks, rows): (&[Check], &mut [RowCut]),
+        (checks, rows): (&mut [Check], &mut [RowCut]),
         cuts: &mut Vec<(i32, f32)>,
         (geom, cfg, night): (Geom, &GlowConfig, Option<NightGround>),
         (caret, trail): (CaretCell, Trail<'_>),
@@ -5045,6 +5146,10 @@ impl CursorGlow {
         // The under stream as the frame publishes it.
         let mut under = std::mem::take(&mut guard.verify_under);
         let mut under_ramps = std::mem::take(&mut guard.verify_ramps);
+        let (mut laid_cuts, mut laid_rows) = std::mem::take(&mut guard.verify_laid);
+        laid_cuts.clone_from(cuts);
+        laid_rows.clear();
+        laid_rows.extend(rows.iter().map(|r| r.cuts));
         under.clear();
         under.extend_from_slice(&self.flame_night);
         if let Some(ng) = night {
@@ -5069,7 +5174,7 @@ impl CursorGlow {
         let mut lowered = false;
         let mut at_row = usize::MAX;
         let mut row_bounds = (i32::MAX, i32::MIN);
-        for c in checks {
+        for c in checks.iter_mut() {
             let r = rows[c.row];
             if at_row != c.row {
                 at_row = c.row;
@@ -5135,20 +5240,50 @@ impl CursorGlow {
             }
             // Under its bar on the frame: a lesser share.
             let row_cuts = &cuts[r.cuts.0..r.cuts.1];
-            let (share, at) = match find_cut(row_cuts, c.col) {
-                Some(k) => (row_cuts[k].1, Some(r.cuts.0 + k)),
-                None => (1.0, None),
+            let at = find_cut(row_cuts, c.col).map(|k| r.cuts.0 + k);
+            // The frame laid the cell at its row's ramp's share, under its own cut where a
+            // neighbour's is lower: what [`LetterGuard::frame_keeps`] scales is that, read off the
+            // cuts the frame was laid with, which the cells this pass lowered before it have moved.
+            let laid_row = {
+                let (from, to) = laid_rows[c.row];
+                &laid_cuts[from..to]
             };
-            let less = if last || share <= VERIFY_FLOOR {
-                0.0
+            #[cfg(any(test, debug_assertions))]
+            let comb = guard.comb;
+            #[cfg(not(any(test, debug_assertions)))]
+            let comb = false;
+            #[cfg(any(test, debug_assertions))]
+            let by_cut = guard.lowered_by_cut;
+            #[cfg(not(any(test, debug_assertions)))]
+            let by_cut = false;
+            let lettered = |col: i32| matches!(text.pair(r.row, col), Some((Some(_), _)));
+            let eased = if comb {
+                cut_share_of(laid_row, c.col)
             } else {
-                share * VERIFY_STEP
+                ramp_share(laid_row, r.skip, false, &lettered, c.col)
             };
+            let laid = if by_cut {
+                cut_share_of(laid_row, c.col)
+            } else {
+                eased
+            };
+            // One a pass of this frame lowered already that reads under its bar again was
+            // lowered as far as the scaled frame let it keep, and the cut frame did not keep it
+            // there: it gives up at least what the passes took already ([`VERIFY_PASSES`]).
+            let keeps = if last || laid <= VERIFY_FLOOR {
+                0.0
+            } else if by_cut {
+                guard.frame_keeps(j, bar, has_over).min(laid / c.share)
+            } else {
+                guard.frame_keeps(j, bar, has_over).min(c.kept)
+            };
+            let less = laid * keeps;
             // A cell cut to none already has no light left to give: lowered again it lays the
             // same cuts, and another pass reads it under its bar as this one did.
-            if less >= share {
+            if less >= laid {
                 continue;
             }
+            c.kept *= keeps;
             #[cfg(any(test, debug_assertions))]
             if guard.lowered_kept
                 && let Some(v) = guard.fresh.iter_mut().find(|v| v.0 == c.key)
@@ -5169,11 +5304,22 @@ impl CursorGlow {
                     }
                 }
             }
+            #[cfg(any(test, debug_assertions))]
+            {
+                let row_cuts = &cuts[rows[c.row].cuts.0..rows[c.row].cuts.1];
+                let now = if comb {
+                    cut_share_of(row_cuts, c.col)
+                } else {
+                    ramp_share(row_cuts, r.skip, false, &lettered, c.col)
+                };
+                guard.verify_vain += u64::from(now >= eased);
+            }
             lowered = true;
         }
         guard.ramp_rows = ramp_rows;
         guard.verify_under = under;
         guard.verify_ramps = under_ramps;
+        guard.verify_laid = (laid_cuts, laid_rows);
         lowered
     }
 
@@ -5202,6 +5348,14 @@ impl CursorGlow {
     #[inline]
     pub const fn set_letter_guard_shades_to_own(&mut self, on: bool) {
         self.letter_guard.shades_at_bar = !on;
+    }
+
+    /// A test's negative control: a verify pass lowers a cell's own cut (`true`), not the share
+    /// its row's ramp laid it at ([`LetterGuard::lowered_by_cut`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    pub const fn set_letter_guard_lowered_by_cut(&mut self, on: bool) {
+        self.letter_guard.lowered_by_cut = on;
     }
 
     /// A test's negative control: the share [`Self::verify_cuts`] lowers a cell to written back
@@ -5551,6 +5705,15 @@ impl CursorGlow {
             self.letter_guard.verify_passes,
             self.letter_guard.verify_idle,
         )
+    }
+
+    /// A test's counter: the cells the guard's passes over its cut frames lowered whose row's
+    /// ramp then laid them no lower ([`Self::verify_cuts`]).
+    #[cfg(any(test, debug_assertions))]
+    #[inline]
+    #[must_use]
+    pub const fn letter_guard_vain(&self) -> u64 {
+        self.letter_guard.verify_vain
     }
 }
 

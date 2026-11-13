@@ -31,6 +31,9 @@ const NAME_CAP: usize = 24;
 /// The first-run toolchain row's title, the one noun on every surface.
 pub(crate) const INSTALLING_ALAB: &str = "Installing ALab tools";
 
+/// The live title while a package check runs.
+pub(crate) const CHECKING_ALAB: &str = "Checking ALab tools";
+
 /// A heavy routine pass's live row: the same noun, and the verb says it updates what is already there.
 pub(crate) const UPDATING_ALAB: &str = "Updating ALab tools";
 

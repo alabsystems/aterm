@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Explicit in-place restart: `aterm ctl @<sid> restart [pid=<n>] [if-stalled] [quiet=<s>]`.
+//! Explicit in-place restart: `aterm ctl @<sid> restart [pid=<n>] [if-stalled] [quiet=<s>]`, and
+//! for a codex-alab session on one of the pool's stored Codex logins
+//! `restart [pid=<n>] [quiet=<s>] [account=<label> | account-auto]`: the same act, whose stamp
+//! names the account the relaunch should start on.
 
 #![cfg_attr(not(unix), allow(dead_code))]
 
@@ -10,8 +13,9 @@ use std::sync::Arc;
 use std::sync::Weak;
 use std::time::{Duration, Instant};
 
+use aterm_agent::harness::accounts_pool;
 use aterm_agent::harness::restart_stamp::Cause;
-use aterm_agent::harness::restart_stamp::{self, Stamp};
+use aterm_agent::harness::restart_stamp::{self, Stamp, Wanted};
 
 use crate::SessionCtx;
 
@@ -66,7 +70,7 @@ impl Drop for DeadlineForTest {
 }
 
 /// The verb's arguments.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Ask {
     /// `pid=<n>`: only while `n` leads the tab's foreground group.
     pub(crate) pid: Option<i32>,
@@ -74,17 +78,38 @@ pub(crate) struct Ask {
     pub(crate) if_stalled: bool,
     /// `quiet=<s>`: refused while a person gave the session input within `s` seconds.
     pub(crate) quiet: Option<u32>,
+    /// `account=<label>` or `account-auto`: the account the relaunch should start on.
+    pub(crate) account: Option<Wanted>,
 }
 
-/// Pure parser for `restart [pid=<n>] [if-stalled] [quiet=<s>]`, in any order, each at most once.
+/// The bare word that asks for the pool's choice. Never `account=auto`: `auto` is a label a
+/// roster row may carry.
+const ACCOUNT_AUTO: &str = "account-auto";
+
+/// Pure parser for `restart [pid=<n>] [if-stalled] [quiet=<s>] [account=<label> | account-auto]`,
+/// in any order, each at most once; one account word at most, and never with `if-stalled` (a
+/// move is asked for, not a stall's remedy). A label outside the roster grammar
+/// ([`aterm_agent::harness::accounts::admissible_label`]) is a bad argument.
 pub(crate) fn parse(rest: &str) -> Result<Ask, String> {
     let mut ask = Ask::default();
     let mut stalled_seen = false;
     for w in rest.split_whitespace() {
         let bad = || format!("ERR bad restart argument: {w}\n");
-        if w == "if-stalled" && !stalled_seen {
+        if w == "if-stalled" && !stalled_seen && ask.account.is_none() {
             stalled_seen = true;
             ask.if_stalled = true;
+        } else if w == ACCOUNT_AUTO || w.starts_with("account=") {
+            let wanted = match w.strip_prefix("account=") {
+                None => Wanted::Pool,
+                Some(label) if aterm_agent::harness::accounts::admissible_label(label) => {
+                    Wanted::Row(label.to_string())
+                }
+                Some(_) => return Err(bad()),
+            };
+            if ask.account.is_some() || stalled_seen {
+                return Err(bad());
+            }
+            ask.account = Some(wanted);
         } else if let Some(s) = w.strip_prefix("quiet=") {
             match s
                 .bytes()
@@ -123,6 +148,36 @@ pub(crate) fn stalled_for(tl: &crate::session_timeline::SessionTimeline, pgrp: i
 
 /// The timeline event sent instead of signalling a scoped harness's own process.
 pub(crate) const RESTART_EVENT: &str = "restart";
+
+/// A restored task needs an actual runner to carry the gap before a replacement starts.
+pub(crate) const EXIT_OWNER_NOT_READY: &str = "exit-owner-not-ready";
+
+/// The ordinary restart admission stays independent of task metadata. Only a restored working
+/// task needs this additional acknowledgment, before its old process can be ended. Read the
+/// observed agent or a kernel-proven scoped claimant, never the legacy task's agent label.
+fn restored_exit_owner_ready(ctx: &SessionCtx, pgrp: i32, start: &str) -> bool {
+    let agent = crate::harness_host::published_snapshot(ctx.self_id.as_str())
+        .filter(|snapshot| {
+            i32::try_from(snapshot.pid).ok() == Some(pgrp) && snapshot.start == start
+        })
+        .map(|snapshot| snapshot.agent().program());
+    let meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
+    let timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
+    if !timeline.task().is_some_and(|task| {
+        task.state == crate::task_record::TaskState::Working
+            && task.why == Some(crate::task_record::WHY_RESTORED)
+    }) {
+        return true;
+    }
+    let agent = agent.or_else(|| {
+        meta.live_scoped(crate::metrics::now_us())
+            .filter(|scoped| {
+                i32::try_from(scoped.proven.pid).ok() == Some(pgrp) && scoped.proven.start == start
+            })
+            .map(|scoped| scoped.claim.row.program)
+    });
+    agent.is_some_and(|agent| meta.task_exit_owner.current(ctx.nonce, Some(agent)))
+}
 
 fn scoped_relaunch(ctx: &SessionCtx, pgrp: i32) -> bool {
     scoped_relaunch_pid(ctx, crate::metrics::now_us()).and_then(|pid| i32::try_from(pid).ok())
@@ -404,6 +459,12 @@ pub(crate) fn begin<'a>(
     by: aterm_slog::Actor,
 ) -> Result<Stamped<'a>, String> {
     let ask = parse(rest)?;
+    // An asked account is judged against the pool's records, which are files: before the act's
+    // lock, so no other tab's restart waits on that read, and reported after the fences below.
+    let judged = ask
+        .account
+        .as_ref()
+        .and_then(|wanted| judge_account(master, ctx, state, wanted));
     let one_act = ACTING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -448,10 +509,29 @@ pub(crate) fn begin<'a>(
     {
         return Err(format!("ERR busy person human_ms={ms}\n"));
     }
+    if !restored_exit_owner_ready(ctx, pgrp, &start) {
+        crate::harness_host::ring();
+        return Err(refuse(EXIT_OWNER_NOT_READY));
+    }
     let sid = ctx.self_id.as_str();
     let pid = u32::try_from(pgrp).unwrap_or(0);
     let now = aterm_time::unix_secs().unwrap_or(0);
-    if let Some(stamp) = restart_stamp::standing(state, sid, pid, &start, now) {
+    let standing = restart_stamp::standing(state, sid, pid, &start, now);
+    // A refused account leaves nothing behind: no stamp is written and no signal sent.
+    if let Some(wanted) = &ask.account
+        && let Some(why) = account_fence(
+            ctx,
+            (pid, &start),
+            wanted,
+            judged.as_ref(),
+            standing.as_ref(),
+        )
+    {
+        return Err(refuse(why));
+    }
+    if let Some(stamp) = standing {
+        // A plain restart that joins an account's stamp keeps that destination: the stamp is
+        // the first act's, and its relaunch is the one both asked for.
         return Ok(Stamped {
             master,
             ctx,
@@ -459,6 +539,7 @@ pub(crate) fn begin<'a>(
             pgrp,
             stamp,
             wrote: false,
+            account: ask.account,
             by,
             _one_act: one_act,
         });
@@ -468,6 +549,7 @@ pub(crate) fn begin<'a>(
         start,
         cause: if stalled { Cause::Stall } else { Cause::Asked },
         at: now,
+        wanted: ask.account.clone(),
         input: restart_stamp::input_host().map(|host| restart_stamp::Input {
             host,
             seq: ctx.human_input.seq(),
@@ -483,9 +565,240 @@ pub(crate) fn begin<'a>(
         pgrp,
         stamp,
         wrote: true,
+        account: ask.account,
         by,
         _one_act: one_act,
     })
+}
+
+/// `restart account=`'s refusal words that are the act's own, beside the pool's
+/// ([`accounts_pool::MOVE_UNMANAGED`] and the words with it): the host's snapshot names no shell
+/// under the session, so nothing would type its relaunch line.
+pub(crate) const ACCOUNT_NOT_RESUMABLE: &str = "account-not-resumable";
+/// A login renewal or an exec handoff of this session is in flight ([`crate::native_act`]).
+pub(crate) const ACCOUNT_RECOVERY_PENDING: &str = "account-recovery-pending";
+/// A restart of this process already stands and names another destination, or none.
+pub(crate) const ACCOUNT_RESTART_PENDING: &str = "account-restart-pending";
+
+/// How long an account ask waits for the pool's records ([`bounded`]).
+const ACCOUNT_JUDGE: Duration = Duration::from_secs(5);
+
+/// Minimum test value of [`ACCOUNT_JUDGE`].
+const ACCOUNT_JUDGE_TEST_FLOOR: Duration = Duration::from_millis(250);
+
+/// How many account judgements may run at once; one more is answered as unread.
+const ACCOUNT_JUDGES: usize = 4;
+
+/// What an account ask's judgement found, before the act's lock ([`judge_account`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Judged {
+    /// The process it judged: the tab's foreground group leader and its kernel start.
+    pub(crate) pid: u32,
+    pub(crate) start: String,
+    /// Whether the tab's validated self-claim copy is of that process: only a codex-alab that
+    /// claimed its own session, on a line aterm validated, is moved.
+    pub(crate) copied: bool,
+    /// Why the pool's records refuse the move ([`accounts_pool::Moves::refusal`]).
+    pub(crate) refusal: Option<&'static str>,
+}
+
+/// The pool's word on moving the session `launch` started to `wanted` ([`judge_account`]).
+type AccountJudge =
+    dyn Fn(&crate::harness_host::RunningLaunch, &Wanted) -> Option<&'static str> + Send + Sync;
+
+#[cfg(test)]
+thread_local! {
+    static JUDGE_FOR_TEST: std::cell::RefCell<Option<(Arc<AccountJudge>, Duration)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// This test thread's account judge and how long an ask waits for it, until the guard drops,
+/// in place of the one that reads this process's own account pool.
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) struct JudgeForTest(Option<(Arc<AccountJudge>, Duration)>);
+
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn judge_for_test(judge: Arc<AccountJudge>, wait: Duration) -> JudgeForTest {
+    JudgeForTest(JUDGE_FOR_TEST.with(|slot| slot.replace(Some((judge, wait)))))
+}
+
+#[cfg(test)]
+impl Drop for JudgeForTest {
+    fn drop(&mut self) {
+        let before = self.0.take();
+        JUDGE_FOR_TEST.with(|slot| *slot.borrow_mut() = before);
+    }
+}
+
+/// The judge an ask on this thread runs and how long it waits for it: the one over this
+/// process's account pool with its harness state at `state`, for [`ACCOUNT_JUDGE`], unless a
+/// unit test set its own. `None` where the pool's place is not known.
+fn account_judge(state: Option<&std::path::Path>) -> Option<(Arc<AccountJudge>, Duration)> {
+    #[cfg(test)]
+    if let Some(judge) = JUDGE_FOR_TEST.with(|slot| slot.borrow().clone()) {
+        return Some(judge);
+    }
+    let config = aterm_types::dirs::aterm_config_path()?;
+    let config_dir = config.parent()?.to_path_buf();
+    let home = aterm_primer::home_dir()?;
+    let state = state?.to_path_buf();
+    let wait = aterm_gui_timing::current().of_at_least(ACCOUNT_JUDGE, ACCOUNT_JUDGE_TEST_FLOOR);
+    let judge: Arc<AccountJudge> = Arc::new(move |launch, wanted| {
+        let Some(now) = aterm_time::unix_secs().and_then(|now| i64::try_from(now).ok()) else {
+            return Some(accounts_pool::MOVE_UNREAD);
+        };
+        let seat = accounts_pool::Seat {
+            config_dir: &config_dir,
+            state: &state,
+            home: &home,
+            now,
+        };
+        pool_refusal(&seat, launch, wanted)
+    });
+    Some((judge, wait))
+}
+
+/// Why the pool at `seat` refuses to move the codex-alab session `launch` started to `wanted`,
+/// as its records stand ([`accounts_pool::moves`]): the row the session runs on is the one its
+/// launch's environment names, which aterm read from that process, not anything the session
+/// says.
+pub(crate) fn pool_refusal(
+    seat: &accounts_pool::Seat<'_>,
+    launch: &crate::harness_host::RunningLaunch,
+    wanted: &Wanted,
+) -> Option<&'static str> {
+    match accounts_pool::moves(
+        seat,
+        aterm_agent::harness::accounts::Cli::Codex,
+        &launch.login_env(),
+        launch.resume.argv.first().map(std::path::Path::new),
+    ) {
+        Ok(moves) => moves.refusal(wanted),
+        Err(why) => Some(why),
+    }
+}
+
+/// `judge`'s answer, waited for at most `wait` off this thread: a pool whose files do not
+/// answer holds neither this ask's caller nor, since it runs before the act's lock, any other
+/// restart. `None` where it did not answer in time, could not start, or [`ACCOUNT_JUDGES`]
+/// others still wait on such a read.
+fn bounded<T: Send + 'static>(
+    wait: Duration,
+    judge: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    static RUNNING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    bounded_among(&RUNNING, wait, judge)
+}
+
+/// [`bounded`], counted among the judgements `running` counts.
+fn bounded_among<T: Send + 'static>(
+    running: &'static std::sync::atomic::AtomicUsize,
+    wait: Duration,
+    judge: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    use std::sync::atomic::Ordering;
+    struct Slot(&'static std::sync::atomic::AtomicUsize);
+    impl Drop for Slot {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    if running.fetch_add(1, Ordering::SeqCst) >= ACCOUNT_JUDGES {
+        running.fetch_sub(1, Ordering::SeqCst);
+        return None;
+    }
+    let slot = Slot(running);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("aterm-restart-account".into())
+        .spawn(move || {
+            let _slot = slot;
+            let _ = tx.send(judge());
+        })
+        .ok()?;
+    rx.recv_timeout(wait).ok()
+}
+
+/// The judgement of an ask for `wanted` in `ctx`'s tab, made before the act's lock: of the
+/// process that leads the tab now, by the tab's validated self-claim copy of it and the pool's
+/// records. `None` where no process could be named; [`begin`]'s fences then say why.
+#[cfg(unix)]
+fn judge_account(
+    master: i32,
+    ctx: &SessionCtx,
+    state: Option<&std::path::Path>,
+    wanted: &Wanted,
+) -> Option<Judged> {
+    // SAFETY: `tcgetpgrp` only reads the live master's foreground group.
+    let pgrp = unsafe { libc::tcgetpgrp(master) };
+    let pid = u32::try_from(pgrp).ok().filter(|pid| *pid > 0)?;
+    let start = restart_stamp::kernel_start(pid)?;
+    let resume = crate::self_claim::copy_of_tab(ctx.self_id.as_str())
+        .filter(|copy| copy.pid == pid && copy.start == start)
+        .and_then(|copy| copy.resume.ok());
+    let Some(resume) = resume else {
+        return Some(Judged {
+            pid,
+            start,
+            copied: false,
+            refusal: None,
+        });
+    };
+    // The credential variables its exec environment set are read from the process itself: a
+    // process whose environment cannot be read is judged on nothing.
+    let launch = crate::harness_host::RunningLaunch::of_live(resume, pid);
+    let refusal = match (launch, account_judge(state)) {
+        (Some(launch), Some((judge, wait))) => {
+            let wanted = wanted.clone();
+            bounded(wait, move || judge(&launch, &wanted))
+                .unwrap_or(Some(accounts_pool::MOVE_UNREAD))
+        }
+        _ => Some(accounts_pool::MOVE_UNREAD),
+    };
+    Some(Judged {
+        pid,
+        start,
+        copied: true,
+        refusal,
+    })
+}
+
+/// Why an ask for `wanted` is refused for the process `pid` started at `start`, once the act's
+/// own fences passed: in order, the session is no codex-alab aterm holds a validated line of
+/// (`account-unmanaged`), no shell would type its relaunch (`account-not-resumable`), a renewal
+/// or exec handoff of it is in flight (`account-recovery-pending`), the pool's records refuse
+/// the move (`judged`, which must be of this very process: else `account-unread`), or a restart
+/// of it already stands for another destination or none (`account-restart-pending`).
+pub(crate) fn account_fence(
+    ctx: &SessionCtx,
+    (pid, start): (u32, &str),
+    wanted: &Wanted,
+    judged: Option<&Judged>,
+    standing: Option<&Stamp>,
+) -> Option<&'static str> {
+    let Some(judged) = judged.filter(|judged| judged.pid == pid && judged.start == start) else {
+        return Some(accounts_pool::MOVE_UNREAD);
+    };
+    if !judged.copied {
+        return Some(accounts_pool::MOVE_UNMANAGED);
+    }
+    let shell = crate::harness_host::published_snapshot(ctx.self_id.as_str())
+        .filter(|snap| snap.pid == pid && snap.start == start)
+        .map(|snap| snap.shell);
+    if shell.is_none_or(|shell| shell == aterm_agent::harness::relaunch::NO_SHELL) {
+        return Some(ACCOUNT_NOT_RESUMABLE);
+    }
+    if crate::native_act::renewal_pending(ctx) {
+        return Some(ACCOUNT_RECOVERY_PENDING);
+    }
+    if let Some(why) = judged.refusal {
+        return Some(why);
+    }
+    standing
+        .is_some_and(|stamp| stamp.wanted.as_ref() != Some(wanted))
+        .then_some(ACCOUNT_RESTART_PENDING)
 }
 
 static ACTING: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -501,6 +814,9 @@ pub(crate) struct Stamped<'a> {
     stamp: Stamp,
     /// Whether this act wrote [`Self::stamp`] (else it joined it).
     wrote: bool,
+    /// The account this act asked for, which its reply names: the stamp's own where it asked
+    /// for one ([`account_fence`]), none for a plain restart whatever stamp it joined.
+    account: Option<Wanted>,
     /// Who asked for it.
     by: aterm_slog::Actor,
     _one_act: std::sync::MutexGuard<'static, ()>,
@@ -517,11 +833,17 @@ impl Stamped<'_> {
             pgrp,
             stamp,
             wrote,
+            account,
             by,
             _one_act,
         } = self;
         let sid = ctx.self_id.as_str();
         let cause = stamp.cause;
+        if !restored_exit_owner_ready(ctx, pgrp, &stamp.start) {
+            let _ = take_back(state, sid, &stamp, wrote);
+            crate::harness_host::ring();
+            return format!("ERR restart unavailable: {EXIT_OWNER_NOT_READY}\n");
+        }
         if scoped_relaunch(ctx, pgrp) {
             record_restart(ctx, cause);
             aterm_log::info!(
@@ -560,7 +882,16 @@ impl Stamped<'_> {
                 };
                 spawn_escalation(Arc::downgrade(ctx), state, pgrp, &stamp);
                 let tail = discarded.map_or_else(String::new, |n| format!(" discarded={n}"));
-                format!("OK restarting pid {pgrp} cause={}{tail}\n", cause.word())
+                // A plain restart's reply is as it was; an account ask's ends in what it asked.
+                let account = match &account {
+                    Some(Wanted::Row(label)) => format!(" account={label}"),
+                    Some(Wanted::Pool) => format!(" {ACCOUNT_AUTO}"),
+                    None => String::new(),
+                };
+                format!(
+                    "OK restarting pid {pgrp} cause={}{tail}{account}\n",
+                    cause.word()
+                )
             }
         }
     }

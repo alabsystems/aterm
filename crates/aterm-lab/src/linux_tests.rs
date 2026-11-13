@@ -374,6 +374,72 @@ fn every_checkout_takes_the_one_lock_beside_the_vm() {
 }
 
 #[test]
+fn memory_takes_whole_gib_from_four_to_the_full_guest() {
+    assert_eq!(parse_memory("8").ok(), Some(8));
+    assert_eq!(parse_memory("4").ok(), Some(MEMORY_MIN_GIB));
+    assert_eq!(parse_memory("16").ok(), Some(MEMORY_GIB));
+    for bad in ["3", "17", "8.5", "8G", "", "-8"] {
+        let refused = parse_memory(bad).expect_err(bad);
+        assert!(
+            refused
+                .msg
+                .as_deref()
+                .is_some_and(|m| m.contains("from 4 to 16")),
+            "{bad:?}: {:?}",
+            refused.msg
+        );
+    }
+    assert_eq!(memory_gib(), MEMORY_GIB, "unnamed, the guest boots whole");
+    let cell = OnceLock::new();
+    assert_eq!(memory_in(&cell, "8").ok(), Some(8));
+    assert_eq!(memory_in(&cell, "8").ok(), Some(8), "the same size again");
+    let other = memory_in(&cell, "12").expect_err("another size");
+    assert!(
+        other
+            .msg
+            .as_deref()
+            .is_some_and(|m| m.contains("this run's guest is 8 GiB")),
+        "{:?}",
+        other.msg
+    );
+    assert_eq!(cell.get(), Some(&8), "the first size holds");
+}
+
+#[test]
+fn a_stopped_vm_is_resized_before_its_boot_and_a_running_one_is_adopted() {
+    let stopped = parse_list(LIST, VM).expect("the lane's VM");
+    assert_eq!(stopped.memory, u64::from(MEMORY_GIB) << 30);
+    assert_eq!(
+        memory_edit_args(VM, &stopped, 8),
+        Some(vec![
+            "edit".to_string(),
+            "--tty=false".into(),
+            VM.into(),
+            "--memory=8".into()
+        ])
+    );
+    assert_eq!(
+        memory_edit_args(VM, &stopped, MEMORY_GIB),
+        None,
+        "at its size already"
+    );
+    let small = VmState {
+        memory: 8 << 30,
+        ..stopped.clone()
+    };
+    assert_eq!(
+        memory_edit_args(VM, &small, MEMORY_GIB).map(|a| a[3].clone()),
+        Some("--memory=16".into()),
+        "a boot without --memory gives the guest back its 16 GiB"
+    );
+    let running = VmState {
+        status: "Running".into(),
+        ..stopped
+    };
+    assert_eq!(memory_edit_args(VM, &running, 8), None, "adopted as it is");
+}
+
+#[test]
 fn the_mount_expression_quotes_its_paths() {
     assert_eq!(
         mount_expr(&["/Users//u/aterm".into()]),

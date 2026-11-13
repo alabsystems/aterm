@@ -39,6 +39,17 @@ pub(crate) fn run_stage_prepared(
     }
     if matches!(spec.id, StageId::RedrawConformance | StageId::ObjcDrives) && (ctx.screen_locked)()
     {
+        // Each builds what it drives into the main lane's build directory: a run that skips
+        // one reports less of that directory than a run of its selection that does not, and
+        // its record says so ([`crate::disk::note_skipped`]).
+        crate::disk::note_skipped(
+            ctx,
+            if matches!(spec.id, StageId::RedrawConformance) {
+                "redraw-conformance"
+            } else {
+                "objc-drives"
+            },
+        );
         r.skip("native AppKit checks require an unlocked console; the console session is locked");
         return r;
     }
@@ -937,8 +948,9 @@ pub(crate) fn step_of(r: &Report) -> &str {
 /// Run `cmd`, a call that compiles and runs nothing it built, with Cargo's messages on a stdout
 /// of its own ([`crate::compile_account::with_message_format`], [`exec::run_machine`]), and
 /// account for it ([`crate::compile_account::Account`]) as call `call` of `step`: its
-/// `compile-finished` event goes to stderr at once, its line to its caller for its report. Never
-/// a call that runs tests or programs: their stdout is theirs.
+/// `compile-finished` event goes to stderr at once, its line to its caller for its report. What
+/// it used of the build directory it builds into is noted for the run's record of it
+/// ([`crate::disk::note_call`]). Never a call that runs tests or programs: their stdout is theirs.
 fn run_compile(ctx: &Ctx, step: &str, call: &str, cmd: &Cmd) -> Compile {
     let cmd = crate::compile_account::with_message_format(cmd.clone());
     let began = std::time::Instant::now();
@@ -948,6 +960,7 @@ fn run_compile(ctx: &Ctx, step: &str, call: &str, cmd: &Cmd) -> Compile {
     );
     let exec::MachineRun { run, stdout } = exec::run_machine(&cmd, ctx.exec_env(), Some(step));
     let ended = std::time::Instant::now();
+    crate::disk::note_call(ctx, &cmd, stdout.as_deref().ok(), run.ok);
     crate::event_log::emit(
         ctx.events.as_ref(),
         &crate::report::row_event(
@@ -1184,7 +1197,9 @@ fn test_doc_binding(ctx: &Ctx) -> (&'static str, bool) {
 
 /// The test compile, or one call of it when it is shaped ([`crate::shape`]): a cut over its own
 /// crates ([`piece_compile_args`]), the closing call today's command over the run's selection.
-/// Behind a call that did not pass, a call is COULD NOT RUN and starts no cargo.
+/// Behind a call that did not pass, a call is COULD NOT RUN and starts no cargo. The whole call,
+/// or a shaped compile's closing one, that passes closes the run's note of the main lane's build
+/// directory ([`crate::disk::close`]): from then the run's record of it may be kept.
 fn test_compile(ctx: &Ctx, spec: &StageSpec, r: &mut Report) {
     if !ctx.tools.have_targo() {
         r.cannot_run(ctx.tools.missing_targo_label());
@@ -1244,13 +1259,19 @@ fn test_compile(ctx: &Ctx, spec: &StageSpec, r: &mut Report) {
         }
     };
     let began = std::time::SystemTime::now();
-    let (compiled, _, artifacts, script_runs) =
-        compile_tests(ctx, r, &format!("{label}{suffix}"), &compile);
-    crate::disk::note_used(ctx, &artifacts, &script_runs);
+    let (compiled, _, artifacts) = compile_tests(ctx, r, &format!("{label}{suffix}"), &compile);
     if !compiled {
         ctx.test_compile_failed
             .store(true, std::sync::atomic::Ordering::Release);
-    } else if let Some(part) = spec.part.as_ref().filter(|p| p.shaped()) {
+        return;
+    }
+    // The whole call, or the closing one of a shaped compile, built every test the run's
+    // selection has: with what its other compile calls report, the run's note of the main
+    // lane's build directory names all it uses there.
+    if cut.is_none() {
+        crate::disk::close(ctx, &crate::disk::Dir::Main);
+    }
+    if let Some(part) = spec.part.as_ref().filter(|p| p.shaped()) {
         shape_after(ctx, part, &artifacts, began);
     }
 }
@@ -1297,14 +1318,12 @@ fn said_on(ctx: &Ctx, index: usize, said: String) {
         .or_insert(said);
 }
 
-/// What a test compile's child did: whether it passed, the test executables it built, every
-/// artifact it reported ([`crate::shape::artifacts`]), and the `out_dir` of every build script it
-/// ran ([`crate::shape::script_runs`]).
+/// What a test compile's child did: whether it passed, the test executables it built, and every
+/// artifact it reported ([`crate::shape::artifacts`]).
 type Compiled = (
     bool,
     Result<Vec<crate::testrun::TestExe>, String>,
     Vec<crate::shape::Artifact>,
-    Vec<String>,
 );
 
 fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compiled {
@@ -1325,12 +1344,11 @@ fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compi
             r.raw(line);
             r.decide_child(&run, label);
             r.cannot_run(&why);
-            return (false, Err(why), Vec::new(), Vec::new());
+            return (false, Err(why), Vec::new());
         }
     };
 
     let artifacts = crate::shape::artifacts(&stdout);
-    let script_runs = crate::shape::script_runs(&stdout);
     let refusal = crate::compile_width::refusal(&run, &stdout);
     if run.ok {
         let indexed = crate::test_index::identities(&ctx.root, &ctx.tools.targo)
@@ -1356,7 +1374,7 @@ fn compile_tests(ctx: &Ctx, r: &mut Report, label: &str, compile: &Cmd) -> Compi
     } else {
         r.decide_child(&run, label);
     }
-    (run.ok, exes, artifacts, script_runs)
+    (run.ok, exes, artifacts)
 }
 
 /// After call `part` of a shaped test compile, which began at `began`, passed with `artifacts`: a
@@ -2057,6 +2075,7 @@ fn cargo_doc_driver(ctx: &Ctx, driver: &DocDriver) -> Option<std::path::PathBuf>
             cwd: Some(&ctx.root),
             env: &lookup,
             read: &read_config,
+            read_manifest: &aterm_toolchain::build_cache::read_manifest,
             writable: &|_| None,
         };
         configs_name(&machine, names_rustdoc)
@@ -2157,7 +2176,16 @@ fn tippy(ctx: &Ctx, r: &mut Report) {
         tippy_release_content(ctx, r, &bin, &borrowed);
     } else {
         let scope = ctx.scope.clone();
-        let _ = tippy_scope(ctx, r, &bin, &scope, &borrowed);
+        // Every pass of the lint over the run's selection passed: what they reported of the
+        // lint lane's build directory is all the run uses there, so its record may be kept
+        // ([`crate::disk::close`]). The release's content passes lint package by package from
+        // what earlier runs carried, never the whole selection in one run, and close nothing.
+        if tippy_scope(ctx, r, &bin, &scope, &borrowed)
+            && !scope.selects_nothing()
+            && let Some(lane) = lane_dir(ctx, Lane::TippyTarget)
+        {
+            crate::disk::close(ctx, &crate::disk::Dir::Side(lane));
+        }
     }
 }
 
@@ -2761,10 +2789,16 @@ fn preflight_censuses(ctx: &Ctx, r: &mut Report, check: &str) {
     }
 }
 
-/// The engine-naming variables of `ctx`'s environment ([`crate::EnvSnapshot::engine_var`]),
+/// The engine checkout and explicit pin variables of `ctx`'s environment ([`crate::EnvSnapshot::engine_var`]),
 /// owned so a walk on another thread reads them.
 fn engine_vars(ctx: &Ctx) -> impl Fn(&str) -> Option<std::ffi::OsString> + Send + 'static {
-    let held = ["PUBLICATION_ENGINE", "HOME"].map(|name| (name, ctx.env.engine_var(name)));
+    let held = [
+        "PUBLICATION_ENGINE",
+        "HOME",
+        crate::engine::GIT_DIR_ENV,
+        crate::engine::COMMIT_ENV,
+    ]
+    .map(|name| (name, ctx.env.engine_var(name)));
     move |name| {
         held.iter()
             .find(|(held, _)| *held == name)

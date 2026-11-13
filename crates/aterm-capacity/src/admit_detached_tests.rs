@@ -73,6 +73,8 @@ fn assert_full_budget_refused(machine: &Fixed, record: Record) {
             available: 3 * GIB,
             reserved: 2 * GIB,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }]
     );
     assert!(

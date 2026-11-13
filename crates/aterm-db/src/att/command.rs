@@ -6,7 +6,7 @@
 //! unless `--show-addresses` is given, and no refusal quotes a value. JSON output is for
 //! scripts and agents; there is no MCP server.
 
-use super::{Capacity, Entry, Handle, Roll, Saved, TABLES, Usage, View, edit, find};
+use super::{Capacity, Diff, Entry, Handle, Point, Roll, Saved, TABLES, Usage, View, edit, find};
 use crate::{
     Error, Result,
     database::decode_hex,
@@ -32,19 +32,24 @@ pub const USAGE: &str = "aterm db table — typed ATT/1 tables on Commons (Unix)
                                         per-Mac quota left, inert records, conflicts, schemas\n\
   schema <app>/<role>[/<collection>] [--publish]\n\
                                         compiled and stored schema rows; --publish writes them\n\
-  get <app>/<role> <collection> <pk>    one row\n\
-  scan <app>/<role> <collection> [--where col=val]... [--tsv|--json]\n\
+  get <app>/<role> <collection> <pk> [--at <operation>]\n\
+                                        one row\n\
+  scan <app>/<role> <collection> [--where col=val]... [--tsv|--json] [--at <operation>]\n\
   history <app>/<role> [<collection> [<pk>]]\n\
                                         who changed what, in causal order\n\
+  diff <app>/<role> [<collection>] <from> [<to>|head]\n\
+                                        the cells added, retired, changed and conflict-changed\n\
+                                        from one point to a later one, and who made each\n\
   check <app>/<role>                    conflicts, dangling references, unique clashes\n\
   revert <app>/<role> <operation> [--request <hex>]\n\
-  export <app>/<role> <collection> --tsv <file> [--where col=val]...\n\
+  export <app>/<role> <collection> --tsv <file> [--where col=val]... [--at <operation>]\n\
   apply <file>                          write an exported file's changed cells\n\
   edit <app>/<role> <collection> [--where col=val]...\n\
                                         edit in amacs's spreadsheet mode, then write\n\
   Addresses are masked unless --show-addresses is given. A header starting with = is\n\
   read-only; a conflicted cell shows ⚠ a ‖ b; a new row leaves its pk empty; a deleted row is\n\
-  retired. A cell that changed since the export is never overwritten.\n";
+  retired. A cell that changed since the export is never overwritten. A point is an\n\
+  operation as history prints it: --at reads the table as that operation's causal past holds it.\n";
 
 /// What a verb prints.
 #[derive(Clone, Debug, PartialEq)]
@@ -97,6 +102,8 @@ struct Args {
     file: Option<String>,
     request: Option<String>,
     filters: Vec<Where>,
+    /// `--at <operation>`: read as of that operation's causal cut.
+    at: Option<Point>,
 }
 
 fn parse(verb: &str, words: &[String]) -> Result<Args> {
@@ -125,6 +132,12 @@ fn parse(verb: &str, words: &[String]) -> Result<Args> {
                     return Err(Error::new("revert takes one --request <hex>"));
                 }
                 args.request = Some(value("--request")?);
+            }
+            "--at" if matches!(verb, "get" | "scan" | "export") => {
+                if args.at.is_some() {
+                    return Err(Error::new(&format!("{verb} takes one --at <operation>")));
+                }
+                args.at = Some(Point::At(decode_hex::<32>(&value("--at")?)?));
             }
             "--where" if matches!(verb, "scan" | "export" | "edit") => {
                 args.filters.push(Where::parse(&value("--where")?)?);
@@ -180,6 +193,7 @@ pub fn run(
             | "get"
             | "scan"
             | "history"
+            | "diff"
             | "check"
             | "revert"
             | "export"
@@ -230,7 +244,7 @@ pub fn run(
                 .compiled()
                 .collection(args.operand(1, "<collection>")?)?;
             let pk = args.operand(2, "<pk>")?;
-            let view = handle.view()?;
+            let view = handle.view_at(args.at.unwrap_or(Point::Head))?;
             Ok(Output::Json(get(&view, collection, pk, args.reveal)?))
         }
         "scan" => {
@@ -239,14 +253,14 @@ pub fn run(
             let collection = handle
                 .compiled()
                 .collection(args.operand(1, "<collection>")?)?;
-            let view = handle.view()?;
+            let view = handle.view_at(args.at.unwrap_or(Point::Head))?;
             if args.tsv && !args.json {
-                let export = grid::export(
+                let export = view.export_grid(
                     handle.compiled().table,
                     collection,
-                    &view.cells,
                     &args.filters,
                     args.reveal,
+                    None,
                 )?;
                 return Ok(Output::Text(export.text));
             }
@@ -270,6 +284,45 @@ pub fn run(
                 &handle.history()?,
                 collection,
                 pk,
+                args.reveal,
+            )))
+        }
+        "diff" => {
+            args.at_most(4)?;
+            let handle = handle(args.operand(0, "<app>/<role>")?)?;
+            // The first word names a collection only where the table has one of that name;
+            // otherwise it is <from>, so a mistyped digest is refused as a digest.
+            let mut points = &args.operands[1..];
+            let mut collection = None;
+            if let Some(found) = points
+                .first()
+                .and_then(|word| handle.compiled().table.collection(word))
+            {
+                collection = Some(found);
+                points = &points[1..];
+            }
+            let from = match points.first().map(|word| Point::parse(word)) {
+                Some(Ok(Point::At(at))) => at,
+                Some(Ok(Point::Head)) => {
+                    return Err(Error::new(
+                        "diff compares forward from an operation, so <from> is not head",
+                    ));
+                }
+                Some(Err(error)) => return Err(error),
+                None => return Err(Error::new("missing <from>")),
+            };
+            let to = match points.get(1) {
+                Some(word) => Point::parse(word)?,
+                None => Point::Head,
+            };
+            if points.len() > 2 {
+                return Err(Error::new("too many operands"));
+            }
+            let diff = handle.diff(from, to)?;
+            Ok(Output::Json(diff_json(
+                &handle,
+                &diff,
+                collection.map(|c| c.name),
                 args.reveal,
             )))
         }
@@ -301,13 +354,15 @@ pub fn run(
                 .file
                 .as_deref()
                 .ok_or_else(|| Error::new("export needs --tsv <file>"))?;
-            let export = grid::export(
-                handle.compiled().table,
-                collection,
-                &handle.view()?.cells,
-                &args.filters,
-                args.reveal,
-            )?;
+            let export = handle
+                .view_at(args.at.unwrap_or(Point::Head))?
+                .export_grid(
+                    handle.compiled().table,
+                    collection,
+                    &args.filters,
+                    args.reveal,
+                    None,
+                )?;
             save(Path::new(file), &export.text, &export.base)?;
             Ok(Output::Json(
                 json!({"file": file, "baseline": baseline(Path::new(file)),
@@ -415,6 +470,9 @@ fn row_json(
     for (name, field) in &row.fields {
         let column = collection.column(name).filter(|_| !row.raw.contains(name));
         let value = match column {
+            Some(column) if row.claims.contains_key(name) => row.claims[name]
+                .as_ref()
+                .map_or(Value::Null, |value| grid_value(&column.ty, value, reveal)),
             Some(column) => field_json(Some(column), field, reveal),
             None => field_json(None, field, reveal),
         };
@@ -452,17 +510,37 @@ fn get(view: &View, collection: &'static Collection, pk: &str, reveal: bool) -> 
     let conflicts: Vec<&str> = row
         .fields
         .iter()
-        .filter(|(_, f)| match f {
-            Field::Set(elements) => elements.values().any(Field::conflicted),
-            other => other.conflicted(),
+        .filter(|(name, f)| {
+            row.claims.get(*name).is_some_and(Option::is_none)
+                || match f {
+                    Field::Set(elements) => elements.values().any(Field::conflicted),
+                    other => other.conflicted(),
+                }
         })
         .map(|(name, _)| safe_key(name))
         .collect();
-    Ok(
-        json!({"collection": collection.name, "row": row_json(collection, pk, row, reveal),
+    let mut shown = json!({"collection": collection.name, "row": row_json(collection, pk, row, reveal),
         "lifecycle": row.lifecycle().unwrap_or("live"), "conflicts": conflicts,
-        "raw": row.raw.iter().map(|name| safe_key(name)).collect::<Vec<_>>()}),
-    )
+        "raw": row.raw.iter().map(|name| safe_key(name)).collect::<Vec<_>>()});
+    if !row.claims.is_empty() {
+        let candidates: Map = row
+            .claims
+            .keys()
+            .filter_map(|name| {
+                row.fields.get(name).map(|field| {
+                    (
+                        safe_key(name).to_owned(),
+                        field_json(collection.column(name), field, reveal),
+                    )
+                })
+            })
+            .collect();
+        shown
+            .as_object_mut()
+            .unwrap()
+            .insert("claim_candidates".into(), Value::Object(candidates));
+    }
+    Ok(shown)
 }
 
 fn scan(
@@ -707,18 +785,34 @@ fn check(handle: &Handle, view: &View, usage: &Usage) -> Value {
 /// One change as history shows it: a typed cell's value in its grid spelling (addresses masked
 /// unless `reveal`), a schema row by its version, anything else raw and masked.
 fn change_json(handle: &Handle, change: &crate::database::Change, reveal: bool) -> Value {
-    let value = change.value.as_ref();
-    let shown = if change.collection == SCHEMA {
+    json!({
+        "collection": safe_key(&change.collection),
+        "key": safe_key(&change.key),
+        "value": stored_json(handle, &change.collection, &change.key, change.value.as_ref(), reveal),
+    })
+}
+
+/// A stored value of cell `key` in `collection` as history and diff show it: a typed cell's value
+/// in its grid spelling (addresses masked unless `reveal`), a set member's presence, a schema row
+/// by its version, anything else raw and masked.
+fn stored_json(
+    handle: &Handle,
+    collection: &str,
+    key: &str,
+    value: Option<&Value>,
+    reveal: bool,
+) -> Value {
+    if collection == SCHEMA {
         value.and_then(|v| v.get("r")).map_or(
             Value::Null,
             |r| json!({"schema": grid::raw_masked(r, reveal)}),
         )
     } else {
-        let collection = handle.compiled().table.collection(&change.collection);
+        let collection = handle.compiled().table.collection(collection);
         match (collection, value) {
             (_, None) => Value::Null,
             (Some(collection), Some(value)) if collection.kind == Kind::Cells => {
-                let typed = CellKey::parse(&change.key)
+                let typed = CellKey::parse(key)
                     .ok()
                     .and_then(|key| collection.column(key.col).map(|c| (key, c)));
                 match (typed, CellValue::decode(value)) {
@@ -737,12 +831,45 @@ fn change_json(handle: &Handle, change: &crate::database::Change, reveal: bool) 
             }
             (_, Some(value)) => grid::raw_masked(value, reveal),
         }
+    }
+}
+
+/// `diff`'s answer: each differing cell (or owned row) of `only` (every collection where `None`)
+/// with what it held at each point and the operations, writers and machines that made it.
+fn diff_json(handle: &Handle, diff: &Diff, only: Option<&str>, reveal: bool) -> Value {
+    let point = |point: &Point| match point {
+        Point::Head => json!("head"),
+        Point::At(at) => json!(hex::encode_lower(at)),
     };
-    json!({
-        "collection": safe_key(&change.collection),
-        "key": safe_key(&change.key),
-        "value": shown,
-    })
+    let cells: Vec<Value> = diff
+        .cells
+        .iter()
+        .filter(|cell| only.is_none_or(|name| cell.collection == name))
+        .map(|cell| {
+            let values = |candidates: &[crate::database::Candidate]| {
+                candidates
+                    .iter()
+                    .map(|c| {
+                        stored_json(handle, &cell.collection, &cell.key, Some(&c.value), reveal)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            json!({
+                "collection": safe_key(&cell.collection),
+                "key": safe_key(&cell.key),
+                "change": cell.delta.word(),
+                "before": values(&cell.before),
+                "after": values(&cell.after),
+                "by": cell.by.iter().map(|by| json!({
+                    "operation": hex::encode_lower(&by.operation),
+                    "author": hex::encode_lower(&by.actor),
+                    "machine": by.machine.as_ref().map(keys::uuid32),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    json!({"table": handle.compiled().name(), "from": point(&Point::At(diff.from)),
+        "to": point(&diff.to), "cells": cells})
 }
 
 fn history(
@@ -835,13 +962,9 @@ fn apply(paths: &Paths, file: &Path) -> Result<Output> {
                 .collect::<Vec<_>>()})));
         }
     };
-    let fresh = grid::export(
-        compiled.table,
-        collection,
-        &handle.view()?.cells,
-        &[],
-        base.reveal,
-    )?;
+    let fresh = handle
+        .view()?
+        .export_grid(compiled.table, collection, &[], base.reveal, None)?;
     let reopened = grid::reopen(fresh.base, &applied.stale);
     let rows: std::collections::BTreeSet<&str> =
         base.rows.iter().map(|(pk, _)| pk.as_str()).collect();

@@ -98,7 +98,73 @@ fn lineage() -> Table {
 }
 
 fn line(word: &str, sid: &str) -> String {
-    format!("OK 1\nverdict={word} session={sid}\n")
+    format!("OK 1\nverdict={word} session={sid} fleet=no\n")
+}
+
+/// [`line`] where another Mac is behind the question.
+fn fleet_line(word: &str, sid: &str) -> String {
+    format!("OK 1\nverdict={word} session={sid} fleet=yes\n")
+}
+
+/// ANOTHER MAC BEHIND THE QUESTION IS SAID BESIDE THE VERDICT, so a sign-in started in the
+/// session opens nothing on this Mac's desk: a fleet driver admitted to type into the session
+/// marks it from its admission, before anything is written, and for as long as the session
+/// lives, whatever a local driver or aterm types after; a question a fleet driver or the
+/// bridge asked is one. CONTROLS: a local driver's typing is `driven` and no other Mac's, and
+/// a person's tab is neither.
+#[test]
+fn a_fleet_driver_s_typing_marks_the_session_as_another_mac_s() {
+    use crate::typed_by::{Caller, Who, fleet_credit};
+    let (store, sid, ctx) = store_with(500);
+    assert_eq!(
+        answer(&store, false, Some(510), &lineage()),
+        line("allowed", &sid)
+    );
+    ctx.typed
+        .stamp(Caller::new(Who::Word("a driver".into())), NOW - 20);
+    assert_eq!(
+        answer(&store, false, Some(510), &lineage()),
+        line("driven", &sid),
+        "a local driver is no other Mac"
+    );
+    let fleet = Caller::new(Who::Word(fleet_credit("m3")));
+    ctx.typed.admit(&fleet);
+    assert!(ctx.typed.fleet_admitted(), "from its admission");
+    assert_eq!(
+        answer(&store, false, Some(510), &lineage()),
+        fleet_line("driven", &sid)
+    );
+    ctx.typed
+        .stamp(Caller::new(Who::Word("a driver".into())), NOW - 5);
+    ctx.typed.stamp(Caller::new(Who::Aterm), NOW - 1);
+    assert_eq!(
+        answer(&store, false, Some(510), &lineage()),
+        fleet_line("driven", &sid),
+        "what it typed can still be running"
+    );
+
+    // Its typing alone marks a session too.
+    let (store, sid, ctx) = store_with(500);
+    ctx.typed
+        .stamp(Caller::new(Who::Word(fleet_credit("m3"))), NOW - 5);
+    assert_eq!(
+        answer(&store, false, Some(510), &lineage()),
+        fleet_line("driven", &sid)
+    );
+    // A question asked remotely is another Mac's, and names no session.
+    assert_eq!(
+        answer(&store, true, Some(510), &lineage()),
+        fleet_line("remote", "-")
+    );
+    // aterm's own typing and the message bus's mark nothing.
+    let (store, sid, ctx) = store_with(500);
+    ctx.typed.stamp(Caller::new(Who::Aterm), NOW - 5);
+    ctx.typed.stamp(Caller::new(Who::Bridge), NOW - 4);
+    assert!(!ctx.typed.fleet_admitted());
+    assert_eq!(
+        answer(&store, false, Some(510), &lineage()),
+        line("allowed", &sid)
+    );
 }
 
 #[test]
@@ -109,6 +175,7 @@ fn the_verdict_is_the_first_fact_that_holds_in_order() {
         held: true,
         driven: true,
         agent: true,
+        fleet: true,
     };
     let mut facts = RevealFacts {
         remote: true,
@@ -131,6 +198,8 @@ fn the_verdict_is_the_first_fact_that_holds_in_order() {
             held: clear < 3,
             driven: clear < 4,
             agent: clear < 5,
+            // Who typed decides no verdict: `driven` already withholds.
+            fleet: true,
         };
         seen.push(reveal_verdict(RevealFacts {
             session: Some(session),
@@ -171,6 +240,7 @@ fn allowed_only_when_no_fact_withholds() {
             held: bit(5),
             driven: bit(6),
             agent: bit(7),
+            fleet: false,
         };
         let facts = RevealFacts {
             remote: bit(0),
@@ -211,7 +281,7 @@ fn remote_indirect_and_none_name_no_session() {
     let (store, sid, _) = store_with(500);
     assert_eq!(
         answer(&store, true, Some(510), &lineage()),
-        line("remote", "-")
+        fleet_line("remote", "-")
     );
     assert_eq!(
         answer(&store, false, None, &lineage()),
@@ -374,13 +444,13 @@ fn the_connection_s_kernel_peer_decides() {
     );
     let _direct = DirectPeer::enter();
     assert_eq!(served(&store, false, "", &table), line("allowed", &sid));
-    assert_eq!(served(&store, true, "", &table), line("remote", "-"));
+    assert_eq!(served(&store, true, "", &table), fleet_line("remote", "-"));
     {
         let _driving = crate::fabric::DrivingAs::enter(crate::fabric::Driver {
             node: "0d".repeat(16),
             host: "mac-0d".to_owned(),
         });
-        assert_eq!(served(&store, false, "", &table), line("remote", "-"));
+        assert_eq!(served(&store, false, "", &table), fleet_line("remote", "-"));
     }
     assert_eq!(
         served(&store, false, "now", &table),

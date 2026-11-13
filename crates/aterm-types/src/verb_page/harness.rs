@@ -78,7 +78,10 @@ pub(crate) const PAGE: Page = Page {
                      (Grok Build under grok-alab); `contract=` is the set of harness contracts \
                      served (2: codex-alab's self-claim, 3: a rostered harness's scoped `meta set \
                      supervisor`); ` codex_rotation=1` follows while the native policy's quota \
-                     rotation is on.",
+                     rotation is on, and with it ` codex_rotation_five_hour=<seconds>`, a plain \
+                     decimal count: this host hands a codex-alab session off at a five-hour \
+                     limit only where that limit's reset is more than that many seconds away \
+                     (nearer, `codex-rotation prepare` answers `state=not-needed`).",
                 ),
                 para(
                     "Followed by every `[harness]` key (pct-encoded, `-` when empty, \

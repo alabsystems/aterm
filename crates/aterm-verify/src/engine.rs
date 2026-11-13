@@ -5,7 +5,8 @@
 //! The publication engine as a reader outside it judges it: the files of one of its commits,
 //! never a checkout's working tree.
 //!
-//! - `PUBLICATION_ENGINE` names a checkout, and its HEAD commit is the engine. A release hands
+//! - An explicit [`GIT_DIR_ENV`]/[`COMMIT_ENV`] pair pins local immutable reader objects.
+//! - Otherwise `PUBLICATION_ENGINE` names a checkout, and its HEAD commit is the engine. A release hands
 //!   each child its own engine this way, synced to the origin's main ([`engine_copy`]).
 //! - Otherwise the engine is its origin's main, imported now ([`OriginMain`]). The origin is the
 //!   one the release's own engine names, else `~/publication`'s. GitHub is reached only through
@@ -148,9 +149,16 @@ impl std::fmt::Display for Error {
     }
 }
 
+/// Exact local object repository selected for publication-policy readers.
+pub const GIT_DIR_ENV: &str = "PUBLICATION_ENGINE_GIT_DIR";
+/// Full immutable commit selected together with [`GIT_DIR_ENV`].
+pub const COMMIT_ENV: &str = "PUBLICATION_ENGINE_COMMIT";
+
 /// The engine a reader judges.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Named {
+    /// An explicitly pinned local repository and commit; neither HEAD nor a remote is read.
+    Pinned { git_dir: PathBuf, commit: String },
     /// `PUBLICATION_ENGINE`'s checkout, read at its HEAD commit.
     Checkout(PathBuf),
     /// The engine's origin, read at its main.
@@ -167,8 +175,27 @@ pub enum Named {
 /// or, where a release made none, of `~/publication` (where a first release clones from).
 ///
 /// # Errors
-/// [`Kind::Unnamed`]: neither names a checkout with an origin.
+/// [`Kind::Unread`] for an incomplete or malformed explicit pin; [`Kind::Unnamed`] when no engine names an origin.
 pub fn named(repo: &Path, var: &dyn Fn(&str) -> Option<OsString>) -> Result<Named, Error> {
+    let directory = var(GIT_DIR_ENV);
+    let commit = var(COMMIT_ENV);
+    if directory.is_some() || commit.is_some() {
+        let invalid = || {
+            Error { kind: Kind::Unread, why: "publication engine pin requires a nonempty absolute Git directory and one full lowercase commit ID".into() }
+        };
+        let directory = directory
+            .filter(|value| !value.is_empty())
+            .ok_or_else(invalid)?;
+        let git_dir = PathBuf::from(directory);
+        let commit = commit
+            .and_then(|value| value.into_string().ok())
+            .filter(|value| aterm_types::land_trailer::object_id(value))
+            .ok_or_else(invalid)?;
+        if !git_dir.is_absolute() {
+            return Err(invalid());
+        }
+        return Ok(Named::Pinned { git_dir, commit });
+    }
     if let Some(dir) = var("PUBLICATION_ENGINE").filter(|v| !v.is_empty()) {
         return Ok(Named::Checkout(PathBuf::from(dir)));
     }
@@ -212,16 +239,17 @@ pub struct Commit {
 }
 
 enum At {
+    Pinned(PathBuf),
     Checkout(PathBuf),
     Origin(OriginMain),
 }
 
 impl Commit {
-    /// The commit `named` is: the checkout's HEAD, or the origin's main brought in by `import`,
+    /// The commit `named` is: its explicit local pin, the checkout's HEAD, or the origin's main brought in by `import`,
     /// each git child run by `run`.
     ///
     /// # Errors
-    /// [`Kind::Unread`]: the checkout has no HEAD commit, or the import failed, each in its own
+    /// [`Kind::Unread`]: the pin is invalid or unavailable, the checkout has no HEAD commit, or the import failed, each in its own
     /// words and naming where.
     pub fn read(named: &Named, run: RunGit<'_>, import: Import<'_>) -> Result<Self, Error> {
         let unread = |why: String| Error {
@@ -229,6 +257,47 @@ impl Commit {
             why,
         };
         match named {
+            Named::Pinned { git_dir, commit } => {
+                if !git_dir.is_absolute() || !aterm_types::land_trailer::object_id(commit) {
+                    return Err(unread("invalid publication engine pin".into()));
+                }
+                let resolved = in_pinned(
+                    git_dir,
+                    &[
+                        "rev-parse",
+                        "--verify",
+                        "--end-of-options",
+                        &format!("{commit}^{{commit}}"),
+                    ],
+                    run,
+                )
+                .map_err(|error| {
+                    unread(format!(
+                        "cannot read pinned publication engine commit {commit}: {error}"
+                    ))
+                })?;
+                if resolved != format!("{commit}\n").as_bytes() {
+                    return Err(unread(
+                        "pinned publication engine object is not the exact commit".into(),
+                    ));
+                }
+                let kind =
+                    in_pinned(git_dir, &["cat-file", "-t", commit], run).map_err(|error| {
+                        unread(format!(
+                            "cannot inspect pinned publication engine commit: {error}"
+                        ))
+                    })?;
+                if kind != b"commit\n" {
+                    return Err(unread(
+                        "pinned publication engine object is not a commit".into(),
+                    ));
+                }
+                Ok(Self {
+                    at: At::Pinned(git_dir.clone()),
+                    sha: commit.clone(),
+                    shown: format!("{} at pinned {}", git_dir.display(), short(commit)),
+                })
+            }
             Named::Checkout(dir) => {
                 // `git -C` searches upward: a directory inside another repository would be read
                 // as that repository's HEAD.
@@ -295,6 +364,7 @@ impl Commit {
         let object = format!("{}:{path}", self.sha);
         let shown = &self.shown;
         let out = match &self.at {
+            At::Pinned(dir) => in_pinned(dir, &["show", &object], run),
             At::Checkout(dir) => in_checkout(dir, &["show", &object], run),
             At::Origin(main) => main.git(&["show", &object], run, true),
         };
@@ -312,6 +382,7 @@ impl Commit {
 /// status or yank run by hand, `export-scan`), never a checkout's working tree, which is as old
 /// as whatever last moved it.
 pub struct OriginMain {
+    origin: String,
     scratch: aterm_tempfile::TempDir,
     commit: String,
 }
@@ -331,6 +402,7 @@ impl OriginMain {
         let scratch = aterm_tempfile::tempdir()
             .map_err(|e| format!("no scratch directory to import into: {e}"))?;
         let mut main = Self {
+            origin: origin.to_owned(),
             scratch,
             commit: String::new(),
         };
@@ -353,6 +425,18 @@ impl OriginMain {
             .map(utf8_line)
             .map_err(|e| format!("the import named {commit}, which it did not bring in ({e})"))?;
         Ok(main)
+    }
+
+    /// The private bare object repository. Its pathname is valid only while this snapshot lives.
+    #[must_use]
+    pub fn git_dir(&self) -> PathBuf {
+        self.at()
+    }
+
+    /// The origin passed to the caller-authorized import of this snapshot.
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
     }
 
     /// The commit main was when it was imported.
@@ -452,3 +536,36 @@ fn short(sha: &str) -> &str {
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
+
+/// Exact local reads ignore inherited Git configuration and cannot lazy-fetch or run a transport.
+fn in_pinned(dir: &Path, args: &[&str], run: RunGit<'_>) -> Result<Vec<u8>, String> {
+    let mut command = crate::git_provider::command();
+    for (name, _) in std::env::vars_os() {
+        if name
+            .as_encoded_bytes()
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"GIT_"))
+        {
+            command.env_remove(name);
+        }
+    }
+    command
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .args([
+            "--no-replace-objects",
+            "-c",
+            "protocol.allow=never",
+            "--git-dir",
+        ])
+        .arg(dir)
+        .args(args);
+    output(&mut command, run)
+}

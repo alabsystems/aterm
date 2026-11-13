@@ -7,6 +7,28 @@
 use aterm_scrollback::{ImageSpan, Line, Scrollback, ScrollbackStorage};
 
 use super::Grid;
+use crate::{CellFlags, LineSize};
+
+/// What a grid's visible rows hold that their [`Line`] records leave out: each row's DEC line size and its DECSCA-protected columns.
+///
+/// A line size is a row flag, and protection shares bit 10 with a wide glyph's spacer, so a line's attributes mask it out.
+/// Both lists are in ascending row order as [`Grid::checkpoint_visible_cells`] writes them; [`Grid::restore_visible_cells`] skips an entry out of that order or out of the grid.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct VisibleCells {
+    /// `(row, size)` of each visible row that is not single width.
+    pub line_sizes: Vec<(u16, LineSize)>,
+    /// `(row, start, end)` of each half-open run of protected columns; a wide glyph's spacer is in its lead's run.
+    pub protected: Vec<(u16, u16, u16)>,
+}
+
+impl VisibleCells {
+    /// Whether every visible row is single width and unprotected.
+    #[must_use]
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.line_sizes.is_empty() && self.protected.is_empty()
+    }
+}
 
 /// Inline-image spans carried beside a line-serialized [`Grid`] checkpoint: sparse visible rows (`0..rows`) and reverse-indexed uncompressed history rows (`0` = newest scrollback line).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -124,6 +146,84 @@ impl Grid {
         }
         self.storage.extras.finish_rows_restore(refill, owned_text);
         self.storage.extras.maybe_shrink();
+    }
+
+    /// Projects the live visible rows' line sizes and DECSCA-protected columns, which [`Self::checkpoint_visible_lines`] leaves out.
+    #[must_use]
+    pub fn checkpoint_visible_cells(&self) -> VisibleCells {
+        let mut cells = VisibleCells::default();
+        for r in 0..self.rows() {
+            let Some(row) = self.row_at_screen(r) else {
+                continue;
+            };
+            let size = row.line_size();
+            if size != LineSize::SingleWidth {
+                cells.line_sizes.push((r, size));
+            }
+            // Bit 10 is a wide glyph's spacer too, so only a row that sets it is walked for runs.
+            let bits = row
+                .as_slice()
+                .iter()
+                .fold(0u16, |bits, cell| bits | cell.flags().bits());
+            if bits & CellFlags::PROTECTED.bits() == 0 {
+                continue;
+            }
+            let cols = row.cols();
+            let mut from = None;
+            for col in 0..cols {
+                match (row.is_cell_protected(col), from) {
+                    (true, None) => from = Some(col),
+                    (false, Some(start)) => {
+                        cells.protected.push((r, start, col));
+                        from = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(start) = from {
+                cells.protected.push((r, start, cols));
+            }
+        }
+        cells
+    }
+
+    /// Applies `cells` to visible rows that [`Self::restore_visible_from_lines`] has filled: DECSCA protection, then each row's line size.
+    ///
+    /// Each list is read once: an entry out of ascending order, out of the grid or overlapping the one before is skipped.
+    /// The line size is set without the blanking `ESC # 6` does, because the restored cells are the live row's own, the half the size hides included.
+    pub fn restore_visible_cells(&mut self, cells: &VisibleCells) {
+        let rows = self.rows();
+        let cols = self.cols();
+        let mut after = (0u16, 0u16);
+        for &(r, start, end) in &cells.protected {
+            if (r, start) < after || r >= rows {
+                continue;
+            }
+            after = (r, end.max(start));
+            let Some(row) = self.row_mut(r) else {
+                continue;
+            };
+            for col in start..end.min(cols) {
+                // A spacer's bit 10 is its role; its protection is its lead's.
+                if row.is_cell_wide_continuation(col) {
+                    continue;
+                }
+                if let Some(cell) = row.get_mut(col) {
+                    cell.set_flags(cell.flags().union(CellFlags::PROTECTED));
+                }
+            }
+        }
+        let mut next_row = 0u16;
+        for &(r, size) in &cells.line_sizes {
+            if r < next_row || r >= rows || size == LineSize::SingleWidth {
+                continue;
+            }
+            next_row = r.saturating_add(1);
+            if let Some(row) = self.row_mut(r) {
+                row.restore_line_size(size);
+                self.mark_has_double_width();
+            }
+        }
     }
 
     /// Clones this grid's history, live frame, and cursor state for mid-recording replay.

@@ -5,7 +5,7 @@
 //! `computers` table, the sheets and the roster, each alone and all in one run.
 
 use super::super::{
-    Input, Mode, Plan, Sheet, SheetKind, Step, covered, dump_sheets, plan,
+    Input, Mode, Plan, Sheet, SheetKind, Step, covered, dump_sheets, plan_cells as plan,
     tests::{SEALER, Stand, logins, vault},
 };
 use super::*;
@@ -26,6 +26,7 @@ const OTHER_PRINCIPAL: &str = "ffeeddccbbaa9988";
 /// A synthetic `[everyone]` key the dumps' sources are keyed under.
 const KEY: [u8; 32] = [0x5a; 32];
 
+/// An import's own input: it births a row only for a machine a source of the run names.
 fn input<'a>(sheets: &'a [Sheet], macs: &'a [KnownMac]) -> Input<'a> {
     Input {
         sheets,
@@ -33,8 +34,16 @@ fn input<'a>(sheets: &'a [Sheet], macs: &'a [KnownMac]) -> Input<'a> {
         vendors: &Stand,
         sealer: &SEALER,
         now_ms: 1_800_000_000_000,
-        births: true,
+        births: Births::Named,
         unread: &[],
+    }
+}
+
+/// Registration's label migration: it births every Mac it is handed, and reads no sheet.
+fn listed(macs: &[KnownMac]) -> Input<'_> {
+    Input {
+        births: Births::Listed,
+        ..input(&[], macs)
     }
 }
 
@@ -310,7 +319,7 @@ fn a_host_never_crosses_a_node() {
         hosts: vec!["Studio".to_owned()],
         ..roster(9, &[], Some(PRINCIPAL))
     }];
-    let known = plan(&input(&[], &macs), &book.cells()).unwrap();
+    let known = plan(&listed(&macs), &book.cells()).unwrap();
     assert_eq!(new_machines(&known), 1, "{:?}", known.counts);
     assert_eq!(wanted(&known, &one, "label"), None);
 }
@@ -400,7 +409,7 @@ fn a_roster_birth_stays_planned_until_its_mac_publishes_its_node() {
     let macs = [roster(5, &[], Some(PRINCIPAL))];
     let row = keys::machine_pk(&format!("n-{PRINCIPAL}"));
     let mut book = Book::new();
-    let born = plan(&input(&[], &macs), &book.cells()).unwrap();
+    let born = plan(&listed(&macs), &book.cells()).unwrap();
     assert_eq!(wanted(&born, &row, "status"), Some(&json!("planned")));
     assert_eq!(wanted(&born, &row, "node"), None);
     let cells = apply(&mut book, &born);
@@ -419,6 +428,86 @@ fn a_roster_birth_stays_planned_until_its_mac_publishes_its_node() {
     assert!(settled.rows.is_empty(), "{:?}", settled.planned);
 }
 
+/// An import births no row for a roster Mac none of its sources names. The roster it reads holds
+/// every standing vault seat, and a seat proves no Mac: m22's dry run of 2026-11-12 planned 186
+/// rows for seats no row answered, 169 of them a seat that asked under another standing seat's
+/// name, and a row is never removed. A seat with a node, a seat with none (a writer successor's)
+/// and a Mac with its row: nothing is born, the Mac with a row is still bound to it, and an import
+/// reports no seat (`adopt --findings` lists them).
+/// NEGATIVE CONTROL: with `known_row` birthing under `Births::Named` whatever `named` says, the
+/// first `assert_eq!` reads `left: 2 right: 0`.
+#[test]
+fn an_import_births_no_row_for_a_roster_mac_no_source_names() {
+    let held = keys::machine_pk("m22");
+    let mut book = Book::new();
+    book.write(
+        2,
+        &[],
+        vec![
+            put(&MACHINE, &held, "label", json!("m22")),
+            put(&MACHINE, &held, "node", json!(PRINCIPAL)),
+            put(&MACHINE, &held, "row", json!("live")),
+        ],
+    );
+    let macs = [
+        roster(22, &[], Some(PRINCIPAL)),
+        roster(200, &[], Some(OTHER_PRINCIPAL)),
+        roster(381, &[], None),
+    ];
+    let plan = plan(&input(&[], &macs), &book.cells()).unwrap();
+    assert_eq!(new_machines(&plan), 0, "{:?}", plan.planned);
+    assert!(
+        plan.planned.iter().all(|p| p.pk == held),
+        "{:?}",
+        plan.planned
+    );
+    // The roster still says what it knows of a row that is there.
+    assert_eq!(wanted(&plan, &held, "status"), Some(&json!("active")));
+    assert_eq!(kinds(&plan), ["adopted-by-node"]);
+    // `adopt` is the reader that lists the seats no row answers.
+    let adopt = Input {
+        births: Births::None,
+        ..input(&[], &macs)
+    };
+    let adopted = super::super::plan_cells(&adopt, &book.cells()).unwrap();
+    assert_eq!(
+        kinds(&adopted),
+        ["adopted-by-node", "unadopted", "unadopted"]
+    );
+}
+
+/// A roster Mac a sheet names is born as before: `planned`, under its node's key, so the Mac's
+/// row is the one its node finds later, or under its label where the roster knows no node. The
+/// seat beside them that no sheet names gets nothing, and a second import over the result writes
+/// nothing: the roster's own pass finds the rows the sheets' labels born.
+/// NEGATIVE CONTROL: with `machine_for` passing `named: false` to `known_row`, neither row is
+/// born: the first `assert_eq!` reads `left: 0 right: 2`.
+#[test]
+fn a_roster_mac_a_sheet_names_is_born_under_its_node() {
+    let sheet = vault(&[
+        ",ann@example.invalid,m5,,1,,,,,,,,",
+        ",bob@example.invalid,m6,,1,,,,,,,,",
+    ]);
+    let macs = [
+        roster(5, &[], Some(PRINCIPAL)),
+        roster(6, &[], None),
+        roster(200, &[], Some(OTHER_PRINCIPAL)),
+    ];
+    let row = keys::machine_pk(&format!("n-{PRINCIPAL}"));
+    let mut book = Book::new();
+    let born = plan(&input(std::slice::from_ref(&sheet), &macs), &book.cells()).unwrap();
+    assert_eq!(new_machines(&born), 2, "{:?}", born.counts);
+    assert_eq!(wanted(&born, &row, "label"), Some(&json!("m5")));
+    assert_eq!(wanted(&born, &row, "status"), Some(&json!("planned")));
+    assert_eq!(
+        wanted(&born, &keys::machine_pk("m6"), "label"),
+        Some(&json!("m6"))
+    );
+    let cells = apply(&mut book, &born);
+    let again = plan(&input(std::slice::from_ref(&sheet), &macs), &cells).unwrap();
+    assert!(again.rows.is_empty(), "{:?}", again.planned);
+}
+
 /// A row the roster born under a Mac's own key is its row before the Mac publishes its node: a
 /// relabel moves it rather than birthing another, and a Mac with no label reaches a fixed point.
 /// NEGATIVE CONTROL: with `row_under_key` answering `None`, the relabel births: `left: 1 right: 0`.
@@ -426,11 +515,7 @@ fn a_roster_birth_stays_planned_until_its_mac_publishes_its_node() {
 fn a_roster_row_is_found_under_its_own_key() {
     let row = keys::machine_pk(&format!("n-{PRINCIPAL}"));
     let mut book = Book::new();
-    let born = plan(
-        &input(&[], &[roster(12, &[], Some(PRINCIPAL))]),
-        &book.cells(),
-    )
-    .unwrap();
+    let born = plan(&listed(&[roster(12, &[], Some(PRINCIPAL))]), &book.cells()).unwrap();
     let cells = apply(&mut book, &born);
     let macs = [roster(120, &[], Some(PRINCIPAL))];
     let relabelled = plan(&input(&[], &macs), &cells).unwrap();
@@ -445,7 +530,7 @@ fn a_roster_row_is_found_under_its_own_key() {
         hosts: Vec::new(),
     }];
     let mut book = Book::new();
-    let first = plan(&input(&[], &unlabelled), &book.cells()).unwrap();
+    let first = plan(&listed(&unlabelled), &book.cells()).unwrap();
     assert_eq!(new_machines(&first), 1, "{:?}", first.counts);
     let cells = apply(&mut book, &first);
     let again = plan(&input(&[], &unlabelled), &cells).unwrap();
@@ -456,8 +541,8 @@ fn a_roster_row_is_found_under_its_own_key() {
 /// Links close across sources, so a name two sources state as an alias of different labels may mean
 /// two machines: it links nothing and is written on neither. A link joining two of the roster's
 /// members is a finding too, not a fold, even with each member's row found by its own node. A roster
-/// name the sources contest births nothing. A computers sheet's link joins one Mac's names as a
-/// replica's does.
+/// Mac whose label the sources contest is not born, even where a source names it by another of its
+/// names. A computers sheet's link joins one Mac's names as a replica's does.
 /// NEGATIVE CONTROL: with `NameLinks::read` recording no contest across tables, `m3` folds into
 /// `m1`: `left: 1 right: 2`. With `known_found` skipping its contested label, the roster's `m2` is
 /// born: `left: 3 right: 2`. With `named` taking the first of two members, the sheet's `make` lands
@@ -481,7 +566,10 @@ fn a_name_two_sources_claim_links_nothing() {
         assert_eq!(wanted(&first, &pk, "aliases.m2"), None);
     }
     assert!(kinds(&first).contains(&"label-ambiguous"));
-    let named = [roster(2, &[], None)];
+    // A third source places an account on `m9`, the roster's other name for its `m2`: that asks
+    // an import for the Mac's row, and its label is the contested name.
+    sheets.push(vault(&[",ann@example.invalid,m9,,1,,,,,,,,"]));
+    let named = [roster(2, &[9], None)];
     let contested = plan(&input(&sheets, &named), &Cells::new()).unwrap();
     assert_eq!(new_machines(&contested), 2, "{:?}", contested.counts);
 
@@ -1012,11 +1100,7 @@ fn a_name_a_sheet_still_says_survives_the_rosters_rename() {
     ] {
         let row = keys::machine_pk(&format!("n-{PRINCIPAL}"));
         let mut book = Book::new();
-        let born = plan(
-            &input(&[], &[roster(12, &[], Some(PRINCIPAL))]),
-            &book.cells(),
-        )
-        .unwrap();
+        let born = plan(&listed(&[roster(12, &[], Some(PRINCIPAL))]), &book.cells()).unwrap();
         apply(&mut book, &born);
         // The Mac publishes its own node, which is how the roster's new name finds this row.
         let seen = book.all();
@@ -1074,7 +1158,7 @@ fn a_clash_does_not_retract_the_name_it_is_about() {
     let macs = [roster(36, &[104], None)];
     let row = keys::machine_pk("m36");
     let mut book = Book::new();
-    let born = plan(&input(&[], &macs), &book.cells()).unwrap();
+    let born = plan(&listed(&macs), &book.cells()).unwrap();
     apply(&mut book, &born);
     let seen = book.all();
     book.write(
@@ -1698,7 +1782,7 @@ fn a_chain_of_roster_renames_settles_in_one_plan() {
     };
     let start = || {
         let mut book = Book::new();
-        let first = plan(&input(&[], &was), &book.cells()).unwrap();
+        let first = plan(&listed(&was), &book.cells()).unwrap();
         let cells = apply(&mut book, &first);
         assert_eq!(label_of(&cells, PRINCIPAL), Some(json!("m1")));
         assert_eq!(label_of(&cells, OTHER_PRINCIPAL), Some(json!("m2")));
@@ -1708,7 +1792,7 @@ fn a_chain_of_roster_renames_settles_in_one_plan() {
     let b = roster(3, &[], Some(OTHER_PRINCIPAL));
     for now in [[a.clone(), b.clone()], [b, a]] {
         let (mut book, cells) = start();
-        let moved = plan(&input(&[], &now), &cells).unwrap();
+        let moved = plan(&listed(&now), &cells).unwrap();
         assert!(
             !kinds(&moved).contains(&"label-ambiguous"),
             "{:?}",
@@ -1717,7 +1801,7 @@ fn a_chain_of_roster_renames_settles_in_one_plan() {
         let cells = apply(&mut book, &moved);
         assert_eq!(label_of(&cells, PRINCIPAL), Some(json!("m2")));
         assert_eq!(label_of(&cells, OTHER_PRINCIPAL), Some(json!("m3")));
-        let again = plan(&input(&[], &now), &cells).unwrap();
+        let again = plan(&listed(&now), &cells).unwrap();
         assert!(again.rows.is_empty(), "{:?}", again.planned);
     }
     let (_, cells) = start();
@@ -1725,7 +1809,7 @@ fn a_chain_of_roster_renames_settles_in_one_plan() {
         roster(2, &[], Some(PRINCIPAL)),
         roster(1, &[], Some(OTHER_PRINCIPAL)),
     ];
-    let swapped = plan(&input(&[], &swap), &cells).unwrap();
+    let swapped = plan(&listed(&swap), &cells).unwrap();
     let held = swapped
         .findings
         .iter()
@@ -1749,14 +1833,14 @@ fn a_chain_of_roster_renames_settles_in_one_plan() {
         roster(2, &[], Some(OTHER_PRINCIPAL)),
         roster(3, &[], Some(THIRD)),
     ];
-    let first = plan(&input(&[], &three), &book.cells()).unwrap();
+    let first = plan(&listed(&three), &book.cells()).unwrap();
     let cells = apply(&mut book, &first);
     let renamed = [
         roster(2, &[], Some(PRINCIPAL)),
         roster(3, &[], Some(OTHER_PRINCIPAL)),
         roster(4, &[], Some(THIRD)),
     ];
-    let moved = plan(&input(&[], &renamed), &cells).unwrap();
+    let moved = plan(&listed(&renamed), &cells).unwrap();
     assert!(
         !kinds(&moved).contains(&"label-ambiguous"),
         "{:?}",
@@ -1803,7 +1887,7 @@ fn a_chain_of_roster_renames_settles_in_one_plan() {
     // A label a source contests never lands, on a row its node found and no row holding it.
     let mut book = Book::new();
     let one = [roster(1, &[], Some(PRINCIPAL))];
-    let first = plan(&input(&[], &one), &book.cells()).unwrap();
+    let first = plan(&listed(&one), &book.cells()).unwrap();
     let cells = apply(&mut book, &first);
     let sheet = [computers_sheet(&[
         "m8,Apple,,,,,,m2,,,,",
@@ -1978,8 +2062,8 @@ fn a_phone_label_a_replica_states_replaces_one_an_import_made_up() {
 }
 
 /// A row giving a name up leaves the name in the plan that takes it, whichever way the taker gets
-/// it: the roster's label on a row it holds, or on a row it births, where the table's own row that
-/// states the name found nothing.
+/// it: the roster's label on a row it holds, or on the row the plan births for a roster Mac the
+/// sheet names by it.
 /// NEGATIVE CONTROL: with `names_given_up` leaving the giver out of the plan, or not run:
 /// `assertion failed: aliases_of(&cells, &giver).is_empty()`. With `rows_named` never asking
 /// `gives_up`, the roster's label never lands: `left: Some(String("m1")) right: Some(String("m2"))`.
@@ -1987,21 +2071,24 @@ fn a_phone_label_a_replica_states_replaces_one_an_import_made_up() {
 fn a_name_given_up_leaves_its_row_however_it_is_taken() {
     let giver = keys::machine_pk("m5");
     let others = roster(7, &[], Some(OTHER_PRINCIPAL));
+    // The sheet names `m1` and `m7`, so the first plan births both roster Macs' rows.
     let held = (
         vec![roster(1, &[], Some(PRINCIPAL)), others.clone()],
+        vec!["m5,,,,,,,m2,,,,", "m1,,,,,,,,,,,", "m7,,,,,,,,,,,"],
         vec!["m5,,,,,,,,,,,", "m7,,,,,,,m2,,,,"],
         vec![roster(2, &[], Some(PRINCIPAL)), others.clone()],
     );
-    // `m8` contests `m7`, so the name `m2` links to no other Mac and the roster births its row.
+    // No row is the roster's `m2` yet: the sheet's `m9` row states `m2` beside its own name, so the
+    // plan births that Mac's row under its node, labelled as the roster says.
     let born = (
         Vec::new(),
-        vec!["m5,,,,,,,,,,,", "m7,,,,,,,m2,,,,", "m8,,,,,,,m7,,,,"],
+        vec!["m5,,,,,,,m2,,,,"],
+        vec!["m5,,,,,,,,,,,", "m9,,,,,,,m2,,,,"],
         vec![roster(2, &[], Some(PRINCIPAL))],
     );
-    for (was, after, now) in [held, born] {
+    for (was, before, after, now) in [held, born] {
         let mut book = Book::new();
-        let before = [computers_sheet(&["m5,,,,,,,m2,,,,"])];
-        let first = plan(&input(&before, &was), &book.cells()).unwrap();
+        let first = plan(&input(&[computers_sheet(&before)], &was), &book.cells()).unwrap();
         let cells = apply(&mut book, &first);
         assert_eq!(aliases_of(&cells, &giver), ["m2"]);
         let moved = plan(&input(&[computers_sheet(&after)], &now), &cells).unwrap();
@@ -2030,7 +2117,7 @@ fn a_name_a_row_cannot_take_as_its_label_moves_with_the_row_leaving_it() {
     for now in [[a.clone(), b.clone()], [b, a]] {
         let mut book = Book::new();
         let was = [roster(2, &[], Some(OTHER_PRINCIPAL))];
-        let first = plan(&input(&[], &was), &book.cells()).unwrap();
+        let first = plan(&listed(&was), &book.cells()).unwrap();
         apply(&mut book, &first);
         let seen = book.all();
         book.write(
@@ -2041,7 +2128,7 @@ fn a_name_a_row_cannot_take_as_its_label_moves_with_the_row_leaving_it() {
                 put(&MACHINE, &owned, "row", json!("live")),
             ],
         );
-        let moved = plan(&input(&[], &now), &book.cells()).unwrap();
+        let moved = plan(&listed(&now), &book.cells()).unwrap();
         assert!(
             !kinds(&moved).contains(&"label-ambiguous"),
             "{:?}",
@@ -2051,7 +2138,7 @@ fn a_name_a_row_cannot_take_as_its_label_moves_with_the_row_leaving_it() {
         assert_eq!(label_at(&cells, &owned), Some(json!("m1")));
         assert_eq!(aliases_of(&cells, &owned), ["m2"]);
         assert_eq!(label_at(&cells, &moving), Some(json!("m3")));
-        let again = plan(&input(&[], &now), &cells).unwrap();
+        let again = plan(&listed(&now), &cells).unwrap();
         assert!(again.rows.is_empty(), "{:?}", again.planned);
     }
 }
@@ -2085,14 +2172,14 @@ fn no_prefix_of_a_plan_shows_a_name_on_two_rows() {
             roster(2, &[], Some(b)),
             roster(3, &[], Some(c)),
         ];
-        let first = plan(&input(&[], &was), &book.cells()).unwrap();
+        let first = plan(&listed(&was), &book.cells()).unwrap();
         let cells = apply(&mut book, &first);
         let now = [
             roster(2, &[], Some(a)),
             roster(3, &[], Some(b)),
             roster(4, &[], Some(c)),
         ];
-        let moved = plan(&input(&[], &now), &cells).unwrap();
+        let moved = plan(&listed(&now), &cells).unwrap();
         stays_one(&mut book, &moved);
         assert_eq!(
             label_at(&book.cells(), &keys::machine_pk(&format!("n-{a}"))),
@@ -2103,10 +2190,10 @@ fn no_prefix_of_a_plan_shows_a_name_on_two_rows() {
     for (x, y) in [(PRINCIPAL, OTHER_PRINCIPAL), (OTHER_PRINCIPAL, PRINCIPAL)] {
         let mut book = Book::new();
         let was = [roster(3, &[4], Some(x)), roster(2, &[], Some(y))];
-        let first = plan(&input(&[], &was), &book.cells()).unwrap();
+        let first = plan(&listed(&was), &book.cells()).unwrap();
         let cells = apply(&mut book, &first);
         let now = [roster(4, &[], Some(x)), roster(3, &[], Some(y))];
-        let moved = plan(&input(&[], &now), &cells).unwrap();
+        let moved = plan(&listed(&now), &cells).unwrap();
         stays_one(&mut book, &moved);
         assert_eq!(
             label_at(&book.cells(), &keys::machine_pk(&format!("n-{y}"))),
@@ -2310,11 +2397,7 @@ fn a_name_a_source_still_gives_a_row_it_reaches_stays_on_it() {
     ] {
         let mut book = Book::new();
         if *pk == keyed {
-            let born = plan(
-                &input(&[], &[roster(5, &[], Some(PRINCIPAL))]),
-                &book.cells(),
-            )
-            .unwrap();
+            let born = plan(&listed(&[roster(5, &[], Some(PRINCIPAL))]), &book.cells()).unwrap();
             apply(&mut book, &born);
         }
         let before = [computers_sheet(&["m5,Apple,,,,,,m104,,,,"])];

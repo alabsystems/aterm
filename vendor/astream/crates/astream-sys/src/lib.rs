@@ -88,7 +88,8 @@
 //!   in place would be; [`owner_private`] and
 //!   [`owner_private_dir`] judge the open descriptor: the kind asked for (a regular
 //!   file, a directory), owned by [`euid`], no group or other permission bit, and on
-//!   macOS no access-list entry that allows anyone anything (`acl_get_fd_np`), because
+//!   macOS no access-list entry that allows anyone anything (`fstatx_np` into a filesec,
+//!   decided by return codes and validity bits, never errno), because
 //!   macOS checks an extended ACL before the mode bits. astream-cap's `capfile` reads
 //!   every secret file through it (claim `cap.secret-file-owner-only`).
 //!   [`owner_private_dir_by_path`] (macOS arm64) gives `owner_private_dir`'s verdict on a
@@ -110,10 +111,10 @@
 //! `clock_gettime_nsec_np(CLOCK_UPTIME_RAW)` behind [`clock_ns`], and `signal(SIGHUP)`
 //! behind [`install_sighup_handler`]. `owner`
 //! (`cfg(unix)`): `geteuid` behind [`euid`] and [`owner_private`], on Apple
-//! `acl_get_fd_np`, `acl_get_entry`, `acl_get_tag_type` and `acl_free` behind
-//! [`owner_private`] and [`owner_private_dir`], on macOS arm64 `lstatx_np`,
-//! `filesec_init`, `filesec_get_property`, `filesec_query_property` and `filesec_free`
-//! behind [`owner_private_dir_by_path`], and off Apple `fsync` behind
+//! `fstatx_np`, `filesec_init`, `filesec_query_property`, `filesec_get_property`,
+//! `filesec_free`, `acl_get_entry`, `acl_get_tag_type` and `acl_free` behind
+//! [`owner_private`] and [`owner_private_dir`], on macOS arm64 `lstatx_np` and the same
+//! filesec calls behind [`owner_private_dir_by_path`], and off Apple `fsync` behind
 //! [`plain_fsync`]; the per-OS `O_NONBLOCK` and `O_NOFOLLOW` numbers
 //! [`open_nonblocking`] and [`open_nonblocking_rw`] pass to safe `std` live there too.
 //! `file_identity` (`cfg(windows)`) reads the kernel's volume and file index for
@@ -1088,7 +1089,7 @@ fn kind_of(file_type: std::fs::FileType) -> &'static str {
 }
 
 /// `file` held to the owner-only rule, read off the descriptor (`fstat`, and on
-/// macOS `acl_get_fd_np`), never by path: a REGULAR file, owned by this process's
+/// macOS `fstatx_np`'s filesec), never by path: a REGULAR file, owned by this process's
 /// effective uid ([`euid`]), carrying no access-list entry that allows anyone anything
 /// (macOS; a deny entry takes nothing away and passes), and with no group or other
 /// permission bit. The clauses are judged in that order, and the first one broken is

@@ -28,6 +28,7 @@ pub(super) use owner::bootstrap_object::SourceOffer as BootstrapObjectOffer;
 pub(super) use owner::runtime_inputs::Attachment as RuntimeInputsAttachment;
 pub(super) use owner::runtime_inputs::Preparing as RuntimeInputsPreparing;
 pub(super) use owner::workload::MemberOriginalCustody as WorkloadMemberOriginal;
+pub(super) use owner::workload::NativeReadyCustody as NativeJobReady;
 pub(super) use owner::workload::ReadyCustody as WorkloadReady;
 pub(super) use owner::workload::{WorkerCustody, WorkerOffer, WorkerReturn};
 
@@ -194,6 +195,7 @@ enum Message {
     SubmitMetadata(Box<crate::metadata_transport::Incoming>),
     SubmitResolverQuery(Box<crate::resolver_transport::Incoming>),
     SubmitWorkloadQuery(Box<crate::workload_transport::Incoming>),
+    SubmitNativeJobQuery(Box<crate::workload_transport::NativeIncoming>),
     SubmitLinker(Box<crate::linker_transport::Incoming>),
     SubmitMember(Box<aterm_ctl::resource_subgroup_client::AuthorizedSubgroup>),
     SubmitProxy(Box<crate::resource_proxy_intake::Incoming>),
@@ -225,6 +227,11 @@ enum Message {
         peer: Peer,
         request: Box<trust_resource_controller::workload::host::ReadyRequest>,
         reply: SyncSender<io::Result<WorkloadReady>>,
+    },
+    NativeJobReady {
+        peer: Peer,
+        request: Box<trust_resource_controller::native_job::host::ReadyRequest>,
+        reply: SyncSender<io::Result<NativeJobReady>>,
     },
     WorkloadMemberOriginal {
         peer: Peer,
@@ -449,6 +456,34 @@ pub(super) fn authorize_workload_query(
 pub(super) fn submit_workload_query(member: crate::workload_transport::Incoming) -> io::Result<()> {
     send(Message::SubmitWorkloadQuery(Box::new(member)))
 }
+pub(super) fn native_job_binding(value: &aterm_json::Value) -> io::Result<Binding> {
+    owner::members::binding_role(
+        value,
+        trust_resource_controller::native_job::query::QUERY_PURPOSE,
+    )
+}
+pub(super) fn authorize_native_job_query(
+    request: &aterm_types::resource_subgroup::Request,
+    peer: Peer,
+    query: &trust_resource_controller::native_job::query::CompilerQuery,
+) -> bool {
+    let Ok(mut request) = owner::members::Authorization::of(request, peer) else {
+        return false;
+    };
+    request.native_job_query = Some(query.clone());
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::AuthorizeMember {
+        request: Box::new(request),
+        reply,
+    })
+    .is_ok()
+        && receive_reply(read).unwrap_or(false)
+}
+pub(super) fn submit_native_job_query(
+    member: crate::workload_transport::NativeIncoming,
+) -> io::Result<()> {
+    send(Message::SubmitNativeJobQuery(Box::new(member)))
+}
 pub(crate) fn authorize_linker(
     request: &aterm_types::resource_subgroup::Request,
     peer: Peer,
@@ -475,6 +510,18 @@ pub(super) fn workload_ready(
 ) -> io::Result<WorkloadReady> {
     let (reply, read) = mpsc::sync_channel(1);
     send(Message::WorkloadReady {
+        peer,
+        request: Box::new(request),
+        reply,
+    })?;
+    receive_reply(read).map_err(|_| unavailable())?
+}
+pub(super) fn native_job_ready(
+    peer: Peer,
+    request: trust_resource_controller::native_job::host::ReadyRequest,
+) -> io::Result<NativeJobReady> {
+    let (reply, read) = mpsc::sync_channel(1);
+    send(Message::NativeJobReady {
         peer,
         request: Box::new(request),
         reply,
@@ -1146,6 +1193,7 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                 Message::SubmitMetadata(member) => owner.submit_metadata(*member),
                 Message::SubmitResolverQuery(member) => owner.submit_resolver_query(*member),
                 Message::SubmitWorkloadQuery(member) => owner.submit_workload_query(*member),
+                Message::SubmitNativeJobQuery(member) => owner.submit_native_job_query(*member),
                 Message::SubmitLinker(member) => owner.submit_linker(*member),
 
                 Message::SubmitProxy(incoming) => owner.submit_proxy(*incoming),
@@ -1171,6 +1219,13 @@ fn run(receiver: mpsc::Receiver<Message>, mut owner: owner::Owner) {
                     reply,
                 } => {
                     let _ = reply.try_send(owner.workload_ready(peer, &request));
+                }
+                Message::NativeJobReady {
+                    peer,
+                    request,
+                    reply,
+                } => {
+                    let _ = reply.try_send(owner.native_job_ready(peer, &request));
                 }
                 Message::WorkloadMemberOriginal {
                     peer,

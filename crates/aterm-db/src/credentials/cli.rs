@@ -2,13 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 //! `aterm secrets need` (docs/DESIGN-credential-requests-2026-10-27.md §13): raise, list and
-//! retire this Mac's needs, decline on the vault's admin Mac another Mac's request that awaits a
-//! person, and run a pass over the lab's table now. Every verb moves the need ledger first,
-//! except `peek`, which reads existing state only; a decline the ledger has nothing for goes to
-//! the custodian. The table pass after a changing verb is best effort, and its line says what
-//! stopped it.
+//! retire this Mac's needs, and run a pass over the lab's table now. Every verb moves the need
+//! ledger first, except `peek`, which reads existing state only. The table pass after a changing
+//! verb is best effort, and its line says what stopped it.
 
-use super::{Decline, Observation, Pass, Thread};
+use super::{Observation, Pass, Thread};
 use aterm_codec::hex;
 use aterm_json::{Map, Value};
 use aterm_secrets::{
@@ -24,9 +22,8 @@ pub const USAGE: &str = "usage:
   aterm secrets need peek [--all] [--json]        read retained state only; never posts, sweeps or advances needs
                                                   JSON identifies the observer, requester and delivery origin; never credential values
   aterm secrets need <want> [--purpose <id>]       raise a need by hand (want: site-deployer-key, notary, mailbox:<label>, gh:dev, gh:release, entry:<name>, ...)
-  aterm secrets need retire <want|id> [--declined] [--note <text>]
-                                                   withdraw a need, or decline one a person was asked for
-                                                   (on the vault's admin Mac, another Mac's, by the id ls --all prints)
+  aterm secrets need retire <want|id> [--note <text>]
+                                                   withdraw a need
   aterm secrets need pass                          run this Mac's pass over credentials/requests/1 now (and the custodian's, on the vault's admin Mac)
   aterm secrets need give <want|id> [--file <path>]
                                                    offer a value from a file or piped stdin; an admin publishes it now
@@ -99,8 +96,8 @@ fn known(words: &[String], flags: &[&str], valued: &[&str]) -> Result<(), (Strin
 /// Run one verb for this Mac's `paths`: the text to print, or the refusal and its exit code.
 ///
 /// # Errors
-/// The words do not parse, the ledger cannot be read or written, a retire names nothing it can
-/// end, or a decline on the vault's admin Mac cannot reach the lab's table.
+/// The words do not parse, the ledger cannot be read or written, or a retire names nothing it
+/// can end.
 pub fn run(paths: &Paths, words: &[String]) -> Result<String, (String, u8)> {
     let ledger = |error: aterm_secrets::Error| (error.to_string(), 1);
     match words[0].as_str() {
@@ -148,16 +145,16 @@ pub fn run(paths: &Paths, words: &[String]) -> Result<String, (String, u8)> {
             Ok(listing(&needs, all.then_some(&pass)))
         }
         "retire" => {
-            known(&words[1..], &["--declined"], &["--note"])?;
+            known(&words[1..], &[], &["--note"])?;
             let Some(selector) = words.get(1).filter(|word| !word.starts_with("--")) else {
                 return Err((format!("retire names a want or a request id\n{USAGE}"), 2));
             };
             let note = option(words, "--note")?.unwrap_or_default();
-            let declined = words.iter().any(|word| word == "--declined");
-            let mut out: String = match need::retire(paths, selector, declined, note) {
-                Ok(retired) => retired.iter().map(row).collect(),
-                Err(refused) => admin_decline(paths, selector, declined, note, &refused)?,
-            };
+            let mut out: String = need::retire(paths, selector, note)
+                .map_err(ledger)?
+                .iter()
+                .map(row)
+                .collect();
             out.push_str(&pass_line(&table_pass(paths)));
             Ok(out)
         }
@@ -235,50 +232,6 @@ pub fn run(paths: &Paths, words: &[String]) -> Result<String, (String, u8)> {
     }
 }
 
-/// A decline this Mac's ledger declined nothing for, on the vault's admin Mac: the custodian's,
-/// of a request another Mac raised that awaits a person (§6.2), and this Mac's own ledger's for
-/// one of its own the selector names by its table id. Where this Mac opens no admin custody,
-/// `refused` stands, saying why.
-fn admin_decline(
-    paths: &Paths,
-    selector: &str,
-    declined: bool,
-    note: &str,
-    refused: &aterm_secrets::Error,
-) -> Result<String, (String, u8)> {
-    if !declined {
-        return Err((refused.to_string(), 1));
-    }
-    let mine = need::peek(paths)
-        .map_err(|error| (error.to_string(), 1))?
-        .iter()
-        .any(|need| need.named(selector));
-    match super::custodian_decline(paths, selector, note) {
-        Ok(Decline::NoCustody(why)) => Err((
-            format!(
-                "{refused}; this Mac declines for the lab only while it opens the vault's admin custody, which it cannot now ({why})"
-            ),
-            1,
-        )),
-        Ok(Decline::Named { declined, .. }) if !declined.is_empty() => {
-            Ok(declined.iter().map(thread_row).collect())
-        }
-        Ok(Decline::Named { own, .. }) => match own.first() {
-            _ if mine => Err((refused.to_string(), 1)),
-            Some(id) => need::retire(paths, &hex::encode_lower(id), true, note)
-                .map(|retired| retired.iter().map(row).collect())
-                .map_err(|error| (error.to_string(), 1)),
-            None => Err((
-                format!(
-                    "no request another Mac raised that awaits a person is {selector} in the lab's table (aterm secrets need ls --all names them); this Mac's own go by the ids aterm secrets need ls prints"
-                ),
-                1,
-            )),
-        },
-        Err(error) => Err((format!("lab table: {error}"), 1)),
-    }
-}
-
 fn table_pass(paths: &Paths) -> Result<Pass, String> {
     super::pass(paths).map_err(|error| error.to_string())
 }
@@ -329,10 +282,6 @@ fn thread_row(thread: &Thread) -> String {
         }
     } else if thread.version_pending {
         "waits for complete version witness".to_owned()
-    } else if thread.needs_person && thread.offers.is_empty() {
-        format!("awaiting-person, swept by {}", thread.swept.len())
-    } else if thread.needs_person {
-        format!("awaiting-person, offered by {}", thread.offers.len())
     } else if thread.offers.is_empty() {
         format!("open, swept by {}", thread.swept.len())
     } else {
@@ -353,10 +302,6 @@ fn listing(needs: &[Need], all: Option<&Result<Pass, String>>) -> String {
     } else {
         needs.iter().map(row).collect()
     };
-    for line in need::needs_you(needs) {
-        out.push_str(&line);
-        out.push('\n');
-    }
     if let Some(pass) = all {
         out.push_str(&pass_line(pass));
         if let Ok(pass) = pass {
@@ -423,7 +368,6 @@ fn observation_json(table: &Result<Observation, String>) -> Value {
                 "required_sweeps": required_sweeps,
                 "sweeps_complete": swept_current == required_sweeps,
                 "want_window_ended": thread.window_ended(observed.at_ms),
-                "needs_person": thread.needs_person,
                 "published_seq": thread.published.as_ref().and_then(|(_, version)| match version {
                     RefusalClaim::LegacySequence(seq) => Some(*seq),
                     RefusalClaim::Authenticated(claim) => claim.envelope().map(|v| v.seq),

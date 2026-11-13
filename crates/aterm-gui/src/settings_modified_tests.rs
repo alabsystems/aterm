@@ -1008,7 +1008,7 @@ fn undo_names_the_change_and_what_it_restored() {
         )),
     );
     let said = lab.state().feedback.clone().unwrap_or_default();
-    assert_eq!(said.matches("Aterm Day").count(), 1, "{said}");
+    assert_eq!(said.matches("aterm Day").count(), 1, "{said}");
     lab.undo().expect("Undo is offered");
     assert_eq!(
         lab.state().feedback.as_deref(),

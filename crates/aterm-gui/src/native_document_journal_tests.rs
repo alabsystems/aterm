@@ -7,6 +7,55 @@ use crate::native_document_io::{encode_journal, encode_journal_v1, journal_tail}
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt as _;
 
+#[cfg(any(unix, windows))]
+thread_local! {
+    static WORKER_RECORDING: std::cell::RefCell<Option<aterm_durable::seam::Recording>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Observe the actual custody worker's durable calls, without replacing asynchronous
+/// production execution with an inline test arm.
+#[cfg(any(unix, windows))]
+pub(super) struct JournalRecording(Arc<owner::JournalOwner>);
+#[cfg(any(unix, windows))]
+impl JournalRecording {
+    pub(super) fn start(journals: &DocumentJournalStore) -> Self {
+        let owner = journals.host.owner.as_ref().unwrap().clone();
+        owner
+            .run(|_| {
+                WORKER_RECORDING.with(|slot| {
+                    assert!(slot.borrow().is_none());
+                    *slot.borrow_mut() = Some(aterm_durable::seam::Recording::start());
+                })
+            })
+            .unwrap();
+        Self(owner)
+    }
+    pub(super) fn take(&self) -> Vec<Flush> {
+        self.0
+            .run(|_| WORKER_RECORDING.with(|slot| slot.borrow().as_ref().unwrap().take()))
+            .unwrap()
+    }
+}
+#[cfg(any(unix, windows))]
+impl Drop for JournalRecording {
+    fn drop(&mut self) {
+        self.0
+            .run(|_| WORKER_RECORDING.with(|slot| drop(slot.borrow_mut().take())))
+            .unwrap();
+    }
+}
+#[cfg(not(any(unix, windows)))]
+pub(super) struct JournalRecording(aterm_durable::seam::Recording);
+#[cfg(not(any(unix, windows)))]
+impl JournalRecording {
+    pub(super) fn start(_journals: &DocumentJournalStore) -> Self {
+        Self(aterm_durable::seam::Recording::start())
+    }
+    pub(super) fn take(&self) -> Vec<Flush> {
+        self.0.take()
+    }
+}
+
 pub(super) fn test_root(name: &str) -> PathBuf {
     let root =
         std::env::temp_dir().join(format!("aterm-draft-journal-{}-{name}", std::process::id()));
@@ -344,7 +393,7 @@ fn clean_recovery_replays_before_reinitializing_sequence_space() {
     };
     let canonical = "file:///tmp/draft.md";
     let first = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
-    host.initialize(first, &disk, &current).unwrap();
+    let _prepared = host.initialize(first, &disk, &current).unwrap();
 
     let reopened = host.inspect_open(canonical, disk.text.as_bytes()).unwrap();
     assert_eq!(reopened.recovered_text.as_deref(), Some("base draft"));
@@ -1268,7 +1317,7 @@ fn a_reseat_preserves_what_it_never_had() {
     ])
     .unwrap();
     fs::write(&path, &foreign).unwrap();
-    let recording = aterm_durable::seam::Recording::start();
+    let recording = JournalRecording::start(&journals);
     let (result, _) = run_reseat(&mut journals, id);
     #[cfg(unix)]
     let expected_reseat = [Flush::Ordered, Flush::Durable, Flush::Durable];
@@ -1728,7 +1777,7 @@ fn a_legacy_journal_with_nothing_to_carry_is_retired_at_the_open() {
     let conflict_image = fs::read(&conflict).unwrap();
     let mut store = crate::test_document_store();
 
-    let recording = aterm_durable::seam::Recording::start();
+    let recording = JournalRecording::start(&journals);
     let (decision, _, initialized) = open_as_the_app_does(&mut journals, &mut store, CLEAN, "disk");
     #[cfg(unix)]
     let expected_clean = [Flush::Durable, Flush::Durable, Flush::Ordered];
@@ -1841,6 +1890,53 @@ fn a_legacy_draft_that_is_the_file_never_sets_a_keyed_draft_aside_silently() {
         ContentFingerprint::of(b""),
     )
     .expect("an outgoing older aterm still finds its carried draft");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A keyed image with a fault after its whole records (here a crash's cut past a frame nested
+/// in its only draft's text, so its prefix holds no draft) is set aside by a legacy draft
+/// equal to the file, which says nothing of its own: the open still says the keyed image could
+/// not be read, and keeps it.
+#[test]
+fn a_legacy_draft_never_sets_a_faulted_keyed_image_aside_silently() {
+    const URI: &str = "file:///tmp/legacy-over-faulted-keyed.md";
+    let root = test_root("legacy-over-faulted-keyed");
+    let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
+    let mut store = crate::test_document_store();
+    let keyed = journal_a_draft(
+        &mut journals,
+        &mut store,
+        URI,
+        "\u{a5}q\u{1}\0\0\0\0\0\0\0\0\0 and after",
+    );
+    drop(journals);
+    let typed = fs::read(&keyed).unwrap();
+    let nested = 1 + typed
+        .windows(4)
+        .position(|bytes| bytes == [0xc2, 0xa5, b'q', 1])
+        .expect("the draft's frame holds the nested one");
+    let cut = typed[..nested + 12].to_vec();
+    fs::write(&keyed, &cut).unwrap();
+    let legacy = write_legacy_journal_typing(&root, URI, "", &["typed", ""]);
+
+    let mut journals = DocumentJournalStore::for_test(root.clone()).unwrap();
+    let mut store = crate::test_document_store();
+    let (decision, _, initialized) = open_as_the_app_does(&mut journals, &mut store, URI, "");
+    assert_eq!(decision.recovered_text, None);
+    assert_eq!(
+        initialized.notice,
+        Some(RecoveryNotice::Corrupt),
+        "the faulted keyed image was set aside with no notice"
+    );
+    assert_eq!(
+        preserved_images(&root),
+        vec![cut],
+        "kept aside, byte for byte"
+    );
+    assert!(
+        legacy.exists(),
+        "its draft is carried until the first write"
+    );
     let _ = fs::remove_dir_all(root);
 }
 

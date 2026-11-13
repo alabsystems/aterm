@@ -30,8 +30,11 @@ impl Key {
         Ok(())
     }
     fn read(d: &mut Decoder<'_>) -> io::Result<Self> {
-        let key =
-            Self { root_attempt: d.array()?, invocation_sha256: d.array()?, attempt: d.array()? };
+        let key = Self {
+            root_attempt: d.array()?,
+            invocation_sha256: d.array()?,
+            attempt: d.array()?,
+        };
         key.write(&mut Encoder::new(0))?;
         Ok(key)
     }
@@ -60,7 +63,10 @@ impl Lock {
     fn read(d: &mut Decoder<'_>) -> io::Result<Self> {
         let lock = Self {
             path: d.bytes()?,
-            backing: FileIdentity { device: d.number()?, inode: d.number()? },
+            backing: FileIdentity {
+                device: d.number()?,
+                inode: d.number()?,
+            },
         };
         lock.write(&mut Encoder::new(0))?;
         Ok(lock)
@@ -116,7 +122,11 @@ impl Request {
             locks.push(Lock::read(&mut d)?);
         }
         d.done()?;
-        let value = Self { key, output_root, locks };
+        let value = Self {
+            key,
+            output_root,
+            locks,
+        };
         value.validate()?;
         Ok(value)
     }
@@ -175,10 +185,105 @@ impl Reply {
                 }
                 Self::Retained { key, locks }
             }
-            1 => Self::Refused { key, reason: d.text()? },
+            1 => Self::Refused {
+                key,
+                reason: d.text()?,
+            },
             _ => return Err(invalid()),
         };
         d.done()?;
+        value.encode()?;
+        Ok(value)
+    }
+}
+
+/// Selection DATA for a previously authenticated retained original handoff.
+/// No descriptions, path opens or re-lock operations accompany this frame.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Selection {
+    pub retained: Request,
+    pub sequence: u64,
+    pub attempt: [u8; 16],
+}
+impl Selection {
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        self.retained.validate()?;
+        if self.sequence == 0
+            || self.attempt == [0; 16]
+            || self.attempt == self.retained.key.root_attempt
+            || self.attempt == self.retained.key.attempt
+        {
+            return Err(invalid());
+        }
+        let mut e = Encoder::new(112);
+        e.number(1);
+        e.number(self.sequence);
+        e.0.extend(self.attempt);
+        e.bytes(&self.retained.encode()?)?;
+        e.finish()
+    }
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let mut d = header(bytes, 112)?;
+        if d.number()? != 1 {
+            return Err(invalid());
+        }
+        let value = Self {
+            sequence: d.number()?,
+            attempt: d.array()?,
+            retained: Request::decode(&d.bytes()?)?,
+        };
+        d.done()?;
+        value.encode()?;
+        Ok(value)
+    }
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SelectionDecision {
+    Selected,
+    Refused { reason: String },
+}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SelectionReply {
+    pub selection: Selection,
+    pub decision: SelectionDecision,
+}
+impl SelectionReply {
+    pub fn encode(&self) -> io::Result<Vec<u8>> {
+        let mut e = Encoder::new(113);
+        e.number(1);
+        e.bytes(&self.selection.encode()?)?;
+        match &self.decision {
+            SelectionDecision::Selected => e.number(0),
+            SelectionDecision::Refused { reason } => {
+                if reason.is_empty() || reason.len() > 4096 || reason.contains('\0') {
+                    return Err(invalid());
+                }
+                e.number(1);
+                e.bytes(reason.as_bytes())?;
+            }
+        }
+        e.finish()
+    }
+    pub fn decode(bytes: &[u8], expected: &Selection) -> io::Result<Self> {
+        expected.encode()?;
+        let mut d = header(bytes, 113)?;
+        if d.number()? != 1 {
+            return Err(invalid());
+        }
+        let selection = Selection::decode(&d.bytes()?)?;
+        if selection != *expected {
+            return Err(invalid());
+        }
+        let decision = match d.number()? {
+            0 => SelectionDecision::Selected,
+            1 => SelectionDecision::Refused { reason: d.text()? },
+            _ => return Err(invalid()),
+        };
+        d.done()?;
+        let value = Self {
+            selection,
+            decision,
+        };
         value.encode()?;
         Ok(value)
     }

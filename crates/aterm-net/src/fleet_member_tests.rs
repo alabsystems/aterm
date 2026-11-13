@@ -12854,6 +12854,9 @@ mod book_fallback;
 #[path = "fleet_member_tests/heartbeat_reads.rs"]
 mod heartbeat_reads;
 
+#[path = "fleet_member_tests/keyring_reads.rs"]
+mod keyring_reads;
+
 #[path = "fleet_member_tests/quiet_writes.rs"]
 mod quiet_writes;
 

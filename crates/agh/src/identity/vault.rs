@@ -55,11 +55,6 @@ const RECORD_LOCK: &str = ".vault-record.lock";
 #[cfg(unix)]
 const RECORD_MAX: usize = 4 * 1024;
 
-/// The step for a vault token GitHub refuses (a 401): the secrets subscriber writes the vault's
-/// current token, and a token the vault itself holds stale is its admin's to rotate.
-pub const REFRESH_STEP: &str = "aterm secrets sync fetches the vault's current token; if the \
-                                vault holds this one, its admin rotates it";
-
 /// Why neither vault token routes when both files hold one token.
 #[cfg(unix)]
 const ONE_TOKEN: &str = "L7: the vault's dev and release files hold one token, so its tier is \
@@ -137,14 +132,24 @@ impl Slot {
         }
     }
 
-    /// The step for its file when it holds no token agh can use: the vault's subscriber
-    /// rewrites it, and content the vault itself holds is its admin's to replace.
+    /// The `aterm secrets need` want that names its token.
+    #[must_use]
+    pub const fn want(self) -> &'static str {
+        match self {
+            Slot::Dev => "gh:dev",
+            Slot::Release => "gh:release",
+        }
+    }
+
+    /// The step for its file when it holds no token agh can use (absent, unusable, or one
+    /// GitHub refuses): the credential's one path, the vault's subscriber, else the lab.
     #[must_use]
     pub fn sync_step(self) -> String {
         format!(
-            "aterm secrets sync rewrites ~/{} from the vault; if the vault holds this content, \
-             its admin replaces it",
-            self.file()
+            "aterm secrets sync writes ~/{} from the vault, else aterm secrets need {} asks the \
+             lab's Macs for it",
+            self.file(),
+            self.want()
         )
     }
 
@@ -205,7 +210,7 @@ pub enum Found {
         /// Whether this call asked GitHub (and failed), not only read the record.
         tried: bool,
         /// Whether GitHub answered that the token does not authenticate (a 401), which no
-        /// retry changes: `REFRESH_STEP` is its step.
+        /// retry changes: `Slot::sync_step` is its step.
         rejected: bool,
         /// Whether the record holds another fingerprint for this file: the token rotated, and
         /// the next routed call learns it again, refusing it if its login changed.
@@ -343,18 +348,19 @@ impl Adoption {
     }
 
     /// The step for `error`, from a call that routed by adoption's rows, where the error's own
-    /// step names something adoption has none of: a 401 for an adopted token is the vault's to
-    /// refresh (`REFRESH_STEP`), never an agh.toml edit; an owner with no writer or no reader
+    /// step names something adoption has none of: a 401 for an adopted token is its slot's
+    /// `sync_step`, never an agh.toml edit; an owner with no writer or no reader
     /// left is the public owner's release file's (`~/.secrets/gh_access_token_alabsystems`) or
-    /// a dev token found and not routed, and with no agh.toml, any other owner's is a profile
-    /// of its own (`agh auth add`), since there is no row to edit. `None` keeps the error's.
+    /// the dev token's (its `sync_step` when absent, else its found-and-not-routed step), and
+    /// with no agh.toml, an owner the adopted dev token does not write is a profile of its own
+    /// (`agh auth add`), since there is no row to edit. `None` keeps the error's.
     #[must_use]
     pub fn next_for(&self, error: &Error) -> Option<String> {
         if error.kind == Kind::Unauthenticated
             && let Some(IdentityRef::Profile { name, .. }) = &error.identity
             && self.adopted(name)
         {
-            return Some(REFRESH_STEP.to_string());
+            return Slot::named(name).map(Slot::sync_step);
         }
         let Sub::Policy(
             RefusalCode::WriteNone
@@ -373,26 +379,22 @@ impl Adoption {
         }
         match self.vaulted.iter().find(|v| v.slot == Slot::Dev) {
             Some(Vaulted {
-                found: Found::Absent | Found::Adopted { .. },
+                found: Found::Adopted { .. },
                 ..
-            })
-            | None => Some(format!(
+            }) => Some(format!(
                 "agh auth add NAME --file PATH --tier dev|external --owner {owner} --write, with \
                  a NAME other than dev or release: its rows join the vault's"
             )),
-            Some(_) => self.slot_step(Slot::Dev),
+            _ => self.slot_step(Slot::Dev),
         }
     }
 
-    /// The step for `slot`'s token when it does not route: an absent file is the secrets
-    /// subscriber's to write.
+    /// The step for `slot`'s token when it does not route: an absent file's is its
+    /// `sync_step`.
     fn slot_step(&self, slot: Slot) -> Option<String> {
         let vaulted = self.vaulted.iter().find(|v| v.slot == slot)?;
         match &vaulted.found {
-            Found::Absent => Some(format!(
-                "~/{} is absent: aterm secrets sync writes it where the vault holds it",
-                slot.file()
-            )),
+            Found::Absent => Some(slot.sync_step()),
             _ => vaulted.next(),
         }
     }
@@ -444,7 +446,7 @@ impl Adoption {
                         v.slot.profile(),
                         tilde(&v.token_file, home)
                     ),
-                    REFRESH_STEP,
+                    &v.slot.sync_step(),
                 )),
                 Found::Unusable { slug, why, .. } => lines.push(note_line(
                     v.slot.profile(),
@@ -597,7 +599,7 @@ impl Adoption {
 
 impl Vaulted {
     /// The step that makes this token route, when it is found and does not: an unusable
-    /// file's remedy, a left-out token's fix, `REFRESH_STEP` for a token GitHub refused, and
+    /// file's remedy, a left-out token's fix, `Slot::sync_step` for a token GitHub refused, and
     /// for one whose login GitHub could not be reached for, the next call. `None` for an
     /// absent, adopted, unasked or changed one (a change is the call's refusal, which names
     /// its step).
@@ -608,7 +610,7 @@ impl Vaulted {
                 Some(remedy.clone().unwrap_or_else(|| self.slot.sync_step()))
             }
             Found::Faulted { next, .. } => Some(next.clone()),
-            Found::Unlearned { rejected: true, .. } => Some(REFRESH_STEP.to_string()),
+            Found::Unlearned { rejected: true, .. } => Some(self.slot.sync_step()),
             Found::Unlearned { tried: true, .. } => {
                 Some("the next call asks GitHub for its login again".to_string())
             }
@@ -1493,39 +1495,69 @@ fn write_record(dirs: &Dirs, record: &Record) -> std::io::Result<()> {
 /// could_not_run on I/O.
 #[cfg(unix)]
 fn record_lock(dirs: &Dirs) -> Result<super::provision::AuthEdit> {
-    super::provision::AuthEdit::take_named(dirs, RECORD_LOCK, LOCK_NAME, lock_busy)
+    super::provision::AuthEdit::take_named(dirs, RECORD_LOCK, LOCK_NAME, record_wait(), lock_busy)
+}
+
+/// How long a call waits for the record's lock while another agh call holds it: the
+/// one-minute hang detector ([`crate::journal::LOCK_WAIT`]). A holder reads, merges and
+/// writes a record of a few hundred bytes, and lets go when it ends; a call that gave up at
+/// once recorded nothing, and its git run's helper, which reads the record, then answered
+/// nobody. In a test, what [`with_record_wait_for_tests`] says.
+#[cfg(unix)]
+fn record_wait() -> std::time::Duration {
+    #[cfg(any(test, debug_assertions))]
+    if let Some(wait) = RECORD_WAIT.get() {
+        return wait;
+    }
+    crate::journal::LOCK_WAIT
+}
+
+#[cfg(all(unix, any(test, debug_assertions)))]
+thread_local! {
+    static RECORD_WAIT: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `body` with this thread's calls waiting `wait` for the record's lock, as a holder that
+/// keeps it past the one-minute wait would be met.
+#[cfg(all(unix, any(test, debug_assertions)))]
+pub fn with_record_wait_for_tests<R>(wait: std::time::Duration, body: impl FnOnce() -> R) -> R {
+    struct Restore(Option<std::time::Duration>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RECORD_WAIT.set(self.0);
+        }
+    }
+    let _restore = Restore(RECORD_WAIT.replace(Some(wait)));
+    body()
 }
 
 /// What the record's lock is called in a refusal.
 #[cfg(unix)]
 const LOCK_NAME: &str = "the vault record lock";
 
-/// The refusal while another agh call holds the record's lock.
+/// The refusal when another agh call held the record's lock through [`record_wait`].
 #[cfg(unix)]
 fn lock_busy() -> Error {
-    Error::refused("another agh call is writing the vault adoption record")
-        .with_next("run the command again: that write takes milliseconds")
+    Error::refused("another agh call held the vault adoption record's lock for a minute")
+        .with_next("run the command again; a write of the record takes milliseconds")
 }
 
 /// What was learned, recorded under adoption's own lock: each row is written only while the
 /// record still holds what `find` judged it against, or the same login, so two calls that
-/// learned two logins for one slot never move it from one owner to the other unasked. Nothing
-/// is written when the lock is held by another call, adoption no longer applies, or the record
-/// cannot be read or written: the next call learns it again. Returns each slot whose record
-/// moved to another login meanwhile, with that login (the call refuses it as
-/// `Found::Changed`), and why nothing could be recorded, unless only another call's lock
-/// stood in the way, which the next call outlasts.
+/// learned two logins for one slot never move it from one owner to the other unasked. While
+/// another call holds the lock, this one waits for it ([`record_wait`]): the holder is most
+/// often another call that learned the same login, and git's credential helper answers only
+/// from the record, so a call that gave up at once sent its git run to a helper that answered
+/// nobody. Nothing is written when the lock was held past that wait, adoption no longer
+/// applies, or the record cannot be read or written: the next call learns it again. Returns
+/// each slot whose record moved to another login meanwhile, with that login (the call refuses
+/// it as `Found::Changed`), and why nothing could be recorded.
 #[cfg(unix)]
 fn record_learned(dirs: &Dirs, learned: &[Learn]) -> (Vec<(Slot, String)>, Option<Error>) {
     let mut moved = Vec::new();
-    let busy = std::cell::Cell::new(false);
-    let lock = super::provision::AuthEdit::take_named(dirs, RECORD_LOCK, LOCK_NAME, || {
-        busy.set(true);
-        lock_busy()
-    });
-    let _lock = match lock {
+    let _lock = match record_lock(dirs) {
         Ok(lock) => lock,
-        Err(_) if busy.get() => return (moved, None),
         Err(error) => return (moved, Some(error)),
     };
     if base(dirs).is_none() {
@@ -1605,8 +1637,8 @@ fn record_blocked(dirs: &Dirs) -> Option<Error> {
 /// forgets the login adopted for the vault token NAME names, so the next call learns it again.
 /// `false` when it held none.
 /// # Errors
-/// The record's refusal; refused while another agh call writes the record; could_not_run when
-/// it cannot be written.
+/// The record's refusal; refused when another agh call held the record's lock past
+/// [`record_wait`]; could_not_run when it cannot be written.
 #[cfg(unix)]
 pub(crate) fn forget_locked(dirs: &Dirs, slot: Slot) -> Result<bool> {
     let _lock = record_lock(dirs)?;
@@ -1647,7 +1679,7 @@ pub fn record_for_tests(dirs: &Dirs, rows: &[(Slot, &str, &str)]) -> std::io::Re
 /// # Errors
 /// `record_lock`'s.
 #[cfg(all(unix, any(test, debug_assertions)))]
-pub fn hold_record_lock_for_tests(dirs: &Dirs) -> Result<impl Sized> {
+pub fn hold_record_lock_for_tests(dirs: &Dirs) -> Result<impl Sized + use<>> {
     if let Some(parent) = dirs.config.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent).map_err(|e| Error::could_not_run(e.to_string()))?;
     }

@@ -25,18 +25,23 @@ impl Ctl for Host {
     }
 }
 
-const INPUT: [&[&str]; 5] = [
+const INPUT: [&[&str]; 8] = [
     &["key", "1"],
     &["send", "--", "go on"],
     &["turn", "go on"],
     &["paste", "x"],
     &["feed-bin", "00"],
+    &["restart", "pid=9", "if-stalled", "quiet=5"],
+    &["restart", "pid=9", "quiet=5"],
+    &["signal", "term"],
 ];
 
-/// The one gate: while the host observes, no input verb reaches the transport, and the
-/// reads, waits and attention writes an escalation needs still do; a confirmed agent, or a
-/// loop whose host confirms nothing, sends each. NEGATIVE CONTROL (by hand, run): with the
-/// gate's line in [`Session::call`] removed, every input row reaches the host.
+/// The one gate: while the host observes, no input verb and no restart or signal of the
+/// agent's process reaches the transport, and the reads, waits and attention writes an
+/// escalation needs still do; a confirmed agent, or a loop whose host confirms nothing, sends
+/// each. NEGATIVE CONTROL (by hand, run): with the gate's line in [`Session::call`] removed,
+/// every input row reaches the host; with [`drives_agent`] left out of the gate, the restart
+/// and signal rows do.
 #[test]
 fn an_observed_agent_gets_no_input_and_keeps_its_escalation() {
     for (confirms, act) in [(true, Act::Observe), (true, Act::On), (false, Act::Observe)] {
@@ -113,11 +118,9 @@ fn the_act_crosses_a_tape_as_one_byte() {
 
 #[test]
 fn the_refusal_backs_off_and_names_no_holder() {
-    let r = CtlReply {
-        code: 1,
-        stdout: String::new(),
-        stderr: OBSERVE_REFUSAL.to_string(),
-    };
+    let r = refusal();
+    assert!(agent_image::observe_refused(&r.stderr));
+    assert!(refused(&r));
     assert!(r.is_err("busy"));
     assert!(!r.is_err("busy sink"));
     assert!(!r.is_err("busy input-unread"));

@@ -24,6 +24,9 @@ const ACTOR: &str = "ATPKG_RETAINED_OPERATION_CASE";
 #[path = "build_admit_returning_tests.rs"]
 mod returning_tests;
 
+#[path = "build_admit_materialization_tests.rs"]
+mod materialization_tests;
+
 struct Guard(Arc<AtomicUsize>);
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -101,7 +104,7 @@ fn tick(jobs: &mut Jobs) -> Vec<Completion> {
 
 fn until(jobs: &mut Jobs, found: impl Fn(&Jobs) -> bool) -> Vec<Completion> {
     use std::os::fd::AsFd as _;
-    let (control, _send) = std::io::pipe().unwrap();
+    let (control, _send) = aterm_uds::pipe().unwrap();
     let by = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let mut done = Vec::new();
     loop {
@@ -291,7 +294,7 @@ fn root_reaped_member_retained(world: &Path, seat: &Seat<'_>) {
         .cancel
         .request(crate::build_admit::CancelRequest::Kill)
         .unwrap();
-    let (control, _send) = std::io::pipe().unwrap();
+    let (control, _send) = aterm_uds::pipe().unwrap();
     let readiness = jobs.wait(control.as_fd(), Instant::now()).unwrap();
     assert!(
         !readiness.jobs_hint,
@@ -380,7 +383,7 @@ fn uncertain_arm(world: &Path, seat: &Seat<'_>) {
         .cancel
         .request(crate::build_admit::CancelRequest::Kill)
         .unwrap();
-    let (control, _send) = std::io::pipe().unwrap();
+    let (control, _send) = aterm_uds::pipe().unwrap();
     assert!(
         !jobs
             .wait(control.as_fd(), Instant::now())
@@ -655,7 +658,7 @@ fn private_input_bundle_before_birth_and_until_native_finish(world: &Path, seat:
         Instant::now() + aterm_spec::wait::MUST_HAPPEN,
     )
     .unwrap();
-    let (reader, mut writer) = std::io::pipe().unwrap();
+    let (reader, mut writer) = aterm_uds::pipe().unwrap();
     let output = world.join("actual-private-input-child.stdout");
     let mut target = command("/bin/cat");
     target
@@ -754,6 +757,10 @@ fn retained_actor() {
     };
     with_world(|world, seat| {
         match case.as_str() {
+            "materialization-fetch" => materialization_tests::actual_offline_fetch(world, seat),
+            "materialization-refusal" => {
+                materialization_tests::revoked_input_starts_no_child(world, seat)
+            }
             "return-producer" => returning_tests::successful_producer(world, seat),
             "return-failure" => returning_tests::failed_result_cannot_be_rewritten(world, seat),
             "return-launch" => {
@@ -802,6 +809,16 @@ fn actor(case: &str) {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn materialization_private_cache_survives_actual_targo_fetch_until_native_return() {
+    actor("materialization-fetch");
+}
+
+#[test]
+fn materialization_revoked_input_returns_original_attempt_without_child_birth() {
+    actor("materialization-refusal");
 }
 
 #[test]

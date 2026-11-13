@@ -492,6 +492,76 @@ fn a_boot_above_what_the_mac_can_ever_have_available_is_not_run_at_once() {
     );
 }
 
+/// `--memory` sizes lima's boot claim: on a 32 GiB Mac with 16 GiB available, an 8 GiB guest
+/// fits beside its 8 GiB spare at once, where the whole guest's 16 GiB waits for room.
+#[test]
+fn a_smaller_lima_guest_claims_its_own_memory() {
+    assert_eq!(
+        Guest::lima(crate::linux::VM, crate::linux::MEMORY_GIB),
+        LIMA
+    );
+    let small = Guest::lima(crate::linux::VM, 8);
+    let need = small.need("lab linux exec", true);
+    assert_eq!(
+        (need.mem, need.margin, need.cores),
+        (8 << 30, aterm_vz::plan::HOST_MARGIN, LIMA.cpus)
+    );
+    let dir = aterm_tempfile::tempdir().expect("a scratch ledger");
+    let ledger = Ledger::at(dir.path().join("capacity"));
+    let machine = Arc::new(Fixed::new(Reading::of_gib(32, 16, 10)));
+    let mut said = Vec::new();
+    let admitted = admit_in(
+        &ledger,
+        &*machine,
+        need,
+        &small,
+        Admit::Wait,
+        quick(),
+        &mut |l| said.push(l.to_owned()),
+        &|| Ok(()),
+    )
+    .unwrap_or_else(|f| panic!("the 8 GiB guest fits: {:?}", f.msg));
+    assert!(
+        said.iter().all(|l| !l.contains("waits")),
+        "no wait line: {said:?}"
+    );
+    drop(admitted);
+
+    let (lines, heard) = std::sync::mpsc::channel::<String>();
+    let whole = {
+        let (ledger, machine) = (ledger.clone(), Arc::clone(&machine));
+        std::thread::spawn(move || {
+            admit_in(
+                &ledger,
+                &*machine,
+                LIMA.need("lab linux exec", true),
+                &LIMA,
+                Admit::Wait,
+                quick(),
+                &mut |l| {
+                    let _ = lines.send(l.to_owned());
+                },
+                &|| Ok(()),
+            )
+            .map(|a| a.jobs)
+            .map_err(|f| f.msg)
+        })
+    };
+    let first = heard
+        .recv_timeout(MUST)
+        .expect("the whole guest's wait line");
+    assert!(
+        first.contains("aterm-linux boot (16 GiB, 8 vCPUs) waits"),
+        "{first:?}"
+    );
+    assert!(!whole.is_finished(), "the whole guest waits for room");
+    machine.set(Reading::of_gib(32, 24, 10));
+    assert!(
+        whole.join().expect("its admission").is_ok(),
+        "admitted once 24 GiB is available"
+    );
+}
+
 /// The guest's jobs are the cores the claim was granted: on 14 cores at a 5-minute load of
 /// 60, lima's boot is granted its share, 3, and its guest builds with `CARGO_BUILD_JOBS=3`
 /// (CAP-1's first rule granted 1); a run on the VM already up claims cores alone and is

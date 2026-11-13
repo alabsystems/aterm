@@ -20,8 +20,8 @@ const REAL: &str = "ATPKG_NATIVE_JOB_TABLE_REAL";
 fn shared_host_wait_services_mixed_interests_and_buffered_work() {
     use aterm_uds::ready::{Interest, Watch};
     let jobs = Jobs::new(1).unwrap();
-    let (mut control, mut send) = std::io::pipe().unwrap();
-    let (mut drain, mut input) = std::io::pipe().unwrap();
+    let (mut control, mut send) = aterm_uds::pipe().unwrap();
+    let (mut drain, mut input) = aterm_uds::pipe().unwrap();
     let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let wake = jobs
         .wait_with(
@@ -76,7 +76,7 @@ struct Driver {
 
 impl Driver {
     fn new(world: &Path) -> Self {
-        let (control, sender) = std::io::pipe().unwrap();
+        let (control, sender) = aterm_uds::pipe().unwrap();
         Self {
             jobs: Jobs::new(2).unwrap(),
             control,
@@ -191,7 +191,7 @@ pub(super) fn held(world: &Path, seat: &Seat<'_>) -> Held {
 
 pub(super) fn worker(world: &Path, stop: bool) -> (spawnfd::Command, std::io::PipeWriter) {
     std::fs::create_dir(world).unwrap();
-    let (input, writer) = std::io::pipe().unwrap();
+    let (input, writer) = aterm_uds::pipe().unwrap();
     let mut command = spawnfd::command(std::env::current_exe().unwrap());
     command
         .args([
@@ -367,7 +367,7 @@ fn native_table_actor_if_requested() {
     driver.done.clear();
     let clean = world.join("cleanup-zero");
     std::fs::create_dir(&clean).unwrap();
-    let (exit_reader, mut exit_writer) = std::io::pipe().unwrap();
+    let (exit_reader, mut exit_writer) = aterm_uds::pipe().unwrap();
     let mut command = spawnfd::command(std::env::current_exe().unwrap());
     command
         .args([
@@ -660,7 +660,18 @@ fn failed_cleanup_ends_a_surviving_member_before_reaping_its_exited_leader() {
     );
     assert_eq!(member.0.wait().unwrap().signal(), Some(libc::SIGKILL));
     assert!(root.0.child_mut().wait().unwrap().success());
-    admission.claim.finish_cohort().unwrap();
+    // The kernel answers `EPERM` for a group whose last member was just reaped until it lets the
+    // group go, which reads as an inconclusive lifetime: FINISH refuses with `WouldBlock` and
+    // keeps the reservation, and the next read is conclusive.
+    aterm_spec::wait::until_within(
+        aterm_spec::wait::MUST_HAPPEN,
+        "the reaped cohort reads as drained and finishes",
+        || match admission.claim.finish_cohort() {
+            Ok(()) => Some(()),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => None,
+            Err(error) => panic!("{error}"),
+        },
+    );
     drop(admission);
     assert!(seat.ledger.as_ref().unwrap().list().unwrap().is_empty());
 }

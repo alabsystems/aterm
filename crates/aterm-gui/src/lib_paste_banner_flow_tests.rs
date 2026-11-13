@@ -9,8 +9,10 @@ use super::{App, WindowId};
 use crate::input::Source;
 
 fn app_with_pty_observer() -> (App, i32) {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "observer pipe");
+    use std::os::fd::IntoRawFd;
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("observer pipe");
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(

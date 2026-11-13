@@ -174,6 +174,7 @@ fn resource_capabilities_query_reaches_native_without_observing_cache_ownership(
         cwd: Some(home),
         env: &|_| panic!("a capability query must not inspect inherited cache settings"),
         read: &|_| panic!("a capability query must not read or register caches"),
+        read_manifest: &|_| panic!("a capability query must not read or register caches"),
         writable: &|_| panic!("a capability query must not require cache writes"),
     };
     assert!(!observe_for_producer(&args, super::super::Tool::Targo, home, &machine, true).unwrap());
@@ -186,6 +187,7 @@ fn resource_capabilities_query_reaches_native_without_observing_cache_ownership(
     let inert = super::super::Machine {
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         ..machine
     };
     for args in [
@@ -335,11 +337,13 @@ fn native_build_tree_administration_does_not_read_or_adopt_build_caches() {
         cwd: Some(home),
         env: &|_| panic!("native tree administration must not inspect build-cache settings"),
         read: &|_| panic!("native tree administration must not read build-cache config"),
+        read_manifest: &|_| panic!("native tree administration must not read build-cache config"),
         writable: &|_| panic!("native tree administration must not register build output"),
     };
     let inert = super::super::Machine {
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         ..machine
     };
     for operation in [
@@ -431,6 +435,7 @@ fn trust_cargo_custody_reads_each_twin_with_a_toolchain_and_no_lane() {
                 cwd: Some(&world.owner),
                 env: &env,
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             let result = observe_for_producer(
@@ -499,6 +504,7 @@ fn directory_changed_producers_own_the_effective_package_target() {
                 cwd: Some(&launcher),
                 env: &|_| None,
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             assert!(
@@ -575,6 +581,7 @@ fn directory_changed_producers_refuse_unknown_custody_and_leave_queries_alone() 
             cwd: Some(&launcher),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let result = observe_for_producer(&args, Tool::Targo, &world.home, &machine, true);
@@ -652,6 +659,7 @@ fn cli_configs_preserve_selected_explicit_custody() {
                     cwd: Some(&launcher),
                     env: &|_| None,
                     read: &read,
+                    read_manifest: &read,
                     writable: &|_| Some(true),
                 };
                 let mut args = vec!["--unverified".into()];
@@ -750,6 +758,7 @@ fn cli_config_selected_targets_bind_provenance_to_receipts() {
                 cwd: Some(&launcher),
                 env: &|key| (key == "CARGO_BUILD_TARGET_DIR").then(|| "lower.noindex".into()),
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             let mut args = vec!["--unverified".into()];
@@ -821,6 +830,7 @@ fn cli_include_targets_bind_the_winning_file_to_actual_custody() {
                     cwd: Some(&launcher),
                     env: &|_| None,
                     read: &read,
+                    read_manifest: &read,
                     writable: &|_| Some(true),
                 };
                 let mut args = vec!["--unverified".into()];
@@ -875,7 +885,7 @@ fn cli_include_targets_bind_the_winning_file_to_actual_custody() {
 fn configured_outputs_share_only_covering_custody_and_keep_the_actual_owner() {
     use super::super::Tool;
     for moved in [false, true] {
-        for environment in [false, true] {
+        for source in ["cli", "environment", "discovered"] {
             for layout in ["distinct", "equal", "target-parent", "build-parent"] {
                 let world = World::new();
                 let (target, build) = match layout {
@@ -898,7 +908,7 @@ fn configured_outputs_share_only_covering_custody_and_keep_the_actual_owner() {
                     Err(_) => Err(()),
                 };
                 let env = |name: &str| {
-                    (environment && name == super::super::BUILD_DIR_ENV)
+                    (source == "environment" && name == super::super::BUILD_DIR_ENV)
                         .then(|| build.clone().into_os_string())
                 };
                 let machine = super::super::Machine {
@@ -907,6 +917,7 @@ fn configured_outputs_share_only_covering_custody_and_keep_the_actual_owner() {
                     cwd: Some(&launcher),
                     env: &env,
                     read: &read,
+                    read_manifest: &read,
                     writable: &|_| Some(true),
                 };
                 let mut args = vec!["--unverified".into()];
@@ -922,17 +933,25 @@ fn configured_outputs_share_only_covering_custody_and_keep_the_actual_owner() {
                     "--target-dir".into(),
                     target.display().to_string(),
                 ]);
-                if !environment {
+                if source == "cli" {
                     args.extend([
                         "--config".into(),
                         format!("build.build-dir='{}'", build.display()),
                     ]);
                 }
+                if source == "discovered" {
+                    std::fs::create_dir_all(world.owner.join(".cargo")).unwrap();
+                    std::fs::write(
+                        world.owner.join(".cargo/config.toml"),
+                        format!("build.build-dir='{}'", build.display()),
+                    )
+                    .unwrap();
+                }
                 for _ in 0..2 {
                     assert!(
                         observe_for_producer(&args, Tool::Targo, &world.home, &machine, true)
                             .unwrap(),
-                        "{layout} env={environment} moved={moved}"
+                        "{layout} source={source} moved={moved}"
                     );
                     assert!(target.is_dir() && build.is_dir());
                     let recorded = roots(&world.home);
@@ -973,6 +992,7 @@ fn configured_outputs_refuse_existing_unowned_roots_and_busy_gates() {
             cwd: Some(&world.owner),
             env: &|_| None,
             read: &|p| Ok(std::fs::read_to_string(p).ok()),
+            read_manifest: &|p| Ok(std::fs::read_to_string(p).ok()),
             writable: &|_| Some(true),
         };
         let args = vec![
@@ -1644,6 +1664,13 @@ fn package_registers_its_fresh_target_without_adopting_existing_output() {
                     Ok(None)
                 }
             },
+            read_manifest: &|path| {
+                if path.starts_with(&world.home) {
+                    super::super::read_manifest(path)
+                } else {
+                    Ok(None)
+                }
+            },
             writable: &|_| Some(true),
         };
         let mut args = vec![
@@ -1707,6 +1734,7 @@ fn observations_distinguish_unmanaged_outputs_from_registered_roots() {
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(true),
     };
     let args = |manifest: &Path, target: &Path| {
@@ -1855,6 +1883,7 @@ fn the_index_folders_are_laid_private_before_a_shared_cache_build() {
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(true),
     };
     let plain = ["--unverified".to_owned(), "build".to_owned()];
@@ -1909,6 +1938,7 @@ fn a_home_a_build_left_group_writable_is_made_private_by_the_next_observed_call(
             cwd: Some(&world.owner),
             env: &|_| None,
             read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
             writable: &|_| Some(true),
         };
         let plain = ["--unverified".to_owned(), "build".to_owned()];
@@ -1962,6 +1992,7 @@ fn equivalent_inherited_placement_preserves_owners_through_nested_and_rust_calls
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &read_manifest,
+        read_manifest: &read_manifest,
         writable: &|_| Some(true),
     };
     let typed = vec!["--unverified".into(), "tippy".into()];
@@ -2007,8 +2038,8 @@ fn equivalent_inherited_placement_preserves_owners_through_nested_and_rust_calls
             super::super::UserAlias::None
         })
         .expect("the fixture exposes its explicit target and owning manifest")
-        .manifest,
-        manifest
+        .manifests,
+        vec![manifest.clone()]
     );
     let value = format!("build.build-dir='{}'", child.display());
     let environment =
@@ -2089,6 +2120,7 @@ fn quiet_local_fallback_owns_only_its_child_in_an_existing_unmanaged_target() {
             cwd: Some(&world.owner),
             env: &|_| None,
             read: &super::super::read_config,
+            read_manifest: &super::super::read_manifest,
             // A shared cache unavailable to a plain build takes the same local fallback.
             writable: &|_| Some(false),
         };
@@ -2139,6 +2171,7 @@ fn quiet_physical_target_inherited_by_verify_prepares_the_owned_target() {
         cwd: Some(&world.owner),
         env: &environment,
         read: &super::super::read_config,
+        read_manifest: &super::super::read_manifest,
         writable: &|_| Some(true),
     };
     let args = vec![
@@ -2212,6 +2245,7 @@ fn custom_or_overridden_inherited_placement_keeps_conservative_custody() {
             cwd: Some(&world.owner),
             env: &environment,
             read: &super::super::read_config,
+            read_manifest: &super::super::read_manifest,
             writable: &|_| Some(true),
         };
         let observed = observe_on(&args, super::super::Tool::Targo, &world.home, &machine);
@@ -2545,6 +2579,47 @@ fn a_marked_cache_with_missing_or_corrupt_owner_records_refuses_another_producer
 }
 
 #[test]
+fn an_advisory_inventory_does_not_exclude_a_new_producer() {
+    use std::cell::RefCell;
+    thread_local! {
+        static INPUT: RefCell<Option<(PathBuf, PathBuf, PathBuf)>> = const { RefCell::new(None) };
+        static RESULT: RefCell<Option<std::io::Result<bool>>> = const { RefCell::new(None) };
+    }
+    struct Clear;
+    impl Drop for Clear {
+        fn drop(&mut self) {
+            INPUT.with(|input| input.borrow_mut().take());
+            RESULT.with(|result| result.borrow_mut().take());
+        }
+    }
+    fn register_during_inventory() {
+        let input = INPUT.with(|input| input.borrow_mut().take());
+        if let Some((home, target, owner)) = input {
+            let result = create_checked(&home, &target, &owner);
+            RESULT.with(|slot| *slot.borrow_mut() = Some(result));
+        }
+    }
+    let world = World::new();
+    world.build();
+    let other = world.another_owner();
+    let payload = std::fs::read(world.target.join("debug/deps/keep")).unwrap();
+    let _clear = Clear;
+    INPUT.with(|input| {
+        *input.borrow_mut() = Some((world.home.clone(), world.target.clone(), other.clone()));
+    });
+    aterm_uds::progress::heard_by(register_during_inventory, || {
+        let _ = plan(&world.home, world.later());
+    });
+    let result = RESULT.with(|result| result.borrow_mut().take());
+    assert!(matches!(result, Some(Ok(true))), "{result:?}");
+    assert!(read(&world.path()).unwrap().owners.contains(&other));
+    assert_eq!(
+        std::fs::read(world.target.join("debug/deps/keep")).unwrap(),
+        payload
+    );
+}
+
+#[test]
 fn a_busy_producer_gate_refuses_direct_and_linked_targets_without_changing_custody() {
     for linked in [false, true] {
         let world = World::new();
@@ -2568,6 +2643,7 @@ fn a_busy_producer_gate_refuses_direct_and_linked_targets_without_changing_custo
                 cwd: Some(owner),
                 env: &|_| None,
                 read: &|_| Ok(None),
+                read_manifest: &|_| Ok(None),
                 writable: &|_| Some(true),
             };
             observe_for_producer(
@@ -2589,6 +2665,8 @@ fn a_busy_producer_gate_refuses_direct_and_linked_targets_without_changing_custo
         };
         let gate = crate::metadata_io::open_regular(&gate_path(&world.path()).unwrap()).unwrap();
         let held = crate::lock::Flock::try_lock(gate).unwrap();
+        let opener = format!("pid {}", std::process::id());
+        let gate_name = format!("gate={:?}", gate_path(&world.path()).unwrap());
         for owner in [&world.owner, &other] {
             let error = observe(owner).unwrap_err();
             assert_eq!(
@@ -2601,6 +2679,8 @@ fn a_busy_producer_gate_refuses_direct_and_linked_targets_without_changing_custo
                     .to_string()
                     .contains(&world.target.display().to_string())
             );
+            assert!(error.to_string().contains(&gate_name), "{error}");
+            assert!(error.to_string().contains(&opener), "{error}");
         }
         #[cfg(target_os = "macos")]
         {
@@ -2610,6 +2690,10 @@ fn a_busy_producer_gate_refuses_direct_and_linked_targets_without_changing_custo
             assert!(
                 String::from_utf8_lossy(&out.stderr).contains(&world.target.display().to_string()),
                 "{linked}: {out:?}"
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stderr).contains(&opener),
+                "{out:?}"
             );
             assert!(!world.home.join("ledger.noindex").exists());
         }
@@ -2841,6 +2925,76 @@ fn a_refused_rename_after_the_intent_closes_it_with_nothing_gone() {
     assert!(!world.target.exists());
 }
 
+/// A REGISTERED CACHE WHOSE ROOT IS FLAGGED BEFORE THE PASS IS KEPT WITH NO INTENT (review
+/// RV2, J2-1-R1): a gone owner's cache whose root its owner flagged `uchg` before any pass
+/// cannot have its name taken out of its folder, which is read before its intent, as a leaf's
+/// is (`movable`), so two passes ask nothing, return nothing, make no stage and write no
+/// pending stage into its receipt, and its outputs stay whole; with the flag cleared, the
+/// next pass retires it. NEGATIVE CONTROL (run): without that read, each pass asks its intent
+/// and returns it refused at its rename (`Refusal::Rename`), the churn of a removing row and a
+/// kept one every other pass.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_registered_root_flagged_before_the_pass_is_kept_with_no_intent() {
+    struct Unflag(PathBuf);
+    impl Drop for Unflag {
+        fn drop(&mut self) {
+            let _ = crate::platform::set_file_flags(&self.0, 0);
+        }
+    }
+    let world = World::new();
+    world.build();
+    std::fs::remove_dir_all(&world.owner).unwrap();
+    crate::platform::set_file_flags(&world.target, libc::UF_IMMUTABLE).unwrap();
+    let unflag = Unflag(world.target.clone());
+    let parent = world.target.parent().unwrap().to_path_buf();
+    let stages = || {
+        std::fs::read_dir(&parent)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("atpkg-cache-retiring-")
+            })
+            .count()
+    };
+    for pass in 0..2 {
+        let mut asked = Vec::new();
+        let removed = reclaim(
+            &world.home,
+            world.later(),
+            super::super::ReclaimAfter::CALM,
+            None,
+            &mut |path, _| {
+                asked.push(path.to_path_buf());
+                true
+            },
+        );
+        assert!(asked.is_empty(), "pass {pass}: no intent asked: {asked:?}");
+        assert!(removed.is_empty(), "pass {pass}: {removed:?}");
+        assert_eq!(stages(), 0, "pass {pass}: no stage made");
+        assert!(
+            read(&world.path()).is_some_and(|receipt| receipt.pending.is_none()),
+            "pass {pass}: no pending stage on record"
+        );
+        assert!(world.target.join("debug/deps/keep").is_file());
+    }
+    drop(unflag);
+    let removed = reclaim(
+        &world.home,
+        world.later(),
+        super::super::ReclaimAfter::CALM,
+        None,
+        &mut |_, _| true,
+    );
+    assert!(
+        matches!(removed.as_slice(), [(path, super::super::Unused::Gone { .. })] if path == &world.target),
+        "{removed:?}"
+    );
+    assert!(!world.target.exists());
+}
+
 /// A REGISTERED CACHE STOPPED ONCE STAGED CLOSES AS ITS PENDING STAGE: a gone owner's cache
 /// renamed into its private stage, then found in use there (the fence reports a process in a
 /// stage that holds the payload, from the moment an intent is on record), is returned as that
@@ -2972,6 +3126,7 @@ fn outside_home_is_not_an_explicit_output_directory() {
         cwd: Some(&outside),
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(true),
     };
     let args = ["--unverified".into(), "build".into()];
@@ -3007,6 +3162,360 @@ fn outside_home_is_not_an_explicit_output_directory() {
 }
 
 #[test]
+fn workspace_owners_follow_complete_search_and_package_home_boundaries() {
+    use super::super::Tool;
+    for (depth, case) in [
+        (34, "default"),
+        (2, "cargo"),
+        (2, "relative"),
+        (2, "empty"),
+        (2, "twin"),
+        (2, "suppressed-twin"),
+        (2, "moved-relative"),
+    ] {
+        let world = World::new();
+        let mut member = world.owner.clone();
+        for _ in 0..depth {
+            member.push("n");
+        }
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            world.owner.join("Cargo.toml"),
+            format!(
+                "[workspace]\nmembers=['{}']\n",
+                member.strip_prefix(&world.owner).unwrap().display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.0.0'\nedition='2024'\n",
+        )
+        .unwrap();
+        let inside = member.parent().unwrap();
+        let outside = world.home.join("cargo-home");
+        let env = |name: &str| match (name, case) {
+            ("CARGO_HOME", "cargo") => Some(inside.as_os_str().to_owned()),
+            ("CARGO_HOME", "relative" | "moved-relative") => Some("..".into()),
+            ("CARGO_HOME", "empty") => Some("".into()),
+            ("CARGO_HOME", "suppressed-twin") => Some(outside.as_os_str().to_owned()),
+            ("TARGO_HOME", "twin" | "suppressed-twin" | "empty") => {
+                Some(inside.as_os_str().to_owned())
+            }
+            _ => None,
+        };
+        let read = |path: &Path| match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(()),
+        };
+        let launcher = world.home.join("launcher");
+        std::fs::create_dir(&launcher).unwrap();
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(if case == "moved-relative" {
+                &launcher
+            } else {
+                &member
+            }),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let mut args = Vec::new();
+        if case == "moved-relative" {
+            args.extend([
+                "-Zunstable-options".into(),
+                "-C".into(),
+                member.display().to_string(),
+            ]);
+        }
+        args.extend([
+            "--unverified".into(),
+            "build".into(),
+            "--target-dir".into(),
+            world.target.display().to_string(),
+        ]);
+        let result = observe_for_producer(&args, Tool::Targo, &world.home, &machine, true);
+        if case == "twin" {
+            assert!(
+                result.is_err(),
+                "different supported workspace owners: {case}"
+            );
+            assert!(!world.target.exists());
+            assert!(roots(&world.home).is_empty());
+            continue;
+        }
+        assert!(result.unwrap(), "{case}");
+        let owner = if matches!(case, "cargo" | "relative" | "moved-relative") {
+            &member
+        } else {
+            &world.owner
+        };
+        let recorded = roots(&world.home);
+        assert_eq!(recorded.len(), 1, "{case}");
+        assert_eq!(recorded[0].root, world.target, "{case}");
+        assert_eq!(recorded[0].owners, std::slice::from_ref(owner), "{case}");
+    }
+}
+
+#[test]
+fn workspace_owners_keep_logical_manifest_and_home_spellings() {
+    for case in ["home-alias", "both-alias", "manifest-alias", "file-link"] {
+        let world = World::new();
+        let member = world.owner.join("n/member");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.0.0'\n",
+        )
+        .unwrap();
+        let alias = world.home.join("alias");
+        std::os::unix::fs::symlink(&world.owner, &alias).unwrap();
+        let (manifest, package_home, expected) = match case {
+            "home-alias" => (
+                member.join("Cargo.toml"),
+                alias.join("n"),
+                world.owner.clone(),
+            ),
+            "both-alias" => (
+                alias.join("n/member/Cargo.toml"),
+                alias.join("n"),
+                member.clone(),
+            ),
+            "manifest-alias" => (
+                alias.join("n/member/Cargo.toml"),
+                world.owner.join("n"),
+                world.owner.clone(),
+            ),
+            "file-link" => {
+                let logical = world.home.join("linked-member");
+                std::fs::create_dir(&logical).unwrap();
+                std::os::unix::fs::symlink(member.join("Cargo.toml"), logical.join("Cargo.toml"))
+                    .unwrap();
+                (logical.join("Cargo.toml"), world.home.clone(), logical)
+            }
+            _ => unreachable!(),
+        };
+        let env = |name: &str| (name == "CARGO_HOME").then(|| package_home.as_os_str().to_owned());
+        let read = |path: &Path| match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(()),
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&world.owner),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let args = vec![
+            "--unverified".into(),
+            "build".into(),
+            "--manifest-path".into(),
+            manifest.display().to_string(),
+            "--target-dir".into(),
+            world.target.display().to_string(),
+        ];
+        let verdict = observe_for_producer(
+            &args,
+            super::super::Tool::Targo,
+            &world.home,
+            &machine,
+            true,
+        );
+        if case == "file-link" {
+            // Targo resolves this logical package, but custody requires a regular manifest.
+            assert!(verdict.is_err());
+            assert!(!world.target.exists());
+            assert!(roots(&world.home).is_empty());
+            continue;
+        }
+        assert!(verdict.unwrap(), "{case}");
+        let recorded = roots(&world.home);
+        assert_eq!(recorded.len(), 1, "{case}");
+        assert_eq!(recorded[0].owners, [expected], "{case}");
+    }
+}
+
+#[test]
+fn workspace_owners_keep_unknown_ancestors_and_external_roots_unmanaged() {
+    for case in [
+        "malformed",
+        "wrong-type",
+        "wrong-members",
+        "pointer-type",
+        "missing-pointer",
+        "unreadable",
+        "external-root",
+        "redirected",
+    ] {
+        let world = World::new();
+        let member = world.owner.join("n/member");
+        std::fs::create_dir_all(&member).unwrap();
+        let package = "[package]\nname='member'\nversion='0.0.0'\n";
+        std::fs::write(member.join("Cargo.toml"), package).unwrap();
+        let parent_manifest = world.owner.join("Cargo.toml");
+        match case {
+            "malformed" => std::fs::write(&parent_manifest, "[workspace").unwrap(),
+            "wrong-type" => std::fs::write(&parent_manifest, "workspace=false").unwrap(),
+            "wrong-members" => {
+                std::fs::write(&parent_manifest, "[workspace]\nmembers=[1]").unwrap()
+            }
+            "pointer-type" => {
+                std::fs::write(member.join("Cargo.toml"), format!("{package}workspace=1\n"))
+                    .unwrap()
+            }
+            "missing-pointer" => std::fs::write(
+                member.join("Cargo.toml"),
+                format!("{package}workspace='../missing'\n"),
+            )
+            .unwrap(),
+            "unreadable" => {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&parent_manifest, std::fs::Permissions::from_mode(0o000))
+                    .unwrap();
+            }
+            "external-root" => {
+                std::fs::write(
+                    &parent_manifest,
+                    "[package]\nname='parent'\nversion='0.0.0'\n",
+                )
+                .unwrap();
+                std::fs::write(world.home.join("Cargo.toml"), "[workspace]\n").unwrap();
+            }
+            "redirected" => {
+                let directory = world.home.parent().unwrap().join("elsewhere");
+                std::fs::create_dir(&directory).unwrap();
+                let outside = directory.join("Cargo.toml");
+                std::fs::write(&outside, "[workspace]\n").unwrap();
+                std::fs::remove_file(&parent_manifest).unwrap();
+                std::os::unix::fs::symlink(outside, &parent_manifest).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let env = |name: &str| (name == "CARGO_HOME").then(|| world.home.as_os_str().to_owned());
+        let read = |path: &Path| match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(()),
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&member),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let args = vec![
+            "--unverified".into(),
+            "build".into(),
+            "--target-dir".into(),
+            world.target.display().to_string(),
+        ];
+        let verdict = observe_for_producer(
+            &args,
+            super::super::Tool::Targo,
+            &world.home,
+            &machine,
+            true,
+        );
+        if case == "unreadable" {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&parent_manifest, std::fs::Permissions::from_mode(0o644))
+                .unwrap();
+        }
+        assert!(verdict.is_err(), "{case}");
+        assert!(!world.target.exists(), "{case}");
+        assert!(roots(&world.home).is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn workspace_owners_respect_exclusion_and_packaged_source_boundaries() {
+    for case in [
+        "excluded",
+        "explicit-member",
+        "packaged",
+        "ancestor-pointer",
+    ] {
+        let world = World::new();
+        let member = world.owner.join(if case == "packaged" {
+            "target/package/member"
+        } else {
+            "n/member"
+        });
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname='member'\nversion='0.0.0'\n",
+        )
+        .unwrap();
+        let definition = if case == "explicit-member" {
+            "[workspace]\nmembers=['n']\nexclude=['n']\n"
+        } else {
+            "[workspace]\nexclude=['n']\n"
+        };
+        std::fs::write(world.owner.join("Cargo.toml"), definition).unwrap();
+        if case == "ancestor-pointer" {
+            std::fs::write(world.owner.join("Cargo.toml"), "[workspace]\n").unwrap();
+            std::fs::write(
+                member.parent().unwrap().join("Cargo.toml"),
+                "[package]\nname='parent'\nversion='0.0.0'\nworkspace='..'\n",
+            )
+            .unwrap();
+        }
+        let env = |name: &str| (name == "CARGO_HOME").then(|| world.home.as_os_str().to_owned());
+        let read = |path: &Path| match std::fs::read_to_string(path) {
+            Ok(text) => Ok(Some(text)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(_) => Err(()),
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&member),
+            env: &env,
+            read: &read,
+            read_manifest: &read,
+            writable: &|_| Some(true),
+        };
+        let args = vec![
+            "--unverified".into(),
+            "build".into(),
+            "--target-dir".into(),
+            world.target.display().to_string(),
+        ];
+        assert!(
+            observe_for_producer(
+                &args,
+                super::super::Tool::Targo,
+                &world.home,
+                &machine,
+                true
+            )
+            .unwrap(),
+            "{case}"
+        );
+        let expected = if matches!(case, "explicit-member" | "ancestor-pointer") {
+            &world.owner
+        } else {
+            &member
+        };
+        let recorded = roots(&world.home);
+        assert_eq!(recorded.len(), 1, "{case}");
+        assert_eq!(recorded[0].owners, std::slice::from_ref(expected), "{case}");
+    }
+}
+
+#[test]
 fn explicit_manifest_and_target_precedence_bind_the_real_workspace() {
     let world = World::new();
     let launcher = world.home.join("launcher");
@@ -3025,6 +3534,7 @@ fn explicit_manifest_and_target_precedence_bind_the_real_workspace() {
         cwd: Some(&launcher),
         env: &env,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     let args = vec![
@@ -3079,6 +3589,7 @@ fn a_short_manifest_and_targo_twins_name_what_their_long_spellings_name() {
             cwd: Some(&launcher),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let named = spelling[0] != "-pm";
@@ -3130,6 +3641,7 @@ fn a_short_manifest_and_targo_twins_name_what_their_long_spellings_name() {
             cwd: Some(&world.owner),
             env,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let args = if tool.is_cargo() {
@@ -3185,6 +3697,7 @@ fn a_short_manifest_and_targo_twins_name_what_their_long_spellings_name() {
             cwd: Some(cwd),
             env,
             read,
+            read_manifest: read,
             writable: &|_| Some(true),
         })
     }
@@ -3294,6 +3807,7 @@ fn a_short_manifest_and_targo_twins_name_what_their_long_spellings_name() {
             cwd: Some(&world.owner),
             env: &env,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let args = words(&["--unverified", "an-unknown-alias"]);
@@ -3364,6 +3878,7 @@ fn the_front_reads_a_short_manifest_only_among_targos_own_words() {
             cwd: Some(cwd),
             env: &env,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let verdict = observe_for_producer(args, Tool::Targo, &world.home, &machine, true).ok();
@@ -3406,6 +3921,7 @@ fn the_front_reads_a_short_manifest_only_among_targos_own_words() {
         cwd: Some(&world.owner),
         env: &env,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     let mut cargo = words(&["+stable", "build", "-m"]);
@@ -3700,6 +4216,7 @@ fn the_front_reads_a_short_manifest_only_among_targos_own_words() {
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     let program = words(&["--unverified", "run", "demo", "-o", "--target-dir", "sub"]);
@@ -3717,6 +4234,7 @@ fn the_front_reads_a_short_manifest_only_among_targos_own_words() {
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     let program = words(&["--unverified", "run", "demo", "-j", "--target-dir", "sub"]);
@@ -3786,6 +4304,7 @@ fn the_front_judges_the_line_targo_runs() {
             cwd: Some(cwd),
             env: &env,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let verdict = observe_for_producer(args, Tool::Targo, &world.home, &machine, true).ok();
@@ -3913,6 +4432,7 @@ fn the_front_judges_the_line_targo_runs() {
         cwd: Some(&world.owner),
         env: &machine_env,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     let args = words(&["xb"]);
@@ -3933,6 +4453,7 @@ fn the_front_judges_the_line_targo_runs() {
             cwd: Some(&other),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let args = words(&["--unverified", "xd"]);
@@ -3985,6 +4506,7 @@ fn the_front_judges_each_word_where_targo_reads_it() {
                 cwd: Some(cwd),
                 env: &env,
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             let verdict = observe_for_producer(args, Tool::Targo, &world.home, &machine, true).ok();
@@ -4063,6 +4585,7 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     assert!(!requires_managed_explicit(
@@ -4178,8 +4701,8 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         produce(&world, &world.owner, false, &[], &tested),
         (None, 0)
     );
-    // A directory an include names is the config's: `b` builds into it, unrecorded unless
-    // the front owes it custody. An include that names none leaves `b` free.
+    // A resolved included target grants custody to the exact selected directory for both
+    // command spellings. An independent neutral include selects no output and grants none.
     let world = World::new();
     config(&world.owner, "config.toml", "include = [\"dirs.toml\"]\n");
     let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
@@ -4187,10 +4710,13 @@ fn the_front_judges_each_word_where_targo_reads_it() {
     for typed in [["--unverified", "build"], ["--unverified", "b"]] {
         assert_eq!(
             produce(&world, &world.owner, false, &[], &words(&typed)),
-            (None, 0),
+            (Some(true), 1),
             "{typed:?}"
         );
     }
+    assert_eq!(root(&world), std::slice::from_ref(&world.target));
+    let world = World::new();
+    config(&world.owner, "config.toml", "include = [\"dirs.toml\"]\n");
     config(&world.owner, "dirs.toml", "[build]\njobs = 4\n");
     assert_eq!(
         produce(
@@ -4331,6 +4857,7 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     let observed = observe(
@@ -4357,6 +4884,7 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         cwd: Some(&world.owner),
         env: &env,
         read: &read,
+        read_manifest: &read,
         writable: &|_| Some(true),
     };
     let observed = observe(
@@ -4555,7 +5083,11 @@ fn the_front_judges_each_word_where_targo_reads_it() {
     std::os::unix::fs::symlink(elsewhere.join("inner"), world.owner.join(".cargo/sub")).unwrap();
     let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
     config(&world.owner, "dirs.toml", &named);
-    assert_eq!(produce(&world, &world.owner, false, &[], &built), (None, 0));
+    assert_eq!(
+        produce(&world, &world.owner, false, &[], &built),
+        (Some(true), 1)
+    );
+    assert_eq!(root(&world), std::slice::from_ref(&world.target));
     // Each config file the walk finds checks its own cycles: `config` and `config.toml` in
     // one folder may include one file.
     let world = World::new();
@@ -4566,8 +5098,7 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         produce(&world, &world.owner, false, &[], &built),
         (Some(false), 0)
     );
-    // A build directory an include names is the config's, which no cache the front grants
-    // holds.
+    // A resolved included build directory and a known final target each get custody.
     let world = World::new();
     config(&world.owner, "config.toml", "include = [\"dirs.toml\"]\n");
     let build_dir = format!(
@@ -4575,7 +5106,13 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         world.home.join("built").display()
     );
     config(&world.owner, "dirs.toml", &build_dir);
-    assert_eq!(produce(&world, &world.owner, true, &[], &built), (None, 0));
+    assert_eq!(
+        produce(&world, &world.owner, true, &[], &built),
+        (Some(true), 2)
+    );
+    let recorded = root(&world);
+    assert!(recorded.contains(&world.target));
+    assert!(recorded.contains(&world.home.join("built")));
     // A key spelled with an escape is the key Targo decodes: an `include`, and a directory.
     let world = World::new();
     let named = format!("[build]\ntarget-dir = \"{}\"\n", world.target.display());
@@ -4584,11 +5121,14 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         "[build]\n\"target\\u002ddir\" = \"{}\"\n",
         world.target.display()
     );
-    // The include's target the front cannot resolve, so the call is refused; the target the
-    // decoded key names is the call's, owned and recorded (read as no key, the call would
-    // be free).
+    // Escaped include and target keys both select the exact recorded target; reading
+    // either as no key would wrongly leave the call free.
     for (text, want, recorded) in [
-        ("\"incl\\u0075de\" = [\"dirs.toml\"]\n", (None, 0), vec![]),
+        (
+            "\"incl\\u0075de\" = [\"dirs.toml\"]\n",
+            (Some(true), 1),
+            vec![world.target.clone()],
+        ),
         (
             escaped.as_str(),
             (Some(true), 1),
@@ -4630,12 +5170,14 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &front_read,
+        read_manifest: &front_read,
         writable: &|_| Some(true),
     };
     assert_eq!(
         observe_for_producer(&built, Tool::Targo, &world.home, &machine, true).ok(),
         Some(false)
     );
+    // The included target belongs to the earlier world; resolving it grants no new owner.
     std::fs::write(dotfiles.join("local.toml"), &named).unwrap();
     assert_eq!(
         observe_for_producer(&built, Tool::Targo, &world.home, &machine, true).ok(),
@@ -4951,6 +5493,7 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &no_follow,
+        read_manifest: &no_follow,
         writable: &|_| Some(true),
     };
     let fresh = world.home.join("fresh").display().to_string();
@@ -4999,12 +5542,15 @@ fn the_front_judges_each_word_where_targo_reads_it() {
         produce(&world, &world.owner, false, &homed, &registry),
         (Some(false), 0)
     );
-    // A target that owes no custody, for a package atpkg never manages, is the folder the
-    // kernel reaches: a registered root behind a link from outside HOME loses its known
-    // owners.
+    // A target that owes no custody, for a package atpkg never manages (in a folder of HOME
+    // this platform never looks into), is the folder the kernel reaches: a registered root
+    // behind a link from outside HOME loses its known owners.
     let world = World::new();
     world.build();
-    let skipped = world.home.join("Documents/proj");
+    let skipped = world
+        .home
+        .join(crate::build_cache::checkout::HOME_SKIP[0].trim_end_matches('*'))
+        .join("proj");
     std::fs::create_dir_all(&skipped).unwrap();
     std::fs::write(skipped.join("Cargo.toml"), "[workspace]\nmembers = []\n").unwrap();
     let link = world.home.parent().unwrap().join("into-home");
@@ -5055,6 +5601,7 @@ fn a_user_alias_is_read_as_targo_reads_it() {
             cwd: Some(cwd),
             env: &env,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let verdict = observe_for_producer(args, Tool::Targo, &world.home, &machine, true).ok();
@@ -5164,6 +5711,7 @@ fn a_user_alias_is_read_as_targo_reads_it() {
                 cwd: Some(&world.owner),
                 env: &lookup,
                 read: &read,
+                read_manifest: &read,
                 writable: &|_| Some(true),
             };
             assert_eq!(
@@ -5184,6 +5732,7 @@ fn a_user_alias_is_read_as_targo_reads_it() {
             cwd: Some(&world.owner),
             env: &|_| None,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         assert_eq!(
@@ -5255,6 +5804,7 @@ fn a_user_alias_is_read_as_targo_reads_it() {
             cwd: Some(cwd),
             env: &lookup,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         let line = if tool == Tool::Cargo {
@@ -5285,6 +5835,7 @@ fn a_free_verb_reads_its_options_clustered_as_spaced() {
         cwd: Some(&world.owner),
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(true),
     };
     let free = |args: &[&str]| {
@@ -5347,6 +5898,7 @@ fn a_named_manifest_owes_custody_by_the_configs_targo_reads() {
             cwd: Some(cwd),
             env,
             read: &read,
+            read_manifest: &read,
             writable: &|_| Some(true),
         };
         requires_managed_explicit(args, Tool::Targo, home, &machine)
@@ -5460,6 +6012,7 @@ fn builtin_queries_leave_registered_receipts_unchanged_even_when_writes_are_refu
         cwd: Some(&world.owner),
         env: &env,
         read: &read_config,
+        read_manifest: &read_config,
         writable: &|_| Some(false),
     };
     let index = path.parent().unwrap();
@@ -5646,6 +6199,7 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
         cwd: Some(&world.owner),
         env: &env,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(false),
     };
     let index = path.parent().unwrap();
@@ -5660,6 +6214,7 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
         "tree",
         "metadata",
         "generate-lockfile",
+        "update",
         "pkgid",
         "verify-project",
         "read-manifest",
@@ -5960,6 +6515,7 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
         let placing = super::super::Machine {
             env: &env,
             read: &read,
+            read_manifest: &read,
             ..machine
         };
         for verb in READING_VERBS.iter().chain(RESOLVING_VERBS) {
@@ -6036,6 +6592,7 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
             cwd: Some(&elsewhere),
             env: &env,
             read: &read,
+            read_manifest: &read,
             ..machine
         };
         assert!(
@@ -6045,6 +6602,7 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
         let read = |_: &Path| Ok(None);
         let plain = super::super::Machine {
             read: &read,
+            read_manifest: &read,
             ..homed
         };
         assert!(!lockfile_may_land_in_a_target(&words(&["fetch"]), &plain));
@@ -6064,6 +6622,7 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
         cwd: Some(&elsewhere),
         env: &env,
         read: &read,
+        read_manifest: &read,
         ..machine
     };
     assert!(!lockfile_may_land_in_a_target(&words(&["fetch"]), &twinned));
@@ -6074,6 +6633,7 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
     let twin = super::super::Machine {
         env: &env,
         read: &read,
+        read_manifest: &read,
         ..machine
     };
     assert!(lockfile_may_land_in_a_target(&words(&["fetch"]), &twin));
@@ -6082,6 +6642,7 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
         cwd: None,
         env: &env,
         read: &read,
+        read_manifest: &read,
         ..machine
     };
     assert!(lockfile_may_land_in_a_target(&words(&["fetch"]), &nowhere));
@@ -6101,6 +6662,7 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
         cwd: Some(&linked),
         env: &env,
         read: &no_follow,
+        read_manifest: &no_follow,
         ..machine
     };
     for (text, placed) in [
@@ -6132,6 +6694,60 @@ fn output_free_verbs_owe_no_ownership_in_every_target_spelling() {
     drop(held);
     drop(permissions);
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn ordinary_update_aliases_keep_manifest_writing_and_unknown_shapes_observed() {
+    let world = World::new();
+    world.build();
+    let before = std::fs::read(world.path()).unwrap();
+    let gate = crate::metadata_io::open_regular(&gate_path(&world.path()).unwrap()).unwrap();
+    let _held = crate::lock::Flock::try_lock(gate).unwrap();
+    for (alias, free) in [
+        ("update --offline", true),
+        ("update --breaking", false),
+        ("update --breaking=true", false),
+        ("update --dry-run --breaking", false),
+        ("update -b", false),
+        ("update -qvb", false),
+        ("update -bn", false),
+        ("update -pb", true),
+        ("update --config resolver.lockfile-path='Cargo.lock'", false),
+        ("!echo update", false),
+        ("unknown update", false),
+        ("build update", false),
+    ] {
+        let env = |name: &str| match name {
+            "CARGO_TARGET_DIR" => Some(world.target.as_os_str().to_owned()),
+            "CARGO_ALIAS_REFRESH" => Some(alias.into()),
+            _ => None,
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&world.owner),
+            env: &env,
+            read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
+            writable: &|_| Some(false),
+        };
+        let args = vec!["refresh".into()];
+        assert_eq!(
+            non_producing_command(&args, super::super::Tool::Targo, &machine),
+            free,
+            "{alias}"
+        );
+        let observed = observe_for_producer(
+            &args,
+            super::super::Tool::Targo,
+            &world.home,
+            &machine,
+            true,
+        );
+        assert_eq!(observed.is_err(), !free, "{alias}: {observed:?}");
+        assert!(observed.is_err() || !observed.unwrap(), "{alias}");
+        assert_eq!(std::fs::read(world.path()).unwrap(), before, "{alias}");
+    }
 }
 
 /// The `*.json` receipts of `home`'s index, by name, with their bytes.
@@ -6192,6 +6808,7 @@ fn a_target_named_through_a_link_to_an_owned_folder_is_that_folder() {
             cwd: Some(&other),
             env: &|_| None,
             read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
             writable: &|_| Some(true),
         };
         let args = build_into(&other, &link);
@@ -6273,6 +6890,7 @@ fn links_to_folders_atpkg_does_not_own_refuse_each_in_its_own_words() {
         cwd: Some(&other),
         env: &|_| None,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(true),
     };
     let folder = |name: &str| {
@@ -6445,6 +7063,7 @@ fn a_link_retargeted_between_observation_and_the_gate_is_refused() {
             cwd: Some(&producer),
             env: &|_| None,
             read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
             writable: &|_| Some(true),
         };
         let link = world.home.join("target");
@@ -6500,6 +7119,7 @@ fn a_link_retargeted_between_observation_and_the_gate_is_refused() {
             cwd: Some(&world.owner),
             env: &|_| None,
             read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
             writable: &|_| Some(true),
         };
         let index = receipts(&world.home);
@@ -6545,6 +7165,7 @@ fn a_link_retargeted_between_observation_and_the_gate_is_refused() {
             cwd: Some(&producer),
             env: &|_| None,
             read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
             writable: &|_| Some(true),
         };
         let links = world.home.join("links");
@@ -6654,6 +7275,7 @@ fn through_clean_front_in(
         cwd: Some(cwd),
         env: &environment,
         read: &super::super::read_config,
+        read_manifest: &super::super::read_manifest,
         writable: &super::super::writable,
     };
     let placement = (!non_producing_command(words, super::super::Tool::Targo, &machine))
@@ -6721,6 +7343,29 @@ fn through_placed_front(
 #[test]
 fn quiet_front_checks_exact_claim_and_owned_descendants_before_starting_the_tool() {
     use std::os::unix::fs::MetadataExt as _;
+    // The first call in a new home must choose the same plan before and after its own
+    // registrar creates the shared parents. No earlier failed call warms this fixture.
+    let cold = World::new();
+    assert!(!cold.home.join("Library").exists());
+    let words = vec!["--unverified".into(), "build".into(), "--jobs=1".into()];
+    let out = through_clean_front(&cold, Path::new("/bin/echo"), &words);
+    assert!(out.status.success(), "{out:?}");
+    assert!(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|line| line.ends_with(&words.join(" ")))
+    );
+    for path in [
+        "Library/Caches",
+        "Library/Caches/aterm",
+        "Library/Caches/aterm/.ubd",
+    ] {
+        assert_eq!(
+            std::fs::metadata(cold.home.join(path)).unwrap().mode() & 0o777,
+            0o700
+        );
+    }
+    assert!(!cold.owner.join("target").exists());
     for shape in [
         "safe",
         "stale",
@@ -6905,6 +7550,278 @@ fn quiet_front_prepares_foreign_manifest_targets_without_claiming_custody() {
                 }
             }
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_manifest_discovery_binds_both_outputs_to_the_actual_owner() {
+    for shape in [
+        "native-only",
+        "native-preferred",
+        "nearest-cargo",
+        "explicit-cargo",
+        "deep-native",
+        "deep-cargo",
+        "preferred-unreadable",
+        "deep-unreadable-cargo",
+        "cargo-directory",
+        "preferred-directory",
+        "preferred-directory-link",
+    ] {
+        let world = World::new();
+        let member = if shape.starts_with("deep-") {
+            let mut member = world.owner.clone();
+            for _ in 0..40 {
+                member.push("nested");
+            }
+            member
+        } else {
+            world.owner.join("member")
+        };
+        std::fs::create_dir_all(&member).unwrap();
+        let native = member.join("Targo.toml");
+        let cargo = member.join("Cargo.toml");
+        let standalone = "[package]\nname='member'\nversion='0.0.0'\nedition='2024'\n[workspace]\n";
+        let mut unreadable = None;
+        let expected = match shape {
+            "cargo-directory" => {
+                std::fs::create_dir(&cargo).unwrap();
+                None
+            }
+            "preferred-directory" | "preferred-directory-link" => {
+                std::fs::write(&cargo, standalone).unwrap();
+                if shape == "preferred-directory-link" {
+                    let directory = world.home.join("manifest-directory");
+                    std::fs::create_dir(&directory).unwrap();
+                    std::os::unix::fs::symlink(directory, &native).unwrap();
+                } else {
+                    std::fs::create_dir(&native).unwrap();
+                }
+                None
+            }
+            "deep-cargo" => Some(&world.owner),
+            "deep-unreadable-cargo" => {
+                unreadable = Some(world.owner.join("Cargo.toml"));
+                None
+            }
+            "nearest-cargo" => {
+                std::fs::write(world.owner.join("Targo.toml"), "[workspace]\n").unwrap();
+                std::fs::write(&cargo, standalone).unwrap();
+                Some(&member)
+            }
+            _ => {
+                std::fs::write(&native, standalone).unwrap();
+                if matches!(shape, "native-preferred" | "explicit-cargo") {
+                    std::fs::write(
+                        world.owner.join("Cargo.toml"),
+                        "[workspace]\nmembers=['member']\nresolver='3'\n",
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        &cargo,
+                        "[package]\nname='compat'\nversion='0.0.0'\nedition='2024'\nworkspace='..'\n",
+                    )
+                    .unwrap();
+                }
+                if shape == "preferred-unreadable" {
+                    std::fs::write(&cargo, standalone).unwrap();
+                    unreadable = Some(native.clone());
+                    None
+                } else if shape == "explicit-cargo" {
+                    unreadable = Some(native.clone());
+                    Some(&world.owner)
+                } else {
+                    Some(&member)
+                }
+            }
+        };
+        if let Some(path) = &unreadable {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let intermediate = world.home.join("intermediate.noindex");
+        let mut words = vec![
+            "--unverified".into(),
+            "build".into(),
+            format!("--target-dir={}", world.target.display()),
+            "--config".into(),
+            format!("build.build-dir='{}'", intermediate.display()),
+        ];
+        if shape == "explicit-cargo" {
+            words.push(format!("--manifest-path={}", cargo.display()));
+        }
+        let out = through_placed_front(
+            &world,
+            &member,
+            Path::new("/bin/echo"),
+            &words,
+            None,
+            "-",
+            None,
+        );
+        if let Some(path) = &unreadable {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        if let Some(owner) = expected {
+            assert!(out.status.success(), "{shape}: {out:?}");
+            let registered = roots(&world.home);
+            assert_eq!(registered.len(), 2, "{shape}");
+            for root in [&world.target, &intermediate] {
+                let receipt = registered
+                    .iter()
+                    .find(|receipt| receipt.root.as_path() == root.as_path())
+                    .unwrap();
+                assert_eq!(receipt.owners, vec![owner.clone()], "{shape}");
+                assert!(!receipt.owners_unknown, "{shape}");
+            }
+        } else {
+            assert_eq!(out.status.code(), Some(75), "{shape}: {out:?}");
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("--target-dir="));
+            assert!(!world.target.exists(), "{shape}");
+            assert!(!intermediate.exists(), "{shape}");
+            assert!(roots(&world.home).is_empty(), "{shape}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn implicit_manifest_errors_refuse_paired_output_custody_before_exec() {
+    for shape in [
+        "readable",
+        "absent",
+        "unreadable",
+        "linked",
+        "directory",
+        "oversized",
+        "invalid-utf8",
+    ] {
+        let world = World::new();
+        std::fs::write(
+            world.owner.join("Cargo.toml"),
+            "[workspace]\nmembers=[]\nexclude=['member']\n",
+        )
+        .unwrap();
+        let member = world.owner.join("member");
+        std::fs::create_dir(&member).unwrap();
+        let manifest = member.join("Cargo.toml");
+        let text = "[package]\nname='member'\nversion='0.0.0'\n[workspace]\n";
+        match shape {
+            "absent" => (),
+            "linked" => {
+                let definition = world.home.join("definition/Cargo.toml");
+                std::fs::create_dir(definition.parent().unwrap()).unwrap();
+                std::fs::write(&definition, text).unwrap();
+                std::os::unix::fs::symlink(definition, &manifest).unwrap();
+            }
+            "directory" => std::fs::create_dir(&manifest).unwrap(),
+            "oversized" => std::fs::write(&manifest, vec![b' '; (1 << 20) + 1]).unwrap(),
+            "invalid-utf8" => std::fs::write(&manifest, [0xff]).unwrap(),
+            _ => std::fs::write(&manifest, text).unwrap(),
+        }
+        if shape == "unreadable" {
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let intermediate = world.home.join("intermediate.noindex");
+        let words = vec![
+            "--unverified".into(),
+            "build".into(),
+            format!("--target-dir={}", world.target.display()),
+            "--config".into(),
+            format!("build.build-dir='{}'", intermediate.display()),
+        ];
+        let out = through_placed_front(
+            &world,
+            &member,
+            Path::new("/bin/echo"),
+            &words,
+            None,
+            "-",
+            None,
+        );
+        if shape == "unreadable" {
+            std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        if matches!(shape, "readable" | "absent") {
+            assert!(out.status.success(), "{shape}: {out:?}");
+            let owner = if shape == "readable" {
+                &member
+            } else {
+                &world.owner
+            };
+            let registered = roots(&world.home);
+            assert_eq!(registered.len(), 2, "{shape}");
+            for root in [&world.target, &intermediate] {
+                let receipt = registered
+                    .iter()
+                    .find(|receipt| receipt.root.as_path() == root.as_path())
+                    .unwrap();
+                assert_eq!(receipt.owners, vec![owner.clone()], "{shape}");
+                assert!(!receipt.owners_unknown, "{shape}");
+            }
+        } else {
+            assert_eq!(out.status.code(), Some(75), "{shape}: {out:?}");
+            assert!(
+                !String::from_utf8_lossy(&out.stdout).contains("--target-dir="),
+                "{shape}: {out:?}"
+            );
+            assert!(!world.target.exists(), "{shape}");
+            assert!(!intermediate.exists(), "{shape}");
+            assert!(roots(&world.home).is_empty(), "{shape}");
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_deep_native_manifest_never_confers_a_parent_workspaces_custody() {
+    let world = World::new();
+    let mut member = world.owner.clone();
+    for _ in 0..40 {
+        member.push("nested");
+    }
+    std::fs::create_dir_all(&member).unwrap();
+    std::fs::write(
+        member.join("Targo.toml"),
+        "[package]\nname='native-member'\nversion='0.0.0'\n[workspace]\n",
+    )
+    .unwrap();
+    let intermediate = world.home.join("intermediate.noindex");
+    let words = vec![
+        "--unverified".into(),
+        "build".into(),
+        format!("--target-dir={}", world.target.display()),
+        "--config".into(),
+        format!("build.build-dir='{}'", intermediate.display()),
+    ];
+    let out = through_placed_front(
+        &world,
+        &member,
+        Path::new("/bin/echo"),
+        &words,
+        None,
+        "-",
+        None,
+    );
+    // Resolving native manifests may admit this member; an unresolved reading must
+    // refuse before exec. Neither may attribute its outputs to the outer Cargo.toml.
+    if out.status.success() {
+        let registered = roots(&world.home);
+        assert_eq!(registered.len(), 2, "{out:?}");
+        for root in [&world.target, &intermediate] {
+            let receipt = registered
+                .iter()
+                .find(|receipt| receipt.root.as_path() == root.as_path())
+                .unwrap();
+            assert_eq!(receipt.owners, vec![member.clone()]);
+            assert!(!receipt.owners_unknown);
+        }
+    } else {
+        assert_eq!(out.status.code(), Some(75), "{out:?}");
+        assert!(!String::from_utf8_lossy(&out.stdout).contains("--target-dir="));
+        assert!(!world.target.exists());
+        assert!(!intermediate.exists());
+        assert!(roots(&world.home).is_empty());
     }
 }
 
@@ -7128,74 +8045,270 @@ fn clean_reaches_the_tool_without_adopting_unknown_or_changing_registered_output
     }
 }
 
+/// The real driver must update lock metadata even while its existing cache's
+/// custody gate is held. Invalid Rust and a failing build script prove that
+/// this operation cannot have obtained success by compiling the fixture.
+#[cfg(target_os = "macos")]
+#[test]
+fn ordinary_update_reaches_the_real_driver_without_building_or_changing_cache_custody() {
+    use std::os::unix::fs::MetadataExt as _;
+    for shape in ["fresh", "unregistered", "registered"] {
+        let world = World::new();
+        std::fs::write(
+            world.owner.join("Cargo.toml"),
+            "[package]\nname='update-fixture'\nversion='0.0.0'\nedition='2024'\n\
+             [workspace]\nmembers=['dep']\nresolver='3'\n\
+             [dependencies]\nupdate-fixture-dependency={path='dep',version='*'}\n",
+        )
+        .unwrap();
+        let dep = world.owner.join("dep");
+        let root_manifest = std::fs::read(world.owner.join("Cargo.toml")).unwrap();
+        std::fs::create_dir_all(dep.join("src")).unwrap();
+        std::fs::create_dir(world.owner.join("src")).unwrap();
+        std::fs::write(world.owner.join("src/lib.rs"), "this is invalid Rust\n").unwrap();
+        std::fs::write(
+            world.owner.join("build.rs"),
+            "compile_error!(\"update must not compile\");\n",
+        )
+        .unwrap();
+        std::fs::write(dep.join("src/lib.rs"), "this is also invalid Rust\n").unwrap();
+        let manifest = |version: &str| {
+            format!(
+                "[package]\nname='update-fixture-dependency'\nversion='{version}'\nedition='2024'\n"
+            )
+        };
+        std::fs::write(dep.join("Cargo.toml"), manifest("0.1.0")).unwrap();
+        if shape == "registered" {
+            world.build();
+        } else if shape == "unregistered" {
+            std::fs::create_dir(&world.target).unwrap();
+            std::fs::write(world.target.join("keep"), b"unregistered output").unwrap();
+        }
+        let snapshot = |path: &Path| match std::fs::symlink_metadata(path) {
+            Ok(m) => Some((
+                std::fs::read(path).unwrap(),
+                m.dev(),
+                m.ino(),
+                m.mode(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => panic!("snapshot {}: {error}", path.display()),
+        };
+        let receipt = snapshot(&world.path());
+        let marker = snapshot(&world.target.join(MARKER));
+        let cache_tag = snapshot(&world.target.join("CACHEDIR.TAG"));
+        let reusable = snapshot(&world.target.join("debug/deps/keep"));
+        let unregistered = snapshot(&world.target.join("keep"));
+        let held = (shape == "registered").then(|| {
+            let gate =
+                crate::metadata_io::open_regular(&gate_path(&world.path()).unwrap()).unwrap();
+            crate::lock::Flock::try_lock(gate).unwrap()
+        });
+        // Cargo supplies the actual Trust driver used to compile this image.
+        let driver = Path::new(env!("CARGO"));
+        let manifest_path = world.owner.join("Cargo.toml").display().to_string();
+        let generate = vec![
+            "generate-lockfile".into(),
+            "--offline".into(),
+            "--manifest-path".into(),
+            manifest_path.clone(),
+        ];
+        let out =
+            through_clean_front_in(&world, &world.owner, driver, &generate, Some(&world.target));
+        assert!(
+            out.status.success(),
+            "{shape}: initial lock generation: {out:?}"
+        );
+        let lock = world.owner.join("Cargo.lock");
+        let mut expected: aterm_toml::Value =
+            aterm_toml::from_str(&std::fs::read_to_string(&lock).unwrap()).unwrap();
+        let table = expected.as_table_mut().unwrap();
+        let aterm_toml::Value::Array(mut packages) = table.remove("package").unwrap() else {
+            panic!("the actual lock has a package array")
+        };
+        let mut selected = 0;
+        for package in &mut packages {
+            if package["name"].as_str() == Some("update-fixture-dependency") {
+                assert_eq!(package["version"].as_str(), Some("0.1.0"));
+                package
+                    .as_table_mut()
+                    .unwrap()
+                    .insert("version".into(), aterm_toml::Value::String("0.2.0".into()));
+                selected += 1;
+            }
+        }
+        assert_eq!(selected, 1);
+        table.insert("package".into(), aterm_toml::Value::Array(packages));
+        std::fs::write(dep.join("Cargo.toml"), manifest("0.2.0")).unwrap();
+        let update = vec![
+            "update".into(),
+            "--offline".into(),
+            "--manifest-path".into(),
+            manifest_path,
+            "-p".into(),
+            "update-fixture-dependency".into(),
+        ];
+        let out =
+            through_clean_front_in(&world, &world.owner, driver, &update, Some(&world.target));
+        assert!(out.status.success(), "{shape}: actual lock update: {out:?}");
+        let actual: aterm_toml::Value =
+            aterm_toml::from_str(&std::fs::read_to_string(&lock).unwrap()).unwrap();
+        assert_eq!(
+            actual, expected,
+            "{shape}: only the dependency lock version changes"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dep.join("Cargo.toml")).unwrap(),
+            manifest("0.2.0")
+        );
+        assert_eq!(
+            std::fs::read(world.owner.join("Cargo.toml")).unwrap(),
+            root_manifest,
+            "{shape}: root manifest unchanged"
+        );
+        assert_eq!(snapshot(&world.path()), receipt, "{shape}: custody record");
+        assert_eq!(
+            snapshot(&world.target.join(MARKER)),
+            marker,
+            "{shape}: owner marker"
+        );
+        assert_eq!(
+            snapshot(&world.target.join("CACHEDIR.TAG")),
+            cache_tag,
+            "{shape}: cache tag"
+        );
+        assert_eq!(
+            snapshot(&world.target.join("debug/deps/keep")),
+            reusable,
+            "{shape}: reusable output"
+        );
+        assert_eq!(
+            snapshot(&world.target.join("keep")),
+            unregistered,
+            "{shape}: unregistered output"
+        );
+        assert_eq!(roots(&world.home).len(), usize::from(shape == "registered"));
+        if shape == "fresh" {
+            assert!(!world.target.exists(), "no build directory created");
+        }
+        drop(held);
+    }
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 fn a_real_compiler_writes_both_configured_outputs_under_recorded_custody() {
-    let world = World::new();
-    std::fs::write(
+    for source in ["cli", "discovered", "nested", "legacy"] {
+        let world = World::new();
+        std::fs::write(
         world.owner.join("Cargo.toml"),
         "[package]\nname='configured-output-probe'\nversion='0.0.0'\nedition='2024'\n[workspace]\n",
     )
     .unwrap();
-    std::fs::create_dir(world.owner.join("src")).unwrap();
-    std::fs::write(
-        world.owner.join("src/lib.rs"),
-        "pub fn value() -> usize { 42 }\n",
-    )
-    .unwrap();
-    let intermediates = world.home.join("intermediates.noindex");
-    let args = vec![
-        "--unverified".into(),
-        "build".into(),
-        "--offline".into(),
-        "-j1".into(),
-        "--target-dir".into(),
-        world.target.display().to_string(),
-        "--config".into(),
-        format!("build.build-dir='{}'", intermediates.display()),
-    ];
-    let out = through_clean_front(&world, Path::new(env!("CARGO")), &args);
-    assert!(out.status.success(), "real configured build: {out:?}");
-    assert!(
-        world
-            .target
-            .join("debug/libconfigured_output_probe.rlib")
-            .is_file()
-    );
-    // The driver may use legacy deps/ or per-unit build directories. Inspect actual
-    // compiler output without binding this custody test to either disposable layout.
-    let mut pending = vec![intermediates.clone()];
-    let mut visited = 0;
-    let mut compiled = false;
-    while let Some(dir) = pending.pop() {
-        visited += 1;
-        assert!(visited < 128, "the dependency-free fixture stays bounded");
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let entry = entry.unwrap();
-            if entry.file_type().unwrap().is_dir() {
-                pending.push(entry.path());
-            } else if entry.file_name().to_str().is_some_and(|name| {
-                name.starts_with("libconfigured_output_probe")
-                    && (name.ends_with(".rmeta") || name.ends_with(".rlib"))
-            }) {
-                compiled = true;
+        std::fs::create_dir(world.owner.join("src")).unwrap();
+        std::fs::write(
+            world.owner.join("src/lib.rs"),
+            "pub fn value() -> usize { 42 }\n",
+        )
+        .unwrap();
+        let intermediates = match source {
+            "cli" => world.home.join("intermediates.noindex"),
+            "nested" => world.owner.join(".cargo/intermediates.noindex"),
+            _ => world.owner.join("intermediates.noindex"),
+        };
+        let mut args = vec![
+            "--unverified".into(),
+            "build".into(),
+            "--offline".into(),
+            "-j1".into(),
+        ];
+        if source == "cli" {
+            args.extend([
+                "--target-dir".into(),
+                world.target.display().to_string(),
+                "--config".into(),
+                format!("build.build-dir='{}'", intermediates.display()),
+            ]);
+        } else {
+            let config = world.owner.join(".cargo");
+            let leaf = if source == "nested" {
+                "layers/layout.toml"
+            } else {
+                "layout.toml"
+            };
+            std::fs::create_dir_all(config.join(leaf).parent().unwrap()).unwrap();
+            let root = if source == "legacy" {
+                "config"
+            } else {
+                "config.toml"
+            };
+            std::fs::write(config.join(root), format!("include=['{leaf}']")).unwrap();
+            std::fs::write(
+                config.join(leaf),
+                format!(
+                    "build.target-dir='{}'\nbuild.build-dir='intermediates.noindex'",
+                    world.target.display()
+                ),
+            )
+            .unwrap();
+            if source == "legacy" {
+                std::fs::write(
+                    config.join("config.toml"),
+                    "build.build-dir='ignored-build'",
+                )
+                .unwrap();
             }
         }
-    }
-    assert!(
-        compiled,
-        "the compiler wrote intermediates in the selected root: {out:?}"
-    );
-    let recorded = roots(&world.home);
-    assert_eq!(recorded.len(), 2);
-    for output in [&world.target, &intermediates] {
-        let entry = recorded.iter().find(|entry| entry.root == *output).unwrap();
-        let receipt = super::read(&entry.receipt_path).unwrap();
-        assert_eq!(
-            receipt.owners.as_slice(),
-            std::slice::from_ref(&world.owner)
+        let out = through_clean_front(&world, Path::new(env!("CARGO")), &args);
+        assert!(
+            out.status.success(),
+            "real {source} configured build: {out:?}"
         );
-        assert!(!receipt.owners_unknown && same(&world.home, &receipt));
+        assert!(
+            world
+                .target
+                .join("debug/libconfigured_output_probe.rlib")
+                .is_file()
+        );
+        // The driver may use legacy deps/ or per-unit build directories. Inspect actual
+        // compiler output without binding this custody test to either disposable layout.
+        let mut pending = vec![intermediates.clone()];
+        let mut visited = 0;
+        let mut compiled = false;
+        while let Some(dir) = pending.pop() {
+            visited += 1;
+            assert!(visited < 128, "the dependency-free fixture stays bounded");
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    pending.push(entry.path());
+                } else if entry.file_name().to_str().is_some_and(|name| {
+                    name.starts_with("libconfigured_output_probe")
+                        && (name.ends_with(".rmeta") || name.ends_with(".rlib"))
+                }) {
+                    compiled = true;
+                }
+            }
+        }
+        assert!(
+            compiled,
+            "the compiler wrote intermediates in the selected root: {out:?}"
+        );
+        let recorded = roots(&world.home);
+        assert_eq!(recorded.len(), 2);
+        for output in [&world.target, &intermediates] {
+            let entry = recorded.iter().find(|entry| entry.root == *output).unwrap();
+            let receipt = super::read(&entry.receipt_path).unwrap();
+            assert_eq!(
+                receipt.owners.as_slice(),
+                std::slice::from_ref(&world.owner)
+            );
+            assert!(!receipt.owners_unknown && same(&world.home, &receipt));
+        }
     }
 }
 
@@ -7373,6 +8486,7 @@ fn unknown_invocations_suppress_retirement_but_never_claim_fresh_targets() {
         cwd: Some(&world.owner),
         env: &env,
         read: &|_| Ok(None),
+        read_manifest: &|_| Ok(None),
         writable: &|_| Some(true),
     };
     let args = ["--unverified".into(), "an-unknown-alias".into()];
@@ -7415,6 +8529,7 @@ fn configured_targets_preserve_an_unobserved_shared_owner() {
         cwd: Some(&owner),
         env: &|_| None,
         read: &read_config,
+        read_manifest: &read_config,
         writable: &|_| Some(true),
     };
     observe_on(
@@ -7581,6 +8696,231 @@ fn the_front_reads_the_call_as_typed() {
     assert_eq!(typed_call(&own, "both"), None);
 }
 
+fn retain_cold_inputs_on_failure(test: impl FnOnce(&World)) {
+    let world = World::new();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| test(&world)));
+    if let Err(failure) = result {
+        eprintln!(
+            "cold placement failure inputs: {}",
+            world._directory.keep().display()
+        );
+        std::panic::resume_unwind(failure);
+    }
+}
+
+#[test]
+fn cold_home_keeps_the_selected_cache_and_rechecks_configuration() {
+    for shim in [false, true] {
+        for changed_config in [false, true] {
+            retain_cold_inputs_on_failure(|world| {
+                let args = vec!["--unverified".into(), "build".into()];
+                let config = world.owner.join(".cargo/config.toml");
+                let inserted = std::cell::Cell::new(false);
+                let read = |path: &Path| {
+                    if changed_config
+                        && world.home.join("Library/Caches/aterm/.ubd").is_dir()
+                        && !inserted.replace(true)
+                    {
+                        std::fs::create_dir(world.owner.join(".cargo")).unwrap();
+                        std::fs::write(&config, "[build]\nbuild-dir = 'changed-output'\n").unwrap();
+                    }
+                    super::super::read_config(path)
+                };
+                let machine = super::super::Machine {
+                    home: Some(&world.home),
+                    root: None,
+                    cwd: Some(&world.owner),
+                    env: &|_| None,
+                    read: &read,
+                    read_manifest: &super::super::read_manifest,
+                    writable: &super::super::writable,
+                };
+                assert!(!world.home.join("Library").exists());
+                let (selected, placed) =
+                    super::super::placed_build_dir(&args, super::super::Tool::Targo, &machine)
+                        .unwrap();
+                // Current placement walks actual existing writable ancestors;
+                // a cold private HOME can already support this shared cache.
+                assert!(matches!(selected, super::super::BuildDir::Cache(_)));
+                let result = if shim {
+                    observe_shim_on(
+                        &placed,
+                        super::super::Tool::Targo,
+                        "config",
+                        &world.home,
+                        &machine,
+                        true,
+                    )
+                    .map(|_| ())
+                } else {
+                    observe_placed_command_with(&args, &placed, super::super::Tool::Targo, &machine)
+                };
+                assert!(world.home.join("Library/Caches/aterm/.ubd").is_dir());
+                if changed_config {
+                    assert!(inserted.get());
+                    assert!(
+                        result.is_err(),
+                        "a new configured build directory must invalidate placement; no build started"
+                    );
+                } else {
+                    result.unwrap();
+                    assert!(
+                        !world.owner.join("target").exists(),
+                        "cold cache placement must not become a local fallback"
+                    );
+                    assert_eq!(
+                        super::super::decide(&args, super::super::Tool::Targo, &machine),
+                        Some(selected)
+                    );
+                }
+            });
+        }
+    }
+}
+
+#[test]
+fn cold_trust_shim_keeps_its_local_placement_and_rechecks_configured_targets() {
+    for changed_config in [false, true] {
+        retain_cold_inputs_on_failure(|world| {
+            let args = vec!["trust".into(), "check".into()];
+            let config = world.owner.join(".cargo/config.toml");
+            let inserted = std::cell::Cell::new(false);
+            let read = |path: &Path| {
+                if changed_config
+                    && world.home.join("Library/Caches/aterm/.ubd").is_dir()
+                    && !inserted.replace(true)
+                {
+                    std::fs::create_dir(world.owner.join(".cargo")).unwrap();
+                    std::fs::write(&config, "[build]\ntarget-dir = 'changed-output'\n").unwrap();
+                }
+                super::super::read_config(path)
+            };
+            let original = super::super::Machine {
+                home: Some(&world.home),
+                root: None,
+                cwd: Some(&world.owner),
+                env: &|_| None,
+                read: &read,
+                read_manifest: &super::super::read_manifest,
+                writable: &super::super::writable,
+            };
+            assert!(!world.home.join("Library").exists());
+            let selected =
+                super::super::decide(&args, super::super::Tool::Targo, &original).unwrap();
+            let super::super::BuildDir::TrustEnv(directory) = &selected else {
+                panic!("the actual trust lane must select its local environment placement");
+            };
+            let environment = |name: &str| {
+                (name == super::super::BUILD_DIR_ENV).then(|| std::ffi::OsString::from(directory))
+            };
+            let machine = super::super::Machine {
+                env: &environment,
+                ..original
+            };
+            let result = observe_shim_on(
+                &args,
+                super::super::Tool::Targo,
+                "env",
+                &world.home,
+                &machine,
+                true,
+            );
+            assert!(world.home.join("Library/Caches/aterm/.ubd").is_dir());
+            if changed_config {
+                assert!(inserted.get());
+                assert!(
+                    result.is_err(),
+                    "a changed target configuration must refuse before any build starts"
+                );
+            } else {
+                result.unwrap();
+                let records = roots(&world.home);
+                assert_eq!(records.len(), 1);
+                assert_eq!(records[0].root, world.owner.join("target"));
+                assert!(super::super::target_build_path(&records[0].root).is_dir());
+                assert_eq!(
+                    super::super::decide(&args, super::super::Tool::Targo, &original),
+                    Some(selected)
+                );
+            }
+        });
+    }
+}
+
+/// The workspace fallback a call was placed in is the directory admission judges, though
+/// admission itself makes the shared cache's parents in a home that had no `Library/Caches`.
+/// The probe answers only for folders standing under `Library/Caches` (one that cannot read the
+/// home itself): before admission it answers nothing, so the cache is not writable and the call
+/// takes `{workspace-root}/target`; after `lay_shared` it answers the cache writable, and a fresh
+/// decision would name the cache instead. The negative control keeps the guard against a plan
+/// that really changed: a config that names a target during admission, which no admission
+/// writes, is refused by the final check, which a held writability answer does not blind.
+#[test]
+fn a_cold_home_fallback_is_judged_by_the_directory_it_was_placed_in() {
+    for changed in [false, true] {
+        let world = World::new();
+        let caches = world.home.join("Library/Caches");
+        assert!(!world.home.join("Library").exists());
+        let writable = |path: &Path| (path.starts_with(&caches) && path.is_dir()).then_some(true);
+        let config = world.owner.join(".cargo/config.toml");
+        let read = |path: &Path| {
+            // Change during admission, after its own cache-parent creation.
+            // Before that point the exact initially selected plan still holds.
+            Ok((changed && path == config && caches.is_dir()).then(|| {
+                format!(
+                    "[build]\ntarget-dir = '{}'\n",
+                    world.home.join("configured.noindex").display()
+                )
+            }))
+        };
+        let machine = super::super::Machine {
+            home: Some(&world.home),
+            root: None,
+            cwd: Some(&world.owner),
+            env: &|_| None,
+            read: &|_| Ok(None),
+            read_manifest: &super::super::read_manifest,
+            writable: &writable,
+        };
+        let args: Vec<String> = vec!["--unverified".into(), "build".into()];
+        let tool = super::super::Tool::Targo;
+        let (selected, _) = super::super::placed_build_dir(&args, tool, &machine).unwrap();
+        let fallback = super::super::target_build_path(Path::new("{workspace-root}/target"));
+        assert_eq!(
+            selected,
+            super::super::BuildDir::Target(format!("build.build-dir='{}'", fallback.display()))
+        );
+        let during = super::super::Machine {
+            read: &read,
+            ..machine
+        };
+        let result = observe_selected_placement(&args, tool, &world.home, &during, &selected, true);
+        assert!(
+            world.home.join(INDEX).parent().unwrap().is_dir(),
+            "{changed}: admission laid the shared cache's parents"
+        );
+        assert!(matches!(
+            super::super::decide(&args, tool, &machine),
+            Some(super::super::BuildDir::Cache(_))
+        ));
+        if changed {
+            let error = result.unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{error}");
+            assert!(
+                error.to_string().contains("changed during admission"),
+                "{error}"
+            );
+            assert!(
+                !super::super::target_build_path(&world.owner.join("target")).exists(),
+                "a refused admission wrote no build directory"
+            );
+        } else {
+            result.unwrap();
+            assert!(super::super::target_build_path(&world.owner.join("target")).is_dir());
+        }
+    }
+}
+
 #[test]
 fn quiet_claim_recomputation_requires_the_matching_environment_and_resolvable_machine() {
     for tool in [super::super::Tool::Targo, super::super::Tool::Tippy] {
@@ -7606,6 +8946,7 @@ fn quiet_claim_recomputation_requires_the_matching_environment_and_resolvable_ma
                     cwd: Some(&world.owner),
                     env: &|_| None,
                     read: &super::super::read_config,
+                    read_manifest: &super::super::read_manifest,
                     writable: &|_| Some(true),
                 };
                 let (placed, handed) = if lane == "trust" {
@@ -8112,6 +9453,7 @@ fn a_link_to_a_cache_recorded_on_a_renumbered_volume_says_so() {
             cwd: Some(&other),
             env: &|_| None,
             read: &|_| Ok(None),
+            read_manifest: &|_| Ok(None),
             writable: &|_| Some(true),
         };
         let index = receipts(&world.home);
@@ -8127,6 +9469,183 @@ fn a_link_to_a_cache_recorded_on_a_renumbered_volume_says_so() {
             assert_eq!(receipts(&world.home), index);
         } else {
             assert_eq!(observed, Observation::Owned);
+        }
+    }
+}
+
+#[test]
+fn compatibility_and_proof_manifest_readings_require_canonical_owner_agreement() {
+    use super::super::{Machine, Tool};
+    for agree in [false, true] {
+        for tool in [Tool::CargoCompat, Tool::Cargo, Tool::Targo] {
+            let world = World::new();
+            let member = world.owner.join("member");
+            std::fs::create_dir(&member).unwrap();
+            let standalone = "[package]\nname='member'\nversion='0.0.0'\n[workspace]\n";
+            std::fs::write(member.join("Targo.toml"), standalone).unwrap();
+            std::fs::write(
+                world.owner.join("Cargo.toml"),
+                "[workspace]\nmembers=['member']\n",
+            )
+            .unwrap();
+            std::fs::write(
+                member.join("Cargo.toml"),
+                if agree {
+                    standalone
+                } else {
+                    "[package]\nname='member'\nversion='0.0.0'\nworkspace='..'\n"
+                },
+            )
+            .unwrap();
+            let intermediate = world.home.join("intermediate.noindex");
+            let mut args = vec![
+                "build".into(),
+                format!("--target-dir={}", world.target.display()),
+            ];
+            if tool == Tool::Targo {
+                args.splice(0..1, ["trust".into(), "check".into()]);
+            }
+            if tool == Tool::CargoCompat {
+                args.extend([
+                    "--config".into(),
+                    format!("build.build-dir='{}'", intermediate.display()),
+                ]);
+            }
+            let machine = Machine {
+                home: Some(&world.home),
+                root: None,
+                cwd: Some(&member),
+                env: &|_| None,
+                read: &super::super::read_config,
+                read_manifest: &super::super::read_manifest,
+                writable: &|_| Some(true),
+            };
+            let result = observe_for_producer(&args, tool, &world.home, &machine, true);
+            if !agree && tool != Tool::Cargo {
+                assert!(result.is_err());
+                assert!(!world.target.exists());
+                assert!(!intermediate.exists());
+                assert!(roots(&world.home).is_empty());
+            } else {
+                assert!(result.unwrap(), "{tool:?}, agree={agree}");
+                let receipts = roots(&world.home);
+                assert_eq!(
+                    receipts.len(),
+                    if tool == Tool::CargoCompat { 2 } else { 1 }
+                );
+                let owner = if agree { &member } else { &world.owner };
+                let outputs = if tool == Tool::CargoCompat {
+                    vec![&world.target, &intermediate]
+                } else {
+                    vec![&world.target]
+                };
+                for root in outputs {
+                    let receipt = receipts
+                        .iter()
+                        .find(|receipt| receipt.root.as_path() == root.as_path())
+                        .unwrap();
+                    assert_eq!(receipt.owners, vec![owner.clone()]);
+                    assert!(!receipt.owners_unknown);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_foreign_manifest_keeps_pass_through_beside_a_managed_cargo_ancestor() {
+    let world = World::new();
+    let member = world.owner.join("member");
+    let foreign = world.home.parent().unwrap().join("foreign.toml");
+    std::fs::create_dir(&member).unwrap();
+    std::fs::write(
+        &foreign,
+        "[package]\nname='foreign'\nversion='0.0.0'\n[workspace]\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(&foreign, member.join("Targo.toml")).unwrap();
+    let args = vec![
+        "--unverified".into(),
+        "build".into(),
+        format!("--target-dir={}", world.target.display()),
+    ];
+    let machine = super::super::Machine {
+        home: Some(&world.home),
+        root: None,
+        cwd: Some(&member),
+        env: &|_| None,
+        read: &super::super::read_config,
+        read_manifest: &super::super::read_manifest,
+        writable: &|_| Some(true),
+    };
+    assert!(!requires_managed_explicit(
+        &args,
+        super::super::Tool::Targo,
+        &world.home,
+        &machine
+    ));
+    assert!(
+        !observe_for_producer(
+            &args,
+            super::super::Tool::Targo,
+            &world.home,
+            &machine,
+            true
+        )
+        .unwrap()
+    );
+    assert!(!world.target.exists());
+    assert!(roots(&world.home).is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_manifest_cannot_acquire_a_cargo_workspace_membership_by_directory() {
+    for pointer in [false, true] {
+        for cargo_member in [false, true] {
+            let world = World::new();
+            let member = world.owner.join("member");
+            std::fs::create_dir(&member).unwrap();
+            std::fs::write(
+                world.owner.join("Cargo.toml"),
+                "[workspace]\nmembers=['member']\nresolver='3'\n",
+            )
+            .unwrap();
+            let mut package =
+                "[package]\nname='member'\nversion='0.0.0'\nedition='2024'\n".to_owned();
+            if pointer {
+                package.push_str("workspace='..'\n");
+            }
+            std::fs::write(member.join("Targo.toml"), &package).unwrap();
+            if cargo_member {
+                std::fs::write(member.join("Cargo.toml"), &package).unwrap();
+            }
+            let intermediate = world.home.join("intermediate.noindex");
+            let args = vec![
+                "--unverified".into(),
+                "build".into(),
+                format!("--target-dir={}", world.target.display()),
+                "--config".into(),
+                format!("build.build-dir='{}'", intermediate.display()),
+            ];
+            let out = through_placed_front(
+                &world,
+                &member,
+                Path::new("/bin/echo"),
+                &args,
+                None,
+                "-",
+                None,
+            );
+            assert_eq!(
+                out.status.code(),
+                Some(75),
+                "pointer={pointer}, cargo_member={cargo_member}: {out:?}"
+            );
+            assert!(!String::from_utf8_lossy(&out.stdout).contains("--target-dir="));
+            assert!(!world.target.exists());
+            assert!(!intermediate.exists());
+            assert!(roots(&world.home).is_empty());
         }
     }
 }

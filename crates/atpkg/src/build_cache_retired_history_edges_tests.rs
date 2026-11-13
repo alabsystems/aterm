@@ -304,9 +304,13 @@ fn a_canonical_orig_head_alone_does_not_retain_private_history() {
     assert_eq!(read(&m.sub, &["cat-file", "-t", &blob]), "blob");
 }
 
+/// A pseudoref (`FETCH_HEAD`, `MERGE_HEAD`) or a root ref (`ORIG_HEAD`; `AUTO_MERGE`, one git
+/// names outside the `_HEAD` pattern) alone keeps the private history it names, whether git
+/// lists root refs itself (`for-each-ref --include-root-refs`) or the store's own files name
+/// them (a git without that option).
 #[test]
-fn private_fetch_and_merge_heads_keep_otherwise_unreferenced_history() {
-    for name in ["FETCH_HEAD", "MERGE_HEAD"] {
+fn private_pseudo_and_root_refs_keep_otherwise_unreferenced_history() {
+    for name in ["FETCH_HEAD", "MERGE_HEAD", "ORIG_HEAD", "AUTO_MERGE"] {
         let g = gate();
         let m = module(&g);
         let refs_before = read(

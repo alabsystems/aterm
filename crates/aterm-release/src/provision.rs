@@ -9,6 +9,8 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
+use aterm_secrets::need::{GhProfile, Purpose, Want};
+#[cfg(unix)]
 use aterm_uds::spawnfd::command;
 #[cfg(unix)]
 use aterm_update_core::pins;
@@ -489,7 +491,7 @@ pub fn run_provision(
     phase(5, "credentials", "the tokens and profile a cut is handed");
     record(
         "channel",
-        channel_token_check(&slug, !check_only),
+        channel_token_check(!check_only, !check_only),
         &mut checks,
     );
 
@@ -1150,7 +1152,7 @@ enum Check {
         what: String,
         next: String,
     },
-    /// A gap only the owner can close.
+    /// A gap only the owner can close: Apple's developer agreement, never a credential.
     Owner {
         what: String,
         fix: String,
@@ -1664,9 +1666,6 @@ fn gaps(fails: usize, waiting: usize) -> String {
     parts.join(", ")
 }
 
-/// `crate::apple::APPLE_LABEL`.
-const APPLE_LABEL: &str = "apple id";
-
 /// One provisioning finding, as `ship release` reads it ([`audit`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Audited {
@@ -1704,12 +1703,12 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
     if id.is_empty() {
         found.push((
             "roster",
-            Check::Owner {
+            Check::Fail {
                 what: "this machine names no roster id (no ~/.aterm/release-ring/machine.toml, \
                        no machine_id in its credentials profile) — the cut signs only as a \
                        rostered machine"
                     .into(),
-                fix: format!("{SHIP} provision --id <its roster id> (docs/RELEASE-KEYS.md)"),
+                fix: RELEASE_MACHINE.into(),
             },
         ));
     }
@@ -1731,10 +1730,7 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
         .map_err(|e| Error::new(format!("read {}/Cargo.toml: {e}", repo.display())))
         .and_then(|manifest| channel::update_channel_slug(&manifest))
         .and_then(|slug| slug.ok_or_else(|| Error::new("no update channel is committed")));
-    match &slug {
-        Ok(slug) => found.push(("channel", channel_token_check(slug, false))),
-        Err(e) => found.push(("channel", Check::CouldNotRun(e.to_string()))),
-    }
+    found.push(("channel", channel_token_check(false, !dry)));
     let resolved = sign::ReleaseCredentials::resolve(profile, repo)
         .ok()
         .flatten();
@@ -1785,9 +1781,9 @@ pub fn audit(repo: &Path, id: &str, profile: Option<&Path>, dry: bool) -> Vec<Fi
                 "authorize_cut passes: '{}' signs under roster seq {}",
                 a.machine_id, a.roster_seq
             )),
-            Err(e) => Check::Owner {
+            Err(e) => Check::Fail {
                 what: e.to_string(),
-                fix: format!("{SHIP} provision --id {id}"),
+                fix: RELEASE_MACHINE.into(),
             },
         },
     ));
@@ -1849,8 +1845,9 @@ pub fn audit(
     }]
 }
 
-/// Convert [`Check`] to [`Audited`] by its cause: an owner gap or a [`Check::Todo`] is the
-/// owner's, a [`Check::Fail`] the machine's, an unanswered check [`Audited::CouldNotRun`].
+/// Convert [`Check`] to [`Audited`] by its cause: only a [`Check::Owner`] gap is the owner's
+/// (no credential is one: a missing credential is filed with the lab and fails the step), any
+/// other gap the machine's, an unanswered check [`Audited::CouldNotRun`].
 #[cfg(unix)]
 fn audited(check: Check) -> Audited {
     match check {
@@ -1868,7 +1865,7 @@ fn audited(check: Check) -> Audited {
         Check::Todo { what, next } => Audited::Gap {
             what,
             fix: next,
-            owner: true,
+            owner: false,
         },
         Check::Skip(why) => Audited::Gap {
             what: format!("impossible here — {why}"),
@@ -1888,52 +1885,33 @@ pub struct AskWords {
     pub step: String,
 }
 
-/// Where the release channel's token lives.
-pub const CHANNEL_TOKEN_HOME: &str = "~/.secrets/gh_access_token_alabsystems";
+/// What a release gap this Mac cannot close says: a release is the release machine's to cut.
+#[cfg(unix)]
+const RELEASE_MACHINE: &str = "the release machine cuts releases; `targo --unverified ship \
+                               provision --id <its roster id>` rosters this Mac \
+                               (docs/RELEASE-KEYS.md)";
 
-/// [`AskWords`] for the gap labelled `label` whose words are `what`.
+/// The notice key a gap labelled `label` is asked, withdrawn or resolved under.
 #[must_use]
-pub fn ask_words(label: &str, what: &str) -> AskWords {
+pub fn ask_key(label: &str) -> String {
+    format!("release.{}", label.replace(' ', "-"))
+}
+
+/// The audit label of the one gap a person closes: the notary row's 403.
+pub const AGREEMENT_LABEL: &str = "notary";
+
+/// [`AskWords`] for Apple's developer agreement, the notary row's 403 and the one owner gap:
+/// a person's act at Apple, not a credential.
+#[must_use]
+pub fn agreement_ask() -> AskWords {
     let team = aterm_update_core::pins::APPLE_TEAM_ID;
-    let (key, title, reason, step) = match label {
-        "notary" if what.contains("agreement") => (
-            "notary",
-            "Apple agreement blocks the release".to_string(),
-            format!(
-                "Apple's developer agreement for team {team} lapsed, so notarization answers 403"
-            ),
-            "Accept the current agreements at developer.apple.com/account".to_string(),
-        ),
-        "notary" => (
-            "notary",
-            "Notary login blocks the release".to_string(),
-            "Apple refuses the notary credential this Mac stores".to_string(),
-            "Store a new app-specific password with xcrun notarytool store-credentials".to_string(),
-        ),
-        APPLE_LABEL => (
-            "apple-id",
-            "Signing certificate blocks the release".to_string(),
-            "this Mac holds no Developer ID certificate that signs".to_string(),
-            "Finish the certificate errand ship provision starts on this Mac".to_string(),
-        ),
-        "channel" => (
-            "channel",
-            "Channel token blocks the release".to_string(),
-            "only the owner mints the release channel's token, and this Mac holds none".to_string(),
-            format!("Save a new fine-grained channel token to {CHANNEL_TOKEN_HOME}"),
-        ),
-        _ => (
-            "key",
-            "Release key blocks the release".to_string(),
-            "this Mac's release key is not authorized to sign a release".to_string(),
-            "Run targo --unverified ship provision --id <machine-id> on this Mac".to_string(),
-        ),
-    };
     AskWords {
-        key: format!("release.{key}"),
-        title,
-        reason,
-        step,
+        key: ask_key(AGREEMENT_LABEL),
+        title: "Apple agreement blocks the release".to_string(),
+        reason: format!(
+            "Apple's developer agreement for team {team} lapsed, so notarization answers 403"
+        ),
+        step: "Accept the current agreements at developer.apple.com/account".to_string(),
     }
 }
 
@@ -1970,9 +1948,10 @@ fn phase(n: usize, name: &str, what: &str) {
 fn notary_acquire(may_change: bool) -> Check {
     let result = notary_acquire_with(may_change, notary_probe, crate::apple::ensure_notary);
     if may_change {
-        report_notary_need(result.need);
+        report_notary_need(result)
+    } else {
+        result.check
     }
-    result.check
 }
 
 #[cfg(unix)]
@@ -2023,42 +2002,65 @@ struct NotaryProbe {
 fn notary_check_recording(record: bool) -> Check {
     let result = notary_probe();
     if record {
-        report_notary_need(result.need);
-    }
-    result.check
-}
-
-#[cfg(unix)]
-fn report_notary_need(action: NotaryNeed) {
-    if action == NotaryNeed::Unchanged {
-        return;
-    }
-    let result =
-        aterm_secrets::client::Paths::live().and_then(|paths| settle_notary_need(&paths, action));
-    match result {
-        Ok(Some(line)) => step("notary need", &line),
-        Ok(None) => {}
-        Err(error) => step(
-            "notary need",
-            &format!("could not record the request: {error}"),
-        ),
+        report_notary_need(result)
+    } else {
+        result.check
     }
 }
 
+/// Move the notary need as `result` says; a raised need is the check's fix: filed, not asked.
 #[cfg(unix)]
-fn settle_notary_need(
-    paths: &aterm_secrets::client::Paths,
-    action: NotaryNeed,
-) -> aterm_secrets::Result<Option<String>> {
-    use aterm_secrets::need::{self, Purpose, Want};
-    match action {
-        NotaryNeed::Unchanged => Ok(None),
-        NotaryNeed::Raise => {
-            need::raise(paths, Want::Notary, Purpose::ReleaseNotary).map(|need| Some(need.line))
+fn report_notary_need(result: NotaryProbe) -> Check {
+    let paths = aterm_secrets::client::Paths::live();
+    match result.need {
+        NotaryNeed::Unchanged => result.check,
+        NotaryNeed::Raise => filed(result.check, paths, Want::Notary, Purpose::ReleaseNotary),
+        NotaryNeed::Satisfied => {
+            match paths.and_then(|paths| close_notary_need(&paths)) {
+                Ok(Some(line)) => step("notary need", &line),
+                Ok(None) => {}
+                Err(error) => step(
+                    "notary need",
+                    &format!("could not record the request: {error}"),
+                ),
+            }
+            result.check
         }
-        NotaryNeed::Satisfied => need::satisfied(paths, &Want::Notary, Purpose::ReleaseNotary)
-            .map(|need| need.map(|need| need.line)),
     }
+}
+
+/// THE ONE PATH A CREDENTIAL THIS MAC LACKS TAKES: file `want` with the lab's Macs
+/// (`aterm secrets need <want>`), and fail `check` naming the want and its filed request. No
+/// person is asked for a credential.
+#[cfg(unix)]
+fn filed(
+    check: Check,
+    paths: aterm_secrets::Result<aterm_secrets::client::Paths>,
+    want: Want,
+    purpose: Purpose,
+) -> Check {
+    let (Check::Fail { what, .. } | Check::Todo { what, .. } | Check::Owner { what, .. }) = check
+    else {
+        return check;
+    };
+    let key = want.key();
+    let fix = match paths.and_then(|paths| aterm_secrets::need::raise(&paths, want, purpose)) {
+        Ok(need) => format!(
+            "filed `aterm secrets need {key}` with the lab: {}",
+            need.line
+        ),
+        Err(error) => format!("`aterm secrets need {key}` could not be filed: {error}"),
+    };
+    Check::Fail { what, fix }
+}
+
+/// The live check passed: the notary need, if one is open, is met.
+#[cfg(unix)]
+fn close_notary_need(
+    paths: &aterm_secrets::client::Paths,
+) -> aterm_secrets::Result<Option<String>> {
+    aterm_secrets::need::satisfied(paths, &Want::Notary, Purpose::ReleaseNotary)
+        .map(|need| need.map(|need| need.line))
 }
 
 /// Live-tested, not presence-tested.
@@ -2133,8 +2135,8 @@ fn notary_probe_verdict(profile: &str, success: bool, stdout: &str, stderr: &str
                 ),
                 fix: format!(
                     "the team's Account Holder accepts the current agreements at \
-                 https://developer.apple.com/account (no credential fixes this: \
-                 store-credentials leaves the 403 as it is), then `{SHIP} release` goes on"
+                 https://developer.apple.com/account (no credential fixes this), then \
+                 `{SHIP} release` goes on"
                 ),
             },
             need: NotaryNeed::Unchanged,
@@ -2158,12 +2160,12 @@ fn notary_probe_verdict(profile: &str, success: bool, stdout: &str, stderr: &str
         };
     }
     NotaryProbe {
-        check: Check::Owner {
+        check: Check::Fail {
             what: format!("notarytool profile '{profile}' did not authenticate: {first}"),
             fix: format!(
-                "xcrun notarytool store-credentials {profile} --apple-id <your-apple-id> \
-             --team-id {} (password: an app-specific password — mint at https://account.apple.com → Sign-In and Security → App-Specific Passwords)",
-                pins::APPLE_TEAM_ID
+                "`aterm secrets need {}` (the vault's {} entry sets profile '{profile}')",
+                Want::Notary.key(),
+                aterm_secrets::need::catalog::NOTARY_ENTRY
             ),
         },
         need: NotaryNeed::Raise,
@@ -2296,95 +2298,92 @@ fn profile_check_at(
     }
 }
 
-/// The channel token is the cut's GitHub identity.
+/// The channel token is the cut's GitHub identity: the vault's [`publish::CHANNEL_TOKEN`] entry.
+/// `may_change` tightens an open file; `record` files a missing token with the lab.
 #[cfg(unix)]
-fn channel_token_check(slug: &str, may_change: bool) -> Check {
+fn channel_token_check(may_change: bool, record: bool) -> Check {
     let path = publish::channel_token_path();
-    channel_token_check_at(slug, may_change, path.as_deref(), crate::github::has_token)
+    channel_token_check_at(may_change, path.as_deref(), crate::github::has_token).unwrap_or_else(
+        || {
+            let missing = channel_token_missing(path.as_deref());
+            if record {
+                filed(
+                    missing,
+                    aterm_secrets::client::Paths::live(),
+                    Want::Gh(GhProfile::Release),
+                    Purpose::AghRelease,
+                )
+            } else {
+                missing
+            }
+        },
+    )
 }
 
+/// The verdict on no channel token at `path`: the want that brings it, never a person's errand.
+#[cfg(unix)]
+fn channel_token_missing(path: Option<&Path>) -> Check {
+    Check::Fail {
+        what: format!(
+            "no channel token at {}",
+            path.map_or_else(publish::channel_token_pointer, |p| p.display().to_string())
+        ),
+        fix: format!(
+            "`aterm secrets need {}`",
+            Want::Gh(GhProfile::Release).key()
+        ),
+    }
+}
+
+/// The token file at `path` judged, `None` when it holds no token.
 #[cfg(unix)]
 fn channel_token_check_at(
-    slug: &str,
     may_change: bool,
     path: Option<&Path>,
     present: impl FnOnce() -> bool,
-) -> Check {
+) -> Option<Check> {
     use std::os::unix::fs::PermissionsExt as _;
-    let where_it_lives = path
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "~/.secrets/gh_access_token_alabsystems".into());
-    let missing = || channel_token_verdict(&where_it_lives, slug, false, false, false);
-    let Some(path) = path else { return missing() };
+    let path = path?;
+    let where_it_lives = path.display();
     let meta = match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_file() => meta,
         Ok(_) => {
-            return Check::Fail {
+            return Some(Check::Fail {
                 what: format!("{where_it_lives} is not a regular token file"),
                 fix: format!(
                     "restore this machine's private regular token file at {where_it_lives}"
                 ),
-            };
+            });
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return missing(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
         Err(error) => {
-            return Check::Fail {
+            return Some(Check::Fail {
                 what: format!("cannot inspect {where_it_lives}: {error}"),
                 fix: format!(
                     "make this machine's private regular token file readable at {where_it_lives}"
                 ),
-            };
+            });
         }
     };
-    let present = present();
+    if !present() {
+        return None;
+    }
     let open = meta.permissions().mode() & 0o077 != 0;
-    let tightened = present
-        && open
+    let tightened = open
         && may_change
         && crate::durable::open_regular_file(path)
             .and_then(|f| f.set_permissions(std::fs::Permissions::from_mode(0o600)))
             .is_ok();
-    channel_token_verdict(
-        &where_it_lives,
-        slug,
-        present,
-        open && !tightened,
-        tightened,
-    )
-}
-
-/// The channel token's verdict: a missing token is the owner's to mint ([`Check::Owner`]); a
-/// file open to group or others is this machine's to `chmod` ([`Check::Fail`]).
-#[cfg(unix)]
-fn channel_token_verdict(
-    where_it_lives: &str,
-    slug: &str,
-    present: bool,
-    open: bool,
-    tightened: bool,
-) -> Check {
-    // "mint", not "copy": a per-machine token revokes per-machine, like the signing key.
-    if !present {
-        return Check::Owner {
-            what: format!("no channel token at {where_it_lives}"),
-            fix: format!(
-                "1. https://github.com/settings/personal-access-tokens/new  (FINE-GRAINED, not \
-                 the classic-token page)\n\
-                 2. Contents: read/write on {slug}, short expiry\n\
-                 3. (umask 077; cat > {where_it_lives})   (then paste it and press ^D)"
-            ),
-        };
-    }
-    if tightened {
-        return Check::Pass(format!("{where_it_lives}  tightened to 0600"));
-    }
-    if open {
-        return Check::Fail {
+    Some(if tightened {
+        Check::Pass(format!("{where_it_lives}  tightened to 0600"))
+    } else if open {
+        Check::Fail {
             what: format!("{where_it_lives} is group/other-accessible"),
             fix: format!("chmod 600 {where_it_lives}"),
-        };
-    }
-    Check::Pass(format!("{where_it_lives}  0600, owner-only"))
+        }
+    } else {
+        Check::Pass(format!("{where_it_lives}  0600, owner-only"))
+    })
 }
 
 /// Unix seconds, failing rather than guessing.

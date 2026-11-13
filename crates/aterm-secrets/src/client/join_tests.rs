@@ -3842,7 +3842,7 @@ fn member_admission_projects_after_the_previous_runner_without_releasing_the_lon
         let root = aterm_tempfile::tempdir().unwrap();
         let server = serve_holding(&root.path().join("store"), Duration::from_secs(600));
         let (_admin, mb, alab) = waiting_for_alab(root.path(), &server);
-        let (input, mut release) = std::io::pipe().unwrap();
+        let (input, mut release) = aterm_uds::pipe().unwrap();
         let input = std::sync::Mutex::new(Some(input));
         let starts = AtomicUsize::new(0);
         let pid = AtomicI32::new(0);

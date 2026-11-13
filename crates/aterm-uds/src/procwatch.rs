@@ -306,7 +306,7 @@ impl ProcWatch {
     #[must_use]
     pub fn scripted(shell_pid: i32) -> Option<(Self, ProcScript)> {
         use std::os::fd::AsRawFd as _;
-        let (rd, wr) = std::io::pipe().ok()?;
+        let (rd, wr) = crate::pipe().ok()?;
         let fd = std::os::fd::OwnedFd::from(rd);
         // SAFETY: F_GETFL/F_SETFL on a descriptor this process owns.
         let nonblocking = unsafe {

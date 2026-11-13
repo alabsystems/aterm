@@ -172,8 +172,9 @@ pub fn no_window_desk_in(
 }
 
 /// Why no sign-in window can open on this machine's desk, which `accounts browser` refuses on
-/// before anything else about the window and [`window_route`] reads first: a host that is neither
-/// macOS nor Linux, or a Linux session with no display (`DISPLAY`, `WAYLAND_DISPLAY`).
+/// before anything else about the window (the live host's
+/// [`super::cli::AccountsHost::no_window_desk`]) and [`window_route`] reads first: a host that is
+/// neither macOS nor Linux, or a Linux session with no display (`DISPLAY`, `WAYLAND_DISPLAY`).
 #[must_use]
 pub fn no_window_desk() -> Option<&'static str> {
     no_window_desk_in(cfg!(unix), cfg!(target_os = "linux"), &|name| {
@@ -1081,9 +1082,9 @@ pub fn tidy_profile_scoped(
     use aterm_uds::spawnfd::{ChildStdio, LaneCommand, spawn_with_two_fds};
     use std::os::fd::OwnedFd;
     let (cmd_read, cmd_write) =
-        std::io::pipe().map_err(|e| format!("no DevTools pipe could be made ({e})"))?;
+        aterm_uds::pipe().map_err(|e| format!("no DevTools pipe could be made ({e})"))?;
     let (out_read, out_write) =
-        std::io::pipe().map_err(|e| format!("no DevTools pipe could be made ({e})"))?;
+        aterm_uds::pipe().map_err(|e| format!("no DevTools pipe could be made ({e})"))?;
     let mut cmd = LaneCommand::new(&browser.path);
     cmd.args(super::headless_oauth::headless_launch_args(
         browser, profile,

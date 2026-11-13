@@ -334,7 +334,10 @@ pub struct SupervisorConfig {
     pub stall_term: bool,
     /// How much memory a supervised agent's process group (physical footprint) may use before aterm warns.
     pub memory_ceiling: MemoryCeiling,
-    /// Restart an idle agent onto a newer installed build of itself.
+    /// Restart an idle agent onto a newer installed build of itself. `false` begins nothing (no
+    /// notice, no tell, no restart); what the upgrade already did to a conversation is still
+    /// finished, which no lane switch holds: a restart already made gets its relaunch and its
+    /// carry-on, and an agent already typed a notice gets the line that releases it from it.
     pub upgrade: bool,
     /// The live upgrade asks first.
     pub upgrade_ask: bool,
@@ -342,9 +345,11 @@ pub struct SupervisorConfig {
     /// A choice dialog that grants and spends nothing (a question, a plan-mode switch, a goal, a
     /// model or effort switch, the autocompact offer, the auto-mode setup offer) waits the shorter
     /// of this and `approval_loop::QUESTION_PERSON_GRACE` (15 s): a dialog nobody is answering is
-    /// answered, never held for the whole grace. A permission box nobody has touched since it
-    /// appeared waits the same 15 s at most; one a person or another driver touched, a held
-    /// message, an unrecognized box and the usage-limit menu wait the whole grace.
+    /// answered, never held for the whole grace. A Claude Code permission box nobody has touched
+    /// (no key moved its focus, no other driver held the session) waits only until the person's
+    /// last input is `approval_loop::PERSON_SETTLE` (2.5 s) old; another program's untouched box
+    /// waits the same 15 s at most. One a person or another driver touched, a held message, an
+    /// unrecognized box and the usage-limit menu wait the whole grace.
     pub human_grace_s: u32,
     /// What the harness does with a session's measured wait ([`Occupancy`]).
     pub occupancy: Occupancy,
@@ -1660,13 +1665,6 @@ pub struct Written {
 }
 
 fn unknown_key(key: &str) -> String {
-    let head = key.split('.').next().unwrap_or(key);
-    if aterm_phase::retired_agent(head) {
-        return format!(
-            "harness.{key}: {UNKNOWN_KEY}, ignored — {}",
-            aterm_phase::RETIRED_AGENT
-        );
-    }
     format!(
         "harness.{key}: {UNKNOWN_KEY}, ignored (known: {})",
         KEYS.join(", ")

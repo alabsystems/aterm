@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use aterm_scene::smoothstep;
 use aterm_time::Instant;
 
 use aterm_render::{GlowQuad, HaloMode, RainHalo, premul_rgb};
@@ -137,20 +138,6 @@ impl Default for SingSync {
     fn default() -> Self {
         Self::NONE
     }
-}
-
-/// Smoothstep ramp of `x` across `[lo, lo + 1 / inv_span]` → `0..=1` (eased at both ends).
-#[inline]
-const fn smoothstep(lo: f32, inv_span: f32, x: f32) -> f32 {
-    let t = ((x - lo) * inv_span).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
-}
-
-/// Smoothstep ramp of `x` across `[0, 1 / inv_hi]` → `0..=1` (eased at both ends).
-#[inline]
-const fn smoothstep_0(inv_hi: f32, x: f32) -> f32 {
-    let t = (x * inv_hi).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
 }
 
 /// The living-cartoon pose handed to the host each frame.
@@ -1142,7 +1129,7 @@ impl CursorCat {
     ) -> CatPose {
         const INV_BANK_SPAN: f32 = 1.0 / (BANK_HI - BANK_LO);
         self.advance_spine(now, target);
-        let bank = smoothstep(BANK_LO, INV_BANK_SPAN, self.disp);
+        let bank = smoothstep((self.disp - BANK_LO) * INV_BANK_SPAN);
         let mut scale_x = 1.0 + STRETCH_X * bank;
         let mut scale_y = 1.0 - THIN_Y * bank;
         let mut lead = LEAD_MAX * bank;
@@ -1184,16 +1171,14 @@ impl CursorCat {
                 const INV_OOPS_ATTACK: f32 = 1.0 / OOPS_ATTACK;
                 const INV_OOPS_SETTLE: f32 = 1.0 / OOPS_SETTLE;
                 let attack = match self.oops_at {
-                    Some(t0) => smoothstep_0(
-                        INV_OOPS_ATTACK,
-                        now.saturating_duration_since(t0).as_secs_f32(),
+                    Some(t0) => smoothstep(
+                        now.saturating_duration_since(t0).as_secs_f32() * INV_OOPS_ATTACK,
                     ),
                     None => 1.0,
                 };
                 let settle = match self.reaction_until {
-                    Some(until) => smoothstep_0(
-                        INV_OOPS_SETTLE,
-                        until.saturating_duration_since(now).as_secs_f32(),
+                    Some(until) => smoothstep(
+                        until.saturating_duration_since(now).as_secs_f32() * INV_OOPS_SETTLE,
                     ),
                     None => 1.0,
                 };
@@ -1210,11 +1195,10 @@ impl CursorCat {
                     Some(t0) => now.saturating_duration_since(t0).as_secs_f32(),
                     None => 0.0,
                 };
-                let attack = smoothstep_0(INV_WINCE_ATTACK, elapsed);
+                let attack = smoothstep(elapsed * INV_WINCE_ATTACK);
                 let settle = match self.reaction_until {
-                    Some(until) => smoothstep_0(
-                        INV_WINCE_SETTLE,
-                        until.saturating_duration_since(now).as_secs_f32(),
+                    Some(until) => smoothstep(
+                        until.saturating_duration_since(now).as_secs_f32() * INV_WINCE_SETTLE,
                     ),
                     None => 1.0,
                 };
@@ -1251,11 +1235,10 @@ impl CursorCat {
                     Some(t0) => now.saturating_duration_since(t0).as_secs_f32(),
                     None => 0.0,
                 };
-                let attack = smoothstep_0(INV_DELIGHT_ATTACK, elapsed);
+                let attack = smoothstep(elapsed * INV_DELIGHT_ATTACK);
                 let settle = match self.reaction_until {
-                    Some(until) => smoothstep_0(
-                        INV_DELIGHT_SETTLE,
-                        until.saturating_duration_since(now).as_secs_f32(),
+                    Some(until) => smoothstep(
+                        until.saturating_duration_since(now).as_secs_f32() * INV_DELIGHT_SETTLE,
                     ),
                     None => 1.0,
                 };

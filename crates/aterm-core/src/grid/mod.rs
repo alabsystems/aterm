@@ -48,6 +48,7 @@ pub mod extra_collection {
 }
 
 pub use aterm_grid::grid::Grid;
+pub use aterm_grid::grid::VisibleCells;
 pub use aterm_grid::grid::{MaterializedRow, materialize_from_line, stored_line_cells};
 
 pub use aterm_grid::ResizeLaw;

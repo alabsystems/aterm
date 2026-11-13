@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! WHAT NO BUILD READS AGAIN inside a build directory that stays: stale incremental folders,
-//! units an old compiler built, and, in a build directory whose last passing release run named
-//! the units it used ([`USED`], [`Used`]), each unit of the workspace's own packages that run
-//! superseded (another build of the same package and kind it did use, [`Part::Superseded`]). A
+//! units an old compiler built, and, in a build directory whose check runs named the units they
+//! used ([`USED`], [`Kept`]), each unit of the workspace's own packages those runs superseded
+//! (none of the kept runs uses it, and one uses another build of the same package and kind,
+//! [`Part::Superseded`]). A
 //! unit whose folder, fingerprint or outputs cannot be listed is not read, so nothing is decided
 //! of it. A profile's units are read in both of
 //! cargo's layouts: `.fingerprint/<pkg>-<hash>` beside `deps/`, `build/` and `examples/` entries
@@ -120,9 +121,14 @@ pub struct Profile {
     /// Its `incremental/` crate folders.
     pub crates: Vec<Stamp>,
     pub units: Vec<Unit>,
-    /// The hashes of its units the build directory's last passing release run used ([`USED`]);
-    /// `None` where no such run named any of the build directory's ([`Survey::began`]).
+    /// The hashes of its units the build directory's kept runs used ([`USED`], [`Kept::runs`]),
+    /// together; `None` where the build directory carries no record, or one unread
+    /// ([`Survey::began`]).
     pub used: Option<BTreeSet<String>>,
+    /// The hashes of its units the run that last ended in the build directory retired
+    /// ([`Kept::retired`]): a kept run used each, and none does since that run ended. Empty where
+    /// the record names none, or there is no record.
+    pub retired: BTreeSet<String>,
 }
 
 /// The store build cargo last built with in a build directory (`.rustc_info.json`).
@@ -140,11 +146,18 @@ pub struct Survey {
     /// `None` where cargo last built here with a compiler no store holds, or that cannot be read.
     pub last_built: Option<LastBuilt>,
     pub profiles: Vec<Profile>,
-    /// When the build directory's last passing release run began ([`USED`], [`Used::began_ms`]),
-    /// no later than its record was written; `None` where it carries no record, or one unread.
+    /// When the oldest of the build directory's kept runs began ([`USED`], [`Kept::runs`],
+    /// [`Used::began_ms`]), no later than its record was written; `None` where it carries no
+    /// record, one unread, or one that keeps no run.
     pub began: Option<SystemTime>,
-    /// The packages that run built tests of ([`Used::members`]): the workspace's own.
+    /// The packages the kept runs built tests of ([`Used::members`]), together: the workspace's
+    /// own.
     pub members: BTreeSet<String>,
+    /// When the run that last ended in the build directory began ([`Kept::retired`], its
+    /// [`Used::began_ms`]), no later than its record was written: a unit it retired
+    /// ([`Profile::retired`]) that nothing wrote since goes without waiting to be quiet. `None`
+    /// where there is no record, or one unread.
+    pub retired_before: Option<SystemTime>,
 }
 
 /// Ages of recognized survey entries, never a census of the whole cache.
@@ -177,7 +190,9 @@ pub(crate) struct Observations {
     pub profiles: usize,
     pub profiles_with_compiler_references: usize,
     pub units_without_compiler: usize,
-    pub release_record: bool,
+    /// The build directory's record of the units its check runs used ([`USED`]) was read and
+    /// keeps a run ([`Survey::began`]).
+    pub used_record: bool,
     pub profiles_naming_used_units: usize,
 }
 
@@ -187,7 +202,7 @@ pub(super) fn observations(survey: &Survey, now: SystemTime, after: Duration) ->
     let mut seen = Observations {
         last_build_current: survey.last_built.map(|last| last.current),
         profiles: survey.profiles.len(),
-        release_record: survey.began.is_some(),
+        used_record: survey.began.is_some(),
         ..Observations::default()
     };
     for profile in &survey.profiles {
@@ -240,34 +255,62 @@ pub enum Part {
     Incremental,
     /// A unit an old compiler built: its fingerprint folder and its entries.
     Unit,
-    /// A unit the build directory's last passing release run superseded ([`USED`]): of a package
-    /// of the workspace's own ([`Used::members`]), written before that run began, which did not
-    /// use it and did use another build of its package and kind ([`Unit::kind`]).
+    /// A unit the build directory's kept runs superseded ([`USED`]): of a package of the
+    /// workspace's own ([`Used::members`]), which none of them uses while one uses another build
+    /// of its package and kind ([`Unit::kind`]); written before the run that retired it began
+    /// ([`Kept::retired`]) or, where no kept run ever named it, before the oldest kept run began
+    /// and by nothing for the stale window.
     Superseded,
 }
 
-/// THE RECORD OF WHAT A PASSING RELEASE RUN USED, at the top of its build directory
-/// (`aterm-verify` writes it for a release run over the whole workspace that passed): when the
-/// run began, the packages it built tests of (the workspace's own), and the units of each profile
-/// its test compile reported as its outputs, fresh or built, the bins it copied into the target
-/// directory and the build scripts it ran among them ([`Used`]). A unit of one of those packages
-/// that it does not name, of a kind it names another unit of, written by nothing since the run
-/// began nor for the stale window, is a build that run superseded: every version bump hashes each
-/// unit of the workspace's own packages anew (their version, or a dependency's), and cargo never
-/// takes the old ones, so a release clone's build directory grew by every candidate's units
-/// ([`Part::Superseded`]). Kept are every unit of another package (a dependency's, the same build
-/// in every candidate, which another compile of the run may use in a build of its own the record
-/// does not see, spec-check's under its own features: cargo never rewrites a unit it found fresh,
-/// so its age says nothing of its use); every unit of a kind the record names none of; and every
-/// unit written since the run began, which some compile of it built (spec-check's build of the
-/// models without the checkers). ACCEPTED: a unit of the workspace's own that another compile of
-/// the run found fresh from an earlier run of the same version (a release cut again at one
-/// version) goes once quiet for the window, though that compile reads it again: the next version
-/// bump hashes it anew anyway, and a cut again past the window builds those crates once more.
-pub const USED: &str = ".aterm-release-used";
+/// THE RECORD OF WHAT THE CHECK RUNS OF A BUILD DIRECTORY USED, at its top (`aterm-verify`
+/// writes it as each run whose compile calls completed ends): the newest run of each scope
+/// ([`Kept::runs`]; a scope is what a run was asked to check, so a scoped run replaces only its
+/// own scope's), at most [`KEPT_RUNS`] of them and none begun more than [`KEPT_FOR`] before the
+/// run that ended last, and the units that run retired ([`Kept::retired`]). Of each run it holds
+/// when it began, the packages it built tests of (the workspace's own), and the units of each
+/// profile its compile calls reported as their outputs, fresh or built, the bins they copied into
+/// the target directory and the build scripts they ran among them ([`Used`]). A unit of one of
+/// those packages that no kept run names, of a kind a kept run names another unit of, is a build
+/// those runs superseded ([`Part::Superseded`]): every version bump, and every change to the
+/// features or dependencies a unit is built with, hashes each unit of the workspace's own
+/// packages it reaches anew (their version, or a dependency's), and cargo never takes the old
+/// ones, so a build directory grew by every such change's units (an edit to a unit's source alone
+/// builds it again in place, under the hash it had). One the run that ended last retired (a kept
+/// run named it, and none does now) goes at that run's end, where nothing wrote it since that run
+/// began. One no kept run ever named (a plain build's) goes once nothing wrote it since the
+/// oldest kept run began nor for the stale window. Kept are every unit a kept run names; every
+/// unit of another package (a dependency's, the same build in every candidate, which another
+/// compile of a run may use in a build of its own the record does not see, spec-check's under its
+/// own features: cargo never rewrites a unit it found fresh, so its age says nothing of its use);
+/// every unit of a kind the record names none of; and every unit written since the run it is
+/// judged against began, which some compile built (spec-check's build of the models without the
+/// checkers). ACCEPTED: a unit of the workspace's own that a compile no run reports (a plain
+/// build, a doctest's or spec-check's) found fresh goes once a kept run replaced it or it is
+/// quiet for the window, though that compile reads it again: that compile builds it once more.
+/// The record before this one (schema 1, `.aterm-release-used`, a passing release run's alone) is
+/// not read and supersedes nothing; the first run to end in its build directory removes it
+/// ([`Kept::keep`]).
+pub const USED: &str = ".aterm-used";
 
-/// The most of a [`USED`] record read: some thousands of units of a few dozen bytes each. A
-/// longer one is not read, and supersedes nothing.
+/// The name the record of schema 1 was kept under, which [`Kept::keep`] removes.
+const USED_BEFORE: &str = ".aterm-release-used";
+
+/// The most runs a [`USED`] record keeps, one to a scope ([`Kept::end`]). Every kept run holds
+/// its units against both rules that take a superseded one, so each more keeps another run's
+/// units on disk, and each fewer makes the scopes one checkout alternates between (a `-p` loop,
+/// the landing check over its cone, a run of the whole workspace, one of them narrowed) retire
+/// each other's units and build them again.
+pub const KEPT_RUNS: usize = 4;
+
+/// A kept run goes from a [`USED`] record once another run ends that began this much later
+/// ([`Kept::end`]): without it a scope nobody runs again, among [`KEPT_RUNS`] or fewer, stays
+/// the oldest kept run for good, and no unit written since it began would be superseded
+/// ([`Survey::began`]).
+pub const KEPT_FOR: Duration = RECLAIM_STALE;
+
+/// The most of a [`USED`] record read: some thousands of units of a few dozen bytes each, for
+/// each kept run. A longer one is not read, and supersedes nothing.
 const USED_MAX: usize = 16 << 20;
 
 /// The units a run used, by profile, the packages it built tests of, and when it began ([`USED`]).
@@ -282,6 +325,12 @@ pub struct Used {
     /// Each profile, by its path below the build directory (`debug`, `aarch64-apple-darwin/debug`),
     /// and the hashes of its units the run used.
     pub profiles: BTreeMap<String, BTreeSet<String>>,
+}
+
+/// Whether `word` is one plain path component: not empty, not `.` or `..`, and holding no
+/// separator.
+fn plain(word: &str) -> bool {
+    !word.is_empty() && word != "." && word != ".." && !word.contains(['/', '\\'])
 }
 
 impl Used {
@@ -333,9 +382,6 @@ impl Used {
     /// unit holds a twin; and none in the layout that names its entries with the hash, whose copies
     /// [`Self::add`] does not read either.
     pub fn add_uplifted(&mut self, leaf: &Path, profile: &str, package: &str, file: &Path) {
-        let plain = |word: &str| {
-            !word.is_empty() && word != "." && word != ".." && !word.contains(['/', '\\'])
-        };
         if !plain(package) || !profile.split('/').all(plain) {
             return;
         }
@@ -373,10 +419,9 @@ impl Used {
         }
     }
 
-    /// The record as [`USED`] holds it: schema 1, when the run began, its packages and each
-    /// profile's hashes sorted.
-    #[must_use]
-    pub fn encode(&self) -> String {
+    /// The run as a [`USED`] record holds it: when it began, its packages and each profile's
+    /// hashes, sorted.
+    fn value(&self) -> aterm_json::Value {
         let mut profiles = aterm_json::Map::new();
         for (name, hashes) in &self.profiles {
             profiles.insert(
@@ -390,7 +435,6 @@ impl Used {
             );
         }
         let mut o = aterm_json::Map::new();
-        o.insert("schema".to_owned(), aterm_json::Value::from(1u64));
         o.insert(
             "began_ms".to_owned(),
             aterm_json::Value::from(self.began_ms),
@@ -405,18 +449,14 @@ impl Used {
             ),
         );
         o.insert("profiles".to_owned(), aterm_json::Value::Object(profiles));
-        aterm_json::to_string(&aterm_json::Value::Object(o)).unwrap_or_default()
+        aterm_json::Value::Object(o)
     }
 
-    /// The record `bytes` holds; `None` for bytes that are not [`Self::encode`]'s: no time it
-    /// began, no packages, or a hash that is not one ([`unit_hash`]'s sixteen hex digits) among
-    /// them.
-    #[must_use]
-    pub fn decode(bytes: &[u8]) -> Option<Used> {
-        let v: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
-        if v.get("schema").and_then(aterm_json::Value::as_u64) != Some(1) {
-            return None;
-        }
+    /// The run `v` holds; `None` for a value that is not [`Self::value`]'s: no time it began, no
+    /// packages or an empty one among them, a profile whose name is not plain components joined
+    /// by `/` (a record's profile names say which folders a trim reads), or a hash that is not
+    /// one ([`unit_hash`]'s sixteen hex digits).
+    fn of_value(v: &aterm_json::Value) -> Option<Used> {
         let mut used = Used {
             began_ms: v.get("began_ms")?.as_u64()?,
             ..Used::default()
@@ -426,6 +466,9 @@ impl Used {
                 .insert(member.as_str().filter(|m| !m.is_empty())?.to_owned());
         }
         for (name, hashes) in v.get("profiles")?.as_object()? {
+            if !name.split('/').all(plain) {
+                return None;
+            }
             let set = used.profiles.entry(name.clone()).or_default();
             for h in hashes.as_array()? {
                 let h = h.as_str().filter(|h| is_hash(h))?;
@@ -434,16 +477,163 @@ impl Used {
         }
         Some(used)
     }
+}
+
+/// What a [`USED`] record holds: the newest run of each scope, and what the run that ended last
+/// retired.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Kept {
+    /// The newest run of each scope, by the scope's name: what its run was asked to check, spelled
+    /// the same each time (`aterm-verify` names its checkout, its checks and how they are
+    /// narrowed, and its packages).
+    pub runs: BTreeMap<String, Used>,
+    /// What the run that ended last retired ([`Self::end`]): by profile, the units a run it
+    /// replaced or evicted used and no kept run uses; and when that run began, which a retired
+    /// unit must be older than to go ([`decide`]). Its packages are not read. Each end computes
+    /// it again and carries nothing over: a unit an earlier end retired that is still there may
+    /// since have been built again in place by a compile no run reports, so it waits the stale
+    /// window like any unit no kept run names.
+    pub retired: Used,
+}
+
+impl Kept {
+    /// THE RUN `run` OF `scope` ENDED: it is kept in place of the run of its scope before; every
+    /// other kept run that began more than [`KEPT_FOR`] before it goes; and while more than
+    /// [`KEPT_RUNS`] are kept, the one that began first goes (by its scope's name between two
+    /// that began together), never `run` itself. [`Self::retired`] becomes what those runs used
+    /// that no kept run uses, as of when `run` began. Returns how many units that is.
+    pub fn end(&mut self, scope: &str, run: Used) -> usize {
+        let began_ms = run.began_ms;
+        let mut dropped: Vec<Used> = self
+            .runs
+            .insert(scope.to_owned(), run)
+            .into_iter()
+            .collect();
+        let window = u64::try_from(KEPT_FOR.as_millis()).unwrap_or(u64::MAX);
+        let aged: Vec<String> = self
+            .runs
+            .iter()
+            .filter(|(name, kept)| {
+                name.as_str() != scope && kept.began_ms.saturating_add(window) < began_ms
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in aged {
+            dropped.extend(self.runs.remove(&name));
+        }
+        while self.runs.len() > KEPT_RUNS {
+            let Some(first) = self
+                .runs
+                .iter()
+                .filter(|(name, _)| name.as_str() != scope)
+                .min_by(|a, b| (a.1.began_ms, a.0).cmp(&(b.1.began_ms, b.0)))
+                .map(|(name, _)| name.clone())
+            else {
+                break;
+            };
+            dropped.extend(self.runs.remove(&first));
+        }
+        let mut retired = Used {
+            began_ms,
+            ..Used::default()
+        };
+        for run in dropped {
+            for (profile, hashes) in run.profiles {
+                retired.profiles.entry(profile).or_default().extend(hashes);
+            }
+        }
+        for kept in self.runs.values() {
+            for (profile, hashes) in &kept.profiles {
+                if let Some(gone) = retired.profiles.get_mut(profile) {
+                    gone.retain(|hash| !hashes.contains(hash));
+                }
+            }
+        }
+        retired.profiles.retain(|_, hashes| !hashes.is_empty());
+        self.retired = retired;
+        self.retired.profiles.values().map(BTreeSet::len).sum()
+    }
+
+    /// Every profile the record names, a kept run's or a retired unit's.
+    #[must_use]
+    pub fn profiles(&self) -> BTreeSet<String> {
+        self.runs
+            .values()
+            .chain(std::iter::once(&self.retired))
+            .flat_map(|run| run.profiles.keys().cloned())
+            .collect()
+    }
+
+    /// The record as [`USED`] holds it: schema 2, each kept run by its scope, and what the last
+    /// retired.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        let mut runs = aterm_json::Map::new();
+        for (scope, run) in &self.runs {
+            runs.insert(scope.clone(), run.value());
+        }
+        let mut o = aterm_json::Map::new();
+        o.insert("schema".to_owned(), aterm_json::Value::from(2u64));
+        o.insert("runs".to_owned(), aterm_json::Value::Object(runs));
+        o.insert("retired".to_owned(), self.retired.value());
+        aterm_json::to_string(&aterm_json::Value::Object(o)).unwrap_or_default()
+    }
+
+    /// The record `bytes` holds; `None` for bytes that are not [`Self::encode`]'s: another schema
+    /// (the record before this one, schema 1, among them), no runs, more runs than
+    /// [`Self::end`] ever leaves ([`KEPT_RUNS`]: what a run's end does with a record is bounded
+    /// by the runs it holds, so one that holds more is not read at all), nothing retired, or a
+    /// run that is none ([`Used::of_value`]).
+    #[must_use]
+    pub fn decode(bytes: &[u8]) -> Option<Kept> {
+        let v: aterm_json::Value = aterm_json::from_slice(bytes).ok()?;
+        if v.get("schema").and_then(aterm_json::Value::as_u64) != Some(2) {
+            return None;
+        }
+        let runs = v.get("runs")?.as_object()?;
+        if runs.len() > KEPT_RUNS {
+            return None;
+        }
+        let mut kept = Kept {
+            runs: BTreeMap::new(),
+            retired: Used::of_value(v.get("retired")?)?,
+        };
+        for (scope, run) in runs {
+            kept.runs.insert(scope.clone(), Used::of_value(run)?);
+        }
+        Some(kept)
+    }
+
+    /// The record at the top of the build directory `leaf` and when it was written, as `fs` reads
+    /// them: `None` where there is none, it is no regular file, it is longer than [`USED_MAX`],
+    /// or it does not decode.
+    fn read_on(fs: &dyn Fs, leaf: &Path) -> Option<(SystemTime, Kept)> {
+        let record = leaf.join(USED);
+        let written = fs.meta(&record).filter(|m| m.kind == Kind::File)?.modified;
+        let bytes = fs.head(&record, USED_MAX + 1)?;
+        let kept = (bytes.len() <= USED_MAX)
+            .then(|| Kept::decode(&bytes))
+            .flatten()?;
+        Some((written, kept))
+    }
+
+    /// The record at the top of the build directory `leaf`; an empty one where there is none or
+    /// it cannot be read ([`Self::read_on`]), so the run that ends next starts it again.
+    #[must_use]
+    pub fn read(leaf: &Path) -> Kept {
+        Self::read_on(&Disk, leaf).map_or_else(Kept::default, |(_, kept)| kept)
+    }
 
     /// Keep the record at the top of the build directory `leaf` ([`USED`]): staged in a private
-    /// folder there, then renamed over the one before.
+    /// folder there, then renamed over the one before. The record of schema 1, where one is left
+    /// under its own name, is then removed; one that stays is not read.
     ///
     /// # Errors
     /// The build directory is not there, or the write failed: the record before stands.
     pub fn keep(&self, leaf: &Path) -> std::io::Result<()> {
         use std::io::Write as _;
         let stage = aterm_tempfile::Builder::new()
-            .prefix(".aterm-release-used-")
+            .prefix(".aterm-used-")
             .tempdir_in(leaf)?;
         let staged = stage.path().join("data");
         let mut file = std::fs::OpenOptions::new()
@@ -452,7 +642,9 @@ impl Used {
             .open(&staged)?;
         file.write_all(self.encode().as_bytes())?;
         drop(file);
-        std::fs::rename(&staged, leaf.join(USED))
+        std::fs::rename(&staged, leaf.join(USED))?;
+        let _ = std::fs::remove_file(leaf.join(USED_BEFORE));
+        Ok(())
     }
 }
 
@@ -494,11 +686,13 @@ pub struct Doomed {
 /// fingerprint names a compiler no unit of the profile written since the store's `current` link
 /// was made names, nothing having written its fingerprint or any of its entries for `after`.
 /// Where that build is the current one, a profile with no unit written since keeps every unit:
-/// nothing there says which compiler is current. And where the build directory's last passing
-/// release run named the units it used ([`USED`], [`Survey::began`]), every unit of the profile
-/// of a package that run built tests of ([`Survey::members`]) that it did not use, of a package
-/// and kind ([`Unit::kind`]) it used another unit of, nothing having written it since that run
-/// began nor for `after` ([`Part::Superseded`]).
+/// nothing there says which compiler is current. And where the build directory's check runs
+/// named the units they used ([`USED`], [`Survey::began`]), every unit of the profile of a
+/// package a kept run built tests of ([`Survey::members`]) that no kept run uses, of a package
+/// and kind ([`Unit::kind`]) a kept run uses another unit of ([`Part::Superseded`]): one the run
+/// that ended last retired ([`Profile::retired`]) where nothing wrote it since that run began
+/// ([`Survey::retired_before`]), whatever `after`; any other where nothing wrote it since the
+/// oldest kept run began nor for `after`.
 #[must_use]
 pub fn decide(survey: &Survey, now: SystemTime, after: Duration) -> Vec<Doomed> {
     let stale = |at| stale_at(at, now, after);
@@ -532,13 +726,20 @@ pub fn decide(survey: &Survey, now: SystemTime, after: Duration) -> Vec<Doomed> 
             .filter(|u| ours(u) && used.contains(&u.hash))
             .map(|u| u.kind.as_str())
             .collect();
-        let before = |t: Option<SystemTime>| t.is_some_and(|t| t < began);
         for (unit, old) in profile.units.iter().zip(&old) {
+            // A unit the last run retired is judged against that run's beginning and need not
+            // be quiet: a kept run reported it, so its use is known. Any other is judged
+            // against the oldest kept run's and waits the window.
+            let retired = survey
+                .retired_before
+                .filter(|_| profile.retired.contains(&unit.hash));
+            let since = retired.unwrap_or(began);
+            let before = |t: Option<SystemTime>| t.is_some_and(|t| t < since);
             if *old
                 || used.contains(&unit.hash)
                 || !ours(unit)
                 || !kinds.contains(unit.kind.as_str())
-                || !quiet(unit)
+                || !(retired.is_some() || quiet(unit))
                 || !before(unit.fingerprint.newest)
                 || !unit.artifacts.iter().all(|a| before(a.newest))
             {
@@ -579,44 +780,58 @@ fn old_compilers(survey: &Survey, profile: &Profile) -> Vec<bool> {
 }
 
 /// Reads the build directory `leaf`: its profiles, the compiler that last built there, and the
-/// units its last passing release run used ([`USED`]), that run's beginning read no later than
-/// its record was written.
+/// units its kept runs used and the last of them retired ([`USED`]), the oldest kept run's
+/// beginning and the retiring run's each read no later than the record was written.
 pub fn survey(fs: &dyn Fs, leaf: &Path, profiles: &[PathBuf], store: Option<&Path>) -> Survey {
-    let record = leaf.join(USED);
-    let used = fs
-        .meta(&record)
-        .filter(|m| m.kind == Kind::File)
-        .and_then(|m| {
-            let bytes = fs.head(&record, USED_MAX + 1)?;
-            let used = (bytes.len() <= USED_MAX)
-                .then(|| Used::decode(&bytes))
-                .flatten()?;
-            let began = SystemTime::UNIX_EPOCH.checked_add(Duration::from_millis(used.began_ms))?;
-            Some((began.min(m.modified), used))
-        });
+    let record = Kept::read_on(fs, leaf);
+    let at = |ms: u64, written: SystemTime| {
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_millis(ms))
+            .map(|began| began.min(written))
+    };
+    let began = record.as_ref().and_then(|(written, kept)| {
+        let oldest = kept.runs.values().map(|run| run.began_ms).min()?;
+        at(oldest, *written)
+    });
+    let retired_before = record
+        .as_ref()
+        .and_then(|(written, kept)| at(kept.retired.began_ms, *written));
+    let named = |run: &Used, name: &str| run.profiles.get(name).cloned().unwrap_or_default();
     Survey {
         last_built: last_built(fs, leaf, store),
         profiles: profiles
             .iter()
             .map(|p| {
                 let mut read = profile(fs, p);
-                read.used = used.as_ref().map(|(_, u)| {
+                if let Some((_, kept)) = &record {
                     let name = p
                         .strip_prefix(leaf)
                         .ok()
                         .and_then(Path::to_str)
                         .map(|n| n.replace(std::path::MAIN_SEPARATOR, "/"))
                         .unwrap_or_default();
-                    u.profiles.get(&name).cloned().unwrap_or_default()
-                });
+                    read.used = Some(
+                        kept.runs
+                            .values()
+                            .flat_map(|run| named(run, &name))
+                            .collect(),
+                    );
+                    read.retired = named(&kept.retired, &name);
+                }
                 read
             })
             .collect(),
-        members: used
+        members: record
             .as_ref()
-            .map(|(_, u)| u.members.clone())
+            .map(|(_, kept)| {
+                kept.runs
+                    .values()
+                    .flat_map(|run| run.members.iter().cloned())
+                    .collect()
+            })
             .unwrap_or_default(),
-        began: used.map(|(at, _)| at),
+        began,
+        retired_before,
     }
 }
 
@@ -652,6 +867,7 @@ fn profile(fs: &dyn Fs, dir: &Path) -> Profile {
         crates,
         units,
         used: None,
+        retired: BTreeSet::new(),
     }
 }
 

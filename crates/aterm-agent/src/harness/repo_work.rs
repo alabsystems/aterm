@@ -1455,7 +1455,6 @@ fn work_status(
 }
 
 /// How [`work_status_in`] resolves `core.excludesFile`.
-#[derive(Clone, Copy)]
 pub(super) enum RepoExcludes {
     /// Query [`own_excludes`] and, when unset, [`global_excludes`] (`probe` and `read_work`).
     Probe,
@@ -1465,9 +1464,9 @@ pub(super) enum RepoExcludes {
     /// `~/.config/git/ignore` (or `$XDG_CONFIG_HOME/git/ignore`) path directly without spawning a
     /// second `git config --global` process.
     DefaultGlobal,
-    /// Global configuration sets `core.excludesFile`; resolve it through [`global_excludes`] so
-    /// Git's `--path` expansion applies.
-    ConfiguredGlobal,
+    /// Global configuration sets `core.excludesFile`, and this is what Git's `--path` expansion
+    /// made of it ([`global_excludes_set`]; `None` where it gave none), still to be admitted.
+    GlobalAt(Option<PathBuf>),
 }
 
 /// [`work_status`] with `excludes_mode` and `index_source` supplied where the caller has already
@@ -1489,7 +1488,7 @@ fn work_status_in(
         }
         RepoExcludes::Own => None,
         RepoExcludes::DefaultGlobal => default_global_excludes(reads.home, reads.xdg, table),
-        RepoExcludes::ConfiguredGlobal => global_excludes(root, table, reads),
+        RepoExcludes::GlobalAt(set) => admit_global_excludes(set, reads, table),
     };
     let excludes = excludes_path.and_then(|p| p.to_str().map(|p| format!("core.excludesFile={p}")));
     let mut status_args: Vec<&str> = vec!["-c", "status.renames=false"];
@@ -1585,6 +1584,9 @@ fn private_index_folder() -> Option<PathBuf> {
 /// would trust as a status of the source would not, and keeps every skip-worktree bit, which a
 /// status of the source clears for a present file only as it reads. Every call reads the current
 /// source index before choosing a copy, named by its path, exact bytes and modification time.
+/// The fingerprint uses a fixed-size buffer; only a cache miss reads the source a second time
+/// to copy it, checking both the copied bytes against that fingerprint and the descriptor's
+/// identity through both reads.
 /// The modification time remains part of the input to git's racy-clean check; filesystem clock
 /// precision and a source replacement's inode do not decide whether bytes changed. A copy is
 /// renamed into place only once refreshed and is opened under the private-file rules before use.
@@ -1597,8 +1599,61 @@ fn private_index(root: &Path, reads: &Reads<'_>) -> Option<PrivateIndex> {
 }
 
 #[cfg(unix)]
+const INDEX_READ_BUFFER: usize = 64 * 1024;
+
+#[cfg(unix)]
+fn index_fingerprint(meta: &std::fs::Metadata) -> aterm_digest::Sha256 {
+    use std::os::unix::fs::MetadataExt as _;
+    let mut content = aterm_digest::Sha256::new();
+    content.update(b"aterm refreshed index bytes v1\0");
+    content.update(meta.mtime().to_be_bytes());
+    content.update(meta.mtime_nsec().to_be_bytes());
+    content
+}
+
+/// Copy only the exact bytes whose fingerprint selected this private index. A second read
+/// can differ without moving a coarse filesystem stamp, so metadata alone cannot admit it.
+#[cfg(unix)]
+fn copy_index_bytes(
+    source: &mut impl std::io::Read,
+    copy: &mut impl std::io::Write,
+    meta: &std::fs::Metadata,
+    expected: [u8; 32],
+    reads: &Reads<'_>,
+    buffer: &mut [u8; INDEX_READ_BUFFER],
+) -> std::io::Result<()> {
+    use std::io::Read as _;
+    let extent = meta
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| std::io::Error::other("index extent cannot be bounded"))?;
+    let mut source = source.take(extent);
+    let mut content = index_fingerprint(meta);
+    let mut copied = 0;
+    loop {
+        if Instant::now() >= reads.deadline.get() || reads.held.is_some_and(|held| held()) {
+            return Err(std::io::Error::other("index copy stopped"));
+        }
+        let n = source.read(buffer)?;
+        if n == 0 {
+            break;
+        }
+        copy.write_all(&buffer[..n])?;
+        content.update(&buffer[..n]);
+        copied += n as u64;
+    }
+    if copied != meta.len() || content.finalize() != expected {
+        return Err(std::io::Error::other("index bytes changed while copied"));
+    }
+    if Instant::now() >= reads.deadline.get() || reads.held.is_some_and(|held| held()) {
+        return Err(std::io::Error::other("index copy stopped"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn private_index_at(root: &Path, source: Option<&Path>, reads: &Reads<'_>) -> Option<PrivateIndex> {
-    use std::io::{Read as _, Write as _};
+    use std::io::{Read as _, Seek as _};
     use std::os::unix::ffi::OsStrExt as _;
     use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
     static TEMPORARY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1630,14 +1685,24 @@ fn private_index_at(root: &Path, source: Option<&Path>, reads: &Reads<'_>) -> Op
     {
         return None;
     }
-    let mut bytes = Vec::new();
-    (&mut file)
-        .take(meta.len().checked_add(1)?)
-        .read_to_end(&mut bytes)
-        .ok()?;
+    let mut content = index_fingerprint(&meta);
+    let mut source_bytes = 0u64;
+    let mut buffer = [0u8; INDEX_READ_BUFFER];
+    let mut bounded = (&mut file).take(meta.len().checked_add(1)?);
+    loop {
+        if Instant::now() >= reads.deadline.get() || reads.held.is_some_and(|held| held()) {
+            return None;
+        }
+        let n = bounded.read(&mut buffer).ok()?;
+        if n == 0 {
+            break;
+        }
+        content.update(&buffer[..n]);
+        source_bytes += n as u64;
+    }
     // A read is admitted only for the opened source's extent and one unchanged descriptor.
     // The stamp detects a competing write; it never substitutes for reading the bytes.
-    if bytes.len() as u64 != meta.len()
+    if source_bytes != meta.len()
         || file.metadata().ok().map(|now| stamp(&now)) != Some(stamp(&meta))
         || Instant::now() >= reads.deadline.get()
         || reads.held.is_some_and(|held| held())
@@ -1645,12 +1710,8 @@ fn private_index_at(root: &Path, source: Option<&Path>, reads: &Reads<'_>) -> Op
         return None;
     }
     let id = digest(source.as_os_str().as_bytes());
-    let mut content = aterm_digest::Sha256::new();
-    content.update(b"aterm refreshed index bytes v1\0");
-    content.update(meta.mtime().to_be_bytes());
-    content.update(meta.mtime_nsec().to_be_bytes());
-    content.update(&bytes);
-    let state = aterm_uds::rand::hex_encode(&content.finalize());
+    let fingerprint = content.finalize();
+    let state = aterm_uds::rand::hex_encode(&fingerprint);
     let folder = private_index_folder()?;
     match aterm_uds::private_file::check_private_dir(&folder) {
         Ok(()) => {}
@@ -1686,7 +1747,11 @@ fn private_index_at(root: &Path, source: Option<&Path>, reads: &Reads<'_>) -> Op
         .mode(0o600)
         .open(&at)
         .and_then(|mut copy| {
-            copy.write_all(&bytes)?;
+            file.rewind()?;
+            copy_index_bytes(&mut file, &mut copy, &meta, fingerprint, reads, &mut buffer)?;
+            if stamp(&file.metadata()?) != stamp(&meta) {
+                return Err(std::io::Error::other("index changed while copied"));
+            }
             copy.set_modified(meta.modified()?)
         })
         .is_ok()
@@ -2887,8 +2952,13 @@ fn global_excludes(
     table: &aterm_sysprobe::volumes::Table,
     reads: &Reads<'_>,
 ) -> Option<PathBuf> {
-    let (home, xdg) = (reads.home, reads.xdg);
-    let set = git_as(
+    admit_global_excludes(global_excludes_set(root, reads), reads, table)
+}
+
+/// The global configuration's `core.excludesFile` as Git's `--path` expansion gives it, `None`
+/// where it sets none or the read gave none.
+fn global_excludes_set(root: &Path, reads: &Reads<'_>) -> Option<PathBuf> {
+    git_as(
         root,
         &[
             "config",
@@ -2903,10 +2973,19 @@ fn global_excludes(
     )
     .map(|p| p.trim_end_matches(['\n', '\r']).to_string())
     .filter(|p| !p.is_empty())
-    .map(PathBuf::from);
+    .map(PathBuf::from)
+}
+
+/// The global excludes file a status passes: `set` ([`global_excludes_set`]) where it is one this
+/// read admits, and Git's default where the configuration sets none.
+fn admit_global_excludes(
+    set: Option<PathBuf>,
+    reads: &Reads<'_>,
+    table: &aterm_sysprobe::volumes::Table,
+) -> Option<PathBuf> {
     match set {
-        Some(path) => admit_global_excludes_path(&path, home, table),
-        None => default_global_excludes(home, xdg, table),
+        Some(path) => admit_global_excludes_path(&path, reads.home, table),
+        None => default_global_excludes(reads.home, reads.xdg, table),
     }
 }
 
@@ -3096,6 +3175,23 @@ struct Reads<'a> {
 }
 
 impl Reads<'_> {
+    /// What a git started now must end by, `None` with [`Self::cut`] set where none may start:
+    /// the deadline is past, or new starts are held back ([`Self::held`]). An answer kept from
+    /// an earlier read is given only where this lets its git start ([`home`]'s kept answers), so
+    /// a read held back says nothing whether or not it would have started a git.
+    fn start_by(&self) -> Option<Instant> {
+        let deadline = self.deadline.get();
+        #[cfg(test)]
+        let deadline = deadline
+            .checked_sub(read_stall::spent())
+            .unwrap_or_else(Instant::now);
+        if Instant::now() >= deadline || self.held.is_some_and(|held| held()) {
+            self.cut.set(true);
+            return None;
+        }
+        Some(deadline)
+    }
+
     /// A read ended: the next has [`Self::each`] from now. A read its limit
     /// cut never ends, so none after it starts.
     fn ended(&self) {
@@ -3160,21 +3256,39 @@ fn run_git_bytes(
     diagnostics: Diagnostics,
     index: Option<&Path>,
 ) -> Option<Vec<u8>> {
-    let deadline = reads.deadline.get();
-    #[cfg(test)]
-    let deadline = deadline
-        .checked_sub(read_stall::spent())
-        .unwrap_or_else(Instant::now);
-    if Instant::now() >= deadline || reads.held.is_some_and(|held| held()) {
-        reads.cut.set(true);
-        return None;
-    }
+    run_git_told(dir, args, reads, global, offline, feed, diagnostics, index).ok()
+}
+
+/// Why a read gave no output ([`run_git_told`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NoAnswer {
+    /// Git ran and said "none" quietly: it exited 1 with nothing on stderr, as `git config
+    /// --get-regexp` does where no key matches.
+    Quiet,
+    /// Every other read that gave none: one that did not start or was cut, a `git` that is not
+    /// there, a refusal that said why, a signal.
+    Other,
+}
+
+/// [`run_git_bytes`], telling a quiet "none" from every other read that gave no output.
+#[allow(clippy::too_many_arguments)]
+fn run_git_told(
+    dir: &Path,
+    args: &[&str],
+    reads: &Reads<'_>,
+    global: bool,
+    offline: bool,
+    feed: Option<std::fs::File>,
+    diagnostics: Diagnostics,
+    index: Option<&Path>,
+) -> Result<Vec<u8>, NoAnswer> {
+    let deadline = reads.start_by().ok_or(NoAnswer::Other)?;
     #[cfg(test)]
     if reads.refused.is_some_and(|refused| refused(args)) {
         reads.ended();
-        return None;
+        return Err(NoAnswer::Other);
     }
-    let path = std::env::var_os("PATH")?;
+    let path = std::env::var_os("PATH").ok_or(NoAnswer::Other)?;
     // On a Mac without Apple's Command Line Tools the `git` on PATH may be Apple's `/usr/bin`
     // stub, which raises their install dialog: there is no git here, read as quietly as none at
     // all.
@@ -3183,7 +3297,8 @@ fn run_git_bytes(
         dir,
         Path::new("/usr/bin"),
         aterm_types::clt_shim::developer_git,
-    )?;
+    )
+    .ok_or(NoAnswer::Other)?;
     cmd.arg("--no-pager")
         .arg("-c")
         .arg("core.fsmonitor=false")
@@ -3229,25 +3344,28 @@ fn run_git_bytes(
         // No `git` here: the probe cannot run, and reads clean.
         Err(aterm_uds::deadline::CompleteOutputError::Run(
             aterm_uds::deadline::RunError::Spawn(e),
-        )) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        )) if e.kind() == std::io::ErrorKind::NotFound => return Err(NoAnswer::Other),
         Err(_) => {
             reads.cut.set(true);
-            return None;
+            return Err(NoAnswer::Other);
         }
     };
     reads.ended();
     if output.status.code().is_none() {
         // A signal ended it: what it would have said is not known.
         reads.cut.set(true);
-        return None;
+        return Err(NoAnswer::Other);
     }
     if !output.status.success() {
-        if matches!(diagnostics, Diagnostics::Answer)
-            && (output.status.code() != Some(1) || !output.stderr.is_empty())
-        {
+        let quiet = output.status.code() == Some(1) && output.stderr.is_empty();
+        if matches!(diagnostics, Diagnostics::Answer) && !quiet {
             reads.cut.set(true);
         }
-        return None;
+        return Err(if quiet {
+            NoAnswer::Quiet
+        } else {
+            NoAnswer::Other
+        });
     }
     if (matches!(diagnostics, Diagnostics::Refuse | Diagnostics::Answer)
         && !output.stderr.is_empty())
@@ -3257,9 +3375,9 @@ fn run_git_bytes(
             .any(|line| line.starts_with(b"warning: could not open directory '"))
     {
         reads.cut.set(true);
-        return None;
+        return Err(NoAnswer::Other);
     }
-    Some(output.stdout)
+    Ok(output.stdout)
 }
 
 /// The `git` a read starts in `dir` with `path` as its whole PATH: exactly the `git` that

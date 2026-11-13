@@ -37,13 +37,14 @@ fn reach(m: &Model) -> Vec<State> {
 }
 
 /// The looks a quiet round can make at state `s`, in a session its autopilot carries, at the land
-/// rung: the agent's real work at an idle point is a process under it, or a status its in-process
-/// work keeps busy past the turn end ([`upgrade::status_lags`]); and a turn that runs is its busy
+/// rung: what names nothing that would be lost at an idle point is a follow under it, or a status
+/// its in-process work keeps busy past the turn end with no process under it
+/// ([`upgrade::status_lags`]); and a turn that runs is its busy
 /// footer, or, with a shell of the agent's own alive, the `shell` status that has not yet lagged
 /// its turn's end (no footer, no idle look in a row).
 fn looks(s: &State) -> Vec<Facts> {
     let f = facts(s);
-    if s["posture"] == 2 && s["work"] == 2 {
+    if s["posture"] == 2 && s["work"] == 3 {
         let lagging = Facts {
             status: "busy".to_string(),
             background: Vec::new(),
@@ -51,6 +52,20 @@ fn looks(s: &State) -> Vec<Facts> {
         };
         assert!(upgrade::status_lags(&lagging), "{lagging:?}");
         vec![f, lagging]
+    } else if s["posture"] == 3 && s["dated"] == 1 {
+        // The wall its transcript dates is a login wall, or a usage limit as old.
+        let limit = Facts {
+            login: false,
+            login_s: 0,
+            limited: true,
+            limit_s: if s["aged"] == 1 {
+                upgrade::LIMIT_WALL_S
+            } else {
+                upgrade::LIMIT_WALL_S - 1
+            },
+            ..f.clone()
+        };
+        vec![f, limit]
     } else if s["posture"] == 0 && s["work"] > 0 {
         let fresh = Facts {
             status: "shell".to_string(),
@@ -64,7 +79,8 @@ fn looks(s: &State) -> Vec<Facts> {
     }
 }
 
-/// A quiet round's look at state `s`, in a session its autopilot carries, at the land rung. With
+/// A quiet round's look at state `s`, at the land rung, in a session its autopilot carries unless
+/// a person holds the carry (`off`). With
 /// a shell of the agent's own alive its status is `shell`, never `idle`: at an idle point it is
 /// the status that lags the turn's end, which is what the look reads there.
 fn facts(s: &State) -> Facts {
@@ -78,6 +94,7 @@ fn facts(s: &State) -> Facts {
             Vec::new()
         },
         waits_only: s["work"] == 1,
+        follows_only: s["work"] == 3,
         deadline_set: s["tells"] > 0,
         work_due: s["due"] == 1,
         quiet_s: 3_600,
@@ -85,9 +102,12 @@ fn facts(s: &State) -> Facts {
         rung: upgrade::Rung::Land,
         still_s: 3_600,
         quiet: true,
-        may_tell: true,
+        may_tell: s["off"] == 0,
+        silent: s["silent"] == 1,
         attended: s["near"] == 1,
-        own_hold_s: if s["held"] == 1 {
+        own_hold_s: if s["outlasted"] == 1 {
+            upgrade::SILENT_HOLD_S
+        } else if s["held"] == 1 {
             upgrade::WORK_TELL_S
         } else {
             upgrade::WORK_TELL_S - 1
@@ -107,6 +127,17 @@ fn facts(s: &State) -> Facts {
             f.status = "busy".to_string();
             f.idle_looks = 0;
             f.background_point = true;
+        }
+        // A wall its transcript dates (a login wall here, a usage limit in [`looks`]), standing
+        // within its bound or aged past it with nobody seen; a wall nothing dates is a usage
+        // limit of no age.
+        3 if s["dated"] == 1 => {
+            f.login = true;
+            f.login_s = if s["aged"] == 1 {
+                upgrade::LOGIN_WALL_S
+            } else {
+                upgrade::LOGIN_WALL_S - 1
+            };
         }
         3 => f.limited = true,
         4 => f.approval_box = true,
@@ -151,6 +182,7 @@ fn the_quiet_flow_is_the_derived_machine() {
         states.len()
     );
     let (mut told, mut moved, mut over_waits, mut at_deadline, mut voided) = (0, 0, 0, 0, 0);
+    let (mut outlasted, mut past_login, mut past_limit) = (0, 0, 0);
     let mut caught: BTreeSet<&str> = BTreeSet::new();
     for (s, f) in states
         .iter()
@@ -233,8 +265,12 @@ fn the_quiet_flow_is_the_derived_machine() {
         }
         if step == Step::Terminate {
             moved += 1;
+            past_login += usize::from(f.login);
+            past_limit += usize::from(f.limited);
             if upgrade::own_yields(&f) == Some(upgrade::Yield::Waits) {
                 over_waits += 1;
+            } else if upgrade::own_yields(&f) == Some(upgrade::Yield::Outlasted) {
+                outlasted += 1;
             } else if upgrade::own_yields(&f).is_some() && s["work"] == 2 {
                 at_deadline += 1;
             }
@@ -246,6 +282,8 @@ fn the_quiet_flow_is_the_derived_machine() {
             ("TellOverAPerson", false),
             ("TellsEarly", false),
             ("TellsPastTheCap", false),
+            ("SilentMovesEarly", true),
+            ("TellsASilentSession", false),
         ] {
             if buggy.action_enabled(mutant, s) {
                 let does = if moves {
@@ -256,7 +294,7 @@ fn the_quiet_flow_is_the_derived_machine() {
                 assert!(!does, "{mutant} at {s:?}: the real step {step:?}");
             }
         }
-        let controls: [(&str, &str, Step); 8] = [
+        let controls: [(&str, &str, Step); 15] = [
             (
                 "tells below the bound",
                 "TellAtPoint",
@@ -328,6 +366,68 @@ fn the_quiet_flow_is_the_derived_machine() {
                     ..f.clone()
                 }),
             ),
+            // A finished session's own work held with no bound.
+            (
+                "silent work holds",
+                "MoveAtIdle",
+                real(&Facts {
+                    own_hold_s: f.own_hold_s.min(upgrade::WORK_TELL_S),
+                    ..f.clone()
+                }),
+            ),
+            (
+                "a silent move over a person",
+                "MoveAtIdle",
+                real(&Facts {
+                    attended: false,
+                    ..f.clone()
+                }),
+            ),
+            (
+                "a silent move before its told deadline",
+                "MoveAtIdle",
+                real(&Facts {
+                    deadline_set: false,
+                    tells: 0,
+                    ..f.clone()
+                }),
+            ),
+            // A finished session's real work read as follows: ended with nothing to warn it.
+            (
+                "a silent move over real work",
+                "MoveAtIdle",
+                real(&Facts {
+                    follows_only: f.follows_only || s["work"] == 2,
+                    ..f.clone()
+                }),
+            ),
+            (
+                "tells a silent session",
+                "TellAtPoint",
+                real(&Facts {
+                    silent: false,
+                    ..f.clone()
+                }),
+            ),
+            // A wall nobody lifts held with no bound.
+            (
+                "a wall holds for good",
+                "MoveAtIdle",
+                real(&Facts {
+                    login_s: f.login_s.min(upgrade::LOGIN_WALL_S - 1),
+                    limit_s: f.limit_s.min(upgrade::LIMIT_WALL_S - 1),
+                    ..f.clone()
+                }),
+            ),
+            (
+                "moves at a live wall",
+                "MoveAtIdle",
+                real(&Facts {
+                    login_s: f.login_s.max(upgrade::LOGIN_WALL_S),
+                    limit_s: f.limit_s.max(upgrade::LIMIT_WALL_S),
+                    ..f.clone()
+                }),
+            ),
         ];
         for (name, action, control) in controls {
             let (does, want) = if action == "TellAtPoint" {
@@ -344,17 +444,31 @@ fn the_quiet_flow_is_the_derived_machine() {
         }
     }
     assert!(
-        told > 0 && moved > 0 && over_waits > 0 && at_deadline > 0 && voided > 0,
-        "{told} {moved} {over_waits} {at_deadline} {voided}"
+        told > 0
+            && moved > 0
+            && over_waits > 0
+            && at_deadline > 0
+            && voided > 0
+            && outlasted > 0
+            && past_login > 0
+            && past_limit > 0,
+        "{told} {moved} {over_waits} {at_deadline} {voided} {outlasted} {past_login} {past_limit}"
     );
     assert_eq!(
         caught,
         BTreeSet::from([
             "a deadline outlives a person or a wall",
             "a deadline untold",
+            "a wall holds for good",
+            "moves at a live wall",
             "moves at a break",
             "moves over work",
             "own work holds",
+            "a silent move before its told deadline",
+            "a silent move over a person",
+            "a silent move over real work",
+            "silent work holds",
+            "tells a silent session",
             "tells below the bound",
             "tells off a point",
             "tells over a person",

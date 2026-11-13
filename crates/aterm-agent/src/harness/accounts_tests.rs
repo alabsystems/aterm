@@ -5255,6 +5255,9 @@ fn a_row_wakes_waiting_tabs_only_when_an_account_is_usable_sooner() {
         Kind::SignIn,
         Kind::Displaced,
     ];
+    assert!(wakes(Kind::Wall, "five_hour lifted: a read shows room"));
+    assert!(!wakes(Kind::Wall, "five_hour until 1794700800"));
+    assert!(!wakes(Kind::Wall, "five_hour, no reset named"));
     for kind in quiet {
         assert!(!wakes(kind, "ok"), "{}", kind.as_str());
     }
@@ -8394,6 +8397,93 @@ fn a_tap_reading_is_kept_in_tenths_with_its_own_as_of() {
     assert_eq!((fig.pct_x10, fig.at), (426, NOW + 60));
     let back = State::from_json(&s.to_json(), NOW + 60).expect("ours");
     assert_eq!(back.accounts["main"].windows, s.accounts["main"].windows);
+}
+
+#[test]
+fn a_refill_inside_a_window_lifts_the_wall_it_replaced_and_wakes_the_wait() {
+    let reset = NOW + 3 * HOUR;
+    let run = |wall_at: i64, refilled: bool| {
+        let mut s = state();
+        note_reading(
+            &mut s,
+            "main",
+            &five(win(1000, reset, None), NOW - MIN, true),
+            NOW - MIN,
+        );
+        note_wall(&mut s, "main", SESSION_LIMIT, Some(reset), wall_at, wall_at);
+        let events = note_reading(
+            &mut s,
+            "main",
+            &five(win(50, reset, refilled.then_some(1000)), NOW + MIN, true),
+            NOW + MIN,
+        );
+        (s, events)
+    };
+    let (s, events) = run(NOW, true);
+    let kinds: Vec<Kind> = events.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, [Kind::Reset, Kind::Wall, Kind::Sample]);
+    assert_eq!(
+        events[1].why,
+        "five_hour lifted: it refilled inside its window"
+    );
+    assert!(events[1].wakes(), "a waiting tab decides again");
+    let record = &s.accounts["main"];
+    assert_eq!(record.limited_until(NOW + MIN), None);
+    assert_eq!(
+        record.cleared_since(SESSION_LIMIT, NOW, NOW + MIN),
+        Some(NOW + MIN),
+        "the wait on that wall resumes"
+    );
+    let mut later = s.clone();
+    note_wall(
+        &mut later,
+        "main",
+        SESSION_LIMIT,
+        Some(reset),
+        NOW,
+        NOW + 2 * MIN,
+    );
+    assert_eq!(
+        later.accounts["main"].limited_until(NOW + 2 * MIN),
+        None,
+        "an older observer does not raise it again"
+    );
+
+    // A wall filed while the refill was already on record is lifted by the next reading.
+    let (mut s, _) = run(NOW, true);
+    let wall = s
+        .accounts
+        .get_mut("main")
+        .and_then(|a| a.walls.get_mut(SESSION_LIMIT))
+        .expect("the wall");
+    (wall.cleared, wall.at) = (false, NOW);
+    assert!(s.accounts["main"].limited_until(NOW + MIN).is_some());
+    let events = note_reading(
+        &mut s,
+        "main",
+        &five(win(60, reset, None), NOW + 2 * MIN, true),
+        NOW + 2 * MIN,
+    );
+    let kinds: Vec<Kind> = events.iter().map(|e| e.kind).collect();
+    assert_eq!(kinds, [Kind::Wall, Kind::Sample]);
+    assert!(events[0].wakes(), "with no refill row of its own");
+    assert_eq!(s.accounts["main"].limited_until(NOW + 2 * MIN), None);
+
+    // Control: a lower figure the vendor did not refill lifts nothing.
+    let (s, events) = run(NOW, false);
+    assert!(events.iter().all(|e| e.kind == Kind::Sample), "{events:?}");
+    assert_eq!(
+        s.accounts["main"].limited_until(NOW + MIN),
+        Some(reset + RESET_GRACE_S)
+    );
+
+    // A wall observed after the refilled reading describes the new allowance: it stands.
+    let (s, events) = run(NOW + 2 * MIN, true);
+    assert!(events.iter().all(|e| e.kind != Kind::Wall), "{events:?}");
+    assert_eq!(
+        s.accounts["main"].limited_until(NOW + 2 * MIN),
+        Some(reset + RESET_GRACE_S)
+    );
 }
 
 #[test]

@@ -61,11 +61,20 @@ impl Sentinel {
     /// directory barrier, so a power loss may also restore the record. On any `Err`, the
     /// caller must neither swap nor keep the trial identity it wrote for this arm.
     pub fn arm_with(&self, build: u64, flush: Flush) -> io::Result<()> {
+        self.arm_at(build, 0, flush)
+    }
+
+    /// [`Self::arm_with`] for a resumed trial: the count of `build` starts at `attempts`, the
+    /// launches an earlier trial of the same bytes counted and nothing proved, so the launch
+    /// that reaches the revert threshold is the same whatever the spacing of the launches.
+    /// # Errors
+    /// As [`Self::arm_with`].
+    pub fn arm_at(&self, build: u64, attempts: u32, flush: Flush) -> io::Result<()> {
         // Required: the swap an arm precedes must not reach the media ahead of it, so a failed
         // flush of the folder is the arm's error, and its caller does not swap. Try to remove
         // the record: an armed sentinel whose caller does not swap would count the
         // running build's launches against a trial nothing started.
-        let Err(unflushed) = self.write_record(build, 0, &[], flush)? else {
+        let Err(unflushed) = self.write_record(build, attempts, &[], flush)? else {
             return Ok(());
         };
         if let Err(error) = self.confirm() {

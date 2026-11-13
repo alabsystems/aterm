@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Host GitHub key registration and revocation ([`login`], the token file
-//! [`Paths::github_token`] names, [`System::github_rest`], [`KEY_SCOPE`]), or, by `[github] keys`,
+//! Host GitHub key registration and revocation (the token file [`Paths::github_token`] names,
+//! [`System::github_rest`], [`KEY_SCOPE`]), or, by `[github] keys`,
 //! over agh's library ([`register_via`], [`revoke_via`]: machines 5a and 5b). The machine user's
 //! token is never kept in the login keychain.
 
@@ -55,9 +55,9 @@ struct Session {
     token: Secret,
 }
 
-/// `account`'s token, read from `token_file` ([`Paths::github_token`]): what `aterm machines
-/// github login` stored, one token, in a private regular file of this account's (0600) that is
-/// itself no link.
+/// `account`'s token, read from `token_file` ([`Paths::github_token`]): one token, in a private
+/// regular file of this account's (0600) that is itself no link. Nothing here asks anyone for
+/// it: a missing or unusable file blocks the key call, which says so.
 fn stored_token(sys: &dyn System, token_file: &Path, account: &str) -> Result<Secret, String> {
     if !valid_login(account) {
         return Err(format!("{account:?} is not a GitHub login"));
@@ -68,14 +68,13 @@ fn stored_token(sys: &dyn System, token_file: &Path, account: &str) -> Result<Se
         .map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
                 format!(
-                    "no GitHub token for {account} is stored in {} (aterm machines github login \
-                     stores one: a token of {account}'s with the {KEY_SCOPE} scope)",
+                    "no GitHub token for {account} at {}; host key calls are blocked",
                     token_file.display()
                 )
             } else {
                 format!(
-                    "{} must be a private regular file of this account's (0600), not a link, at \
-                     most 64 KiB (aterm machines github login replaces it)",
+                    "{} is not a private regular file of this account's (0600), not a link, at \
+                     most 64 KiB; host key calls are blocked",
                     token_file.display()
                 )
             }
@@ -89,7 +88,7 @@ fn stored_token(sys: &dyn System, token_file: &Path, account: &str) -> Result<Se
     match token {
         Some(Ok(token)) => Ok(token),
         _ => Err(format!(
-            "{} holds no single GitHub token (aterm machines github login replaces it)",
+            "{} holds no single GitHub token; host key calls are blocked",
             token_file.display()
         )),
     }
@@ -103,8 +102,7 @@ impl Session {
         let (login, _) = session.login(sys)?;
         if !login.eq_ignore_ascii_case(account) {
             return Err(format!(
-                "the stored GitHub token for {account} signs in as {login:?}; nothing was sent \
-                 (aterm machines github login replaces it)"
+                "the stored GitHub token for {account} signs in as {login:?}; nothing was sent"
             ));
         }
         Ok(session)
@@ -178,10 +176,7 @@ fn failure(method: RestMethod, endpoint: &str, answer: &GithubResponse) -> Strin
         line.push_str(&format!(" ({message})"));
     }
     if let Some(scope) = missing_scope(&answer.headers) {
-        line.push_str(&format!(
-            "; the token lacks the {scope} scope (aterm machines github login stores one \
-             that holds it)"
-        ));
+        line.push_str(&format!("; the token lacks the {scope} scope"));
     }
     line
 }
@@ -420,60 +415,6 @@ fn judged(ids: &[u64], after: &[u64], answers: &[(u64, String)]) -> Result<(), S
     }
 }
 
-/// Validate `token` against `account` and [`KEY_SCOPE`], then store it in `token_file`
-/// ([`Paths::github_token`], 0600), never the login keychain.
-///
-/// # Errors
-/// One line (not a login, the token is empty or holds whitespace, GitHub refused it, it is
-/// another account's or lacks the scope, the file could not be written, or it did not hand the
-/// token back). Nothing is stored on an error before the write, and no error carries the token.
-pub fn login(
-    sys: &dyn System,
-    token_file: &Path,
-    account: &str,
-    token: Secret,
-) -> Result<(), String> {
-    if !valid_login(account) {
-        return Err(format!(
-            "{account:?} is not a GitHub login; nothing was stored"
-        ));
-    }
-    if token.bytes().is_empty() || token.bytes().iter().any(u8::is_ascii_whitespace) {
-        return Err("the token is not one word; nothing was stored".into());
-    }
-    let session = Session { token };
-    let (login, headers) = session
-        .login(sys)
-        .map_err(|why| format!("{why}; nothing was stored"))?;
-    if !login.eq_ignore_ascii_case(account) {
-        return Err(format!(
-            "the token signs in as {login:?}, not {account}; nothing was stored"
-        ));
-    }
-    if let Some(held) = header(&headers, "x-oauth-scopes")
-        && !scopes(held).any(|scope| scope == KEY_SCOPE)
-    {
-        return Err(format!(
-            "the token lacks the {KEY_SCOPE} scope that adding and deleting {account}'s SSH \
-             keys needs; nothing was stored"
-        ));
-    }
-    if let Some(keys) = token_file.parent() {
-        sys.create_dir_all(keys, 0o700)
-            .map_err(|e| format!("{}: {e}; nothing was stored", keys.display()))?;
-    }
-    sys.write_file(token_file, session.token.bytes(), 0o600)
-        .map_err(|e| format!("{}: {e}", token_file.display()))?;
-    let stored = stored_token(sys, token_file, account)?;
-    if stored.bytes() != session.token.bytes() {
-        return Err(format!(
-            "{} did not hand the token back as it was written",
-            token_file.display()
-        ));
-    }
-    Ok(())
-}
-
 /// The name of the profile the agh key path speaks as, inline (5a) or from agh.toml (5b).
 const FLEET: &str = "fleet";
 
@@ -602,34 +543,26 @@ impl AghKeys {
     }
 
     /// One line for a key call's failure, as `agh_line`. On the inline path a token agh
-    /// refuses as unauthenticated (another login's, or one GitHub answers 401) names the verb
-    /// that replaces the token file's token, never agh's own, which cannot see it: another
-    /// login's token gets the REST path's text. A token GitHub says lacks `admin:public_key`
-    /// keeps agh's scope hint and also names that verb, which stores the re-issued token.
+    /// refuses as unauthenticated, or one that lacks [`KEY_SCOPE`], is named as the token
+    /// file's, never agh's own, which cannot see it: another login's token gets the REST path's
+    /// text.
     fn line(&self, what: &str, e: &agh::Error) -> String {
         let Some(account) = self.inline.as_deref() else {
             return agh_line(&self.gh, what, e);
         };
-        let line = if e.kind == agh::Kind::Unauthenticated {
-            match &e.sub {
-                agh::Sub::LoginMismatch { got, .. } => format!(
-                    "the stored GitHub token for {account} signs in as {got:?}; nothing was \
-                     sent (aterm machines github login replaces it)"
-                ),
-                _ => format!(
-                    "{what}: {}; aterm machines github login replaces the stored token for \
-                     {account} (a token of {account}'s with the {KEY_SCOPE} scope)",
-                    e.why
-                ),
-            }
-        } else if e.next.contains(KEY_SCOPE) {
-            format!(
-                "{what}: {}; {}; aterm machines github login stores the re-issued token for \
-                 {account}",
-                e.why, e.next
-            )
-        } else {
-            return agh_line(&self.gh, what, e);
+        let line = match (&e.kind, &e.sub) {
+            (agh::Kind::Unauthenticated, agh::Sub::LoginMismatch { got, .. }) => format!(
+                "the stored GitHub token for {account} signs in as {got:?}; nothing was sent"
+            ),
+            (agh::Kind::Unauthenticated, _) => format!(
+                "{what}: {}; GitHub refuses the stored token for {account}",
+                e.why
+            ),
+            _ if e.next.contains(KEY_SCOPE) => format!(
+                "{what}: {}; the stored token for {account} lacks the {KEY_SCOPE} scope",
+                e.why
+            ),
+            _ => return agh_line(&self.gh, what, e),
         };
         self.gh.redactor().apply(&line)
     }

@@ -17,6 +17,40 @@ fn multicast_bounds_and_permanent_withdrawal() {
     assert!(socket.receive().is_err());
 }
 
+/// One read tells a dropped datagram from an empty socket ([`Multicast::hear`]): an oversized
+/// datagram reads as dropped, the hint behind it as a hint, and the socket then as empty.
+/// [`Multicast::receive`] reads a dropped one as none. Each read follows a wait for its
+/// datagram to reach the socket, a hang detector.
+#[test]
+fn a_read_tells_a_dropped_datagram_from_an_empty_socket() {
+    let socket = Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap();
+    assert_eq!(socket.hear().unwrap(), Heard::Empty);
+    let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let to = (Ipv4Addr::LOCALHOST, socket.port());
+    let arrives = || {
+        let ready = aterm_uds::ready::any(
+            &[std::os::fd::AsFd::as_fd(&socket)],
+            Some(std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN),
+        )
+        .unwrap();
+        assert_eq!(ready, [0], "the datagram reaches the socket");
+    };
+    sender.send_to(&[0; MAX_PACKET + 1], to).unwrap();
+    arrives();
+    assert_eq!(socket.hear().unwrap(), Heard::Discarded);
+    sender.send_to(b"hint", to).unwrap();
+    arrives();
+    assert_eq!(
+        socket.hear().unwrap(),
+        Heard::Hint(b"hint".to_vec(), sender.local_addr().unwrap())
+    );
+    assert_eq!(socket.hear().unwrap(), Heard::Empty);
+    sender.send_to(&[0; MAX_PACKET + 1], to).unwrap();
+    arrives();
+    assert_eq!(socket.receive().unwrap(), None);
+    assert_eq!(socket.hear().unwrap(), Heard::Empty);
+}
+
 /// The hint `socket` sends to its own group comes back to it (its sends loop back).
 fn hears_its_own_hint(socket: &UdpSocket, policy: impl Fn(&UdpSocket) -> io::Result<()>) {
     let port = socket.local_addr().unwrap().port();
@@ -138,4 +172,29 @@ fn discovery_sources_exclude_self_and_subnet_broadcast_but_allow_point_to_point_
         ip("10.1.2.1"),
         ip("255.255.255.254")
     ));
+}
+
+/// A discovery socket has more receive room than a UDP socket is given by default, or all it
+/// asks for (`native::multicast`'s `ROOM`), and on macOS, whose default limit for a socket
+/// (`kern.ipc.maxsockbuf`) is above that, all of it: its owner reads it once a polled round,
+/// and a round's beacons wait in it.
+///
+/// NEGATIVE CONTROL (2026-11-12): with `native::multicast::bind` not asking, the socket kept
+/// the default (`a discovery socket's room: 786896 bytes, a plain UDP socket's 786896, asked
+/// 1048576`).
+#[test]
+fn a_discovery_socket_asks_for_a_rounds_worth_of_receive_room() {
+    let plain = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let (default, _) = native::multicast::room(&plain).unwrap();
+    let socket = Multicast::bind(Ipv4Addr::LOCALHOST, GROUP, 0, Scope::Loopback).unwrap();
+    let (room, asked) = native::multicast::room(&socket.socket).unwrap();
+    let granted = if cfg!(target_os = "macos") {
+        room >= asked
+    } else {
+        room >= asked || room > default
+    };
+    assert!(
+        granted,
+        "a discovery socket's room: {room} bytes, a plain UDP socket's {default}, asked {asked}"
+    );
 }

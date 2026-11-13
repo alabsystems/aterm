@@ -1689,6 +1689,7 @@ fn the_flusher_writes_holdings_as_place_rows_the_reader_finds() {
             spool,
             &Presence::default,
             holdings,
+            &|| None,
             false,
             now,
         )
@@ -1815,6 +1816,7 @@ fn a_due_flush_waits_out_held_custody_until_the_hang_detector() {
                 &spool,
                 &Presence::default,
                 &|| None,
+                &|| None,
                 false,
                 now,
                 started,
@@ -1891,6 +1893,7 @@ fn a_due_flush_asks_for_holdings_before_it_takes_the_journal_writer() {
         &spool,
         &Presence::default,
         &holdings,
+        &|| None,
         false,
         W * WEEK + 600,
     );
@@ -2074,4 +2077,303 @@ fn the_book_hears_a_heal_and_keeps_a_withdrawn_word_to_itself() {
     assert_eq!(book.facts(400).accounts[&account].signin, None);
     let back = Book::from_value(&book.to_value());
     assert_eq!(word(&back.accounts[&account]), Some(("unknown", 300)));
+}
+
+/// A record for the `upd` tests: build 162 running and proven, 198 offered.
+fn upd_record() -> aterm_update_core::update_record::UpdateRecord {
+    let mut record = aterm_update_core::update_record::UpdateRecord::fresh();
+    record.running = 162;
+    record.proven = true;
+    record.offered = Some(198);
+    record
+}
+
+/// [`upd_record`] holding build 198 since `now`, after it did not start cleanly.
+fn upd_held(now: u64, why: &str) -> aterm_update_core::update_record::UpdateRecord {
+    use aterm_update_core::update_record::{Cause, Failure, Sha, Witness};
+    let mut record = upd_record();
+    assert!(record.set_hold(
+        Failure {
+            build: 198,
+            version: "0.198.0".into(),
+            sha: Sha([7; 32]),
+            cause: Cause::CrashLoop,
+            witness: Witness::Headless,
+            why: why.into(),
+        },
+        now,
+    ));
+    record
+}
+
+/// The `upd` row: the worst-case record (both reasons at their caps, every one a character JSON
+/// escapes) fits its 2 KiB cap whole and reads back as the record it spells, its counter the
+/// row's; over the cap the trial's reason goes first, then the hold's, and a record that fits
+/// with neither is no row; `until` is the end of the next week, or the hold's end where later;
+/// and `live` drops a row whose `until` passed or that is no record.
+/// NEGATIVE CONTROL: with `row` returning `spell` unchecked, the oversized record's row passes
+/// the cap (`` the trial's reason goes first ``).
+#[test]
+fn an_upd_row_fits_its_cap_reads_back_and_lapses_at_its_until() {
+    use aterm_update_core::update_record::{Sha, TRIAL_WHY_MAX, TrialNote, WHY_MAX, Witness};
+    let now = W * WEEK + 3600;
+    let mut worst = upd_held(now, &"\"".repeat(WHY_MAX));
+    worst.running_sha = Some(Sha([9; 32]));
+    worst.trial = Some(TrialNote {
+        build: 198,
+        sha: Sha([7; 32]),
+        since: now,
+        witness: Witness::Headless,
+        misses: 2,
+        why: "\"".repeat(TRIAL_WHY_MAX),
+    });
+    let row = upd::row(&worst, 5, W).unwrap();
+    assert!(aterm_json::to_vec(&row).unwrap().len() <= caps::UPD_ROW);
+    let (back, until) = upd::of_row(&row).unwrap();
+    assert_eq!(until, (W + 2) * WEEK);
+    assert_eq!(
+        back,
+        aterm_update_core::update_record::UpdateRecord {
+            n: 5,
+            ..worst.clone()
+        }
+    );
+
+    // A version long enough to crowd the reasons out.
+    let mut long = worst.clone();
+    long.hold.as_mut().unwrap().version = "9".repeat(caps::UPD_ROW - 900);
+    let row = upd::row(&long, 5, W).unwrap();
+    assert!(
+        aterm_json::to_vec(&row).unwrap().len() <= caps::UPD_ROW,
+        "the trial's reason goes first"
+    );
+    let (back, _) = upd::of_row(&row).unwrap();
+    assert_eq!(back.trial.unwrap().why, "");
+    long.hold.as_mut().unwrap().version = "9".repeat(caps::UPD_ROW);
+    assert_eq!(upd::row(&long, 5, W), None);
+
+    // A hold reaching past the next week's end carries the row until it ends.
+    let late = (W + 2) * WEEK - 600;
+    let held_late = upd_held(late, "x");
+    let until = held_late.hold.as_ref().unwrap().until;
+    assert!(until > (W + 2) * WEEK);
+    assert_eq!(upd::until(&held_late, W), until);
+
+    let mut read = owned::OwnedRead::default();
+    let mut put = |uuid: &str, value: Value| {
+        read.rows.insert(
+            uuid.to_owned(),
+            owned::OwnedRow {
+                machine: [1; 16],
+                actor: [1; 48],
+                value,
+                rank: (W, 1, 1),
+                operation: [0; 32],
+            },
+        );
+    };
+    put(
+        "00000000000000000000000000000001",
+        upd::row(&worst, 1, W).unwrap(),
+    );
+    let mut lapsed = upd::row(&upd_record(), 1, W).unwrap();
+    set(&mut lapsed, "until", json!(now));
+    put("00000000000000000000000000000002", lapsed);
+    put(
+        "00000000000000000000000000000003",
+        json!({"n": 1, "until": now + 10}),
+    );
+    let live = upd::live(&read, now, Some("00000000000000000000000000000002"));
+    assert_eq!(live.len(), 1, "{live:?}");
+    assert_eq!(live[0].uuid, "00000000000000000000000000000001");
+    assert_eq!(live[0].record.hold, worst.hold);
+    assert!(!live[0].own, "another Mac's row");
+    let mine = upd::live(&read, now, Some("00000000000000000000000000000001"));
+    assert!(
+        mine[0].own,
+        "this Mac's own row is marked, so no reader takes it as a peer"
+    );
+}
+
+/// What a row cuts to fit its cap does not depend on its counter or week, so the book, which
+/// asks whether a record is waiting with one spelling and states it with another, sees the row
+/// it wrote as saying what the record says: across every version length that crosses the cap,
+/// the row at counter 0 of week 0 and at a real counter and week say the same.
+/// NEGATIVE CONTROL: with `row` judging the cut on `spell(&record, n, period)`, some length
+/// fits at 0 and not at the real counter (`` the cut depends on the counter ``).
+#[test]
+fn an_upd_rows_cut_is_the_same_at_every_counter() {
+    use aterm_update_core::update_record::{Sha, TRIAL_WHY_MAX, TrialNote, WHY_MAX, Witness};
+    let now = W * WEEK + 3600;
+    let mut record = upd_held(now, &"x".repeat(WHY_MAX));
+    record.trial = Some(TrialNote {
+        build: 198,
+        sha: Sha([7; 32]),
+        since: now,
+        witness: Witness::Headless,
+        misses: 2,
+        why: "y".repeat(TRIAL_WHY_MAX),
+    });
+    for len in 1000..caps::UPD_ROW {
+        record.hold.as_mut().unwrap().version = "9".repeat(len);
+        let at = |n, period| upd::row(&record, n, period).map(|row| upd::content(&row));
+        assert_eq!(
+            at(0, 0),
+            at(1_800_000_000_123, W),
+            "the cut depends on the counter at version length {len}"
+        );
+    }
+}
+
+/// The book states an `upd` row as promptly as a sharp event whenever the record says
+/// something its last row did not, within the pace line; an unchanged record is not due again;
+/// the first record of a new week restates it while a hold or a trial stands, and not for an
+/// idle, proven Mac; and only what the last row said survives the book's file.
+/// NEGATIVE CONTROL: with `upd_due`'s carry ignoring the hold
+/// (`record.hold.is_some() ||` removed), the held record is not restated in the new week
+/// (`` restated while held ``).
+#[test]
+fn the_book_states_an_upd_row_when_the_record_moves_and_carries_it_only_while_held() {
+    let now = W * WEEK + 3600;
+    let me = [1; 16];
+    let mut book = Book {
+        sum_period: Some(W),
+        flushed_at: now,
+        ..Book::default()
+    };
+    assert!(!book.upd_waiting(), "no record read");
+    assert!(!book.due(&[], false, now + 1, W, true, false));
+    book.upd = Some(upd_record());
+    assert!(book.upd_waiting());
+    assert!(book.due(&[], false, now + 1, W, true, false));
+    assert!(
+        !book.due(&[], false, now + 1, W, false, false),
+        "over the line"
+    );
+    let planned = book
+        .plan(
+            &[],
+            &Heard::default(),
+            &Presence::default(),
+            &me,
+            2,
+            W,
+            now + 1,
+            false,
+        )
+        .unwrap();
+    assert_eq!(planned.changes.len(), 1);
+    assert_eq!(planned.changes[0].collection, "upd");
+    assert_eq!(planned.changes[0].key, hex::encode_lower(&me));
+    book.wrote(&planned, 2, W, now + 1);
+    assert!(!book.upd_waiting(), "said");
+    assert_eq!(book.upd_due(3, W), None);
+    // Saved, the book keeps what the row said and never the record it read.
+    let saved = Book::from_value(&book.to_value());
+    assert_eq!(saved.upd_stated, book.upd_stated);
+    assert_eq!(saved.upd, None);
+
+    // An idle, proven Mac's row is not carried into the next week.
+    assert_eq!(book.upd_due(3, W + 1), None, "idle and proven");
+    // A record that moves is due at once.
+    book.upd = Some(upd_held(now + 60, "the listener did not answer"));
+    assert!(book.upd_waiting());
+    let planned = book
+        .plan(
+            &[],
+            &Heard::default(),
+            &Presence::default(),
+            &me,
+            3,
+            W,
+            now + 61,
+            false,
+        )
+        .unwrap();
+    assert!(planned.upd.is_some());
+    book.wrote(&planned, 3, W, now + 61);
+    assert_eq!(book.upd_due(4, W), None);
+    assert!(book.upd_due(4, W + 1).is_some(), "restated while held");
+    // Off, no `upd` row goes out.
+    let planned = book
+        .plan(
+            &[],
+            &Heard::default(),
+            &Presence::default(),
+            &me,
+            4,
+            W + 1,
+            (W + 1) * WEEK,
+            true,
+        )
+        .unwrap();
+    assert_eq!(planned.upd, None);
+}
+
+/// End to end: each Mac's flusher writes its update record from the installed report as the
+/// `upd` row at its own uuid, the reader finds both Macs' rows after a repair, each by its
+/// writer and spelling that Mac's record; an unchanged record writes nothing more, and a hold a
+/// minute later goes out on the next pass.
+/// NEGATIVE CONTROL: with `pass_started` not reading `record` (`book.upd = None`), no row is
+/// written (`` a's row ``).
+#[test]
+fn the_flusher_writes_each_macs_update_record_and_the_reader_finds_it_by_writer() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let spools = spools(scratch.path(), 2);
+    let now = W * WEEK + 3600;
+    let pass = |n: usize, record: &upd::Records, now: u64| {
+        flush::pass_with(
+            &lab.paths[n],
+            &spools[n],
+            &Presence::default,
+            &|| None,
+            record,
+            false,
+            now,
+        )
+        .unwrap()
+    };
+    let idle = || Some(upd_record());
+    assert!(matches!(pass(0, &idle, now), Flushed::Wrote { .. }));
+    let held = upd_held(now + 30, "the listener did not answer");
+    let held_now = held.clone();
+    assert!(matches!(
+        pass(1, &move || Some(held_now.clone()), now + 30),
+        Flushed::Wrote { .. }
+    ));
+    repair_commons_at(&lab, 2, &[now + 60, now + 60]);
+    let (a, _) = window_at(&lab.paths[0], now + 60);
+    let (b, _) = window_at(&lab.paths[1], now + 60);
+    let rows = upd::read(&lab.paths[0], now + 60).unwrap().unwrap();
+    let find = |uuid: &[u8; 16]| {
+        rows.iter()
+            .find(|row| row.uuid == hex::encode_lower(uuid))
+            .map(|row| row.record.clone())
+    };
+    assert_eq!(find(&a).map(|r| r.offered), Some(Some(198)), "a's row");
+    assert_eq!(find(&b).map(|r| r.hold), Some(held.hold.clone()), "b's row");
+    assert_eq!(rows.len(), 2);
+
+    // Unchanged, nothing is due; held a minute later, the next pass writes it.
+    assert_eq!(pass(0, &idle, now + 120), Flushed::Idle);
+    let later = upd_held(now + 180, "the listener did not answer");
+    assert!(matches!(
+        pass(0, &move || Some(later.clone()), now + 180),
+        Flushed::Wrote { rows: 1, .. }
+    ));
+    let rows = upd::read(&lab.paths[0], now + 181).unwrap().unwrap();
+    let mine = rows
+        .iter()
+        .find(|row| row.uuid == hex::encode_lower(&a))
+        .unwrap();
+    assert!(mine.record.hold.is_some());
+}
+
+/// A nudge asks this process's flusher for one pass: the ask is taken once.
+#[test]
+fn a_nudge_is_taken_once() {
+    upd::nudge();
+    assert!(upd::nudged());
+    assert!(!upd::nudged());
 }

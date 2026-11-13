@@ -30,10 +30,9 @@ fn push_with_line_limit_constant_time_truncate() {
     eprintln!("push_line+truncate records walked: limit=500 -> {small}, limit=10K -> {large}");
     for (limit, walked) in [(500, small), (10_000, large)] {
         assert_eq!(
-            walked, batch,
-            "{batch} pushes at limit {limit} walked {walked} records — the only decode \
-             a push may pay is its line's one warm->cold framing check; more means \
-             truncate is decoding the scrollback (#5893)"
+            walked, 0,
+            "{batch} pushes at limit {limit} walked {walked} records — untrimmed warm->cold \
+             promotion and truncate must decode zero records (#5893)"
         );
     }
 }

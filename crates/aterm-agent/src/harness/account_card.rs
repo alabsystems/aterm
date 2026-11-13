@@ -210,9 +210,11 @@ pub struct History {
     /// from the list was not read. The journal types no day rows, so a history from it has
     /// none.
     pub days: Vec<DayPoint>,
-    /// The oldest row this Mac holds of the account, whatever the span; `None` for a history
-    /// from the journal. With [`HistoryFrom::Nothing`] it says this Mac holds rows of the
-    /// account and none of them is a reading of its week inside the span.
+    /// The oldest row this Mac holds of the account, whatever the span; `None` where it holds
+    /// none. A history from the journal keeps the series' (rows here, none a week reading in the
+    /// span), so one kept and built again says what a fresh fold says. With
+    /// [`HistoryFrom::Nothing`] it says this Mac holds rows of the account and none of them is
+    /// a reading of its week inside the span.
     pub since: Option<i64>,
     /// The series files' stamp the history was folded at
     /// ([`super::account_history::stamp`]): a caller keeps it while this holds.
@@ -259,8 +261,8 @@ impl History {
 }
 
 /// `own`, this Mac's history, or the journal's week where this Mac holds no row of the account
-/// and `seen` holds readings of the last eight days. It keeps `own`'s stamp, so a caller that
-/// keeps the result asks the journal again at each build and never the files.
+/// and `seen` holds readings of the last eight days. It keeps `own`'s stamp and first row, so a
+/// caller that keeps the result asks the journal again at each build and never the files.
 fn or_the_journals(own: Arc<History>, seen: Option<&AccountSeen>, now: i64) -> Arc<History> {
     if matches!(own.from, HistoryFrom::Series | HistoryFrom::NotKept) {
         return own;
@@ -290,6 +292,7 @@ fn or_the_journals(own: Arc<History>, seen: Option<&AccountSeen>, now: i64) -> A
     Arc::new(History {
         from,
         reads,
+        since: own.since,
         stamp: own.stamp,
         ..History::none(from)
     })
@@ -485,6 +488,62 @@ impl LoginHalf {
     }
 }
 
+/// What this Mac holds of an account's stored login, as the vault token's surfaces say it
+/// (`accounts_token_view`, the fact menu before the card). A row's records alone cannot tell a
+/// login with no end known from no login at all: both forecast nothing ([`LoginHalf::Ok`]).
+/// It is defined here, beside [`LoginHalf`], because the menu is built on every platform and
+/// the token view only on Unix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoginHere {
+    /// A login, at this half of the offer pair.
+    Half(LoginHalf),
+    /// None: a roster row names the account, no session on this Mac is logged into it, its own
+    /// login directory holds no login, and no record says one ended.
+    Absent,
+    /// Not known here: no roster row and no session names the account (this Mac's table row
+    /// alone), so nothing read says whether a login exists.
+    Unread,
+}
+
+impl LoginHere {
+    /// A roster row's login here: `half`, what its records make of it ([`LoginHalf::of_row`]),
+    /// where the Mac `holds` a login of it or a record says its login ended; [`Self::Absent`]
+    /// otherwise.
+    #[must_use]
+    pub fn of_row(half: LoginHalf, holds: bool) -> Self {
+        if holds || matches!(half, LoginHalf::Ended { .. }) {
+            Self::Half(half)
+        } else {
+            Self::Absent
+        }
+    }
+
+    /// The half, where a login is held.
+    #[must_use]
+    pub const fn half(self) -> Option<LoginHalf> {
+        match self {
+            Self::Half(half) => Some(half),
+            Self::Absent | Self::Unread => None,
+        }
+    }
+
+    /// Its word in the pair: the half's ([`LoginHalf::word`]), `none` or `unread`.
+    #[must_use]
+    pub const fn word(self) -> &'static str {
+        match self {
+            Self::Half(half) => half.word(),
+            Self::Absent => "none",
+            Self::Unread => "unread",
+        }
+    }
+
+    /// Whether a vault token stands in for the login ([`LoginHalf::InUse`]).
+    #[must_use]
+    pub fn in_use(self) -> bool {
+        self == Self::Half(LoginHalf::InUse)
+    }
+}
+
 /// Everything the Account card says of one account that a file, a table or the journal holds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccountCard {
@@ -557,8 +616,9 @@ pub struct Inputs<'a> {
 }
 
 /// The roster row a session runs on: the row `label` names, unless its expected address
-/// contradicts the session's `email`; with no label, the row whose expected address is the
-/// session's. Never the store's active fallback: a session's own figures belong to its own
+/// contradicts the session's `email`; otherwise (no label, or one the address contradicts) the
+/// row whose expected address is the session's, since the address observed beats the label
+/// believed. Never the store's active fallback: a session's own figures belong to its own
 /// account alone.
 #[must_use]
 pub fn session_row<'a>(
@@ -566,20 +626,20 @@ pub fn session_row<'a>(
     label: Option<&str>,
     email: Option<&str>,
 ) -> Option<&'a Row> {
-    match label {
-        Some(label) => roster.row(label).filter(|row| {
-            email.is_none_or(|email| {
-                row.expected_identity_email()
-                    .is_none_or(|expected| accounts::email_matches(expected, email))
-            })
-        }),
-        None => email.and_then(|email| {
+    let labelled = label.and_then(|label| roster.row(label)).filter(|row| {
+        email.is_none_or(|email| {
+            row.expected_identity_email()
+                .is_none_or(|expected| accounts::email_matches(expected, email))
+        })
+    });
+    labelled.or_else(|| {
+        email.and_then(|email| {
             roster.rows.iter().find(|row| {
                 row.expected_identity_email()
                     .is_some_and(|expected| accounts::email_matches(expected, email))
             })
-        }),
-    }
+        })
+    })
 }
 
 /// Which account the card is about ([`Who`]): for Claude Code the session's own row

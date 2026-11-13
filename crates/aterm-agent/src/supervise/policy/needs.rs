@@ -1629,7 +1629,8 @@ pub(super) fn sanitized(need: &str) -> String {
     cut
 }
 
-/// What the report `tail` names only a person can give, each need one line.
+/// What the report `tail` names after a `NEEDS YOU:` head, each need one line: the grammar's
+/// read, credential lines among them ([`persons_needs`] leaves those out).
 #[must_use]
 pub fn needs_you(tail: &str) -> Vec<String> {
     let read = needs_lines(tail);
@@ -1644,6 +1645,24 @@ pub fn needs_you(tail: &str) -> Vec<String> {
         out.push(UNREAD_NEED.to_string());
     }
     out
+}
+
+/// What the report `tail` names only a person can give ([`needs_you`]): a line that asks for a
+/// credential is no person's ([`super::credential_need`]); it is in [`credential_needs`].
+#[must_use]
+pub fn persons_needs(tail: &str) -> Vec<String> {
+    let mut needs = needs_you(tail);
+    needs.retain(|need| !super::credential_need::is_credential(need));
+    needs
+}
+
+/// The `NEEDS YOU:` lines of `tail` that ask for a credential, which aterm resolves on the
+/// secrets path instead of showing them to a person ([`super::credential_need::wants_of`]).
+#[must_use]
+pub fn credential_needs(tail: &str) -> Vec<String> {
+    let mut needs = needs_you(tail);
+    needs.retain(|need| super::credential_need::is_credential(need));
+    needs
 }
 
 /// Whether `tail` says no need stands.

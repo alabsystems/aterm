@@ -259,7 +259,8 @@ fn own(why: &Restart, ask: &RestartAsk, st: &St, click: &Click) -> bool {
 /// a record that no longer says anything of it.
 fn own_record(opts: &Opts, click: &Click, st: &St) -> Option<Look> {
     if st.in_flight() {
-        let carried = relaunch::carry_restart(opts, upgrade::Agent::Claude, Some(st.pid), false);
+        let carried =
+            relaunch::carry_restart(opts, upgrade::Agent::Claude, Some(st.pid), false, now_s());
         return Some(
             match load_record(opts, &click.conversation).ok().flatten() {
                 Some(after) if after.in_flight() || after.confirming() => {
@@ -286,6 +287,7 @@ fn own_record(opts: &Opts, click: &Click, st: &St) -> Option<Look> {
             return Some(Look::Done);
         };
         let r = Report {
+            rung: None,
             pid: st.resumed_pid,
             tab: st.tab.clone(),
             session: click.conversation.clone(),

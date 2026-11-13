@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use aterm_durable::Flush;
+use aterm_update_core::update_record::{Hold, UpdateRecord, Witness};
 use aterm_update_core::{FileLock, LaunchName, Sentinel, ensure_private_dir, same_volume};
 
 use crate::manifest::{Manifest, Ready};
@@ -778,7 +779,7 @@ fn window_launch_of_trial_at(staging: &Staging, build: u64) -> Option<u64> {
         return None;
     };
     let armed = trial_armed_for(staging, build);
-    let this_trial = crate::manifest::FailedMark::read(&staging.trial())
+    let this_trial = crate::manifest::Trial::read(&staging.trial())
         .is_some_and(|trial| trial.matches(build, digest));
     (recorded == build && armed && this_trial).then_some(at)
 }
@@ -800,7 +801,7 @@ fn trial_window_launch(staging: &Staging, build: u64, now: u64) -> WindowLaunch 
 }
 
 fn record_window_launch(staging: &Staging, build: u64) {
-    let Some(trial) = crate::manifest::FailedMark::read(&staging.trial())
+    let Some(trial) = crate::manifest::Trial::read(&staging.trial())
         .filter(|trial| trial.build_number == build && !trial.sha256.is_empty())
     else {
         crate::warn(&format!(
@@ -809,6 +810,7 @@ fn record_window_launch(staging: &Staging, build: u64) {
         ));
         return;
     };
+    arm_record_trial(staging, build, &trial.sha256, Witness::Window);
     if let Err(error) = write_private_file(
         &trial_window_launch_path(staging),
         format!("{build} {} {}\n", trial.sha256, unix_now_secs()).as_bytes(),
@@ -820,8 +822,120 @@ fn record_window_launch(staging: &Staging, build: u64) {
     }
 }
 
+/// What a passed recovery proof says about the build on trial.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Settle {
+    /// It started as a person runs it: it runs, proven, and its hold ends.
+    Proven,
+    /// A headless start passed, which proves nothing about its windows: it runs, unproven, and
+    /// its hold lineage stays, so a window's crash loop of it still escalates.
+    KeptUnproven,
+}
+
+/// The trial of `build` (the artifact `trial` names) passed as `settle` says: the update
+/// record says it runs, proven with a hold on it or an older build ended
+/// ([`UpdateRecord::confirm`]), or unproven with the hold slot left alone
+/// ([`UpdateRecord::keep_unproven`]).
+fn confirm_record_trial(
+    staging: &Staging,
+    build: u64,
+    trial: Option<&crate::manifest::Trial>,
+    settle: Settle,
+) {
+    let sha = trial.and_then(|trial| crate::hold::sha(&trial.sha256));
+    let now = unix_now_secs();
+    crate::hold::edit(staging, "settle a trial", |record| match (settle, sha) {
+        (Settle::Proven, Some(sha)) => record.confirm(build, sha, now),
+        // With no digest there is no artifact to name as proven, and none a peer could match.
+        (Settle::Proven, None) | (Settle::KeptUnproven, _) => record.keep_unproven(build, sha),
+    });
+}
+
+/// Note in the update record that `(build, sha256)` is on trial, launched as `witness` saw it
+/// ([`UpdateRecord::arm_trial`]: arming the trial under way keeps its misses and never lowers
+/// a window's witness).
+fn arm_record_trial(staging: &Staging, build: u64, sha256: &str, witness: Witness) {
+    let Some(sha) = crate::hold::sha(sha256) else {
+        return;
+    };
+    let now = unix_now_secs();
+    crate::hold::edit(staging, "arm a trial", |record| {
+        record.arm_trial(build, sha, witness, now)
+    });
+}
+
+/// Who the armed trial of `build` was seen by: a window when one launched it, else nobody.
+fn trial_witness(staging: &Staging, build: u64) -> Witness {
+    if window_launch_of_trial_at(staging, build).is_some() {
+        Witness::Window
+    } else {
+        Witness::Headless
+    }
+}
+
+/// Note the armed trial (`trial.toml`) of `build` in the update record, when it names one: a
+/// trial armed by an earlier updater, or one whose record write was lost, is put back before it
+/// is settled.
+fn note_trial(record: &mut UpdateRecord, trial: &crate::manifest::Trial, witness: Witness) {
+    if let Some(sha) = crate::hold::sha(&trial.sha256) {
+        let since = record
+            .trial
+            .as_ref()
+            .map_or_else(unix_now_secs, |note| note.since);
+        record.arm_trial(trial.build_number, sha, witness, since);
+    }
+}
+
+/// A trial of `build` settled keeping it, never proven: it runs, and its artifact is held
+/// ([`aterm_update_core::update_record::Cause::Unproven`]) so the build is not offered again
+/// before its hold lapses. `why` is kept where the trial noted no miss of its own.
+fn hold_unproven_trial(staging: &Staging, build: u64, why: &str) {
+    let Some(trial) =
+        crate::manifest::Trial::read(&staging.trial()).filter(|trial| trial.build_number == build)
+    else {
+        return;
+    };
+    let witness = trial_witness(staging, build);
+    let now = unix_now_secs();
+    crate::hold::edit(staging, "hold an unproven trial", |record| {
+        note_trial(record, &trial, witness);
+        if record
+            .trial
+            .as_ref()
+            .is_some_and(|note| note.why.is_empty())
+        {
+            record.note_miss(why);
+        }
+        record.unproven(aterm_stamp::app_version(), now);
+    });
+}
+
+/// The crash-loop revert's verdict: hold the reverted trial's artifact (its witness and the
+/// latest miss's reason, on the crash schedule) and note that `restored` runs again. Returns
+/// the hold it set, or `None` when the trial had no identity or the record could not be written
+/// (the build is then tried again on the next check).
+fn hold_reverted_trial(staging: &Staging, build: u64, restored: u64) -> Option<Hold> {
+    let trial = crate::manifest::Trial::read(&staging.trial())
+        .filter(|trial| trial.build_number == build)?;
+    let witness = trial_witness(staging, build);
+    let now = unix_now_secs();
+    let (record, ()) = crate::hold::edit(staging, "hold a reverted trial", |record| {
+        note_trial(record, &trial, witness);
+        record.revert(aterm_stamp::app_version(), now);
+        if record.running != restored {
+            record.running = restored;
+            record.running_sha = None;
+            record.proven = false;
+        }
+    })?;
+    record.hold.filter(|hold| hold.build == build)
+}
+
 fn clear_trial_identity(staging: &Staging) {
-    crate::manifest::FailedMark::clear(&staging.trial());
+    crate::manifest::Trial::clear(&staging.trial());
+    if crate::hold::load(staging).trial.is_some() {
+        crate::hold::edit(staging, "end a trial", |record| record.trial = None);
+    }
     let _ = std::fs::remove_file(trial_window_launch_path(staging));
 }
 
@@ -839,32 +953,72 @@ pub(crate) fn window_trial_wait_at(staging: &Staging, build: u64, now: u64) -> O
     // Armed as the confirmation reads it ([`trial_armed_for`]): a trial whose
     // sentinel does not read but whose identity names the build is retried, so its
     // refusal is said too.
-    if trial_armed_for(staging, build) {
-        let ledger = crate::health::Health::read(&staging.health());
-        if ledger.trial_proof_failure_build == build && !ledger.trial_proof_failure.is_empty() {
-            // The recorded words end with what ends the hold (`refused_confirmation`).
-            return Some(format!(
-                "build {build} is on trial after its update; the last confirmation was \
-                 refused (first at {}): {}",
-                ledger.trial_proof_failure_at, ledger.trial_proof_failure
-            ));
-        }
+    if trial_armed_for(staging, build)
+        && let Some(words) = trial_refusal_words(staging, build)
+    {
+        return Some(format!(
+            "build {build} is on trial after its update; the last confirmation was refused: \
+             {words}"
+        ));
     }
     match trial_window_launch(staging, build, now) {
-        WindowLaunch::Waiting { until } => Some(window_trial_wait_notice(build, until)),
+        WindowLaunch::Waiting { until } => {
+            let notice = window_trial_wait_notice(build, until);
+            Some(
+                match crate::window_start_failure::held(
+                    staging,
+                    build,
+                    &trial_digest(staging, build),
+                ) {
+                    Ok(Some(failure)) => format!(
+                        "{notice}; a window running build {} saw these bytes fail to start at \
+                         {} ({})",
+                        failure.by_build, failure.at, failure.signature
+                    ),
+                    Ok(None) | Err(_) => notice,
+                },
+            )
+        }
         WindowLaunch::None | WindowLaunch::Lapsed => None,
     }
+}
+
+/// The window-start failure on record as `aterm ctl update status` reports it to `current_build`:
+/// only bytes of a newer build, or the bytes of its own armed trial or of its headless-settled
+/// trial awaiting a window, which are the ones a lane of this build honours it for.
+pub(crate) fn window_start_failure_for_report(
+    staging: &Staging,
+    current_build: u64,
+) -> Option<crate::WindowStartFailure> {
+    let failure = crate::window_start_failure::read(staging).ok().flatten()?;
+    let own_trial = || {
+        trial_armed_for(staging, current_build)
+            && failure.names(current_build, &trial_digest(staging, current_build))
+    };
+    let own_unproven = || {
+        WindowUnproven::read(staging)
+            .is_some_and(|record| failure.names(record.build, &record.digest))
+    };
+    (failure.build > current_build
+        || (failure.build == current_build && (own_trial() || own_unproven())))
+    .then_some(failure)
 }
 
 fn window_unproven_path(staging: &Staging) -> PathBuf {
     staging.root.join("boot.sentinel.window-unproven")
 }
 
+/// A trial a headless launch settled while no window had proved it: its window lane, which a
+/// window launch of the same bytes reopens ([`rearm_window_unproven_trial`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct WindowUnproven {
     build: u64,
     digest: String,
     at: u64,
+    /// The launches the settled trial counted that nothing proved, carried for bytes a window here
+    /// saw fail to start, or kept where that record could not be read ([`Carried`]); 0 otherwise.
+    /// The first line's optional 4th field (absent reads as 0).
+    attempts: u32,
     install_root: PathBuf,
 }
 
@@ -876,11 +1030,16 @@ impl WindowUnproven {
         let build = crate::parse_uint::<u64>(fields.next()?).filter(|build| *build != 0)?;
         let digest = canonical_digest(fields.next()?)?;
         let at = crate::parse_uint::<u64>(fields.next()?)?;
+        let attempts = match fields.next() {
+            None => 0,
+            Some(field) => crate::parse_uint::<u32>(field)?,
+        };
         let install_root = PathBuf::from(lines.next()?);
         install_root.is_absolute().then_some(Self {
             build,
             digest,
             at,
+            attempts,
             install_root,
         })
     }
@@ -889,10 +1048,11 @@ impl WindowUnproven {
         write_private_file(
             &window_unproven_path(staging),
             format!(
-                "{} {} {}\n{}\n",
+                "{} {} {} {}\n{}\n",
                 self.build,
                 self.digest,
                 self.at,
+                self.attempts,
                 self.install_root.display()
             )
             .as_bytes(),
@@ -915,21 +1075,111 @@ fn window_unproven_names(staging: &Staging, build: u64) -> bool {
     WindowUnproven::read(staging).is_some_and(|record| record.build == build)
 }
 
+/// The launches of `build`'s armed trial a headless settle carries for bytes a window here saw
+/// fail to start: the sentinel's count less this process's own named launch, which proved the
+/// bytes start headless (0 for another build or none armed).
+fn carried_attempts(sentinel: &Sentinel, build: u64) -> u32 {
+    let Some((_, attempts)) = sentinel.read_state().filter(|(armed, _)| *armed == build) else {
+        return 0;
+    };
+    let settler_counted = TrialLauncher::this_process()
+        .is_some_and(|this| sentinel.named_launches(build).contains(&this.name()));
+    attempts.saturating_sub(u32::from(settler_counted))
+}
+
+/// What a headless settle of a trial carries into the window re-trial it keeps
+/// ([`carried_for_failed_bytes`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Carried {
+    /// No window here saw these bytes fail to start: their re-trial starts at 0 and lapses.
+    Nothing,
+    /// A window here saw these bytes fail to start: their re-trial has no lapse and resumes at
+    /// these launches ([`carried_attempts`]).
+    FailedBytes(u32),
+    /// Whether a window here saw these bytes fail to start could not be read (`error`): the
+    /// launches ([`carried_attempts`]) are kept, and the re-arm, which reads the record again,
+    /// decides whether they count ([`rearm_window_unproven_trial`]).
+    Undecided { attempts: u32, error: String },
+}
+
+impl Carried {
+    /// The launches the window re-trial's record keeps.
+    const fn attempts(&self) -> u32 {
+        match self {
+            Self::Nothing => 0,
+            Self::FailedBytes(attempts) | Self::Undecided { attempts, .. } => *attempts,
+        }
+    }
+
+    /// What reopens the window lane the headless settle kept.
+    fn reopens(&self) -> String {
+        let within = WINDOW_TRIAL_HEADLESS_WAIT.as_secs() / 3600;
+        match self {
+            Self::Nothing => format!("a window launch within {within} h puts it back on trial"),
+            Self::FailedBytes(carried) => format!(
+                "a window here saw these bytes fail to start: the next window launch of them, \
+                 however late, puts them back on trial with {carried} launch(es) counted"
+            ),
+            Self::Undecided { attempts, error } => format!(
+                "whether a window here saw these bytes fail to start could not be read \
+                 ({error}): {attempts} launch(es) are kept for their window re-trial, which \
+                 resumes at them if the record then names these bytes, and otherwise a window \
+                 launch within {within} h puts it back on trial"
+            ),
+        }
+    }
+}
+
+/// What a headless settle of `build`'s bytes `digest` carries into their window re-trial, read
+/// under the apply lock before the settle disarms the trial. For bytes a window here saw fail to
+/// start, or where that record cannot be read, a give-back owed since it met a held apply lock is
+/// paid first ([`pay_owed_trial_launches`]): its launch was forgiven (a stall its parent judged no
+/// failure of the bytes), and carrying it would charge it for good.
+fn carried_for_failed_bytes(
+    staging: &Staging,
+    sentinel: &Sentinel,
+    build: u64,
+    digest: &str,
+) -> Carried {
+    let failed = crate::window_start_failure::names(staging, build, digest);
+    if failed == Ok(false) {
+        return Carried::Nothing;
+    }
+    pay_owed_trial_launches(staging, sentinel);
+    let attempts = carried_attempts(sentinel, build);
+    match failed {
+        Ok(_) => Carried::FailedBytes(attempts),
+        Err(error) => {
+            crate::warn(&format!(
+                "build {build}'s trial is settled by a headless launch, and whether a window \
+                 here saw these bytes fail to start could not be read ({error}): its \
+                 {attempts} unproven launch(es) are kept for the window re-trial to decide"
+            ));
+            Carried::Undecided { attempts, error }
+        }
+    }
+}
+
+/// Put `build` back on trial at this window launch from the record a headless settle left, and
+/// answer the count it armed at, or `None` with nothing armed. Bytes a window here saw fail to
+/// start are re-armed whatever the record's age, at the launches it carried (below the revert
+/// threshold, so the launch about to be counted decides); any other record re-arms at 0 within
+/// [`WINDOW_TRIAL_HEADLESS_WAIT`] and is dropped after it. Where the window-start failure record
+/// cannot be read, nothing is armed or dropped: the launch is not counted, and a later one decides
+/// once it reads, so one failed read never discards the bytes' re-trial nor its count.
 fn rearm_window_unproven_trial(
     staging: &Staging,
     sentinel: &Sentinel,
     build: u64,
     app_root: &Path,
     now: u64,
-) -> bool {
-    let Some(record) = WindowUnproven::read(staging).filter(|record| record.build == build) else {
-        return false;
-    };
+) -> Option<u32> {
+    let record = WindowUnproven::read(staging).filter(|record| record.build == build)?;
     if sentinel.read_state().is_some()
         || record.install_root != app_root
         || marker_present(&staging.ready)
     {
-        return false;
+        return None;
     }
     let drop_record = |why: &str| {
         crate::log(&format!(
@@ -937,9 +1187,24 @@ fn rearm_window_unproven_trial(
              put it back on trial: {why}"
         ));
         clear_window_unproven(staging);
-        false
+        None
     };
-    if record.lapsed(now) {
+    // Read closed, as every other reader of the record is: bytes it might name keep their
+    // re-trial and the count the settle kept for them, so a failed read neither drops nor zeroes
+    // the re-trial nor leaves a window launch uncounted. Bytes it does not name lose only a lapse,
+    // and their first window that presents confirms them.
+    let evidence = match crate::window_start_failure::names(staging, build, &record.digest) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            crate::warn(&format!(
+                "build {build} was settled by a headless launch, and whether a window here saw \
+                 these bytes fail to start could not be read ({error}): this window launch puts \
+                 it back on trial as bytes a window saw fail, at the count that settle kept"
+            ));
+            true
+        }
+    };
+    if record.lapsed(now) && !evidence {
         return drop_record(&format!(
             "no window launched it within {} h",
             WINDOW_TRIAL_HEADLESS_WAIT.as_secs() / 3600
@@ -956,7 +1221,7 @@ fn rearm_window_unproven_trial(
     ) {
         return drop_record("the installed receipt no longer names that artifact");
     }
-    if let Err(error) = crate::manifest::FailedMark::record_required(
+    if let Err(error) = crate::manifest::Trial::record_required(
         &staging.trial(),
         build,
         &record.digest,
@@ -966,26 +1231,40 @@ fn rearm_window_unproven_trial(
             "could not put build {build} back on trial for a window launch (persist trial \
              identity: {error}); this launch is not counted against it"
         ));
-        return false;
+        return None;
     }
     let _ = std::fs::remove_file(trial_launchers_path(staging));
     let _ = std::fs::remove_file(trial_window_launch_path(staging));
-    if let Err(error) = sentinel.arm_with(build, install_flush(staging, app_root)) {
-        crate::manifest::FailedMark::clear(&staging.trial());
+    let resumed_at = if evidence {
+        record.attempts.min(MAX_BOOT_ATTEMPTS - 1)
+    } else {
+        0
+    };
+    if let Err(error) = sentinel.arm_at(build, resumed_at, install_flush(staging, app_root)) {
+        crate::manifest::Trial::clear(&staging.trial());
         crate::warn(&format!(
             "could not put build {build} back on trial for a window launch (arm: {error}); \
              this launch is not counted against it"
         ));
-        return false;
+        return None;
     }
     clear_window_unproven(staging);
+    arm_record_trial(staging, build, &record.digest, Witness::Window);
     crate::log(&format!(
         "build {build} was settled by a headless launch, which proves nothing about its \
          windows: this window launch puts it back on trial over the retained predecessor \
-         at {}",
-        fixed.display()
+         at {}{}",
+        fixed.display(),
+        if evidence {
+            format!(
+                ", resuming at the {resumed_at} launch(es) its last trial counted, since a \
+                 window here saw these bytes fail to start, or that could not be read"
+            )
+        } else {
+            String::new()
+        }
     ));
-    true
+    Some(resumed_at)
 }
 
 #[cfg_attr(
@@ -1019,6 +1298,7 @@ fn count_trial_launch(
     launcher: Option<TrialLauncher>,
     handoff_target: bool,
     witness: crate::TrialWitness,
+    resumed: bool,
 ) -> Result<(), String> {
     match witness {
         crate::TrialWitness::Headless => {
@@ -1054,7 +1334,13 @@ fn count_trial_launch(
                 && overlap_exempts(witness, live.witness)
         })
         .map(|live| live.launcher);
-    let sentinel_age = mtime(&staging.root.join("boot.sentinel")).and_then(|t| t.elapsed().ok());
+    // A trial this launch just re-armed at a carried count was not counted by a launch moments
+    // ago: its sentinel is new, and the burst rule must not swallow its first launch.
+    let sentinel_age = if resumed {
+        None
+    } else {
+        mtime(&staging.root.join("boot.sentinel")).and_then(|t| t.elapsed().ok())
+    };
     pay_owed_trial_launches(staging, sentinel);
     let attempts_now = sentinel.read_state().map_or(0, |(_, attempts)| attempts);
     if launch_is_burst(attempts_now, sentinel_age) {
@@ -1097,7 +1383,7 @@ fn prepare_trial(
     install_root: &Path,
 ) -> Result<Sentinel, String> {
     let sentinel = boot_sentinel(staging);
-    if let Err(error) = crate::manifest::FailedMark::record_required(
+    if let Err(error) = crate::manifest::Trial::record_required(
         &staging.trial(),
         ready.build_number,
         &ready.dmg_sha256,
@@ -1115,12 +1401,18 @@ fn prepare_trial(
     let _ = std::fs::remove_file(trial_window_launch_path(staging));
     let _ = remove_path_no_follow(&owed_give_backs_dir(staging));
     clear_window_unproven(staging);
+    arm_record_trial(
+        staging,
+        ready.build_number,
+        &ready.dmg_sha256,
+        Witness::Headless,
+    );
     Ok(sentinel)
 }
 
 #[must_use]
 fn trial_owned_by(staging: &Staging, app_root: &Path) -> bool {
-    match crate::manifest::FailedMark::read(&staging.trial()).and_then(|trial| trial.install_root) {
+    match crate::manifest::Trial::read(&staging.trial()).and_then(|trial| trial.install_root) {
         None => true,
         Some(recorded) => {
             let recorded = Path::new(&recorded);
@@ -1326,7 +1618,7 @@ fn escape_wedged_foreign_trial(staging: &Staging, current_build: u64, armed_buil
     if observed < MAX_BOOT_ATTEMPTS {
         return false;
     }
-    let owned_elsewhere = crate::manifest::FailedMark::read(&staging.trial())
+    let owned_elsewhere = crate::manifest::Trial::read(&staging.trial())
         .and_then(|trial| trial.install_root)
         .is_some_and(|root| {
             let root = Path::new(&root);
@@ -1377,7 +1669,7 @@ fn rollback_path(installed: &Path) -> PathBuf {
     installed.with_file_name("aterm.app.rollback")
 }
 
-fn canonical_digest(digest: &str) -> Option<String> {
+pub(crate) fn canonical_digest(digest: &str) -> Option<String> {
     let digest = digest.trim();
     aterm_codec::hex::is_hex(digest, 64).then(|| digest.to_ascii_lowercase())
 }
@@ -1390,7 +1682,7 @@ fn ready_matches_verified_identity(ready: &Ready, build: u64, sealed_commit: &st
 }
 
 fn trial_authorizes_candidate(staging: &Staging, build: u64, sealed_commit: &str) -> bool {
-    let Some(trial) = crate::manifest::FailedMark::read(&staging.trial()) else {
+    let Some(trial) = crate::manifest::Trial::read(&staging.trial()) else {
         return false;
     };
     let Some(trial_digest) = canonical_digest(&trial.sha256) else {
@@ -2060,7 +2352,7 @@ fn prove_current_trial(
         ));
     }
 
-    let trial = crate::manifest::FailedMark::read(&staging.trial())
+    let trial = crate::manifest::Trial::read(&staging.trial())
         .ok_or_else(|| "installed trial has no exact trial identity".to_string())?;
     let trial_digest = canonical_digest(&trial.sha256)
         .filter(|_| trial.build_number == current_build)
@@ -2810,7 +3102,7 @@ fn handoff_floor_refusal(staging: &Staging, build: u64, machine: Option<&str>) -
 }
 
 /// Check whether a cached pre-verification pass for staged `build` at `commit` still matches the
-/// published, unquarantined, floor-admitted stage.
+/// published, unheld, floor-admitted stage.
 pub(crate) fn handoff_cached_pass_refusal_at(
     staging: &Staging,
     build: u64,
@@ -2839,15 +3131,8 @@ pub(crate) fn handoff_cached_pass_refusal_at(
             "staged build {build} is not the authorized commit {commit}; not handing off to it"
         ));
     }
-    match crate::manifest::artifact_quarantined_for_gate(staging, build, &ready.dmg_sha256) {
-        Err(refusal) => return Some(refusal),
-        Ok(true) => {
-            return Some(format!(
-                "staged build {build} is quarantined: it crash-looped on this machine and was \
-                 reverted"
-            ));
-        }
-        Ok(false) => {}
+    if let Some(hold) = crate::hold::held(staging, build, &ready.dmg_sha256, unix_now_secs()) {
+        return Some(format!("staged {}", crate::hold::refusal(&hold)));
     }
     if let Some(refusal) = handoff_floor_refusal(staging, build, ready.machine_id.as_deref()) {
         return Some(refusal);
@@ -2958,15 +3243,13 @@ fn preverify_staged_handoff_candidate_with_enter<R>(
             ready.build_number
         )));
     }
-    if crate::manifest::artifact_quarantined_for_gate(
+    if let Some(hold) = crate::hold::held(
         staging,
         ready.build_number,
         &ready.dmg_sha256,
-    )? {
-        return Err(format!(
-            "staged build {} is quarantined: it crash-looped on this machine and was reverted",
-            ready.build_number
-        ));
+        unix_now_secs(),
+    ) {
+        return Err(format!("staged {}", crate::hold::refusal(&hold)));
     }
     if let Some(refusal) = handoff_apply_floor_refusal_at(staging, ready.build_number) {
         return Err(refusal);
@@ -3185,17 +3468,15 @@ fn publish_local_pair(
 }
 
 fn stage_withdrawn(staging: &Staging, ready: &Ready) -> Result<(), String> {
-    if crate::manifest::artifact_quarantined_for_gate(
+    if let Some(hold) = crate::hold::held(
         staging,
         ready.build_number,
         &ready.dmg_sha256,
-    )
-    .map_err(|refusal| format!("stage refused: {refusal}"))?
-    {
+        unix_now_secs(),
+    ) {
         return Err(format!(
-            "stage refused: build {} ({}) is quarantined — it crash-looped on this machine \
-             and was reverted while this check was downloading it",
-            ready.build_number, ready.dmg_sha256
+            "stage refused: {} — held while this check was downloading it",
+            crate::hold::refusal(&hold)
         ));
     }
     if let Some(why) = crate::manifest::Floor::read_for_gate(&staging.floor())
@@ -3838,14 +4119,12 @@ pub(crate) fn unconfirmed_trial_refusal(armed_build: u64) -> String {
 /// that keeps it armed and, in the recorded words, what ends it ([`refused_confirmation`]). A
 /// person's Install gets no shorter bound: one transient refusal would then end the trial.
 fn refused_trial_refusal(staging: &Staging, build: u64) -> String {
-    let ledger = crate::health::Health::read(&staging.health());
-    if ledger.trial_proof_failure_build != build || ledger.trial_proof_failure.is_empty() {
+    let Some(words) = trial_refusal_words(staging, build) else {
         return unconfirmed_trial_refusal(build);
-    }
+    };
     crate::verify::mark_passing(format!(
         "update trial for build {build} is still unconfirmed: its recovery proof is refused \
-         ({})",
-        ledger.trial_proof_failure
+         ({words})"
     ))
 }
 
@@ -3930,13 +4209,17 @@ fn boot_lane_auto_apply(
 }
 
 /// Read `auto_apply` as [`boot_lane_auto_apply`] says, before the lock, then admit the stage under the
-/// apply lock and put it through the boot's lane.
+/// apply lock and put it through the boot's lane. A headless boot (`witness`) leaves bytes a window
+/// here saw fail to start staged for a window, under the same lock, retiring and arming nothing
+/// ([`crate::window_start_failure::headless_refusal`]); a window's boot is the witness that may
+/// try them.
 fn admit_stage_for_boot_lane(
     staging: &Staging,
     installed: &Path,
     (current_build, current_commit): (u64, Option<&str>),
     expected: Option<&ExpectedArtifact>,
     image: crate::ImageReplacement,
+    witness: crate::TrialWitness,
     read_auto_apply: impl FnOnce() -> bool,
 ) -> Result<AdmittedStage, ApplyOutcome> {
     let auto_apply = boot_lane_auto_apply(
@@ -3946,6 +4229,12 @@ fn admit_stage_for_boot_lane(
     );
     let admitted =
         admit_stage_under_apply_lock(staging, installed, current_build, current_commit, expected)?;
+    if witness == crate::TrialWitness::Headless
+        && let Some(outcome) =
+            crate::window_start_failure::headless_refusal(staging, current_build, &admitted.ready)
+    {
+        return Err(outcome);
+    }
     boot_lane_under_apply_lock(staging, image, auto_apply, admitted)
 }
 
@@ -4108,6 +4397,7 @@ fn apply_staged_if_ready_inner(
         (current_build, current_commit),
         expected_artifact.as_ref(),
         image,
+        witness,
         aterm_update_core::settings::update_auto_apply,
     ) {
         Ok(admitted) => admitted,
@@ -4176,10 +4466,12 @@ fn apply_staged_if_ready_inner(
         Ok(receipt_restore_error) => receipt_restore_error,
         Err(outcome) => return outcome,
     };
-    crate::manifest::FailedMark::record_stage_failure(
-        &staging.failed(),
+    crate::hold::stage_failed(
+        &staging,
         ready.build_number,
+        &ready.version,
         &ready.dmg_sha256,
+        &format!("it did not start: {err}"),
         unix_now_secs(),
     );
     clear_trial_identity(&staging);
@@ -4370,10 +4662,12 @@ fn swap_admitted_stage(
             recover_prepared_candidate(&prepared, staging);
         }
         if stage_failure_is_a_verdict(&error) {
-            crate::manifest::FailedMark::record_stage_failure(
-                &staging.failed(),
+            crate::hold::stage_failed(
+                staging,
                 ready.build_number,
+                &ready.version,
                 &ready.dmg_sha256,
+                &format!("its start probe failed: {error}"),
                 unix_now_secs(),
             );
         }
@@ -4791,17 +5085,17 @@ fn check_boot_health_with_proof(
         return None;
     }
     let b = resolve_installed()?;
-    if !armed_for_this_build(&sentinel)
-        && !rearm_window_unproven_trial(
+    let rearmed_at = if armed_for_this_build(&sentinel) {
+        None
+    } else {
+        Some(rearm_window_unproven_trial(
             staging,
             &sentinel,
             current_build,
             &b.app_root,
             unix_now_secs(),
-        )
-    {
-        return None;
-    }
+        )?)
+    };
     if !trial_owned_by(staging, &b.app_root) {
         crate::log(&format!(
             "boot sentinel armed for build {current_build} belongs to another install of \
@@ -4817,6 +5111,7 @@ fn check_boot_health_with_proof(
         TrialLauncher::this_process(),
         handoff_target,
         witness,
+        rearmed_at.is_some_and(|carried| carried > 0),
     ) {
         return Some(ApplyOutcome::Deferred(error));
     }
@@ -4867,16 +5162,12 @@ fn check_boot_health_with_proof(
                     apply_lock,
                 ));
             }
-            let disarm = sentinel.confirm();
-            crate::health::Health::record_apply_failure(
-                &staging.health(),
+            hold_unproven_trial(
+                staging,
                 current_build,
-                current_build,
-                &format!(
-                    "trial recovery proof failed {MAX_BOOT_ATTEMPTS}x ({error}); disarmed \
-                     the boot sentinel to keep updates possible"
-                ),
+                &format!("its rollback could not be proven {MAX_BOOT_ATTEMPTS} times: {error}"),
             );
+            let disarm = sentinel.confirm();
             crate::status::record(
                 staging,
                 current_build,
@@ -5008,16 +5299,9 @@ fn revert_to_rollback(
             "rollback succeeded but trial disarm failed: {error}"
         ));
     }
-    if let Some(t) = crate::manifest::FailedMark::read(&staging.trial())
-        && t.build_number == current_build
-    {
-        crate::manifest::quarantine_artifact(
-            staging,
-            t.build_number,
-            &t.sha256,
-            install_flush(staging, &b.app_root),
-        );
-    }
+    // The crash-loop hold takes the record's one slot, and a window-start failure of the same
+    // bytes ends: this hold holds every lane ([`UpdateRecord::revert`]).
+    let held = hold_reverted_trial(staging, current_build, restored_build);
     let _ = std::fs::remove_dir_all(&rb);
     crate::manifest::InstalledReceipt::clear(&staging.installed_receipt());
     clear_trial_identity(staging);
@@ -5030,23 +5314,23 @@ fn revert_to_rollback(
         )
     });
     let breach = breach.as_deref().unwrap_or("");
-    crate::health::Health::record_apply_failure(
-        &staging.health(),
-        current_build,
-        current_build,
-        &format!(
-            "crash-loop revert: build {current_build} failed to confirm boot health \
-             {MAX_BOOT_ATTEMPTS} times in a row and was reverted to build \
-             {restored_build}{breach}"
-        ),
-    );
+    let held = held.map_or_else(String::new, |hold| {
+        format!(
+            "; build {current_build} is held until {} ({}, try {})",
+            crate::hold::until_words(&hold),
+            hold.why,
+            hold.tries
+        )
+    });
     crate::status::record(
         staging,
         current_build,
-        &format!("reverted crash-looping update to the previous build {restored_build}{breach}"),
+        &format!(
+            "reverted crash-looping update to the previous build {restored_build}{breach}{held}"
+        ),
     );
     crate::warn(&format!(
-        "reverted a crash-looping update to the previous build {restored_build}{breach}"
+        "reverted a crash-looping update to the previous build {restored_build}{breach}{held}"
     ));
     if revert_lane(image) == RevertLane::ExitInstead {
         return ApplyOutcome::Reverted(format!(
@@ -5162,12 +5446,9 @@ fn supersede_activation_locked(
     if let Some(why) = floor.withdraws(newer_build, ready.machine_id.as_deref()) {
         return settled(format!("the staged {why}"));
     }
-    match crate::manifest::artifact_quarantined_for_gate(staging, newer_build, &ready.dmg_sha256) {
-        Ok(true) => {
-            return settled(format!("the staged build {newer_build} is quarantined"));
-        }
-        Ok(false) => {}
-        Err(refusal) => return for_now(refusal),
+    if let Some(hold) = crate::hold::held(staging, newer_build, &ready.dmg_sha256, unix_now_secs())
+    {
+        return settled(format!("the staged {}", crate::hold::refusal(&hold)));
     }
     if let Some(refusal) = ready.roster_authorization_stale(
         unix_now_secs(),
@@ -5353,7 +5634,7 @@ fn window_apply_failure_of(staging: &Staging, activation: u64) -> Option<WindowA
 /// The activation a window failed to switch to and the newer stage that may take its place, read
 /// without the apply lock or a signature check: a boot trial armed for an activation, a window's
 /// failure to switch to it in the ledger, and a ready stage newer than it that names the published
-/// bundle and that neither the quarantine nor the floor holds back. `None` is the usual answer.
+/// bundle and that neither a hold nor the floor holds back. `None` is the usual answer.
 pub(crate) fn failed_activation_waiting() -> Option<(u64, u64)> {
     if !crate::enabled() {
         return None;
@@ -5393,9 +5674,11 @@ struct FailedActivationGate {
 /// The gates of [`install_over_failed_activation_at`] that small files answer, read with no
 /// signature check, so a refusal here costs a later look as little: the look
 /// ([`failed_activation_found`]: an armed trial, a window's failure against it, a newer
-/// publishable stage), no window launch of the activation after that failure (a switch in flight
-/// that has not reported), no live window launch of it, this process running one of the two
-/// builds by number, and the stage's roster confirmation fresh. The live launch is a fast path:
+/// publishable stage), the newer stage's exact bytes not ones a window here saw fail to start
+/// (a record that cannot be read holds too: [`crate::window_start_failure`]), no window launch of
+/// the activation after that failure (a switch in flight that has not reported), no live window
+/// launch of it, this process running one of the two builds by number, and the stage's roster
+/// confirmation fresh. The live launch is a fast path:
 /// [`supersede_activation_locked`] waits it out under the lock too, and here it spares the
 /// verification of three bundles while a switch may still land.
 fn failed_activation_gates(
@@ -5409,6 +5692,23 @@ fn failed_activation_gates(
         return Err(NoneFailed);
     };
     let stays = |why: String| format!("the installed build {activation} stays in place: {why}");
+    match crate::window_start_failure::holds(staging, ready.build_number, &ready.dmg_sha256) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(Held(ForNow(stays(format!(
+                "the newer stage, build {}, is bytes a window here saw fail to start; a \
+                 headless install leaves them for a window",
+                ready.build_number
+            )))));
+        }
+        Err(error) => {
+            return Err(Held(ForNow(stays(format!(
+                "whether a window here saw the newer stage, build {}, fail to start could not \
+                 be read ({error})",
+                ready.build_number
+            )))));
+        }
+    }
     if let Some(launched) = window_launch_of_trial_at(staging, activation)
         && failure.at.is_none_or(|failed| launched > failed)
     {
@@ -5856,7 +6156,7 @@ fn trial_armed_for(staging: &Staging, current_build: u64) -> bool {
         Some((build, _)) => build == current_build,
         None => {
             sentinel.unreadable()
-                && crate::manifest::FailedMark::read(&staging.trial())
+                && crate::manifest::Trial::read(&staging.trial())
                     .is_some_and(|trial| trial.build_number == current_build)
         }
     }
@@ -5907,7 +6207,7 @@ fn with_trial_refusals<T>(
 
 /// The canonical digest `build`'s trial is keyed by, or `""` when its identity does not read.
 fn trial_digest(staging: &Staging, build: u64) -> String {
-    crate::manifest::FailedMark::read(&staging.trial())
+    crate::manifest::Trial::read(&staging.trial())
         .filter(|trial| trial.build_number == build)
         .and_then(|trial| canonical_digest(&trial.sha256))
         .unwrap_or_default()
@@ -6021,6 +6321,7 @@ enum TrialProof {
 fn confirm_trial_health_after_proof(
     staging: &Staging,
     current_build: u64,
+    settle: Settle,
     prove: impl FnOnce() -> Result<(), ProofRefusal>,
 ) -> TrialProof {
     let sentinel = boot_sentinel(staging);
@@ -6041,9 +6342,12 @@ fn confirm_trial_health_after_proof(
     if !trial_armed_for(staging, current_build) {
         return TrialProof::Gone;
     }
+    let trial = crate::manifest::Trial::read(&staging.trial())
+        .filter(|trial| trial.build_number == current_build);
     if let Err(error) = sentinel.confirm() {
         return TrialProof::DisarmFailed(error.to_string());
     }
+    confirm_record_trial(staging, current_build, trial.as_ref(), settle);
     clear_trial_identity(staging);
     crate::health::Health::record_apply_success(&staging.health());
     TrialProof::Settled
@@ -6076,21 +6380,16 @@ fn refused_confirmation(
         crate::TrialWitness::Headless => "a headless start",
     };
     let error = refusal.why.as_str();
-    let words = if refusal.reverts_at_launch_count {
-        format!(
-            "{who} reached its health checkpoint, but the installed build is not proven to be \
-             the running one: {error}; the trial stays armed for the launch count, whose \
-             launch {MAX_BOOT_ATTEMPTS} reverts to the previous build"
-        )
+    let what = if refusal.reverts_at_launch_count {
+        "the installed build is not proven to be the running one"
     } else {
-        format!(
-            "{who} reached its health checkpoint, but the trial's recovery proof failed: \
-             {error}; the running build retries it and settles the trial without the proof \
-             after {} in this process",
-            trial_bound_words()
-        )
+        "the trial's recovery proof failed"
     };
-    if crate::health::Health::record_trial_proof_failure(&staging.health(), build, &words) {
+    let words = format!(
+        "{who} reached its health checkpoint, but {what}: {error}; {}",
+        trial_refusal_ends(refusal.reverts_at_launch_count)
+    );
+    if note_trial_refusal(staging, build, error) {
         crate::warn(&format!("build {build}'s boot trial stays armed: {words}"));
     }
     if refusal.reverts_at_launch_count {
@@ -6123,7 +6422,10 @@ fn refused_confirmation(
 /// that replaced it, so it is not [`keep_settled_predecessor`]'s to release when this process
 /// ends. The next apply's swap replaces it ([`prepare_fixed_swap_candidate`]); a headless
 /// settle also leaves the window lane open where the trial's identity reads
-/// ([`rearm_window_unproven_trial`]).
+/// ([`rearm_window_unproven_trial`]), carrying the trial's unproven launches for bytes a window
+/// here saw fail to start, owed give-backs paid ([`carried_for_failed_bytes`]), and a window's
+/// settle, a window of the bytes at its checkpoint, withdraws that record
+/// ([`crate::window_start_failure`]).
 ///
 /// Unbounded here, on purpose: a sentinel the filesystem will not remove (a locked flag, a
 /// read-only volume) stays armed and the answer stays `Pending`, said once and re-asked.
@@ -6143,8 +6445,15 @@ fn settle_trial_at_bound(
         return crate::BootHealthVerdict::NO_TRIAL;
     }
     let digest = trial_digest(staging, build);
+    let sha = crate::hold::sha(&digest);
+    let sentinel = boot_sentinel(staging);
+    let carried = if witness == crate::TrialWitness::Headless && !digest.is_empty() {
+        carried_for_failed_bytes(staging, &sentinel, build, &digest)
+    } else {
+        Carried::Nothing
+    };
     let minutes = span_ms / 60_000;
-    if let Err(error) = boot_sentinel(staging).confirm() {
+    if let Err(error) = sentinel.confirm() {
         let line = format!(
             "build {build}'s update trial reached its bound ({count} refusals over {minutes} \
              min awake: {why}) but its sentinel could not be removed: {error}"
@@ -6170,7 +6479,17 @@ fn settle_trial_at_bound(
     // Without the record the window lane stays shut, and the predecessor stays where it is
     // all the same.
     let (checkpoint, window_lane_open) = match witness {
-        crate::TrialWitness::Window => ("window", false),
+        crate::TrialWitness::Window => {
+            if !digest.is_empty() {
+                crate::window_start_failure::withdraw_judged(
+                    staging,
+                    build,
+                    &digest,
+                    "a window of them settled their trial at its bound",
+                );
+            }
+            ("window", false)
+        }
         crate::TrialWitness::Headless => (
             "headless",
             !digest.is_empty()
@@ -6178,6 +6497,7 @@ fn settle_trial_at_bound(
                     build,
                     digest,
                     at: unix_now_secs(),
+                    attempts: carried.attempts(),
                     install_root: app_root.to_path_buf(),
                 }
                 .record(staging)
@@ -6187,22 +6507,104 @@ fn settle_trial_at_bound(
     // An earlier settle's record must not release this predecessor.
     clear_kept_predecessor(staging);
     reclaim_swapped_out_orphan(staging);
-    crate::health::Health::record_trial_settled_unproven(&staging.health());
+    crate::hold::edit(staging, "settle a trial unproven", |record| {
+        record.keep_unproven(build, sha)
+    });
     let line = format!(
         "settled build {build}'s update trial unproven at its {checkpoint} checkpoint: recovery \
          proof refused {count}x over {minutes} min awake ({why}); the previous build stays at \
          {} until {}; updates re-enabled",
         rollback.display(),
-        if window_lane_open {
-            "a window of this build confirms or reverts it, or the next update replaces it"
-        } else {
-            "the next update replaces it"
+        match (window_lane_open, &carried) {
+            (true, Carried::Nothing) => {
+                "a window of this build confirms or reverts it, or the next update replaces it"
+                    .to_string()
+            }
+            (true, carried) => format!(
+                "a window of this build confirms or reverts it, or the next update replaces \
+                 it ({})",
+                carried.reopens()
+            ),
+            (false, _) => "the next update replaces it".to_string(),
         }
     );
     crate::warn(&line);
     crate::status::record(staging, build, &line);
     forget_trial_refusals(staging);
     crate::BootHealthVerdict::SettledUnproven { build, why: line }
+}
+
+/// The node service is about to end its run because `build`'s boot trial could not prove its
+/// listener, for `why`: note that miss in the update record first
+/// ([`UpdateRecord::note_miss`]), so the hold a later crash-loop revert sets carries the node's
+/// reason. Returns whether it was noted (false with no trial of `build` armed, or a record that
+/// could not be written).
+pub(crate) fn note_trial_miss(staging: &Staging, build: u64, why: &str) -> bool {
+    let Some(trial) =
+        crate::manifest::Trial::read(&staging.trial()).filter(|trial| trial.build_number == build)
+    else {
+        return false;
+    };
+    let witness = trial_witness(staging, build);
+    crate::hold::edit(staging, "note a missed trial", |record| {
+        note_trial(record, &trial, witness);
+        record.note_miss(why)
+    })
+    .is_some_and(|(_, noted)| noted)
+}
+
+/// Note in the update record that `build`'s trial was refused for `words`, once per reason (a
+/// refusal said again is the same miss). Returns whether this reason was new.
+fn note_trial_refusal(staging: &Staging, build: u64, words: &str) -> bool {
+    let trial =
+        crate::manifest::Trial::read(&staging.trial()).filter(|trial| trial.build_number == build);
+    let Some(trial) = trial else {
+        return false;
+    };
+    let witness = trial_witness(staging, build);
+    crate::hold::edit(staging, "note a refused trial", |record| {
+        note_trial(record, &trial, witness);
+        let said = record
+            .trial
+            .as_ref()
+            .is_some_and(|note| !note.why.is_empty() && words.starts_with(note.why.as_str()));
+        !said && record.note_miss(words)
+    })
+    .is_some_and(|(_, noted)| noted)
+}
+
+/// What ends a trial whose proof was refused: the launch count, or (a refusal this process
+/// retries) the bound on its streak ([`count_trial_refusal`]).
+fn trial_refusal_ends(reverts_at_launch_count: bool) -> String {
+    if reverts_at_launch_count {
+        format!(
+            "the trial stays armed for the launch count, whose launch {MAX_BOOT_ATTEMPTS} \
+             reverts to the previous build"
+        )
+    } else {
+        format!(
+            "the running build retries it and settles the trial without the proof after {} \
+             in this process",
+            trial_bound_words()
+        )
+    }
+}
+
+/// The refusal the update record keeps for `build`'s trial, if any, with what ends it: the
+/// bound where this process holds a streak of refusals for the trial, else the launch count
+/// (a refusal the launch count reverts keeps no streak, and a new process starts none).
+fn trial_refusal_words(staging: &Staging, build: u64) -> Option<String> {
+    let why = crate::hold::load(staging)
+        .trial
+        .filter(|note| note.build == build && !note.why.is_empty())
+        .map(|note| note.why)?;
+    let digest = trial_digest(staging, build);
+    let streak = with_trial_refusals(|streaks| {
+        streaks
+            .get(&staging.root)
+            .is_some_and(|streak| streak.build == build && streak.digest == digest)
+    });
+    Some(format!("{why}; {}", trial_refusal_ends(!streak)))
 }
 
 /// The answer when a proof passed but its sentinel could not be removed: re-asked, and no
@@ -6223,7 +6625,9 @@ fn confirm_health_under_apply_lock_with_proof(
     now: ProbeClock,
     prove: impl FnOnce() -> Result<(), ProofRefusal>,
 ) -> crate::BootHealthVerdict {
-    match confirm_trial_health_after_proof(staging, current_build, prove) {
+    // The settle confirms the trial in the update record, which ends a hold on its build,
+    // a window-start failure of its bytes included ([`UpdateRecord::confirm`]).
+    match confirm_trial_health_after_proof(staging, current_build, Settle::Proven, prove) {
         TrialProof::Settled => {}
         TrialProof::Gone => {
             forget_trial_refusals(staging);
@@ -6396,10 +6800,14 @@ fn confirm_headless_keeping_predecessor(
     now: ProbeClock,
     prove: impl FnOnce() -> Result<(), ProofRefusal>,
 ) -> crate::BootHealthVerdict {
-    let digest = crate::manifest::FailedMark::read(&staging.trial())
+    let digest = crate::manifest::Trial::read(&staging.trial())
         .filter(|trial| trial.build_number == current_build)
         .and_then(|trial| canonical_digest(&trial.sha256));
-    match confirm_trial_health_after_proof(staging, current_build, prove) {
+    // Read before the proof's settle disarms the sentinel.
+    let carried = digest.as_deref().map_or(Carried::Nothing, |digest| {
+        carried_for_failed_bytes(staging, &boot_sentinel(staging), current_build, digest)
+    });
+    match confirm_trial_health_after_proof(staging, current_build, Settle::KeptUnproven, prove) {
         TrialProof::Settled => {}
         TrialProof::Gone => {
             forget_trial_refusals(staging);
@@ -6423,16 +6831,16 @@ fn confirm_headless_keeping_predecessor(
         build: current_build,
         digest,
         at: unix_now_secs(),
+        attempts: carried.attempts(),
         install_root: app_root.to_path_buf(),
     });
     match record.as_ref().map(|record| record.record(staging)) {
         Some(Ok(())) => crate::log(&format!(
             "build {current_build}'s trial was settled by a headless launch, which proves \
              nothing about its windows: the previous build stays at {} until a window of \
-             build {current_build} confirms it, and a window launch within {} h puts it \
-             back on trial",
+             build {current_build} confirms it, and {}",
             rollback_path(app_root).display(),
-            WINDOW_TRIAL_HEADLESS_WAIT.as_secs() / 3600
+            carried.reopens()
         )),
         failed => {
             crate::warn(&format!(
@@ -6916,14 +7324,16 @@ const UNRESOLVED_INSTALL: &str = "this process does not run from an install it c
 /// ([`refused_confirmation`]). Before a checkpoint it reads only, so a process that owes no
 /// trial is confirmed without drawing.
 ///
-/// Unbounded, and named in the answer's words: an armed trial whose window never draws is
-/// never asked at a checkpoint and stays `Pending` (disarming it would end the revert a
-/// build that cannot draw needs; reverting it would revert a possibly healthy build); a
-/// sentinel the filesystem will not remove ([`settle_trial_at_bound`]); a refusal that says
-/// the installed bundle is not the running build while its predecessor verifies, which is
-/// left to the launch count's revert ([`refused_confirmation`]); and a process with no awake
-/// clock, whose refusals span nothing ([`count_trial_refusal`]).
-/// [`WINDOW_TRIAL_HEADLESS_WAIT`] stays on the wall clock.
+/// An armed trial whose window never draws is never asked at a window checkpoint: disarming it
+/// would end the revert a build that cannot draw needs, and reverting it would revert a
+/// possibly healthy build. It stays armed, `Pending`, until a window of it draws or the launch
+/// count ends it; the GUI's startup gate stops waiting on it at its own patience.
+///
+/// Unbounded, and named in the answer's words: a sentinel the filesystem will not remove
+/// ([`settle_trial_at_bound`]); a refusal that says the installed bundle is not the running
+/// build while its predecessor verifies, which is left to the launch count's revert
+/// ([`refused_confirmation`]); and a process with no awake clock, whose refusals span nothing
+/// ([`count_trial_refusal`]).
 ///
 /// A checkpoint ask also releases an ended window's kept predecessor, which is no trial
 /// state; an ask before one locks, writes and removes nothing.
@@ -7314,7 +7724,7 @@ fn floor_withdrawal_gate(
     None
 }
 
-fn records_unreadable_deferral(
+pub(crate) fn records_unreadable_deferral(
     staging: &Staging,
     current_build: u64,
     ready: &Ready,
@@ -7333,7 +7743,7 @@ fn records_unreadable_deferral(
 }
 
 /// Check the admission gates for a stage read under the apply lock: expected handoff artifact,
-/// floor withdrawals, quarantine, published bundle match, and roster freshness.
+/// floor withdrawals, the update record's hold, published bundle match, and roster freshness.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -7388,24 +7798,13 @@ pub(crate) fn stage_admission_gates(
     if let Some(outcome) = floor_withdrawal_gate(staging, current_build, ready) {
         return Some(outcome);
     }
-    match crate::manifest::artifact_quarantined_for_gate(
-        staging,
-        ready.build_number,
-        &ready.dmg_sha256,
-    ) {
-        Err(refusal) => {
-            return Some(records_unreadable_deferral(
-                staging,
-                current_build,
-                ready,
-                refusal,
-            ));
-        }
-        Ok(true) => {
-            staging.retire_published();
-            return Some(ApplyOutcome::NoUpdate);
-        }
-        Ok(false) => {}
+    if let Some(hold) = crate::hold::held(staging, ready.build_number, &ready.dmg_sha256, now) {
+        crate::log(&format!(
+            "the staged build is not applied and its stage is retired: {}",
+            crate::hold::refusal(&hold)
+        ));
+        staging.retire_published();
+        return Some(ApplyOutcome::NoUpdate);
     }
     if !ready.names_published_bundle(staging) {
         staging.retire_published();

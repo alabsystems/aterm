@@ -19,14 +19,11 @@ use headless_boot::{Instance, boot_session, client_command, ctl, ctl_ok, field};
 /// that way, `headless_boot::standin`), and so, unrecorded, do agy's quota and
 /// model reads (`-p /usage`, `-p /model`), which an agy spawn makes before its
 /// launch: recorded, one could stand in for the launch at the test's read. Any
-/// other call writes the trusted-folders file its environment names (the
-/// retired Gemini CLI's `GEMINI_CLI_TRUSTED_FOLDERS_PATH`, which no worker is
-/// handed any more, so empty) to `$HOME/trust.txt`, then its argv NUL-separated to `$HOME/argv.bin`, whole
+/// other call writes its argv NUL-separated to `$HOME/argv.bin`, whole
 /// (written aside, then renamed), and exits 0.
 const STANDIN: &str = "#!/bin/sh\n\
     case \"$1\" in --version) echo '2.1.0 (Claude Code)'; exit 0 ;; esac\n\
     case \" $* \" in *' -p /usage '*|*' -p /model '*) exit 0 ;; esac\n\
-    printf '%s' \"${GEMINI_CLI_TRUSTED_FOLDERS_PATH-}\" > \"$HOME/trust.txt\"\n\
     for a in \"$@\"; do printf '%s\\000' \"$a\"; done > \"$HOME/argv.part\" && \
     mv \"$HOME/argv.part\" \"$HOME/argv.bin\"\n";
 
@@ -357,12 +354,6 @@ fn run_agent_worker(tag: &str, shell: &str, model: Option<&str>, word: &str) {
         .and_then(|at| argv.get(at + 1))
         .map(|id| String::from_utf8_lossy(id).into_owned());
     assert_eq!(session, None, "{word}: no session id of the line's");
-    let trust = std::fs::read_to_string(home.join("trust.txt")).expect("the stand-in's trust");
-    assert_eq!(trust, "", "{word}: no trusted-folders file");
-    assert!(
-        !tasks.join(format!("{worker}-1.trust.json")).exists(),
-        "{word}: no trusted-folders sidecar"
-    );
     let attached = [b"--prompt-interactive=".as_slice(), whole].concat();
     match word {
         "agy" => want.extend([attached.as_slice(), b"".as_slice()]),
@@ -552,34 +543,6 @@ fn an_explicit_integration_opt_out_refuses_workers_even_with_a_command() {
             "no task was booked"
         );
     }
-}
-
-/// The retired Gemini CLI (`agent=gemini`, `agent=gemini-cli`) is refused by
-/// name with agy named in its place, on a supervised instance where any
-/// other agent would start, and nothing is spawned: never another agent.
-#[test]
-fn a_spawn_of_the_retired_gemini_cli_is_refused_and_spawns_nothing() {
-    let inst = boot("r", "/bin/bash", Some(SUPERVISED), None);
-    let (_, manager) = boot_session(&inst);
-    let work = inst.tmp.join("work");
-    let rows = || ctl_ok(&inst, &["sessions"]).lines().count();
-    let before = rows();
-    for word in ["gemini", "gemini-cli"] {
-        let agent = format!("agent={word}");
-        let (ok, stdout, stderr) = spawn_as(
-            &inst,
-            &manager,
-            &work,
-            &["@self", "spawn", &agent, "-"],
-            b"a task",
-        );
-        assert!(
-            !ok && stderr.contains("Gemini CLI is no longer supported: agy replaces it"),
-            "{word}: {stdout} {stderr}"
-        );
-    }
-    assert_eq!(rows(), before, "nothing was spawned");
-    assert!(!inst.tmp.join("home/argv.bin").exists(), "no stand-in ran");
 }
 
 /// With the window harness off nothing would finish a worker's task: `ERR

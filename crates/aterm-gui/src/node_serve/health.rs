@@ -141,7 +141,7 @@ impl Basis {
             && self.vault == other.vault
     }
 
-    pub(super) fn prove(&self, addr: SocketAddr, within: Duration) -> Result<Proven, String> {
+    pub(super) fn prove(&self, addr: SocketAddr, within: Bounds) -> Result<Proven, Unproven> {
         prove(addr, &self.secret, &self.node, within)
     }
 }
@@ -149,6 +149,27 @@ impl Basis {
 /// Constructed only by a complete, authenticated reply from the expected node.
 #[derive(Debug)]
 pub(super) struct Proven(());
+
+/// What a self-dial's two phases may take: the connect and authenticated handshake together, then
+/// the census reply, each on its own clock.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Bounds {
+    pub(super) handshake: Duration,
+    pub(super) reply: Duration,
+}
+
+/// Why a self-dial proved nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum Unproven {
+    /// The listener did not answer as this node: no connect, no handshake, another node's proof, or
+    /// a reply that is no census. A miss ([`NodeUpdates::trial_proof_missed`]).
+    Missed(String),
+    /// The listener answered as this very node (it accepted, and the TLS, the fleet secret and the
+    /// node proof all held, so it dispatched the census) and its reply did not come within its own
+    /// bound. What a census reads (a vault writer, a Commons bootstrap, a loaded Mac) says nothing
+    /// of this build, so it is unprovable ([`NodeUpdates::trial_unprovable`]), never a miss.
+    ReplyLate(String),
+}
 
 fn loopback_of(mut addr: SocketAddr) -> SocketAddr {
     addr.set_ip(if addr.is_ipv4() {
@@ -190,11 +211,12 @@ fn prove(
     mut addr: SocketAddr,
     secret: &aterm_net::fleet::FleetSecret,
     node: &NodeIdentity,
-    within: Duration,
-) -> Result<Proven, String> {
+    within: Bounds,
+) -> Result<Proven, Unproven> {
+    let missed = |why: &dyn std::fmt::Display| Unproven::Missed(why.to_string());
     let until = Instant::now()
-        .checked_add(within)
-        .ok_or("node health deadline is out of range")?;
+        .checked_add(within.handshake)
+        .ok_or_else(|| missed(&"node health deadline is out of range"))?;
     if addr.ip().is_unspecified() {
         addr = loopback_of(addr);
     }
@@ -202,32 +224,52 @@ fn prove(
         until
             .checked_duration_since(Instant::now())
             .filter(|left| !left.is_zero())
-            .ok_or("node health deadline expired")
+            .ok_or_else(|| missed(&"node health deadline expired"))
     };
-    let tcp = aterm_uds::connect_tcp(&addr, left()?).map_err(|e| e.to_string())?;
+    let tcp = aterm_uds::connect_tcp(&addr, left()?).map_err(|e| missed(&e))?;
     // Prove this node using the ordinary fleet protocol, without publishing peer-heard
     // evidence or requiring this node to be its own mesh neighbour.
     let me = node.clone().dialing_mesh(None).noting(None);
     let reached =
         aterm_net::fleet::client_handshake_as(tcp, secret, Some(&me), FleetOp::Census, left()?)
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| missed(&e))?;
     if !reached
         .peer
         .as_ref()
         .is_some_and(|peer| peer.node == node.node() && peer.key == node.key())
     {
-        return Err("node health reply came from another or unproved node".into());
+        return Err(missed(
+            &"node health reply came from another or unproved node",
+        ));
     }
+    // This very node answered: from here only the census reply is outstanding, on its own clock.
+    let reply_until = Instant::now()
+        .checked_add(within.reply)
+        .ok_or_else(|| missed(&"node health reply deadline is out of range"))?;
     let stream = reached
         .transport
-        .into_bounded_stream(until)
-        .map_err(|e| e.to_string())?;
+        .into_bounded_stream(reply_until)
+        .map_err(|e| missed(&e))?;
     let limit = aterm_net::fleet_member::MAX_CENSUS_REPLY;
     let mut reader = std::io::BufReader::new(stream.take(limit as u64 + 7));
     let mut reply = String::new();
-    reader.read_line(&mut reply).map_err(|e| e.to_string())?;
+    if let Err(error) = reader.read_line(&mut reply) {
+        let late = matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ) || Instant::now() >= reply_until;
+        return Err(if late {
+            Unproven::ReplyLate(format!(
+                "this node answered its own dial and its census reply did not come within {} ms \
+                 ({error})",
+                within.reply.as_millis()
+            ))
+        } else {
+            missed(&error)
+        });
+    }
     if reply.len() > limit + 6 || !reply.ends_with('\n') {
-        return Err("node health reply is oversized or unfinished".into());
+        return Err(missed(&"node health reply is oversized or unfinished"));
     }
     // A framed refusal from the authenticated node proves its listener as a census does. The census's
     // own inputs (a vault this Mac has no Commons in, a writer holding the roster) say nothing of this
@@ -237,9 +279,9 @@ fn prove(
     }
     let json = reply
         .strip_prefix("OK ")
-        .ok_or("node health request was not answered successfully")?;
+        .ok_or_else(|| missed(&"node health request was not answered successfully"))?;
     aterm_agent::fleet_census::SwarmCensus::from_json(json)
-        .map_err(|_| "node health census is invalid")?;
+        .map_err(|_| missed(&"node health census is invalid"))?;
     Ok(Proven(()))
 }
 

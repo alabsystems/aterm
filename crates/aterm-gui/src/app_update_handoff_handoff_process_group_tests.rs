@@ -7,10 +7,11 @@ use super::{
     contain_own_process_group, deliver_handoff_rejection, emergency_kill_and_reap_handoff_child,
     handoff_candidate_terminated, handoff_commit_admitted, handoff_masters_closed,
     handoff_masters_have_activity, handoff_ready_deadline, kill_and_reap_handoff_child,
-    make_cloexec_pipe, wait_handoff_ready, worker_claim_handoff_reaper,
+    wait_handoff_ready, worker_claim_handoff_reaper,
 };
 use aterm_uds::spawnfd::InheritNothing as _;
 use std::io::{BufRead as _, Read as _};
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::os::unix::process::CommandExt as _;
 
 struct ProcessGroupCleanup {
@@ -325,7 +326,8 @@ fn ready_wait_types_a_handed_session_s_death_as_activity() {
         assert!(std::time::Instant::now() < deadline, "the hang-up shows");
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    let (proof_rd, _proof_wr) = make_cloexec_pipe().expect("proof pipe");
+    let (proof_rd, _proof_wr) = aterm_uds::pipe().expect("proof pipe");
+    let proof_rd = OwnedFd::from(proof_rd);
     let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
     assert_eq!(
         wait_handoff_ready(
@@ -334,10 +336,13 @@ fn ready_wait_types_a_handed_session_s_death_as_activity() {
             &cancel_rx,
             &[master],
             handoff_ready_deadline(),
+            super::PROGRESS_SILENCE_BOUND,
+            &mut || None,
             &mut || false,
             #[cfg(target_os = "macos")]
             None,
-        ),
+        )
+        .outcome,
         crate::UpdateHandoffOutcome::ActivityRevoked,
         "a session's death is the desk changing"
     );
@@ -356,23 +361,18 @@ fn ready_wait_tolerates_queued_output_and_types_cancel_as_activity() {
     )
     .expect("bounded proof fixture");
 
-    let mut master = [0i32; 2];
-    // SAFETY: plain pipe(2) into a valid 2-slot out-array.
-    assert_eq!(unsafe { libc::pipe(master.as_mut_ptr()) }, 0, "master pipe");
-    let (master_rd, master_wr) = (master[0], master[1]);
+    let (master_rd, master_wr) = aterm_uds::pipe().expect("master pipe");
     // SAFETY: bounded write of a stack byte to the test-owned pipe.
     assert_eq!(
-        unsafe { libc::write(master_wr, [0x62u8].as_ptr().cast(), 1) },
+        unsafe { libc::write(master_wr.as_raw_fd(), [0x62u8].as_ptr().cast(), 1) },
         1
     );
 
-    let (proof_rd, proof_wr) = make_cloexec_pipe().expect("proof pipe");
+    let (proof_rd, proof_wr) = aterm_uds::pipe().expect("proof pipe");
+    let proof_rd = OwnedFd::from(proof_rd);
     let wire = expected.to_wire();
     // SAFETY: bounded write of the fixed proof wire to the test-owned pipe.
-    let wrote = unsafe {
-        use std::os::fd::AsRawFd as _;
-        libc::write(proof_wr.as_raw_fd(), wire.as_ptr().cast(), wire.len())
-    };
+    let wrote = unsafe { libc::write(proof_wr.as_raw_fd(), wire.as_ptr().cast(), wire.len()) };
     assert_eq!(wrote as usize, wire.len(), "one complete proof wire");
     let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
     assert_eq!(
@@ -380,17 +380,21 @@ fn ready_wait_tolerates_queued_output_and_types_cancel_as_activity() {
             &proof_rd,
             expected,
             &cancel_rx,
-            &[master_rd],
+            &[master_rd.as_raw_fd()],
             handoff_ready_deadline(),
+            super::PROGRESS_SILENCE_BOUND,
+            &mut || None,
             &mut || false,
             #[cfg(target_os = "macos")]
             None,
-        ),
+        )
+        .outcome,
         crate::UpdateHandoffOutcome::ProofReady,
         "queued shell output must not abort the ready wait"
     );
 
-    let (proof_rd, _proof_wr) = make_cloexec_pipe().expect("second proof pipe");
+    let (proof_rd, _proof_wr) = aterm_uds::pipe().expect("second proof pipe");
+    let proof_rd = OwnedFd::from(proof_rd);
     let (cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
     cancel_tx.try_send(()).expect("queue cancel poke");
     assert_eq!(
@@ -398,18 +402,20 @@ fn ready_wait_tolerates_queued_output_and_types_cancel_as_activity() {
             &proof_rd,
             expected,
             &cancel_rx,
-            &[master_rd],
+            &[master_rd.as_raw_fd()],
             handoff_ready_deadline(),
+            super::PROGRESS_SILENCE_BOUND,
+            &mut || None,
             &mut || false,
             #[cfg(target_os = "macos")]
             None,
-        ),
+        )
+        .outcome,
         crate::UpdateHandoffOutcome::ActivityRevoked,
         "cancel must carry the typed activity classification"
     );
 
-    aterm_pty::close_fd(master_rd);
-    aterm_pty::close_fd(master_wr);
+    drop((master_rd, master_wr));
 }
 
 #[test]
@@ -570,7 +576,8 @@ fn pre_ready_death_preserves_leader_identity_until_normal_group_reap() {
         );
     }
 
-    let (proof_rd, _stray_proof_wr) = make_cloexec_pipe().expect("proof pipe");
+    let (proof_rd, _stray_proof_wr) = aterm_uds::pipe().expect("proof pipe");
+    let proof_rd = OwnedFd::from(proof_rd);
     let candidate = HandoffCandidate::of_unreaped_child(&child);
     let mut handle = HandoffCandidateHandle::Forked(child);
     let expected = crate::seamless::adoption_proof(
@@ -590,10 +597,13 @@ fn pre_ready_death_preserves_leader_identity_until_normal_group_reap() {
             &cancel_rx,
             &[],
             handoff_ready_deadline(),
+            super::PROGRESS_SILENCE_BOUND,
+            &mut || None,
             &mut || handle.candidate_gone(candidate),
             #[cfg(target_os = "macos")]
             None,
-        ),
+        )
+        .outcome,
         crate::UpdateHandoffOutcome::ChildDied,
         "the leader's own end is seen without reaping it"
     );
@@ -671,7 +681,8 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
         );
     }
 
-    let (proof_rd, _proof_wr) = make_cloexec_pipe().expect("proof pipe");
+    let (proof_rd, _proof_wr) = aterm_uds::pipe().expect("proof pipe");
+    let proof_rd = OwnedFd::from(proof_rd);
     let expected = crate::seamless::adoption_proof(
         "corroboration-test",
         2,
@@ -691,6 +702,8 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
             &cancel_rx,
             &[],
             std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+            super::PROGRESS_SILENCE_BOUND,
+            &mut || None,
             &mut || false,
             Some(super::LaunchCorroboration::of_dialer(
                 &in_flight,
@@ -698,7 +711,8 @@ fn a_launchservices_pid_mismatch_after_transfer_is_rejected_and_reaped() {
                     u32::try_from(leader).expect("a live pid is positive")
                 ),
             )),
-        ),
+        )
+        .outcome,
         crate::UpdateHandoffOutcome::Rejected,
         "a launch answer naming another pid refuses the handoff rather than timing out"
     );
@@ -756,7 +770,8 @@ fn a_candidate_that_ends_behind_a_stray_proof_writer_ends_the_ready_wait() {
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    let (proof_rd, _stray_proof_wr) = make_cloexec_pipe().expect("proof pipe");
+    let (proof_rd, _stray_proof_wr) = aterm_uds::pipe().expect("proof pipe");
+    let proof_rd = OwnedFd::from(proof_rd);
     let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
 
     assert_eq!(
@@ -766,12 +781,16 @@ fn a_candidate_that_ends_behind_a_stray_proof_writer_ends_the_ready_wait() {
             &cancel_rx,
             &[],
             std::time::Instant::now() + std::time::Duration::from_millis(200),
+            super::PROGRESS_SILENCE_BOUND,
+            &mut || None,
             &mut || false,
             #[cfg(target_os = "macos")]
             None,
-        ),
-        crate::UpdateHandoffOutcome::TimedOut,
-        "a stray writer hides the death from an EOF-only wait"
+        )
+        .outcome,
+        crate::UpdateHandoffOutcome::Stalled,
+        "a stray writer hides the death from an EOF-only wait, which ends at its hang detector \
+         with nothing reported: a successor silent since its grant"
     );
     assert_eq!(
         wait_handoff_ready(
@@ -780,10 +799,13 @@ fn a_candidate_that_ends_behind_a_stray_proof_writer_ends_the_ready_wait() {
             &cancel_rx,
             &[],
             std::time::Instant::now() + std::time::Duration::from_secs(60),
+            super::PROGRESS_SILENCE_BOUND,
+            &mut || None,
             &mut || handle.candidate_gone(candidate),
             #[cfg(target_os = "macos")]
             None,
-        ),
+        )
+        .outcome,
         crate::UpdateHandoffOutcome::ChildDied,
         "the candidate's own end ends the wait"
     );
@@ -910,7 +932,8 @@ fn a_matching_or_pending_launch_answer_leaves_the_proof_wait_to_its_outcome() {
     )
     .expect("bounded proof fixture");
     for answer in [Some(4242), None] {
-        let (proof_rd, proof_wr) = make_cloexec_pipe().expect("proof pipe");
+        let (proof_rd, proof_wr) = aterm_uds::pipe().expect("proof pipe");
+        let proof_rd = OwnedFd::from(proof_rd);
         drop(proof_wr);
         let (_cancel_tx, cancel_rx) = std::sync::mpsc::sync_channel(1);
         let in_flight = crate::app_launch_successor::LaunchInFlight::scripted(answer);
@@ -921,12 +944,15 @@ fn a_matching_or_pending_launch_answer_leaves_the_proof_wait_to_its_outcome() {
                 &cancel_rx,
                 &[],
                 std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+                super::PROGRESS_SILENCE_BOUND,
+                &mut || None,
                 &mut || false,
                 Some(super::LaunchCorroboration::of_dialer(
                     &in_flight,
                     HandoffCandidate::from_bare_pid(4242),
                 )),
-            ),
+            )
+            .outcome,
             crate::UpdateHandoffOutcome::ChildDied,
             "answer {answer:?}: the corroboration neither rejects nor ends the wait"
         );

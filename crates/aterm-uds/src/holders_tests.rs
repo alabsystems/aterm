@@ -701,7 +701,7 @@ fn a_shared_memory_descriptor_is_named_with_its_size_and_nothing_else_is() {
     assert_eq!(super::fd_is_pshm(file.as_fd()), None, "a vnode");
     let (a, _b) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
     assert_eq!(super::fd_is_pshm(a.as_fd()), None, "a socket");
-    let (r, _w) = std::io::pipe().expect("a pipe");
+    let (r, _w) = crate::pipe().expect("a pipe");
     assert_eq!(super::fd_is_pshm(r.as_fd()), None, "a pipe");
 }
 

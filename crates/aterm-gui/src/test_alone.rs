@@ -23,6 +23,7 @@ use std::process::{Child, Command};
 /// child of the child (a stand-in it spawns, another test run alone) never
 /// reads as it unless it runs the very same test.
 const ALONE: &str = "ATERM_TEST_ALONE";
+pub(crate) const DENSE_LEASE: &str = "ATERM_TEST_DENSE_LEASE";
 
 /// How long the child may run before it is named wedged and SIGKILLed: a hang
 /// detector, never a latency budget.
@@ -70,12 +71,29 @@ pub(crate) fn run_alone_with(env: &[(&str, &OsStr)]) {
 /// When the child cannot be started.
 #[track_caller]
 pub(crate) fn spawn_alone_with(env: &[(&str, &OsStr)]) -> Running {
+    alone_stand_in(env).spawn()
+}
+
+fn alone_stand_in(env: &[(&str, &OsStr)]) -> StandIn {
     let test = current_test();
     let mut child = StandIn::new(&test, "alone in its own process");
     child.command().env(ALONE, &test);
     for (key, value) in env {
         child.command().env(key, value);
     }
+    child
+}
+
+/// Admit before the child's watchdog, and keep the same kernel lease in the child
+/// until its fixture closes even if the waiting parent is killed.
+#[cfg(unix)]
+pub(crate) fn spawn_alone_with_lease(
+    env: &[(&str, &OsStr)],
+    lease: &aterm_pty::test_budget::Lease,
+) -> Running {
+    use std::os::fd::{AsFd as _, AsRawFd as _};
+    let mut child = alone_stand_in(env);
+    child.hand(DENSE_LEASE, lease.as_fd().as_raw_fd());
     child.spawn()
 }
 
@@ -111,6 +129,8 @@ impl StandIn {
         let output = Output::new();
         let mut command = Command::new(std::env::current_exe().expect("the test binary"));
         command
+            .env_remove(DENSE_LEASE)
+            .env_remove(format!("{DENSE_LEASE}_IS"))
             .args([
                 "--exact",
                 test,

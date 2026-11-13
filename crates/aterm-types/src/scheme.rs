@@ -297,10 +297,10 @@ const fn c(r: u8, g: u8, b: u8) -> Rgb {
 /// Bundled built-in color schemes.
 static BUILTINS: &[Builtin] = &[
     Builtin {
-        name: "Aterm Night",
+        name: "aterm Night",
         appearance: Appearance::Dark,
         description: "aterm's signature night: low-glare blue-black, cool slate ink and a sea-glass cyan cursor",
-        pair: Some("Aterm Day"),
+        pair: Some("aterm Day"),
         signature: true,
         source: None,
         fg: c(0xd8, 0xe1, 0xec),
@@ -327,10 +327,10 @@ static BUILTINS: &[Builtin] = &[
         ],
     },
     Builtin {
-        name: "Aterm Day",
+        name: "aterm Day",
         appearance: Appearance::Light,
         description: "aterm's signature day: soft paper-white, deep ink-blue text and a cobalt cursor",
-        pair: Some("Aterm Night"),
+        pair: Some("aterm Night"),
         signature: true,
         source: None,
         fg: c(0x20, 0x27, 0x33),

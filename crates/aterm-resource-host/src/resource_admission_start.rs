@@ -61,7 +61,10 @@ impl Owner {
                     pending.sdk = Some(sdk.context()?);
                     pending.bootstrap_graph = Some(root);
                     command = prelude;
-                } else if matches!(recipe.kind, recipe::Kind::Workload) {
+                } else if matches!(
+                    recipe.kind,
+                    recipe::Kind::Workload | recipe::Kind::NativeJob
+                ) {
                     let sdk = service_sdk
                         .as_ref()
                         .ok_or_else(|| refused("original workload SDK missing"))?;
@@ -227,7 +230,10 @@ impl Owner {
         let native_targo = pending.recipe.as_ref().is_some_and(|recipe| {
             matches!(
                 recipe.kind,
-                recipe::Kind::Targo | recipe::Kind::Workload | recipe::Kind::BootstrapGraph
+                recipe::Kind::Targo
+                    | recipe::Kind::Workload
+                    | recipe::Kind::NativeJob
+                    | recipe::Kind::BootstrapGraph
             )
         });
         let metadata_root = pending

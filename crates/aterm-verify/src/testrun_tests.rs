@@ -76,7 +76,9 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
         |need| Waiter::enter(&ledger, &machine, need).map_err(aterm_capacity::Error::Ledger);
     assert!(
         waiters
-            .poll_with(7, need(), &machine, enter)
+            .poll_noting(7, need(), &machine, enter,
+                &mut |_| panic!("the first blocked binary must enter the fair queue, regardless of a cached shortfall"),
+                &mut None)
             .expect("entering the first waiting request")
             .is_none()
     );
@@ -124,6 +126,45 @@ fn a_waiting_binary_keeps_its_admission_order_until_admitted_or_cancelled() {
         );
         assert!(records.iter().any(|record| record.order() == original));
     }
+    let mut reason = None;
+    assert!(
+        waiters
+            .poll_noting(
+                8,
+                need(),
+                &machine,
+                |_| panic!("a cached rejection must not create a temporary waiter"),
+                &mut |_| Some(aterm_capacity::admit::ProbeRejection::Unreachable(
+                    "observed shortfall".into()
+                )),
+                &mut reason,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(reason.is_some());
+    assert!(
+        waiters
+            .poll_noting(
+                7,
+                need(),
+                &machine,
+                |_| panic!("the retained waiter must keep its original queue identity"),
+                &mut |_| panic!(
+                    "the retained waiter must poll fresh instead of consulting a stale rejection"
+                ),
+                &mut None,
+            )
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ledger
+            .of_pid(std::process::id())
+            .unwrap()
+            .iter()
+            .any(|record| record.order() == original)
+    );
     machine.set(aterm_capacity::Reading::of_gib(48, 40, 14));
     let claim = waiters
         .poll_with(7, need(), &machine, |_| {
@@ -920,14 +961,17 @@ fn binary_events_report_completed_counts_without_inventing_them() {
             exe_sha256: Some("aa".repeat(32)),
             content_key: Some("11".repeat(32)),
             reason: None,
+            parts: crate::test_content::KeyParts::new(),
         },
         json: false,
         prior_execution_s: 0.01,
+        origin_run: None,
     };
     let changed = Evidence {
         exe_sha256: carried.evidence.exe_sha256.clone(),
         content_key: None,
         reason: Some("runtime inputs changed".into()),
+        parts: crate::test_content::KeyParts::new(),
     };
     for line in [
         carried_event(&carried),
@@ -1086,12 +1130,16 @@ fn a_resume_carries_only_unchanged_binaries_that_passed_and_never_the_golden_pac
             _ => "44".repeat(32),
         }),
         reason: None,
+        parts: [("env:MAKEFLAGS".to_owned(), "current".to_owned())].into(),
     };
     let mut passed = Passed::new();
     for (index, binary) in bins.iter().take(3).enumerate() {
         let mut prior = CarryProof::passed(&binary.spec, &evidence(binary), 1.25 + index as f64);
         if index == 1 {
             prior.content_key = Some("ee".repeat(32));
+            prior
+                .key_parts
+                .insert("env:MAKEFLAGS".into(), "prior".into());
         }
         passed.insert(binary.spec.clone(), prior);
     }
@@ -1103,6 +1151,7 @@ fn a_resume_carries_only_unchanged_binaries_that_passed_and_never_the_golden_pac
         run,
         carried,
         known,
+        refused,
     } = carry(
         &passed,
         bins,
@@ -1111,6 +1160,31 @@ fn a_resume_carries_only_unchanged_binaries_that_passed_and_never_the_golden_pac
             evidence(b)
         },
         2,
+    );
+    assert_eq!(
+        refused,
+        [
+            (
+                "-p aterm-grid --lib".to_owned(),
+                "content key moved in env:MAKEFLAGS".to_owned()
+            ),
+            (
+                format!("-p {} --lib", crate::checks::GOLDEN.0),
+                format!("{} always runs", crate::checks::GOLDEN.0)
+            ),
+        ],
+        "each offered ok proof that runs again says what differs; a prior FAIL was no offer"
+    );
+    assert_eq!(
+        refused_lines(&refused),
+        [
+            format!(
+                "  offered and run again: 1 ({0} always runs), as -p {0} --lib",
+                crate::checks::GOLDEN.0
+            ),
+            "  offered and run again: 1 (content key moved in env:MAKEFLAGS), as -p aterm-grid --lib"
+                .to_owned(),
+        ]
     );
     let specs = |v: &[Binary]| v.iter().map(|b| b.spec.clone()).collect::<Vec<_>>();
     assert_eq!(
@@ -1192,6 +1266,7 @@ fn fix_hop_line_timeline_runs_only_changed_complete_inputs() {
                 exe_sha256: Some(format!("{:02x}", index + 1).repeat(32)),
                 content_key: Some(format!("{:02x}", index + 17).repeat(32)),
                 reason: None,
+                parts: crate::test_content::KeyParts::new(),
             },
         );
     }
@@ -1280,6 +1355,7 @@ fn fix_hop_line_timeline_runs_only_changed_complete_inputs() {
             exe_sha256: base["-p fixture-sibling --lib"].exe_sha256.clone(),
             content_key: None,
             reason: Some("runtime inputs are undeclared".into()),
+            parts: crate::test_content::KeyParts::new(),
         },
     );
     let (run, _, _) = scenario(unbounded);
@@ -1313,12 +1389,14 @@ fn a_binarys_event_reaches_the_release_events_file_whole() {
         exe_sha256: Some("aa".repeat(32)),
         content_key: Some("11".repeat(32)),
         reason: None,
+        parts: crate::test_content::KeyParts::new(),
     };
     let event = carried_event(&CarriedBinary {
         binary,
         evidence,
         json: false,
         prior_execution_s: 1.0,
+        origin_run: None,
     });
     let initial = std::fs::read_to_string(&at).unwrap();
     let prepared = ctx.events.as_ref().unwrap().prepare(&event);
@@ -2016,6 +2094,101 @@ fn charged(charges: &[u32], share: u32) -> (Vec<Binary>, Plan) {
     (bins, plan)
 }
 
+#[test]
+fn a_smaller_execution_grant_leaves_local_room_for_a_fitting_binary() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let ledger = aterm_capacity::Ledger::at(tmp.path().join("ledger"));
+    let machine = aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, 1));
+    let claim = aterm_capacity::admit::try_admit_with(
+        &ledger,
+        &machine,
+        aterm_capacity::Need::new("test execution grant")
+            .cores(4)
+            .mem(8),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(claim.cores(), 1);
+    let permit = Ok(BinaryPermit {
+        claim: Some(Arc::new(claim)),
+        tokens: None,
+    });
+    let (_, mut plan) = charged(&[4, 3, 1], 4);
+    for (binary, peak) in plan.order.iter_mut().zip([8, 4, 1]) {
+        binary.peak = peak;
+    }
+    let state = Mutex::new(Dispatcher::new(&plan, Some(12)));
+    let preferred = state.lock().unwrap().next(0.0).unwrap();
+    let actual = execution_grant(&state, &permit, preferred);
+    assert_eq!((actual.charge, actual.width), (1, 1));
+    let mut dispatcher = state.lock().unwrap();
+    assert_eq!(dispatcher.held_bytes(), 8, "memory custody is unchanged");
+    assert_eq!(
+        dispatcher.next(0.0).map(|binary| binary.index),
+        Some(1),
+        "the ungranted cores must not keep the fitting binary queued"
+    );
+    assert_eq!((dispatcher.held(), dispatcher.held_bytes()), (4, 12));
+    assert!(dispatcher.next(0.0).is_none());
+    dispatcher.finish(0).unwrap();
+    assert_eq!((dispatcher.held(), dispatcher.held_bytes()), (3, 4));
+    assert_eq!(dispatcher.next(0.0).unwrap().index, 2);
+    dispatcher.finish(1).unwrap();
+    dispatcher.finish(2).unwrap();
+    assert_eq!((dispatcher.held(), dispatcher.held_bytes()), (0, 0));
+    assert_eq!(plan.order[0].charge, 4, "the preferred plan is preserved");
+    drop(permit);
+    assert!(ledger.of_pid(std::process::id()).unwrap().is_empty());
+}
+
+/// The ledger's core request is elastic. A smaller positive grant must start the binary
+/// within that grant, rather than drop its admission and repeat forever. The unchanged
+/// four-core plan is the control; a claim with no core authority starts nothing.
+#[test]
+fn a_binary_runs_within_its_actual_ledger_core_grant() {
+    let tmp = aterm_tempfile::tempdir().unwrap();
+    let mut ctx = crate::Ctx::new(
+        tmp.path().to_path_buf(),
+        crate::Scope::workspace(),
+        crate::EnvSnapshot::default(),
+        tmp.path().join("scratch"),
+    );
+    ctx.memory = Some(crate::memory::Book::at(
+        None,
+        Some(48 << 30),
+        Some(40 << 30),
+    ));
+    let (_, plan) = charged(&[4], 4);
+    let planned = plan.order[0];
+    for available in 0..=4 {
+        let ledger = aterm_capacity::Ledger::at(tmp.path().join(format!("ledger-{available}")));
+        let machine =
+            aterm_capacity::Fixed::new(aterm_capacity::Reading::of_gib(48, 40, available.max(1)));
+        let mut attempt = |need: aterm_capacity::Need, mode| {
+            assert_eq!(
+                mode, None,
+                "ordinary admission retains the ledger's authority"
+            );
+            assert_eq!(need.cores, 4, "the preferred plan remains unchanged");
+            let need = if available == 0 { need.cores(0) } else { need };
+            aterm_capacity::admit::try_admit_with(&ledger, &machine, need)
+        };
+        let permit = binary_permit_with(Some(&ctx), None, &planned, &mut attempt);
+        if available == 0 {
+            assert!(permit.is_none(), "zero granted cores cannot start a binary");
+        } else {
+            let permit = permit
+                .expect("a positive grant must make progress")
+                .expect("the ledger admits the request");
+            assert_eq!(permit.claim.as_ref().unwrap().cores(), available);
+            let actual = permit.granted(planned);
+            assert_eq!((actual.charge, actual.width), (available, available));
+            drop(permit);
+        }
+        assert!(ledger.of_pid(std::process::id()).unwrap().is_empty());
+    }
+}
+
 /// UNDER THE RELEASE'S POOL a binary holds its charge in the pool's tokens while it runs. On
 /// four slots with the release's build holding two, two binaries charged two each fit the
 /// share together, yet run one at a time on the two tokens left: while each runs, no token
@@ -2152,6 +2325,135 @@ fn a_blocked_pool_reservation_keeps_no_memory_or_partial_tokens_and_a_peer_start
         )
     });
     SCRATCH.set(None);
+}
+
+/// LOST TOKENS. On a pool of four slots a client died holding two, so two tokens are all the
+/// pool will ever hold. A binary charged four, with no binary of the dispatch running and no
+/// child of the run alive, starts on those two: its charge and its width are two, it holds both
+/// while it runs, and both come back. NEGATIVE CONTROL: while a child of the run is alive the
+/// same binary waits for its whole charge, and the stop leaves it unstarted.
+#[cfg(unix)]
+#[test]
+fn a_lone_binary_starts_on_the_tokens_a_pool_that_lost_some_still_holds() {
+    let tmp = aterm_tempfile::tempdir().expect("scratch");
+    let pool = aterm_capacity::Jobserver::new(&tmp.path().join("jobs"), 4).expect("a pool");
+    // The dead client's two: taken and never given back while the dispatch runs.
+    let lost: Vec<_> = (0..2)
+        .map(|_| pool.try_acquire().expect("reads").expect("a token"))
+        .collect();
+    let (bins, plan) = charged(&[4], 4);
+    let ran_as = Mutex::new(None);
+    let ran = dispatch_resources(
+        &bins,
+        &plan,
+        None,
+        Some(&pool),
+        None,
+        &|| 0.0,
+        &|| false,
+        &|| true,
+        |_, planned, _| {
+            *ran_as.lock().unwrap() = Some(*planned);
+            assert!(
+                pool.try_acquire().expect("reads").is_none(),
+                "it holds every token the pool had"
+            );
+            Some(Run {
+                case_observations: None,
+                ok: true,
+                code: Some(0),
+                ..Run::default()
+            })
+        },
+        |_, _, _| {},
+    );
+    let planned = ran_as.lock().unwrap().expect("it ran");
+    assert_eq!(
+        (planned.charge, planned.width),
+        (2, 2),
+        "within its two tokens"
+    );
+    assert_eq!(
+        ran[0].as_ref().expect("it answered").planned.charge,
+        2,
+        "the report names what it held"
+    );
+    let back: Vec<_> = std::iter::from_fn(|| pool.try_acquire().expect("reads")).collect();
+    assert_eq!(back.len(), 2, "its two came back");
+    drop(back);
+
+    let asked = (Mutex::new(false), Condvar::new());
+    let stopped = std::sync::atomic::AtomicBool::new(false);
+    let started = AtomicUsize::new(0);
+    let waited = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let (seen, waited) = asked
+                .1
+                .wait_timeout_while(
+                    asked.0.lock().unwrap(),
+                    aterm_spec::wait::MUST_HAPPEN,
+                    |seen| !*seen,
+                )
+                .unwrap();
+            assert!(*seen && !waited.timed_out(), "the dispatch never asked");
+            stopped.store(true, Ordering::SeqCst);
+        });
+        dispatch_resources(
+            &bins,
+            &plan,
+            None,
+            Some(&pool),
+            None,
+            &|| 0.0,
+            &|| stopped.load(Ordering::SeqCst),
+            &|| {
+                *asked.0.lock().unwrap() = true;
+                asked.1.notify_all();
+                false
+            },
+            |_, _, _| {
+                started.fetch_add(1, Ordering::SeqCst);
+                Some(Run::default())
+            },
+            |_, _, _| {},
+        )
+    });
+    assert_eq!(
+        started.load(Ordering::SeqCst),
+        0,
+        "a live child may give a token back: it waits"
+    );
+    assert!(waited[0].is_none(), "the stop left it unstarted");
+    drop(lost);
+    let back: Vec<_> = std::iter::from_fn(|| pool.try_acquire().expect("reads")).collect();
+    assert_eq!(back.len(), 4, "every token is in the pool again");
+}
+
+/// The permit of a lone binary on a pool that holds none of its tokens is still a wait: with
+/// nothing to run on it starts nothing, and one that holds its whole charge runs as planned.
+#[cfg(unix)]
+#[test]
+fn a_lone_binary_with_no_token_waits_and_a_whole_charge_runs_as_planned() {
+    let tmp = aterm_tempfile::tempdir().expect("scratch");
+    let pool = aterm_capacity::Jobserver::new(&tmp.path().join("jobs"), 2).expect("a pool");
+    let (_, plan) = charged(&[2], 2);
+    let b = plan.order[0];
+    let attempt = &mut |_, _| -> Result<Option<aterm_capacity::Claim>, aterm_capacity::Error> {
+        unreachable!("no run, so no memory claim")
+    };
+    let whole = binary_permit_noting(None, Some(&pool), &b, attempt, true, &mut None)
+        .expect("admitted")
+        .expect("no FIFO error");
+    assert_eq!(whole.granted(b), b, "its whole charge: as planned");
+    let mut waiting = None;
+    assert!(
+        binary_permit_noting(None, Some(&pool), &b, attempt, true, &mut waiting).is_none(),
+        "no token is left to start on"
+    );
+    assert!(waiting.is_some(), "and the wait names the pool");
+    drop(whole);
+    let back: Vec<_> = std::iter::from_fn(|| pool.try_acquire().expect("reads")).collect();
+    assert_eq!(back.len(), 2);
 }
 
 /// A binary whose tokens the stop ends the wait for never runs and is left unstarted, as the

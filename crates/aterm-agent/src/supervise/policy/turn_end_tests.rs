@@ -147,6 +147,7 @@ fn idle(said: &str, worked: Option<Duration>) -> TurnEndReading {
         credits: None,
         repo: crate::harness::repo_work::RepoRead::Clean,
         leftover: crate::harness::leftover::LeftRead::NotAsked,
+        credentials: crate::supervise::policy::credential_need::CredentialRead::NotAsked,
     }
 }
 
@@ -416,9 +417,9 @@ fn two_stages() -> (TurnEndState, Instant) {
 #[test]
 fn a_carry_on_answered_with_work_and_a_done_report_is_checked() {
     for said in [
-        "Everything is already done; nothing left to do.",
-        "All done.",
-        "No lander is running, so I'm not re-arming that watch. All queued work has landed.",
+        "All done.\n\nATERM-TASK-DONE",
+        "Nothing left: all queued work has landed.",
+        "DONE",
     ] {
         let (mut st, now) = two_stages();
         st.host_typed(now, HostTurn::CarryOn);
@@ -461,8 +462,8 @@ fn a_carry_on_answered_with_work_and_a_done_report_is_checked() {
 #[test]
 fn a_carry_on_answered_short_with_a_done_report_is_checked() {
     let short = Duration::from_secs(25);
-    let said = "Everything is already done; nothing left to do.";
-    for said in [said, "All done."] {
+    let said = "All done.\n\nATERM-TASK-DONE";
+    for said in [said, "Nothing left: all queued work has landed."] {
         let (mut st, now) = two_stages();
         let streak = st.short_streak();
         st.host_typed(now, HostTurn::CarryOn);
@@ -571,7 +572,7 @@ fn a_restarts_check_answered_done_is_the_checks_answer() {
     use crate::harness::upgrade_drive::host_turn;
     assert_eq!(host_turn("continued:check"), Some(HostTurn::Check));
     assert_eq!(host_turn("continued"), Some(HostTurn::CarryOn));
-    let report = "All tasks are complete and verified; nothing is left to do.";
+    let report = "Nothing left: all of it is merged into the remote main branch.";
     let quick = Some(Duration::from_secs(6));
     let fresh = || {
         let mut st = TurnEndState::default();
@@ -579,7 +580,7 @@ fn a_restarts_check_answered_done_is_the_checks_answer() {
         st.observe(&idle(report, None), now);
         (st, now)
     };
-    for answer in [report, "All done.", "DONE"] {
+    for answer in [report, "Verified on main.\n\nATERM-TASK-DONE", "DONE"] {
         for worked in [quick, Some(5 * MIN)] {
             for (name, (mut st, now)) in [("fresh", fresh()), ("two stages", two_stages())] {
                 st.host_typed(now, HostTurn::Check);
@@ -606,24 +607,12 @@ fn a_restarts_check_answered_done_is_the_checks_answer() {
     let (a, _) = past_backoff(&mut st, &idle(answer, quick), now + MIN);
     assert_eq!(a, typed(RULE_CONTINUE), "{answer}");
     assert!(!st.task_done(), "{answer}");
-    let idle_line =
-        "No lander is running, so I'm not re-arming that watch. All queued work has landed.";
-    for worked in [quick, Some(5 * MIN)] {
-        let (mut st, now) = fresh();
-        st.host_typed(now, HostTurn::Check);
-        let a = at(
-            &mut st,
-            &idle(idle_line, worked),
-            now + worked.unwrap_or_default(),
-        );
-        assert!(claimed_at(&st, &a), "{worked:?}: {a:?}");
-    }
 }
 
 #[test]
 fn a_quiet_restarts_line_answered_nothing_else_is_no_done_report() {
     use crate::harness::upgrade_drive::host_turn;
-    let said = "Restored the Artifact comment monitor; nothing else to do.";
+    let said = "Restored the Artifact comment monitor.\nNothing left: it runs again.";
     assert!(says_done(Some(said)));
     for (step, check) in [("continued:restore", false), ("continued", true)] {
         let mut st = TurnEndState::default();
@@ -1367,10 +1356,11 @@ fn the_vendors_own_continuation_delivers_the_check_a_limit_cut_again() {
     let reset = t + 60 * MIN;
     let armed = captured(AUTO_CONTINUE_ARMED, Some(reset), Duration::ZERO);
     let reported = idle(
-        "All done: the change is committed and pushed.",
+        "All done: the change is committed and pushed.\n\nATERM-TASK-DONE",
         Some(3 * MIN),
     );
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let progress = "Stage 2 of 5 is in; stage 3 is next.";
     let after = reset + Duration::from_secs(70);
     let mut wrong = Vec::new();
@@ -1516,7 +1506,8 @@ fn a_limits_end_types_no_keep_going_into_a_done_report() {
         }
         last
     };
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\nATERM-TASK-DONE";
     let reversible = TurnEndAction::Type {
         text: format!("{} {DONE_CHECK_REVERSIBLE}", done_check_words(0)),
         rule_id: RULE_DONE_CHECK,
@@ -1539,7 +1530,7 @@ fn a_limits_end_types_no_keep_going_into_a_done_report() {
             for (reply, cfg, want) in [
                 (done, cfg(), checked()),
                 (
-                    "All done. Shall I delete the old release branches?",
+                    "All done. Shall I delete the old release branches?\n\nATERM-TASK-DONE",
                     cfg(),
                     reversible.clone(),
                 ),
@@ -1674,7 +1665,8 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
             .wall
             .expect("the armed wall")
     };
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let reversible = TurnEndAction::Type {
         text: format!("{} {DONE_CHECK_REVERSIBLE}", done_check_words(0)),
         rule_id: RULE_DONE_CHECK,
@@ -1710,7 +1702,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
         for (reply, want) in [
             (done, checked()),
             (
-                "All done. Shall I delete the old release branches?",
+                "All done. Shall I delete the old release branches?\n\nATERM-TASK-DONE",
                 reversible.clone(),
             ),
             ("All done.\nATERM-TASK-DONE", checked()),
@@ -1794,7 +1786,8 @@ fn a_done_check_in_a_limits_place_that_meets_the_limit_is_its_retry() {
         restartable: true,
         ..walled(WallKind::UsageSession, notice, None)
     };
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let progress = "Stage 2 of 5 is in; stage 3 is next.";
     let shape = |a: &TurnEndAction| match a {
         TurnEndAction::WaitUntil { until, .. } => format!("wait {until:?}"),
@@ -1926,7 +1919,8 @@ fn a_successor_works_the_limit_from_the_attempts_its_last_try_left() {
         restartable: true,
         ..walled(WallKind::UsageSession, notice, worked)
     };
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let ladder = TurnEndTiming::default().limit_backoff;
     let first_loop = |worked: bool| {
         let mut st = TurnEndState::default();
@@ -1988,7 +1982,8 @@ fn a_seeded_track_stands_in_for_its_limit_only_once_the_limit_is_read() {
     let t = t0();
     let reset = t + 60 * MIN;
     let armed = captured(AUTO_CONTINUE_ARMED, Some(reset), Duration::ZERO);
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let window = LimitTry {
         bucket: false,
         in_place: false,
@@ -2101,7 +2096,8 @@ fn a_seeded_track_stands_in_for_its_limit_only_once_the_limit_is_read() {
 fn a_limits_end_keeps_the_resume_on_codex_and_after_an_esc_and_the_budget() {
     let t = t0();
     let reset = t + 60 * MIN;
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let ended = |limit: &TurnEndReading, point: &TurnEndReading| {
         let mut st = TurnEndState::default();
         at(&mut st, limit, t);
@@ -2252,8 +2248,9 @@ fn a_limits_end_answers_a_question_naming_an_irreversible_act_as_continue_does()
     let reset = t + 60 * MIN;
     let armed = captured(AUTO_CONTINUE_ARMED, Some(reset), Duration::ZERO);
     let force = "Stage 3 needs main rewritten. Should I force-push over main?";
-    let done_asks = "All done. Shall I delete the old release branches?";
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done_asks = "All done. Shall I delete the old release branches?\n\nATERM-TASK-DONE";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let first_act =
         |st: &mut TurnEndState, r: &TurnEndReading, from: Instant, cfg: &SupervisorConfig| {
             let mut last = TurnEndAction::Nothing;
@@ -2406,8 +2403,9 @@ fn a_limits_end_under_land_gets_lands_own_act_and_under_off_nothing() {
     let t = t0();
     let reset = t + 60 * MIN;
     let armed = captured(AUTO_CONTINUE_ARMED, Some(reset), Duration::ZERO);
-    let done = "All done: the change is committed and pushed, and every suite passes.";
-    let done_asks = "All done. Shall I delete the old release branches?";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
+    let done_asks = "All done. Shall I delete the old release branches?\n\nATERM-TASK-DONE";
     let force = "Stage 3 needs main rewritten. Should I force-push over main?";
     let progress = "Stage 2 of 5 is in; stage 3 is next.";
     let first_act =
@@ -2767,7 +2765,7 @@ fn at_a_limits_reset_another_conversations_words_get_the_continue_policys_act() 
         Duration::ZERO,
     );
     let reply = "⏺ Hi! I am the local lab stub, not a model. (reply 3)";
-    let done = "⏺ All done: the change is committed and pushed, and every suite passes.";
+    let done = "⏺ All done: the change is committed and pushed, and every suite passes.\n\n  ATERM-TASK-DONE";
     let history = |clock: &str, words: &str| {
         captured(
             &RESUMED_BY_ITSELF
@@ -6165,7 +6163,7 @@ fn claimed_at(st: &TurnEndState, a: &TurnEndAction) -> bool {
 
 #[test]
 fn a_done_yield_is_short_whatever_it_worked_and_gets_the_check() {
-    let done = "Re-ran the whole suite: everything is already done; nothing left to do.";
+    let done = "Re-ran the whole suite: everything is already done; nothing left to do.\n\nATERM-TASK-DONE";
     let mut now = t0();
     let mut st = TurnEndState::default();
     assert_eq!(
@@ -6222,9 +6220,12 @@ fn past_backoff(
 
 fn checked_at(now: Instant) -> (TurnEndState, Instant) {
     let mut st = TurnEndState::default();
-    st.observe(&idle("All done.", Some(3 * MIN)), now);
+    st.observe(&idle("All done.\n\nATERM-TASK-DONE", Some(3 * MIN)), now);
     let now = now + st.short_wait().unwrap_or_default();
-    assert_eq!(act(&mut st, &idle("All done.", None), now), checked());
+    assert_eq!(
+        act(&mut st, &idle("All done.\n\nATERM-TASK-DONE", None), now),
+        checked()
+    );
     (st, now)
 }
 
@@ -6251,7 +6252,7 @@ fn record_of(prompt: &str, age: Duration, ended: Option<Duration>) -> RecordTurn
 fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record() {
     let check = done_check_words(0);
     let check = check.as_str();
-    const IDLE: &str = "Both branches have landed and no lander is running.";
+    const IDLE: &str = "Both branches have landed and no lander is running.\n\nATERM-TASK-DONE";
     const LAND: &str = "land the two branches";
     let secs = Duration::from_secs;
     let fast = Duration::from_millis(600);
@@ -6421,7 +6422,10 @@ fn an_act_answered_before_any_read_saw_it_run_is_taken_by_its_row_or_its_record(
         sent + fast + fast,
     );
     assert!(!st.task_done(), "a wall's answer: {a:?}");
-    let stopped = read_screen(&stopped_by_hook(LAND, IDLE, "No lander is running."), None);
+    let stopped = read_screen(
+        &stopped_by_hook(LAND, IDLE, "No lander is running.\n\nATERM-TASK-DONE"),
+        None,
+    );
     untaken(&stopped, Some(LAND));
     let (mut st, sent) = checking(Some(LAND));
     at(&mut st, &stopped, sent + fast);
@@ -6500,207 +6504,16 @@ fn stopped_by_hook(prompt: &str, said: &str, reason: &str) -> Vec<String> {
 }
 
 #[test]
-fn the_checks_old_words_echoed_never_end_the_task_at_the_check() {
-    for reply in [
-        "Phase 1 is finished and verified; phase 2 is next.",
-        "Not everything is finished and verified: the lexer tests still fail.",
-        "The task is not yet fully finished and verified: two suites fail.",
-        "Is the task finished and verified? Not yet: two tests fail, fixing them now.",
-        "This cannot be finished and verified until the lander reports.",
-        "For phase 1 everything left needs a person; phase 2 is next.",
-        "For phase 1 nothing of the job is left; phase 2 is next.",
-    ] {
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(reply, Some(10 * MIN)), now + 10 * MIN);
-        assert!(!st.task_done(), "{reply}");
-        let acted = if says_done(Some(reply)) {
-            claimed_at(&st, &a)
-        } else {
-            a == typed(RULE_CONTINUE)
-        };
-        assert!(acted, "{reply}: {a:?}");
-    }
-    for echo in [
-        "The task is finished and verified.",
-        "Everything left needs a person: the release needs the owner's credential.",
-        "Nothing of the job is left.",
-    ] {
-        let mut st = TurnEndState::default();
-        let now = t0();
-        act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now);
-        let (a, _) = past_backoff(&mut st, &idle(echo, Some(5 * MIN)), now + 5 * MIN);
-        assert_eq!(a, checked(), "{echo}");
-    }
-    assert!(!says_done(Some(
-        "Not everything left needs a person: the lexer tests are mine."
-    )));
-    for word in [
-        "The work this session was given is finished and verified, and I've stopped.",
-        "The task is finished and verified.\n\nATERM-TASK-DONE",
-    ] {
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(word, Some(4 * MIN)), now + 4 * MIN);
-        assert!(claimed_at(&st, &a), "{word}: {a:?}");
-    }
-}
-
-#[test]
-fn a_done_report_said_as_a_condition_is_no_done_report() {
-    for condition in [
-        "Fixing the lexer now; I'll tag the release once it is finished and verified.",
-        "If the task is finished and verified, the release goes out tonight. Two suites fail; \
-         fixing them.",
-        "When everything left needs a person I'll say so. Fixing the lexer suite now.",
-        "If all tasks are complete, I'll tag the release. Two suites fail; fixing them now.",
-        "Everything is done when CI is green: two suites fail, fixing them now.",
-    ] {
-        assert!(!says_done(Some(condition)), "{condition}");
-        let mut st = TurnEndState::default();
-        let now = t0();
-        act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now);
-        let a = at(&mut st, &idle(condition, Some(5 * MIN)), now + 5 * MIN);
-        assert_eq!(a, typed(RULE_CONTINUE), "outside the check: {condition}");
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(condition, Some(5 * MIN)), now + 5 * MIN);
-        assert_eq!(a, typed(RULE_CONTINUE), "at the check: {condition}");
-        assert!(!st.task_done(), "{condition}");
-    }
-    for report in [
-        "The task is finished and verified.",
-        "Everything left needs a person: the release needs the owner's credential.",
-        "When I checked, everything is complete.",
-        "If you want docs too, say so; all tasks are complete.",
-        "All done. Let me know if you need anything.",
-    ] {
-        assert!(says_done(Some(report)), "NEGATIVE CONTROL: {report}");
-    }
-    for word in [
-        "When I checked, everything is complete.",
-        "If you want docs too, say so; all tasks are complete.",
-    ] {
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(word, Some(4 * MIN)), now + 4 * MIN);
-        assert!(claimed_at(&st, &a), "NEGATIVE CONTROL: {word}: {a:?}");
-    }
-}
-
-#[test]
-fn a_done_phrase_led_by_any_subordinator_is_no_done_report() {
-    for condition in [
-        "As soon as all tasks are complete, I'll tag the release. Two suites fail; fixing them \
-         now.",
-        "After all tasks are complete, I'll tag the release. Two suites fail; fixing them now.",
-        "Before everything is done, two suites must pass. Fixing them now.",
-        "Provided all tasks are complete, I'll tag the release. Two suites fail; fixing them \
-         now.",
-        "Assuming all tasks are complete, I'll tag the release. Two suites fail; fixing them \
-         now.",
-        "By the time everything is done, CI will be green. Two suites fail; fixing them now.",
-        "Supposing everything is done by noon, the release goes out tonight. Fixing the lexer.",
-        "In case all tasks are complete early I'll start the docs. Two suites fail; fixing them.",
-        "Whether all tasks are complete depends on the lexer suite, which I'm fixing now.",
-        "All tasks are complete as soon as CI is green: two suites fail, fixing them now.",
-        "Everything is done as long as the lexer suite passes; fixing it now.",
-        "Fixing the lexer now; I'll tag the release as soon as it is finished and verified.",
-        "Fixing the lexer now; I'll tag the release after it is finished and verified.",
-        "Fixing the lexer now; the release waits until it is finished and verified.",
-    ] {
-        assert!(!says_done(Some(condition)), "{condition}");
-        let mut st = TurnEndState::default();
-        let now = t0();
-        act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now);
-        let a = at(&mut st, &idle(condition, Some(5 * MIN)), now + 5 * MIN);
-        assert_eq!(a, typed(RULE_CONTINUE), "outside the check: {condition}");
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(condition, Some(5 * MIN)), now + 5 * MIN);
-        assert_eq!(a, typed(RULE_CONTINUE), "at the check: {condition}");
-        assert!(!st.task_done(), "{condition}");
-    }
-    for report in [
-        "All tasks are complete after the rebase.",
-        "Everything is done before the deadline.",
-        "After the rebase, all tasks are complete.",
-        "Until you review PR #42 there is nothing left to do.",
-        "All tasks are complete in case you want to ship tonight.",
-    ] {
-        assert!(says_done(Some(report)), "NEGATIVE CONTROL: {report}");
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(report, Some(4 * MIN)), now + 4 * MIN);
-        assert!(claimed_at(&st, &a), "NEGATIVE CONTROL: {report}: {a:?}");
-    }
-    assert!(
-        says_done(Some(
-            "Checked after the rebase: the task is finished and verified."
-        )),
-        "NEGATIVE CONTROL: an echo in a clause of its own"
-    );
-}
-
-#[test]
-fn everything_was_already_completed_is_a_done_report() {
-    for done in [
-        "Everything was already completed.",
-        "Checked again: all tasks were already completed on main.",
-        "The task had already been completed by the earlier session.",
-        "Everything was already done.",
-    ] {
-        assert!(says_done(Some(done)), "{done}");
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(done, Some(2 * MIN)), now + 2 * MIN);
-        assert!(claimed_at(&st, &a), "{done}: {a:?}");
-    }
-    for busy in [
-        "The build had already completed step 3 when the lexer suite started.",
-        "The fuzz agent has already completed two of its four corpora.",
-    ] {
-        assert!(!says_done(Some(busy)), "NEGATIVE CONTROL: {busy}");
-    }
-}
-
-#[test]
-fn a_subject_that_names_part_of_the_task_is_no_done_report() {
-    for part in [
-        "The first task was completed; the second needs the new fixture.",
-        "The migration task was completed. The two failing suites are next.",
-        "Phase 1's work was already completed, so I started phase 2's lexer.",
-        "Half the work was completed before the crash; redoing the rest.",
-        "The first task is complete; the second needs the new fixture.",
-        "Phase 1's work is done, so I started phase 2's lexer.",
-        "Most of the work is done; the docs pass is left.",
-        "Almost everything is done; the docs pass is left.",
-        "Nearly all tasks are complete; the docs pass is left.",
-    ] {
-        assert!(!says_done(Some(part)), "{part}");
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(part, Some(5 * MIN)), now + 5 * MIN);
-        assert_eq!(a, typed(RULE_CONTINUE), "at the check: {part}");
-        assert!(!st.task_done(), "{part}");
-    }
-    for done in [
-        "Everything was already completed.",
-        "The task had already been completed by the earlier session.",
-        "The task was completed.",
-        "All the work is done.",
-        "All of the work is done.",
-        "The whole task is complete.",
-        "I re-ran the suites and the work is done.",
-        "Task is complete.",
-    ] {
-        assert!(says_done(Some(done)), "NEGATIVE CONTROL: {done}");
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(done, Some(2 * MIN)), now + 2 * MIN);
-        assert!(claimed_at(&st, &a), "NEGATIVE CONTROL: {done}: {a:?}");
-    }
-}
-
-#[test]
 fn someone_elses_turn_opens_a_landed_task_again() {
     let (mut st, mut now) = landed_at(t0());
     now += MIN;
     st.host_typed(now, HostTurn::CarryOn);
     let a = at(
         &mut st,
-        &land(idle("Nothing left to do.", Some(Duration::from_secs(3)))),
+        &land(idle(
+            "Nothing left to do.\n\nATERM-TASK-DONE",
+            Some(Duration::from_secs(3)),
+        )),
         now,
     );
     assert_eq!(a, TurnEndAction::Nothing);
@@ -6708,7 +6521,10 @@ fn someone_elses_turn_opens_a_landed_task_again() {
     now += 10 * MIN;
     let a = at(
         &mut st,
-        &land(idle("Added the flag. All done.", Some(5 * MIN))),
+        &land(idle(
+            "Added the flag. All done.\n\nATERM-TASK-DONE",
+            Some(5 * MIN),
+        )),
         now,
     );
     assert!(!st.task_done() && !st.landed());
@@ -6728,10 +6544,13 @@ fn a_done_check_answered_with_progress_is_continued() {
         ("Done.", false),
     ] {
         let mut st = TurnEndState::default();
-        st.observe(&idle("All done.", Some(3 * MIN)), now);
+        st.observe(&idle("All done.\n\nATERM-TASK-DONE", Some(3 * MIN)), now);
         let wait = st.short_wait().unwrap_or_default();
         now += wait;
-        assert_eq!(act(&mut st, &idle("All done.", None), now), checked());
+        assert_eq!(
+            act(&mut st, &idle("All done.\n\nATERM-TASK-DONE", None), now),
+            checked()
+        );
         now += 4 * MIN;
         let a = at(&mut st, &idle(reply, Some(4 * MIN)), now);
         assert!(!st.task_done(), "{reply}");
@@ -6987,7 +6806,11 @@ fn a_check_in_on_a_carried_task_stays_on_the_ladder() {
     let a = decide_turn_end(&st, &idle("Going well.", None), &cfg(), now + 60 * MIN);
     assert_eq!(a, typed(RULE_CONTINUE));
     now += MIN;
-    at(&mut st, &idle("All done.", Some(10 * MIN)), now);
+    at(
+        &mut st,
+        &idle("All done.\n\nATERM-TASK-DONE", Some(10 * MIN)),
+        now,
+    );
     assert_eq!(st.done_reports(), 1);
     now += MIN;
     let thanks = TurnEndReading {
@@ -7228,11 +7051,11 @@ fn a_persons_exchange_at_a_wall_stays_theirs_in_a_new_loop() {
 fn only_the_check_itself_can_end_the_task() {
     let mut now = t0();
     let mut st = TurnEndState::default();
-    st.observe(&idle("All done.", Some(3 * MIN)), now);
+    st.observe(&idle("All done.\n\nATERM-TASK-DONE", Some(3 * MIN)), now);
     now += st.short_wait().unwrap_or_default();
     let drafted = TurnEndReading {
         composer: Composer::Typed,
-        ..idle("All done.", None)
+        ..idle("All done.\n\nATERM-TASK-DONE", None)
     };
     assert_eq!(
         act(&mut st, &drafted, now),
@@ -7265,18 +7088,28 @@ fn the_done_check_is_a_continuation_the_owner_can_limit() {
         ..cfg()
     };
     let mut st = TurnEndState::default();
-    st.observe(&idle("All done.", Some(3 * MIN)), now);
+    st.observe(&idle("All done.\n\nATERM-TASK-DONE", Some(3 * MIN)), now);
     let later = now + st.short_wait().unwrap_or_default();
     assert_eq!(
-        decide_turn_end(&st, &idle("All done.", None), &off, later),
+        decide_turn_end(
+            &st,
+            &idle("All done.\n\nATERM-TASK-DONE", None),
+            &off,
+            later
+        ),
         TurnEndAction::Nothing
     );
     assert_eq!(
-        decide_turn_end(&st, &idle("All done.", None), &cfg(), later),
+        decide_turn_end(
+            &st,
+            &idle("All done.\n\nATERM-TASK-DONE", None),
+            &cfg(),
+            later
+        ),
         checked()
     );
     let mut st = TurnEndState::default();
-    let asks = "All done. I will wait for your go-ahead on the next stage.";
+    let asks = "All done. I will wait for your go-ahead on the next stage.\n\nATERM-TASK-DONE";
     st.observe(&idle(asks, Some(3 * MIN)), now);
     assert!(matches!(
         decide_turn_end(&st, &idle(asks, None), &no_answers(), later),
@@ -7300,7 +7133,7 @@ fn a_done_report_naming_an_irreversible_act_gets_the_check_with_the_reversible_c
     let now = t0();
     let mut st = TurnEndState::default();
     act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now);
-    let offer = "All done. Shall I delete the old release branches?";
+    let offer = "All done. Shall I delete the old release branches?\n\nATERM-TASK-DONE";
     let (a, then) = past_backoff(&mut st, &idle(offer, Some(30 * MIN)), now + 30 * MIN);
     assert_eq!(a, with_clause);
     st.acted(&a, &idle(offer, None), then);
@@ -7319,7 +7152,11 @@ fn a_done_report_naming_an_irreversible_act_gets_the_check_with_the_reversible_c
     );
     let mut st = TurnEndState::default();
     act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now);
-    let (a, _) = past_backoff(&mut st, &idle("All done.", Some(30 * MIN)), now + 30 * MIN);
+    let (a, _) = past_backoff(
+        &mut st,
+        &idle("All done.\n\nATERM-TASK-DONE", Some(30 * MIN)),
+        now + 30 * MIN,
+    );
     assert_eq!(a, checked());
     let mut st = TurnEndState::default();
     act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now);
@@ -7628,116 +7465,6 @@ fn a_report_or_a_question_only_the_person_can_answer_is_no_choice() {
             classify_said(Some(said))
         );
     }
-}
-
-#[test]
-fn whats_next_after_finished_work_is_a_done_report() {
-    for said in [
-        "Done. I've created hello.txt with the greeting. What's next?",
-        "The migration is in and the suite is green. Anything else?",
-    ] {
-        assert!(says_done(Some(said)), "{said}");
-    }
-    assert!(!says_done(Some("Should I also update the docs?")));
-    assert!(!says_done(Some(
-        "Next I will check what's next in the plan."
-    )));
-}
-
-#[test]
-fn a_report_that_stops_or_hands_off_is_a_done_report() {
-    for yes in [
-        "r repo has a pre-push hook configured, so these pushes were gated only by the agents' \
-         test runs.\n\nWith these landed, every item that could be decided or done from this \
-         machine is finished:\n- **Decided and landed:** D33, D34 and D35, the orca limits, and \
-         the nn API changes.\n- **Decided, no code change needed:** the ty allocator row is \
-         accepted, and the aterm consent commit stays unmerged on its rescue branch.\n\nThe one \
-         remaining step that matters most needs a release-key machine: cutting the new Trust \
-         pack on m2 or m3 using the runbook, then re-measuring every repo against it. I'm \
-         stopping here.",
-        "Both false-alarm fixes have landed and no lander is running, so I'm not re-arming the \
-         watch.",
-        "No lander is running, so I'm not re-arming that watch.\n\nEverything this machine can do \
-         is landed or recorded. What's left needs m2 or m3 to cut the new Trust pack.",
-        "No lander is running, so I'm not re-arming that watch. All queued work has landed.",
-        "Both branches have landed and no lander is running, so I'm leaving the watch off.",
-        "All four regression fixes have landed and no lander is running, so I'm not re-arming \
-         the watch.",
-        "ged branches I left:** trust's `wip/lower-generic-instance-callee-20261008` (it still \
-         has commits that aren't on main) and ny's routing branch (main's docs cite it). The \
-         unrelated stash in `$HOME/trust` isn't mine, so I left it.\n- **Disk:** 5.9 TiB free after \
-         reclaiming 744 GiB from `$HOME/trust/build`. Worktree removal is still running in the \
-         background.\n- **Kept on purpose:** `fix11/wt`, which has a partial build for a \
-         faster first rebuild, and its logs, which hold the list of red tests.\n\nI saved the \
-         fix-forward list to memory as `fix-forward-20261015-handoff`, so the next session can \
-         start from it.",
-        "The work this session was given is finished and verified, and I've stopped.",
-        "Everything I can do is landed; the rest needs the release key.",
-        "Nothing else is queued.",
-    ] {
-        assert!(says_done(Some(yes)), "{yes}");
-    }
-    for no in [
-        "Stage 1 landed.",
-        "Landed the parser; next I'll do the lexer.",
-        "The tests are done; now fixing lint.",
-        "I've stopped the stale watcher and restarted the lander.",
-        "No lander is running right now, so I'm not re-arming the watch. Two agents are still \
-         working, on the seam-lint classification and the test repair.",
-        "No lander is running, so I'm leaving the lander watch off. The preview workflow and the \
-         red-UI-tests agent are still running.",
-        "No lander is running, so I'm leaving that watch off. The orca and nn workflow is still \
-         running, and I'll report when it finishes.",
-        "No lander is running, so I'm leaving that watch off. The over-cap run for the cap fix is \
-         still going, and I'll report when it finishes.",
-        "Nothing is landing right now, so I'm leaving the lander watch off. The next step is \
-         OD-1's first phase: checking whether a concrete call can hide an open-dispatch call in \
-         the same body.",
-        "Still running: the agent bisecting the regression, and fingerprint round 5.",
-        "The build is running in the background; I'll report when it finishes.",
-        "The lander watch expired. I'm not restarting it, because nothing is queued to land.\n\n\
-         Still running:\n- **tla-model-ir:** an agent is working on its failing rows.\n- \
-         **clean-ck0:** an agent is working on its failing rows.\n- **Crate-fix workflow:** it \
-         covers the ingest, conformance and shapes/astream crates.\n\nOnce they've pushed, I'll \
-         run the preview3 re-measure on the stage1 snapshot at `7be75e9a80`.",
-        "I'll land all queued work next.",
-        "I've done everything I can do until the build finishes.",
-        "Phase 0 is landed and no lander is running, so I'm not re-arming the watch. OD-1 phase \
-         1 is the next step whenever work continues.",
-        "Did it pass? No. CI is running again with the fix.",
-        "No, it is running the last suite now.",
-        "Nothing. Is running the suite enough?",
-        "The task is not yet finished and verified: the lexer tests fail.",
-        "This isn't all done; the docs are left.",
-        "The migration cannot be all done in one pass.",
-    ] {
-        assert!(!says_done(Some(no)), "{no}");
-    }
-    assert!(says_done(Some(
-        "The flaky test did not fail again; all done."
-    )));
-    let asks = "No lander is running and nothing is queued, so I'm leaving the status watch off.\n\n\
-                What's left needs your decisions: D33, D34 and D35 in Trust's decision queue, \
-                orca's two limits, and the m2/m3 release runbook.";
-    assert!(!says_done(Some(asks)));
-    let mut st = TurnEndState::default();
-    let now = t0();
-    act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now);
-    let a = at(&mut st, &idle(asks, Some(20 * MIN)), now + 20 * MIN);
-    assert_eq!(a, answered_reversibly());
-    let mut st = TurnEndState::default();
-    let now = t0();
-    act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now);
-    let report =
-        "Both branches have landed and no lander is running, so I'm leaving the watch off.";
-    let (a, _) = past_backoff(&mut st, &idle(report, Some(20 * MIN)), now + 20 * MIN);
-    assert_eq!(a, checked());
-    let mut st = TurnEndState::default();
-    act(&mut st, &idle("Stage 1 landed.", Some(5 * MIN)), now);
-    let waits = "No lander is running, so I'm leaving the lander watch off. The preview workflow \
-                 and the red-UI-tests agent are still running.";
-    let a = at(&mut st, &idle(waits, Some(20 * MIN)), now + 20 * MIN);
-    assert_eq!(a, typed(RULE_CONTINUE));
 }
 
 #[test]
@@ -10511,7 +10238,7 @@ fn a_workers_check_and_answer_go_without_the_back_off() {
             st.set_managed(managed);
             at(&mut st, &idle(said, None), t)
         };
-        let check = first("Everything is already done; nothing left to do.");
+        let check = first("Everything is already done; nothing left to do.\n\nATERM-TASK-DONE");
         let answer = first(ASKS);
         let stop = first("Stage 1 landed.");
         if managed {
@@ -10751,265 +10478,30 @@ fn a_retired_token_line_is_a_done_claim() {
     assert!(!says_done(None));
 }
 
-const WAITS_AT_THE_CHECK: [&str; 3] = [
-    "Nothing more I can do until the release build finishes; its monitor will notify me.",
-    "I'll stop here until CI reports back; the build is still running.",
-    "Everything I can do is queued behind the build, which is still running.",
-];
-
 #[test]
-fn a_done_phrase_beside_a_wait_is_no_done_word() {
-    for wait in WAITS_AT_THE_CHECK.into_iter().chain([
-        "I'll stop here and pick it up once CI reports back.",
-        "Not yet: the release build is still running in the background. I'll stop here until \
-         it reports back.",
-        "Phase 1 landed; phase 2 is next. What's next? Starting phase 2.",
-    ]) {
-        assert!(!says_done_outright(wait), "{wait}");
-        assert!(!says_done(Some(wait)), "{wait}");
-    }
-    for done in [
-        "I'm stopping here.",
-        "Both branches have landed. I'm stopping here.",
-        "Everything I can do is landed; the rest needs the release key.",
-        "I'm stopping here. The worktree removal is still running in the background.",
-        "Done. I've created hello.txt with the greeting. What's next?",
-        "ged branches I left:** trust's `wip/lower-generic-instance-callee-20261008` (it still \
-         has commits that aren't on main) and ny's routing branch (main's docs cite it). The \
-         unrelated stash in `$HOME/trust` isn't mine, so I left it.\n- **Disk:** 5.9 TiB free after \
-         reclaiming 744 GiB from `$HOME/trust/build`. Worktree removal is still running in the \
-         background.\n- **Kept on purpose:** `fix11/wt`, which has a partial build for a \
-         faster first rebuild, and its logs, which hold the list of red tests.\n\nI saved the \
-         fix-forward list to memory as `fix-forward-20261015-handoff`, so the next session can \
-         start from it.",
-    ] {
-        assert!(says_done_outright(done), "{done}");
-        assert!(says_done(Some(done)), "{done}");
-    }
-}
-
-const DONE_BESIDE_NO_WAIT: [&str; 8] = [
-    "All tasks complete\n- PR #12 merged\n- The release workflow is still running in CI and \
-     publishes on its own",
-    "Nothing left to do until you review PR #42.",
-    "I'll stop here until you're back.",
-    "Everything is done — I re-ran the full suite once more to be sure.",
-    "Nothing more I can do until the owner provides the release credential.",
-    "Nothing left to do until your review of PR #42.",
-    "I'll stop here until your go-ahead.",
-    "Nothing more I can do until the owner's sign-off.",
-];
-
-#[test]
-fn a_done_word_beside_a_list_line_or_a_stop_for_a_person_is_the_end() {
-    for done in DONE_BESIDE_NO_WAIT {
-        assert!(says_done_outright(done), "{done}");
-        let (mut st, now) = two_stages();
-        let r = idle(done, Some(5 * MIN));
-        let (a, now) = past_backoff(&mut st, &r, now + 4 * MIN);
-        assert_eq!(a, checked(), "{done}");
-        assert_eq!(st.done_reports(), 1, "{done}");
-        st.acted(&a, &r, now);
-        let now = now + MIN;
-        let (a, _) = past_backoff(&mut st, &idle(done, Some(Duration::from_secs(20))), now);
-        assert!(claimed_at(&st, &a), "{done}: {a:?}");
-    }
-    for wait in WAITS_AT_THE_CHECK.into_iter().chain([
-        "I'll stop here and pick it up once CI reports back.",
-        "Nothing more I can do until it finishes.",
-        "Nothing more I can do until your CI run finishes.",
-        "I'll stop here until your build finishes.",
-    ]) {
-        assert!(!says_done_outright(wait), "{wait}");
-    }
-    let (mut st, now) = two_stages();
-    let r = idle(WAITS_AT_THE_CHECK[0], Some(5 * MIN));
-    assert_eq!(at(&mut st, &r, now + 4 * MIN), typed(RULE_CONTINUE));
-    assert_eq!(st.done_reports(), 0);
-}
-
-#[test]
-fn a_list_its_sentence_introduces_and_a_hyphenated_noun_stay_in_the_sentence() {
-    for wait in [
-        "All tasks are complete except:\n- the release workflow, still running in CI\n- the \
-         docs deploy, waiting for review",
-        "Nothing more I can do until the user-space daemon finishes rebuilding.",
-    ] {
-        assert!(!says_done_outright(wait), "{wait}");
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(wait, Some(30 * MIN)), now + 30 * MIN);
-        assert_eq!(a, typed(RULE_CONTINUE), "{wait}");
-        assert!(!st.task_done(), "{wait}");
-    }
-    for done in [
-        DONE_BESIDE_NO_WAIT[0],
-        "All tasks complete:\n- PR #12 merged\n- the docs landed",
-        "Nothing more I can do until the user provides the key.",
-        "I'll stop here until your go-ahead.",
-        "Nothing more I can do until the owner's sign-off.",
-        "Nothing left to do until your say-so.",
-    ] {
-        assert!(says_done_outright(done), "{done}");
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &idle(done, Some(30 * MIN)), now + 30 * MIN);
-        assert!(claimed_at(&st, &a), "{done}: {a:?}");
-    }
-}
-
-const DONE_PHRASE_UNSAID: [&str; 9] = [
-    "All six resumed workflows have fresh agents running, plus the new help-surfaces read. A \
-     few steps that had already completed were re-dispatched on resume; their worktrees \
-     already contain the finished commits, so those agents will see the work in \
-     place.\nWaiting on results. The next thing to land is the help-surfaces fix, which \
-     unblocks pushing for everyone, followed by the six Clean probes.",
-    "Correct — still no compiler, and this build's outcome is unknown.\nA tracked waiter will \
-     report the result directly: whether a stage2 compiler exists, whether the proc-macro \
-     failure recurred, and what backends the sysroot carries.\n- The deduplication that should \
-     catch the second resolution cannot: its fast path bails out when there is no expected \
-     hash, and its slower check only sees crates whose registration has already \
-     completed.\nIf this build fails the same way, the next move is a fix aimed at that \
-     deduplication gap.",
-    "Summary of this stretch — the goal's primary blocker is cleared.\n**Goal: stage 2 builds \
-     and verification works.** `Build completed successfully in 0:59:34`; a true contract \
-     reports `5 proved, 0 failed, 0 unknown`, a false one fails strict verification.\nPush \
-     running with 8 commits.",
-    "Install done; running the integration suite now.",
-    "The first subtask is complete; the second one starts now.",
-    "No more worktrees to remove; rebuilding the index now.",
-    "The framework is complete; the app on top of it comes after.",
-    "Firewall done. Moving on to the proxy config.",
-    "Stage 2 is up. Its log:\n```\nBuild completed successfully in 0:59:34\n```\nPush running \
-     with 8 commits.",
-];
-
-#[test]
-fn a_done_report_that_says_completed_is_a_done_word() {
-    for done in [
-        "All tasks completed.",
-        "All tasks are completed and verified.",
-        "The task is completed.",
-        "Everything is completed; nothing is left to do here.",
-        "The work is completed and pushed to main.",
-        "The release workflow is completed.",
-    ] {
-        assert!(says_done(Some(done)), "{done}");
-        assert!(says_done_outright(done), "{done}");
-        let (mut st, now) = checked_at(t0());
-        let r = recorded(Some(false), idle(done, Some(30 * MIN)));
-        let a = at(&mut st, &r, now + 30 * MIN);
-        assert!(claimed_at(&st, &a), "{done}: {a:?}");
-    }
-    for going in [
-        "The first subtask is completed; running the second now.",
-        "All tasks completed except the release, which is still running in CI.",
-    ] {
-        assert!(!says_done_outright(going), "{going}");
-        let (mut st, now) = checked_at(t0());
-        let r = recorded(Some(false), idle(going, Some(30 * MIN)));
-        assert_eq!(
-            at(&mut st, &r, now + 30 * MIN),
-            typed(RULE_CONTINUE),
-            "{going}"
-        );
-        assert!(!st.task_done(), "{going}");
-    }
-}
-
-#[test]
-fn a_done_phrase_inside_another_word_or_a_code_span_is_no_done_word() {
-    use crate::harness::upgrade::transcript_finished;
-    let json = |text: &str| aterm_json::to_string(&aterm_json::Value::from(text)).expect("json");
-    let user = |text: &str| {
-        format!(
-            r#"{{"isSidechain":false,"type":"user","message":{{"role":"user","content":{}}},"origin":{{"kind":"human"}},"promptSource":"typed","version":"2.1.300"}}"#,
-            json(text)
-        )
-    };
-    let model = |text: &str| {
-        format!(
-            r#"{{"isSidechain":false,"type":"assistant","message":{{"model":"claude-opus-5-5","role":"assistant","content":[{{"type":"text","text":{}}}],"stop_reason":"end_turn"}},"version":"2.1.300"}}"#,
-            json(text)
-        )
-    };
-    let closed = r#"{"isSidechain":false,"type":"system","subtype":"turn_duration","durationMs":1800000,"messageCount":4,"isMeta":false}"#;
-    let record = |reply: &str| {
-        [
-            user("Fix the lexer and land it."),
-            model("All done."),
-            user(DONE_CHECK),
-            model(reply),
-            closed.to_string(),
-        ]
-        .join("\n")
-    };
-    let drawn = |reply: &str| {
-        reply
-            .lines()
-            .filter(|l| !l.trim_start().starts_with("```"))
-            .collect::<Vec<_>>()
-            .join("\n")
-            .replace("**", "")
-            .replace('`', "")
-    };
-    let mut overruled = 0;
-    for reply in DONE_PHRASE_UNSAID {
-        assert!(!says_done(Some(reply)), "{reply}");
-        let rec = record(reply);
-        let finished = transcript_finished(&rec, &[]);
-        assert!(!finished, "the record: {reply}");
-        let screen = drawn(reply);
-        overruled += usize::from(says_done_outright(&screen));
-        let r = recorded(Some(finished), idle(&screen, Some(30 * MIN)));
-        let claim = says_done(Some(&screen));
-        let (mut st, now) = checked_at(t0());
-        let a = at(&mut st, &r, now + 30 * MIN);
-        if claim {
-            assert!(claimed_at(&st, &a), "{screen}: {a:?}");
-        } else {
-            assert_eq!(a, typed(RULE_CONTINUE), "{screen}");
-        }
-        assert!(!st.task_done(), "{screen}");
-        let mut st = TurnEndState::default();
-        let now = t0();
-        st.observe(&idle("All done.", None), now);
-        st.host_typed(now, HostTurn::Check);
-        let (a, _) = past_backoff(&mut st, &r, now + 30 * MIN);
-        if claim {
-            assert_eq!(a, checked(), "the restart's check: {screen}");
-        } else {
-            assert_eq!(a, typed(RULE_CONTINUE), "the restart's check: {screen}");
-        }
-        assert!(!st.task_done(), "the restart's check: {screen}");
-    }
-    assert!(
-        overruled >= 2,
-        "the screen's drawn words alone read as done: {overruled}"
-    );
-    for done in [
+fn completion_prose_receives_the_ordinary_continuation() {
+    for said in [
         "All done.",
-        "The task is complete.",
-        "There is no more work in this repo.",
-        "Everything was already complete.",
-        "The workflow completed successfully.",
-        "All done: `targo test` passes on main.",
-        "Both branches have landed and I've stopped.",
-        "The fix landed and verified. What's next?",
+        "Nothing left to do.",
+        "I'm stopping here.",
+        "All queued work has landed.",
+        "Finished and verified.",
     ] {
-        assert!(says_done_outright(done), "{done}");
-        let rec = record(done);
-        let finished = transcript_finished(&rec, &[]);
-        assert!(!finished, "the check's answer lands nothing: {done}");
+        assert!(!says_done(Some(said)), "completion prose: {said}");
         let (mut st, now) = checked_at(t0());
-        let r = recorded(Some(finished), idle(&drawn(done), Some(30 * MIN)));
-        let a = at(&mut st, &r, now + 30 * MIN);
-        assert!(claimed_at(&st, &a), "{done}: {a:?}");
+        let a = at(&mut st, &idle(said, Some(30 * MIN)), now + 30 * MIN);
+        assert_eq!(a, typed(RULE_CONTINUE), "completion prose: {said}");
+        assert_eq!(st.done_reports(), 0, "completion prose: {said}");
+        assert!(!st.task_done(), "completion prose: {said}");
     }
+
     let (mut st, now) = checked_at(t0());
-    let lagging = record("Running the last check.");
-    assert!(!transcript_finished(&lagging, &[]));
-    let r = recorded(Some(false), idle("All done.", Some(30 * MIN)));
-    let a = at(&mut st, &r, now + 30 * MIN);
-    assert!(claimed_at(&st, &a), "{a:?}");
+    let defense = idle(
+        "Nothing left: the parser is on remote main.",
+        Some(30 * MIN),
+    );
+    let a = at(&mut st, &defense, now + 30 * MIN);
+    assert!(claimed_at(&st, &a), "a structural defense: {a:?}");
 }
 
 const FINISHED_REPORT: &str = "Landed the fix and verified it on main.\n\nATERM-TASK-DONE";
@@ -11033,21 +10525,20 @@ fn the_record_never_ends_the_task_at_the_check() {
             json(text)
         )
     };
-    let queue =
-        "No lander is running, so I'm not re-arming that watch. All queued work has landed.";
-    let echo = "Phase 1 is finished and verified; phase 2 is next.";
+    let claim = "Verified on main.\n\nATERM-TASK-DONE";
     for reply in [
-        queue,
-        echo,
-        "Verified on main.\n\nATERM-TASK-DONE",
+        "No lander is running, so I'm not re-arming that watch. All queued work has landed.",
+        "Phase 1 is finished and verified; phase 2 is next.",
+        claim,
         "Both branches have landed. I'm stopping here.",
-        WAITS_AT_THE_CHECK[0],
-        WAITS_AT_THE_CHECK[1],
-        WAITS_AT_THE_CHECK[2],
+        "Nothing more I can do until the release build finishes; its monitor will notify me.",
+        "I'll stop here until CI reports back; the build is still running.",
+        "Everything I can do is queued behind the build, which is still running.",
         "I'm stopping here. The worktree removal is still running in the background.",
-        DONE_BESIDE_NO_WAIT[0],
-        DONE_BESIDE_NO_WAIT[1],
-        DONE_BESIDE_NO_WAIT[3],
+        "All tasks complete\n- PR #12 merged\n- The release workflow is still running in CI and \
+         publishes on its own",
+        "Nothing left to do until you review PR #42.",
+        "Everything is done — I re-ran the full suite once more to be sure.",
         "Pushed it.\nNothing left: all of it is merged into the remote main branch.",
     ] {
         let (mut st, now) = checked_at(t0());
@@ -11071,7 +10562,7 @@ fn the_record_never_ends_the_task_at_the_check() {
         }
     }
     let (mut st, now) = checked_at(t0());
-    let r = recorded(Some(true), idle(queue, Some(30 * MIN)));
+    let r = recorded(Some(true), idle(claim, Some(30 * MIN)));
     let a = at(&mut st, &r, now + 30 * MIN);
     assert!(claimed_at(&st, &a), "{a:?}");
 }
@@ -11157,7 +10648,7 @@ fn open_work_reads_heads_and_status_words_and_never_a_negation() {
             &["still open"],
         ),
         (
-            "Still open:\n- the release: needs the owner's release credential\n\
+            "Still open:\n- the release: needs the owner's release permission\n\
              - the GPU bench: no GPU on this host\nATERM-TASK-DONE",
             &["still open"],
         ),
@@ -11231,10 +10722,7 @@ fn open_work_keeps_fenced_examples_out_of_the_report() {
         ("```markdown", "~~~", "````"),
     ] {
         let tail = format!("{open}\n{inner}\nAll done.\n{close}");
-        assert!(without_code(&tail).trim().is_empty(), "{tail:?}");
-        assert!(!says_done_outright(&tail), "{tail:?}");
         assert!(open_work(Some(&tail)).is_empty(), "{tail:?}");
-        assert!(says_done_outright(&format!("{tail}\nAll done.")));
         assert_eq!(
             open_work(Some(&format!(
                 "{tail}\nStill open: finish the actual tests."
@@ -12521,7 +12009,7 @@ fn a_lost_login_before_any_turn_is_asked_is_the_old_process_s() {
         Some(5 * MIN),
     );
     let done = TurnEndReading {
-        said_tail: Some("All done.".to_string()),
+        said_tail: Some("All done.\n\nATERM-TASK-DONE".to_string()),
         ..done
     };
     assert_eq!(
@@ -12578,7 +12066,7 @@ fn a_move_over_an_unanswered_move_owes_what_that_move_owed() {
         st
     };
     let first = idle("Stage 2 done.", None);
-    let done = idle("All done.", Some(5 * MIN));
+    let done = idle("All done.\n\nATERM-TASK-DONE", Some(5 * MIN));
     let mut st = chain(AccountAt::Ahead, false);
     assert!(!st.account_resume_owed());
     assert_eq!(
@@ -15100,7 +14588,7 @@ fn a_remembered_tail_reads_as_a_fresh_read_of_it() {
     let tails = [
         "Suites are running.",
         "Should I delete the old branch? (y/n)",
-        "All done. Nothing left to do.",
+        "Nothing left: the parser is on main.",
         "Suites are running!",
         "Want me to take that on?",
         "DONE",
@@ -15109,13 +14597,15 @@ fn a_remembered_tail_reads_as_a_fresh_read_of_it() {
     for _ in 0..2 {
         for t in tails {
             assert_eq!(classify_said(Some(t)), classify_said_read(t), "{t:?}");
-            assert_eq!(says_done(Some(t)), says_done_read(t), "{t:?}");
+            let fresh =
+                needs::defense_line(t).is_some() || says_done_outright(&needs::without_needs(t));
+            assert_eq!(says_done(Some(t)), fresh, "{t:?}");
         }
     }
     assert_eq!(classify_said(None), Said::Plain);
     assert!(!says_done(None));
     assert_ne!(classify_said_read(tails[0]), classify_said_read(tails[1]));
-    assert_ne!(says_done_read(tails[0]), says_done_read(tails[2]));
+    assert_ne!(says_done(Some(tails[0])), says_done(Some(tails[2])));
 }
 
 #[test]
@@ -15328,7 +14818,7 @@ fn landed_at(t: Instant) -> (TurnEndState, Instant) {
 #[test]
 fn a_cruise_done_claim_gets_the_defend_prompt_never_nothing() {
     for claim in [
-        "All done. Nothing left to do.",
+        "All done. Nothing left to do.\n\nATERM-TASK-DONE",
         "Committed and pushed.\nATERM-TASK-DONE",
         DEFENSE,
         "**Nothing left:** all of it is on main.",
@@ -15472,7 +14962,7 @@ fn land_lands_only_on_its_checks_landed() {
     assert!(st.landed() && st.standing_needs().is_empty());
     let mut st = TurnEndState::default();
     act(&mut st, &land(idle("Stage 1 landed.", Some(3 * MIN))), t0());
-    let need = format!("{DEFENSE}\nNEEDS YOU: the signing credential");
+    let need = format!("{DEFENSE}\nNEEDS YOU: the signing permission");
     assert_eq!(
         at(&mut st, &land(idle(&need, Some(3 * MIN))), t0() + 3 * MIN),
         TurnEndAction::Type {
@@ -15573,7 +15063,8 @@ fn a_cruise_claim_over_repo_work_gets_the_check_with_the_repo_suffix() {
         text: act_words(&done_check_words(n), &[&suffix], None),
         rule_id: RULE_DONE_CHECK,
     };
-    let claim = "Built, tested and landed the parser. All done; nothing left to do.";
+    let claim =
+        "Built, tested and landed the parser. All done; nothing left to do.\n\nATERM-TASK-DONE";
     let mut now = t0();
     let mut st = TurnEndState::default();
     assert_eq!(
@@ -15602,7 +15093,7 @@ fn a_cruise_claim_over_repo_work_gets_the_check_with_the_repo_suffix() {
     let mut st = TurnEndState::default();
     let now = t0();
     act(&mut st, &idle("Stage 1 landed.", Some(3 * MIN)), now);
-    let open = "Merged the parser. All done.\nStill open: the lexer's e2e suite (not run).";
+    let open = "Merged the parser. All done.\nStill open: the lexer's e2e suite (not run).\n\nATERM-TASK-DONE";
     let found = open_work(Some(open));
     assert!(!found.is_empty(), "{open}");
     let (a, _) = past_backoff(
@@ -15812,7 +15303,7 @@ fn a_checked_reading_decides_as_clean() {
         let r = TurnEndReading {
             repo,
             ..idle(
-                "Built, tested and landed the parser. All done; nothing left to do.",
+                "Built, tested and landed the parser. All done; nothing left to do.\n\nATERM-TASK-DONE",
                 Some(3 * MIN),
             )
         };
@@ -15867,15 +15358,15 @@ fn the_standing_needs_clear_on_nothing_someone_elses_turn_or_off() {
     let standing = |now: Instant| {
         let mut st = TurnEndState::default();
         st.observe(
-            &idle("Merged it.\nNEEDS YOU: the signing credential", None),
+            &idle("Merged it.\nNEEDS YOU: the signing permission", None),
             now,
         );
-        assert_eq!(st.standing_needs(), ["the signing credential"]);
+        assert_eq!(st.standing_needs(), ["the signing permission"]);
         st
     };
     let now = t0();
     let mut st = standing(now);
-    let r = idle("Merged it.\nNEEDS YOU: the signing credential", None);
+    let r = idle("Merged it.\nNEEDS YOU: the signing permission", None);
     let (a, then) = until_acted(&mut st, &r, now);
     assert!(a.rule_id().is_some(), "{a:?}");
     at(
@@ -15892,7 +15383,7 @@ fn the_standing_needs_clear_on_nothing_someone_elses_turn_or_off() {
         &idle("Fixed the lexer.", Some(3 * MIN)),
         then + 3 * MIN,
     );
-    assert_eq!(st.standing_needs(), ["the signing credential"]);
+    assert_eq!(st.standing_needs(), ["the signing permission"]);
     let mut st = standing(now);
     at(
         &mut st,
@@ -15925,12 +15416,12 @@ fn the_standing_needs_clear_on_nothing_someone_elses_turn_or_off() {
         &idle("The background build finished.", Some(5 * MIN)),
         now + 10 * MIN,
     );
-    assert_eq!(st.standing_needs(), ["the signing credential"]);
+    assert_eq!(st.standing_needs(), ["the signing permission"]);
     let mut st = TurnEndState::default();
     st.observe(
         &TurnEndReading {
             answered: Some(answered(7)),
-            ..idle("Merged it.\nNEEDS YOU: the signing credential", None)
+            ..idle("Merged it.\nNEEDS YOU: the signing permission", None)
         },
         now,
     );
@@ -15942,7 +15433,7 @@ fn the_standing_needs_clear_on_nothing_someone_elses_turn_or_off() {
         },
         now + 10 * MIN,
     );
-    assert_eq!(st.standing_needs(), ["the signing credential"]);
+    assert_eq!(st.standing_needs(), ["the signing permission"]);
     let mut st = standing(now);
     st.park_off();
     assert!(st.standing_needs().is_empty());
@@ -15986,7 +15477,10 @@ fn a_turn_of_someone_elses_keeps_the_land_episode() {
 #[test]
 fn a_done_report_under_land_gets_the_instruction_not_the_check() {
     let quick = Some(Duration::from_secs(4));
-    for said in ["All done.", "All done. What's next?"] {
+    for said in [
+        "All done.\n\nATERM-TASK-DONE",
+        "All done. What's next?\n\nATERM-TASK-DONE",
+    ] {
         let mut now = t0();
         let mut st = TurnEndState::default();
         st.observe(&land(idle(said, quick)), now);
@@ -16866,7 +16360,7 @@ fn cruise_never_parks_at_a_reply_to_the_persons_own_message() {
         "Hello!",
         "Fixed it; the suite is green.\nATERM-TASK-DONE",
         "All done: the change is committed and pushed, and every suite passes.",
-        "The fix is in.\nNEEDS YOU: the release credential to sign 0.145.0",
+        "The fix is in.\nNEEDS YOU: the release permission to sign 0.145.0",
         "Keep the token: it costs nothing and survives a restart.",
     ] {
         let theirs = TurnEndReading {
@@ -17660,7 +17154,7 @@ fn wall_split_reply(
 
 #[test]
 fn a_wall_inside_a_land_act_or_the_done_check_keeps_the_act_it_cut() {
-    let reply = "All done: committed and pushed.";
+    let reply = "All done: committed and pushed.\n\nATERM-TASK-DONE";
     let progress = "Committing the parser now; the lexer is next.";
     for lead in [&[][..], &[progress; 3][..]] {
         let (mut st, a) = wall_split_reply(Autopilot::Land, lead, "Stage 1 landed.", DEFENSE);
@@ -17694,7 +17188,7 @@ fn a_full_context_inside_the_done_check_gets_the_check_again_after_the_compactio
         then: Then::Continue,
     };
     let compacted = idle("Conversation compacted.", Some(Duration::from_secs(40)));
-    let reply = "All done: committed and pushed.";
+    let reply = "All done: committed and pushed.\n\nATERM-TASK-DONE";
     let (mut st, mut now) = checked_at(t0());
     now += 5 * MIN;
     assert_eq!(act(&mut st, &context(Some(5 * MIN)), now), compact);
@@ -18655,8 +18149,8 @@ fn a_wall_splits_a_job_in_a_new_loop_too() {
 
 #[test]
 fn a_wall_inside_the_restarts_check_keeps_the_check_it_cut() {
-    let report = "All tasks are complete and verified; nothing is left to do.";
-    let reply = "All done: committed and pushed.";
+    let report = "All tasks are complete and verified; nothing is left to do.\n\nATERM-TASK-DONE";
+    let reply = "All done: committed and pushed.\n\nATERM-TASK-DONE";
     let run = |kind: HostTurn| {
         let mut st = TurnEndState::default();
         let mut now = t0();
@@ -18756,10 +18250,10 @@ fn only_the_land_checks_landed_is_the_records_landing() {
             !s.finished() && s.said_done(),
             "a defense lands nothing: {asked}"
         );
-        let s = scan(asked, "All done.");
+        let s = scan(asked, "All done.\n\nATERM-TASK-DONE");
         assert!(!s.finished(), "a done phrase: {asked}");
         assert!(s.said_done(), "a done phrase: {asked}");
-        let needs = format!("{DEFENSE}\nNEEDS YOU: the release credential.");
+        let needs = format!("{DEFENSE}\nNEEDS YOU: the release permission.");
         assert!(!scan(asked, &needs).finished(), "a need: {asked}");
     }
     let hinted = land_check::land_check_text(
@@ -18772,7 +18266,7 @@ fn only_the_land_checks_landed_is_the_records_landing() {
         for reply in [
             DEFENSE,
             "LANDED, except the docs PR",
-            "NEEDS YOU: the release credential.",
+            "NEEDS YOU: the release permission.",
         ] {
             assert!(!scan(check, reply).finished(), "{reply}: {check}");
         }
@@ -18785,7 +18279,7 @@ fn only_the_land_checks_landed_is_the_records_landing() {
         !scan(&quoted, LANDED_WORD).finished(),
         "CONTROL: a person's prompt"
     );
-    for reply in ["All done.", DEFENSE] {
+    for reply in ["All done.\n\nATERM-TASK-DONE", DEFENSE] {
         let s = scan(DONE_CHECK, reply);
         for (mode, want) in [
             (Autopilot::Land, land_instruction()),
@@ -18801,13 +18295,14 @@ fn only_the_land_checks_landed_is_the_records_landing() {
 
 #[test]
 fn a_done_check_a_loop_before_this_one_asked_is_answered_for_this_one() {
-    let report = "All done: verified again, every suite passes.";
+    let report = "All done: verified again, every suite passes.\n\nATERM-TASK-DONE";
     let answer = Some(Duration::from_secs(70));
     let now = t0();
     let then = now + Duration::from_secs(72);
-    let typed_at = "All done: the change is committed and pushed, and every suite passes.";
+    let typed_at =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let progress = "Stage 3 of 5 is in; stage 4 is next.";
-    let idle_report = "No lander is running. All queued work has landed.";
+    let idle_report = "No lander is running. All queued work has landed.\n\nATERM-TASK-DONE";
     type Seed = Box<dyn Fn(&mut TurnEndState)>;
     let cases: Vec<(&str, Seed, TurnEndReading, Instant, Option<TurnEndAction>)> = vec![
         (
@@ -19850,7 +19345,7 @@ fn a_dialog_whose_login_came_back_elsewhere_is_backed_out_of() {
     let a = at(&mut st, &r, t + MIN);
     assert!(
         matches!(&a, TurnEndAction::WaitUntil { .. }),
-        "the key held for the person: {a:?}"
+        "the nod held for the person: {a:?}"
     );
     // The turn already delivered again once the login came back (login-back@v1) and met by the
     // wall again: it signs in itself, and a `Back` the host still reports (the login back in
@@ -22232,7 +21727,7 @@ fn a_turn_no_read_saw_run_since_the_last_point_is_judged_where_it_shows_once() {
 fn a_judged_turn_whose_opener_comes_into_sight_is_not_judged_again() {
     const PROMPT: &str = "write the parser for this repository and land it";
     const FIRST: &str = "Wrote the parser module.";
-    const REPORT: &str = "All done. Nothing left to do.";
+    const REPORT: &str = "All done. Nothing left to do.\n\nATERM-TASK-DONE";
     const HEAD: &str = "The report: every item of the parser is written and tested.";
     let secs = Duration::from_secs;
     let t = t0();
@@ -22989,7 +22484,10 @@ fn the_doors_lines_answer_is_no_done_report_and_moves_no_streak() {
             st.fact_typed();
             st.took();
         }
-        st.observe(&idle("All done.", Some(short)), now + MIN);
+        st.observe(
+            &idle("All done.\n\nATERM-TASK-DONE", Some(short)),
+            now + MIN,
+        );
         (
             st.done_reports(),
             st.short_streak() - streak,

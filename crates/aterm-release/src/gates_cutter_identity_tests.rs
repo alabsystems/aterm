@@ -14,14 +14,21 @@ struct Claimed {
 
 impl GitRunner for Claimed {
     fn git(&self, args: &[&str]) -> Result<RunOut> {
+        // `changed` lists `diff --name-status` rows (`M\tpath`); git's `-z` form separates
+        // each status and path by NUL.
         let text = match args.first() {
-            Some(&"rev-parse") => self.parent,
-            Some(&"diff") => self.changed,
-            _ => "",
+            Some(&"rev-parse") => self.parent.to_string(),
+            Some(&"diff") => self
+                .changed
+                .lines()
+                .flat_map(|row| row.split('\t'))
+                .map(|field| format!("{field}\0"))
+                .collect(),
+            _ => String::new(),
         };
         Ok(RunOut {
             status: 0,
-            stdout: text.as_bytes().to_vec(),
+            stdout: text.into_bytes(),
             stderr: Vec::new(),
         })
     }
@@ -30,7 +37,7 @@ impl GitRunner for Claimed {
 fn unrelated() -> Claimed {
     Claimed {
         parent: OLDER,
-        changed: "crates/aterm-release/src/publish.rs\n",
+        changed: "M\tcrates/aterm-release/src/publish.rs\n",
     }
 }
 
@@ -40,7 +47,7 @@ fn another_commits_binary_is_refused() {
     own_cutter_with(&unrelated(), OLDER, HEAD).expect_err("not its own");
     let docs = Claimed {
         parent: OLDER,
-        changed: "docs/NOTE.md\n",
+        changed: "M\tdocs/NOTE.md\n",
     };
     assert!(own_cutter_with(&docs, OLDER, HEAD).is_err());
 }
@@ -49,12 +56,12 @@ fn another_commits_binary_is_refused() {
 fn a_claim_commit_is_finished_by_the_cutter_of_the_commit_it_claims() {
     let claim = Claimed {
         parent: OLDER,
-        changed: "CHANGELOG.md\nRELEASES.ledger\n",
+        changed: "M\tCHANGELOG.md\nM\tRELEASES.ledger\n",
     };
     own_cutter_with(&claim, OLDER, HEAD).expect("the claim's cutter");
     let recut = Claimed {
         parent: OLDER,
-        changed: "RELEASES.ledger\n",
+        changed: "M\tRELEASES.ledger\n",
     };
     assert!(
         own_cutter_with(&recut, OLDER, HEAD).is_ok(),
@@ -62,21 +69,45 @@ fn a_claim_commit_is_finished_by_the_cutter_of_the_commit_it_claims() {
     );
     let more = Claimed {
         parent: OLDER,
-        changed: "CHANGELOG.md\nRELEASES.ledger\ncrates/aterm-release/src/gates.rs\n",
+        changed: "M\tCHANGELOG.md\nM\tRELEASES.ledger\nM\tcrates/aterm-release/src/gates.rs\n",
     };
     assert!(own_cutter_with(&more, OLDER, HEAD).is_err());
     let other_parent = Claimed {
         parent: "3333333333333333333333333333333333333333",
-        changed: "RELEASES.ledger\n",
+        changed: "M\tRELEASES.ledger\n",
     };
     assert!(own_cutter_with(&other_parent, OLDER, HEAD).is_err());
+    // T-R7: a claim commit deletes the entry files it shipped and keeps its cutter; one that
+    // adds or edits an entry file, or deletes files and changes no claim file, does not.
+    let ships = Claimed {
+        parent: OLDER,
+        changed: "M\tCHANGELOG.md\nM\tRELEASES.ledger\nD\tchanges/added/b.md\nD\tchanges/fixed/a.md\n",
+    };
+    let kept = own_cutter_with(&ships, OLDER, HEAD).expect("deleting what shipped");
+    assert!(
+        kept.contains("deletes the entry files it shipped"),
+        "{kept}"
+    );
+    for changed in [
+        "M\tCHANGELOG.md\nM\tRELEASES.ledger\nA\tchanges/fixed/new.md\n",
+        "M\tCHANGELOG.md\nM\tRELEASES.ledger\nM\tchanges/fixed/a.md\n",
+        "D\tchanges/fixed/a.md\n",
+        "M\tCHANGELOG.md\nD\tchangesets/a.md\n",
+        "M\tCHANGELOG.md\nD\tcrates/aterm-release/src/gates.rs\n",
+    ] {
+        let claim = Claimed {
+            parent: OLDER,
+            changed,
+        };
+        assert!(own_cutter_with(&claim, OLDER, HEAD).is_err(), "{changed}");
+    }
 }
 
 #[test]
 fn a_binary_that_is_no_commits_build_fails_closed() {
     let claim = Claimed {
         parent: "unknown",
-        changed: "RELEASES.ledger\n",
+        changed: "M\tRELEASES.ledger\n",
     };
     let none = crate::cutter::NotOwn {
         why: "its checkout is dirty".into(),
@@ -89,14 +120,15 @@ fn a_binary_that_is_no_commits_build_fails_closed() {
 }
 
 /// A frozen cutter's content proof covers its commit and that commit's claim commit,
-/// which adds only CLAIM_FILES (no cutter compiles them in): a resume past the claim runs
-/// R's frozen cutter against the claim commit (aterm 0.184.0's step 8 resume refused
-/// here). Any other child, or another parent, is still refused.
+/// which changes only CLAIM_FILES and deletes the entry files it shipped (no cutter compiles
+/// any of them in): a resume past the claim runs R's frozen cutter against the claim commit
+/// (aterm 0.184.0's step 8 resume refused here). Any other child, or another parent, is
+/// still refused.
 #[test]
 fn a_content_proved_cutter_finishes_only_its_own_claim_commit() {
     let claim = Claimed {
         parent: OLDER,
-        changed: "CHANGELOG.md\nRELEASES.ledger\n",
+        changed: "M\tCHANGELOG.md\nM\tRELEASES.ledger\n",
     };
     let proved = crate::cutter::Stamp::Proved(HEAD.into());
     assert!(own_cutter_stamp_of(&claim, Ok(&proved), HEAD).is_ok());
@@ -108,13 +140,13 @@ fn a_content_proved_cutter_finishes_only_its_own_claim_commit() {
 
     let more = Claimed {
         parent: OLDER,
-        changed: "CHANGELOG.md\nRELEASES.ledger\ncrates/aterm-release/src/gates.rs\n",
+        changed: "M\tCHANGELOG.md\nM\tRELEASES.ledger\nM\tcrates/aterm-release/src/gates.rs\n",
     };
     let not = own_cutter_stamp_of(&more, Ok(&proved_old), HEAD).unwrap_err();
     assert!(not.why.contains("content-proved"), "{not:?}");
     let other_parent = Claimed {
         parent: "3333333333333333333333333333333333333333",
-        changed: "RELEASES.ledger\n",
+        changed: "M\tRELEASES.ledger\n",
     };
     assert!(own_cutter_stamp_of(&other_parent, Ok(&proved_old), HEAD).is_err());
     assert!(

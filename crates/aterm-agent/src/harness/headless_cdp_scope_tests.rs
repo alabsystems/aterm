@@ -46,8 +46,8 @@ fn sleep_ends_a_real_cdp_wait_without_releasing_its_blocked_reader() {
         }
         let profile_path = profile.path().to_owned();
         let lifetime = Lifetime::default();
-        let (mut command_read, command_write) = std::io::pipe().unwrap();
-        let (output_read, output_write) = std::io::pipe().unwrap();
+        let (mut command_read, command_write) = aterm_uds::pipe().unwrap();
+        let (output_read, output_write) = aterm_uds::pipe().unwrap();
         let mut client =
             CdpClient::new_scoped(command_write, output_read, lifetime.enter()).unwrap();
         let slept = std::sync::Arc::new(AtomicU64::new(0));
@@ -111,8 +111,8 @@ fn sleep_ends_a_real_cdp_wait_without_releasing_its_blocked_reader() {
 #[test]
 fn a_detached_cdp_reader_retains_the_scope_until_its_real_pipe_closes() {
     let lifetime = Lifetime::default();
-    let (command_read, command_write) = std::io::pipe().unwrap();
-    let (output_read, output_write) = std::io::pipe().unwrap();
+    let (command_read, command_write) = aterm_uds::pipe().unwrap();
+    let (output_read, output_write) = aterm_uds::pipe().unwrap();
     let client = CdpClient::new_scoped(command_write, output_read, lifetime.enter()).unwrap();
     drop(client);
     let held = lifetime.pause().unwrap().try_wait();
@@ -130,8 +130,8 @@ fn a_detached_cdp_reader_retains_the_scope_until_its_real_pipe_closes() {
 #[test]
 fn a_backpressured_cdp_writer_retains_its_command_buffer_and_scope() {
     let lifetime = Lifetime::default();
-    let (mut command_read, command_write) = std::io::pipe().unwrap();
-    let (output_read, output_write) = std::io::pipe().unwrap();
+    let (mut command_read, command_write) = aterm_uds::pipe().unwrap();
+    let (output_read, output_write) = aterm_uds::pipe().unwrap();
     let client = CdpClient::new_scoped(command_write, output_read, lifetime.enter()).unwrap();
     let (done, written) = std::sync::mpsc::sync_channel(1);
     // A private ordinary pipe cannot accept this buffer while only one byte is read.
@@ -167,8 +167,8 @@ fn a_closed_scope_refuses_cdp_workers_and_retires_the_supplied_pipes() {
     let lifetime = Lifetime::default();
     let scope = lifetime.enter().unwrap();
     let pause = lifetime.pause().unwrap();
-    let (mut command_read, command_write) = std::io::pipe().unwrap();
-    let (output_read, output_write) = std::io::pipe().unwrap();
+    let (mut command_read, command_write) = aterm_uds::pipe().unwrap();
+    let (output_read, output_write) = aterm_uds::pipe().unwrap();
     let refused = CdpClient::new_scoped(command_write, output_read, Some(scope)).is_err();
     drop(output_write);
     let mut byte = [0];
@@ -189,8 +189,8 @@ fn a_closed_scope_refuses_cdp_workers_and_retires_the_supplied_pipes() {
 #[test]
 fn a_scoped_cdp_client_preserves_real_command_and_response_delivery() {
     let lifetime = Lifetime::default();
-    let (mut command_read, command_write) = std::io::pipe().unwrap();
-    let (output_read, mut output_write) = std::io::pipe().unwrap();
+    let (mut command_read, command_write) = aterm_uds::pipe().unwrap();
+    let (output_read, mut output_write) = aterm_uds::pipe().unwrap();
     let client = CdpClient::new_scoped(command_write, output_read, lifetime.enter()).unwrap();
     let worker = std::thread::spawn(move || {
         let mut client = client;
@@ -240,8 +240,8 @@ fn a_scoped_cdp_client_preserves_real_command_and_response_delivery() {
 #[test]
 fn cancelling_a_cdp_response_wait_does_not_release_the_actual_reader() {
     let lifetime = Lifetime::default();
-    let (mut command_read, command_write) = std::io::pipe().unwrap();
-    let (output_read, output_write) = std::io::pipe().unwrap();
+    let (mut command_read, command_write) = aterm_uds::pipe().unwrap();
+    let (output_read, output_write) = aterm_uds::pipe().unwrap();
     let mut client = CdpClient::new_scoped(command_write, output_read, lifetime.enter()).unwrap();
     let (done, finished) = std::sync::mpsc::channel();
     let worker = std::thread::spawn(move || {

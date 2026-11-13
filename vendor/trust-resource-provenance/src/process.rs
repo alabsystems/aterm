@@ -37,7 +37,9 @@ fn refused(why: &str) -> io::Error {
 
 /// Absence is reported only when the kernel proves ESRCH, never on a failed read.
 pub fn presence(pid: u32) -> Presence {
-    let Ok(pid) = i32::try_from(pid) else { return Presence::Unknown };
+    let Ok(pid) = i32::try_from(pid) else {
+        return Presence::Unknown;
+    };
     if pid <= 1 {
         return Presence::Unknown;
     }
@@ -193,6 +195,19 @@ pub fn check_peer(stream: &UnixStream, expected: Identity) -> io::Result<()> {
         return Err(refused("peer changed during credential read"));
     }
     Ok(())
+}
+
+/// Observe a connected native peer, then bind its complete current lifetime.
+/// This authenticates no resource, SDK, caller role or release authority.
+pub fn connected_identity(stream: &UnixStream) -> io::Result<Identity> {
+    let (pid, uid, _) = peer(stream)?;
+    // SAFETY: geteuid observes the current account only.
+    if uid != unsafe { libc::geteuid() } {
+        return Err(refused("connected peer belongs to another account"));
+    }
+    let identity = read_identity(pid)?;
+    check_peer(stream, identity)?;
+    Ok(identity)
 }
 
 #[cfg(target_os = "macos")]
@@ -558,3 +573,16 @@ pub fn host_boot() -> io::Result<(String, String)> {
 #[cfg(test)]
 #[path = "process/tests.rs"]
 mod tests;
+
+// Trust: one WNOWAIT/group-stop owner shared by Cargo and native harnesses.
+#[path = "process/owned_group.rs"]
+mod owned_group;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use owned_group::{OwnedGroupExit, observe_owned_group_exit};
+pub use owned_group::{stop_owned_group, unreaped_child_exit};
+
+#[path = "process/signal_lease.rs"]
+mod signal_lease;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use signal_lease::OWNED_GROUP_SIGNALS;
+pub use signal_lease::{ChildSignalLease, pending_child_signal};

@@ -174,7 +174,32 @@ impl Slot {
 /// It grants neither execution nor SDK access. A reservation may precede bytes.
 #[derive(Debug)]
 pub(super) struct Pin(Arc<Slot>);
+/// Disposal owner returned to the caller, so file close happens outside native
+/// operation, metadata and data-state locks.
+pub(super) struct Released {
+    _snapshot: Arc<Snapshot>,
+}
 impl Pin {
+    /// Only the owning native handover calls this after live settlement checks.
+    /// Concurrent readers/pins or changed DATA retain custody for a later retry.
+    pub(super) fn release_retained(&self, bytes: u64, digest: &str) -> Option<Released> {
+        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.pins != 1
+            || state.sending
+            || !matches!(
+                &state.outcome, Outcome::Ready(snapshot) if snapshot.size == bytes && snapshot.digest == digest
+            )
+        {
+            return None;
+        }
+        let Outcome::Ready(snapshot) = std::mem::replace(&mut state.outcome, Outcome::Released)
+        else {
+            unreachable!("retained snapshot checked under the same lock");
+        };
+        Some(Released {
+            _snapshot: snapshot,
+        })
+    }
     pub(super) fn retained(&self) -> Option<(u64, String)> {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         match &state.outcome {

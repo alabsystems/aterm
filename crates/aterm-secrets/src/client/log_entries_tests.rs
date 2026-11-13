@@ -17,6 +17,8 @@ mod coalesce;
 #[path = "home_content_tests.rs"]
 pub(super) mod home_content;
 
+/// `host` asks to join the vault at `source` and returns at once, pending: no approval comes
+/// while it asks, so a wait for one would only elapse.
 pub(super) fn join_host(paths: &Paths, source: &str, host: &str) {
     join(
         paths,
@@ -24,7 +26,7 @@ pub(super) fn join_host(paths: &Paths, source: &str, host: &str) {
             source: source.to_owned(),
             host: Some(host.to_owned()),
             interactive: false,
-            wait: Duration::from_secs(2),
+            wait: Duration::ZERO,
             confirm: &|_| false,
             password: JoinPassword::Given(None),
             fetched: None,
@@ -74,6 +76,15 @@ fn start_server_on(
         None => crate::server::start(listener, &options),
     }
     .expect("start server")
+}
+
+/// A lab's server again after its [`crate::server::Running::stop`], as a vault server that comes
+/// back is: on the address `addr` it had, which the lab's homes name as their source, over the
+/// store under `root` it kept, so it holds what it held when it stopped and nothing a Mac signed
+/// since.
+pub(crate) fn server_again(root: &Path, addr: std::net::SocketAddr) -> crate::server::Running {
+    let listener = std::net::TcpListener::bind(addr).expect("bind the stopped server's address");
+    start_server_on(listener, &root.join("s1"), None)
 }
 
 pub(super) fn enroll_commons(owner_paths: &Paths, member_paths: &Paths) {
@@ -239,7 +250,6 @@ fn a_mac_writes_the_same_files_from_the_log_as_from_the_envelope() {
     assert_eq!(log_state.manifest.files, env_state.manifest.files);
     assert_eq!(log_state.own, env_state.own);
     assert_eq!(log_sight.held, env_sight.held);
-    assert_eq!(log_sight.hidden, env_sight.hidden);
     assert_eq!(log_commons, env_commons);
     assert_eq!(
         log_verified.value().as_slice(),

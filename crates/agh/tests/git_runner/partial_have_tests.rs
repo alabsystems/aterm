@@ -28,6 +28,169 @@ impl Drop for KeptWorld {
     }
 }
 
+/// The commit reader can retain a real commit without its tree. Neither raw,
+/// named nor batch acquisition may equate that object with a complete source.
+#[test]
+fn commit_only_objects_do_not_shortcut_raw_named_or_batch_source_completion() {
+    let world = KeptWorld(Some(World::canonical("git-commit-only-have")));
+    let bare = bare_repo(world.path(), "app");
+    let work = world.path().join("app-work");
+    std::fs::write(
+        work.join("payload"),
+        b"actual absent checkout tree and body\n",
+    )
+    .unwrap();
+    host_git(&work, &["add", "payload"]);
+    host_git(
+        &work,
+        &["commit", "--quiet", "-m", "physical selected tree"],
+    );
+    host_git(&work, &["push", "--quiet", bare.to_str().unwrap(), "main"]);
+    let oid = host_git(&bare, &["rev-parse", "main"]);
+    let tree = host_git(&bare, &["rev-parse", "main^{tree}"]);
+    let raw = super::raw_blob_tests::git_input(&bare, &["cat-file", "commit", &oid], None);
+    assert!(raw.status.success());
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    let slug = common::slug("fixture-dev/app");
+    for operation in ["raw", "named", "batch"] {
+        let target = world.path().join(format!("{operation}.git"));
+        host_git(
+            world.path(),
+            &["init", "--quiet", "--bare", target.to_str().unwrap()],
+        );
+        let inserted = super::raw_blob_tests::git_input(
+            &target,
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            Some(&raw.stdout),
+        );
+        assert!(inserted.status.success());
+        assert_eq!(String::from_utf8(inserted.stdout).unwrap().trim_end(), oid);
+        let missing = super::raw_blob_tests::git_input(&target, &["cat-file", "-t", &tree], None);
+        assert!(
+            !missing.status.success(),
+            "the original root tree must really be absent"
+        );
+        assert!(host_git(&target, &["for-each-ref"]).is_empty());
+        let request = match operation {
+            "raw" => GitRun::fetch_ref(
+                &slug,
+                &target,
+                &oid,
+                "refs/agh/complete",
+                true,
+                agh::git::FetchScope::NativeExact,
+            ),
+            "named" => GitRun::fetch_ref(
+                &slug,
+                &target,
+                "refs/heads/main",
+                "refs/agh/complete",
+                true,
+                agh::git::FetchScope::NativeExact,
+            ),
+            "batch" => GitRun::fetch_batch(
+                &slug,
+                &target,
+                fetch_rows(&[("refs/heads/main", "refs/agh/complete", &oid)]),
+                true,
+            ),
+            _ => unreachable!(),
+        };
+        if let Err(error) = gh.run_git(&request) {
+            assert!(
+                host_git(&target, &["for-each-ref"]).is_empty(),
+                "failure must publish no ref"
+            );
+            panic!("{operation} commit-only acquisition: {error:?}");
+        }
+        assert_eq!(host_git(&target, &["rev-parse", "refs/agh/complete"]), oid);
+        assert!(
+            !host_git(&target, &["rev-list", "--objects", &oid, "--missing=print"])
+                .lines()
+                .any(|line| line.starts_with('?'))
+        );
+    }
+}
+
+/// A real metadata acquisition can outlive its cache ref. Git's raw-OID
+/// optimization must not mistake that surviving commit for its complete graph.
+#[test]
+fn unreferenced_metadata_commit_does_not_shortcut_exact_source_completion() {
+    let world = KeptWorld(Some(World::canonical("git-unreferenced-partial-have")));
+    let bare = bare_repo(world.path(), "app");
+    let work = world.path().join("app-work");
+    std::fs::write(
+        work.join("payload"),
+        b"required original blob absent from metadata snapshots\n",
+    )
+    .unwrap();
+    host_git(&work, &["add", "payload"]);
+    host_git(&work, &["commit", "--quiet", "-m", "original payload"]);
+    host_git(&work, &["push", "--quiet", bare.to_str().unwrap(), "main"]);
+    host_git(&bare, &["config", "uploadpack.allowFilter", "true"]);
+    let oid = host_git(&bare, &["rev-parse", "main"]);
+    let blob = host_git(&bare, &["rev-parse", "main:payload"]);
+    let slug = common::slug("fixture-dev/app");
+    let gh = world
+        .client(git_env())
+        .git_remote_for_tests("fixture-dev/app", &bare)
+        .build();
+    for mode in ["cold", "full", "unreferenced-metadata"] {
+        let target = world.path().join(format!("{mode}.git"));
+        host_git(
+            world.path(),
+            &["init", "--quiet", "--bare", target.to_str().unwrap()],
+        );
+        if mode != "cold" {
+            let request = GitRun::fetch_main(&slug, &target, "refs/agh/seed");
+            gh.run_git(&if mode == "full" {
+                request
+            } else {
+                request.without_blobs()
+            })
+            .unwrap();
+            host_git(&target, &["update-ref", "-d", "refs/agh/seed"]);
+            assert!(host_git(&target, &["for-each-ref"]).is_empty());
+            assert_eq!(host_git(&target, &["cat-file", "-t", &oid]), "commit");
+            if mode == "unreferenced-metadata" {
+                assert!(
+                    host_git(&target, &["rev-list", "--objects", &oid, "--missing=print"])
+                        .contains(&format!("?{blob}"))
+                );
+            }
+        }
+        let before = host_git(&target, &["for-each-ref"]);
+        if let Err(error) = gh.run_git(&GitRun::fetch_ref(
+            &slug,
+            &target,
+            &oid,
+            "refs/agh/complete",
+            true,
+            agh::git::FetchScope::NativeExact,
+        )) {
+            assert_eq!(
+                host_git(&target, &["for-each-ref"]),
+                before,
+                "failed exact source cannot publish a ref"
+            );
+            panic!(
+                "{mode} exact source failed: {error:?}; final child: {:?}",
+                gh.fx().children_run().last()
+            );
+        }
+        assert_eq!(host_git(&target, &["rev-parse", "refs/agh/complete"]), oid);
+        assert_eq!(host_git(&target, &["cat-file", "-t", &blob]), "blob");
+        assert!(
+            !host_git(&target, &["rev-list", "--objects", &oid, "--missing=print"])
+                .lines()
+                .any(|line| line.starts_with('?'))
+        );
+    }
+}
+
 /// Produce the partial store through the real public metadata operation, then ask
 /// ordinary main/exact/batch fetch to complete the same history. Cold and fully populated
 /// stores exercise the identical native request as positive controls.
@@ -111,7 +274,14 @@ fn metadata_only_haves_do_not_omit_required_historical_blobs() {
                 fetch_rows(&[("refs/heads/main", "refs/agh/exact", &new)]),
                 true,
             ),
-            "exact" => GitRun::fetch_ref(&slug, target, "refs/heads/main", "refs/agh/exact", true),
+            "exact" => GitRun::fetch_ref(
+                &slug,
+                target,
+                "refs/heads/main",
+                "refs/agh/exact",
+                true,
+                agh::git::FetchScope::NativeExact,
+            ),
             _ => unreachable!("test operation"),
         };
         if let Err(error) = gh.run_git(&request) {
@@ -144,15 +314,26 @@ fn metadata_only_haves_do_not_omit_required_historical_blobs() {
     }
 }
 
-/// Raw blob wants are separate from commit haves. Exercise the actual selected
-/// tree producer with no cache and with a complete cache, on the same provider.
-/// Only a blob the cache lacks is fetched: a complete cache sends no blob want, so a
+/// Checkout bodies are fetched from the exact commit in a separate cold repository.
+/// Exercise no cache, a complete cache and a metadata-only cache on one provider.
+/// Only a cache miss fetches bodies: a complete cache sends no body fetch, so a
 /// presence read that saw nothing (and answered every blob missing) fails here.
 #[test]
 fn checkout_closure_fetches_real_blob_objects_with_and_without_a_cache() {
+    use std::os::unix::fs::PermissionsExt as _;
+
     let world = KeptWorld(Some(World::canonical("git-checkout-blob-wants")));
     let bare = bare_repo(world.path(), "app");
     let work = world.path().join("app-work");
+    std::fs::write(
+        work.join("payload"),
+        b"historical blob outside the selected tree\n",
+    )
+    .unwrap();
+    host_git(&work, &["add", "payload"]);
+    host_git(&work, &["commit", "--quiet", "-m", "historical payload"]);
+    let historical_commit = host_git(&work, &["rev-parse", "HEAD"]);
+    let historical_blob = host_git(&work, &["rev-parse", "HEAD:payload"]);
     std::fs::write(work.join("payload"), b"the selected blob body\n").unwrap();
     host_git(&work, &["add", "payload"]);
     host_git(&work, &["commit", "--quiet", "-m", "selected payload"]);
@@ -172,11 +353,11 @@ fn checkout_closure_fetches_real_blob_objects_with_and_without_a_cache() {
     );
     gh.run_git(&GitRun::fetch_main(&slug, &partial, "refs/agh/metadata").without_blobs())
         .unwrap();
-    let blob_fetches = || {
+    let body_fetches = || {
         gh.fx()
             .children_run()
             .iter()
-            .filter(|child| child.args.iter().any(|arg| arg == "--stdin"))
+            .filter(|child| child.args.iter().any(|arg| arg == "--depth=1"))
             .count()
     };
     for (label, cache, fetches) in [
@@ -184,14 +365,22 @@ fn checkout_closure_fetches_real_blob_objects_with_and_without_a_cache() {
         ("full", Some(bare.as_path()), false),
         ("partial", Some(partial.as_path()), true),
     ] {
-        let fetched_before = blob_fetches();
+        let fetched_before = body_fetches();
         let target = world.path().join(format!("target-{label}.git"));
         host_git(
             world.path(),
             &["init", "--quiet", "--bare", target.to_str().unwrap()],
         );
-        let request = GitRun::fetch_ref(&slug, &target, &oid, "refs/agh/selected", true)
-            .with_checkout_closure(cache);
+        let request = GitRun::fetch_ref(
+            &slug,
+            &target,
+            &oid,
+            "refs/agh/selected",
+            true,
+            agh::git::FetchScope::SelectedCheckout {
+                cache: cache.map(|path| path.to_path_buf()),
+            },
+        );
         gh.run_git(&request).unwrap_or_else(|error| {
             panic!(
                 "cache={cache:?}: {error:?}; final child: {:?}",
@@ -200,7 +389,87 @@ fn checkout_closure_fetches_real_blob_objects_with_and_without_a_cache() {
         });
         assert_eq!(host_git(&target, &["cat-file", "-t", &blob]), "blob");
         assert_eq!(host_git(&target, &["rev-parse", "refs/agh/selected"]), oid);
-        assert_eq!(blob_fetches() > fetched_before, fetches, "{label}");
+        assert_eq!(
+            body_fetches() - fetched_before,
+            usize::from(fetches),
+            "{label}"
+        );
+        gh.run_git(&request)
+            .unwrap_or_else(|error| panic!("repeated selected checkout: {error:?}"));
+        assert_eq!(host_git(&target, &["rev-parse", "refs/agh/selected"]), oid);
+        let partial_objects =
+            host_git(&target, &["rev-list", "--objects", &oid, "--missing=print"]);
+        assert!(
+            partial_objects
+                .lines()
+                .any(|line| line == format!("?{historical_blob}"))
+        );
+        if label == "cold" {
+            let full = world.path().join("full-from-selected.git");
+            host_git(
+                world.path(),
+                &["init", "--quiet", "--bare", full.to_str().unwrap()],
+            );
+            let prior_refs = host_git(&target, &["for-each-ref"]);
+            let prior_config = std::fs::read(target.join("config")).unwrap();
+            gh.run_git(&GitRun::fetch_ref(
+                &slug,
+                &full,
+                &oid,
+                "refs/agh/source",
+                true,
+                agh::git::FetchScope::FullSource {
+                    cache: target.clone(),
+                },
+            ))
+            .unwrap();
+            assert_eq!(
+                host_git(&full, &["show", &format!("{historical_commit}:payload")]),
+                "historical blob outside the selected tree"
+            );
+            host_git(
+                &full,
+                &["fsck", "--full", "--strict", "--no-dangling", &oid],
+            );
+            assert_eq!(host_git(&target, &["for-each-ref"]), prior_refs);
+            assert_eq!(std::fs::read(target.join("config")).unwrap(), prior_config);
+            assert_eq!(
+                host_git(&target, &["rev-list", "--objects", &oid, "--missing=print"]),
+                partial_objects
+            );
+            let prior_ref = std::fs::read(target.join("refs/agh/selected")).unwrap();
+            assert!(!target.join("packed-refs").exists());
+            let index = std::fs::read_dir(target.join("objects/pack"))
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| path.extension().is_some_and(|extension| extension == "idx"))
+                .unwrap();
+            let mut corrupt = std::fs::read(&index).unwrap();
+            corrupt[0] ^= 1;
+            let permissions = std::fs::metadata(&index).unwrap().permissions();
+            std::fs::set_permissions(
+                &index,
+                std::fs::Permissions::from_mode(permissions.mode() | 0o200),
+            )
+            .unwrap();
+            std::fs::write(&index, &corrupt).unwrap();
+            std::fs::set_permissions(&index, permissions).unwrap();
+            let refused = GitRun::fetch_ref(
+                &slug,
+                &target,
+                &oid,
+                "refs/agh/corrupt",
+                true,
+                agh::git::FetchScope::SelectedCheckout { cache: None },
+            );
+            assert!(gh.run_git(&refused).is_err());
+            assert_eq!(
+                std::fs::read(target.join("refs/agh/selected")).unwrap(),
+                prior_ref
+            );
+            assert!(!target.join("refs/agh/corrupt").exists());
+            assert!(!target.join("packed-refs").exists());
+        }
     }
 }
 
@@ -228,8 +497,14 @@ fn checkout_closure_reuses_verified_metadata_and_completed_snapshot_packs() {
     gh.run_git(&GitRun::fetch_main(&slug, &target, "refs/agh/metadata").without_blobs())
         .unwrap();
     let oid = host_git(&bare, &["rev-parse", "main"]);
-    let request = GitRun::fetch_ref(&slug, &target, &oid, "refs/agh/selected", true)
-        .with_checkout_closure(None);
+    let request = GitRun::fetch_ref(
+        &slug,
+        &target,
+        &oid,
+        "refs/agh/selected",
+        true,
+        agh::git::FetchScope::SelectedCheckout { cache: None },
+    );
     for _ in 0..2 {
         gh.run_git(&request).unwrap_or_else(|error| {
             panic!("verified metadata/checkout pack reuse must succeed: {error:?}")
@@ -374,16 +649,14 @@ fn checkout_closure_installer_checks_collisions_and_verification_bookends() {
             .fx(fx)
             .build();
         let oid = host_git(&bare, &["rev-parse", "main"]);
-        let result = gh.run_git(
-            &GitRun::fetch_ref(
-                &common::slug("fixture-dev/app"),
-                &target,
-                &oid,
-                "refs/agh/selected",
-                true,
-            )
-            .with_checkout_closure(None),
-        );
+        let result = gh.run_git(&GitRun::fetch_ref(
+            &common::slug("fixture-dev/app"),
+            &target,
+            &oid,
+            "refs/agh/selected",
+            true,
+            agh::git::FetchScope::SelectedCheckout { cache: None },
+        ));
         assert!(
             *reached.lock().unwrap(),
             "{fault}: production verification reached"
@@ -536,6 +809,7 @@ fn object_intake_refuses_corrupt_packs_and_replaced_original_directories() {
                 "refs/heads/main",
                 "refs/agh/requested",
                 true,
+                agh::git::FetchScope::NativeExact,
             )
         };
         let error = gh.run_git(&request).expect_err("unsafe intake refuses");
@@ -662,6 +936,7 @@ fn object_intake_refuses_a_different_valid_pack_under_the_expected_hash_name() {
             &requested,
             "refs/agh/requested",
             true,
+            agh::git::FetchScope::NativeExact,
         ));
         assert!(
             *reached.lock().unwrap(),

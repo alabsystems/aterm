@@ -3,10 +3,10 @@
 
 //! Tier-1 of `TestDispatch` (`aterm_models_capacity::test_dispatch_model`): the real
 //! `aterm_verify::test_plan::Dispatcher`, on the model's four binaries, share and claim, is driven
-//! through every schedule of starts, ends, live-rate reads and a halt, and each call's effect,
+//! through every schedule of starts, grants, ends, live-rate reads and a halt, and each call's effect,
 //! projected onto the model's variables, is replayed through the model. A start the dispatcher
 //! makes is the model's `Start<i>`, an end `Finish<i>`, a live rate a read moves `LiveRises` or
-//! `LiveFalls`, a halt `Halt`; a start
+//! `LiveFalls`, a smaller positive core grant `Grant<i>`, a halt `Halt`; a start
 //! or an end it refuses is one the model has no step for. The schedules reach exactly the model's
 //! states.
 
@@ -65,6 +65,8 @@ fn project(d: &Dispatcher, live: i64) -> S {
         ("p2", phase(1)),
         ("p3", phase(2)),
         ("p4", phase(3)),
+        ("c1", i64::from(d.charge(0).expect("first binary"))),
+        ("c2", i64::from(d.charge(1).expect("second binary"))),
         ("next", i64::try_from(started).expect("four") + 1),
         ("held", i64::from(d.held())),
         ("bytes", i64::try_from(d.held_bytes()).expect("small")),
@@ -139,6 +141,20 @@ fn every_schedule_of_the_real_dispatcher_is_a_run_of_the_model() {
                 ),
             }
         }
+        for i in 0..2 {
+            let mut next = d.clone();
+            let granted = d.charge(i).expect("in the plan") - 1;
+            match next.limit_charge(i, granted) {
+                Ok(()) => {
+                    replay(&prev, &project(&next, live), &format!("Grant{}", i + 1));
+                    queue.push_back((next, live));
+                }
+                Err(_) => assert!(
+                    m.successors(&format!("Grant{}", i + 1), &prev).is_empty(),
+                    "the dispatcher refused a grant the model takes from {prev:?}"
+                ),
+            }
+        }
         if d.held() > 0 {
             if live <= share {
                 replay(&prev, &project(&d, live + 1), "LiveRises");
@@ -204,4 +220,39 @@ fn the_model_refuses_a_double_release_and_a_start_past_the_share() {
     );
     assert!(interp::bmc(&m).is_ok());
     assert!(interp::bmc(&buggy).is_err());
+}
+
+#[test]
+fn the_model_refuses_zero_growing_or_unreturned_execution_grants() {
+    let m = test_dispatch_model();
+    let buggy = interp::with_buggy(&m, 1);
+    let mut d = dispatcher(&m);
+    assert_eq!(d.next(0.0).unwrap().index, 0);
+    let running = project(&d, 0);
+    let mut zero = running.clone();
+    zero.insert("c1", 0);
+    zero.insert("held", running["held"] - running["c1"]);
+    zero.insert("extra", 1);
+    assert_eq!(interp::admits(&m, &running, &zero), None);
+    assert_eq!(interp::admits(&buggy, &running, &zero), Some("ZeroGrant1"));
+    let mut unreturned = running.clone();
+    unreturned.insert("c1", running["c1"] - 1);
+    unreturned.insert("extra", 1);
+    assert_eq!(interp::admits(&m, &running, &unreturned), None);
+    assert_eq!(
+        interp::admits(&buggy, &running, &unreturned),
+        Some("GrantWithoutReturning1")
+    );
+    let mut growing = running.clone();
+    growing.insert("c1", running["c1"] + 1);
+    growing.insert("held", running["held"] + 1);
+    growing.insert("extra", 1);
+    assert_eq!(interp::admits(&m, &running, &growing), None);
+    assert_eq!(
+        interp::admits(&buggy, &running, &growing),
+        Some("GrowGrant1")
+    );
+    assert!(d.limit_charge(0, 0).is_err());
+    assert!(d.limit_charge(0, 3).is_err());
+    assert_eq!(project(&d, 0), running);
 }

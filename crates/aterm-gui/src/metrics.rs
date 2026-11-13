@@ -34,11 +34,11 @@ pub(crate) use startup::{
 };
 #[cfg(unix)]
 pub(crate) use startup::{
-    keeper_seam, mark_keeper_hello, mark_keeper_imported, mark_keeper_placed,
-    record_keeper_admitted, record_keeper_cohort,
+    first_present_done, keeper_seam, launch_finished, mark_keeper_hello, mark_keeper_imported,
+    mark_keeper_placed, record_keeper_admitted, record_keeper_cohort,
 };
 #[cfg(target_os = "macos")]
-pub(crate) use startup::{mark_handoff_claimed, process_main_start};
+pub(crate) use startup::{mark_handoff_claimed, process_age, process_main_start};
 use std::cell::Cell;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -223,6 +223,14 @@ window_ledger! {
         pub(crate) edges_dropped: Counter,
         /// Of the slices in `input`, those a PREDICTION closed.
         pub(crate) predicted: Counter,
+        /// Of the slices in `input`, those an application present booked when it came
+        /// [`COLD_GAP_NS`] or more after the process's previous present (`n_input_cold`,
+        /// `input_cold_p50/p95/p99_ms`), at `input`'s resolution so their quantiles compare.
+        pub(crate) input_cold: LatencyDist,
+        /// Of the window slices in `input`, those booked in the first present of a window that a
+        /// person's event woke from rest while it was focused
+        /// ([`WindowPresentState::note_rest_wake`], `n_rest_wake_key`).
+        pub(crate) rest_wake_key: Counter,
         /// Hardware-key arrival → completed PTY write (`key_write`).
         pub(crate) key_write: Dist,
         /// The NSEvent-QUEUE RESIDENCE that `key_write` is BACKDATED by: how long each hardware key sat in the OS event queue before the loop dispatched it.
@@ -630,6 +638,7 @@ label_enum! {
         DeckClock => "deck_clock",
         NativeMotion => "native_motion",
         ChipWord => "chip_word",
+        CardWash => "card_wash",
         FleetAccess => "fleet_access",
         DiskFacts => "disk_facts",
         RestoreGlass => "restore_glass",
@@ -812,6 +821,12 @@ pub(crate) fn note_reading(step: ReadingStep) {
 /// A frame whose causal CPU work exceeds the ~30 fps (33.3 ms) budget below which interaction visibly stutters.
 pub(crate) const SLOW_FRAME_THRESHOLD_NS: u64 = 33_333_333;
 
+/// A present this long or more after the process's previous present is COLD: it is the first
+/// frame any window drew in that long. On macOS the Apple GPU driver frees the block it keeps for
+/// a class of GPU work 1 to 2 s after that work's command buffer completes
+/// (`docs/measured/idle-memory-window-2026-10-27.md`), so a cold frame takes that block back.
+pub(crate) const COLD_GAP_NS: u64 = 2_000_000_000;
+
 /// One window's present-side state, kept in its `WindowState` (UI thread only, so plain integers).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct WindowPresentState {
@@ -819,6 +834,22 @@ pub(crate) struct WindowPresentState {
     pub(crate) pending_native_input: PendingNativeInputStamp,
     last_present_ns: u64,
     shown_through: Option<u64>,
+    rest_woke: bool,
+}
+
+impl WindowPresentState {
+    /// A person's event woke this window from rest while it was focused (`App::stir_rest`): the
+    /// window's next application present, whatever it books, clears the mark, and each window
+    /// slice that present books counts as a rest-wake key ([`InputLedger::rest_wake_key`]).
+    pub(crate) const fn note_rest_wake(&mut self) {
+        self.rest_woke = true;
+    }
+
+    /// Whether a rest wake is marked and no present has cleared it yet.
+    #[cfg(test)]
+    pub(crate) const fn rest_woke(&self) -> bool {
+        self.rest_woke
+    }
 }
 
 /// The present-side state that belongs to the whole process, owned by the `App` (UI thread).
@@ -828,7 +859,7 @@ pub(crate) struct PresentObserver {
     last_present_ns: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 struct PresentClock {
     now: u64,
     epoch: u64,
@@ -880,6 +911,73 @@ struct PresentBooking {
     input_predicted: u32,
 }
 
+/// The application present an input slice is booked in: when, whether it is cold
+/// ([`COLD_GAP_NS`]), and whether it is the first present of a window a rest wake marked.
+#[derive(Clone, Copy, Debug)]
+struct SliceAt {
+    now: u64,
+    cold: bool,
+    rest_woke: bool,
+}
+
+/// What one window's coming application present is to the input slices it books, read before
+/// [`record_present`] moves the process's last present and clears the window's rest wake: the
+/// shared clock, process's previous present (for [`COLD_GAP_NS`]) and the window's mark
+/// ([`WindowPresentState::note_rest_wake`]). A native page's slices
+/// ([`record_native_content_present`]) and the stats lens's ([`PendingChromeInputStamp::record`])
+/// book from it, so they count as the terminal's slices of the same present do.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct PresentInput {
+    clock: PresentClock,
+    previous_present_ns: u64,
+    rest_woke: bool,
+}
+
+impl PresentInput {
+    /// Read one clock for every input surface of this successful application present.
+    pub(crate) fn read(
+        observer: &PresentObserver,
+        window: Option<&WindowPresentState>,
+        capture_forced: bool,
+    ) -> Self {
+        Self::of(
+            observer,
+            window,
+            PresentClock::read(&METRICS, capture_forced),
+        )
+    }
+
+    const fn of(
+        observer: &PresentObserver,
+        window: Option<&WindowPresentState>,
+        clock: PresentClock,
+    ) -> Self {
+        Self {
+            clock,
+            previous_present_ns: observer.last_present_ns,
+            rest_woke: match window {
+                Some(window) => window.rest_woke,
+                None => false,
+            },
+        }
+    }
+
+    pub(crate) const fn capture_forced(self) -> bool {
+        self.clock.capture_forced
+    }
+
+    /// Book at `now`, with coldness fixed by the present's shared clock rather than the
+    /// individual surface's booking time. A callback cannot make one present cross the threshold.
+    const fn at(self, now: u64) -> SliceAt {
+        SliceAt {
+            now,
+            cold: self.previous_present_ns != 0
+                && self.clock.now.saturating_sub(self.previous_present_ns) >= COLD_GAP_NS,
+            rest_woke: self.rest_woke,
+        }
+    }
+}
+
 /// Record one successful application present.
 pub(crate) fn record_present(
     latency_ns: u64,
@@ -887,16 +985,16 @@ pub(crate) fn record_present(
     startup_timing: StartupPresentTiming,
     window: Option<&mut WindowPresentState>,
     observer: &mut PresentObserver,
-    capture_forced: bool,
+    input: PresentInput,
 ) {
     #[cfg(any(debug_assertions, feature = "dev-seams"))]
     submit_split::close();
-    let clock = PresentClock::read(&METRICS, capture_forced);
+    let clock = input.clock;
     startup::STARTUP.publish_first_present(startup_timing);
     let booking = METRICS.record_present_at(clock, latency_ns, render_ns, window, observer);
     #[cfg(test)]
     if booking.output_tainted.is_some() {
-        crate::work_counts::present_sample_booked(capture_forced);
+        crate::work_counts::present_sample_booked(clock.capture_forced);
     }
     #[cfg(test)]
     crate::work_counts::input_slices_booked(booking.input_booked, booking.input_predicted);
@@ -923,6 +1021,16 @@ impl Metrics {
                 let _ = present.resize_present.record(d);
             }
         }
+        // Cold reads the process's previous present whatever the epoch, as `latency_idle` reads
+        // the window's: the first present after a reset still knows how long the GPU was quiet.
+        let at = PresentInput {
+            clock,
+            previous_present_ns: observer.last_present_ns,
+            rest_woke: window
+                .as_deref_mut()
+                .is_some_and(|w| std::mem::take(&mut w.rest_woke)),
+        }
+        .at(now);
         let mut booking = PresentBooking {
             output_tainted: (latency_ns != 0).then_some(clock.tainted),
             window_gap_ns: window
@@ -981,14 +1089,21 @@ impl Metrics {
                     if edge.before_epoch {
                         return;
                     }
-                    self.window.input.book_present(edge.slice_ns, now);
+                    self.window.input.book_slice_at(edge.slice_ns, at);
                     booking.input_booked += 1;
                 });
             }
-            if let Some(stamp) = self.window.input.session_stamp.take() {
+            if let Some(stamp) = self.window.input.session_stamp.take_through(now) {
                 let d = now.saturating_sub(stamp);
                 if d <= INPUT_SLICE_CAP_NS {
-                    self.window.input.book_present(d, now);
+                    // A session's input names no window, so it is no window's rest-wake key.
+                    self.window.input.book_slice_at(
+                        d,
+                        SliceAt {
+                            rest_woke: false,
+                            ..at
+                        },
+                    );
                 }
             }
         }
@@ -1002,7 +1117,7 @@ impl Metrics {
                         if edge.before_epoch {
                             return;
                         }
-                        self.window.input.book_present(edge.slice_ns, now);
+                        self.window.input.book_slice_at(edge.slice_ns, at);
                         booking.input_booked += 1;
                         self.window.input.predicted.inc();
                         booking.input_predicted += 1;
@@ -1761,6 +1876,20 @@ impl InputLedger {
             self.input_at.set(now);
         }
     }
+
+    /// Books slice `d` in the application present `at`: in `input`, in `input_cold` too when
+    /// that present is cold, and as a rest-wake key when it is a woken window's first. Each is
+    /// its own relaxed instrument, so only a ledger no present books into while it is read holds
+    /// `n_input_cold <= n_input` and `n_rest_wake_key <= n_input`.
+    fn book_slice_at(&self, d: u64, at: SliceAt) {
+        if at.cold {
+            self.input_cold.record(d);
+        }
+        if at.rest_woke {
+            self.rest_wake_key.inc();
+        }
+        self.book_present(d, at.now);
+    }
 }
 
 /// How many unpresented keystrokes one window's [`PendingInputStamp`] holds.
@@ -2019,11 +2148,11 @@ impl Metrics {
         }
     }
 
-    fn record_native_content_present(&self, pending: &mut PendingInputStamp, now: u64) {
+    fn record_native_content_present(&self, pending: &mut PendingInputStamp, at: SliceAt) {
         let epoch = self.epoch.load(Ordering::Relaxed);
-        pending.drain_into(now, epoch, |edge| {
+        pending.drain_into(at.now, epoch, |edge| {
             if !edge.before_epoch {
-                self.window.input.book_present(edge.slice_ns, now);
+                self.window.input.book_slice_at(edge.slice_ns, at);
             }
         });
     }
@@ -2093,11 +2222,13 @@ pub(crate) fn note_native_window_input(
 }
 
 /// A present that put `view`'s pixels of paint serial `serial` on glass for the first time: the
-/// answer of every key it was awaited for at or before that serial.
+/// answer of every key it was awaited for at or before that serial, booked as that window's
+/// present `input` books its slices.
 pub(crate) fn record_native_content_present(
     pending: &mut PendingNativeInputStamp,
     view: crate::tab_model::ViewId,
     serial: u64,
+    input: PresentInput,
 ) {
     if !pending
         .awaited
@@ -2106,7 +2237,7 @@ pub(crate) fn record_native_content_present(
         return;
     }
     let mut taken = std::mem::take(pending);
-    METRICS.record_native_content_present(&mut taken.edges, now_ns());
+    METRICS.record_native_content_present(&mut taken.edges, input.at(input.clock.now));
 }
 
 /// An opaque receipt for the latest contiguous chrome input in one window.
@@ -2139,11 +2270,12 @@ impl PendingChromeInputStamp {
         self.edges = PendingInputStamp::default();
     }
 
-    /// Book only a successful live present carrying this ring's latest painted receipt.
+    /// Book only a successful live present carrying this ring's latest painted receipt, as
+    /// that window's present `input` books its slices.
     /// Return the number of clean samples booked. Captures and their taint retire the ring,
     /// so an observer's frame cannot satisfy an edge or leave it for a later clean sample.
-    pub(crate) fn record(&mut self, token: ChromeInputToken, capture_forced: bool) -> usize {
-        METRICS.record_chrome_input_at(self, token, PresentClock::read(&METRICS, capture_forced))
+    pub(crate) fn record(&mut self, token: ChromeInputToken, input: PresentInput) -> usize {
+        METRICS.record_chrome_input_at(self, token, input.clock, input)
     }
 }
 
@@ -2174,6 +2306,7 @@ impl Metrics {
         pending: &mut PendingChromeInputStamp,
         token: ChromeInputToken,
         clock: PresentClock,
+        input: PresentInput,
     ) -> usize {
         if clock.capture_forced || clock.tainted {
             pending.retire();
@@ -2185,7 +2318,9 @@ impl Metrics {
         let mut booked = 0;
         pending.edges.drain_into(clock.now, clock.epoch, |edge| {
             if !edge.before_epoch {
-                self.window.input.book_present(edge.slice_ns, clock.now);
+                self.window
+                    .input
+                    .book_slice_at(edge.slice_ns, input.at(clock.now));
                 booked += 1;
             }
         });
@@ -3116,6 +3251,7 @@ pub(crate) fn emit_summary(
         ["n_input", "input_p50_ms", "input_p95_ms", "input_p99_ms"],
         &h_input,
     );
+    emit_cold_input(&w.input, s);
     emit_quantiles(
         s,
         [
@@ -3312,8 +3448,26 @@ pub(crate) fn emit_summary(
     emit_pty_census(ctx, s);
     if ctx.reads_process() {
         crate::spare::emit_metrics(s);
+        #[cfg(unix)]
+        emit_commons_cadence(s);
     }
     emit_gpu(ctx, s);
+}
+
+/// Commons repair's counts in this process since it started (`aterm_db::runtime::cadence`):
+/// each only rises, so no `reset` clears one and a reader subtracts two readings. Commons
+/// repair runs on unix alone, so a Windows build carries none of them.
+#[cfg(unix)]
+fn emit_commons_cadence(s: &mut dyn wire::FieldSink) {
+    let counts = aterm_db::runtime::cadence();
+    s.count("commons_rounds_out", counts.rounds_out);
+    s.count("commons_rounds_in", counts.rounds_in);
+    s.count("commons_rounds_quiet", counts.rounds_quiet);
+    s.count("commons_owner_ticks", counts.owner_ticks);
+    s.count("commons_beacons", counts.beacons);
+    s.count("commons_announces", counts.announces);
+    s.count("commons_signature_checks", counts.signature_checks);
+    s.count("commons_deadline_spawns", counts.deadline_spawns);
 }
 
 pub(crate) fn emit_percentiles(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink) {
@@ -3324,6 +3478,7 @@ pub(crate) fn emit_percentiles(ctx: &wire::ReadCtx, s: &mut dyn wire::FieldSink)
         ["n_input", "input_p50_ms", "input_p95_ms", "input_p99_ms"],
         &w.input.input.copy_out(),
     );
+    emit_cold_input(&w.input, s);
     s.count("input_edges_dropped", w.input.edges_dropped.get());
     s.count("input_predicted", w.input.predicted.get());
     emit_quantiles(
@@ -3490,8 +3645,26 @@ fn emit_key_clock_availability(input: &InputLedger, s: &mut dyn wire::FieldSink)
     s.count("key_write_unavailable", input.key_write_unavailable.get());
 }
 
+/// Beside `n_input`, in `metrics` and `metrics percentiles` alike: the slices booked in a cold
+/// present and the rest-wake keys ([`InputLedger::input_cold`], [`InputLedger::rest_wake_key`]).
+fn emit_cold_input(input: &InputLedger, s: &mut dyn wire::FieldSink) {
+    emit_quantiles(
+        s,
+        [
+            "n_input_cold",
+            "input_cold_p50_ms",
+            "input_cold_p95_ms",
+            "input_cold_p99_ms",
+        ],
+        &input.input_cold.copy_out(),
+    );
+    s.decimal("last_input_cold_ms", wire::ms6(input.input_cold.last()));
+    s.decimal("max_input_cold_ms", wire::ms6(input.input_cold.max()));
+    s.count("n_rest_wake_key", input.rest_wake_key.get());
+}
+
 fn emit_quantiles(s: &mut dyn wire::FieldSink, keys: [&str; 4], h: &HistCopy) {
-    let unit = if matches!(keys[0], "n_input" | "n_present") {
+    let unit = if matches!(keys[0], "n_input" | "n_input_cold" | "n_present") {
         wire::ms6
     } else {
         wire::ms
@@ -3558,6 +3731,14 @@ mod chrome_input_receipt_tests;
 #[cfg(test)]
 #[path = "metrics_present_clock_tests.rs"]
 mod present_clock_tests;
+
+/// The cold-key and rest-wake counters (ATERM-KI-1027-4): which slices a present books as cold
+/// ([`super::COLD_GAP_NS`], the process's gap, whatever the epoch) and which as rest-wake keys
+/// (a stir that woke a focused window, cleared by that window's next present). Instant and ns
+/// arithmetic only.
+#[cfg(test)]
+#[path = "metrics_cold_input_tests.rs"]
+mod cold_input_tests;
 
 #[cfg(test)]
 #[path = "metrics_lateness_attribution_tests.rs"]

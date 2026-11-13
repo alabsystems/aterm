@@ -234,7 +234,7 @@ impl<T: Clone + Send + Sync + 'static> ExitMoment<T> {
         ready: impl FnOnce() + Send + 'static,
     ) -> Option<Self> {
         let target = exit_readable(pid)?;
-        let (cancelled, cancel) = std::io::pipe().ok()?;
+        let (cancelled, cancel) = crate::pipe().ok()?;
         let stamped = std::sync::Arc::new(std::sync::OnceLock::new());
         let into = std::sync::Arc::clone(&stamped);
         std::thread::Builder::new()

@@ -127,6 +127,10 @@ pub(crate) struct Inert {
     steward_revoke: Mutex<StewardRevokeRead>,
     steward_lease: Mutex<StewardLeaseRead>,
     steward_standby_server: Mutex<StewardStandbyServerRead>,
+    /// The member vault server an earlier aterm installed ([`Ports::stale_vault_server`]), which
+    /// its removal takes away, and how often it was read (apart from `reads`, the swarm's ports).
+    stale_server: Mutex<Option<String>>,
+    stale_reads: AtomicU32,
     shared: Mutex<SharedRead>,
     requests: Mutex<RequestsRead>,
     /// Observe the actual need ledger when the publisher runs, where a test supplies one.
@@ -242,6 +246,8 @@ impl Inert {
             steward_standby_server: Mutex::new(StewardStandbyServerRead::Idle(
                 NO_STEWARD.to_owned(),
             )),
+            stale_server: Mutex::new(None),
+            stale_reads: AtomicU32::new(0),
             shared: Mutex::new(SharedRead::Visible("control record here".to_owned())),
             requests: Mutex::new(RequestsRead::Idle(
                 "this Mac is not a Commons Writer, and holds no needs".to_owned(),
@@ -472,6 +478,19 @@ impl Ports for Inert {
             "systems.alab.aterm-secrets-server running for m29 (pid 88)".to_owned(),
         );
         Ok("started systems.alab.aterm-secrets-server advertising m29.local".to_owned())
+    }
+    fn stale_vault_server(&self) -> Result<Option<String>, String> {
+        self.stale_reads.fetch_add(1, Ordering::SeqCst);
+        Ok(self.stale_server.lock().unwrap().clone())
+    }
+    fn retire_stale_vault_server(&self) -> Result<Option<String>, String> {
+        self.applied("retire-stale-server");
+        Ok(self
+            .stale_server
+            .lock()
+            .unwrap()
+            .take()
+            .map(|_| "removed systems.alab.aterm-secrets-server.service".to_owned()))
     }
     fn shared_data(&self) -> Result<SharedRead, String> {
         if let Some(why) = self.shared_fails.lock().unwrap().clone() {
@@ -2481,8 +2500,9 @@ fn sync_identity_applies_before_fleet_and_accounts_and_skips_personal_vaults() {
 }
 
 /// `[swarm] enabled = false` turns every converge sync item `NotApplicable` across every trigger,
-/// reading none of the individual sync ports and applying nothing; an invalid `[swarm]` section
-/// fails every sync row rather than defaulting on.
+/// reading none of the individual sync ports (aterm's own stale vault server's read apart,
+/// [`Ports::stale_vault_server`]) and applying nothing; an invalid `[swarm]` section fails every
+/// sync row rather than defaulting on.
 /// NEGATIVE CONTROL: on the same ports with `[swarm] enabled = true`, the due sync items read
 /// their ports and apply changes.
 #[test]
@@ -3001,6 +3021,101 @@ fn steward_lease_and_standby_server_items_apply_and_respect_a_lan_broker_deferra
     );
 }
 
+/// The member vault server an earlier aterm installed where nothing finds or feeds it (a Linux
+/// member's) goes through `sync.steward.server.standby`, swarm on or off, and its read-back,
+/// which then reads the standby step idle, says it is gone: the row is `Changed`, not `Failed`
+/// for a removal that worked. A hold on the vault keeps it, and a plan only plans it.
+/// NEGATIVE CONTROL: with no stale server the row reads the swarm switch and the standby step.
+#[test]
+fn a_member_server_an_earlier_aterm_installed_goes_with_the_swarm_on_or_off() {
+    const STALE: &str = "systems.alab.aterm-secrets-server runs the member vault server an \
+                         earlier aterm installed";
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let ports = |swarm: bool, held: Option<&str>| {
+        let ports = Inert::new(&scratch.path().join(format!("{swarm}-{held:?}")));
+        *ports.swarm.lock().unwrap() = Ok(swarm);
+        *ports.held.lock().unwrap() = held.map(str::to_owned);
+        *ports.stale_server.lock().unwrap() = Some(STALE.to_owned());
+        // Off macOS the standby step serves nothing, so its read idles once the job is gone.
+        *ports.steward_standby_server.lock().unwrap() =
+            StewardStandbyServerRead::Idle("Bonjour is macOS only".to_owned());
+        ports
+    };
+
+    let server_applies = |ports: &Inert| -> Vec<&'static str> {
+        ports
+            .applies()
+            .into_iter()
+            .filter(|kind| kind.contains("server"))
+            .collect()
+    };
+    for swarm in [true, false] {
+        let ports = ports(swarm, None);
+        let pass = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        let removed = row(&pass.rows, STEWARD_SERVER_STANDBY);
+        assert_eq!(
+            removed.outcome,
+            Outcome::Changed,
+            "swarm {swarm}: {removed:?}"
+        );
+        assert_eq!(removed.from.as_deref(), Some(STALE), "swarm {swarm}");
+        assert_eq!(
+            server_applies(&ports),
+            ["retire-stale-server"],
+            "swarm {swarm}"
+        );
+        assert_eq!(*ports.stale_server.lock().unwrap(), None, "swarm {swarm}");
+        if !swarm {
+            assert_eq!(
+                ports.reads.load(Ordering::SeqCst),
+                0,
+                "no swarm port read with the swarm off"
+            );
+        }
+        // The next pass finds none left and reads the row as it reads any other.
+        let next = ran(ports.pass(Trigger::Subscriber, Mode::Apply));
+        let after = row(&next.rows, STEWARD_SERVER_STANDBY);
+        assert_eq!(
+            after.outcome,
+            Outcome::NotApplicable,
+            "swarm {swarm}: {after:?}"
+        );
+        assert_eq!(
+            server_applies(&ports),
+            ["retire-stale-server"],
+            "swarm {swarm}"
+        );
+    }
+
+    let held = ports(true, Some("a Stop holds it"));
+    let pass = ran(held.pass(Trigger::Subscriber, Mode::Apply));
+    let kept = row(&pass.rows, STEWARD_SERVER_STANDBY);
+    assert_eq!(kept.outcome, Outcome::NotApplicable, "{kept:?}");
+    assert_eq!(kept.why.as_deref(), Some("a Stop holds it"));
+    assert!(server_applies(&held).is_empty(), "{:?}", held.applies());
+    assert!(held.stale_server.lock().unwrap().is_some());
+
+    let planned = ports(false, None);
+    let plan = ran(planned.pass(Trigger::Init, Mode::Plan));
+    assert_eq!(
+        row(&plan.rows, STEWARD_SERVER_STANDBY).outcome,
+        Outcome::Planned
+    );
+    assert!(
+        server_applies(&planned).is_empty(),
+        "{:?}",
+        planned.applies()
+    );
+
+    let none = ports(false, None);
+    *none.stale_server.lock().unwrap() = None;
+    let pass = ran(none.pass(Trigger::Subscriber, Mode::Apply));
+    let off = row(&pass.rows, STEWARD_SERVER_STANDBY);
+    assert_eq!(off.outcome, Outcome::NotApplicable, "{off:?}");
+    assert_eq!(off.why.as_deref(), Some(SWARM_OFF));
+    assert_eq!(none.stale_reads.load(Ordering::SeqCst), 1);
+}
+
 /// `sync.node` runs right after `sync.fleet` so a Mac that joins a fleet installs and starts
 /// `systems.alab.aterm-node` in the same converge pass; `NotApplicable` (`aterm node off` or no
 /// fleet) applies nothing.
@@ -3472,19 +3587,18 @@ pub(crate) mod owed_clone {
         aterm_uds::private_file::write_private(&dir, "clone-owed", b"owed\n").unwrap();
     }
 
-    /// Nothing loops: the vault's token landed, but GitHub refuses it, which only a person (a
-    /// vault admin) can fix, and the native step's rule is that its row needs them and no pass
-    /// retries it. The first pass runs the step once and records that it waits for a person;
-    /// later passes say what to do and run nothing until the token or init.toml changes.
-    #[test]
-    fn a_clone_only_a_person_can_finish_is_not_rerun_every_pass() {
-        let scratch = aterm_tempfile::tempdir().unwrap();
+    /// alice's init.toml names `account`, and the vault's token file holds a token GitHub's
+    /// `GET /user` answers with `user`.
+    fn profiled(
+        account: &str,
+        user: Result<crate::port::GithubResponse, crate::port::GithubFailure>,
+    ) -> crate::port::Fake {
         let (sys, alice) = alice();
         // This independently configured profile still authenticates with GitHub. The vault
         // default instead reads account and inventory metadata locally.
         let profile = "/Users//alice/.config/aterm/init.toml";
-        let profile_bytes = b"[github]\naccount='alice'\n";
-        sys.file(profile, profile_bytes).stat_of(
+        let profile_bytes = format!("[github]\naccount='{account}'\n").into_bytes();
+        sys.file(profile, &profile_bytes).stat_of(
             profile,
             crate::port::Stat {
                 uid: 501,
@@ -3495,9 +3609,8 @@ pub(crate) mod owed_clone {
                 len: profile_bytes.len() as u64,
             },
         );
-        let token = "/Users//alice/.secrets/gh_access_token";
-        sys.file(token, b"fixture_token_only").stat_of(
-            token,
+        sys.file(OWED_TOKEN, b"fixture_token_only").stat_of(
+            OWED_TOKEN,
             crate::port::Stat {
                 uid: 501,
                 gid: 20,
@@ -3507,36 +3620,46 @@ pub(crate) mod owed_clone {
                 len: 18,
             },
         );
-        sys.fail_github_api(&alice, "/user", crate::port::GithubFailure::Unauthenticated);
-        owe_a_clone(scratch.path());
-        let state = scratch.path().to_path_buf();
+        match user {
+            Ok(answer) => sys.on_github_api(&alice, "/user", Ok(answer)),
+            Err(failure) => sys.fail_github_api(&alice, "/user", failure),
+        };
+        sys
+    }
+
+    /// The vault's token file [`profiled`] writes.
+    const OWED_TOKEN: &str = "/Users//alice/.secrets/gh_access_token";
+
+    /// `n` subscriber passes over an owed clone: each one's clone row, and how many times the
+    /// GitHub step asked `GET /user` in all.
+    fn owed_passes(
+        sys: &crate::port::Fake,
+        state: &Path,
+        n: usize,
+    ) -> (Vec<(Outcome, Option<String>)>, usize) {
         let held = || None;
         let owed = |readback: Option<&crate::init_github::RepositoryReadback>| {
             crate::init::owed_clone_in_pass(
-                &sys,
-                &state,
+                sys,
+                state,
                 &crate::init::Holds::NONE,
                 readback,
                 aterm_secrets::converge::RepositoryWork::Refresh,
             )
         };
         let clone = || {
-            crate::init::clone_owed(
-                &sys,
-                &state,
-                aterm_secrets::converge::RepositoryWork::Refresh,
-            )
+            crate::init::clone_owed(sys, state, aterm_secrets::converge::RepositoryWork::Refresh)
         };
         let ports = Hooked {
-            inner: Inert::new(scratch.path()),
+            inner: Inert::new(state),
             held: &held,
             owed: &owed,
             clone: &clone,
             control: None,
-            forget: &|| crate::init::forget_owed_clone(&state),
+            forget: &|| crate::init::forget_owed_clone(state),
         };
         let mut said = Vec::new();
-        for _ in 0..3 {
+        for _ in 0..n {
             let pass = ran(converge(
                 &ports,
                 Trigger::Subscriber,
@@ -3552,6 +3675,27 @@ pub(crate) mod owed_clone {
             .iter()
             .filter(|call| call.contains("agh GET /user"))
             .count();
+        (said, asked)
+    }
+
+    /// Nothing loops: the vault's token landed, but it signs in as another account than
+    /// init.toml names, which only a person's settings fix, and the native step's rule is that
+    /// its row needs them and no pass retries it. The first pass runs the step once and records
+    /// that it waits for a person; later passes say what to do and run nothing until the token
+    /// or init.toml changes.
+    #[test]
+    fn a_clone_only_a_person_can_finish_is_not_rerun_every_pass() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let sys = profiled(
+            "bob",
+            Ok(crate::port::GithubResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: br#"{"login":"alice"}"#.to_vec(),
+            }),
+        );
+        owe_a_clone(scratch.path());
+        let (said, asked) = owed_passes(&sys, scratch.path(), 3);
         assert_eq!(
             asked, 1,
             "three passes each re-ran the GitHub step a person must finish: {said:?}"
@@ -3565,19 +3709,37 @@ pub(crate) mod owed_clone {
             "{said:?}"
         );
         // A new token from the vault is a new chance: the next pass runs the step again.
-        sys.file(token, b"fixture_token_next");
-        ran(converge(
-            &ports,
-            Trigger::Subscriber,
-            Mode::Apply,
-            aterm_secrets::converge::RepositoryWork::Refresh,
-            &mut |_| {},
-        ));
-        let asked = sys
-            .calls()
-            .iter()
-            .filter(|call| call.contains("agh GET /user"))
-            .count();
+        sys.file(OWED_TOKEN, b"fixture_token_next");
+        let (_, asked) = owed_passes(&sys, scratch.path(), 1);
+        assert_eq!(asked, 2, "a new token runs the step again");
+    }
+
+    /// A token GitHub refuses is no person's step and no loop: the first pass runs the step
+    /// once, and later passes wait, asking nobody and running nothing, until the vault's token
+    /// changes, which runs the step again.
+    #[test]
+    fn a_refused_token_waits_without_a_person_and_is_not_rerun_every_pass() {
+        let scratch = aterm_tempfile::tempdir().unwrap();
+        let sys = profiled("alice", Err(crate::port::GithubFailure::Unauthenticated));
+        owe_a_clone(scratch.path());
+        let (said, asked) = owed_passes(&sys, scratch.path(), 3);
+        assert_eq!(
+            asked, 1,
+            "three passes each re-ran a refused token: {said:?}"
+        );
+        assert!(
+            said.iter().all(|(outcome, _)| *outcome != Outcome::Person),
+            "{said:?}"
+        );
+        let (outcome, why) = &said[2];
+        assert_eq!(*outcome, Outcome::Deferred, "{said:?}");
+        assert!(
+            why.as_deref()
+                .is_some_and(|why| !why.contains("Only you can fix this")),
+            "{said:?}"
+        );
+        sys.file(OWED_TOKEN, b"fixture_token_next");
+        let (_, asked) = owed_passes(&sys, scratch.path(), 1);
         assert_eq!(asked, 2, "a new token runs the step again");
     }
 

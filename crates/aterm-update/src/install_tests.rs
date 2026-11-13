@@ -573,12 +573,12 @@ fn a_stage_withdrawn_while_it_downloaded_is_never_published() {
 
     let (s, root) = temp_staging();
     let incoming = incoming_stage(&s, 7, commit);
-    crate::manifest::quarantine_artifact(&s, 7, &ready.dmg_sha256, aterm_durable::Flush::Durable);
+    hold_artifact(&s, 7, &ready.dmg_sha256);
     let refused = publish_verified_stage(&s, &incoming, &ready);
     assert!(
         refused
             .as_ref()
-            .is_err_and(|error| error.contains("quarantined")),
+            .is_err_and(|error| error.contains("held until")),
         "{refused:?}"
     );
     assert!(Ready::read_publishable(&s).is_none());
@@ -586,7 +586,7 @@ fn a_stage_withdrawn_while_it_downloaded_is_never_published() {
     std::fs::write(&s.ready, ready.to_toml().unwrap()).unwrap();
     assert!(
         Ready::read_publishable(&s).is_none(),
-        "a quarantined stage is not publishable"
+        "a held stage is not publishable"
     );
     let other = Ready {
         dmg_sha256: "cd".repeat(32),
@@ -707,8 +707,8 @@ fn a_cold_launch_waits_for_a_check_to_confirm_a_stale_roster_authorization() {
             "a wait keeps the stage for the check to confirm"
         );
         assert!(
-            crate::manifest::FailedMark::read(&s.failed()).is_none(),
-            "nothing is memoized against the build"
+            crate::hold::load(&s).hold.is_none(),
+            "nothing is held against the build"
         );
     }
     let stale = publish_confirmed_stage(&s, 20, "m11", Some(now - 2 * day));
@@ -1593,13 +1593,13 @@ fn a_stage_state_refusal_is_passing_and_a_verdict_is_not() {
         "{yanked}"
     );
     std::fs::remove_file(s.floor()).unwrap();
-    crate::manifest::quarantine_artifact(&s, 20, &"ab".repeat(32), aterm_durable::Flush::Durable);
-    let quarantined =
+    hold_artifact(&s, 20, &"ab".repeat(32));
+    let held =
         preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ)
             .unwrap_err();
     assert!(
-        quarantined.contains("quarantined") && !crate::is_passing_refusal(&quarantined),
-        "{quarantined}"
+        held.contains("held until") && !crate::is_passing_refusal(&held),
+        "{held}"
     );
 
     let _ = std::fs::remove_dir_all(root);
@@ -2072,105 +2072,96 @@ fn expected_handoff_authority_is_exact_build_commit_and_digest() {
     let _ = std::fs::remove_dir_all(root);
 }
 
-/// A quarantine record that could not be read admits nothing.
+/// Hold the artifact `(build, digest)` now, as a crash-loop revert would.
+fn hold_artifact(s: &Staging, build: u64, digest: &str) {
+    let sha = crate::hold::sha(digest).expect("a digest");
+    let now = unix_now_secs();
+    crate::hold::edit(s, "test hold", |record| {
+        record.set_hold(
+            aterm_update_core::update_record::Failure {
+                build,
+                version: format!("0.{build}.0"),
+                sha,
+                cause: aterm_update_core::update_record::Cause::CrashLoop,
+                witness: Witness::Headless,
+                why: "it did not start cleanly 3 times".into(),
+            },
+            now,
+        )
+    })
+    .expect("the record is written");
+}
+
+/// Every gate refuses a held artifact while its hold lasts and admits it once it lapses or a
+/// person ends it; an update record that cannot be read holds nothing (the gates fail open: the
+/// trial bounds a bad build to its launches, where a record failing closed stranded a Mac).
 #[test]
-fn a_quarantine_record_that_could_not_be_read_admits_no_stage() {
+fn every_gate_refuses_a_held_stage_until_its_hold_ends_and_an_unreadable_record_admits_it() {
     use std::os::unix::fs::PermissionsExt;
     let (s, root) = temp_staging();
     let commit = "0123456789abcdef0123456789abcdef01234567";
     let digest = "ab".repeat(32);
-    let mode = |path: &Path, bits| {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
-    };
-    for alone in [s.quarantine(), s.failed()] {
-        let _ = std::fs::remove_file(s.quarantine());
-        let _ = std::fs::remove_file(s.failed());
-        let now = unix_now_secs();
-        let ready = publish_confirmed_stage(&s, 20, "m3", Some(now));
-        if alone == s.quarantine() {
-            crate::manifest::quarantine_artifact(&s, 20, &digest, aterm_durable::Flush::Durable);
-            crate::manifest::FailedMark::record_stage_failure(
-                &s.failed(),
-                21,
-                &"cd".repeat(32),
-                now,
-            );
-            assert!(
-                crate::manifest::FailedMark::read(&s.failed()).is_some_and(|m| !m.is_quarantine()),
-                "PRECONDITION: failed.toml no longer names the quarantine"
-            );
-        } else {
-            crate::manifest::FailedMark::record_quarantine(
-                &s.failed(),
-                20,
-                &digest,
-                aterm_durable::Flush::Durable,
-            );
-            assert!(!s.quarantine().exists(), "PRECONDITION: failed.toml alone");
-        }
-        let at = alone.display().to_string();
-        assert!(Ready::read_publishable(&s).is_none(), "{at}: PRECONDITION");
-        let incoming = incoming_stage(&s, 20, commit);
+    let now = unix_now_secs();
+    let ready = publish_confirmed_stage(&s, 20, "m3", Some(now));
+    let incoming = incoming_stage(&s, 20, commit);
+    hold_artifact(&s, 20, &digest);
 
-        mode(&alone, 0o000);
-        if std::fs::File::open(&alone).is_ok() {
-            mode(&alone, 0o600);
-            break;
-        }
-        let publishable = Ready::read_publishable(&s);
-        let swap = stage_admission_gates(&s, 10, &ready, None, now);
-        let cached = handoff_cached_pass_refusal_at(&s, 20, commit);
-        let full =
-            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ);
-        let publish = publish_verified_stage(&s, &incoming, &ready);
-        mode(&alone, 0o600);
+    let held = |why: &str| why.contains("held until") && !crate::is_passing_refusal(why);
+    assert!(
+        Ready::read_publishable(&s).is_none(),
+        "a held stage is not publishable"
+    );
+    let cached = handoff_cached_pass_refusal_at(&s, 20, commit);
+    assert!(cached.as_deref().is_some_and(held), "{cached:?}");
+    let full =
+        preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ);
+    assert!(full.as_ref().is_err_and(|why| held(why)), "{full:?}");
+    let publish = publish_verified_stage(&s, &incoming, &ready);
+    assert!(publish.as_ref().is_err_and(|why| held(why)), "{publish:?}");
+    assert!(incoming.exists(), "nothing published");
 
-        let moment = |why: &str| crate::is_passing_refusal(why) && why.contains("update records");
-        assert!(publishable.is_none(), "{at}: {publishable:?}");
+    // Unreadable: it holds nothing.
+    std::fs::set_permissions(s.record(), std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(s.record()).is_err() {
         assert!(
-            matches!(&swap, Some(ApplyOutcome::Deferred(why)) if moment(why)),
-            "{at}: {swap:?}"
+            Ready::read_publishable(&s).is_some(),
+            "an unreadable record fails open"
         );
-        assert!(
-            s.ready.exists() && s.staged_app.exists(),
-            "{at}: a record it could not read retires nothing"
-        );
-        assert!(cached.as_deref().is_some_and(moment), "{at}: {cached:?}");
-        assert!(
-            full.as_ref().is_err_and(|why| moment(why)),
-            "{at}: {full:?}"
-        );
-        assert!(
-            publish.as_ref().is_err_and(|why| moment(why)),
-            "{at}: {publish:?}"
-        );
-        assert!(incoming.exists(), "{at}: nothing published");
-
-        let verdict = |why: &str| why.contains("quarantined") && !crate::is_passing_refusal(why);
-        let cached = handoff_cached_pass_refusal_at(&s, 20, commit);
-        assert!(cached.as_deref().is_some_and(verdict), "{at}: {cached:?}");
-        let full =
-            preverify_staged_handoff_candidate_at(&s, None, 10, None, Some(20), None, NEVER_READ);
-        assert!(
-            full.as_ref().is_err_and(|why| verdict(why)),
-            "{at}: {full:?}"
-        );
-        let publish = publish_verified_stage(&s, &incoming, &ready);
-        assert!(
-            publish.as_ref().is_err_and(|why| verdict(why)),
-            "{at}: {publish:?}"
-        );
-        assert_eq!(
-            stage_admission_gates(&s, 10, &ready, None, now),
-            Some(ApplyOutcome::NoUpdate),
-            "{at}"
-        );
-        assert!(
-            !s.ready.exists(),
-            "{at}: the swap retires a quarantined stage"
-        );
-        let _ = std::fs::remove_dir_all(&incoming);
+        assert_eq!(handoff_cached_pass_refusal_at(&s, 20, commit), None);
     }
+    std::fs::set_permissions(s.record(), std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    // A person ends the hold: admitted.
+    crate::hold::edit(&s, "test retry", |record| {
+        record.end_hold(aterm_update_core::update_record::Ending::Person, now)
+    });
+    assert!(Ready::read_publishable(&s).is_some(), "the hold ended");
+    assert_eq!(handoff_cached_pass_refusal_at(&s, 20, commit), None);
+
+    // Held again, then the swap retires the held stage.
+    hold_artifact(&s, 20, &digest);
+    assert_eq!(
+        stage_admission_gates(&s, 10, &ready, None, now),
+        Some(ApplyOutcome::NoUpdate)
+    );
+    assert!(!s.ready.exists(), "the swap retires a held stage");
+    // Once its hold lapses (kept in the slot as history), the gates admit the same artifact.
+    crate::hold::edit(&s, "test lapse", |record| {
+        if let Some(hold) = &mut record.hold {
+            hold.until = hold.at;
+        }
+    });
+    let ready = publish_confirmed_stage(&s, 20, "m3", Some(now));
+    assert_eq!(
+        stage_admission_gates(&s, 10, &ready, None, now),
+        None,
+        "a lapsed hold admits the build for its next trial"
+    );
+    assert!(
+        crate::hold::load(&s).hold.is_some(),
+        "the lapsed hold stays as history"
+    );
+    let _ = std::fs::remove_dir_all(&incoming);
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -2284,7 +2275,7 @@ fn trial_arm_failure_keeps_verified_stage_ready_and_unswapped() {
     assert!(s.ready.exists());
     assert_eq!(read_id(&s.staged_app), "VERIFIED-NEW");
     assert!(
-        crate::manifest::FailedMark::read(&s.trial()).is_none(),
+        crate::manifest::Trial::read(&s.trial()).is_none(),
         "a failed sentinel arm cannot mint partial trial authority"
     );
     let _ = std::fs::remove_dir_all(root);
@@ -2312,7 +2303,7 @@ fn a_trial_arm_whose_folder_flush_fails_leaves_nothing_armed() {
     assert!(failed.is_err());
     assert_eq!(boot_sentinel(&s).read_state(), None, "no trial is armed");
     assert!(
-        crate::manifest::FailedMark::read(&s.trial()).is_none(),
+        crate::manifest::Trial::read(&s.trial()).is_none(),
         "and no trial identity is left"
     );
     assert!(s.ready.exists());
@@ -2406,13 +2397,12 @@ fn assert_real_disk_projection(
         i64::from(matches!(fixed_identity, 1 | 2))
     );
 
-    let trial_exact =
-        matches!(
-            boot_sentinel(staging).read_state(),
-            Some((build, _)) if build == current_build
-        ) && crate::manifest::FailedMark::read(&staging.trial()).is_some_and(|trial| {
-            trial.build_number == current_build && trial.sha256.eq_ignore_ascii_case(current_digest)
-        });
+    let trial_exact = matches!(
+        boot_sentinel(staging).read_state(),
+        Some((build, _)) if build == current_build
+    ) && crate::manifest::Trial::read(&staging.trial()).is_some_and(|trial| {
+        trial.build_number == current_build && trial.sha256.eq_ignore_ascii_case(current_digest)
+    });
     assert_eq!(state["trial"], i64::from(trial_exact));
 
     let receipt_exact = crate::manifest::InstalledReceipt::read(&staging.installed_receipt())
@@ -2522,15 +2512,16 @@ fn the_boot_lanes_arm_swap_and_unswap_take_the_install_tier() {
     });
     assert_eq!(
         here,
-        [vec![O, O, O, O], vec![O, O, O], vec![O, O, O]],
-        "one device: the trial identity and the arm, file and entry each; the swap's \
-         parent, then the receipt; the inverse swap, then OLD's receipt"
+        [vec![O, O, O, O, D, D], vec![O, O, O], vec![O, O, O]],
+        "one device: the trial identity and the arm, file and entry each, then the update \
+         record's trial (always durable); the swap's parent, then the receipt; the inverse \
+         swap, then OLD's receipt"
     );
     assert_eq!(
         elsewhere,
-        [vec![O, O, D, D], vec![D, D, D], vec![D, D, D]],
+        [vec![O, O, D, D, D, D], vec![D, D, D], vec![D, D, D]],
         "another device: the trial identity keeps its own same-device guard \
-         (`FailedMark::record_required`); every other step is durable"
+         (`Trial::record_required`); every other step is durable"
     );
 }
 
@@ -2599,8 +2590,16 @@ fn an_unreceipted_swaps_rollback_takes_the_install_tier() {
         let _ = std::fs::remove_dir_all(root);
         flushes
     });
-    assert_eq!(here, [Flush::Ordered], "one device: the inverse swap");
-    assert_eq!(elsewhere, [Flush::Durable], "another device");
+    assert_eq!(
+        here,
+        [Flush::Ordered, Flush::Durable, Flush::Durable],
+        "one device: the inverse swap, then the update record's ended trial (always durable)"
+    );
+    assert_eq!(
+        elsewhere,
+        [Flush::Durable; 3],
+        "another device: the inverse swap, then the update record"
+    );
 }
 
 /// The receipt a counted launch binds from `ready.toml` after a cut between the swap
@@ -2615,13 +2614,8 @@ fn a_trials_recovered_receipt_takes_the_install_tier() {
         write_ready(&s, 11);
         let installed = root.join("Applications/aterm.app");
         make_app(&installed, "NEW");
-        crate::manifest::FailedMark::record_required(
-            &s.trial(),
-            11,
-            &"ab".repeat(32),
-            Some(&installed),
-        )
-        .unwrap();
+        crate::manifest::Trial::record_required(&s.trial(), 11, &"ab".repeat(32), Some(&installed))
+            .unwrap();
         let sealed = installed.clone();
         let identity = move |path: &Path| {
             if path == sealed.as_path() {
@@ -2759,7 +2753,7 @@ fn a_failed_receipt_after_a_copied_swap_keeps_the_intact_stage() {
     let prepared = copied_candidate(&fixed);
     let sentinel = boot_sentinel(&s);
     sentinel.arm(11).unwrap();
-    crate::manifest::FailedMark::record(&s.trial(), 11, &"ab".repeat(32));
+    crate::manifest::Trial::record(&s.trial(), 11, &"ab".repeat(32));
     let retained =
         swap_fixed_candidate(&prepared, &installed, aterm_durable::Flush::Durable).unwrap();
     assert_eq!(read_id(&installed), "COPIED-NEW");
@@ -2791,7 +2785,7 @@ fn old_process_confirmation_cannot_gc_a_newer_trial_or_its_receipt() {
     let (s, root) = temp_staging();
     let sentinel = boot_sentinel(&s);
     sentinel.arm(1000).unwrap();
-    crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
+    crate::manifest::Trial::record(&s.trial(), 1000, &"ab".repeat(32));
     crate::manifest::InstalledReceipt::record(
         &s.installed_receipt(),
         1000,
@@ -2829,7 +2823,7 @@ fn unresolved_installed_bundle_cannot_disarm_or_gc_trial() {
     let (s, root) = temp_staging();
     let sentinel = boot_sentinel(&s);
     sentinel.arm(1000).unwrap();
-    crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
+    crate::manifest::Trial::record(&s.trial(), 1000, &"ab".repeat(32));
     let verdict = confirm_boot_health_verdict_at(
         &s,
         1000,
@@ -2912,7 +2906,7 @@ fn superseded_activation_desk() -> (crate::paths::ScratchStaging, PathBuf, PathB
     sealed_fixture(&rollback_path(&installed), 10, SUPERSEDE_RUNNING_COMMIT);
     write_ready_for(&s, 12, SUPERSEDE_NEWER_COMMIT);
     sealed_fixture(&s.staged_app, 12, SUPERSEDE_NEWER_COMMIT);
-    crate::manifest::FailedMark::record_required(
+    crate::manifest::Trial::record_required(
         &s.trial(),
         11,
         SUPERSEDE_ACTIVATION_DIGEST,
@@ -2951,7 +2945,7 @@ fn supersede_desk(
 }
 
 /// The running build goes back to the install path and the activation's trial is disarmed at
-/// its two counted launches (a third would revert and poison it); nothing is quarantined, and
+/// its two counted launches (a third would revert and poison it); nothing is held, and
 /// the boot apply's preconditions hold for the next candidate.
 #[test]
 fn a_newer_stage_supersedes_an_unconfirmed_activation_without_counting_a_launch() {
@@ -2990,8 +2984,8 @@ fn a_newer_stage_supersedes_an_unconfirmed_activation_without_counting_a_launch(
         "a receipt naming the retired activation is not proof for what is installed"
     );
     assert!(
-        crate::manifest::FailedMark::read(&s.failed()).is_none(),
-        "nothing is quarantined: the activation never failed to BOOT"
+        crate::hold::load(&s).hold.is_none(),
+        "nothing is held: the activation never failed to BOOT"
     );
     assert_eq!(
         sealed_fixture_identity(&s.staged_app),
@@ -3045,6 +3039,7 @@ fn a_supersede_waits_while_another_windows_candidate_of_the_activation_runs() {
         TrialLauncher::of(sibling.id()),
         true,
         crate::TrialWitness::Window,
+        false,
     )
     .unwrap();
     let counted = boot_sentinel(&s).read_state();
@@ -3179,7 +3174,7 @@ fn a_supersede_moves_nothing_unless_every_precondition_holds() {
     let other_install = |s: &Staging, _installed: &Path, root: &Path| {
         let other = root.join("Other").join("aterm.app");
         sealed_fixture(&other, 11, SUPERSEDE_ACTIVATION_COMMIT);
-        crate::manifest::FailedMark::record_required(
+        crate::manifest::Trial::record_required(
             &s.trial(),
             11,
             SUPERSEDE_ACTIVATION_DIGEST,
@@ -3193,14 +3188,8 @@ fn a_supersede_moves_nothing_unless_every_precondition_holds() {
         std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
         std::fs::write(s.floor(), "revoked_machines = [\"m-revoked\"]\n").unwrap();
     };
-    let quarantined_stage = |s: &Staging, _installed: &Path, _root: &Path| {
-        crate::manifest::Quarantine::record(
-            &s.quarantine(),
-            12,
-            &"cd".repeat(32),
-            aterm_durable::Flush::Ordered,
-        )
-        .unwrap();
+    let held_stage = |s: &Staging, _installed: &Path, _root: &Path| {
+        hold_artifact(s, 12, &"cd".repeat(32));
     };
     let stale_roster = |s: &Staging, _installed: &Path, _root: &Path| {
         let mut r = Ready::read(&s.ready).unwrap();
@@ -3254,8 +3243,8 @@ fn a_supersede_moves_nothing_unless_every_precondition_holds() {
             false,
         ),
         (
-            "the stage is quarantined",
-            quarantined_stage,
+            "the stage is held",
+            held_stage,
             (10, SUPERSEDE_RUNNING_COMMIT),
             12,
             false,
@@ -3466,7 +3455,7 @@ impl SignatureReads {
 /// that is not the window: the node service, whether it still runs the window's build 10 or was
 /// restarted onto the activation 11. Build 12 goes in over the retained build 10 on a fresh trial,
 /// 10 stays retained for its rollback, and 11's trial is disarmed without a counted launch or a
-/// quarantine.
+/// hold.
 #[test]
 fn an_unconfirmed_failed_activation_yields_the_install_path_to_a_newer_verified_stage() {
     for running in [
@@ -3514,7 +3503,7 @@ fn an_unconfirmed_failed_activation_yields_the_install_path_to_a_newer_verified_
             Some((12, 0)),
             "{running:?}: 12 is on a fresh trial and 11's is disarmed"
         );
-        let trial = crate::manifest::FailedMark::read(&s.trial()).expect("12's trial identity");
+        let trial = crate::manifest::Trial::read(&s.trial()).expect("12's trial identity");
         assert!(
             trial.matches(12, &"cd".repeat(32)),
             "{running:?}: {trial:?}"
@@ -3529,8 +3518,8 @@ fn an_unconfirmed_failed_activation_yields_the_install_path_to_a_newer_verified_
             "{running:?}: the installed stage is retired"
         );
         assert!(
-            crate::manifest::FailedMark::read(&s.failed()).is_none(),
-            "{running:?}: nothing is quarantined"
+            crate::hold::load(&s).hold.is_none(),
+            "{running:?}: nothing is held"
         );
         assert_eq!(
             failed_activation_waiting_at(&s),
@@ -3565,12 +3554,7 @@ fn a_failed_activation_stays_installed_unless_every_gate_holds() {
             running,
             "none",
         ),
-        (
-            "the stage is quarantined",
-            quarantine_the_stage,
-            running,
-            "none",
-        ),
+        ("the stage is held", hold_the_stage, running, "none"),
         (
             "the stage is withdrawn by the operator floor",
             withdraw_the_stage,
@@ -3620,6 +3604,7 @@ fn a_failed_activation_stays_installed_unless_every_gate_holds() {
                     TrialLauncher::of(launch.id()),
                     true,
                     crate::TrialWitness::Window,
+                    false,
                 )
                 .unwrap();
                 record_window_launch_at(s, unix_now_secs() - 60);
@@ -3723,7 +3708,7 @@ fn a_failed_activation_stays_installed_unless_every_gate_holds() {
                     .join("Other")
                     .join("aterm.app");
                 sealed_fixture(&other, 11, SUPERSEDE_ACTIVATION_COMMIT);
-                crate::manifest::FailedMark::record_required(
+                crate::manifest::Trial::record_required(
                     &s.trial(),
                     11,
                     SUPERSEDE_ACTIVATION_DIGEST,
@@ -3800,6 +3785,7 @@ fn a_failed_activation_held_by_a_gate_small_files_answer_verifies_no_bundle() {
             TrialLauncher::of(launch.id()),
             true,
             crate::TrialWitness::Window,
+            false,
         )
         .unwrap();
         record_window_launch_at(s, unix_now_secs() - 60);
@@ -3933,7 +3919,7 @@ fn an_install_over_a_failed_activation_verifies_its_bundles_before_the_apply_loc
 
 /// What the look found can change between the look and the apply lock, while the bundles verify.
 /// Under the lock the same gates are read again: one that no longer finds the failed activation
-/// (the stage quarantined or withdrawn, the window's failure cleared, the trial disarmed) answers
+/// (the stage held or withdrawn, the window's failure cleared, the trial disarmed) answers
 /// `NoneFailed`, and one that finds another stage, or the failure booked by another window's build,
 /// holds for now; neither is `Refused`, the verdict a caller keeps for the pair, and nothing moves.
 /// The rebooked failure passes every gate under the lock with a process on the activation, so only
@@ -3947,8 +3933,8 @@ fn a_failed_activation_that_changes_while_its_bundles_verify_is_not_refused() {
     let activation = (11, SUPERSEDE_ACTIVATION_COMMIT);
     let cases: [(&str, Change, (u64, &str), bool); 6] = [
         (
-            "the stage was quarantined",
-            |s| quarantine_the_stage(s, Path::new(""), &mut None),
+            "the stage was held",
+            |s| hold_the_stage(s, Path::new(""), &mut None),
             window,
             true,
         ),
@@ -4246,14 +4232,8 @@ fn stale_roster_of_the_stage(s: &Staging, _: &Path, _: &mut Option<aterm_uds::sp
     std::fs::write(&s.ready, r.to_toml().unwrap()).unwrap();
 }
 
-fn quarantine_the_stage(s: &Staging, _: &Path, _: &mut Option<aterm_uds::spawnfd::Child>) {
-    crate::manifest::Quarantine::record(
-        &s.quarantine(),
-        12,
-        &"cd".repeat(32),
-        aterm_durable::Flush::Ordered,
-    )
-    .unwrap();
+fn hold_the_stage(s: &Staging, _: &Path, _: &mut Option<aterm_uds::spawnfd::Child>) {
+    hold_artifact(s, 12, &"cd".repeat(32));
 }
 
 fn withdraw_the_stage(s: &Staging, _: &Path, _: &mut Option<aterm_uds::spawnfd::Child>) {
@@ -4310,7 +4290,7 @@ fn a_trial_armed_below_the_running_build_is_retired_not_kept_forever() {
     let commit = "0123456789abcdef0123456789abcdef01234567";
     let sentinel = boot_sentinel(&s);
     sentinel.arm(1000).unwrap();
-    crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
+    crate::manifest::Trial::record(&s.trial(), 1000, &"ab".repeat(32));
     crate::manifest::InstalledReceipt::record(
         &s.installed_receipt(),
         1000,
@@ -4364,7 +4344,7 @@ fn a_trial_is_owned_by_the_install_it_swapped_and_no_sibling_bundle() {
     ));
     std::fs::remove_dir_all(&owner).unwrap();
     assert!(trial_owned_by(&s, &sibling), "a ghost owns nothing");
-    crate::manifest::FailedMark::record(&s.trial(), 6, &"ab".repeat(32));
+    crate::manifest::Trial::record(&s.trial(), 6, &"ab".repeat(32));
     assert!(trial_owned_by(&s, &sibling) && trial_owned_by(&s, &owner));
     let _ = std::fs::remove_dir_all(root);
 }
@@ -4377,7 +4357,7 @@ fn an_unrecoverable_foreign_trial_is_disarmed_on_a_budget_not_on_sight() {
     let (s, root) = temp_staging();
     let sentinel = boot_sentinel(&s);
     sentinel.arm(1000).unwrap();
-    crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
+    crate::manifest::Trial::record(&s.trial(), 1000, &"ab".repeat(32));
 
     for launch in 1..MAX_BOOT_ATTEMPTS {
         let recording = aterm_durable::seam::Recording::start();
@@ -4420,7 +4400,7 @@ fn a_present_owners_trial_survives_a_siblings_budget_until_the_owner_is_long_idl
     make_app(&owner, "OWNER");
     let sentinel = boot_sentinel(&s);
     sentinel.arm(1000).unwrap();
-    crate::manifest::FailedMark::record_required(&s.trial(), 1000, &"ab".repeat(32), Some(&owner))
+    crate::manifest::Trial::record_required(&s.trial(), 1000, &"ab".repeat(32), Some(&owner))
         .unwrap();
     for _ in 0..MAX_BOOT_ATTEMPTS + 2 {
         assert!(
@@ -4529,7 +4509,7 @@ fn only_a_deferred_boot_apply_is_recorded_as_a_refusal() {
 fn active_trial_digest_rejects_same_build_commit_receipt_with_other_artifact() {
     let (s, root) = temp_staging();
     let commit = "0123456789abcdef0123456789abcdef01234567";
-    crate::manifest::FailedMark::record(&s.trial(), 1000, &"ab".repeat(32));
+    crate::manifest::Trial::record(&s.trial(), 1000, &"ab".repeat(32));
     crate::manifest::InstalledReceipt::record(
         &s.installed_receipt(),
         1000,
@@ -4612,7 +4592,7 @@ fn native_update_disk_transaction_model_conforms_to_real_swap_recovery_and_healt
     let torn = buggy.successors("BuggyTwoRenameSwapFailsMidway", &failed_state)[0].clone();
     assert!(!buggy.check_invariant("FailedSwapNeverReplacesOld", &torn));
     failed_sentinel.confirm().unwrap();
-    crate::manifest::FailedMark::clear(&failed_staging.trial());
+    crate::manifest::Trial::clear(&failed_staging.trial());
     disk_model_step(&model, &mut failed_state, "SwapFailsAndDisarms");
     assert_real_disk_projection(
         &failed_state,
@@ -5060,7 +5040,7 @@ fn native_update_disk_transaction_model_conforms_to_real_swap_recovery_and_healt
     .unwrap();
     disk_model_step(&model, &mut rollback_state, "RestoreExactOld");
     rollback_sentinel.confirm().unwrap();
-    crate::manifest::FailedMark::clear(&rollback_staging.trial());
+    crate::manifest::Trial::clear(&rollback_staging.trial());
     std::fs::remove_dir_all(&rollback_fixed).unwrap();
     restore_installed_receipt(&rollback_staging, None, aterm_durable::Flush::Durable).unwrap();
     disk_model_step(
@@ -6379,6 +6359,7 @@ fn a_window_launch_leaves_the_stage_for_its_window_and_execs_only_to_revert_or_e
         (running, Some(other_commit)),
         None,
         WindowKeepsImage,
+        crate::TrialWitness::Window,
         || {
             read_with_the_lock_free
                 .set(FileLock::acquire_within(&s.apply_lock, std::time::Duration::ZERO).is_ok());
@@ -6691,7 +6672,7 @@ fn a_start_probe_killed_before_its_candidate_exited_leaves_it_where_it_ran() {
         "and held there"
     );
     assert_eq!(
-        crate::manifest::FailedMark::read(&s.failed()).map(|mark| mark.build_number),
+        crate::hold::load(&s).hold.map(|hold| hold.build),
         Some(build),
         "a verdict on the build"
     );
@@ -7015,5 +6996,285 @@ fn no_build_drops_a_record_in_a_format_it_cannot_read() {
             "dropped once its file is FIRST_EXEC_HANG old"
         );
     }
+    let _ = std::fs::remove_dir_all(root);
+}
+
+const STALLED_RUNNING_COMMIT: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+/// The disk a window running build 10 leaves when it quits after its successor of the staged
+/// download 11 (digest `ab`×32) stalled: the old bundle installed, 11 staged and confirmed, and,
+/// when `failed` names bytes, the record the window wrote. No window or App exists.
+fn quit_window_desk(
+    failed: Option<(u64, &str)>,
+) -> (crate::paths::ScratchStaging, PathBuf, PathBuf) {
+    let (s, root) = temp_staging();
+    let installed = root.join("Applications/aterm.app");
+    make_app(&installed, "OLD");
+    publish_confirmed_stage(&s, 11, "m3", Some(unix_now_secs()));
+    if let Some((build, digest)) = failed {
+        crate::window_start_failure::record(
+            &s,
+            10,
+            crate::FailedStartBytes::Download {
+                build,
+                dmg_sha256: digest,
+            },
+            "unexplained/stalled",
+            unix_now_secs(),
+        )
+        .unwrap();
+    }
+    (s, root, installed)
+}
+
+/// The boot's admission of the stage for a start of build 10 that `witness` names, on a
+/// replaceable image with automatic installs on: `Ok(())` where the boot would swap it in.
+fn boot_admission(
+    s: &Staging,
+    installed: &Path,
+    witness: crate::TrialWitness,
+) -> Result<(), ApplyOutcome> {
+    admit_stage_for_boot_lane(
+        s,
+        installed,
+        (10, Some(STALLED_RUNNING_COMMIT)),
+        None,
+        crate::ImageReplacement::Replaceable,
+        witness,
+        || true,
+    )
+    .map(|_admitted| ())
+}
+
+/// Nothing of `s`'s stage was installed or armed: the old bundle stands, build 11 is still staged
+/// with its bundle, and no trial is armed or identified.
+fn assert_left_for_a_window(s: &Staging, installed: &Path, what: &str) {
+    assert_eq!(read_id(installed), "OLD", "{what}: the installed bundle");
+    assert!(
+        matches!(read_ready(s, 10), ReadyState::Newer(ready) if ready.build_number == 11),
+        "{what}: the stage stays published"
+    );
+    assert!(s.staged_app.exists(), "{what}: with its bundle");
+    assert_eq!(boot_sentinel(s).read_state(), None, "{what}: nothing armed");
+    assert!(
+        crate::manifest::Trial::read(&s.trial()).is_none(),
+        "{what}: no trial identity"
+    );
+}
+
+/// KI-1112-144: A QUIT WINDOW'S STALLED DOWNLOAD IS NOT INSTALLED HEADLESS. The window that saw
+/// the successor of build 11's bytes stall has quit and only its record remains. THE INSTALL: a
+/// headless boot (the node job's, any `--headless` start) leaves exactly those bytes staged
+/// for a window, arms nothing, and the job's look sees no build a start would run. WINDOW: a
+/// window's boot is the witness that may try them, so the gate is not a quarantine. NEWER
+/// RELEASE: build 12 over the record of 11 is admitted. OTHER ARTIFACT: a record of another
+/// artifact of 11 holds nothing.
+/// NEGATIVE CONTROLS: drop the Headless check in `admit_stage_for_boot_lane` and THE INSTALL
+/// fails; apply it to every witness and WINDOW fails; key `names` by build alone and OTHER
+/// ARTIFACT fails.
+#[test]
+fn a_quit_windows_stalled_download_is_not_installed_headless() {
+    use crate::TrialWitness::{Headless, Window};
+    let digest = "ab".repeat(32);
+    let (s, root, installed) = quit_window_desk(Some((11, &digest)));
+    assert_eq!(
+        boot_admission(&s, &installed, Headless),
+        Err(ApplyOutcome::NoUpdate),
+        "THE INSTALL: a headless boot does not install the bytes a window saw fail"
+    );
+    assert_left_for_a_window(&s, &installed, "THE INSTALL");
+    assert_eq!(
+        crate::staged_for_a_start(&s),
+        None,
+        "THE INSTALL: the job's look sees no build a start would run"
+    );
+    assert_eq!(
+        boot_admission(&s, &installed, Window),
+        Ok(()),
+        "WINDOW: a window's boot may try them; no quarantine"
+    );
+    assert!(
+        crate::window_start_failure::names(&s, 11, &digest) == Ok(true),
+        "WINDOW: an admission withdraws nothing"
+    );
+
+    publish_confirmed_stage(&s, 12, "m3", Some(unix_now_secs()));
+    assert_eq!(
+        boot_admission(&s, &installed, Headless),
+        Ok(()),
+        "NEWER RELEASE: a newer build is never held"
+    );
+    assert_eq!(crate::staged_for_a_start(&s), Some(12));
+    let _ = std::fs::remove_dir_all(root);
+
+    let (s, root, installed) = quit_window_desk(Some((11, &"cd".repeat(32))));
+    assert_eq!(
+        boot_admission(&s, &installed, Headless),
+        Ok(()),
+        "OTHER ARTIFACT: another artifact of build 11 is not these bytes"
+    );
+    assert_eq!(crate::staged_for_a_start(&s), Some(11));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// KI-1112-144 CONTROL: A DOWNLOAD WHOSE WINDOW PRESENTED IS INSTALLED HEADLESS. A withdraw of
+/// other bytes leaves the hold; a withdraw of exactly these bytes, spelled in capitals as a
+/// window spells them, ends it, and the headless boot and the job's look take build 11 again.
+/// NEGATIVE CONTROL: a withdraw that ignores the digest fails the first arm, and one that never
+/// removes the record fails the second.
+#[test]
+fn a_download_whose_window_presented_is_installed_headless() {
+    use crate::TrialWitness::Headless;
+    let digest = "ab".repeat(32);
+    let (s, root, installed) = quit_window_desk(Some((11, &digest)));
+    let cd = "cd".repeat(32);
+    assert_eq!(
+        crate::window_start_failure::withdraw(
+            &s,
+            crate::FailedStartBytes::Download {
+                build: 11,
+                dmg_sha256: &cd,
+            }
+        ),
+        Ok(false),
+        "a window of other bytes withdraws nothing"
+    );
+    assert_eq!(
+        boot_admission(&s, &installed, Headless),
+        Err(ApplyOutcome::NoUpdate)
+    );
+    assert_eq!(
+        crate::window_start_failure::withdraw(
+            &s,
+            crate::FailedStartBytes::Download {
+                build: 11,
+                dmg_sha256: &digest.to_ascii_uppercase(),
+            }
+        ),
+        Ok(true)
+    );
+    assert_eq!(boot_admission(&s, &installed, Headless), Ok(()));
+    assert_eq!(crate::staged_for_a_start(&s), Some(11));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// AN UNREADABLE START-FAILURE RECORD DEFERS THE HEADLESS INSTALL: a record the read cannot get
+/// through (a link, which the no-follow open refuses whoever runs the test) is no evidence about
+/// any bytes either way, so a headless boot defers as a passing moment, keeps the stage and arms
+/// nothing, and the job's look sees no build a start would run; a window's boot is unaffected.
+/// NEGATIVE CONTROL: reading `Err` as absent makes the headless arm admit.
+#[test]
+fn an_unreadable_start_failure_record_defers_the_headless_install() {
+    use crate::TrialWitness::{Headless, Window};
+    let (s, root, installed) = quit_window_desk(None);
+    std::os::unix::fs::symlink(s.record(), s.record()).unwrap();
+    assert!(
+        crate::window_start_failure::read(&s).is_err(),
+        "PRECONDITION"
+    );
+    match boot_admission(&s, &installed, Headless) {
+        Err(ApplyOutcome::Deferred(why)) => {
+            assert!(crate::is_passing_refusal(&why), "{why}");
+        }
+        other => panic!("a headless boot past an unreadable record: {other:?}"),
+    }
+    assert_left_for_a_window(&s, &installed, "unreadable");
+    assert_eq!(crate::staged_for_a_start(&s), None);
+    assert_eq!(boot_admission(&s, &installed, Window), Ok(()));
+    let _ = std::fs::remove_dir_all(root);
+}
+
+/// A NEWER STAGE A WINDOW SAW FAIL DOES NOT SUPERSEDE A FAILED ACTIVATION: the supersede chain
+/// over an activation a window failed to switch to holds for now while the newer stage's exact
+/// bytes are on record, in its cheap pass and again under the apply lock (the record written
+/// while the bundles verify), and retires nothing; once withdrawn the gates pass. A record of the
+/// activation's own bytes does not hold the chain, so newer releases still supersede failed bytes.
+/// NEGATIVE CONTROL: without the gate the retire proceeds (the last arm, the control desk).
+#[test]
+fn a_newer_stage_a_window_saw_fail_does_not_supersede_a_failed_activation() {
+    use crate::FailedActivationInstall::{Held, Installed};
+    use crate::SupersedeRefusal::ForNow;
+    let running = (10, SUPERSEDE_RUNNING_COMMIT);
+    let newer_bytes = "cd".repeat(32);
+    let newer = crate::FailedStartBytes::Download {
+        build: 12,
+        dmg_sha256: &newer_bytes,
+    };
+    let stands = |s: &Staging, installed: &Path, what: &str| {
+        assert_eq!(
+            sealed_fixture_identity(installed),
+            Ok((11, SUPERSEDE_ACTIVATION_COMMIT.to_string())),
+            "{what}: the activation stands"
+        );
+        assert_eq!(boot_sentinel(s).read_state(), Some((11, 0)), "{what}");
+        assert!(s.ready.exists(), "{what}: the stage stays");
+    };
+
+    let (s, root, installed) = failed_activation_desk();
+    crate::window_start_failure::record(&s, 10, newer, "unexplained/stalled", unix_now_secs())
+        .unwrap();
+    assert!(
+        matches!(
+            failed_activation_gates(&s, 10, unix_now_secs()),
+            Err(Held(ForNow(why))) if why.contains("saw fail to start")
+        ),
+        "the cheap pass holds"
+    );
+    let outcome = install_over_failed_desk(&s, &installed, running);
+    assert!(
+        matches!(&outcome, Held(refusal) if refusal.is_for_now()),
+        "{outcome:?}"
+    );
+    stands(&s, &installed, "held");
+    assert_eq!(crate::window_start_failure::withdraw(&s, newer), Ok(true));
+    assert!(failed_activation_gates(&s, 10, unix_now_secs()).is_ok());
+    crate::window_start_failure::record(
+        &s,
+        10,
+        crate::FailedStartBytes::Download {
+            build: 11,
+            dmg_sha256: SUPERSEDE_ACTIVATION_DIGEST,
+        },
+        "unexplained/stalled",
+        unix_now_secs(),
+    )
+    .unwrap();
+    assert!(
+        failed_activation_gates(&s, 10, unix_now_secs()).is_ok(),
+        "the activation's own bytes on record do not hold a newer release"
+    );
+    let _ = std::fs::remove_dir_all(root);
+
+    let (s, root, installed) = failed_activation_desk();
+    let reads = std::cell::Cell::new(0_usize);
+    let record_while_the_bundles_verify = |app: &Path| {
+        let read = sealed_fixture_identity(app);
+        reads.set(reads.get() + 1);
+        if reads.get() == 3 {
+            crate::window_start_failure::record(&s, 10, newer, "stalled", unix_now_secs()).unwrap();
+        }
+        read
+    };
+    let outcome =
+        install_over_failed_desk_reading(&s, &installed, running, &record_while_the_bundles_verify);
+    assert!(
+        matches!(&outcome, Held(ForNow(why)) if why.contains("saw fail to start")),
+        "the locked pass holds: {outcome:?}"
+    );
+    stands(&s, &installed, "held under the lock");
+    let _ = std::fs::remove_dir_all(root);
+
+    let (s, root, installed) = failed_activation_desk();
+    let outcome = install_over_failed_desk(&s, &installed, running);
+    assert!(
+        matches!(
+            outcome,
+            Installed {
+                installed_build: 12,
+                ..
+            }
+        ),
+        "CONTROL: the same desk with no record installs 12: {outcome:?}"
+    );
     let _ = std::fs::remove_dir_all(root);
 }

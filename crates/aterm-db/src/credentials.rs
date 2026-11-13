@@ -37,8 +37,7 @@ use aterm_secrets::{
     },
     commons::bootstrap::Bootstrap,
     need::{
-        self, Absorb, Decision, Need, Policy, Purpose, Reason, Retirement, State, Unanswered, Want,
-        custody,
+        self, Absorb, Decision, Need, Policy, Purpose, Reason, Retirement, State, Want, custody,
     },
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -65,6 +64,8 @@ const MS: u64 = 1000;
 
 /// The record kinds this build reads. A custodian's `Policy` record is step 5's: this build
 /// holds one inert, so the compiled policy stays in force until a build that reads it.
+/// `needs-person` is an earlier build's custodian handing a request to a person: its writers'
+/// history must stay readable, so it still decodes, and nothing writes it or acts on it.
 pub const KINDS: [&str; 10] = [
     "request",
     "offer",
@@ -379,7 +380,7 @@ fn check_parts(kind: &str, key: &str, body: &Map) -> Result<Vec<u8>> {
             if let Some(hosts) = body.get("unanswered") {
                 let hosts = hosts
                     .as_array()
-                    .filter(|hosts| !hosts.is_empty() && hosts.len() <= need::MAX_UNANSWERED)
+                    .filter(|hosts| !hosts.is_empty() && hosts.len() <= 16)
                     .ok_or_else(|| Error::new("needs-person names 1 to 16 unanswered hosts"))?;
                 let mut seen = BTreeSet::new();
                 for host in hosts {
@@ -554,10 +555,6 @@ pub struct Thread {
     pub swept: BTreeSet<Actor>,
     /// The custodian's publication: vault name and exact attested source.
     pub published: Option<(String, RefusalClaim)>,
-    /// The custodian handed it to a person.
-    pub needs_person: bool,
-    /// Who that decision names as not having answered, once the want window ended first.
-    pub unanswered: Unanswered,
     /// The requester applied it at this seq.
     pub fulfilled: Option<u64>,
     /// How it was retired, and whether a custodian attested it.
@@ -613,17 +610,6 @@ impl Thread {
     /// has decided by then, whenever its own replica took it in.
     fn silence_ended(&self, now_ms: u64) -> bool {
         now_ms.saturating_sub(self.arrived_ms) >= need::SILENCE_SECS * MS
-    }
-
-    /// The current members' Macs but the requester's with no sweep and no offer on it, each by
-    /// its original actor.
-    fn unheard(&self, members: &BTreeSet<Actor>, macs: &Macs) -> Vec<Actor> {
-        let offered: BTreeSet<Actor> = self.offers.iter().map(|actor| macs.of(*actor)).collect();
-        self.others(members, macs)
-            .into_iter()
-            .filter(|(mac, swept)| !swept && !offered.contains(mac))
-            .map(|(mac, _)| mac)
-            .collect()
     }
 }
 
@@ -769,8 +755,6 @@ impl Book {
                     offers: Vec::new(),
                     swept: BTreeSet::new(),
                     published: None,
-                    needs_person: false,
-                    unanswered: Unanswered::default(),
                     fulfilled: None,
                     retired: None,
                 },
@@ -832,7 +816,7 @@ impl Book {
             let record = &entry.record;
             if !matches!(
                 record.kind.as_str(),
-                "published" | "published-v2" | "needs-person" | "retired"
+                "published" | "published-v2" | "retired"
             ) {
                 continue;
             }
@@ -847,7 +831,7 @@ impl Book {
                 continue;
             }
             match record.kind.as_str() {
-                "published" | "published-v2" | "needs-person" if !attested => {
+                "published" | "published-v2" if !attested => {
                     inert(
                         entry.id,
                         "a custodian's record whose attestation does not verify",
@@ -914,24 +898,6 @@ impl Book {
                         candidate.vault().to_owned(),
                         RefusalClaim::Authenticated(candidate),
                     ));
-                }
-                // The first attested decision names who had not answered; a later one changes
-                // nothing.
-                "needs-person" if thread.needs_person => {}
-                "needs-person" => {
-                    let body = &record.body;
-                    thread.needs_person = true;
-                    thread.unanswered = Unanswered {
-                        hosts: body
-                            .get("unanswered")
-                            .and_then(Value::as_array)
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str)
-                            .map(str::to_owned)
-                            .collect(),
-                        others: body.get("others").and_then(Value::as_u64).unwrap_or(0),
-                    };
                 }
                 "retired" => {
                     let body = &record.body;
@@ -1269,12 +1235,7 @@ pub struct Pass {
     pub inert: Vec<(Digest, String)>,
 }
 
-fn decision_for(
-    thread: &Thread,
-    need: &Need,
-    members: &BTreeSet<Actor>,
-    macs: &Macs,
-) -> Option<Decision> {
+fn decision_for(thread: &Thread, need: &Need) -> Option<Decision> {
     if let Some((retirement, _)) = &thread.retired {
         return Some(Decision::Retired(retirement.clone()));
     }
@@ -1286,25 +1247,7 @@ fn decision_for(
     if thread.version_pending {
         return None;
     }
-    let asked = need.state == State::AwaitingPerson;
-    if thread.needs_person && !asked {
-        return Some(Decision::NeedsPerson(thread.unanswered.clone()));
-    }
-    // An ask that rests on less than the table now shows is restated (`need::decided` takes it
-    // once): the custodian's own decision where this Mac stood in for it, and every member's
-    // sweep where the window's end named some that had not answered and each has since.
-    let rests = |on: fn(&need::Proof) -> bool| need.proof.as_ref().is_some_and(on);
-    if asked && thread.offers.is_empty() {
-        if thread.needs_person && rests(|proof| proof.custodian_silent) {
-            return Some(Decision::NeedsPerson(thread.unanswered.clone()));
-        }
-        if rests(|proof| proof.window_ended) && thread.swept_by_all(members, macs) {
-            return Some(Decision::NeedsPerson(Unanswered::default()));
-        }
-    }
-    let late = asked && !need.late_offer;
-    (!thread.offers.is_empty() && (need.state == State::Open || late))
-        .then(|| Decision::Offered(thread.unanswered.clone()))
+    (!thread.offers.is_empty() && need.state == State::Open).then_some(Decision::Offered)
 }
 
 /// The holder's probe (§7.3): the one compiled path the want resolves to under this Mac's
@@ -1399,14 +1342,7 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                     report.posted += 1;
                     open += 1;
                 }
-                (State::AwaitingPerson, None) if writer && allowed && room && !need.posted => {
-                    let receipt =
-                        request(request_record(&me, need)?)?.commit(session, store, &log)?;
-                    moves.push((need.id, Absorb::Posted(receipt.id.to_vec())));
-                    report.posted += 1;
-                    open += 1;
-                }
-                (State::Open | State::Offered | State::Published | State::AwaitingPerson, None)
+                (State::Open | State::Offered | State::Published, None)
                     if writer && allowed && room && need.posted =>
                 {
                     // Older readers must see the old request end before they encounter
@@ -1437,9 +1373,6 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                 (State::Local, Some(thread)) => {
                     moves.push((need.id, Absorb::Flushed(thread.operation.to_vec())));
                 }
-                (State::AwaitingPerson, Some(thread)) if !need.posted => {
-                    moves.push((need.id, Absorb::Posted(thread.operation.to_vec())));
-                }
                 (State::Fulfilled, Some(thread)) if writer && !thread.ended() => {
                     let mut body = Map::new();
                     body.insert("seq".into(), Value::from(need.seq.unwrap_or(0)));
@@ -1459,12 +1392,8 @@ pub fn pass_at(paths: &Paths, now_ms: u64) -> Result<Pass> {
                         report.answered += 1;
                     }
                 }
-                (
-                    State::Open | State::Offered | State::Published | State::AwaitingPerson,
-                    Some(thread),
-                ) => {
-                    if let Some(decision) = decision_for(thread, need, &context.members, &book.macs)
-                    {
+                (State::Open | State::Offered | State::Published, Some(thread)) => {
+                    if let Some(decision) = decision_for(thread, need) {
                         moves.push((need.id, Absorb::Decided(decision)));
                     } else if matches!(need.state, State::Open | State::Offered)
                         && thread.silence_ended(now_ms)
@@ -1717,8 +1646,6 @@ pub fn give_from(
 pub struct Custodian {
     /// Requests published, with the exact version that carries each.
     pub published: Vec<([u8; 16], RefusalClaim)>,
-    /// Requests handed to a person.
-    pub asked: Vec<[u8; 16]>,
     /// Requests retired, and why.
     pub retired: Vec<([u8; 16], Reason)>,
     /// Requests still waiting, and on whom.
@@ -1734,9 +1661,8 @@ impl Custodian {
     #[must_use]
     pub fn summary(&self) -> String {
         let mut said = format!(
-            "custodian: {} published, {} handed to a person, {} retired, {} waiting",
+            "custodian: {} published, {} retired, {} waiting",
             self.published.len(),
-            self.asked.len(),
             self.retired.len(),
             self.waiting.len()
         );
@@ -1836,8 +1762,6 @@ enum Plan {
         offered: bool,
         offer_window_ended: bool,
         decided: bool,
-        asked: bool,
-        unanswered: Unanswered,
     },
     Retire([u8; 16], Reason, String),
 }
@@ -1846,10 +1770,10 @@ enum Plan {
 /// `None` elsewhere. For each live request the policy decides first, before anything reads
 /// whether the vault holds the entry. A held entry is copied into the requester's own host
 /// section (matched by the recipient its Commons binding names) and published; one the vault
-/// lacks waits for the sweeps or the want window, then goes to a person when one can make it
-/// and is retired `not-held` when none can. Every decision is attested. A copy the draft refuses,
-/// or a publication that fails, is the failure of the requests it carries alone
-/// ([`Custodian::failed`]): the pass's other decisions are committed all the same.
+/// lacks waits for the sweeps or the want window, then is retired `not-held`. Every decision is
+/// attested. A copy the draft refuses, or a publication that fails, is the failure of the
+/// requests it carries alone ([`Custodian::failed`]): the pass's other decisions are committed
+/// all the same.
 ///
 /// # Errors
 /// The table's generation link or this Mac's vault facts cannot be read, the table cannot be
@@ -1913,28 +1837,6 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
             };
             let offer_window_ended = thread.window_ended(now_ms);
             let swept = thread.swept_by_all(&context.members, &book.macs);
-            // A decision the window's end makes names each Mac that had not answered by then,
-            // by the vault host its original actor's binding names, so the requester's words
-            // rest on it.
-            let mut unanswered = Unanswered::default();
-            if !swept && offer_window_ended {
-                let mut hosts = BTreeSet::new();
-                for mac in thread.unheard(&context.members, &book.macs) {
-                    match session
-                        .peer(mac)
-                        .ok()
-                        .and_then(|binding| admin.host_of_recipient(&binding.recipient()))
-                    {
-                        Some(host)
-                            if hosts.contains(&host) || hosts.len() < need::MAX_UNANSWERED =>
-                        {
-                            hosts.insert(host);
-                        }
-                        _ => unanswered.others += 1,
-                    }
-                }
-                unanswered.hosts = hosts.into_iter().collect();
-            }
             plans.push(Plan::Copy {
                 id: thread.id,
                 recipient: binding.recipient(),
@@ -1944,8 +1846,6 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 offered: !thread.offers.is_empty(),
                 offer_window_ended,
                 decided: swept || offer_window_ended,
-                asked: thread.needs_person,
-                unanswered,
             });
         }
         Ok((plans, scope.trust().network))
@@ -1968,8 +1868,6 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                 offered,
                 offer_window_ended,
                 decided,
-                asked,
-                unanswered,
             } => {
                 let source = match copy_source(&admin, &recipient, &want, refused.as_ref()) {
                     Ok(source) => source,
@@ -2024,26 +1922,9 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
                         id,
                         "a holder offered it: the custodian's runtime takes the copy on its next authenticated LAN round".into(),
                     )),
-                    Copied::NotHeld if asked => report.waiting.push((
-                        id,
-                        "awaits a person: aterm secrets set on this Mac, or on the requester, gives it".into(),
-                    )),
                     Copied::NotHeld if !decided => report
                         .waiting
                         .push((id, "waits on the members' sweeps or the want window".into())),
-                    Copied::NotHeld if want.person_sourced() => {
-                        let mut body = Map::new();
-                        body.insert("template".into(), Value::from(if offered { "holder-away" } else { "vault-lacks" }));
-                        if !unanswered.hosts.is_empty() {
-                            let hosts = unanswered.hosts.into_iter().map(Value::from).collect();
-                            body.insert("unanswered".into(), Value::Array(hosts));
-                        }
-                        if unanswered.others > 0 {
-                            body.insert("others".into(), Value::from(unanswered.others));
-                        }
-                        records.push(Record::new("needs-person", &id, body));
-                        report.asked.push(id);
-                    }
                     Copied::NotHeld => {
                         records.push(retired_record(
                             &id,
@@ -2105,101 +1986,6 @@ pub fn custodian_pass_at(paths: &Paths, now_ms: u64) -> Result<Option<Custodian>
         Ok(())
     })?;
     Ok(Some(report))
-}
-
-/// What a decline on the vault's admin Mac did ([`custodian_decline`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Decline {
-    /// This Mac opens no admin custody of the vault now, and why (a Mac that is no admin, or an
-    /// admin whose applied version is changing or incomplete): it declines nothing for the lab.
-    NoCustody(String),
-    /// What the selector named.
-    Named {
-        /// The requests another Mac raised that it declined, each as the table now reads it.
-        declined: Vec<Thread>,
-        /// The ledger ids of this Mac's own needs whose table ids (those `need ls --all`
-        /// prints) the selector names: its ledger declines those.
-        own: Vec<[u8; 16]>,
-    },
-}
-
-/// A person's decline (§6.2), on a Mac that can sign with the vault's current key, of each
-/// request another Mac raised that `selector` names (its want key or its request id) and a
-/// custodian handed to a person: one attested `declined` each, keeping `note`, so a request
-/// whose requester is gone or cannot decline it ends rather than wait for a lapse. Another Mac
-/// is another by the table's reading ([`Macs`]), so a recovered Writer's original actor is this
-/// Mac's own. A published request was given, and this Mac's own are its ledger's to decline, so
-/// they come back by their ledger ids instead.
-///
-/// # Errors
-/// The table's generation link, this Mac's vault facts, its need ledger or the table cannot be
-/// read, the table cannot be written (this Mac is not a current Commons Writer, or its own
-/// history there needs recovery), or a decline cannot be signed or attested.
-pub fn custodian_decline(paths: &Paths, selector: &str, note: &str) -> Result<Decline> {
-    let logical = crate::generation::logical_paths(paths)?;
-    let paths = &logical;
-    let admin = match client::admin_cached(paths) {
-        Ok(admin) => admin,
-        Err(error) => return Ok(Decline::NoCustody(error.to_string())),
-    };
-    let now_ms = now_ms();
-    let facts = facts(paths, now_ms)?;
-    let ledger = need::peek(paths).map_err(crate::table::failure)?;
-    let signer = admin.custodian_signer().map_err(crate::table::failure)?;
-    let retirement = Retirement {
-        reason: Reason::Declined,
-        evidence: "a person on the vault's admin Mac".to_owned(),
-        note: need::note_of(note),
-        generation: None,
-    };
-    with_store(paths, |session, store, scope| {
-        let mut context = context(&facts, session, scope, now_ms)?;
-        context.signer = Some(signer);
-        let log = Log::read_with(session, store, scope, decode)?;
-        let me = session.actor();
-        let book = Book::read(&log, &context);
-        let this_mac = book.macs.of(me);
-        let named: Vec<Thread> = book
-            .threads
-            .into_values()
-            .filter(|thread| {
-                thread.want.key() == selector || hex::encode_lower(&thread.id) == selector
-            })
-            .collect();
-        let own = ledger
-            .iter()
-            .map(|need| need.id)
-            .filter(|id| named.iter().any(|thread| thread.id == request_key(&me, id)))
-            .collect();
-        let mut declined: Vec<Thread> = named
-            .into_iter()
-            .filter(|thread| {
-                book.macs.of(thread.requester) != this_mac
-                    && thread.needs_person
-                    && thread.published.is_none()
-                    && !thread.ended()
-            })
-            .collect();
-        if !declined.is_empty() {
-            session.writer()?;
-            log.writable(me)?;
-            let network = scope.trust().network;
-            let sign =
-                |record: custody::Attested<'_>| admin.attest_credential_record(&network, record);
-            for thread in &mut declined {
-                let record = retired_record(
-                    &thread.id,
-                    retirement.reason,
-                    &retirement.evidence,
-                    &retirement.note,
-                )
-                .attest(&sign)?;
-                commit(session, store, &log, &record)?;
-                thread.retired = Some((retirement.clone(), true));
-            }
-        }
-        Ok(Decline::Named { declined, own })
-    })
 }
 
 #[cfg(test)]

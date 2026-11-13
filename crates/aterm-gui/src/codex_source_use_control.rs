@@ -28,9 +28,10 @@ pub(super) fn error(error: registry::Error) -> String {
         registry::Error::Denied => "ERR codex-auth denied\n".into(),
         registry::Error::Stale => "ERR codex-auth stale\n".into(),
         registry::Error::Unsupported => "ERR codex-auth unsupported\n".into(),
-        // A semantic intent may already exist from an earlier lost reply.
-        // Transport contention never proves that intent was not admitted.
-        registry::Error::Busy | registry::Error::Unavailable => UNAVAILABLE.into(),
+        // Busy preserves the connection; the caller reconciles the same
+        // immutable semantic operation, which may already own native custody.
+        registry::Error::Busy => "ERR codex-auth busy\n".into(),
+        registry::Error::Unavailable => UNAVAILABLE.into(),
     }
 }
 

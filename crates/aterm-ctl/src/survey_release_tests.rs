@@ -197,3 +197,90 @@ fn release_details_escape_terminal_controls_and_fold_with_the_text_budget() {
         assert!(!text.contains('\u{1b}'));
     }
 }
+
+fn holder() -> crate::release_holder::Identity {
+    crate::release_holder::Identity {
+        pid: 53173,
+        boot: "7bb572ebe6e14df3961d8955aaf39a61".into(),
+        start: u64::MAX - 1,
+    }
+}
+
+/// A peer answering as `proven` (the node its handshake proved), with a `release_holder` row
+/// judging the identity it was asked about dead, or no row where `--holder` was not sent.
+fn answering(ask: &FleetAsk<'_>, proven: Option<&str>, unproven: bool) -> FleetRead {
+    let mut lines = vec![format!(
+        "instance pid=2100 node={NODE} host=m3.local version=0.199.0 sessions=0 level=facts at_ms=10"
+    )];
+    lines.extend(ask.holder.map(|holder| holder.row(Some(false))));
+    FleetRead {
+        peers: vec![PeerSurvey {
+            authenticated: proven.map(|node| AuthenticatedPeer {
+                node: node.into(),
+                key: [1; 32],
+            }),
+            label: "m3".into(),
+            answer: Ok(lines),
+            fault: PeerFault::Other,
+            unproven,
+            node: Some(NODE.into()),
+            addr: None,
+            reason: None,
+        }],
+        ..FleetRead::default()
+    }
+}
+
+fn holder_json(fleet: FleetSurveyFn, with_holder: bool) -> Value {
+    let word = holder().word();
+    let mut words = vec!["survey", "--host", NODE, "--json"];
+    if with_holder {
+        words.extend(["--holder", word.as_str()]);
+    }
+    let parts: Vec<String> = words.iter().map(|word| (*word).to_owned()).collect();
+    let printed = read_survey(
+        &parse_args(&parts).unwrap(),
+        Some(fleet),
+        || Ok(vec![]),
+        None,
+    );
+    aterm_json::from_str(printed.out.as_deref().unwrap()).unwrap()
+}
+
+/// `--holder` reaches the peer, and its judgement is shown only from the very node asked,
+/// proven in the handshake.
+/// NEGATIVE CONTROLS: an unproven peer, one proving another node, and a read without
+/// `--holder` show `null`; `--holder` without `--host` or with a malformed identity is refused.
+#[test]
+fn a_holder_judgement_is_shown_only_from_the_proven_node_asked() {
+    fn proven(ask: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
+        Ok(answering(ask, Some(NODE), false))
+    }
+    fn unproven(ask: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
+        Ok(answering(ask, None, true))
+    }
+    fn impostor(ask: &FleetAsk<'_>) -> Result<FleetRead, FleetRefused> {
+        Ok(answering(
+            ask,
+            Some("ffffffffffffffffffffffffffffffff"),
+            false,
+        ))
+    }
+    let shown = holder_json(proven, true);
+    assert_eq!(shown[0]["proven_node"].as_str(), Some(NODE));
+    assert_eq!(shown[0]["release_holder"]["alive"].as_bool(), Some(false));
+    assert!(holder_json(proven, false)[0]["release_holder"].is_null());
+    assert!(holder_json(unproven, true)[0]["release_holder"].is_null());
+    assert!(holder_json(unproven, true)[0]["proven_node"].is_null());
+    assert!(holder_json(impostor, true)[0]["release_holder"].is_null());
+    let word = holder().word();
+    for refused in [
+        vec!["survey", "--holder", word.as_str()],
+        vec!["survey", "--fleet", "--holder", word.as_str()],
+        vec!["survey", "--host", NODE, "--holder", "1.AB.2"],
+        vec!["survey", "--host", NODE, "--holder"],
+    ] {
+        let parts: Vec<String> = refused.iter().map(|word| (*word).to_owned()).collect();
+        assert!(parse_args(&parts).is_err(), "{refused:?}");
+    }
+}

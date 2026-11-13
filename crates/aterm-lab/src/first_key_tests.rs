@@ -51,6 +51,82 @@ fn the_schedule_spreads_each_arm_and_reverses_every_other_round() {
 }
 
 #[test]
+fn a_press_waits_out_the_longer_of_the_quiet_and_its_arm_s_rest() {
+    let arm = |s: &str| Arm::parse(s).unwrap();
+    let min = Duration::from_secs(30);
+    assert_eq!(
+        quiet_for(min, &arm("A=0:1")),
+        min,
+        "an awake arm waits the quiet"
+    );
+    assert_eq!(quiet_for(min, &arm("R=30:1")), Duration::from_secs(31));
+    assert_eq!(
+        quiet_for(min, &arm("R120=120:1")),
+        Duration::from_secs(121),
+        "an arm resting past the state wait's minute is still measured"
+    );
+    assert_eq!(
+        quiet_for(Duration::from_secs(200), &arm("R120=120:1")),
+        Duration::from_secs(200)
+    );
+}
+
+#[test]
+fn the_summary_counts_cold_presents_and_tests_the_present_against_the_base() {
+    let row = |arm: &str, present: f64, idle: f64, cold: u32, wake: u32, pressure: &str| -> Row {
+        [
+            ("arm", arm.to_string()),
+            ("burst", "0".to_string()),
+            ("pressure", pressure.to_string()),
+            ("input_ms", (present - 0.5).to_string()),
+            ("present_ms", present.to_string()),
+            ("max_glass_ms", (present + 10.0).to_string()),
+            ("present_idle_ms", idle.to_string()),
+            ("n_input_cold", cold.to_string()),
+            ("n_rest_wake_key", wake.to_string()),
+            ("present_submit_ms", (present / 10.0).to_string()),
+            ("key_queue_ms", "0.5".to_string()),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    };
+    let rows = [
+        row("A", 1.0, 300.0, 0, 0, "normal"),
+        row("R", 5.0, 2500.0, 1, 1, "normal"),
+        row("A", 2.0, 2000.0, 1, 0, "warn"),
+        row("R", 6.0, 4000.0, 1, 1, "normal"),
+        row("A", 3.0, 300.0, 0, 0, "normal"),
+        row("R", 7.0, 1999.0, 0, 0, "-"),
+        row("A", 4.0, 500.0, 0, 0, "normal"),
+        row("R", 8.0, 2500.0, 0, 1, "critical"),
+    ];
+    let s = summarize(&rows);
+    assert!(
+        s.contains("A  1 of 4 (25.0%)  1  0  0  0.20 / 0.40  0.50"),
+        "an idle of exactly 2000 ms is cold: {s}"
+    );
+    assert!(
+        s.contains("R  3 of 4 (75.0%)  2  1  3  0.60 / 0.80  0.50"),
+        "R's last row is cold by its idle and not by its count: {s}"
+    );
+    assert!(
+        s.contains("A  1  1.50 / 1.50 / 1.50  2.00 / 2.00 / 2.00  3 / 1 / 0 / 0"),
+        "A's one cold key, and its presses by pressure: {s}"
+    );
+    assert!(
+        s.contains("R  2  4.50 / 5.50 / 5.50  5.00 / 6.00 / 6.00  2 / 0 / 1 / 1"),
+        "R's two keys with n_input_cold 1, not its cold-idle row with none: {s}"
+    );
+    assert!(s.contains("present p95 +4.00 ms (95% bootstrap"), "{s}");
+    assert!(s.contains("worst glass p95 +4.00 ms (95% bootstrap"), "{s}");
+    assert!(
+        s.contains("above A's present p95 (4.00 ms): 4 of 4 (100.0%) against 0 of 4"),
+        "{s}"
+    );
+}
+
+#[test]
 fn nearest_rank_quantiles() {
     let v: Vec<f64> = (1..=100).map(f64::from).collect();
     assert_eq!(rank(&v, 0.5), 50.0);

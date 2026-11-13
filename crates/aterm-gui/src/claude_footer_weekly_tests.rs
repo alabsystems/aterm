@@ -4,8 +4,9 @@
 //! THE FOOTER READS ITS OWN TAB'S USAGE TAP: the resolver's weekly figure from this process's own
 //! `rl/<tab>-<pid>.json` beside Claude Code's `/usage` cache, the newer of the two, under the one
 //! age rule (`profile::WeeklyFigure::words`); a reason where there is none (`profile::WeeklyGap`),
-//! a restart promised only where a relaunch would carry the tap; and the accounts store's figures
-//! and walls under the same rule ([`super::store_week`]).
+//! a restart promised only where a relaunch would carry the tap; the accounts store's figures
+//! and walls under the same rule ([`super::store_week`]); and the effort that reading says the
+//! session is set to, over the transcript's ([`super::own_tap_effort`]).
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -295,6 +296,7 @@ fn reading(
         cache_expires_at: None,
         version: None,
         model: None,
+        effort: None,
         ctx_left: None,
         dur_us: 0,
         row: None,
@@ -391,6 +393,96 @@ fn words(text: &str) -> (Option<String>, Option<WeeklyGap>) {
 
 fn none(gap: WeeklyGap) -> (Option<String>, Option<WeeklyGap>) {
     (None, Some(gap))
+}
+
+/// Write the session's transcript as a turn that runs at `medium` leaves it: a main-thread
+/// request sent at that effort and an answer's row that names it, both two minutes before
+/// [`NOW`].
+fn turn_at_medium() {
+    let request = r#"{"type":"api-request","timestamp":"2026-10-15T07:38:00Z","querySource":"repl_main_thread","params":{"model":"claude-opus-5-5","output_config":{"effort":"medium"}}}"#;
+    let answer = r#"{"type":"assistant","timestamp":"2026-10-15T07:38:02Z","effort":"medium","message":{"id":"a1","model":"claude-opus-5-5","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1,"output_tokens":1}}}"#;
+    let path = super::rig::transcript_of(&root(), &records());
+    std::fs::write(path, format!("{request}\n{answer}\n")).unwrap();
+}
+
+/// [`reading`] of [`PID`] whose payload named the effort `level` (none where the build names
+/// none), its file last written `age` seconds before [`NOW`].
+fn reading_at_effort(level: Option<&str>, age: i64) {
+    let pid = PID as u32;
+    reading(pid, NOW - 60, (380, RESET), None, None);
+    let text = std::fs::read_to_string(file(pid)).unwrap();
+    let said = tap::Reading {
+        effort: level.map(str::to_owned),
+        ..tap::Reading::of_json(&text).expect("the reading just written")
+    };
+    std::fs::write(file(pid), said.to_json()).unwrap();
+    let written = std::time::UNIX_EPOCH + std::time::Duration::from_secs((NOW - age) as u64);
+    std::fs::File::options()
+        .write(true)
+        .open(file(pid))
+        .unwrap()
+        .set_modified(written)
+        .unwrap();
+}
+
+/// The effort the footer of [`PID`] names after one read under `asks` at [`NOW`], and whether
+/// it is still open to a launch card.
+fn effort(asks: Asks) -> (Option<String>, bool) {
+    let timeline = tab();
+    reread(&timeline, &mut unread(&records()), asks);
+    let held = timeline.lock().unwrap();
+    let facts = held.claude_footer().expect("a Claude Code footer");
+    (facts.effort.clone(), facts.effort_open)
+}
+
+/// THE FOOTER NAMES THE EFFORT THE SESSION IS SET TO, NOT THE ONE THE TURN'S REQUESTS WENT WITH:
+/// with the session set to High mid-turn, the footer said `medium`. Claude Code 2.1.322 records
+/// an `/effort` typed while a turn runs only once that turn's reply lands, and until then every
+/// request row still says the old level; its status line is handed the new one at once, and the
+/// tap keeps it. So a heard reading's effort stands over the transcript's, decided (no launch
+/// card fills it). The transcript's stands where nothing reported one: a process that carries
+/// no tap, no reading, a reading from a build that names none, and a tap gone silent
+/// ([`tap::SILENT_S`]).
+#[test]
+fn the_footer_names_the_effort_its_own_tap_reports_over_the_turns() {
+    fresh("footer-tap-effort");
+    profile(None);
+    turn_at_medium();
+    let tap_on = asks(tapped, armed);
+    let medium = (Some("medium".to_owned()), false);
+
+    assert_eq!(
+        effort(tap_on),
+        medium,
+        "CONTROL: no reading, the transcript"
+    );
+    reading_at_effort(Some("high"), 4);
+    assert_eq!(
+        effort(tap_on),
+        (Some("high".to_owned()), false),
+        "the level Claude Code reports now, while the turn's rows say medium"
+    );
+    assert_eq!(
+        effort(asks(untapped, armed)),
+        medium,
+        "a process that does not carry the tap reads no tap file"
+    );
+    reading_at_effort(Some("high"), tap::SILENT_S);
+    assert_eq!(
+        effort(tap_on).0.as_deref(),
+        Some("high"),
+        "heard at the bound"
+    );
+    reading_at_effort(Some("high"), tap::SILENT_S + 1);
+    assert_eq!(effort(tap_on), medium, "a tap gone silent says nothing now");
+    reading_at_effort(None, 4);
+    assert_eq!(effort(tap_on), medium, "a build that names no effort");
+    reading_at_effort(Some("ultra"), 4);
+    assert_eq!(
+        effort(tap_on).0.as_deref(),
+        Some("ultra"),
+        "a level this build does not know, as Claude Code spells it"
+    );
 }
 
 #[test]

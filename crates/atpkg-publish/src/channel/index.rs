@@ -1022,6 +1022,79 @@ pub struct Outcome {
     pub plan: Plan,
 }
 
+/// The exact candidate after native publication gates, before the first public
+/// pack or index write. Borrowed observations do not grant publication authority.
+#[derive(Clone, Copy)]
+pub struct PreparedPublication<'a> {
+    public_owner: &'a str,
+    staging_owner: &'a str,
+    request: &'a IndexRequest,
+    base: &'a Base,
+    predecessor: Option<&'a VerifiedQuad>,
+    candidate: &'a VerifiedQuad,
+    plan: &'a Plan,
+}
+
+impl PreparedPublication<'_> {
+    /// Actual native publication destination, not a value from the candidate.
+    #[must_use]
+    pub const fn public_owner(&self) -> &str {
+        self.public_owner
+    }
+
+    /// Actual native staging destination.
+    #[must_use]
+    pub const fn staging_owner(&self) -> &str {
+        self.staging_owner
+    }
+    /// The admitted request; its delta remains bound to this exact candidate.
+    #[must_use]
+    pub const fn request(&self) -> &IndexRequest {
+        self.request
+    }
+
+    /// The verified predecessor's parsed baseline.
+    #[must_use]
+    pub const fn base(&self) -> &Base {
+        self.base
+    }
+
+    /// Exact predecessor files, absent only for an admitted first publication.
+    #[must_use]
+    pub const fn predecessor(&self) -> Option<&VerifiedQuad> {
+        self.predecessor
+    }
+
+    /// The signed candidate whose bytes the publisher will send.
+    #[must_use]
+    pub const fn candidate(&self) -> &VerifiedQuad {
+        self.candidate
+    }
+
+    /// The candidate's native plan.
+    #[must_use]
+    pub const fn plan(&self) -> &Plan {
+        self.plan
+    }
+}
+
+/// A controller's durable retention point. Failure prevents public writes;
+/// success neither bypasses native gates nor replaces public readback.
+pub trait PublicationObserver {
+    /// Retain the candidate and predecessor before attempting publication.
+    /// # Errors
+    /// A failed or ambiguous retention must stop publication.
+    fn before_publish(&mut self, prepared: &PreparedPublication<'_>) -> Result<()>;
+}
+
+struct NoObserver;
+
+impl PublicationObserver for NoObserver {
+    fn before_publish(&mut self, _prepared: &PreparedPublication<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+
 fn within(e: Error, what: &str) -> Error {
     match e {
         Error::Refused(m) => Error::Refused(format!("{what}: {m}")),
@@ -1039,42 +1112,21 @@ fn within(e: Error, what: &str) -> Error {
 /// # Errors
 /// Every refusal the plan, the self-check, the triple gate, the mirror or the compare-and-swap raises; nothing is published after one.
 pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<Outcome> {
+    publish_with_observer(ctx, request, log, &mut NoObserver)
+}
+
+/// Publish through the normal native gates with a controller-owned durable
+/// retention point before any public pack/index mutation.
+/// # Errors
+/// Every normal publication refusal, retention failure or changed candidate.
+pub fn publish_with_observer(
+    ctx: &Ctx,
+    request: &IndexRequest,
+    log: &mut Log,
+    observer: &mut dyn PublicationObserver,
+) -> Result<Outcome> {
     let out = &request.out;
-    if ctx.anchor.is_empty() {
-        return Err(Error::refused(
-            "pins::PAPER_MASTER_PUBKEYS is EMPTY — this build trusts no paper master, so \
-             nothing it signs could be verified by any client built from it (arm it with \
-             `atpkg-keys setup --id <id>` on the first machine)",
-        ));
-    }
-    if request.upload && !gh_serves(ctx, HostRole::Channel) {
-        let slug = ctx.index_slug();
-        ctx.hosts.channel.write_preflight(&slug).map_err(|e| {
-            Error::refused(format!(
-                "--upload needs the public owner's writer on {slug}: {e} — the index and the \
-                 packs it pins are published to {}",
-                ctx.accounts.public
-            ))
-        })?;
-    } else if request.upload {
-        match ctx.usable_token(&ctx.tokens.channel) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(Error::refused(format!(
-                    "--upload needs the public owner's token at {} — the index and the packs it \
-                     pins are published to {}",
-                    ctx.shown(&ctx.tokens.channel),
-                    ctx.accounts.public
-                )));
-            }
-            Err(why) => {
-                return Err(Error::refused(format!(
-                    "--upload needs the public owner's token at {}: {why}",
-                    ctx.shown(&ctx.tokens.channel),
-                )));
-            }
-        }
-    }
+    publication_preflight(ctx, request.upload)?;
     let head_dir = Scratch::new("head")?;
 
     let (base, head) = read_baseline(ctx, request, head_dir.path(), log)?;
@@ -1165,30 +1217,200 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
         ))
     })?;
     let new = write_quad(ctx, &plan, &roster, &signer.key, out, log)?;
-    for (def, b) in alab_pins(&plan) {
-        if let Err(e) = crate::artifact::package::verify_pinned(
+    if let Err(error) = qualify_candidate(ctx, request, &base, &plan, &new, log) {
+        for file in QUAD_FILES {
+            let _ = std::fs::remove_file(out.join(file));
+        }
+        return Err(error);
+    }
+    if request.upload {
+        publish_quad(
             ctx,
-            &new,
-            def,
-            b,
-            request.pack_dir.as_deref(),
+            &PreparedPublication {
+                public_owner: &ctx.accounts.public,
+                staging_owner: &ctx.accounts.staging,
+                request,
+                base: &base,
+                predecessor: head.as_ref(),
+                candidate: &new,
+                plan: &plan,
+            },
             log,
-        ) {
-            for f in QUAD_FILES {
-                let _ = std::fs::remove_file(out.join(f));
-            }
-            return Err(within(
-                e,
-                &format!(
-                    "REFUSING to pin {}@{b}: its pack does not verify as a client stages it — \
-                     the signed quad was removed from {}, nothing was published",
-                    def.name,
-                    ctx.shown(out)
-                ),
+            observer,
+        )?;
+    } else {
+        log.say("DRY RUN — nothing published (--upload publishes)");
+    }
+    Ok(Outcome {
+        published: Published {
+            index_build: plan.index_build,
+            dir: out.clone(),
+            uploaded: request.upload,
+        },
+        plan,
+    })
+}
+
+/// Repeat native publication admission for exact retained bytes. This never
+/// signs a new candidate or advances beyond the retained index number.
+pub(crate) fn resume_exact(
+    ctx: &Ctx,
+    request: &IndexRequest,
+    predecessor: &Path,
+    log: &mut Log,
+    observer: &mut dyn PublicationObserver,
+) -> Result<Outcome> {
+    if !request.upload || request.pack_dir.is_some() {
+        return Err(Error::refused(
+            "retained publication requires native public uploads",
+        ));
+    }
+    publication_preflight(ctx, true)?;
+    let _lock = aterm_update_core::FileLock::acquire_within(
+        &request.out.join(".atpkg-publish.lock"),
+        Duration::ZERO,
+    )
+    .map_err(|error| Error::refused(format!("retained candidate is in use: {error}")))?;
+    let candidate = quad::verify_dir(ctx, &request.out)?;
+    let previous = quad::verify_dir_with(ctx, predecessor, Freshness::Ignore)?;
+    let base = Base::of_head(&previous)?;
+    let plan = plan(
+        &base,
+        &request.delta,
+        candidate
+            .index
+            .machine_id
+            .as_deref()
+            .ok_or_else(|| Error::refused("candidate names no signer"))?,
+        candidate
+            .index
+            .roster_seq
+            .ok_or_else(|| Error::refused("candidate names no roster"))?,
+        &candidate.index.valid_until,
+        log,
+    )?;
+    let expected: aterm_toml::Value = render(&plan)
+        .parse()
+        .map_err(|error| Error::refused(format!("decode retained plan: {error}")))?;
+    let actual: aterm_toml::Value =
+        crate::identity::read_regular_text(&candidate.file(QUAD_FILES[0]), MANIFEST_CAP)
+            .map_err(|error| Error::io("read retained plan", &error))?
+            .parse()
+            .map_err(|error| Error::refused(format!("decode retained index: {error}")))?;
+    if actual != expected {
+        return Err(Error::refused(
+            "retained candidate differs from the native publication plan",
+        ));
+    }
+    let live = Scratch::new("retained-live-head")?;
+    let (number, head) =
+        quad::fetch_head_with(ctx, &ctx.index_slug(), live.path(), Freshness::Ignore)?;
+    if number == previous.index.index_build {
+        if quad_digests(&head)? != quad_digests(&previous)? {
+            return Err(Error::refused(
+                "the retained predecessor differs from the public head",
             ));
         }
+    } else if number == candidate.index.index_build {
+        if quad_digests(&head)? != quad_digests(&candidate)? {
+            return Err(Error::refused(
+                "another candidate owns the retained index number",
+            ));
+        }
+    } else {
+        return Err(Error::refused(format!(
+            "public head {number} supersedes or does not follow this retained attempt; refusing to repin it"
+        )));
     }
+    // Compare all public predecessor files, rather than trusting only its tag
+    // or a successful HEAD. The normal triple gate still runs below.
+    confirm_public_quad(ctx, &previous)?;
+    qualify_candidate(ctx, request, &base, &plan, &candidate, log)?;
+    publish_quad(
+        ctx,
+        &PreparedPublication {
+            public_owner: &ctx.accounts.public,
+            staging_owner: &ctx.accounts.staging,
+            request,
+            base: &base,
+            predecessor: Some(&previous),
+            candidate: &candidate,
+            plan: &plan,
+        },
+        log,
+        observer,
+    )?;
+    Ok(Outcome {
+        published: Published {
+            index_build: plan.index_build,
+            dir: request.out.clone(),
+            uploaded: true,
+        },
+        plan,
+    })
+}
 
+fn publication_preflight(ctx: &Ctx, upload: bool) -> Result<()> {
+    if ctx.anchor.is_empty() {
+        return Err(Error::refused(
+            "pins::PAPER_MASTER_PUBKEYS is EMPTY — this build trusts no paper master, so \
+             nothing it signs could be verified by any client built from it (arm it with \
+             `atpkg-keys setup --id <id>` on the first machine)",
+        ));
+    }
+    if upload && !gh_serves(ctx, HostRole::Channel) {
+        let slug = ctx.index_slug();
+        ctx.hosts.channel.write_preflight(&slug).map_err(|e| {
+            Error::refused(format!(
+                "--upload needs the public owner's writer on {slug}: {e} — the index and the \
+                 packs it pins are published to {}",
+                ctx.accounts.public
+            ))
+        })?;
+    } else if upload {
+        match ctx.usable_token(&ctx.tokens.channel) {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Error::refused(format!(
+                    "--upload needs the public owner's token at {} — the index and the packs it \
+                     pins are published to {}",
+                    ctx.shown(&ctx.tokens.channel),
+                    ctx.accounts.public
+                )));
+            }
+            Err(why) => {
+                return Err(Error::refused(format!(
+                    "--upload needs the public owner's token at {}: {why}",
+                    ctx.shown(&ctx.tokens.channel),
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn qualify_candidate(
+    ctx: &Ctx,
+    request: &IndexRequest,
+    base: &Base,
+    plan: &Plan,
+    candidate: &VerifiedQuad,
+    log: &mut Log,
+) -> Result<()> {
+    for (def, build) in alab_pins(plan) {
+        crate::artifact::package::verify_pinned(
+            ctx,
+            candidate,
+            def,
+            build,
+            request.pack_dir.as_deref(),
+            log,
+        )
+        .map_err(|error| within(error, &format!(
+            "REFUSING to pin {}@{build}: its pack does not verify as a client stages it — nothing was published",
+            def.name,
+        )))?;
+    }
     if request.upload {
         let mut trust_builds = BTreeSet::new();
         if let Some(build) = request.delta.pins.get("trust")
@@ -1204,20 +1426,10 @@ pub fn publish_with(ctx: &Ctx, request: &IndexRequest, log: &mut Log) -> Result<
             }
         }
         for build in trust_builds {
-            crate::canary::verify_pinned(ctx, &new, build)?;
+            crate::canary::verify_pinned(ctx, candidate, build)?;
         }
-        publish_quad(ctx, request, &base, head.as_ref(), &new, &plan, log)?;
-    } else {
-        log.say("DRY RUN — nothing published (--upload publishes)");
     }
-    Ok(Outcome {
-        published: Published {
-            index_build: plan.index_build,
-            dir: out.clone(),
-            uploaded: request.upload,
-        },
-        plan,
-    })
+    Ok(())
 }
 
 /// Read the verified baseline without touching the output. The caller owns `head_dir`
@@ -1328,13 +1540,18 @@ fn write_quad(
 /// compare-and-swap and the final anonymous download-host confirmation.
 fn publish_quad(
     ctx: &Ctx,
-    request: &IndexRequest,
-    base: &Base,
-    head: Option<&VerifiedQuad>,
-    new: &VerifiedQuad,
-    plan: &Plan,
+    prepared: &PreparedPublication<'_>,
     log: &mut Log,
+    observer: &mut dyn PublicationObserver,
 ) -> Result<()> {
+    let PreparedPublication {
+        request,
+        base,
+        predecessor: head,
+        candidate: new,
+        plan,
+        ..
+    } = *prepared;
     let out = &request.out;
     let slug = ctx.index_slug();
     let tag = index_tag(plan.index_build);
@@ -1365,6 +1582,14 @@ fn publish_quad(
     if let Some(h) = head {
         triple_gate(ctx, plan, h, new, &request.delta.triple_drops, out, log)?;
     }
+    let before = quad_digests(new)?;
+    let predecessor = head.map(quad_digests).transpose()?;
+    observer.before_publish(prepared)?;
+    if quad_digests(new)? != before || head.map(quad_digests).transpose()? != predecessor {
+        return Err(Error::refused(
+            "the signed candidate or predecessor changed during publication retention",
+        ));
+    }
     mirror::mirror(ctx, new, &MirrorOptions::publish(), log).map_err(|e| {
         within(
             e,
@@ -1386,6 +1611,22 @@ fn publish_quad(
     Ok(())
 }
 
+/// Digests of the exact signed quad files in the client's wire order.
+/// # Errors
+/// An unreadable file; missing data is never an empty digest.
+pub fn quad_digests(quad: &VerifiedQuad) -> Result<[String; 4]> {
+    quad_digests_at(&quad.dir)
+}
+
+fn quad_digests_at(root: &Path) -> Result<[String; 4]> {
+    let [index, signature, roster, roster_signature] = QUAD_FILES.map(|name| {
+        crate::identity::read_regular_bytes(&root.join(name), MANIFEST_CAP)
+            .map(|bytes| atpkg::sha256_bytes(&bytes))
+            .map_err(|error| Error::io(format!("hash retained {name}"), &error))
+    });
+    Ok([index?, signature?, roster?, roster_signature?])
+}
+
 /// Confirm the bytes that clients can fetch, rather than a HEAD response that
 /// may disagree with GET. `new` has already passed the normal signature chain;
 /// exact equality closes this readback without repeating cryptographic checks.
@@ -1397,15 +1638,16 @@ fn confirm_public_quad(ctx: &Ctx, new: &VerifiedQuad) -> Result<()> {
         let expected = crate::identity::read_regular_bytes(&new.file(name), MANIFEST_CAP)
             .map_err(|e| Error::io(format!("read committed {name}"), &e))?;
         let path = scratch.path().join(name);
-        match ctx
-            .hosts
-            .channel
-            .fetch_public(&slug, &tag, name, &path, expected.len() as u64)
-        {
+        let channel = &*ctx.hosts.channel;
+        match super::await_written(channel, || {
+            channel.fetch_public(&slug, &tag, name, &path, expected.len() as u64)
+        }) {
             Probe::Present => {}
             Probe::Absent => {
                 return Err(Error::cannot_run(format!(
-                    "the anonymous download route does not yet serve {tag}/{name}"
+                    "the anonymous download route does not yet serve {tag}/{name} after {} \
+                     reads",
+                    super::SETTLE_READS
                 )));
             }
             Probe::Unknown(why) => {
@@ -1427,13 +1669,14 @@ fn confirm_public_quad(ctx: &Ctx, new: &VerifiedQuad) -> Result<()> {
 
 /// The release notes every index release carries: what it is, first, because these tags
 /// interleave with the app's.
-fn notes(plan: &Plan) -> String {
+fn notes(plan: &Plan, candidate: &str) -> String {
     format!(
         "Machine-readable package index for the aterm toolchain — not an app release. For \
          aterm itself, use the latest vX.Y.0 release.\n\nMachine-signed atpkg index (channel \
          {}, valid_until {}), published with the master-signed machine roster that authorizes \
          it (roster_seq {}, signed by machine {}). Authenticity is the Ed25519 chain from the \
-         paper master — the host is never an authenticity input.",
+         paper master — the host is never an authenticity input.\n\n\
+         atpkg-index-candidate-sha256: {candidate}",
         plan.channel.name, plan.valid_until, plan.roster_seq, plan.machine_id
     )
 }
@@ -1446,13 +1689,15 @@ pub fn compare_and_swap(ctx: &Ctx, plan: &Plan, out: &Path, log: &mut Log) -> Re
     let host = &*ctx.hosts.channel;
     let tag = index_tag(plan.index_build);
     let files: Vec<PathBuf> = QUAD_FILES.iter().map(|f| out.join(f)).collect();
+    let candidate = atpkg::sha256_bytes(quad_digests_at(out)?.join(":").as_bytes());
+    let notes = notes(plan, &candidate);
     let existing = match host.release(&slug, &tag) {
         Err(HostError::NotFound) => {
             host.create(
                 &slug,
                 &tag,
                 &format!("atpkg index {}", plan.index_build),
-                &notes(plan),
+                &notes,
                 &files,
             )
             .map_err(|e| {
@@ -1484,6 +1729,27 @@ pub fn compare_and_swap(ctx: &Ctx, plan: &Plan, out: &Path, log: &mut Log) -> Re
         ""
     };
     if !existing.assets.iter().any(|a| a == QUAD_FILES[0]) {
+        if existing.draft
+            && host
+                .complete_created(
+                    &slug,
+                    &tag,
+                    &format!("atpkg index {}", plan.index_build),
+                    &notes,
+                    &files,
+                )
+                .map_err(|error| {
+                    host_error(
+                        format!("recovering the native create intent for {tag}"),
+                        &error,
+                    )
+                })?
+        {
+            log.say(format!(
+                "{tag}: completed the original native create intent with its exact candidate"
+            ));
+            return Ok(());
+        }
         return Err(Error::refused(format!(
             "{tag} exists on {slug} without an index.toml — a release mid-upload, or \
              half-created; never clobbered. Look at it before re-running.{draft_note}"

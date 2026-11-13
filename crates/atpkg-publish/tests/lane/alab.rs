@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use atpkg_publish::api::Build;
+use atpkg_publish::api::{Build, Delta};
 use atpkg_publish::ctx::Ctx;
 use atpkg_publish::error::{Error, Result};
 use atpkg_publish::lane::LaneKind;
@@ -15,7 +15,7 @@ use atpkg_publish::lane::alab::{self, Decision, Deps, Options, Outcome, Row};
 use atpkg_publish::lane::gap::PinCommit;
 use atpkg_publish::lane::report::Transcript;
 use atpkg_publish::lane::state::LaneState;
-use atpkg_publish::triple::{AARCH64_APPLE_DARWIN as ARM, X86_64_APPLE_DARWIN as X86};
+use atpkg_publish::triple::{AARCH64_APPLE_DARWIN as ARM, Triple, X86_64_APPLE_DARWIN as X86};
 
 use super::super::shared::{Made, made_once, scratch};
 use super::fixture::{self, Fx, Held, Release, git};
@@ -493,6 +493,7 @@ fn a_staging_owner_that_cannot_be_read_is_never_read_as_absent() {
         }),
         staging: alab::Staging::Unknown("alabsystems unreachable".into()),
         latched: false,
+        public_on: std::collections::BTreeSet::new(),
     };
     assert_eq!(
         alab::decide(&facts),
@@ -808,7 +809,10 @@ fn a_finished_run_leaves_no_start_stamp_for_the_next_lock_holder_to_be_read_as()
 
 #[test]
 fn a_signing_run_needs_the_key_and_both_token_files() {
-    let w = World::new("alab-preflight");
+    // The `gh` arm's token check, said outright; under agh both writers are asked instead
+    // (`under_agh::a_signing_run_asks_both_writers_under_agh`).
+    let mut w = World::new("alab-preflight");
+    w.fx.use_gh();
     std::fs::remove_file(&w.fx.ctx.tokens.staging).expect("rm token");
     let (r, _) = w.run(false);
     let e = r.expect_err("no staging token");
@@ -1371,7 +1375,6 @@ mod under_agh {
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
 
-    use atpkg_publish::ctx::HostChoice;
     use atpkg_publish::error::Error;
     use atpkg_publish::host::fake::{FakeFail, FakeHost, FakeOp};
     use atpkg_publish::host::{HostError, Hosts, Probe, Release, ReleaseHost, Replace, Slug};
@@ -1476,9 +1479,7 @@ mod under_agh {
     #[test]
     fn a_signing_run_asks_both_writers_under_agh() {
         let w = World::new("alab-writers");
-        std::fs::remove_file(&w.fx.ctx.tokens.channel).expect("rm token");
-        std::fs::remove_file(&w.fx.ctx.tokens.staging).expect("rm token");
-        let mut ctx = w.fx.ctx.clone().with_host_choice(HostChoice::Agh);
+        let mut ctx = w.fx.ctx.clone();
         let channel = ctx.index_slug();
         let staging = ctx.staging_slug(atpkg::manifest::INDEX_REPO);
 
@@ -1538,4 +1539,143 @@ mod under_agh {
         ok(w.run_as(&ctx, true));
         assert_eq!(asked(&w.fx.host), before, "a dry run asks no writer");
     }
+}
+
+/// Index `n` over [`World::new`]'s pins with ay's `pin` at `ay`, and `overlay` added as one
+/// Apple target's `pin_by_target` cells.
+fn head_with_overlay(w: &World, n: u64, ay: u64, target: Triple, overlay: &[(&str, u64)]) {
+    let mut text = w.fx.index_text(
+        n,
+        &[
+            ("ay", ay),
+            ("nn", 2),
+            ("trust-ir", 1),
+            ("trust", 5),
+            ("trust-mc", 4),
+            ("claude", 2_026_090_101),
+        ],
+    );
+    text.push_str(&format!("\n[channels.pin_by_target.{target}]\n"));
+    for (p, b) in overlay {
+        text.push_str(&format!("{p} = {b}\n"));
+    }
+    w.fx.publish_index_text(n, &text);
+}
+
+fn last_delta(w: &World) -> Delta {
+    w.fx.indexer
+        .requests
+        .lock()
+        .expect("requests")
+        .last()
+        .expect("an index was asked for")
+        .delta
+        .clone()
+}
+
+#[test]
+fn an_apple_silicon_overlay_ahead_of_the_release_is_normal_and_the_release_moves_the_rest() {
+    let w = World::new("alab-overlay-ahead");
+    head_with_overlay(&w, 6, 2, ARM, &[("ay", 9)]);
+    let (o, tx) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with("PACK: v0.2.0 (build 3) > pin 2"),
+        "the lowest target decides: {}",
+        rendered(&o, "ay")
+    );
+    assert_eq!(o.published, Some(7), "{}", tx.text());
+    let delta = last_delta(&w);
+    assert_eq!(delta.pins, BTreeMap::from([("ay".to_string(), 3)]));
+    assert!(
+        delta.retire_target.is_empty() && delta.target_pins.is_empty(),
+        "the overlay ahead is carried untouched: {delta:?}"
+    );
+    let floors = std::fs::read_to_string(&w.state().pins_seen).expect("floors");
+    for line in [
+        "ay 3",
+        "ay@aarch64-apple-darwin 9",
+        "ay@x86_64-apple-darwin 3",
+    ] {
+        assert!(floors.lines().any(|l| l == line), "{line}: {floors}");
+    }
+}
+
+#[test]
+fn an_overlay_the_release_passes_is_retired_with_the_pin_it_follows() {
+    let w = World::new("alab-overlay-behind");
+    head_with_overlay(&w, 6, 2, X86, &[("ay", 1)]);
+    let (o, _) = ok(w.run(false));
+    assert!(
+        rendered(&o, "ay").starts_with("PACK: v0.2.0 (build 3) > pin 1"),
+        "{}",
+        rendered(&o, "ay")
+    );
+    let delta = last_delta(&w);
+    assert_eq!(delta.pins, BTreeMap::from([("ay".to_string(), 3)]));
+    assert_eq!(
+        delta.retire_target.into_iter().collect::<Vec<_>>(),
+        [(X86, Some("ay".to_string()))]
+    );
+}
+
+#[test]
+fn a_release_already_public_on_one_target_is_never_repacked_for_the_other() {
+    let w = World::new("alab-overlay-public");
+    head_with_overlay(&w, 6, 2, ARM, &[("ay", 3)]);
+    let (o, _) = ok(w.run(false));
+    let ay = rendered(&o, "ay");
+    assert!(
+        ay.starts_with("SKIP: build 3 is already public on aarch64-apple-darwin"),
+        "{ay}"
+    );
+    assert!(
+        !w.fx.packer.legs().iter().any(|(p, _, _)| p == "ay"),
+        "a published pack never gains rows: {:?}",
+        w.fx.packer.legs()
+    );
+}
+
+#[test]
+fn a_lowered_overlay_is_a_pin_downgrade() {
+    let w = World::new("alab-overlay-down");
+    head_with_overlay(&w, 6, 2, ARM, &[("ay", 9)]);
+    ok(w.run(false));
+    head_with_overlay(&w, 8, 3, ARM, &[("ay", 8)]);
+    let (r, _) = w.run(false);
+    let e = r.expect_err("a lowered overlay refuses");
+    assert!(
+        e.to_string()
+            .contains("PIN DOWNGRADE on the channel: ay@aarch64-apple-darwin 9 -> 8"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_pin_ahead_of_the_build_raises_only_the_overlays_below_it() {
+    let channel = atpkg::Channel {
+        name: "stable".into(),
+        channel_build: 1,
+        min_build: 0,
+        min_build_by_program: BTreeMap::new(),
+        yanked: Vec::new(),
+        pin: BTreeMap::from([("ay".to_string(), 10)]),
+        pin_by_target: BTreeMap::from([
+            (
+                X86.as_str().to_string(),
+                BTreeMap::from([("ay".to_string(), 4)]),
+            ),
+            (
+                ARM.as_str().to_string(),
+                BTreeMap::from([("ay".to_string(), 7)]),
+            ),
+        ]),
+    };
+    let mut delta = Delta::default();
+    alab::move_pin(&channel, &mut delta, "ay", 6);
+    assert!(delta.pins.is_empty(), "pin 10 is ahead of 6: {delta:?}");
+    assert!(delta.retire_target.is_empty(), "{delta:?}");
+    assert_eq!(
+        delta.target_pins,
+        BTreeMap::from([(X86, BTreeMap::from([("ay".to_string(), 6)]))])
+    );
 }

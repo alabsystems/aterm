@@ -131,7 +131,6 @@ fn mailbox_cli_parser_handles_flags_and_rejects_unknown_args() {
             "m22-1",
             "--mailbox",
             "/tmp/ai-mailbox.toml",
-            "--record",
             "--aterm",
             "/tmp/aterm",
             "--keep"
@@ -142,7 +141,6 @@ fn mailbox_cli_parser_handles_flags_and_rejects_unknown_args() {
             email: Some("a@example.com".into()),
             label: Some("m22-1".into()),
             mailbox: Some("/tmp/ai-mailbox.toml".into()),
-            record: true,
             aterm: Some("/tmp/aterm".into()),
             keep: true,
         }

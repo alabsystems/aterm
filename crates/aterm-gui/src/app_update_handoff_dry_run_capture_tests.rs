@@ -678,7 +678,6 @@ fn a_park_carries_a_lone_workers_list_only_for_a_target_that_declares_it() {
 #[cfg(target_os = "macos")]
 #[test]
 fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
-    use std::os::fd::FromRawFd as _;
     const LAUNCHD_SOFT_NOFILE: u64 = 256;
     const SESSIONS: u64 = 63;
     const WINDOW_BASE_NOFILE: u64 = 30;
@@ -696,23 +695,8 @@ fn a_launchd_limited_producer_makes_room_to_park_a_chunked_desk() {
         usize::try_from(SESSIONS).expect("a count"),
         "PRECONDITION"
     );
-    let wake_pipes: Vec<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> = (0..SESSIONS)
-        .map(|_| {
-            let mut fds = [-1i32; 2];
-            // SAFETY: a valid two-slot out-array for pipe(2).
-            assert_eq!(
-                unsafe { libc::pipe(fds.as_mut_ptr()) },
-                0,
-                "PRECONDITION: the desk fits"
-            );
-            // SAFETY: pipe(2) returned two fresh descriptors owned here.
-            unsafe {
-                (
-                    std::os::fd::OwnedFd::from_raw_fd(fds[0]),
-                    std::os::fd::OwnedFd::from_raw_fd(fds[1]),
-                )
-            }
-        })
+    let wake_pipes: Vec<(std::io::PipeReader, std::io::PipeWriter)> = (0..SESSIONS)
+        .map(|_| aterm_uds::pipe().expect("PRECONDITION: the desk fits"))
         .collect();
     let headroom = LAUNCHD_SOFT_NOFILE - WINDOW_BASE_NOFILE - 3 * SESSIONS;
     let listed: Vec<i32> = std::fs::read_dir("/dev/fd")

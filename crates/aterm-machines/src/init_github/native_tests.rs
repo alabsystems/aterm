@@ -143,8 +143,9 @@ fn a_captured_local_blocker_is_not_reread_after_capture() {
     )
     .unwrap();
     assert_eq!(Reading::of(stage(&rows)), Some(Reading::Waits(Wait::Token)));
-    // The vault this Mac reads holds no GitHub token: only a person puts one there.
-    assert_eq!(stage(&rows).outcome, crate::model::Outcome::Person);
+    // The vault this Mac reads holds no GitHub token: a blocked operation, never a person's
+    // step.
+    assert_eq!(stage(&rows).outcome, crate::model::Outcome::Blocked);
     assert!(!sys.calls().iter().any(|call| call.contains(" agh GET ")));
 }
 
@@ -239,7 +240,7 @@ fn required_dependencies_wait_for_managed_git_and_preserve_dirty_work() {
         .stat_of(child.join(".git").to_str().unwrap(), stat(false, 0o600));
     required_repository(&sys, &item.user, "parent", &["vendor/library"]);
     existing(&sys, &item.user, &child, "library", PIN);
-    // The Command Line Tools' git is one before 2.44 that ignores GIT_NO_LAZY_FETCH.
+    // The Command Line Tools' git is one before 2.45 that ignores GIT_NO_LAZY_FETCH.
     sys.simulate(|sys, command| {
         (command.program == Path::new(crate::items::github::CLT_GIT))
             .then(|| crate::init_github::git_before_no_lazy_fetch(sys, command, false))
@@ -900,7 +901,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
             || {
                 let current = captured
                     .snapshot
-                    .is_current_now(&fixture.paths)
+                    .is_current(&fixture.paths)
                     .map_err(|why| why.to_string())?;
                 checked.set(Some(current));
                 Ok(current)
@@ -1007,6 +1008,200 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
         aterm_secrets::need::peek(&cold.paths).unwrap()[0].id,
         first_id
     );
+
+    // Withdrawal during the final vault wait must be seen before recording a need.
+    // The second caller check holds the final selection read; the third caller
+    // check can itself wait. Neither wait preserves the earlier local intent.
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let withdraw = |sys: &Fake, who: &User, caller: &AtomicBool, changed: &str| match changed {
+        "stop" => {
+            sys.stop_now();
+        }
+        "profile" => {
+            let path = Path::new(&who.home).join(".config/aterm/init.toml");
+            let bytes = b"[github]\nenabled=false\n";
+            sys.file(path.to_str().unwrap(), bytes).stat_of(
+                path.to_str().unwrap(),
+                Stat {
+                    len: bytes.len() as u64,
+                    ..stat(false, 0o600)
+                },
+            );
+        }
+        "account" => {
+            let mut other = who.clone();
+            other.name = "another-account".into();
+            sys.logged_in(&other);
+        }
+        "caller" => {
+            caller.store(true, Ordering::SeqCst);
+        }
+        _ => {}
+    };
+    for (wait_at, changed) in [
+        (2, "none"),
+        (2, "stop"),
+        (2, "profile"),
+        (2, "account"),
+        (2, "caller"),
+        (3, "none"),
+        (3, "stop"),
+        (3, "profile"),
+        (3, "account"),
+    ] {
+        let fixture = readback_fixture(true);
+        let inventory_only = fixture
+            .source_text
+            .lines()
+            .filter(|line| !line.starts_with("gh_access_token="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        aterm_uds::atomic_file::write(&fixture.source, inventory_only.as_bytes(), 0o600).unwrap();
+        client::sync(&fixture.paths, None).unwrap();
+        fixture.sys.remove(&fixture.token).unwrap();
+        aterm_secrets::need::test_alab_policy(&fixture.paths);
+        let selected = super::super::RepositorySelection::capture(&fixture.sys, &fixture.ctx)
+            .unwrap()
+            .unwrap();
+        assert_eq!(selected.count(), 1);
+        let snapshot = client::with_materialization_ready(
+            &fixture.paths,
+            &client::config(&fixture.paths).unwrap().unwrap(),
+            || Ok(()),
+        )
+        .unwrap()
+        .unwrap()
+        .snapshot;
+        let ledger = fixture.paths.dir.join(aterm_secrets::need::LEDGER);
+        let before = std::fs::read(&ledger).ok();
+        let sys = Arc::new(fixture.sys);
+        let waiting_sys = Arc::clone(&sys);
+        let who = fixture.who.clone();
+        let writer = Arc::new(Mutex::new(None));
+        let waiting_writer = Arc::clone(&writer);
+        let withdrawn = Arc::new(AtomicBool::new(false));
+        let waiting_withdrawn = Arc::clone(&withdrawn);
+        let checks = AtomicUsize::new(0);
+        let (raised, waited) = client::test_while_state_lock_held(
+            move || {
+                withdraw(&waiting_sys, &who, &waiting_withdrawn, changed);
+                drop(waiting_writer.lock().unwrap().take());
+            },
+            || {
+                selected.request_credential(
+                    sys.as_ref(),
+                    &|| {
+                        if withdrawn.load(Ordering::SeqCst) {
+                            return Err("the caller withdrew repository setup".into());
+                        }
+                        if checks.fetch_add(1, Ordering::SeqCst) + 1 == wait_at {
+                            *writer.lock().unwrap() =
+                                Some(client::test_hold_state_lock(&fixture.paths).unwrap());
+                            if wait_at == 3
+                                && !snapshot
+                                    .is_current(&fixture.paths)
+                                    .map_err(|why| why.to_string())?
+                            {
+                                return Err("the caller's captured vault changed".into());
+                            }
+                        }
+                        Ok(())
+                    },
+                    &|| {
+                        if withdrawn.load(Ordering::SeqCst) {
+                            Err("the caller withdrew repository setup".into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+            },
+        );
+        drop(writer.lock().unwrap().take());
+        assert!(
+            waited > 0,
+            "{changed}: the final admission met the real writer"
+        );
+        if changed == "none" {
+            assert!(raised.unwrap());
+            assert_eq!(aterm_secrets::need::peek(&fixture.paths).unwrap().len(), 1);
+        } else {
+            assert!(raised.is_err(), "{changed}");
+            assert_eq!(
+                std::fs::read(&ledger).ok(),
+                before,
+                "{changed}: no withdrawn request is recorded"
+            );
+        }
+    }
+
+    // A different writer can hold the need ledger after every vault check passed.
+    // Begin the request while with_ledger holds that real lock, then withdraw only
+    // after the request's pre-lock admission has observed the original choice.
+    for changed in ["none", "stop", "profile", "account", "caller"] {
+        let fixture = readback_fixture(true);
+        let inventory_only = fixture
+            .source_text
+            .lines()
+            .filter(|line| !line.starts_with("gh_access_token="))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        aterm_uds::atomic_file::write(&fixture.source, inventory_only.as_bytes(), 0o600).unwrap();
+        client::sync(&fixture.paths, None).unwrap();
+        fixture.sys.remove(&fixture.token).unwrap();
+        aterm_secrets::need::test_alab_policy(&fixture.paths);
+        let selected = super::super::RepositorySelection::capture(&fixture.sys, &fixture.ctx)
+            .unwrap()
+            .unwrap();
+        let ledger = fixture.paths.dir.join(aterm_secrets::need::LEDGER);
+        let before = std::fs::read(&ledger).ok();
+        let withdrawn = AtomicBool::new(false);
+        let (go, begin) = std::sync::mpsc::channel();
+        let (seen, admission) = std::sync::mpsc::channel();
+        let (locked, raised) = std::thread::scope(|scope| {
+            let selected = &selected;
+            let sys = &fixture.sys;
+            let withdrawn = &withdrawn;
+            let worker = scope.spawn(move || {
+                begin.recv().map_err(|why| why.to_string())?;
+                let told = AtomicBool::new(false);
+                selected.request_credential(sys, &|| Ok(()), &|| {
+                    if withdrawn.load(Ordering::SeqCst) {
+                        return Err("the caller withdrew repository setup".into());
+                    }
+                    if !told.swap(true, Ordering::SeqCst) {
+                        seen.send(()).map_err(|why| why.to_string())?;
+                    }
+                    Ok(())
+                })
+            });
+            let locked = aterm_secrets::need::with_ledger(&fixture.paths, |_, _| {
+                go.send(())
+                    .map_err(|why| aterm_secrets::Error::new(why.to_string()))?;
+                let seen = admission.recv_timeout(std::time::Duration::from_secs(60));
+                if seen.is_ok() {
+                    withdraw(&fixture.sys, &fixture.who, withdrawn, changed);
+                }
+                Ok(seen)
+            });
+            drop(go);
+            (locked, worker.join().unwrap())
+        });
+        locked.unwrap().unwrap();
+        if changed == "none" {
+            assert!(raised.unwrap());
+            assert_eq!(aterm_secrets::need::peek(&fixture.paths).unwrap().len(), 1);
+        } else {
+            assert!(raised.is_err(), "{changed}");
+            assert_eq!(
+                std::fs::read(&ledger).ok(),
+                before,
+                "{changed}: ledger wait cannot retain withdrawn admission"
+            );
+        }
+    }
 
     // Ordinary materialization supplies the credential before this need was published.
     // Successful paired consumption retires that unnecessary request; it proves neither
@@ -1490,7 +1685,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
                 checked.set(true);
                 captured
                     .snapshot
-                    .is_current_now(&fixture.paths)
+                    .is_current(&fixture.paths)
                     .map_err(|why| why.to_string())
             },
             None,
@@ -1516,11 +1711,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
             mode,
             RepositoryWork::Repair,
             captured.inputs.clone(),
-            Box::new(move || {
-                snapshot
-                    .is_current_now(&paths)
-                    .map_err(|why| why.to_string())
-            }),
+            Box::new(move || snapshot.is_current(&paths).map_err(|why| why.to_string())),
         )
         .unwrap();
         assert_eq!(stage(&rows).outcome, crate::model::Outcome::NotApplicable);
@@ -1559,7 +1750,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
             || {
                 captured
                     .snapshot
-                    .is_current_now(&fixture.paths)
+                    .is_current(&fixture.paths)
                     .map_err(|why| why.to_string())
             },
             None,
@@ -2011,7 +2202,7 @@ fn a_ready_vault_preserves_missing_git_and_hold_dispositions_in_captured_readbac
     changed.set_entry(&audience, "unrelated", b"newer").unwrap();
     client::admin_publish(&rejected.paths, &admin, &changed).unwrap();
     client::sync(&rejected.paths, None).unwrap();
-    assert!(captured.snapshot.is_current_now(&rejected.paths).unwrap());
+    assert!(captured.snapshot.is_current(&rejected.paths).unwrap());
     assert!(
         aterm_secrets::need::raise_refused_from_snapshot(
             &rejected.paths,
@@ -2705,7 +2896,7 @@ fn captured_repository_readback_at_the_console_reads_no_workstation_census() {
         || {
             captured
                 .snapshot
-                .is_current_now(&fixture.paths)
+                .is_current(&fixture.paths)
                 .map_err(|why| why.to_string())
         },
         None,
@@ -2773,6 +2964,9 @@ fn captured_automatic_readiness_fences_unlocked_helper_work_with_one_scoped_vaul
                 // Acquiring the actual writer lock proves the helper runs outside it.
                 let writer = client::test_hold_state_lock(&paths).unwrap();
                 if changed == "writer" {
+                    // A vault pass that changes nothing (the subscriber's over an unchanged
+                    // long-poll answer) holds the lock past the helper, until an observation
+                    // after it meets the pass and waits on it.
                     *retain.lock().unwrap() = Some(writer);
                 } else {
                     drop(writer);
@@ -2798,29 +2992,37 @@ fn captured_automatic_readiness_fences_unlocked_helper_work_with_one_scoped_vaul
             None
         });
         let state = aterm_tempfile::tempdir().unwrap();
-        let owed = crate::init::owed_clone_captured(
-            &sys,
-            state.path(),
-            &Holds::NONE,
-            captured.inputs,
+        let (owed, waited) = client::test_while_state_lock_held(
+            move || drop(held.lock().unwrap().take()),
             || {
-                captured
-                    .snapshot
-                    .is_current_now(&final_paths)
-                    .map_err(|why| why.to_string())
+                crate::init::owed_clone_captured(
+                    &sys,
+                    state.path(),
+                    &Holds::NONE,
+                    captured.inputs,
+                    || {
+                        captured
+                            .snapshot
+                            .is_current(&final_paths)
+                            .map_err(|why| why.to_string())
+                    },
+                    None,
+                    aterm_secrets::converge::RepositoryWork::Repair,
+                )
             },
-            None,
-            aterm_secrets::converge::RepositoryWork::Repair,
-        )
-        .unwrap();
+        );
+        let owed = owed.unwrap();
+        // The pass that changed nothing was waited out and the vault read as it is: no change,
+        // where an observation that took the busy lock as its answer would read "writer" as a
+        // vault still syncing (`Waiting`).
+        let unchanged = matches!(changed, "none" | "unrelated" | "writer");
         assert_eq!(
             matches!(owed, OwedClone::Verified { .. }),
-            matches!(changed, "none" | "unrelated"),
+            unchanged,
             "{changed}: {owed:?}"
         );
-        assert!(matches!(changed, "none" | "unrelated") || matches!(owed, OwedClone::Waiting(_)));
-        // A held writer remains held until after the nonwaiting final observation.
-        drop(held.lock().unwrap().take());
+        assert!(unchanged || matches!(owed, OwedClone::Waiting(_)));
+        assert_eq!(waited > 0, changed == "writer", "{changed}: {waited} waits");
         assert_eq!(
             sys.calls()
                 .iter()
@@ -3608,8 +3810,8 @@ fn every_blocked_step_says_why_in_system_states_words() {
         // The pass System State's reading runs: a plan.
         let context = crate::items::defaults::tests::ctx(std::slice::from_ref(&item.user));
         let rows = run(&sys, &context, Mode::Plan).unwrap();
-        // Only a person ends a wait for their sign-in, settings or folder: their step, which
-        // parks a run (design §3.6); GitHub not answering ends by itself.
+        // Only a person ends a wait for their settings or folder: their step, which parks a
+        // run (design §3.6). A token wait or GitHub not answering is a blocked operation.
         let person = wait.is_some_and(|wait| wait.kind() == FailureKind::NeedsPerson);
         let (outcome, standing) = if person {
             (crate::model::Outcome::Person, Standing::NeedsYou)
@@ -4222,11 +4424,11 @@ fn names(prefix: &str, count: usize) -> Vec<String> {
 /// storage replacement and offline failures stop queued work without moving it, and so
 /// does a checkout made a partial clone after its first read (`late partial`): the
 /// storage is read again before the fetch. Its reads of the remote's tip before that never
-/// fetch it lazily, where git honours `GIT_NO_LAZY_FETCH` (2.44 and later, and the May 2024
+/// fetch it lazily, where git honours `GIT_NO_LAZY_FETCH` (2.45 and later, and the May 2024
 /// security releases from 2.39.4 on, which distributions carry to older versions): no
 /// promisor pack appears, though origin is reachable (its URL rewritten to the local origin).
 /// The fake models this host and selects its native git, which the real runs use.
-/// A git before 2.44, which refuses `--no-lazy-fetch` (a stand-in over that git, so on
+/// A git before 2.45, which refuses `--no-lazy-fetch` (a stand-in over that git, so on
 /// every host), refreshes a clean checkout alike: nothing the refresh runs carries the
 /// option, and it leaves a partial clone, the one git could fetch lazily in, as it is.
 /// NEGATIVE CONTROLS: the stand-in does refuse the option, and a refresh that read storage
@@ -4552,7 +4754,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
             && !call.contains(" clean ")
             && !call.contains(" stash ")));
     }
-    // A git before 2.44 as git 2.43 is one: `--no-lazy-fetch` is an unknown option (129).
+    // A git before 2.45 as git 2.43 is one: `--no-lazy-fetch` is an unknown option (129).
     let scratch = aterm_tempfile::tempdir().unwrap();
     let old_git = scratch.path().join("old-git");
     aterm_tempfile::stand_in(
@@ -4572,7 +4774,7 @@ fn default_apply_refreshes_a_clean_checkout_beyond_its_cached_origin() {
     assert_eq!(
         refused.status,
         Some(129),
-        "control: the stand-in is a git before 2.44"
+        "control: the stand-in is a git before 2.45"
     );
     for case in [
         "clean",
@@ -6002,13 +6204,12 @@ fn init_s_default_stage_without_a_token_is_not_applicable_and_asks_nothing() {
         other => panic!("{other:?}"),
     }
     // So does an init.toml `[github]` account's step, whose token file is not there yet
-    // (with the distribution's git there, so the step reaches the token).
+    // (with the distribution's git there, so the step reaches the token): a blocked
+    // operation, never a person's step.
     linux.executable(crate::items::github::SYSTEM_GIT, b"synthetic git");
     match item(&bare.user, None, false, RepositoryWork::Refresh, None, None).probe(&linux, &context)
     {
-        Probe::Person { how, .. } => {
-            assert!(how.contains("is not on this machine yet"), "{how}");
-        }
+        Probe::Blocked { why } => assert!(why.contains("is not on this machine yet"), "{why}"),
         other => panic!("{other:?}"),
     }
 }

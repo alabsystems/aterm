@@ -10,7 +10,7 @@
 //! - [`shim_target`]: what the `targo` shim's hop runs in a locked tree, the build the lock names
 //!   in place of the one the shim was laid for, so plain `targo` and verify compile with one
 //!   compiler, and an index that flips `current` changes no locked tree's build.
-//! - [`shim_answer`]: whether this Mac's shim does that, for verify to say when it does not.
+//! - [`shim_answer`]: whether this machine's shim does that, for verify to say when it does not.
 //!
 //! Every resolution marks the build ([`mark_locked`]), and gc keeps a build marked within
 //! [`LOCKED_KEEP`] whether or not it is `current` (`gc.rs`).
@@ -93,17 +93,39 @@ pub fn fold_and_record(build_dir: &Path) -> std::io::Result<Option<String>> {
 
 /// THE LOCK A TOOLCHAIN IS DISCOVERED FOR in a tree at or above `start` ([`find`]), made ready for
 /// discovery's pure read (`aterm_toolchain::discovery`): a build the store at `prefix` holds
-/// unrecorded is folded and recorded ([`standing`]), and a build that stands is marked
-/// ([`mark_locked`]) so gc keeps it. `None` when the tree has no lock.
+/// unrecorded is folded and recorded ([`standing`]), a build that stands is marked
+/// ([`mark_locked`]) so gc keeps it, and one that does not carries why no published install of
+/// it serves this machine, when the store's signed manifests say so ([`unpublished_in`]). `None`
+/// when the tree has no lock.
 #[must_use]
 pub fn found_for(start: &Path, prefix: Option<&Path>) -> Option<Found> {
-    let found = find(start)?;
-    if let (Ok(lock), Some(prefix)) = (&found.lock, prefix)
-        && matches!(standing(prefix, lock), LockedBuild::Present { .. })
-    {
-        let _ = mark_locked(prefix, lock.build);
+    let mut found = find(start)?;
+    if let (Ok(lock), Some(prefix)) = (&found.lock, prefix) {
+        if matches!(standing(prefix, lock), LockedBuild::Present { .. }) {
+            let _ = mark_locked(prefix, lock.build);
+        } else {
+            found.unpublished = unpublished_in(prefix, lock);
+        }
     }
     Some(found)
+}
+
+/// Why no published install of `lock`'s build can satisfy it on this machine's target, under
+/// the last index the store at `prefix` verified and the manifests it holds
+/// ([`crate::serving::lock_unpublished`]): `None` when one can, or nothing is known.
+#[must_use]
+pub fn unpublished_in(prefix: &Path, lock: &TrustLock) -> Option<String> {
+    let layout = crate::store::Layout {
+        prefix: prefix.to_path_buf(),
+    };
+    let index = crate::cli::cached_index(&layout)?;
+    crate::serving::lock_unpublished(
+        &layout,
+        &index,
+        lock.build,
+        &lock.tree_root,
+        crate::cli::current_triple(),
+    )
 }
 
 /// The prefix, build and route of a shim's baked target: `<prefix>/store/trust/<build>/bin/<tool>`,
@@ -136,17 +158,31 @@ fn baked_build(baked: &Path) -> Option<(PathBuf, u64, bool)> {
 /// tool of the build the lock names (through its exec root when the shim was routed through one
 /// and that build has one). A locked build the store lacks is installed first by `install`
 /// ([`install_named`] in the hop) into the store at the shim's prefix, as rustup installs the
-/// toolchain a `rust-toolchain.toml` names.
+/// toolchain a `rust-toolchain.toml` names, unless the store's signed manifests say no published
+/// install of it serves this machine ([`unpublished_in`]), which is refused with the local build
+/// that does instead.
 ///
 /// # Errors
-/// A lock that does not read, an install that fails, or a build the store does not hold as the
-/// lock names it: the build is refused rather than run on another compiler.
+/// A lock that does not read, an install that fails or cannot serve this machine, or a build the
+/// store does not hold as the lock names it: the build is refused rather than run on another
+/// compiler.
 pub fn shim_target(
     baked: &Path,
     cwd: &Path,
     install: &mut dyn FnMut(&Path, &TrustLock) -> Result<(), String>,
 ) -> Result<Option<PathBuf>, String> {
-    let Some(found) = find(cwd) else {
+    shim_target_with(baked, cwd, &unpublished_in, install)
+}
+
+/// [`shim_target`] with the store's word on whether the lock's build is published for this
+/// machine read through `unpublished` (`prefix`, lock).
+fn shim_target_with(
+    baked: &Path,
+    cwd: &Path,
+    unpublished: &dyn Fn(&Path, &TrustLock) -> Option<String>,
+    install: &mut dyn FnMut(&Path, &TrustLock) -> Result<(), String>,
+) -> Result<Option<PathBuf>, String> {
+    let Some(mut found) = find(cwd) else {
         return Ok(None);
     };
     let Some((prefix, build, routed)) = baked_build(baked) else {
@@ -171,11 +207,14 @@ pub fn shim_target(
         .ok()
     });
     let mut stands = standing(&prefix, lock);
-    if stands == LockedBuild::Absent {
+    if !matches!(stands, LockedBuild::Present { .. }) {
+        found.unpublished = unpublished(&prefix, lock);
+    }
+    if stands == LockedBuild::Absent && found.unpublished.is_none() {
         install(&prefix, lock).map_err(|why| {
             format!(
-                "{} names Trust build {}, which this Mac's store does not hold, and its install \
-                 failed: {why}",
+                "{} names Trust build {}, which this machine's store does not hold, and its \
+                 install failed: {why}",
                 found.path.display(),
                 lock.build
             )
@@ -184,7 +223,13 @@ pub fn shim_target(
     }
     let bin = match stands {
         LockedBuild::Present { bin } => bin,
-        other => return Err(other.refusal(&found, lock).unwrap_or_default()),
+        // The hop reads no TRUST_STAGE2_BIN: only a dev link, whose shim it passes through
+        // ([`baked_build`]), puts a local build in the lock's place here.
+        other => {
+            return Err(other
+                .refusal(&found, lock, LOCAL_SYSROOT_REMEDY)
+                .unwrap_or_default());
+        }
     };
     let _ = mark_locked(&prefix, lock.build);
     if build == lock.build {
@@ -303,7 +348,7 @@ pub fn helper_honours_lock(helper: &Path) -> bool {
     )
 }
 
-/// What plain `targo` runs on this Mac in a locked tree ([`shim_answer`]).
+/// What plain `targo` runs on this machine in a locked tree ([`shim_answer`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ShimAnswer {
     /// The shim hops through an atpkg that runs the lock's build.
@@ -370,8 +415,8 @@ pub fn shim_mismatch(
     }
     Some(format!(
         "plain `targo` resolves {} (the build its shim was laid for, {}); {} names {} and this \
-         run compiles with {}: plain builds and verify alternate units until this Mac's aterm \
-         runs locked builds through its shim",
+         run compiles with {}: plain builds and verify alternate units until this machine's \
+         aterm runs locked builds through its shim",
         build.map_or_else(|| "another build".to_string(), |b| b.to_string()),
         target.display(),
         found.path.display(),

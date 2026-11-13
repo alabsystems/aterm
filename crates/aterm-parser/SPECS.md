@@ -120,6 +120,7 @@ src/tests/csi.rs	csi_fast_path_clears_aborted_param_scratch_matching_per_byte	ad
 src/tests/csi.rs	csi_fast_path_trailing_empty_colon_subparam_matches_per_byte	advance-fast-chunk-invariance	csi-dispatch-denotation
 src/tests/csi.rs	parameter_digits_saturate_and_finalize_clamps	param-accumulator	
 src/tests/csi.rs	add_param_digit_saturates_and_finalize_param_clamps	param-accumulator	
+src/tests/csi.rs	inline_csi_and_esc_fast_paths_match_per_byte_state_machine	advance-fast-chunk-invariance	csi-dispatch-denotation, vt-ground-and-esc-basics
 src/tests/subparams.rs	parse_csi_colon_subparams	csi-dispatch-denotation	
 src/tests/subparams.rs	parse_csi_mixed_colon_semicolon	csi-dispatch-denotation	
 src/tests/subparams.rs	parse_csi_no_colon_no_subparams	csi-dispatch-denotation	

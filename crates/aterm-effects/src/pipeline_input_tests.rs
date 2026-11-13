@@ -45,12 +45,9 @@ impl Host {
             true,
             0x0050_FA7B,
         );
-        // The tall ribbon body, a shape no built-in theme picks: this test's negative control
-        // (a space routed as a plain glyph draws differently) holds in it and did not hold in
-        // the `rainbow` theme's underline.
-        let request = pipeline.glow_request.as_mut().expect("a glow request");
-        request.spelling.ribbon_tall = true;
-        pipeline.resolve_glow();
+        // The `rainbow` theme's tall body: this test's negative control (a space routed as a
+        // plain glyph draws differently) holds in it and did not hold in the underline body.
+        assert!(pipeline.glow_cfg.ribbon_tall);
         let mut term = Terminal::new(8, 80);
         term.set_default_background(aterm_core::terminal::Rgb {
             r: 12,

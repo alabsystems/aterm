@@ -333,7 +333,10 @@ fn a_sign_out_into_an_unreachable_session_clicks_nothing() {
         (SessionReach::KeysInUse, None, 1),
         (SessionReach::Locked, None, 0),
         (SessionReach::KeysInUse, Some("Claude Code"), 0),
-        (SessionReach::Open, Some("Claude Code"), 1),
+        // An agent's run clicks nothing even into an open session: the sign-out is the
+        // person's to start (owner ruling 2026-11-09,
+        // `a_sign_out_in_an_agents_run_asks_and_clicks_nothing`).
+        (SessionReach::Open, Some("Claude Code"), 0),
     ] {
         let (mut sys, ctx, item) = fixture();
         sys.tty = true;
@@ -348,7 +351,12 @@ fn a_sign_out_into_an_unreachable_session_clicks_nothing() {
             clicked,
             "{reach:?} at a terminal under {agent:?}"
         );
-        if clicked == 0 {
+        if agent.is_some() {
+            assert_eq!(
+                item.stood_aside(),
+                Some(aterm_converge::StoodAside::Waiting(agents_run()))
+            );
+        } else if clicked == 0 {
             assert!(looks_again(&report_of(&item)), "{:?}", item.stood_aside());
         }
     }
@@ -461,6 +469,33 @@ fn the_aterm_window_walks_the_runs_accessibility_ask() {
     signed_in_for(&sys, &item, 2);
     let _ = engine::run(&[Box::new(item)], Mode::Apply, &sys, &ctx, &mut NoJournal);
     assert_eq!((count(&sys, "ax-walk"), count(&sys, "ax-request")), (1, 1));
+}
+
+/// A RUN IN A TAB BEHIND BRINGS NOTHING UP: the window's desk door refused the walk, so the
+/// sign-out asks macOS for no dialog in its place, brings no app forward and stands aside
+/// for the person. NEGATIVE CONTROL: with no window to walk it, macOS is asked
+/// (`the_aterm_window_walks_the_runs_accessibility_ask`).
+#[test]
+fn a_walk_the_desk_door_refused_raises_no_macos_dialog_and_no_app() {
+    let (mut sys, ctx, item) = fixture();
+    sys.tty = true;
+    sys.walks = AccessibilityWalk::Behind;
+    sys.trusts(&[false]);
+    item.apply(&sys, &ctx)
+        .expect("standing aside is no failure");
+    assert_eq!(
+        item.stood_aside(),
+        Some(aterm_converge::StoodAside::Waiting(tab_behind()))
+    );
+    assert_eq!(count(&sys, "ax-walk"), 1);
+    assert_eq!(count(&sys, "ax-request"), 0, "{:?}", sys.calls());
+    assert!(
+        sys.calls()
+            .iter()
+            .all(|c| !c.contains(OPEN) && !c.contains(AUTOMATION_ASK)),
+        "{:?}",
+        sys.calls()
+    );
 }
 
 /// The window's answer holds macOS's own dialog back. The owner's Not now on the walk's
@@ -938,4 +973,37 @@ fn every_sign_out_click_follows_a_frontmost_check_and_nothing_is_typed() {
     for at in clicks {
         assert_eq!(lines[at - 1], "my mustBeFront(appName)", "{}", lines[at]);
     }
+}
+
+/// AN AGENT'S RUN PUTS NOTHING ON THE SCREEN (owner ruling 2026-11-09): a sign-out reached
+/// by a run a coding agent started asks macOS nothing (no Accessibility read or walk, no
+/// Automation question), brings no app forward and clicks nothing, with a person at the
+/// screen or not; it stands aside in words that say whose run it was. NEGATIVE CONTROL: the
+/// same Mac with no agent above the run signs out.
+#[test]
+fn a_sign_out_in_an_agents_run_asks_and_clicks_nothing() {
+    let (mut sys, ctx, item) = fixture();
+    sys.agent = Some("claude");
+    sys.trusts(&[true]);
+    clicks(&sys, &item, "sign-out-requested");
+    signed_in_for(&sys, &item, 1);
+    item.apply(&sys, &ctx)
+        .expect("standing aside is no failure");
+    assert_eq!(
+        sys.calls(),
+        Vec::<String>::new(),
+        "an agent's run starts nothing for a sign-out"
+    );
+    assert_eq!(
+        item.stood_aside(),
+        Some(aterm_converge::StoodAside::Waiting(agents_run()))
+    );
+    // CONTROL: the person's own run clicks.
+    let (sys, ctx, item) = fixture();
+    sys.trusts(&[true]);
+    clicks(&sys, &item, "sign-out-requested");
+    signed_in_for(&sys, &item, 1);
+    item.apply(&sys, &ctx).expect("signed out");
+    assert_eq!(count(&sys, &clicking(&item)), 1, "{:?}", sys.calls());
+    assert_eq!(item.stood_aside(), None);
 }

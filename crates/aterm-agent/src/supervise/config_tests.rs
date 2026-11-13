@@ -7,32 +7,6 @@ fn read(text: &str) -> SupervisorConfig {
     SupervisorConfig::from_aterm_toml(text).0
 }
 
-/// A `[harness.gemini]` table, Gemini CLI's before it was retired, sets nothing and is
-/// refused by a note that names agy as its replacement; agy's own table is still read.
-/// NEGATIVE CONTROL: `[harness.agy] enabled = false` switches agy off.
-#[test]
-fn a_retired_agents_table_is_refused_with_its_replacement_named() {
-    for text in [
-        "[harness.gemini]\nenabled = false\n",
-        "[harness]\ngemini.enabled = false\n",
-    ] {
-        let (cfg, notes) = SupervisorConfig::from_aterm_toml(text);
-        assert_eq!(cfg, SupervisorConfig::default(), "{text}: nothing set");
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.starts_with("harness.gemini") && n.contains("agy replaces it")),
-            "{text}: {notes:?}"
-        );
-    }
-    let agy = read("[harness.agy]\nenabled = false\n");
-    assert_ne!(
-        agy,
-        SupervisorConfig::default(),
-        "the control: agy's table is read"
-    );
-}
-
 #[test]
 fn the_autocompact_offer_key_reads_a_size_or_off() {
     let full = SupervisorConfig::default();

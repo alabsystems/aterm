@@ -668,6 +668,19 @@ struct AsksRead {
     damaged: Option<Vec<u8>>,
 }
 
+/// Whether `now` is ANOTHER LOG than `was`, every record on it landed after anything read on
+/// `was`: both named, under different ids, and told with a lineage, so by a broker that mints a
+/// fresh id only for a log that holds no record (`logid::settle`). The same id that continues
+/// nothing (a restored or shortened copy, a move older than the lineage's window) or a log told
+/// without lineage (an older broker) may still hold earlier records, and is not.
+pub(crate) fn another_log(
+    was: Option<astream_broker::LogIdentity>,
+    now: Option<astream_broker::LogIdentity>,
+    lineage: Option<&astream_broker::Lineage>,
+) -> bool {
+    lineage.is_some() && matches!((was, now), (Some(was), Some(now)) if was.id != now.id)
+}
+
 /// The reservations a moved generation resets ([`StateDir::publication_offset_resets`]).
 #[derive(Debug)]
 struct OffsetResets {
@@ -738,6 +751,10 @@ pub struct StateDir {
     adopt_without_the_attach: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     keep_earlier_boot_reservations: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    skip_publication_resets: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    pin_head_gone_on_another_log: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool,
     #[cfg(test)]
@@ -1633,6 +1650,10 @@ impl StateDir {
             #[cfg(test)]
             keep_earlier_boot_reservations: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
+            skip_publication_resets: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            pin_head_gone_on_another_log: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
             lease_names_no_boot_off_the_boot_volume: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             keep_acked_across_its_replace: std::sync::atomic::AtomicBool::new(false),
@@ -1701,6 +1722,24 @@ impl StateDir {
     #[cfg(test)]
     pub(crate) fn keep_earlier_boot_reservations(&self, on: bool) {
         self.keep_earlier_boot_reservations
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a drop of another log's offsets that leaves each key file and
+    /// post pin naming the old log's offsets
+    /// ([`crate::sim::world::Mutant::ForgetPinResetsOnAnotherLog`]).
+    #[cfg(test)]
+    pub(crate) fn skip_publication_resets(&self, on: bool) {
+        self.skip_publication_resets
+            .store(on, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// The negative control of a pin's head on another log, which takes the head out as every
+    /// build before ATERM-KI-1111-4 did, so the pin's retry reads nothing back
+    /// ([`crate::sim::world::Mutant::PinHeadGoneOnAnotherLog`]).
+    #[cfg(test)]
+    pub(crate) fn pin_head_gone_on_another_log(&self, on: bool) {
+        self.pin_head_gone_on_another_log
             .store(on, std::sync::atomic::Ordering::SeqCst);
     }
 
@@ -3346,6 +3385,53 @@ impl StateDir {
         Ok(pin.clone())
     }
 
+    /// WHERE AN ATTACH'S REPLAY LANDED A KEY'S WINNER (ATERM-KI-1111-4): the key of `sid`'s
+    /// whose pin is `seq` and names `identity` its winner, and whose winner's offset the new log
+    /// does not vouch for (a move past the fork, or another log, took it out:
+    /// [`StateDir::publication_offset_resets`]), is told the replay's `off`. The key's next
+    /// re-post reads its winner back there (`Bridge::keyed_winner_at`): past a cut that carried
+    /// the record and dropped its dedup key, a re-post published at the pin unread lands a
+    /// second copy of its key (the lossy-log sim's seed 216 of the keyed world). A key another
+    /// post won since, or one whose offset stands, is left as it is.
+    ///
+    /// # Errors
+    /// Reading or rewriting `keys/<sid>`.
+    pub(crate) fn land_key_winner(
+        &self,
+        sid: &str,
+        seq: u64,
+        identity: &PublishIdentity,
+        off: u64,
+    ) -> io::Result<bool> {
+        let Some(text) = self.read_reservation(&format!("keys/{sid}"))? else {
+            return Ok(false);
+        };
+        let mut changed = false;
+        let mut lines = Vec::new();
+        for line in text.lines() {
+            if line.trim().is_empty() {
+                lines.push(line.to_string());
+                continue;
+            }
+            let (key, mut pin) = key_line(line)?;
+            if !changed
+                && pin.seq == seq
+                && pin.identity.as_ref() == Some(identity)
+                && pin.original_off.is_none()
+            {
+                pin.original_off = Some(off);
+                changed = true;
+                lines.push(format!("{key} {}", pin.render()));
+            } else {
+                lines.push(line.to_string());
+            }
+        }
+        if changed {
+            self.write(&format!("keys/{sid}"), &lines.join("\n"))?;
+        }
+        Ok(changed)
+    }
+
     /// Reconcile a retained key to the bytes actually found/appended, before retiring the post.
     pub(crate) fn reconcile_key(
         &self,
@@ -3394,20 +3480,40 @@ impl StateDir {
 
     /// What a moved generation resets in the reservations: each `original-off` the new log does
     /// not vouch for (at or above `keep_below`, or any where it is `None`), taken out; and each
-    /// head ([`PublishPin::at`]) past where the new log continues the old, brought down to it, or
-    /// taken out where it continues none (aterm-link B05 review): a head is an offset of the log
-    /// the pin was made on, and past the fork the new log's offsets name records published
-    /// since, a copy a retry published there among them, so its read back starts at the fork;
-    /// on another log it bounds nothing, and the pin is published again as before.
-    fn publication_offset_resets(&self, keep_below: Option<u64>) -> io::Result<OffsetResets> {
+    /// head ([`PublishPin::at`]) past where the new log continues the old, brought down to it,
+    /// brought to the log's start on `another_log`, and taken out where the log continues none
+    /// and is not another (aterm-link B05 review; ATERM-KI-1111-4). A head is an offset of the
+    /// log the pin was made on, and past the fork the new log's offsets name records published
+    /// since, a copy a retry published there among them, so its read back starts at the fork.
+    /// ANOTHER LOG is one under another id, told with its lineage ([`another_log`]): every
+    /// record on it landed after the pin was made, so its read back starts at 0. Taken out
+    /// there, the retry read nothing back, and an attempt the attach's replay published on the
+    /// new log, its answer unknown (a poisoned broker's), its dedup key cut, was published a
+    /// second time (the lossy-log sim's seed 2201). A log that keeps its id and continues
+    /// nothing (a restored or shortened copy, a move older than the lineage's window) or whose
+    /// lineage is unknown may still hold records from before the pin, and a read back from 0
+    /// would settle the pin on an earlier identical record and never publish it, so its head is
+    /// taken out and the retry publishes unread, as before.
+    fn publication_offset_resets(
+        &self,
+        keep_below: Option<u64>,
+        another_log: bool,
+    ) -> io::Result<OffsetResets> {
+        #[cfg(test)]
+        let head_gone = self
+            .pin_head_gone_on_another_log
+            .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let head_gone = false;
+        let fork = keep_below.or((another_log && !head_gone).then_some(0));
         let reset = |pin: &mut PublishPin| -> bool {
             let stale = pin
                 .original_off
                 .is_some_and(|off| keep_below.is_none_or(|f| off >= f));
             let off_reset = stale && pin.original_off.take().is_some();
-            let past = pin.at.is_some_and(|at| keep_below.is_none_or(|f| at > f));
+            let past = pin.at.is_some_and(|at| fork.is_none_or(|f| at > f));
             if past {
-                pin.at = keep_below;
+                pin.at = fork;
             }
             off_reset || past
         };
@@ -5393,10 +5499,11 @@ impl StateDir {
         }
     }
 
-    /// Forget every offset this dir holds that the log this node reads now does not vouch for ([`LogWitness::replaced_by`]), and put each back where a reader of this log, whose head is `head`, resumes.
+    /// Forget every offset this dir holds that the log this node reads now does not vouch for ([`LogWitness::replaced_by`]), and put each back where a reader of this log, whose head is `head`, resumes. `was` is the log those offsets were read on, where known.
     pub fn forget_log_offsets(
         &self,
         head: u64,
+        was: Option<astream_broker::LogIdentity>,
         log: Option<astream_broker::LogIdentity>,
         keep_below: Option<u64>,
         lineage: Option<&astream_broker::Lineage>,
@@ -5471,10 +5578,24 @@ impl StateDir {
                 .collect();
             topics.push((sid.to_string(), rebased));
         }
+        #[cfg(test)]
+        let skip_resets = keep_below.is_none()
+            && self
+                .skip_publication_resets
+                .load(std::sync::atomic::Ordering::SeqCst);
+        #[cfg(not(test))]
+        let skip_resets = false;
         let OffsetResets {
             keys: key_resets,
             posts: post_resets,
-        } = self.publication_offset_resets(keep_below)?;
+        } = if skip_resets {
+            OffsetResets {
+                keys: Vec::new(),
+                posts: Vec::new(),
+            }
+        } else {
+            self.publication_offset_resets(keep_below, another_log(was, log, lineage))?
+        };
         let in_flight = self.in_flight()?;
         let owed = self.owed_entries();
         for path in seen_removed.into_iter().chain(unhandled_removed) {

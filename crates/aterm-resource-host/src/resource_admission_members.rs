@@ -48,6 +48,7 @@ pub(in super::super) struct Authorization {
     pub metadata: bool,
     pub resolver: bool,
     pub workload_query: Option<trust_resource_controller::workload::host::CompilerQuery>,
+    pub native_job_query: Option<trust_resource_controller::native_job::query::CompilerQuery>,
     pub linker: Option<trust_resource_controller::linker::Request>,
     pub program: Vec<u8>,
     pub environment: Vec<(Vec<u8>, Vec<u8>)>,
@@ -77,6 +78,7 @@ impl Authorization {
             metadata: false,
             resolver: false,
             workload_query: None,
+            native_job_query: None,
             linker: None,
             program: request.member.argv[0].clone(),
             environment: request.member.env.clone(),
@@ -153,7 +155,7 @@ impl Owner {
         {
             return false;
         }
-        if request.workload_query.is_some()
+        if (request.workload_query.is_some() || request.native_job_query.is_some())
             && job.workload.as_ref().is_none_or(|state| {
                 state.queries >= trust_resource_controller::workload::host::MAX_QUERIES
             })
@@ -190,6 +192,7 @@ pub(super) fn live(
     if usize::from(request.metadata)
         + usize::from(request.resolver)
         + usize::from(request.workload_query.is_some())
+        + usize::from(request.native_job_query.is_some())
         + usize::from(request.linker.is_some())
         > 1
     {
@@ -225,6 +228,23 @@ pub(super) fn live(
                 .workload
                 .as_ref()
                 .is_some_and(|state| state.authorizes_query(query))
+            || request.peer.pid != job.child.child_mut().id()
+            || request.peer.birth != job.root_birth
+            || !matches!(job.custody, Custody::Cooperative(_))
+            || !job
+                .metadata_sdk
+                .as_ref()
+                .is_some_and(|sdk| sdk.validate_loaded(request.peer.pid).is_ok())
+        {
+            return false;
+        }
+    } else if let Some(query) = &request.native_job_query {
+        if job.metadata_root
+            || job.resolver.is_some()
+            || !job
+                .workload
+                .as_ref()
+                .is_some_and(|state| state.authorizes_native_query(query))
             || request.peer.pid != job.child.child_mut().id()
             || request.peer.birth != job.root_birth
             || !matches!(job.custody, Custody::Cooperative(_))

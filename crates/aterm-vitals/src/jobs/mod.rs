@@ -97,6 +97,8 @@ pub struct SweepProc {
     pub has_tty: Option<bool>,
     /// Whether it ran a program since its fork; `None` where unread.
     pub exec: Option<bool>,
+    /// Its threads, where the sweep reads them (Linux `num_threads`).
+    pub threads: Option<u32>,
 }
 
 /// A process's cumulative counters (`aterm_sysprobe::jobs::Counters`).
@@ -361,7 +363,8 @@ pub struct JobProc {
 /// (`aterm_sysprobe::jobs::AtStart`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum StartWait {
-    /// macOS's program check holds it: native, its executable on a local volume.
+    /// macOS's program check holds it: native, its executable on a local volume, its thread's user
+    /// time measured at zero, and per-process request evidence tying it to the check.
     #[default]
     ProgramCheck,
     /// An x86_64 process on an arm64 Mac: Rosetta translates it, and aterm's Developer Tools
@@ -685,7 +688,7 @@ pub struct JobTick {
     /// The per-user process limit (`kern.maxprocperuid`, `RLIMIT_NPROC`).
     pub process_limit: Option<u64>,
     /// aterm's user's processes that have not started: held at macOS's program check,
-    /// translated by Rosetta, on a volume not proven local, or stopped or traced.
+    /// translated by Rosetta, with nothing read to say why, or stopped or traced.
     pub held: Vec<HeldProc>,
     /// The syspolicyd [`HeldProc::stranded`] was judged against, by pid: the one the stuck
     /// check's board read lately, else the one a kept verdict was judged under; `None` with
@@ -1319,15 +1322,17 @@ pub struct StoppedUnstarted {
 /// A stretch of readings in which macOS's program check is backed up
 /// (`docs/DESIGN-leftover-processes-2026-10-16.md` §5.1). It opens at the first reading where one
 /// of aterm's user's programs was held at the reading before too, or three are held at once, and
-/// closes at the second reading in a row that finds none held.
+/// closes at the second reading in a row that finds none of it held. A program the host judged
+/// stranded ([`HeldProc::stranded`]) is no part of it, held or not: its check is not in the
+/// running one's line, so an episode can close while one stands.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HeldEpisode {
     /// The reading it opened at, host ms.
     pub opened_ms: u64,
-    /// From its opening to its last reading that found a program held (this one, while one is
-    /// held), ms.
+    /// From its opening to its last reading that found a program of it held (this one, while one
+    /// is held), ms.
     pub for_ms: u64,
-    /// The most programs held at one reading.
+    /// The most programs of it held at one reading.
     pub peak: u32,
     /// The longest any of them was held, ms.
     pub oldest_ms: u64,
@@ -1369,8 +1374,10 @@ pub struct Findings {
     /// Own x86_64 processes on an arm64 Mac whose one thread never ran past 20 s, each since the
     /// first reading that saw it so ([`StartWait::Translating`]).
     pub translating: Vec<Named>,
-    /// Own processes with the same signature whose executable is not proven on a local volume,
-    /// each since the first reading that saw it so ([`StartWait::NotStarted`]).
+    /// Own processes with the same signature that aterm does not call held at the check: an
+    /// executable not proven on a local volume, or a native local one whose user time went unread
+    /// or that no request evidence ties to the check, each since the first reading that saw it so
+    /// ([`StartWait::NotStarted`]).
     pub not_started: Vec<Named>,
     /// Own processes with the same signature that read stopped or traced, each since the first
     /// reading that saw it so, with what this reading read ([`StartWait::StoppedUnstarted`]):
@@ -1381,9 +1388,11 @@ pub struct Findings {
     /// the reading before while they hold a fresh dylib open: probably waiting for the same
     /// check, a heuristic (§5.1's dylib case). `for_ms` is 0.
     pub probably_program_check: Vec<Named>,
-    /// Own-uid processes, zombies included.
+    /// Own-uid processes, zombies included, in the unit the per-user limit counts: processes on
+    /// macOS, their threads on Linux (`RLIMIT_NPROC` counts a user's threads there, so a few
+    /// processes of many threads near it are near the limit).
     pub own_procs: u64,
-    /// The per-user limit.
+    /// The per-user limit (`kern.maxprocperuid`; Linux `RLIMIT_NPROC`).
     pub process_limit: Option<u64>,
 }
 

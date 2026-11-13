@@ -32,7 +32,7 @@ struct State {
 
 /// A scripted target: `screen` draws each look (`None`: the screen could not be read), and each
 /// look is read by the real [`stand_of`] for `agent` over `cell`'s replies (`ctl cell <row> <col>`
-/// as the target stood at that look).
+/// as the target stood at that look), its cursor home on its composer ([`home`]).
 struct Script<F: Fn(&State) -> Option<String>> {
     agent: &'static str,
     screen: F,
@@ -89,7 +89,12 @@ impl<F: Fn(&State) -> Option<String>> Steps for Script<F> {
         let seen = {
             let s = self.state.borrow();
             (self.screen)(&s).map(|screen| {
-                let stand = stand_of(self.agent, &screen, |row, col| (self.cell)(&s, row, col));
+                let stand = stand_of(
+                    self.agent,
+                    &screen,
+                    |row, col| (self.cell)(&s, row, col),
+                    home(self.agent, &screen),
+                );
                 (screen, stand)
             })
         };
@@ -133,6 +138,13 @@ impl<F: Fn(&State) -> Option<String>> Steps for Script<F> {
 /// Every cell drawn plain, as typed text is.
 fn plain(_row: usize, _col: usize) -> Option<String> {
     Some("OK h d0d0d0 111318 none".to_string())
+}
+
+/// The cursor home on `agent`'s composer on `screen`: its first row, column 2, where a program
+/// leaves it over a placeholder it draws.
+fn home(agent: &str, screen: &str) -> impl FnOnce() -> Option<(usize, usize)> + use<> {
+    let at = crate::screen::composer_at(agent, screen).map(|(row, _)| (row, 2));
+    move || at
 }
 
 /// Claude Code's banner, drawn before its composer (the rows 2.1.300 drew, its version moved on).
@@ -182,7 +194,11 @@ fn a_turn_is_sent_only_once_an_empty_composer_stands_and_entered_once_the_text_s
             Stand::Composer("hi".into()),
         ),
     ] {
-        assert_eq!(stand_of("claude", screen, plain), stands, "{what}");
+        assert_eq!(
+            stand_of("claude", screen, plain, home("claude", screen)),
+            stands,
+            "{what}"
+        );
     }
     let script = Script::new(|s: &State| {
         Some(match (s.sent.as_deref(), s.enters) {
@@ -330,7 +346,12 @@ fn enter_is_pressed_again_where_the_text_still_stands_and_a_late_take_is_waited_
 /// A PLACEHOLDER DRAWN DIM IS AN EMPTY COMPOSER, TYPED TEXT IS NOT: `ctl text` reads Codex's hint
 /// and Claude Code's grey suggestion as text, so the composer's first glyph is read by its cell on
 /// the composer's own row, past a caret the program draws itself; a cell that says nothing, or an
-/// unfinished frame's, is no evidence yet.
+/// unfinished frame's, is no evidence yet. Codex's hint is read by its cell alone, its cursor never
+/// asked; Claude Code's grey suggestion is an empty composer only with the cursor home on it, by
+/// the harness's own rule (review RV2, J0-4-R1): the cursor past it, under it or unread, grey says
+/// neither, and a typed glyph needs no cursor.
+/// NEGATIVE CONTROL (run): with grey read as empty wherever the cursor stands, the suggestion with
+/// the cursor past it reads as an empty composer.
 #[test]
 fn a_placeholder_drawn_dim_is_an_empty_composer_and_typed_text_is_not() {
     let codex = [
@@ -338,7 +359,7 @@ fn a_placeholder_drawn_dim_is_an_empty_composer_and_typed_text_is_not() {
         "",
         "• Hi! I am the local lab stub, not a model. (reply 3)",
         "",
-        "› Ask Codex to do anything",
+        "» Ask Codex to do anything",
         "",
         "  gpt-6.1-sol medium · /private/tmp/x/proj",
     ]
@@ -348,8 +369,9 @@ fn a_placeholder_drawn_dim_is_an_empty_composer_and_typed_text_is_not() {
         asked.borrow_mut().push((row, col));
         Some("OK A 999999 111318 dim".to_string())
     };
+    let unasked = || -> Option<(usize, usize)> { panic!("Codex's cursor is never asked") };
     assert_eq!(
-        stand_of("codex", &codex, dim),
+        stand_of("codex", &codex, dim, unasked),
         Stand::Composer(String::new())
     );
     assert_eq!(
@@ -358,14 +380,20 @@ fn a_placeholder_drawn_dim_is_an_empty_composer_and_typed_text_is_not() {
         "the composer's row, its first glyph"
     );
     assert_eq!(
-        stand_of("codex", &codex, plain),
+        stand_of("codex", &codex, plain, unasked),
         Stand::Composer("Ask Codex to do anything".into())
     );
-    assert_eq!(stand_of("codex", &codex, |_, _| None), Stand::Unknown);
     assert_eq!(
-        stand_of("codex", &codex, |_, _| Some(
-            "OK A 999999 111318 dim frame=open".into()
-        )),
+        stand_of("codex", &codex, |_, _| None, unasked),
+        Stand::Unknown
+    );
+    assert_eq!(
+        stand_of(
+            "codex",
+            &codex,
+            |_, _| Some("OK A 999999 111318 dim frame=open".into()),
+            unasked
+        ),
         Stand::Unknown
     );
     // Claude Code 2.1.310 draws its caret inverse over the suggestion's first glyph, the rest dim.
@@ -378,18 +406,72 @@ fn a_placeholder_drawn_dim_is_an_empty_composer_and_typed_text_is_not() {
         })
     };
     assert_eq!(
-        stand_of("claude", &suggested, caret),
+        stand_of("claude", &suggested, caret, home("claude", &suggested)),
         Stand::Composer(String::new())
     );
+    let row = crate::screen::composer_at("claude", &suggested).map(|(row, _)| row);
+    assert!(row.is_some(), "the composer's row");
+    for (what, cursor) in [
+        ("past the suggestion", row.map(|r| (r, 15))),
+        ("under the composer", row.map(|r| (r + 2, 2))),
+        ("unread", None),
+    ] {
+        assert_eq!(
+            stand_of("claude", &suggested, caret, || cursor),
+            Stand::Unknown,
+            "grey with the cursor {what} says neither"
+        );
+    }
     assert_eq!(
-        stand_of("claude", &suggested, plain),
-        Stand::Composer("run the tests".into())
+        stand_of("claude", &suggested, plain, || None),
+        Stand::Composer("run the tests".into()),
+        "a typed glyph needs no cursor"
     );
     assert_eq!(
-        stand_of("claude", &composer(""), |_, _| None),
+        stand_of("claude", &composer(""), |_, _| None, || None),
         Stand::Composer(String::new()),
         "an empty composer needs no cell"
     );
+}
+
+/// KIMI CODE'S COMPOSER IS READ BY ITS OWN RULE (review RV2, J0-4-R1): its reader declares no
+/// placeholder, so the harness reads any text in its composer as typed and asks no cell, and the
+/// lab does the same. Its caret row is ` │ > text` (2.4.0, measured), so column 2 is the blank
+/// inside its box, no glyph: read by the cell rule, a blank drawn dim made every draft an empty
+/// composer, never standing, and the turn ended `NotStood` with Enter never pressed.
+/// NEGATIVE CONTROL (run): with the cell read for every agent, the dim blank reads as an empty
+/// composer and the cell is asked.
+#[test]
+fn kimi_code_s_composer_is_read_by_its_own_rule_no_cell_asked() {
+    let draft = include_str!("../../aterm-phase/src/fixtures/kimi-2.4.0-draft.txt")
+        .lines()
+        .skip_while(|l| l.starts_with("# "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let asked = RefCell::new(Vec::new());
+    let dim = |row: usize, col: usize| {
+        asked.borrow_mut().push((row, col));
+        Some("OK %20 999999 111318 dim".to_string())
+    };
+    assert_eq!(
+        stand_of("kimi", &draft, dim, home("kimi", &draft)),
+        Stand::Composer("lab draft one".into())
+    );
+    assert!(
+        asked.borrow().is_empty(),
+        "no cell asked: {:?}",
+        asked.borrow()
+    );
+    assert_eq!(
+        Placeholder::of("kimi"),
+        Placeholder::None,
+        "Kimi Code's reader declares no placeholder"
+    );
+    assert_eq!(
+        Placeholder::of("muse"),
+        Placeholder::Harness(Some("676c74"))
+    );
+    assert_eq!(Placeholder::of("claude"), Placeholder::Harness(None));
 }
 
 /// Muse Code 1.4.10's idle composer after a turn, as measured: its prompt hint
@@ -427,7 +509,7 @@ fn muse_code_s_prompt_hint_is_an_empty_composer_and_its_typed_text_is_not() {
         Some(MUSE_HINT_CELL.to_string())
     };
     assert_eq!(
-        stand_of("muse", &hint, drawn),
+        stand_of("muse", &hint, drawn, home("muse", &hint)),
         Stand::Composer(String::new())
     );
     assert_eq!(
@@ -435,7 +517,12 @@ fn muse_code_s_prompt_hint_is_an_empty_composer_and_its_typed_text_is_not() {
         row.map(|r| (r, 2)).into_iter().collect::<Vec<_>>()
     );
     assert_eq!(
-        stand_of("muse", &hint, |_, _| Some(MUSE_TYPED_CELL.into())),
+        stand_of(
+            "muse",
+            &hint,
+            |_, _| Some(MUSE_TYPED_CELL.into()),
+            home("muse", &hint)
+        ),
         Stand::Composer("/export saves the conversation to a text file".into())
     );
 

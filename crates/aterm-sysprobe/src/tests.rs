@@ -277,8 +277,11 @@ fn a_processs_working_directory_and_executable_are_its_own() {
 }
 
 /// `group_memory` sums member footprints within the target process group,
-/// excluding children placed in their own group (`process_group(0)`).
-#[cfg(target_os = "macos")]
+/// excluding children placed in their own group (`process_group(0)`): on
+/// macOS the physical footprint, on Linux (the lane's guest) the anonymous
+/// memory, which 512 MiB of touched pages grow alike.
+/// NEGATIVE CONTROLS: non-existent pid and pid 0 return `None`.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn a_groups_memory_is_its_own_members_footprint() {
     let me = std::process::id();
@@ -322,6 +325,36 @@ fn a_groups_memory_is_its_own_members_footprint() {
 
     assert_eq!(crate::group_memory(0), None);
     assert_eq!(crate::group_memory(u32::MAX), None);
+}
+
+/// The pressure level reads on this Linux host wherever the kernel keeps PSI
+/// (`/proc/pressure/memory`), and only there: no PSI is no level, never normal.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_pressure_level_reads_on_this_linux_host_where_psi_is_kept() {
+    let psi = std::fs::read_to_string("/proc/pressure/memory").is_ok();
+    assert_eq!(crate::memory_pressure().is_some(), psi, "psi kept: {psi}");
+    assert_eq!(
+        crate::memory_detail().and_then(|m| m.pressure).is_some(),
+        psi
+    );
+}
+
+/// The VM's counters read on this Linux host, and the page size is the kernel's own (`sysconf`).
+#[cfg(target_os = "linux")]
+#[test]
+fn the_vm_counters_read_on_this_linux_host() {
+    let m = crate::memory_detail().expect("/proc/meminfo");
+    let c = m.counters.expect("/proc/vmstat's counters");
+    assert!(
+        c.pageins > 0,
+        "a booted machine has faulted pages in: {c:?}"
+    );
+    // SAFETY: `sysconf` reads a constant.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let want_page = u64::try_from(page).expect("a page size");
+    assert_eq!(crate::linux::Root::system().page_bytes(), want_page);
+    assert_eq!(c.page_bytes, want_page);
 }
 
 /// `group_usage` reads each member of the group asked about, keyed by its pid and start: a busy
@@ -860,6 +893,17 @@ fn the_mountinfo_parser_reads_escapes_and_marks_a_cut_table() {
         !volumes::parse_mountinfo(text, true).complete,
         "cut at the cap"
     );
+    // The kernel's memory file systems and a snap's image are local: `/dev` (devtmpfs) above
+    // `/dev/shm` (tmpfs), as the lane's Ubuntu guest mounts them; a VM's host share is not.
+    let guest = volumes::parse_mountinfo(
+        "24 1 0:5 / /dev rw,nosuid shared:2 - devtmpfs udev rw,size=8127432k\n\
+         27 24 0:26 / /dev/shm rw,nosuid,nodev shared:4 - tmpfs tmpfs rw\n\
+         90 1 7:0 / /snap/core22/2045 ro,nodev,relatime shared:30 - squashfs /dev/loop0 ro\n\
+         91 1 0:40 / /mnt/lima-rosetta ro,relatime shared:31 - virtiofs rosetta ro\n",
+        false,
+    );
+    let local: Vec<bool> = guest.mounts.iter().map(|m| m.local).collect();
+    assert_eq!(local, [true, true, true, false]);
     let many: String = (0..=volumes::MAX_MOUNTS)
         .map(|i| format!("{i} 1 0:1 / /m{i} rw - ext4 /dev/x rw\n"))
         .collect();

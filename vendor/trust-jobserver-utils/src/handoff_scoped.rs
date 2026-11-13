@@ -12,7 +12,8 @@ pub(super) enum Scope {
 /// Create before spawn, bind while the registered child is held before GO,
 /// and retain through its completion. This transfers existing descriptors;
 /// it never creates credits or proves host memory/subgroup registration.
-#[derive(Debug)]
+/// Clones retain the SAME endpoint and one-use bind/failure state.
+#[derive(Clone, Debug)]
 pub struct ScopedHandoff(pub(super) Arc<Endpoint>);
 
 impl ScopedHandoff {

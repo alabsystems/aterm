@@ -664,6 +664,41 @@ fn cleanup_decoded(value: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// The boot a record's first line names, where that line is a supported header of the record
+/// `path` is named for.
+fn cleanup_header<'line>(path: &Path, line: &'line str) -> Option<&'line str> {
+    if line.split_whitespace().next()? != "run" {
+        return None;
+    }
+    let fields = cleanup_fields(line, &["v", "boot", "id", "uniqueid", "start", "sid"])?;
+    let [version, boot, id, uniqueid, start, sid] = fields.as_slice() else {
+        return None;
+    };
+    let parsed = RunId::parse(id)?;
+    if *version != "1"
+        || boot.is_empty()
+        || parsed.pid <= 1
+        || parsed.birth.0 == 0
+        || parsed.text() != *id
+        || path.file_name()?.to_str()? != format!("{}.run", parsed.text())
+        || !cleanup_number(uniqueid)
+        || !cleanup_number(start)
+    {
+        return None;
+    }
+    cleanup_decoded(sid)?;
+    Some(*boot)
+}
+
+/// A record that does not read complete, as its lenient projection, where its header line is
+/// whole and names another boot than `boot`. Its launcher and every group it names ended with
+/// that boot, so it makes no claim on this one, and no writer is left to complete it: a
+/// partial write (a full disk) or a kill between two writes of an earlier release leaves one.
+fn earlier_boot_record(path: &Path, text: &str, boot: Option<&str>) -> Option<Record> {
+    let (header, _) = text.split_once('\n')?;
+    (cleanup_header(path, header)? != boot?).then(|| Record::parse(text))
+}
+
 /// Validate the cleanup protocol without changing [`Record::parse`]'s lenient projection.
 fn cleanup_record(path: &Path, text: &str) -> Option<Record> {
     if text.is_empty() || !text.ends_with('\n') {
@@ -672,24 +707,7 @@ fn cleanup_record(path: &Path, text: &str) -> Option<Record> {
     for (index, line) in text.lines().enumerate() {
         match line.split_whitespace().next()? {
             "run" if index == 0 => {
-                let fields =
-                    cleanup_fields(line, &["v", "boot", "id", "uniqueid", "start", "sid"])?;
-                let [version, boot, id, uniqueid, start, sid] = fields.as_slice() else {
-                    return None;
-                };
-                let parsed = RunId::parse(id)?;
-                if *version != "1"
-                    || boot.is_empty()
-                    || parsed.pid <= 1
-                    || parsed.birth.0 == 0
-                    || parsed.text() != *id
-                    || path.file_name()?.to_str()? != format!("{}.run", parsed.text())
-                    || !cleanup_number(uniqueid)
-                    || !cleanup_number(start)
-                {
-                    return None;
-                }
-                cleanup_decoded(sid)?;
+                cleanup_header(path, line)?;
             }
             "root" if index > 0 => {
                 let fields = cleanup_fields(line, &["path"])?;
@@ -741,10 +759,19 @@ fn cleanup_record(path: &Path, text: &str) -> Option<Record> {
 /// read complete refuses the whole snapshot, never a partial set of competing claims. A
 /// directory not made yet holds none.
 ///
+/// `boot` is the reader's own boot, where it knows it. A record of another boot competes for
+/// nothing on this one, so one that is cut short is still admitted, as its lenient projection,
+/// where its header line is whole ([`earlier_boot_record`]): it names its boot, which every
+/// reader judges a record by, and the reader that removes earlier boots' records removes it
+/// too. Without that, one record torn before a restart refused every later reading for good.
+/// A record of this boot that does not read complete refuses as before, as does every
+/// incomplete record for a reader that knows no boot.
+///
 /// # Errors
 /// The directory's read, a record's, or [`std::io::ErrorKind::InvalidData`] for a record that is
-/// not a complete supported one. A record being written returns [`std::io::ErrorKind::WouldBlock`].
-pub fn read_records(dir: &Path) -> std::io::Result<Vec<(PathBuf, Record)>> {
+/// not a complete supported one and is not shown to be another boot's. A record being written
+/// returns [`std::io::ErrorKind::WouldBlock`].
+pub fn read_records(dir: &Path, boot: Option<&str>) -> std::io::Result<Vec<(PathBuf, Record)>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(why) if why.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -757,12 +784,14 @@ pub fn read_records(dir: &Path) -> std::io::Result<Vec<(PathBuf, Record)>> {
             continue;
         }
         let text = read_record_text(&path)?;
-        let rec = cleanup_record(&path, &text).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("{} is not a complete supported run record", path.display()),
-            )
-        })?;
+        let rec = cleanup_record(&path, &text)
+            .or_else(|| earlier_boot_record(&path, &text, boot))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{} is not a complete supported run record", path.display()),
+                )
+            })?;
         records.push((path, rec));
     }
     Ok(records)

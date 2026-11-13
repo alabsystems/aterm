@@ -303,9 +303,13 @@ fn secrets_reading_refresh(
 fn secret_blocker(reason: client::MaterializationBlocker, now_ms: u64) -> ServiceState {
     use client::MaterializationBlocker;
     let (availability, detail) = match reason {
-        MaterializationBlocker::LockUnavailable => (
+        MaterializationBlocker::WriterBusy => (
             ServiceAvailability::Unknown,
-            "Vault state cannot currently be observed; a writer may be active or its observation lock may be missing",
+            "A vault pass on this machine holds its state lock; awaiting a new observation",
+        ),
+        MaterializationBlocker::LockMissing => (
+            ServiceAvailability::Unknown,
+            "Vault state cannot be observed: its observation lock is missing",
         ),
         MaterializationBlocker::Unconfigured => (
             ServiceAvailability::Unavailable,

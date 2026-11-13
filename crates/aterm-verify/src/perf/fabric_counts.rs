@@ -608,7 +608,7 @@ fn run_world(targo: &Targo<'_>, args: &fabric::Args, built: &Built) -> Result<Va
         (bench_spec::ENV, &words),
         (bench_spec::OUT_ENV, scratch.path()),
         "fabric bench:",
-        "the fabric bench",
+        built,
         Entry::Counted,
     )?;
     let path = scratch.path().join("fabric.json");

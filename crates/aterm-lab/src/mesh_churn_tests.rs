@@ -23,16 +23,13 @@ fn parse_takes_the_design_defaults() {
     assert_eq!(args.minutes, 5);
     assert_eq!(args.seed, 7);
     assert_eq!(args.control, None);
-    assert!(!args.record && !args.keep && !args.whole_wraps && args.label.is_none());
+    assert!(!args.keep && !args.whole_wraps && args.label.is_none());
 }
 
 #[test]
 fn parse_reads_every_flag() {
     let args = parse(
-        &words(
-            "--n 14 --seed 42 --minutes 2 --whole-wraps --aterm /x/aterm --keep --record \
-             --label first",
-        ),
+        &words("--n 14 --seed 42 --minutes 2 --whole-wraps --aterm /x/aterm --keep --label first"),
         0,
     )
     .expect("they parse");
@@ -41,7 +38,7 @@ fn parse_reads_every_flag() {
     assert_eq!(args.seed, 42);
     assert_eq!(args.minutes, 2);
     assert_eq!(args.aterm.as_deref(), Some("/x/aterm"));
-    assert!(args.keep && args.record);
+    assert!(args.keep);
     assert_eq!(args.label.as_deref(), Some("first"));
 }
 

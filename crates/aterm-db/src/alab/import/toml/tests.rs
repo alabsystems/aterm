@@ -9,7 +9,7 @@
 use super::super::tests::{SEALER, Stand};
 use super::*;
 use crate::{
-    alab::import::{Input, Plan, covered, plan},
+    alab::import::{Input, Plan, covered, plan_cells as plan},
     typed::{
         cell::{self, Cells},
         grid::tests::Book,
@@ -56,7 +56,7 @@ fn planned(sheets: &[Sheet], cells: &Cells) -> Plan {
             vendors: &Stand,
             sealer: &SEALER,
             now_ms: NOW,
-            births: true,
+            births: crate::alab::import::Births::Named,
             unread: &[],
         },
         cells,

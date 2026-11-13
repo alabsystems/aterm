@@ -9,6 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 use aterm_json::{Map, Value};
 use aterm_types::control_verbs::ScreenGen;
 
+use super::agent_image::{self, Lane};
 use super::relaunch::{
     Launch, NoPlan, Plan, PromptLook, PromptMark, Relaunch, RelaunchLineError, STALE_S, TAB_TAKEN,
     WAIT_HAND_LIFTS, await_new, carry_on, confirm, expired, hand_waits_out, launched, overtaken_by,
@@ -69,7 +70,7 @@ pub use upgrade_status::{
 };
 #[cfg(all(test, unix))]
 use watch::watch_with;
-pub use watch::{Watched, Watcher, watch};
+pub use watch::{Watched, Watcher, wall_due, watch};
 
 #[cfg(any(test, debug_assertions))]
 #[cfg_attr(
@@ -486,8 +487,13 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
             "work",
             if f.waits_only {
                 1
-            } else if !f.background.is_empty() || (lags && !f.owner_now) {
-                2
+            } else if !f.background.is_empty() {
+                // Follows alone end losing nothing that stands; any other process is real work.
+                if f.follows_only { 3 } else { 2 }
+            } else if lags && !f.owner_now {
+                // The status alone names it, no process: a finished session moves over it as it
+                // does over follows (`upgrade::Yield::Outlasted`).
+                3
             } else {
                 0
             },
@@ -498,6 +504,19 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
         // target counts, and one a look voided does not (`upgrade::deadline_voids`).
         ("tells", i64::from(f.tells).max(flag(f.deadline_set))),
         ("due", flag(f.work_due)),
+        // No autopilot carries the session at this look: a person's hold on the carry. A
+        // manager's wait is none (the window's `upgrade_tell` never reads it as one).
+        ("off", flag(!f.may_tell)),
+        ("silent", flag(f.silent)),
+        ("outlasted", flag(f.own_hold_s >= upgrade::SILENT_HOLD_S)),
+        // The wall has an age, from a row of its transcript ([`wall_age`]); it has aged where
+        // each of its parts has stood its bound with nobody seen (`upgrade::login_holds`,
+        // `upgrade::limit_holds`). One nothing dates reads no age and never ages.
+        (
+            "dated",
+            flag((f.login && f.login_s > 0) || (f.limited && f.limit_s > 0)),
+        ),
+        ("aged", flag(upgrade::walls_outlasted(f))),
         ("moved", 0),
     ])
 }
@@ -572,7 +591,15 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
     aterm_spec_anchor::spec_unmodeled(
         machine = "HarnessUpgradeQuiet",
         action = "RealWorkStarts",
-        reason = "Work starting under the agent (a process `upgrade::own_of` does not prove a wait, work its screen names, a status its in-process work keeps busy): the agent's step. The Tier-1 binds name it in `Facts::background` with `Facts::waits_only` clear exactly there."
+        reason = "Work starting under the agent (a process `upgrade::own_of` does not prove a wait and `upgrade::follows_only` does not read as follows, work its screen names): the agent's step. The Tier-1 binds name it in `Facts::background` with `Facts::waits_only` and `Facts::follows_only` clear exactly there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "FollowStarts",
+        reason = "A follow starting under the agent (a tail that follows a file or a development server, `upgrade::follow_command`, beside nothing but waits: `upgrade::follows_only`), or a status the agent's in-process work keeps busy past its turn: the agent's step. The Tier-1 binds name the follow in `Facts::background` with `Facts::follows_only` set, or leave `Facts::background` empty under a lagging status, exactly there."
     )
 )]
 #[cfg_attr(
@@ -687,6 +714,118 @@ pub fn quiet_projection(f: &Facts) -> std::collections::BTreeMap<&'static str, i
         reason = "Buggy=1 negative control only; the agent's own work holding the round with no bound, as it did before `upgrade::own_yields`. The Tier-1 bind's control clears `Facts::waits_only` and `Facts::work_due`, and aterm-spec's liveness sweep breaks the law with it."
     )
 )]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "CarryHeld",
+        reason = "A person's hold on the carry, the environment's: the tab's Autopilot switched off, a person's grace or another driver's hand, under Land the person's own exchange. The window reads it into `Tell::Off` (`upgrade_tell`) and the Tier-1 bind projects it as `Facts::may_tell` clear."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "CarryBack",
+        reason = "The person's hold on the carry lifted, the environment's; the Tier-1 bind projects it as `Facts::may_tell` set."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "ManagerWaits",
+        reason = "A manager awaiting the worker's task, the supervise loop's (`Guard::Managed`, standing for the loop's life). The window's bind (`the_quiet_tell_follows_the_tabs_autopilot_its_guards_and_its_restart_offer`) holds `upgrade_tell` to a tell under both autopilots there."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "ManagerHoldsCarry",
+        reason = "Buggy=1 negative control only; a manager's wait read as a person's hold on the carry, as the window read it under Land before. The window's bind fails on that mapping, and aterm-spec's liveness sweep breaks the law with it."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "TaskLands",
+        reason = "The session's task finishing or landing, the supervise loop's (`IdlePoint::done_under_land`, `FinishedScan`). The window reads it into `Tell::Silent` and the Tier-1 bind projects it as `Facts::silent`."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "TaskAsked",
+        reason = "Someone else's turn reopening a finished task, the supervise loop's; the Tier-1 bind projects it as `Facts::silent` clear."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "SilentHoldOutlasts",
+        reason = "The clock's step over `St::own_since` past `upgrade::SILENT_HOLD_S`, the hold `HoldOutlasts` starts; the Tier-1 bind projects it as `Facts::own_hold_s` at that bound."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "SilentWorkHolds",
+        reason = "Buggy=1 negative control only; a finished or landed session's own work holding the round with no bound, as it did before `upgrade::Yield::Outlasted`. The Tier-1 bind's control shortens `Facts::own_hold_s` below the bound, and aterm-spec's liveness sweep breaks the law with it."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "SilentMovesEarly",
+        reason = "Buggy=1 negative control only; the move over a finished session's work before its hold outlasted the bound. The Tier-1 bind asserts the real step never moves where it is enabled."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "TellsASilentSession",
+        reason = "Buggy=1 negative control only; a line typed into a session whose task finished or landed. The Tier-1 bind's control clears `Facts::silent` and the real reducer tells."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "DatedWallStands",
+        reason = "Claude Code's sign-in wall or usage limit on the screen, read by `aterm_phase` into `Facts::login` or `Facts::limited`; the Tier-1 bind projects it as a wall its transcript dates, within its bound."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "WallAges",
+        reason = "The clock's step past the wall's bound (`upgrade::LOGIN_WALL_S`, `upgrade::LIMIT_WALL_S`) from its first transcript row (`upgrade::LoginScan::since`, `upgrade::StandingScan::since`), restarted by a key of the person's after it and read as 0 at a look that sees a person (`upgrade_drive::wall_age`); the Tier-1 bind projects it as `Facts::login_s` or `Facts::limit_s` at that bound."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "MovesAtALiveWall",
+        reason = "Buggy=1 negative control only; the move at a wall still within its bound. The Tier-1 bind's control ages `Facts::login_s` or `Facts::limit_s` past it and the real reducer moves."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "HarnessUpgradeQuiet",
+        action = "WallHoldsForGood",
+        reason = "Buggy=1 negative control only; a wall nobody lifts holding an idle round with no bound, as a login wall did before `upgrade::LOGIN_WALL_S` and a usage limit before `upgrade::LIMIT_WALL_S`. The Tier-1 bind's control keeps the wall's age below its bound, and aterm-spec's liveness sweep breaks the law with it."
+    )
+)]
 #[doc(hidden)]
 pub fn quiet_environment() {}
 
@@ -729,8 +868,9 @@ pub enum Tell {
     #[default]
     Off,
     /// No line, under an autopilot that carries the session: its task finished or landed, and
-    /// nothing is typed into it before a move. The round still moves over proved waits, and past
-    /// a deadline the process was told before, and the line after the resume says what ended
+    /// nothing is typed into it before a move. The round still moves over proved waits, past a
+    /// deadline the process was told before, and over its own work once that has held the round
+    /// [`upgrade::SILENT_HOLD_S`] unbroken, and the line after the resume says what ended
     /// ([`upgrade::Facts::silent`]).
     Silent,
     /// The line, under an autopilot that carries the session.
@@ -769,6 +909,8 @@ fn claude_profile(user_home: &Path, claude_dir: &Path) -> PathBuf {
 /// What a sweep did with one session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Report {
+    /// The effective urgency rung read by this step's gate, when the step reached one.
+    pub rung: Option<upgrade::Rung>,
     pub pid: u32,
     pub tab: String,
     pub session: String,
@@ -1363,6 +1505,11 @@ pub(super) trait Kernel {
     /// [`Self::restart_background`] is, so that no kernel reads the machine at that look unless it
     /// says so.
     fn process_start(&self, pid: u32) -> Option<String>;
+    /// Optional exact liveness evidence. An injected kernel is inert unless it explicitly
+    /// supplies a reader; the live kernel captures this around the snapshot's process facts.
+    fn process_lifetime(&self, _pid: u32) -> Option<super::relaunch::ProcessLifetime> {
+        None
+    }
     /// Shell rendering facts from the same injected platform source as the restart's job.
     fn shell_dialect(&self, shell: u32, processes: &[ProcRow]) -> Option<super::upgrade::Dialect> {
         super::relaunch::shell_dialect(shell, processes)
@@ -1424,6 +1571,10 @@ impl Kernel for Live {
 
     fn process_start(&self, pid: u32) -> Option<String> {
         kernel_start(pid)
+    }
+
+    fn process_lifetime(&self, pid: u32) -> Option<super::relaunch::ProcessLifetime> {
+        super::relaunch::ProcessLifetime::capture(pid)
     }
 
     fn restart_background(&self, pid: u32) -> Vec<String> {
@@ -1526,13 +1677,26 @@ fn seat_of(agent: u32, pid: u32, t: &[ProcRow]) -> (upgrade::Seat, Vec<String>) 
     (upgrade::Seat::Loose, Vec::new())
 }
 
-/// Whether `raw`, a process's arguments as the kernel gave them and `ps` prints them, are the
-/// words it was started with, byte for byte: no escape `ps` wrote for a byte it does not print
-/// (a newline, a tab, a byte above ASCII; a backslash of the command's own reads the same) and
-/// no run of blanks [`squash`] folds.
+/// Whether the command `raw` carries ([`command_head`]: Claude Code's Bash tool's `eval` payload,
+/// or the whole of `raw` where it has none), `raw` a process's arguments as the kernel gave them
+/// and `ps` prints them, is the command it was started with, byte for byte: no escape `ps` wrote
+/// for a byte it does not print in that command (a newline, a tab, a byte above ASCII; a
+/// backslash of the command's own reads the same) and no run of blanks [`squash`] folds. The
+/// Bash tool's own words around its payload (`\builtin unalias …`, which every shell it starts
+/// carries) are no part of the command, so their backslashes judge nothing.
 #[cfg(target_os = "macos")]
 fn exact_args(raw: &str) -> bool {
-    !raw.contains('\\') && raw == squash(raw)
+    !typed_part(raw).contains('\\') && raw == squash(raw)
+}
+
+/// The part of `raw` [`command_head`] reads the command from, before it undoes its quoting.
+#[cfg(target_os = "macos")]
+fn typed_part(raw: &str) -> &str {
+    raw.split_once("&& eval '").map_or(raw, |(_, payload)| {
+        payload
+            .rsplit_once("' < /dev/null")
+            .map_or(payload, |(head, _)| head)
+    })
 }
 
 const BACKGROUND: &[&str] = upgrade::BACKGROUND;
@@ -2921,31 +3085,185 @@ pub(super) fn compact(s: &str) -> String {
     s.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-pub(super) fn left_standing(c: &mut Client, tab: &str, text: &str) -> Left {
+/// What one read of a composer that holds nothing but a start of aterm's own text says to
+/// [`take_back`] ([`left_read`]).
+struct Own {
+    /// The backspaces that take back what the read shows of the text.
+    keys: usize,
+    /// The person's input count of the read (`"human_seq"`), which each backspace is fenced on.
+    human_seq: Option<u64>,
+    /// When the person last gave the tab input, by the read.
+    human: HumanInput,
+    /// The cursor stands behind the last glyph of the composer's last row: where the text's keys
+    /// left it, so a backspace takes the text's own last glyph.
+    caret_ends: bool,
+    /// The composer opens with a whole head of aterm's ([`upgrade::own_words`]), which no person
+    /// types; a shorter start may be a person's few glyphs.
+    headed: bool,
+}
+
+/// How many of `text`'s characters the composer holds when it shows the first `drawn` of its
+/// non-blank ones: those, the blanks among them, and the blanks the next one follows (a blank
+/// typed last shows nothing). A backspace more than the composer holds takes nothing.
+fn own_keys(text: &str, drawn: usize) -> usize {
+    let mut seen = 0;
+    text.chars()
+        .take_while(|ch| {
+            if !ch.is_whitespace() {
+                if seen == drawn {
+                    return false;
+                }
+                seen += 1;
+            }
+            true
+        })
+        .count()
+}
+
+fn caret_ends(scr: &Screen) -> bool {
+    let Some((top, bottom)) = aterm_phase::phase::composer_rules(&scr.rows) else {
+        return false;
+    };
+    scr.cursor.is_some_and(|(row, col)| {
+        row > top
+            && row.checked_add(1) == Some(bottom)
+            && scr
+                .rows
+                .get(row)
+                .is_some_and(|text| col >= text.trim_end().chars().count())
+    })
+}
+
+/// What stands of `text`, a line aterm typed into Claude Code's composer and did not submit,
+/// and, where the composer holds nothing but a start of it, what that read proves of it.
+fn left_read(c: &mut Client, tab: &str, text: &str) -> (Left, Option<Own>) {
     let ours = compact(text);
     let mark = compact(upgrade::HARNESS_MARK);
     let Some(scr) = screen(c, tab) else {
-        return Left::Kept("screen-unreadable");
+        return (Left::Kept("screen-unreadable"), None);
     };
     if aterm_phase::prompt::prompt_box_span(&scr.rows).is_some() {
-        return Left::Kept("box");
+        return (Left::Kept("box"), None);
     }
     let draft = aterm_phase::phase::composer_rules(&scr.rows)
         .and_then(|_| aterm_phase::phase::composer_draft(&scr.rows));
     let Some((_, lines)) = draft else {
-        return Left::Kept("no-composer");
+        return (Left::Kept("no-composer"), None);
     };
     if composer_empty(c, tab, &scr) {
-        return Left::Gone;
+        return (Left::Gone, None);
     }
-    let draft = compact(&lines.concat());
+    let shown = lines.concat();
+    let draft = compact(&shown);
     if ours.starts_with(&draft) {
-        Left::Kept("unsent")
+        let own = Own {
+            keys: own_keys(text, draft.chars().count()),
+            human_seq: scr.human_seq,
+            human: scr.human,
+            caret_ends: caret_ends(&scr),
+            headed: upgrade::own_words(&shown),
+        };
+        (Left::Kept("unsent"), Some(own))
     } else if draft.starts_with(&mark) {
-        Left::Kept("mixed")
+        (Left::Kept("mixed"), None)
     } else {
-        Left::Gone
+        (Left::Gone, None)
     }
+}
+
+pub(super) fn left_standing(c: &mut Client, tab: &str, text: &str) -> Left {
+    left_read(c, tab, text).0
+}
+
+/// How long the person must have left the tab alone before [`take_back`] presses on the word of a
+/// read alone ([`Unkeyed::For`]): the hang detector of one echo ([`PRESSED_ECHO_HANG`]), past
+/// which a key of theirs the window counted is drawn where the read would show it.
+const TAKE_BACK_QUIET_S: u32 = 60;
+
+/// How many times [`take_back`] reads the composer and presses: keys of the text still undrawn
+/// at one read are taken back at the next.
+const TAKE_BACK_LOOKS: usize = 3;
+
+/// What proves no key of a person's stands among aterm's words in the composer ([`take_back`]).
+#[derive(Clone, Copy)]
+pub(super) enum Unkeyed {
+    /// The person's input count the text's own turn was fenced on (`turn if-human=`), read over
+    /// a composer that held nothing: while it is still the count, every glyph typed since is
+    /// the turn's, however short what stands is.
+    Since(u64),
+    /// The person gave the tab no input for this many seconds (their grace), and for
+    /// [`TAKE_BACK_QUIET_S`]: what stands is aterm's where it opens with a whole head of
+    /// aterm's, and no hand, hold or unread input is on the tab.
+    For(u32),
+}
+
+/// Whether the host's `key` fences on the person (`if-human=`), as [`turn_takes_human`].
+fn key_takes_human(c: &mut Client) -> bool {
+    c.help_counted("key")
+        .is_ok_and(|(head, body)| crate::is_ok_reply(&head) && (head + &body).contains("if-human="))
+}
+
+/// ATERM TAKES BACK WHAT IT TYPED AND COULD NOT SUBMIT. A turn the host stopped after its keys
+/// ([`Typed::Cut`]) leaves a start of `text` in Claude Code's composer, where it reads as a
+/// person's draft, holds every later line and is nobody's to send. This backspaces it out, and
+/// never a glyph of a person's: it presses only while one read shows a composer and no box,
+/// nothing in the composer but a start of `text`, and the cursor behind its last glyph
+/// ([`Own::caret_ends`]); only under `proof` that no person's key is among it; and each
+/// backspace is fenced on that read's count of the person's input (`key if-human=`), under the
+/// window's own lock, so a key of theirs since stops it before it writes. A press the host
+/// refuses ends it, and a look that took nothing back ends it. What a person typed over, after
+/// or among aterm's words is theirs ([`Left::Kept`]`("mixed")`), and stays. Each backspace is
+/// `lane`'s write, the lane that typed `text`, and names it ([`lane_words`]): the one observe
+/// gate takes it where it took the text.
+pub(super) fn take_back(
+    c: &mut Client,
+    tab: &str,
+    text: &str,
+    proof: Unkeyed,
+    authority: Option<(super::contract::Scope, u64)>,
+    every: Duration,
+    lane: Lane,
+) -> Left {
+    let mut pressed: Option<usize> = None;
+    for _ in 0..TAKE_BACK_LOOKS {
+        let (left, own) = left_read(c, tab, text);
+        let Some(own) = own else {
+            return left;
+        };
+        let Some(human) = own.human_seq.filter(|_| own.caret_ends) else {
+            return left;
+        };
+        if pressed.is_some_and(|before| own.keys >= before) {
+            return left;
+        }
+        let unkeyed = match proof {
+            Unkeyed::Since(fenced) => fenced == human && turn_takes_human(c),
+            Unkeyed::For(grace_s) => {
+                own.headed
+                    && !upgrade::attended_by(own.human, grace_s.max(TAKE_BACK_QUIET_S))
+                    && !held(c, tab, grace_s)
+            }
+        };
+        if !unkeyed || !key_takes_human(c) {
+            return left;
+        }
+        let Ok(authority) = authority_words(c, tab, authority) else {
+            return left;
+        };
+        let lane = lane_words(c, "key", lane);
+        let request = format!("@{tab} key {lane}{authority}if-human={human} backspace");
+        for _ in 0..own.keys {
+            let went = c.request_line(&request).is_ok_and(|reply| {
+                crate::is_ok_reply(&reply) && !reply.split_whitespace().any(|w| w == "skipped")
+            });
+            if !went {
+                return left_standing(c, tab, text);
+            }
+        }
+        pressed = Some(own.keys);
+        std::thread::sleep(every);
+    }
+    left_standing(c, tab, text)
 }
 
 fn left_cut(st: &mut St, c: &mut Client, tab: &str, text: &str) {
@@ -2966,6 +3284,10 @@ fn settle_left(
     left
 }
 
+/// What stands of a line aterm typed and could not submit ([`St::left_typed`]) is settled before
+/// anything else is typed: aterm takes its own words back where a read proves them its own and
+/// the person away ([`take_back`], [`Unkeyed::For`]), and the step waits on whatever still
+/// stands (`wait:left-typed:<why>`).
 fn left_first(
     opts: &Opts,
     r: &Report,
@@ -2978,7 +3300,35 @@ fn left_first(
     if st.left_typed.is_empty() {
         return None;
     }
-    let r = match settle_left(st, c, tab, left_standing) {
+    let mut left = settle_left(st, c, tab, left_standing);
+    if left == Left::Kept("unsent") && !opts.dry_run {
+        let text = st.left_typed.clone();
+        left = under_hand(c, tab, None, |c| {
+            take_back(
+                c,
+                tab,
+                &text,
+                Unkeyed::For(opts.human_grace_s),
+                None,
+                opts.timings.fence_every,
+                // What `left_typed` records is a line of the live upgrade's ([`left_cut`]).
+                Lane::Upgrade,
+            )
+        })
+        .unwrap_or(left);
+        if left == Left::Gone {
+            st.left_typed.clear();
+            ledger(
+                opts,
+                &said(r.clone(), "left-typed-cleared"),
+                "a line aterm typed into the composer and could not submit stood there unsent: \
+                 aterm took its own words back, a backspace for each, with nothing of a \
+                 person's among them and no input of theirs since",
+            );
+            save(opts, &sf.session_id, st);
+        }
+    }
+    let r = match left {
         Left::Gone => return None,
         Left::Kept(why) => said(r.clone(), format!("wait:left-typed:{why}")),
     };
@@ -3185,10 +3535,27 @@ pub(super) fn quiet_s(status: Option<&str>, st: &mut St, seq: u64, now: u64) -> 
     }
 }
 
-pub(super) fn type_line(c: &mut Client, sid: &str, line: &str) -> Result<(), Typed> {
+/// The `harness-lane=<word> ` a write of `lane`'s names itself by (THE ONE OBSERVE GATE weighs
+/// it, `agent_image::withholds`), where the host's `help <verb>` names the option: a host older
+/// than the gate would read the word as the write's text.
+fn lane_words(c: &mut Client, verb: &str, lane: Lane) -> String {
+    let named = c.help_counted(verb).is_ok_and(|(head, body)| {
+        crate::is_ok_reply(&head) && (head + &body).contains(agent_image::LANE_OPTION)
+    });
+    if named {
+        format!("{}{} ", agent_image::LANE_OPTION, lane.word())
+    } else {
+        String::new()
+    }
+}
+
+/// Type `line` and Enter into tab `sid` as `lane`'s write ([`lane_words`]).
+pub(super) fn type_line(c: &mut Client, sid: &str, line: &str, lane: Lane) -> Result<(), Typed> {
+    let send = lane_words(c, "send", lane);
+    let key = lane_words(c, "key", lane);
     for request in [
-        format!("@{sid} send -- {line}"),
-        format!("@{sid} key enter"),
+        format!("@{sid} send {send}-- {line}"),
+        format!("@{sid} key {key}enter"),
     ] {
         let reply = c.request_line(&request).map_err(|e| Typed::of_io(&e))?;
         if !crate::is_ok_reply(&reply) {
@@ -3259,7 +3626,7 @@ const NOTICE_KEYS: &str = "typed=1 cadence=2 cap=4096 ";
 /// has drawn the key before it, and gives each wait back to the deadline once it ends, so a
 /// starved agent that keeps drawing is never cut: this is a hang detector for one echo, never a
 /// render budget nor one for their sum (a host older than that give-back holds their sum to
-/// it). A cut leaves aterm's words in the prompt for a person to clear, and the upgrade waits.
+/// it). What a cut leaves of aterm's words in the prompt aterm takes back ([`take_back`]).
 const PRESSED_ECHO_HANG: Duration = Duration::from_secs(60);
 
 /// The `idle= timeout=` words of a turn that types `text` with `keys` ([`TURN_WAIT`] for a paste).
@@ -3316,15 +3683,17 @@ pub(super) fn turn_takes_human(c: &mut Client) -> bool {
 }
 
 /// One turn of `text`, fenced on `generation` (the screen's, or the composer's rows) and on `human`,
-/// the person's input count of the same read: a key since, drawn or not, stops it.
+/// the person's input count of the same read: a key since, drawn or not, stops it. `lane` names
+/// the write ([`lane_words`]).
 pub(super) fn turn_fenced(
     c: &mut Client,
     sid: &str,
     text: &str,
     generation: Option<&str>,
     human: Option<u64>,
+    lane: Lane,
 ) -> Result<(), Typed> {
-    checked_turn(c, sid, text, generation, human, Put::Paste)
+    checked_turn(c, sid, text, generation, human, Put::Paste, lane)
 }
 
 #[cfg(all(test, unix))]
@@ -3334,7 +3703,7 @@ pub(super) fn notice_fenced(
     text: &str,
     generation: Option<&str>,
 ) -> Result<(), Typed> {
-    checked_turn(c, sid, text, generation, None, Put::Pressed)
+    checked_turn(c, sid, text, generation, None, Put::Pressed, Lane::Upgrade)
 }
 
 fn checked_turn(
@@ -3344,10 +3713,12 @@ fn checked_turn(
     generation: Option<&str>,
     human: Option<u64>,
     put: Put,
+    lane: Lane,
 ) -> Result<(), Typed> {
-    checked_turn_for_duty(c, sid, text, generation, human, put, None)
+    checked_turn_for_duty(c, sid, text, generation, human, put, None, lane)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn checked_turn_for_duty(
     c: &mut Client,
     sid: &str,
@@ -3356,7 +3727,9 @@ fn checked_turn_for_duty(
     human: Option<u64>,
     put: Put,
     authority: Option<(super::contract::Scope, u64)>,
+    lane: Lane,
 ) -> Result<(), Typed> {
+    let lane = lane_words(c, "turn", lane);
     let fence = match generation {
         Some(g) if g.starts_with(ROWS_FENCE) => g
             .strip_prefix(ROWS_FENCE)
@@ -3382,30 +3755,37 @@ fn checked_turn_for_duty(
         String::new()
     };
     let wait = turn_wait(keys, text);
-    let authority_words = match authority {
-        None => String::new(),
-        Some((duty, revision)) => {
-            let (head, body) = c
-                .request_counted(&format!("@{sid} status"))
-                .map_err(|e| Typed::of_io(&e))?;
-            let observed =
-                crate::supervise::BuiltinAuthority::from_status(&(head + &body), &hand_name());
-            if observed.revision() != Some(revision) || !observed.keeps(duty) {
-                return Err(Typed::Refused("supervisor input authority".to_string()));
-            }
-            format!(
-                "if-supervisor={} if-supervisor-revision={revision} harness-duty={} ",
-                hand_name(),
-                duty.word()
-            )
-        }
-    };
+    let authority_words = authority_words(c, sid, authority)?;
     let (head, _) = c
         .request_counted(&format!(
-            "@{sid} turn {authority_words}{fence}{person}{keys}{submit}yield=0.2 {wait} {text}"
+            "@{sid} turn {lane}{authority_words}{fence}{person}{keys}{submit}yield=0.2 {wait} {text}"
         ))
         .map_err(|e| Typed::of_io(&e))?;
     turn_verdict(&head)
+}
+
+/// The leading words that claim `authority`, a built-in duty at the revision `status` still
+/// names, for one input request to `sid`; none where the request claims no duty.
+fn authority_words(
+    c: &mut Client,
+    sid: &str,
+    authority: Option<(super::contract::Scope, u64)>,
+) -> Result<String, Typed> {
+    let Some((duty, revision)) = authority else {
+        return Ok(String::new());
+    };
+    let (head, body) = c
+        .request_counted(&format!("@{sid} status"))
+        .map_err(|e| Typed::of_io(&e))?;
+    let observed = crate::supervise::BuiltinAuthority::from_status(&(head + &body), &hand_name());
+    if observed.revision() != Some(revision) || !observed.keeps(duty) {
+        return Err(Typed::Refused("supervisor input authority".to_string()));
+    }
+    Ok(format!(
+        "if-supervisor={} if-supervisor-revision={revision} harness-duty={} ",
+        hand_name(),
+        duty.word()
+    ))
 }
 
 fn turn_verdict(head: &str) -> Result<(), Typed> {
@@ -3847,9 +4227,13 @@ pub(super) struct St {
     /// resume ([`upgrade::Yield::Waits`]); owed to the continuation until it is typed.
     pub(super) ended_waits: Vec<String>,
     /// That this restart came at the deadline and ended the agent's work
-    /// ([`upgrade::Yield::Deadline`]), and what ran under it then as the process table named it
-    /// (empty: nothing it names); owed to the continuation until it is typed.
+    /// ([`upgrade::Yield::Deadline`], or [`upgrade::Yield::Outlasted`] with
+    /// [`Self::ended_held_s`]), and what ran under it then as the process table named it (empty:
+    /// nothing it names); owed to the continuation until it is typed.
     pub(super) ended_work: Option<String>,
+    /// How long the agent's own work had held the round when a restart of a session nothing was
+    /// typed into ended it ([`upgrade::Yield::Outlasted`]); 0: none, or the deadline's form.
+    pub(super) ended_held_s: u64,
     pub(super) work_end_at: Vec<u64>,
     pub(super) goal: bool,
     pub(super) firsts: Vec<(String, u64)>,
@@ -3866,6 +4250,10 @@ pub(super) struct St {
     pub(super) limit_spend: bool,
     pub(super) quiet: bool,
     pub(super) restart_look: bool,
+    /// The watch's last dry look found the move the aged wall's own ([`WALL_RESTART`],
+    /// [`WALL_FRESH`]): the one look at a wall the window's loop offers a point for
+    /// ([`wall_due`]). A wet step clears it ([`Self::note_step`]).
+    pub(super) wall_move: bool,
     /// The relaunch's process was found on the conversation and gone before it came up, and its
     /// stop waits on its native operation's retirement: no look finds that process again, so the
     /// next step ([`super::relaunch::await_new`]) reads that end here.
@@ -4111,12 +4499,39 @@ impl St {
         if !(reached || answered) || !matches!(self.phase, Phase::Announced { .. }) {
             return false;
         }
-        self.owe_release("no-target");
+        self.withdraw("no-target", now);
+        true
+    }
+
+    /// Whether a notice this record's round typed still stands with its agent: an announced
+    /// round the agent was asked in, or a release owed for one. A restart in flight is none: its
+    /// agent is ended, and what it is owed is its carry-on.
+    fn notice_stands(&self) -> bool {
+        !self.native_retired_unissued
+            && !self.in_flight()
+            && (!self.release.is_empty()
+                || (matches!(self.phase, Phase::Announced { .. }) && self.notified()))
+    }
+
+    /// Release an announced round `[harness] upgrade` was switched off under
+    /// ([`SWITCHED_OFF`]): the notice told its agent to stop and wait for a restart no step
+    /// will now make. `false`, the record untouched, for any other.
+    fn release_switched_off(&mut self, now: u64) -> bool {
+        if !(matches!(self.phase, Phase::Announced { .. }) && self.notified()) {
+            return false;
+        }
+        self.withdraw(SWITCHED_OFF, now);
+        true
+    }
+
+    /// Takes an announced round back to pending in a new round, its agent owed the release line
+    /// (`why`): nothing restarts it without asking again first, as that line says.
+    fn withdraw(&mut self, why: &str, now: u64) {
+        self.owe_release(why);
         self.new_round(now);
         self.phase = Phase::Pending;
         self.forget_markers();
         self.noted.clear();
-        true
     }
 
     fn fresh(from: &Version, to: &Candidate, who: Proc<'_>, now: u64) -> St {
@@ -4804,6 +5219,7 @@ impl St {
 
     fn note_step(&mut self, step: &str, status: &str, now: u64) {
         self.restart_look = false;
+        self.wall_move = false;
         if refused(step) {
             if self.refused == 0 {
                 self.refused_at = now;
@@ -5083,11 +5499,13 @@ impl St {
             ("told_at", self.told_at),
             ("deadline_at", self.deadline_at),
             ("deadline_pid", u64::from(self.deadline_pid)),
+            ("ended_held_s", self.ended_held_s),
             ("goal", u64::from(self.goal)),
             ("limit_until", self.limit_until),
             ("quiet", u64::from(self.quiet)),
             ("limit_spend", u64::from(self.limit_spend)),
             ("restart_look", u64::from(self.restart_look)),
+            ("wall_move", u64::from(self.wall_move)),
             ("found_gone", u64::from(self.found_gone)),
         ] {
             o.insert(k.into(), Value::from(v));
@@ -5396,6 +5814,7 @@ impl St {
             ended_work: s("ended_work")
                 .strip_prefix(ENDED_WORK_MARK)
                 .map(str::to_owned),
+            ended_held_s: n("ended_held_s"),
             proc_start: s("proc_start"),
             waits: list("waits")
                 .iter()
@@ -5435,6 +5854,7 @@ impl St {
             quiet: n("quiet") != 0,
             limit_spend: n("limit_spend") != 0,
             restart_look: n("restart_look") != 0,
+            wall_move: n("wall_move") != 0,
             found_gone: n("found_gone") != 0,
         };
         if v.get("progress_key").is_none() {
@@ -5605,6 +6025,19 @@ impl St {
 
     pub(super) fn is_upgrade(&self) -> bool {
         self.cause.is_empty() || self.cause == super::relaunch::CAUSE_UPGRADE_FRESH
+    }
+
+    /// The harness lane this record's writes name themselves by ([`lane_words`]): the
+    /// codex-alab, agy or Muse Code drive by its agent, and for Claude Code the live upgrade or
+    /// a relaunch by its cause.
+    pub(super) fn lane(&self) -> Lane {
+        match self.agent {
+            upgrade::Agent::Codex => Lane::CodexAlab,
+            upgrade::Agent::Agy => Lane::Agy,
+            upgrade::Agent::Muse => Lane::Muse,
+            upgrade::Agent::Claude if self.is_upgrade() => Lane::Upgrade,
+            upgrade::Agent::Claude => Lane::Relaunch,
+        }
     }
 
     pub(super) fn seen_gone(&mut self, now: u64) -> bool {
@@ -5803,6 +6236,7 @@ impl St {
     pub(super) fn unsent(&mut self, back: Unsent) {
         self.ended_waits.clear();
         self.ended_work = None;
+        self.ended_held_s = 0;
         self.account_intent = None;
         self.phase = back.phase;
         self.release = back.release;
@@ -6065,31 +6499,32 @@ fn read_record_text(path: &Path) -> std::io::Result<Option<String>> {
     super::accounts::read_bounded(path, 2 * 1024 * 1024)
 }
 
+/// A pending round this session already reached can close without touching its agent.
+/// A person's live deferral and every unresolved native operation keep their custody.
+fn pending_can_settle(st: &St, running: &Version, now: u64) -> bool {
+    !st.native_retired_unissued
+        && st.phase == Phase::Pending
+        && st.release.is_empty()
+        && !matches!(st.request, Request::DeferUntil(t) if t > now)
+        && Version::parse(&st.to).is_some_and(|to| to <= *running)
+        && !(super::native_restart::coordinated(st)
+            && (st.native.is_some()
+                || !st.native_prepare.is_empty()
+                || st.native_account_candidate.is_some()))
+}
+
 fn forget_settled_pending(
     opts: &Opts,
     session: &str,
     prior: Option<&St>,
     running: &Version,
 ) -> Option<St> {
-    let reached = |st: &St| Version::parse(&st.to).is_some_and(|to| to <= *running);
     let now = now_s();
-    let word_in_force = |st: &St| matches!(st.request, Request::DeferUntil(t) if t > now);
-    let st = prior
-        .filter(|st| {
-            !st.native_retired_unissued && st.phase == Phase::Pending && st.release.is_empty()
-        })
-        .filter(|st| !word_in_force(st))
-        .filter(|st| reached(st))?;
+    let st = prior.filter(|st| pending_can_settle(st, running, now))?;
     if opts.dry_run {
         return None;
     }
     if super::native_restart::coordinated(st) {
-        if st.native.is_some()
-            || !st.native_prepare.is_empty()
-            || st.native_account_candidate.is_some()
-        {
-            return None;
-        }
         let mut closed = st.clone();
         closed.phase = Phase::Done;
         closed.done_at = now;
@@ -6332,6 +6767,17 @@ pub(super) fn build_proved(
     now: u64,
 ) -> Result<(), &'static str> {
     build_start::proved(opts, r, to, now)
+}
+
+pub(super) fn observed_build_start(
+    opts: &Opts,
+    r: &Report,
+    st: &St,
+    sf: &SessionFile,
+    now: u64,
+    confirm: impl FnOnce() -> bool,
+) {
+    build_start::observed_start(opts, r, st, sf, now, confirm);
 }
 
 mod record {
@@ -7154,6 +7600,11 @@ fn needs_upgrade_inspection(sf: &SessionFile, targets: &Targets, prior: Option<&
     let Some(running) = running_version(sf) else {
         return true;
     };
+    // The pending record's last wait ages until a real step closes it. Reaching its build by
+    // another route owes that one visit even when no newer target exists.
+    if prior.is_some_and(|st| pending_can_settle(st, &running, now_s())) {
+        return true;
+    }
     let needed = targets
         .managed
         .iter()
@@ -8800,6 +9251,7 @@ pub fn step(opts: &Opts) -> Report {
         host_roster(&mut c)
     });
     let current = || Report {
+        rung: None,
         pid: 0,
         tab: tab.clone(),
         session: "-".to_string(),
@@ -9153,10 +9605,16 @@ fn tab_agent<'a>(
     tabs: &[LiveTab],
     mut wants: impl FnMut(&SessionFile) -> bool,
     read_args: impl FnMut(u32) -> Option<atpkg::caller_shell::ProcArgs>,
-    read_group: impl FnMut(u32) -> Option<i64>,
+    mut read_group: impl FnMut(u32) -> Option<i64>,
     read_ids: impl FnMut(u32) -> Option<(u32, i64, i64)>,
 ) -> TabAgent<'a> {
+    let front = tabs.iter().find(|t| t.sid == tab).and_then(|t| t.fgpgid);
     let mut leads = false;
+    // A supported record of this tab's own foreground that the attribution could not settle: its
+    // group unread where its pid leads the tab's foreground group, or that group shared by another
+    // tab of the roster. It is undecided, never "no record", which a look past the launch takes
+    // as final ([`no_record`]).
+    let mut unsettled = false;
     let seen = host_candidates(
         files,
         tabs,
@@ -9166,7 +9624,14 @@ fn tab_agent<'a>(
             ours && wants(sf)
         },
         read_args,
-        read_group,
+        |pid| {
+            let group = read_group(pid);
+            unsettled |= front.is_some_and(|front| match group {
+                None => i64::from(pid) == front,
+                Some(group) => group == front,
+            });
+            group
+        },
         read_ids,
     );
     if let Some(sf) = seen
@@ -9174,7 +9639,7 @@ fn tab_agent<'a>(
         .find_map(|c| c.as_ref().ok().map(|(sf, _, _)| *sf))
     {
         TabAgent::Claimed(sf)
-    } else if !seen.is_empty() {
+    } else if !seen.is_empty() || (!leads && unsettled) {
         TabAgent::Unread
     } else if leads {
         TabAgent::Nothing
@@ -9399,6 +9864,7 @@ fn retab(
     save(opts, &sf.session_id, &st);
     if how == Retarget::Rested {
         let r = Report {
+            rung: None,
             pid: sf.pid,
             tab: tab.to_string(),
             session: sf.session_id.clone(),
@@ -9410,6 +9876,7 @@ fn retab(
     }
     if Version::parse(&old).as_ref() != Some(&target.version) {
         let r = Report {
+            rung: None,
             pid: sf.pid,
             tab: tab.to_string(),
             session: sf.session_id.clone(),
@@ -9490,6 +9957,11 @@ pub const IDLE_RUN_GAP_S: u64 = LATER[LATER.len() - 1].as_secs() + upgrade::QUIE
 
 /// How soon a session whose step waited on a person's hold ([`upgrade::person_hold`]) is looked at again, however long it has waited.
 pub const HOLD_LOOK: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How soon a session whose step found the upgrade's own state unusable ([`After::Broken`]) is
+/// looked at again: the ladder's slowest rung, so a folder unwritable for a while holds an idle
+/// session's move a rung at a time, never until its next activation notice.
+pub const BROKEN_LOOK: std::time::Duration = LATER[LATER.len() - 1];
 
 const _: () = assert!(upgrade::HOLD_GAP_S >= 2 * HOLD_LOOK.as_secs());
 
@@ -9691,16 +10163,18 @@ pub const OWNED_BACKGROUND_LOOKS: u32 = 3;
 /// How many quick looks in a row the upgrade may own the session's turn ends for.
 pub const OWNED_SETTLE_LOOKS: u32 = 2;
 
-/// How many turn ends one quiet round's settle may hold ([`quiet_settle_owned`]).
+/// How many turn ends a quiet round's settle may hold at each higher urgency rung
+/// ([`quiet_settle_owned`]).
 pub const QUIET_SETTLE_POINTS: u32 = 3;
 
 /// Whether a quiet round's settle (`wait:settling` under the quiet flow) owns the session's turn
 /// end after a look. `looks` counts the bounded waits at this point before it (since the last
-/// turn, any word's), `held` the turn ends this round's settle has held, and `this_held` says
+/// turn, any word's), `held` the turn ends held since this round's last urgency rise, and `this_held` says
 /// whether this point is one of them. Each turn end is held for at most [`OWNED_SETTLE_LOOKS`]
-/// looks, each [`first_look`] apart ([`after_quiet_settle`]), and a round holds at most
-/// [`QUIET_SETTLE_POINTS`] turn ends; a turn starts the looks over but not the round's count, which
-/// only the round's next act, word or nothing due starts over. Refines `UpgradeQuietSettleTurnEnd`.
+/// looks, each [`first_look`] apart ([`after_quiet_settle`]), and each higher rung grants at most
+/// [`QUIET_SETTLE_POINTS`] turn ends, including this point if already held. A rise renews no
+/// point's looks; a turn starts the looks over without renewing the turn-end budget. The round's
+/// next act, word or nothing due starts both counts over. Refines `UpgradeQuietSettleTurnEnd`.
 #[must_use]
 pub const fn quiet_settle_owned(looks: u32, held: u32, this_held: bool) -> bool {
     looks < OWNED_SETTLE_LOOKS && (this_held || held < QUIET_SETTLE_POINTS)
@@ -9873,6 +10347,7 @@ fn sweep_with_lanes(
         Ok(lock) => lock,
         Err(why) => {
             return vec![Report {
+                rung: None,
                 pid: 0,
                 tab: "-".to_string(),
                 session: "-".to_string(),
@@ -10101,6 +10576,7 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
     );
     let Some(files) = homes.roster(claude_records(&opts.home)) else {
         return vec![Report {
+            rung: None,
             pid: 0,
             tab: "-".to_string(),
             session: "-".to_string(),
@@ -10137,6 +10613,7 @@ fn claude_pass(opts: &Opts, live_tabs: Option<&[LiveTab]>) -> Vec<Report> {
     for sid in &homes.unnamed {
         if !reports.iter().any(|r| r.tab == *sid) {
             reports.push(Report {
+                rung: None,
                 pid: 0,
                 tab: sid.clone(),
                 session: "-".to_string(),
@@ -10348,6 +10825,7 @@ pub fn in_flight_agent(opts: &Opts) -> Option<upgrade::Agent> {
 
 fn blank(sf: &SessionFile) -> Report {
     Report {
+        rung: None,
         pid: sf.pid,
         tab: "-".to_string(),
         session: sf.session_id.clone(),
@@ -10721,6 +11199,7 @@ fn visit_build(
         Some(Vec::new())
     };
     let own = own_at(&facts, own_held.as_deref());
+    facts.follows_only = follows_at(&facts, own_held.as_deref());
     let own_held = own_held.unwrap_or_default();
     facts.waits_only = matches!(own, upgrade::Own::Waits(_));
     facts.deadline_set = st.deadline_at != 0 && st.deadline_pid == sf.pid;
@@ -10770,9 +11249,24 @@ fn visit_build(
         .transcript(&sf.session_id)
         .map(|p| tail_to_end(&p, TAIL_BYTES));
     let tail = recent.as_ref().map(|(text, _)| text.as_str());
-    let rearmed = login_facts(&records, &sf.session_id, &mut st, &mut facts, tail, now);
+    let rearmed = login_facts(
+        &records,
+        &sf.session_id,
+        &mut st,
+        &mut facts,
+        tail,
+        looked_hand,
+        now,
+    );
     let asked = st.request_for(&tab);
     let requeued = queue_facts(&mut st, &mut facts, tail, now, &asked);
+    facts.limit_s = wall_age(
+        facts.limited,
+        &facts,
+        tail.and_then(upgrade::transcript_limit_since),
+        looked_hand,
+        now,
+    );
     let ready = heard(&st, sf, &tab, tail);
     ready_facts(&st, sf, &tab, tail, ready, &mut facts);
     st.time_ready(ready, &mut facts, now);
@@ -10787,6 +11281,9 @@ fn visit_build(
         _ => st.phase.clone(),
     };
     let taken_back = asked_about != st.phase;
+    r.rung = Some(upgrade::rung_in_force(&upgrade::requested_facts(
+        &request, &facts,
+    )));
     let mut step = upgrade::requested_step(&request, &asked_about, &facts, ready, now, &st.to);
     if opts.background {
         step = upgrade::break_step(step, &facts);
@@ -10799,6 +11296,9 @@ fn visit_build(
     {
         rearmed_here = Some(rearm(opts, r.clone(), &mut st, now));
         let request = st.request_for(&tab);
+        r.rung = Some(upgrade::rung_in_force(&upgrade::requested_facts(
+            &request, &facts,
+        )));
         step = upgrade::requested_step(&request, &st.phase, &facts, false, now, &st.to);
         asked_about = st.phase.clone();
     }
@@ -10958,6 +11458,7 @@ fn visit_build(
                     Some(&retry),
                     Put::Pressed,
                     opts.timings.fence_every,
+                    Lane::Upgrade,
                 ) {
                     Ok(()) => Ok(marker),
                     Err(Typed::Cut(why)) => {
@@ -11008,6 +11509,10 @@ fn visit_build(
                 now,
             )
         }
+        Step::Terminate if opts.dry_run && upgrade::walls_outlasted(&facts) => {
+            said(r, WALL_RESTART)
+        }
+        Step::Fresh if opts.dry_run && upgrade::walls_outlasted(&facts) => said(r, WALL_FRESH),
         Step::Terminate if opts.dry_run => said(r, "would-restart"),
         Step::Fresh if opts.dry_run => said(r, "would-restart:fresh"),
         Step::Terminate | Step::Fresh => {
@@ -11033,7 +11538,10 @@ fn visit_build(
             let ended_work =
                 (pressed && !facts.background.is_empty() && !opts.press.is_some_and(|p| p.off))
                     || over.is_some();
-            let quiet = unasked && !owed_here;
+            // A move at a wall past its bound (`upgrade::login_holds`, `upgrade::limit_holds`)
+            // resumes as it was: nothing is typed after it into a build that starts at the same
+            // wall, and the limit lane carries the session on past a limit's reset.
+            let quiet = (unasked || facts.login || facts.limited) && !owed_here;
             st.quiet = quiet && !ended_work;
             // The waits are this look's, so one that ends by itself before the signal is still
             // started again; the last look before the signal holds what runs then to this list.
@@ -11041,8 +11549,16 @@ fn visit_build(
                 (Some(upgrade::Yield::Waits), upgrade::Own::Waits(commands)) => commands.clone(),
                 _ => Vec::new(),
             };
-            st.ended_work =
-                (over == Some(upgrade::Yield::Deadline)).then(|| upgrade::held_list(&own_held));
+            st.ended_work = matches!(
+                over,
+                Some(upgrade::Yield::Deadline | upgrade::Yield::Outlasted)
+            )
+            .then(|| upgrade::held_list(&own_held));
+            st.ended_held_s = if over == Some(upgrade::Yield::Outlasted) {
+                facts.own_hold_s
+            } else {
+                0
+            };
             if !fresh {
                 (st.model_before, st.mark) = model_and_mark(recent.as_ref());
             }
@@ -11081,6 +11597,7 @@ fn visit_build(
                 // No signal went: nothing ended, and nothing is owed a continuation.
                 st.ended_waits.clear();
                 st.ended_work = None;
+                st.ended_held_s = 0;
             }
             r
         }
@@ -11143,7 +11660,29 @@ fn own_at(f: &Facts, held: Option<&[upgrade::Held]>) -> upgrade::Own {
     upgrade::own_of(held.unwrap_or_default(), screen, held.is_none())
 }
 
+/// Whether all that runs under the agent at look `f` is follows and proved waits
+/// ([`upgrade::follows_only`]), read from the same rows as [`own_at`].
+fn follows_at(f: &Facts, held: Option<&[upgrade::Held]>) -> bool {
+    let screen = f.background.iter().any(|w| w.starts_with("screen:"));
+    upgrade::follows_only(held.unwrap_or_default(), screen, held.is_none())
+}
+
 pub(super) const AT_POINT: char = '@';
+
+/// A dry look's word for the move past a wall that outlasted its bound
+/// ([`upgrade::walls_outlasted`]), the agent's conversation kept: the only move the window's loop
+/// offers a point at a wall for ([`St::wall_move`]).
+pub(super) const WALL_RESTART: &str = "would-restart:wall";
+
+/// [`WALL_RESTART`] for a session with no task, restarted afresh.
+pub(super) const WALL_FRESH: &str = "would-restart:fresh-wall";
+
+/// Whether `word`, a dry look's step, is the move past an outlasted wall ([`WALL_RESTART`],
+/// [`WALL_FRESH`]).
+pub(super) fn wall_step(word: &str) -> bool {
+    let act = word.split_once(AT_POINT).map_or(word, |(act, _)| act);
+    act == WALL_RESTART || act == WALL_FRESH
+}
 
 pub(super) fn rounds_step(word: &str) -> bool {
     let act = word.split_once(AT_POINT).map_or(word, |(act, _)| act);
@@ -11302,7 +11841,10 @@ pub(super) fn press_facts(status: &str, read: &TabRead<'_>) -> Facts {
     Facts {
         status: status.to_string(),
         composer_empty: upgrade::composer_is_empty(&scr.rows, scr.cursor, dim),
-        approval_box: aterm_phase::prompt::prompt_box_span(&scr.rows).is_some(),
+        // A standing `/login` dialog (its picker, the browser or paste hand-off) is the person's
+        // or the login lane's, never a wall a clock ages ([`upgrade::login_holds`]).
+        approval_box: aterm_phase::prompt::prompt_box_span(&scr.rows).is_some()
+            || aterm_phase::login_screen(&scr.rows).is_some(),
         busy_footer: turn_shown(scr),
         held: line.is_none_or(|line| held_by_status(line, 0)),
         limited: upgrade::limited(&scr.rows),
@@ -11439,12 +11981,34 @@ fn wait_note(f: &Facts, seen: &str, holders: usize) -> String {
 
 const GAVE_UP_TAIL_BYTES: u64 = 8 * 1024 * 1024;
 
+/// How long a wall that `stands` at look `f` (its login wall, [`upgrade::Facts::login_s`]; its
+/// usage limit, [`upgrade::Facts::limit_s`]) has stood with nobody at the session: since the first
+/// row of the wall its transcript stands at (`since`: [`upgrade::LoginScan::since`],
+/// [`upgrade::StandingScan::since`]), every look (the watch's dry ones too) reading the same age,
+/// or since a key of the person's (`hand`) after it. Where the key record covers only the time
+/// the host has served the session ([`HandAt::Since`]: aterm started serving it again, say after
+/// its own update), the age runs from that start at the earliest, since a key before it is not
+/// known. A look that sees a person reads 0, keys that cannot be read never age it, and nor does a
+/// wall its transcript does not date (one on the screen alone).
+pub(super) fn wall_age(stands: bool, f: &Facts, since: Option<u64>, hand: HandAt, now: u64) -> u64 {
+    if !stands || upgrade::person_seen(f) {
+        return 0;
+    }
+    let keyed = match hand {
+        HandAt::At(at) | HandAt::Since(at) => now.saturating_sub(at.elapsed().as_secs()),
+        HandAt::Never => 0,
+        HandAt::Unknown => return 0,
+    };
+    since.map_or(0, |since| now.saturating_sub(since.max(keyed)))
+}
+
 fn login_facts(
     records: &Records,
     session: &str,
     st: &mut St,
     f: &mut Facts,
     tail: Option<&str>,
+    hand: HandAt,
     now: u64,
 ) -> Option<Phase> {
     let said = tail.map_or_else(upgrade::TranscriptLogin::default, |t| {
@@ -11454,6 +12018,7 @@ fn login_facts(
         f.login = true;
         st.phase = upgrade::clock_held(&st.phase, f, now);
     }
+    f.login_s = wall_age(f.login, f, said.since, hand, now);
     if let Some(lifted) = said.lifted_at {
         let _ = st.hold_clock(lifted);
     }
@@ -11491,14 +12056,19 @@ fn queue_facts(
     let Some(text) = tail else {
         return false;
     };
-    let until = upgrade::transcript_limit_until(text);
-    let reset = upgrade::transcript_limit_reset(text);
+    let standing = upgrade::StandingScan::of(text);
+    let (until, reset) = (standing.until(), standing.reset());
     st.limit_until = reset.unwrap_or(0);
-    st.limit_spend = upgrade::transcript_limit_spend(text);
+    st.limit_spend = standing.spend();
     if f.quiet && reset.is_some_and(|reset| now >= reset.saturating_add(LIMIT_GRACE_S)) {
         f.limited = false;
     }
-    if until.is_some_and(|until| until > now) {
+    // In the quiet flow, which asks nothing again, a limit that names no reset stands as long as
+    // its row does: that is how long the window's loop withholds its points for it
+    // (`StandingLimit::until` none), so its age ends it for the upgrade (`upgrade::limit_holds`),
+    // not the re-ask past its row that the ask flow's notice keeps (`REASK_S`).
+    let standing_unnamed = f.quiet && reset.is_none() && standing.limit().is_some();
+    if until.is_some_and(|until| until > now) || standing_unnamed {
         f.limited = true;
         st.phase = upgrade::clock_held(&st.phase, f, now);
     }
@@ -11590,7 +12160,15 @@ fn release(
         return owed(r, "tab-ownership-changed");
     }
     let text = upgrade::release_prompt(st.agent, f.quiet);
-    match type_fenced(c, tab, &text, None, Put::Pressed, opts.timings.fence_every) {
+    match type_fenced(
+        c,
+        tab,
+        &text,
+        None,
+        Put::Pressed,
+        opts.timings.fence_every,
+        Lane::Upgrade,
+    ) {
         Ok(()) => {
             let why = st.release.clone();
             st.released();
@@ -11709,6 +12287,7 @@ fn tell(
                 *keyed = true;
                 Ok(())
             },
+            Lane::Upgrade,
         )
     };
     match typed {
@@ -11958,6 +12537,7 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
             continue; // `visit` has it, or the loop's `resume`.
         }
         let r = Report {
+            rung: None,
             pid: st.pid,
             tab: st.tab.clone(),
             session: session.clone(),
@@ -12023,6 +12603,26 @@ fn orphans(opts: &Opts, files: &[SessionFile], live_tabs: Option<&[LiveTab]>) ->
             continue;
         }
         if opts.press.is_some() && !st.is_upgrade() {
+            continue;
+        }
+        // An exit read past its restart's signal deadline is settled before anything here stamps
+        // the exit or a hand's sight, either of which would let the restart claim the person's
+        // own end ([`super::relaunch::settle_past_signal`]), as the host's first sight settles it.
+        if super::relaunch::exit_past_signal(&st, now_s()) {
+            if let Some(client) = native_client.as_mut()
+                && let Some(wait) =
+                    super::relaunch::native_retirement_wait(opts, &r, &mut st, &session, client)
+            {
+                out.push(wait);
+                continue;
+            }
+            out.push(super::relaunch::settle_past_signal(
+                opts,
+                r,
+                &mut st,
+                &session,
+                now_s(),
+            ));
             continue;
         }
         if hand_waits_out(opts, &mut st, &session, alive) {
@@ -12500,7 +13100,11 @@ fn composer_rows(scr: &Screen) -> Option<aterm_types::control_verbs::RowsFence> 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum HandAt {
     Unknown,
+    /// No key since the host began serving the session, with no span reported.
     Never,
+    /// No key since this instant, when the host began serving the session
+    /// ([`HumanInput::NeverFor`]); what came before it is not known.
+    Since(Instant),
     At(Instant),
 }
 
@@ -12508,7 +13112,10 @@ impl HandAt {
     pub(super) fn of(human: HumanInput) -> HandAt {
         match human {
             HumanInput::Unknown => HandAt::Unknown,
-            HumanInput::Never | HumanInput::NeverFor(_) => HandAt::Never,
+            HumanInput::Never => HandAt::Never,
+            HumanInput::NeverFor(ms) => Instant::now()
+                .checked_sub(Duration::from_millis(ms))
+                .map_or(HandAt::Unknown, HandAt::Since),
             HumanInput::Ago(ms) => Instant::now()
                 .checked_sub(Duration::from_millis(ms))
                 .map_or(HandAt::Unknown, HandAt::At),
@@ -12517,7 +13124,7 @@ impl HandAt {
 
     pub(super) fn still(self, later: HandAt) -> bool {
         match (self, later) {
-            (_, HandAt::Never) => true,
+            (_, HandAt::Never | HandAt::Since(_)) => true,
             (HandAt::At(then), HandAt::At(now)) => now <= then + HAND_SLACK,
             _ => false,
         }
@@ -12611,6 +13218,7 @@ fn same_composer(a: &Screen, b: &Screen) -> bool {
     a.cursor == b.cursor && a.first == b.first && caret(a) == caret(b)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn type_fenced(
     c: &mut Client,
     tab: &str,
@@ -12618,12 +13226,14 @@ pub(super) fn type_fenced(
     retry: Option<&Retry>,
     put: Put,
     fence_every: Duration,
+    lane: Lane,
 ) -> Result<(), Typed> {
-    type_fenced_then(c, tab, text, retry, put, fence_every, &mut || Ok(()))
+    type_fenced_then(c, tab, text, retry, put, fence_every, &mut || Ok(()), lane)
 }
 
 /// A private built-in semantic input operation. Its exact duty/revision is pinned across
-/// screen checks and retries; every actual `turn` remains one server-side logical batch.
+/// screen checks and retries; every actual `turn` remains one server-side logical batch, named
+/// as `lane`'s write ([`lane_words`]).
 pub(super) fn type_fenced_for_duty(
     c: &mut Client,
     tab: &str,
@@ -12631,6 +13241,7 @@ pub(super) fn type_fenced_for_duty(
     duty: super::contract::Scope,
     put: Put,
     fence_every: Duration,
+    lane: Lane,
 ) -> Result<(), Typed> {
     if !matches!(
         duty,
@@ -12657,12 +13268,14 @@ pub(super) fn type_fenced_for_duty(
         fence_every,
         &mut || Ok(()),
         Some((duty, revision)),
+        lane,
     )
 }
 
 /// [`type_fenced`], calling `before_keys` once the fence is read and right before each try's
 /// keys are sent: an error from it types nothing and is the result. Every refusal before it
 /// typed nothing; an error after it may follow keys the server took.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn type_fenced_then(
     c: &mut Client,
     tab: &str,
@@ -12671,8 +13284,19 @@ pub(super) fn type_fenced_then(
     put: Put,
     fence_every: Duration,
     before_keys: &mut dyn FnMut() -> Result<(), Typed>,
+    lane: Lane,
 ) -> Result<(), Typed> {
-    type_fenced_then_for_duty(c, tab, text, retry, put, fence_every, before_keys, None)
+    type_fenced_then_for_duty(
+        c,
+        tab,
+        text,
+        retry,
+        put,
+        fence_every,
+        before_keys,
+        None,
+        lane,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -12685,6 +13309,7 @@ fn type_fenced_then_for_duty(
     fence_every: Duration,
     before_keys: &mut dyn FnMut() -> Result<(), Typed>,
     authority: Option<(super::contract::Scope, u64)>,
+    lane: Lane,
 ) -> Result<(), Typed> {
     let mut hand = Hand::take(c, tab).ok_or_else(|| Typed::Refused("held".to_string()))?;
     let out = (|| {
@@ -12715,11 +13340,20 @@ fn type_fenced_then_for_duty(
                 read.human_seq,
                 put,
                 authority,
+                lane,
             );
             match typed {
                 Ok(()) => return Ok(()),
                 Err(Typed::Changed) if again => std::thread::sleep(fence_every),
-                Err(e) => return Err(e),
+                Err(e) => {
+                    if let (Typed::Cut(_), Some(fenced)) = (&e, read.human_seq) {
+                        // Still under the hand: what the stopped turn typed is taken back
+                        // while its own fence proves every glyph of it the turn's.
+                        let proof = Unkeyed::Since(fenced);
+                        let _ = take_back(c, tab, text, proof, authority, fence_every, lane);
+                    }
+                    return Err(e);
+                }
             }
         }
     })();
@@ -12820,14 +13454,14 @@ fn restart(
         Some(upgrade::Yield::Waits) => {
             press_lets_signal(read) && aterm_phase::phase::unlisted_work(&read.rows).is_none()
         }
-        Some(upgrade::Yield::Deadline) => press_lets_signal(read),
+        Some(upgrade::Yield::Deadline | upgrade::Yield::Outlasted) => press_lets_signal(read),
         None => turn_over_shown(read, lagging),
     };
     // What runs under the agent at the last look: nothing, unless a press or the deadline moves
     // over it, or only waits whose commands the continuation carries.
     let own_lets_signal = |st: &St| match over {
         _ if pressed => true,
-        Some(upgrade::Yield::Deadline) => true,
+        Some(upgrade::Yield::Deadline | upgrade::Yield::Outlasted) => true,
         Some(upgrade::Yield::Waits) => {
             k.restart_held(sf.pid)
                 .is_some_and(|held| match upgrade::own_of(&held, false, false) {
@@ -13163,6 +13797,10 @@ fn restart(
         } else if over == Some(upgrade::Yield::Deadline) {
             "SIGTERM (the deadline it was told has passed: what still ran under it ends with it, \
              and the continuation names it)"
+        } else if over == Some(upgrade::Yield::Outlasted) {
+            "SIGTERM (its task finished, so no line was typed: its own background work held the \
+             upgrade past the bound a told deadline would have; what still ran under it ends with \
+             it, and the continuation names it)"
         } else if quiet {
             "SIGTERM (idle: nothing asked or typed; resumed as it was)"
         } else {
@@ -13231,6 +13869,7 @@ pub fn close_looks(opts: &Opts) -> Option<Report> {
         Ok(lock) => lock,
         Err(why) => {
             return Some(Report {
+                rung: None,
                 pid: 0,
                 tab: tab.clone(),
                 session: "-".to_string(),
@@ -13246,9 +13885,175 @@ pub fn close_looks(opts: &Opts) -> Option<Report> {
         .or_else(|| closed.into_iter().next())
 }
 
+/// Why a release is owed to an agent whose announced round `[harness] upgrade` was switched off
+/// under ([`release_notice`]): `release=switched-off`, `released:switched-off`.
+pub const SWITCHED_OFF: &str = "switched-off";
+
+/// Whether a notice the upgrade typed into tab `opts.only_sid`'s agent still stands in one of
+/// the tab's records ([`St::notice_stands`]): what [`release_notice`] gives back. It reads the
+/// records alone and asks no socket, so a host may ask it where no idle point is yet owed (a
+/// worker that starts with `[harness] upgrade` off, which no step parks for its next idle point).
+#[must_use]
+pub fn notice_stands(opts: &Opts) -> bool {
+    let Some(tab) = opts.only_sid.as_deref() else {
+        return false;
+    };
+    read_upgrade_dir(&opts.state).is_ok_and(|dir| {
+        dir.flatten().any(|e| {
+            let path = e.path();
+            path.extension().is_some_and(|x| x == "json")
+                && path
+                    .file_stem()
+                    .is_some_and(|session| notice_stands_in(opts, tab, &session.to_string_lossy()))
+        })
+    })
+}
+
+/// Whether session `session`'s record is tab `tab`'s and a notice of its stands.
+fn notice_stands_in(opts: &Opts, tab: &str, session: &str) -> bool {
+    load_record(opts, session)
+        .ok()
+        .flatten()
+        .is_some_and(|st| st.tab == tab && st.notice_stands())
+}
+
+/// What a notice already typed into tab `opts.only_sid`'s agent is owed where no upgrade step
+/// runs to pay it (`[harness] upgrade` off): the release line. The notice told the agent to stop
+/// its watch loops, start no long-running work and wait for a restart; with the switch off no
+/// step makes that restart, hears its READY or gives the round up, so its idle point gives the
+/// conversation back here. An announced round is taken back to pending, its release owed
+/// ([`SWITCHED_OFF`]), and a release already owed (a round that gave up, was voided or stopped)
+/// is typed as it stands, each under every gate a release is typed under at an upgrade's step
+/// ([`release_visit`]: an idle, settled tab, no person, box or draft, the process the notice
+/// reached). It begins nothing: no notice, no tell, no restart, and a round that asked its agent
+/// nothing (pending, or stopped with no release owed) is left as it lay, with no socket asked.
+/// `None` where nothing is owed; `released:<why>` where the line was typed; `wait:release:<why>`
+/// or `busy:<why>` where it stands owed, which its host looks at again later: with the switch
+/// off no other step comes back to it.
+#[must_use]
+pub fn release_notice(opts: &Opts) -> Option<Report> {
+    let tab = opts.only_sid.as_deref()?;
+    let stands = |session: &str| notice_stands_in(opts, tab, session);
+    if opts.dry_run || !notice_stands(opts) || !lane_on(opts, upgrade::Agent::Claude) {
+        return None;
+    }
+    let owed = |why: &str| Report {
+        pid: 0,
+        tab: tab.to_string(),
+        session: "-".to_string(),
+        from: "-".to_string(),
+        to: "-".to_string(),
+        step: why.to_string(),
+        rung: None,
+    };
+    let Ok(mut c) = connect(opts, tab) else {
+        return Some(owed("wait:release:no-socket"));
+    };
+    if status_line(&mut c, tab).is_some_and(|l| self_claimed_by_status(&l)) {
+        return None;
+    }
+    let Some(tabs) = host_roster(&mut c).filter(|tabs| tab_is_live(tabs, tab)) else {
+        return Some(owed("wait:release:tab-not-live"));
+    };
+    drop(c);
+    let _held = match sweep_lock(opts) {
+        Ok(lock) => lock,
+        Err(why) => return Some(owed(&format!("busy:{why}"))),
+    };
+    let homes = Homes::read(
+        opts,
+        Some(&tabs),
+        atpkg::caller_shell::process_args,
+        aterm_sysprobe::process_cwd,
+    );
+    let Some(files) = homes.roster(claude_records(&opts.home)) else {
+        return Some(owed(&format!("wait:release:{UNREAD_FILES}")));
+    };
+    let candidates = host_candidates(
+        &files,
+        &tabs,
+        |sf, its| its == tab && stands(&sf.session_id),
+        atpkg::caller_shell::process_args,
+        process_group,
+        ids,
+    );
+    let mut t = None;
+    let mut reports = Vec::new();
+    for candidate in candidates {
+        match candidate {
+            Ok((sf, _, claim)) => {
+                let t = t.get_or_insert_with(table);
+                reports.extend(release_off(
+                    opts,
+                    sf,
+                    Some(&files),
+                    t,
+                    &Live,
+                    &claim.tab,
+                    Some(&claim),
+                ));
+            }
+            Err(wait) => reports.push(said(wait, format!("wait:release:{UNREAD_PROCESS}"))),
+        }
+    }
+    let act = reports.iter().position(Report::is_act);
+    act.map(|at| reports.swap_remove(at))
+        .or_else(|| reports.into_iter().next())
+}
+
+/// [`release_notice`]'s visit of session `sf`, the agent tab `tab` runs (`host_claim`, the tab's
+/// claim on its process, where the host's roster made it): the release its record's notice is
+/// owed, typed or left owed ([`release_visit`]). `None`, the
+/// record as it lay, where no notice of its stands ([`St::notice_stands`]) or the notice an
+/// announced round typed reached another process than this one: nothing was asked of this one,
+/// and the step a switch turned back on takes reopens that round.
+fn release_off(
+    opts: &Opts,
+    sf: &SessionFile,
+    files: Option<&[SessionFile]>,
+    t: &[ProcRow],
+    k: &dyn Kernel,
+    tab: &str,
+    host_claim: Option<&HostClaim>,
+) -> Option<Report> {
+    let r = Report {
+        tab: tab.to_string(),
+        ..blank(sf)
+    };
+    if !alive(sf.pid) || kernel_start(sf.pid).as_deref() != Some(squash(&sf.proc_start).as_str()) {
+        return None;
+    }
+    let mut st = load_record(opts, &sf.session_id)
+        .ok()
+        .flatten()
+        .filter(|st| st.tab == tab && st.notice_stands())?;
+    let r = Report {
+        to: format!("{}({})", st.to, st.source),
+        ..r
+    };
+    if let Err(why) =
+        preliminary_unique_owner(files, sf).and_then(|()| require_unique_owner(&opts.home, sf))
+    {
+        return Some(said(r, format!("wait:release:{why}")));
+    }
+    if st.release.is_empty() {
+        if !st.notice_belongs_to(sf, tab) {
+            return None;
+        }
+        if !st.release_switched_off(now_s()) {
+            return None;
+        }
+        if save_checked(opts, &sf.session_id, &st).is_err() {
+            return Some(said(r, "wait:release:unsaved"));
+        }
+    }
+    Some(release_visit(opts, r, sf, st, tab, t, k, host_claim))
+}
+
 /// The report a look's close is said under: its own conversation and resumed agent.
 fn look_report(st: &St, session: &str) -> Report {
     Report {
+        rung: None,
         pid: st.resumed_pid,
         tab: st.tab.clone(),
         session: session.to_string(),

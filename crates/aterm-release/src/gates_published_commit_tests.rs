@@ -21,137 +21,6 @@ fn changelog_gate_at(
     super::changelog_gate_at(git, commit, version, &catalog)
 }
 
-/// Object replies are immutable; retain them once during the full-history
-/// replay rather than repeatedly inflating the same gigabytes of blobs.
-struct ReplayGit<'a> {
-    inner: &'a dyn GitRunner,
-    objects: std::cell::RefCell<std::collections::BTreeMap<String, Vec<u8>>>,
-    sizes: std::cell::RefCell<std::collections::BTreeMap<String, Vec<u8>>>,
-    ancestry: std::cell::RefCell<std::collections::BTreeMap<(String, String), i32>>,
-    last_history: std::cell::RefCell<Option<(String, Vec<u8>)>>,
-}
-
-impl GitRunner for ReplayGit<'_> {
-    fn git(&self, args: &[&str]) -> Result<crate::ledger::RunOut> {
-        let history = (args.contains(&"--diff-merges=separate") && args.contains(&"--raw"))
-            .then(|| args[args.len() - 3].to_owned());
-        if let Some(commit) = &history
-            && let Some((at, stdout)) = self.last_history.borrow().as_ref()
-            && at == commit
-        {
-            return Ok(crate::ledger::RunOut {
-                status: 0,
-                stdout: stdout.clone(),
-                stderr: Vec::new(),
-            });
-        }
-        let ancestry = (args.len() >= 4
-            && args[args.len() - 4..args.len() - 2] == ["merge-base", "--is-ancestor"])
-        .then(|| {
-            (
-                args[args.len() - 2].to_owned(),
-                args[args.len() - 1].to_owned(),
-            )
-        });
-        if let Some(key) = &ancestry
-            && let Some(status) = self.ancestry.borrow().get(key)
-        {
-            return Ok(crate::ledger::RunOut {
-                status: *status,
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            });
-        }
-        let args: Vec<_> = ["--no-lazy-fetch", "--no-replace-objects"]
-            .into_iter()
-            .chain(args.iter().copied())
-            .collect();
-        let out = self.inner.git(&args)?;
-        if let Some(commit) = history
-            && out.success()
-        {
-            *self.last_history.borrow_mut() = Some((commit, out.stdout.clone()));
-        }
-        if let Some(key) = ancestry
-            && matches!(out.status, 0 | 1)
-        {
-            self.ancestry.borrow_mut().insert(key, out.status);
-        }
-        Ok(out)
-    }
-
-    fn git_input(&self, args: &[&str], input: &[u8]) -> Result<crate::ledger::RunOut> {
-        let specs = std::str::from_utf8(input).unwrap();
-        if args.ends_with(&["cat-file", "--batch"])
-            && !specs.lines().all(|spec| spec.contains("^{commit}:"))
-        {
-            return self.inner.git_input(args, input);
-        }
-        let cache = if args.ends_with(&["cat-file", "--batch"]) {
-            &self.objects
-        } else if args.ends_with(&["cat-file", "--batch-check"]) {
-            &self.sizes
-        } else {
-            return self.inner.git_input(args, input);
-        };
-        let retained = cache.borrow();
-        if specs.lines().all(|spec| retained.contains_key(spec)) {
-            let mut stdout = Vec::new();
-            for spec in specs.lines() {
-                stdout.extend_from_slice(&retained[spec]);
-            }
-            return Ok(crate::ledger::RunOut {
-                status: 0,
-                stdout,
-                stderr: Vec::new(),
-            });
-        }
-        let missing: String = specs
-            .lines()
-            .filter(|spec| !retained.contains_key(*spec))
-            .map(|spec| format!("{spec}\n"))
-            .collect();
-        drop(retained);
-        let out = self.inner.git_input(args, missing.as_bytes())?;
-        if !out.success() {
-            return Ok(out);
-        }
-        let mut rest = out.stdout.as_slice();
-        let mut retained = cache.borrow_mut();
-        for spec in missing.lines() {
-            let newline = rest.iter().position(|b| *b == b'\n').unwrap();
-            let header = std::str::from_utf8(&rest[..newline]).unwrap();
-            let size = if args.ends_with(&["cat-file", "--batch"]) && !header.ends_with(" missing")
-            {
-                header
-                    .split_whitespace()
-                    .nth(2)
-                    .unwrap()
-                    .parse::<usize>()
-                    .unwrap()
-                    + 1
-            } else {
-                0
-            };
-            let length = newline + 1 + size;
-            retained
-                .entry(spec.to_owned())
-                .or_insert_with(|| rest[..length].to_vec());
-            rest = &rest[length..];
-        }
-        assert!(rest.is_empty());
-        let mut stdout = Vec::new();
-        for spec in specs.lines() {
-            stdout.extend_from_slice(&retained[spec]);
-        }
-        Ok(crate::ledger::RunOut {
-            status: 0,
-            stdout,
-            stderr: Vec::new(),
-        })
-    }
-}
-
 struct Repo {
     root: aterm_tempfile::TempDir,
 }
@@ -256,10 +125,11 @@ fn release_notes_harness_predecessor_is_the_public_object() {
     ] {
         // The candidate's stale copied history claims only 0.30. The
         // immutable public object, not that copy, decides both rules.
+        // A recut ships its rolled section as it stands, so its announcement is judged.
         let current = format!(
-            "## [Unreleased]\n\n- new fix\n\n- **Harness versions since v{base}: `alab claude harness {announced}`.**\n\n## [{older}] - date\n\n- `alab claude harness 0.30` was announced.\n"
+            "## [Unreleased]\n\n## [0.195.0] - date\n\n- new fix\n\n- **Harness versions since v{base}: `alab claude harness {announced}`.**\n\n## [{older}] - date\n\n- `alab claude harness 0.30` was announced.\n"
         );
-        assert!(changelog::gate_unreleased(&current).is_ok());
+        assert!(changelog::gate_section(&current, "0.195.0").is_ok());
         let commit = repo.commit(
             "candidate notes",
             &[
@@ -285,90 +155,129 @@ fn release_notes_harness_predecessor_is_the_public_object() {
     }
 }
 
-/// Real main, 2026-11-10: a branch dropped its own entry to take main's changelog, the
-/// entry landed again afterwards, and a peer that forked before the entry merged main.
-/// Against the peer's parent that merge adds the entry, but its copy comes from main,
-/// which already saw the removal, so it is the author's current text and not stale.
+/// A SHIPPED ENTRY A MERGE BRINGS BACK UNDER `[Unreleased]` IS REFUSED BY ITS RELEASE'S TAG,
+/// whatever main's own copy of the section says.
+/// NEGATIVE CONTROL: before the tag holds it, the same window passes.
 #[test]
-fn an_entry_reauthored_after_its_removal_is_not_resurrected_by_a_later_merge() {
-    let repo = Repo::new("note-reauthored");
+fn a_shipped_entry_merged_back_under_unreleased_is_refused_by_its_tag() {
+    let repo = Repo::new("note-merged-back");
     let bare = "## [Unreleased]\n\n## [0.1.0] - date\n\n- older change\n";
-    repo.commit("no notes yet", &[("CHANGELOG.md", bare)]);
-    repo.run(&["branch", "peer"]);
-    let noted = bare.replace(
-        "## [Unreleased]\n\n",
-        "## [Unreleased]\n\n### Fixed\n\n- **Idle node.** Polls less often.\n\n",
-    );
-    repo.commit("note", &[("CHANGELOG.md", &noted)]);
-    repo.commit("take main's notes", &[("CHANGELOG.md", bare)]);
-    repo.commit("the note lands after", &[("CHANGELOG.md", &noted)]);
-    repo.run(&["checkout", "-q", "peer"]);
-    repo.commit("peer change", &[("peer", "peer work")]);
-    repo.run(&["merge", "--no-ff", "-qm", "peer merges main", "main"]);
-    changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
-}
-
-/// Real main, 2026-11-10 (447aa1deaa5, then 466277007c5): a branch's merge of main put
-/// main's new release heading above the branch's unreleased entry, so for a minute the
-/// entry sat under a release that never shipped it; the next merge moved it back. The
-/// entry never left the changelog, so that move is no removal. A shipped copy merged
-/// back stays refused: the release section still holds it.
-#[test]
-fn an_entry_a_merge_misplaces_under_a_release_and_the_next_moves_back_is_not_resurrected() {
-    let repo = Repo::new("note-misplaced");
-    let bare = "## [Unreleased]\n\n## [0.1.0] - date\n\n- older change\n";
-    repo.commit("no notes yet", &[("CHANGELOG.md", bare)]);
-    repo.run(&["branch", "branch"]);
-    let released = bare.replace(
-        "## [Unreleased]\n\n",
-        "## [Unreleased]\n\n## [0.2.0] - date\n\n- Main's shipped change.\n\n",
-    );
-    repo.commit("release 0.2.0", &[("CHANGELOG.md", &released)]);
-    repo.run(&["checkout", "-q", "branch"]);
     let entry = "- **Sessions keep their model.** A restart keeps the launch's `--model`.\n";
-    let noted = bare.replace(
+    let shipped = bare.replace(
         "## [Unreleased]\n\n",
-        &format!("## [Unreleased]\n\n{entry}\n"),
+        &format!("## [Unreleased]\n\n## [0.2.0] - date\n\n{entry}\n"),
     );
-    repo.commit("branch note", &[("CHANGELOG.md", &noted)]);
-    repo.run(&["merge", "--no-ff", "--no-commit", "-s", "ours", "main"]);
-    let misplaced = released.replace(
-        "## [0.2.0] - date\n\n",
-        &format!("## [0.2.0] - date\n\n{entry}\n"),
-    );
-    repo.commit("merge misplaces the note", &[("CHANGELOG.md", &misplaced)]);
-    repo.run(&["checkout", "-q", "main"]);
-    repo.commit("main moves", &[("main", "work")]);
-    repo.run(&["checkout", "-q", "branch"]);
-    repo.run(&["merge", "--no-ff", "--no-commit", "-s", "ours", "main"]);
-    let repaired = released.replace(
-        "## [Unreleased]\n\n",
-        &format!("## [Unreleased]\n\n{entry}\n"),
-    );
-    repo.commit(
-        "the next merge moves the note back",
-        &[("CHANGELOG.md", &repaired)],
-    );
-    changelog_gate_at(&repo.git(), "HEAD", "0.3.0").unwrap();
-
-    let shipped = released.replace(
-        "## [0.2.0] - date\n\n",
-        &format!("## [0.2.0] - date\n\n{entry}\n"),
-    );
-    repo.commit("the note ships in 0.2.0", &[("CHANGELOG.md", &shipped)]);
-    repo.run(&["tag", "v0.2.0"]);
     let restored = shipped.replace(
         "## [Unreleased]\n\n",
         &format!("## [Unreleased]\n\n{entry}\n"),
     );
+    repo.commit("the note ships in 0.2.0", &[("CHANGELOG.md", &shipped)]);
+    let tagged = repo.run(&["rev-parse", "HEAD"]);
     repo.commit(
         "a merge brings the shipped note back",
         &[("CHANGELOG.md", &restored)],
     );
+    changelog_gate_at(&repo.git(), "HEAD", "0.3.0").unwrap();
+    repo.run(&["tag", "v0.2.0", &tagged]);
     let err = changelog_gate_at(&repo.git(), "HEAD", "0.3.0")
         .unwrap_err()
         .to_string();
     assert!(err.contains("shipped by v0.2.0"), "{err}");
+}
+
+/// THE WINDOW'S STRICT READ REFUSES EVERY ENTRY FILE NO RELEASE SHIPS AS WRITTEN, by its own
+/// message: an executable one, a symlink, one over the bound, bytes that are not UTF-8, a
+/// root directory that is another case of `changes`, and a file named `changes`. A recut
+/// ships its section as it stands and deletes no file, so it reads none of them: a stray
+/// file of the next window never blocks the recovery release.
+/// NEGATIVE CONTROL: a well-formed file passes the fresh window.
+#[cfg(unix)]
+#[test]
+fn the_window_refuses_odd_entry_files_and_a_recut_reads_none() {
+    let fresh = "## [Unreleased]\n\n## [0.1.0] - date\n\n- older change\n";
+    let recut = "## [Unreleased]\n\n## [0.2.0] - date\n\n- Shipped.\n\n## [0.1.0] - date\n\n\
+                 - older change\n";
+    let big = format!("- {}\n", "x".repeat(64 << 10));
+    type Lay = fn(&Repo, &str);
+    let cases: [(&str, Lay, &str); 6] = [
+        (
+            "executable",
+            |repo, body| {
+                repo.commit("x", &[("changes/fixed/x.md", body)]);
+                repo.run(&["update-index", "--chmod=+x", "changes/fixed/x.md"]);
+                repo.run(&["commit", "-q", "-m", "exec"]);
+            },
+            "changes/fixed/x.md: is not a regular, non-executable file (git mode 100755",
+        ),
+        (
+            "symlink",
+            |repo, _| {
+                let at = repo.work().join("changes/fixed");
+                fs::create_dir_all(&at).unwrap();
+                std::os::unix::fs::symlink("../../elsewhere.md", at.join("x.md")).unwrap();
+                repo.run(&["add", "-A"]);
+                repo.run(&["commit", "-q", "-m", "link"]);
+            },
+            "changes/fixed/x.md: is not a regular, non-executable file (git mode 120000",
+        ),
+        (
+            "oversized",
+            |repo, _| {
+                let big = format!("- {}\n", "x".repeat(64 << 10));
+                repo.commit("big", &[("changes/fixed/x.md", &big)]);
+            },
+            "changes/fixed/x.md: is 65539 bytes, over the 65536",
+        ),
+        (
+            "not-utf8",
+            |repo, _| {
+                let at = repo.work().join("changes/fixed");
+                fs::create_dir_all(&at).unwrap();
+                fs::write(at.join("x.md"), b"- \xff\n").unwrap();
+                repo.run(&["add", "-A"]);
+                repo.run(&["commit", "-q", "-m", "bytes"]);
+            },
+            "changes/fixed/x.md: is not readable UTF-8 text",
+        ),
+        (
+            "case",
+            |repo, body| {
+                repo.commit("case", &[("Changes/fixed/x.md", body)]);
+            },
+            "Changes: changelog entries live in a directory spelled exactly changes/",
+        ),
+        (
+            "blob",
+            |repo, body| {
+                repo.commit("blob", &[("changes", body)]);
+            },
+            "changes: changelog entries live in a directory spelled exactly changes/",
+        ),
+    ];
+    assert_eq!(big.len(), 65539);
+    for (label, lay, expected) in cases {
+        for (changelog, version, refused) in [(fresh, "0.2.0", true), (recut, "0.2.0", false)] {
+            let repo = Repo::new(&format!("odd-{label}"));
+            repo.commit("notes", &[("CHANGELOG.md", changelog)]);
+            lay(&repo, "- **X.** Fine.\n");
+            let verdict = changelog_gate_at(&repo.git(), "HEAD", version);
+            if refused {
+                let err = verdict.unwrap_err().to_string();
+                assert!(err.contains(expected), "{label}: {err}");
+            } else {
+                verdict.unwrap_or_else(|e| panic!("{label}: a recut reads no file: {e}"));
+            }
+        }
+    }
+    let repo = Repo::new("odd-control");
+    repo.commit(
+        "notes",
+        &[
+            ("CHANGELOG.md", fresh),
+            ("changes/fixed/x.md", "- **X.** Fine.\n"),
+        ],
+    );
+    changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
 }
 
 /// Real 15b0ad50d50 retains the aCaffeine note in Unreleased and under
@@ -396,7 +305,7 @@ fn shipment_uses_the_tag_even_when_a_merge_changes_older_sections() {
         &[("CHANGELOG.md", &copied)],
     );
     changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
-    changelog::release_changelog(&copied, "0.2.0", "date").unwrap();
+    changelog::roll(&copied, "0.2.0", "date").unwrap();
 
     // NEGATIVE CONTROL: rewriting the candidate's historical copy cannot
     // conceal the original shipped wording still present in Unreleased.
@@ -429,377 +338,6 @@ fn shipment_uses_the_tag_even_when_a_merge_changes_older_sections() {
     );
     repo.commit("recut with later notes", &[("CHANGELOG.md", &recut)]);
     changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
-}
-
-/// Adversarial control for f88ab712514: whole-file presence loses a rewrite
-/// when an older misplaced copy survives. Moving one copy preserves its
-/// count; restoring a rewritten copy increases it again.
-#[test]
-fn a_surviving_misplaced_copy_cannot_hide_a_true_resurrection() {
-    let repo = Repo::new("note-copy-resurrection");
-    let original =
-        "## [Unreleased]\n\n- Original claim.\n\n## [0.1.0] - date\n\n- Original claim.\n";
-    let original_commit = repo.commit(
-        "unshipped note also misplaced under old heading",
-        &[("CHANGELOG.md", original)],
-    );
-    repo.run(&["branch", "peer"]);
-    let corrected = original.replacen("Original claim.", "Corrected claim.", 1);
-    let removed = repo.commit("correct the active note", &[("CHANGELOG.md", &corrected)]);
-    repo.run(&["checkout", "-q", "peer"]);
-    repo.commit("peer work", &[("peer", "work")]);
-    repo.run(&["checkout", "-q", "main"]);
-    repo.run(&["merge", "--no-ff", "--no-commit", "peer"]);
-    let stale = corrected.replacen(
-        "- Corrected claim.",
-        "- Corrected claim.\n\n- Original claim.",
-        1,
-    );
-    let restored = repo.commit(
-        "merge restores the rewritten active copy",
-        &[("CHANGELOG.md", &stale)],
-    );
-    let error = changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains(&removed) && error.contains(&restored),
-        "{error}"
-    );
-    assert!(error.contains("resurrects"), "{error}");
-
-    let hidden = stale.replace(
-        "## [0.1.0] - date\n\n- Original claim.",
-        "## [0.1.0] - date\n\n- Older note.",
-    );
-    repo.commit(
-        "deleting the historical copy does not fix the stale active one",
-        &[("CHANGELOG.md", &hidden)],
-    );
-    assert!(changelog_gate_at(&repo.git(), "HEAD", "0.2.0").is_err());
-
-    // NEGATIVE CONTROL: removing the restored duplicate resolves the gate;
-    // an intentionally retained older copy does not inherit its defect.
-    let repaired =
-        "## [Unreleased]\n\n- Corrected claim.\n\n## [0.1.0] - date\n\n- Original claim.\n";
-    repo.commit(
-        "remove the restored duplicate",
-        &[("CHANGELOG.md", repaired)],
-    );
-    changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
-
-    // Cleaning and restoring only an older misplaced copy never rewrites
-    // the active note. A copy counter without section identity refuses it.
-    repo.run(&["checkout", "-qb", "clean-old", &original_commit]);
-    let no_old_copy = original.replace(
-        "## [0.1.0] - date\n\n- Original claim.",
-        "## [0.1.0] - date\n\n- Older note.",
-    );
-    repo.commit(
-        "clean only the older copy",
-        &[("CHANGELOG.md", &no_old_copy)],
-    );
-    repo.run(&["merge", "--no-ff", "--no-commit", "-s", "ours", "peer"]);
-    repo.commit(
-        "merge restores only the older copy",
-        &[("CHANGELOG.md", original)],
-    );
-    changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
-
-    // Moving the surviving stale older copy into Unreleased is still a
-    // resurrection even though the total count does not increase.
-    repo.run(&["checkout", "-qb", "move-stale", &original_commit]);
-    let removed = repo.commit("rewrite the active copy", &[("CHANGELOG.md", &corrected)]);
-    repo.run(&["merge", "--no-ff", "--no-commit", "-s", "ours", "peer"]);
-    let restored = repo.commit(
-        "move the stale older copy into active notes",
-        &[("CHANGELOG.md", &hidden)],
-    );
-    let error = changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains(&removed) && error.contains(&restored),
-        "{error}"
-    );
-}
-
-#[test]
-fn reducing_two_stale_copies_to_one_does_not_reauthor_the_survivor() {
-    let repo = Repo::new("stale-multiplicity");
-    let original = "## [Unreleased]\n\n- Original claim.\n\n## [0.1.0]\n\n- Older change.\n";
-    let original_commit = repo.commit("original", &[("CHANGELOG.md", original)]);
-    repo.run(&["branch", "peer"]);
-    let corrected = original.replace("Original claim.", "Corrected claim.");
-    let removed = repo.commit("correct the claim", &[("CHANGELOG.md", &corrected)]);
-    repo.run(&["checkout", "-q", "peer"]);
-    repo.commit("peer work", &[("peer", "work")]);
-    repo.run(&["checkout", "-q", "main"]);
-    repo.run(&["merge", "--no-ff", "--no-commit", "-s", "ours", "peer"]);
-    let twice = corrected.replace(
-        "- Corrected claim.",
-        "- Corrected claim.\n\n- Original claim.\n\n- Original claim.",
-    );
-    let restored = repo.commit("restore two stale copies", &[("CHANGELOG.md", &twice)]);
-    assert!(changelog_gate_at(&repo.git(), "HEAD", "0.2.0").is_err());
-    let once = corrected.replace(
-        "- Corrected claim.",
-        "- Corrected claim.\n\n- Original claim.",
-    );
-    repo.commit("drop only one stale copy", &[("CHANGELOG.md", &once)]);
-    let error = changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains(&removed) && error.contains(&restored),
-        "{error}"
-    );
-    // CONTROL: removing both stale copies preserves the actual unshipped fix.
-    repo.commit(
-        "retain only the corrected claim",
-        &[("CHANGELOG.md", &corrected)],
-    );
-    changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
-    // The d1d942b79a2 shape still passes when a post-correction parent
-    // really re-authored the entry, even if the merge duplicated it.
-    repo.run(&["checkout", "-qb", "reauthored", &removed]);
-    repo.commit("main re-authors the entry", &[("CHANGELOG.md", &once)]);
-    repo.run(&["merge", "--no-ff", "--no-commit", "-s", "ours", "peer"]);
-    repo.commit(
-        "duplicate a genuinely re-authored entry",
-        &[("CHANGELOG.md", &twice)],
-    );
-    changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
-    repo.commit("coalesce the re-authored entry", &[("CHANGELOG.md", &once)]);
-    changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
-    // Pure duplicate cleanup never removed the entry from this window.
-    // Returning a harmless second copy must not invent a stale rewrite.
-    repo.run(&["checkout", "-qb", "duplicate-cleanup", &original_commit]);
-    let duplicate = original.replace(
-        "- Original claim.",
-        "- Original claim.\n\n- Original claim.",
-    );
-    repo.commit(
-        "duplicate an unshipped entry",
-        &[("CHANGELOG.md", &duplicate)],
-    );
-    repo.run(&["checkout", "-qb", "duplicate-peer"]);
-    repo.commit("peer keeps the duplicate", &[("duplicate-peer", "work")]);
-    repo.run(&["checkout", "-q", "duplicate-cleanup"]);
-    repo.commit(
-        "coalesce without rewriting the entry",
-        &[("CHANGELOG.md", original)],
-    );
-    repo.run(&[
-        "merge",
-        "--no-ff",
-        "--no-commit",
-        "-s",
-        "ours",
-        "duplicate-peer",
-    ]);
-    repo.commit(
-        "return the harmless duplicate",
-        &[("CHANGELOG.md", &duplicate)],
-    );
-    changelog_gate_at(&repo.git(), "HEAD", "0.2.0").unwrap();
-}
-
-#[test]
-#[ignore = "offline audit of a complete dev-main clone; set ATERM_NOTES_REPLAY_REPO"]
-fn replay_real_main_notes() {
-    let path = std::env::var_os("ATERM_NOTES_REPLAY_REPO").unwrap();
-    let local = Git::new(Path::new(&path));
-    let git = ReplayGit {
-        inner: &local,
-        objects: Default::default(),
-        sizes: Default::default(),
-        ancestry: Default::default(),
-        last_history: Default::default(),
-    };
-    let run = |args: &[&str]| git_ok(&git, args).unwrap().stdout_utf8();
-    assert_eq!(
-        run(&["rev-parse", "--is-shallow-repository"]).trim(),
-        "false"
-    );
-    let selected_tip =
-        std::env::var("ATERM_NOTES_REPLAY_TIP").unwrap_or_else(|_| "origin/main".into());
-    let selected_base =
-        std::env::var("ATERM_NOTES_REPLAY_BASE").unwrap_or_else(|_| "v0.190.0".into());
-    let resolve = |name: &str| {
-        run(&[
-            "rev-parse",
-            "--verify",
-            "--end-of-options",
-            &format!("{name}^{{commit}}"),
-        ])
-        .trim()
-        .to_owned()
-    };
-    let tip = resolve(&selected_tip);
-    let base = resolve(&selected_base);
-    let range = format!("{base}..{tip}");
-    let spine = run(&["rev-list", "--first-parent", &range]);
-    let merges = run(&["rev-list", "--merges", &range]);
-    // A later landing can put yesterday's main on its second-parent side.
-    // Explicit immutable commits supplement a completed range without
-    // inventing history or losing that earlier first-parent coverage.
-    let selected = std::env::var("ATERM_NOTES_REPLAY_COMMITS")
-        .ok()
-        .map(|names| {
-            let commits: Vec<_> = names.split_whitespace().map(resolve).collect();
-            assert!(!commits.is_empty(), "an explicit replay must judge commits");
-            commits
-        });
-    let commits: std::collections::BTreeSet<_> = match &selected {
-        Some(commits) => commits.iter().map(String::as_str).collect(),
-        None => spine.lines().chain(merges.lines()).collect(),
-    };
-    let tags = run(&["show-ref", "--tags", "-d"]);
-    let harness_only = std::env::var_os("ATERM_NOTES_REPLAY_HARNESS_ONLY").is_some();
-    let mut refused = [0; 2];
-    let mut counter = changelog::NoteCounter::default();
-    let mut notes_cache = std::collections::BTreeMap::new();
-    let mut harness_cache = std::collections::BTreeMap::new();
-    assert!(
-        run(&["rev-list", "--count", tip.trim()])
-            .trim()
-            .parse::<usize>()
-            .unwrap()
-            <= 131072
-    );
-    println!(
-        "REPLAY base={base} tip={tip} explicit={} harness_only={harness_only}",
-        selected.is_some()
-    );
-    for (index, commit) in commits.iter().enumerate() {
-        let manifest = run(&["show", &format!("{commit}:Cargo.toml")]);
-        let version = crate::publish::workspace_version(&manifest).unwrap();
-        let blob = run(&["rev-parse", &format!("{commit}:CHANGELOG.md")]);
-        let notes = if harness_only {
-            Ok(())
-        } else {
-            changelog_gate_at_with(&git, commit, &version, &tags, |at, text, section, keys| {
-                // Complete immutable inputs: source commit, selected section and the
-                // exact entries being judged. Published cohorts reuse their source
-                // verdict without rewriting or synthesizing any native Git history.
-                let key = (at.to_owned(), section.to_owned(), keys.clone());
-                notes_cache
-                    .entry(key)
-                    .or_insert_with(|| {
-                        changelog::gate_history_with_keys(
-                            &git,
-                            at,
-                            text,
-                            section,
-                            keys,
-                            |oid, snapshot, section, candidates| {
-                                counter.counts(oid, snapshot, section, candidates)
-                            },
-                        )
-                        .map_err(|error| error.to_string())
-                    })
-                    .clone()
-                    .map_err(Error::new)
-            })
-            .map(|_| ())
-            .map_err(|error| error.to_string())
-        };
-        let ledger = run(&["show", &format!("{commit}:RELEASES.ledger")]);
-        let predecessor =
-            crate::harness_versions::previous_release(&ledger, &version, &tags).unwrap();
-        let mut args = vec!["ls-tree", "-r", "--format=%(objectname)", commit, "--"];
-        args.extend(
-            aterm_phase::CliHarness::ALL
-                .iter()
-                .map(|h| h.version_file()),
-        );
-        let sources = run(&args);
-        let harness = harness_cache
-            .entry((version.clone(), blob, sources, predecessor.clone()))
-            .or_insert_with(|| {
-                match predecessor {
-                    Some((release, at)) => crate::harness_versions::notes_gate_at(
-                        &git,
-                        (&release, &at),
-                        commit,
-                        &version,
-                    ),
-                    None => Ok(()),
-                }
-                .map_err(|error| error.to_string())
-            })
-            .clone();
-        for (gate, verdict) in [notes, harness].into_iter().enumerate() {
-            if let Err(error) = verdict {
-                refused[gate] += 1;
-                println!("REFUSAL {commit} {version} {gate}: {error}");
-            }
-        }
-        println!("JUDGED {}/{} {commit}", index + 1, commits.len());
-    }
-    println!(
-        "REPLAY commits={} first_parent={} merges={} refusals={refused:?} notes_inputs={} harness_inputs={} notes_skipped={harness_only}",
-        commits.len(),
-        spine.lines().count(),
-        merges.lines().count(),
-        notes_cache.len(),
-        harness_cache.len()
-    );
-}
-
-#[test]
-fn recut_notes_cannot_resurrect_a_rewritten_rolled_entry() {
-    let repo = Repo::new("recut-note-resurrection");
-    let original = "## [Unreleased]\n\n### Fixed\n\n- Original claim.\n\n## [0.1.0] - date\n\n- older change\n";
-    repo.commit("original", &[("CHANGELOG.md", original)]);
-    // f88ab712514 adversary: the old words survive in the next window
-    // while this release's copy is corrected. Whole-file presence cannot
-    // hide that correction from the recut audit.
-    let rolled = original.replace(
-        "### Fixed",
-        "- Original claim.\n\n## [0.2.0] - date\n\n### Fixed",
-    );
-    repo.commit("roll candidate", &[("CHANGELOG.md", &rolled)]);
-    assert!(changelog_gate_at(&repo.git(), "HEAD", "0.2.0").is_ok());
-    repo.run(&["branch", "peer"]);
-    let corrected = rolled.replacen(
-        "### Fixed\n\n- Original claim.",
-        "### Fixed\n\n- Corrected claim.",
-        1,
-    );
-    let removed = repo.commit("correct candidate", &[("CHANGELOG.md", &corrected)]);
-    assert!(changelog_gate_at(&repo.git(), "HEAD", "0.2.0").is_ok());
-    repo.run(&["checkout", "-q", "peer"]);
-    repo.commit("peer work", &[("peer", "work")]);
-    repo.run(&["checkout", "-q", "main"]);
-    repo.run(&["merge", "--no-ff", "--no-commit", "peer"]);
-    let restored = repo.commit("restore stale rolled note", &[("CHANGELOG.md", &rolled)]);
-    let error = changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        error.contains(&removed) && error.contains(&restored),
-        "{error}"
-    );
-    // Publication is not a blanket exemption: its own source history must
-    // still reject a true resurrection that happened before publication.
-    repo.run(&["tag", "v0.2.0"]);
-    assert!(
-        changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
-            .unwrap_err()
-            .to_string()
-            .contains("resurrects")
-    );
-    repo.run(&["tag", "-d", "v0.2.0"]);
-    // A tag carrying Corrected claim never blesses the stale Original claim.
-    repo.run(&["tag", "v0.2.0", &removed]);
-    assert!(
-        changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
-            .unwrap_err()
-            .to_string()
-            .contains("resurrects")
-    );
 }
 
 /// 36306dbeb51 / 028db7a01fe and 0e8a5cabde9 / 6c1b1914da6:
@@ -857,163 +395,6 @@ fn a_published_body_can_land_after_main_corrects_the_next_window() {
             .to_string()
             .contains("shipped by v0.2.0")
     );
-}
-
-/// 6a7c5b8b206 moved the unshipped aCaffeine note out of 0.192.0; c2bb03128f8
-/// copied it back while retaining its correct Unreleased copy. The defect is
-/// stale placement, and its remedy must preserve the next window's entry.
-#[test]
-fn restoring_a_future_entry_to_an_older_release_names_its_window() {
-    // ce10eae5f2e / cc1a4bfb3d1 also keeps the correct Unreleased
-    // copy while deleting only its misplaced older-release duplicate.
-    for has_unreleased_copy in [false, true] {
-        let repo = Repo::new("future-note-placement");
-        let public = "## [Unreleased]\n\n## [0.2.0] - date\n\n- Published fix.\n\n## [0.1.0] - date\n\n- Older fix.\n";
-        repo.commit("public source", &[("CHANGELOG.md", public)]);
-        repo.run(&["tag", "v0.2.0"]);
-        let misplaced =
-            public.replace("- Published fix.", "- Published fix.\n\n- Future wake fix.");
-        let misplaced = if has_unreleased_copy {
-            misplaced.replacen(
-                "## [Unreleased]\n\n",
-                "## [Unreleased]\n\n- Future wake fix.\n\n",
-                1,
-            )
-        } else {
-            misplaced
-        };
-        repo.commit(
-            "merge misplaces an unshipped entry",
-            &[("CHANGELOG.md", &misplaced)],
-        );
-        repo.run(&["branch", "peer"]);
-        let corrected = public.replacen(
-            "## [Unreleased]\n\n",
-            "## [Unreleased]\n\n- Future wake fix.\n\n",
-            1,
-        );
-        repo.commit(
-            "move the future change back to Unreleased",
-            &[("CHANGELOG.md", &corrected)],
-        );
-        repo.run(&["checkout", "-q", "peer"]);
-        repo.commit("peer work", &[("peer", "work")]);
-        repo.run(&["checkout", "-q", "main"]);
-        repo.run(&["merge", "--no-ff", "--no-commit", "-s", "ours", "peer"]);
-        let stale = corrected.replace("- Published fix.", "- Published fix.\n\n- Future wake fix.");
-        repo.commit(
-            "copy the future note back under the released heading",
-            &[("CHANGELOG.md", &stale)],
-        );
-        let error = changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
-            .unwrap_err()
-            .to_string();
-        let refusal = gate_refusal(&error);
-        assert!(error.contains("reserved for [Unreleased]"), "{error}");
-        assert!(
-            refusal.remedy.contains("keep this unshipped change"),
-            "{refusal:?}"
-        );
-        assert!(!refusal.remedy.contains("remove"), "{refusal:?}");
-        // NEGATIVE CONTROL: the next window's actual payload is correct.
-        changelog_gate_at(&repo.git(), "HEAD", "0.3.0").unwrap();
-    }
-}
-
-#[test]
-fn release_notes_resurrection_refuses_and_names_both_commits() {
-    let repo = Repo::new("note-resurrection");
-    let original = "## [Unreleased]\n\n### Fixed\n\n- **Idle node.** Polls less often.\n\n## [0.1.0] - date\n\n- older change\n";
-    repo.commit("original note", &[("CHANGELOG.md", original)]);
-    repo.run(&["branch", "peer"]);
-    repo.run(&["branch", "unmerged"]);
-    let rewritten = original.replace("Polls less often.", "Polls less often. Waits for work.");
-    let removed = repo.commit("rewrite note", &[("CHANGELOG.md", &rewritten)]);
-    repo.run(&["checkout", "-q", "peer"]);
-    repo.commit("peer change", &[("peer", "peer work")]);
-    repo.run(&["checkout", "-q", "main"]);
-    repo.run(&["merge", "--no-ff", "--no-commit", "peer"]);
-    let both = rewritten.replace(
-        "\n## [0.1.0]",
-        "\n* **Idle node.** Polls\n  less often.\n\n## [0.1.0]",
-    );
-    let restored = repo.commit("merge restores stale note", &[("CHANGELOG.md", &both)]);
-    // A later peer landing can put the removal on the other ancestry,
-    // exactly how real main lost the evidence from its first-parent spine.
-    repo.run(&["checkout", "-q", "peer"]);
-    repo.run(&["merge", "--no-ff", "-qm", "peer lands main", "main"]);
-    // The original text-only preflight accepts both distinct strings. The
-    // new public commit preflight must refuse the history-backed duplicate.
-    assert!(changelog::gate_unreleased(&both).is_ok());
-    let err = changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
-        .unwrap_err()
-        .to_string();
-    assert!(
-        err.contains(&removed) && err.contains(&restored) && err.contains("resurrects"),
-        "{err}"
-    );
-    let remedy = gate_refusal(&err);
-    assert!(!remedy.remedy.contains("remove"), "{remedy:?}");
-    assert!(remedy.remedy.contains("current wording"), "{remedy:?}");
-    let subdivided = both.replacen("* **Idle node.", "### Security\n\n* **Idle node.", 1);
-    repo.commit(
-        "the stale copy moves to another subsection",
-        &[("CHANGELOG.md", &subdivided)],
-    );
-    changelog::gate_unreleased(&subdivided).unwrap();
-    assert!(
-        changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
-            .unwrap_err()
-            .to_string()
-            .contains("resurrects")
-    );
-    let rolled = both.replacen("## [Unreleased]", "## [0.2.0]", 1);
-    let cut = repo.commit("recut snapshot", &[("CHANGELOG.md", &rolled)]);
-    let err = changelog_gate_at(&repo.git(), &cut, "0.2.0")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains(&removed) && err.contains(&restored), "{err}");
-    let followup = both.replace(
-        "* **Idle node.** Polls\n  less often.",
-        "- **Idle node.** Also sleeps while disconnected.",
-    );
-    let clean = repo.commit("distinct follow-up", &[("CHANGELOG.md", &followup)]);
-    assert!(changelog_gate_at(&repo.git(), &clean, "0.2.0").is_ok());
-
-    // Unmerged peer history cannot poison a candidate.
-    repo.run(&["checkout", "-q", "unmerged"]);
-    assert!(changelog_gate_at(&repo.git(), "HEAD", "0.2.0").is_ok());
-    struct TooLarge<'a>(&'a Git);
-    impl GitRunner for TooLarge<'_> {
-        fn git(&self, args: &[&str]) -> Result<crate::ledger::RunOut> {
-            self.0.git(args)
-        }
-        fn git_input(&self, args: &[&str], input: &[u8]) -> Result<crate::ledger::RunOut> {
-            assert!(
-                args.ends_with(&["cat-file", "--batch-check"]),
-                "an oversized blob must never be read"
-            );
-            let mut out = self.0.git_input(args, input)?;
-            out.stdout = out
-                .stdout_utf8()
-                .lines()
-                .map(|line| format!("{} blob 8388609\n", line.split_whitespace().next().unwrap()))
-                .collect::<String>()
-                .into_bytes();
-            Ok(out)
-        }
-    }
-    let git = repo.git();
-    let err = changelog_gate_at(&TooLarge(&git), "HEAD", "0.2.0")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("8 MiB"), "{err}");
-    let head = repo.run(&["rev-parse", "HEAD"]);
-    fs::write(repo.work().join(".git/shallow"), format!("{head}\n")).unwrap();
-    let err = changelog_gate_at(&repo.git(), "HEAD", "0.2.0")
-        .unwrap_err()
-        .to_string();
-    assert!(err.contains("shallow"), "{err}");
 }
 
 #[test]

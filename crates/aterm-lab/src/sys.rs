@@ -381,29 +381,13 @@ impl SignalPipe {
                 to_set.push((sig, old));
             }
         }
-        use std::os::fd::{AsRawFd as _, FromRawFd as _, IntoRawFd as _};
-        let (rd_fd, wr_fd) = aterm_uds::kept_out(|| {
-            let mut fds = [0 as libc::c_int; 2];
-            // SAFETY: `fds` is a two-int array, as `pipe(2)` requires.
-            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
-            // SAFETY: both are fresh descriptors `pipe` just returned.
-            let (rd, wr) = unsafe {
-                (
-                    std::os::fd::OwnedFd::from_raw_fd(fds[0]),
-                    std::os::fd::OwnedFd::from_raw_fd(fds[1]),
-                )
-            };
-            for fd in [rd.as_raw_fd(), wr.as_raw_fd()] {
-                // SAFETY: both are owned descriptors `pipe` just returned.
-                unsafe {
-                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
-                    libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK);
-                }
-            }
-            Ok((rd, wr))
-        })?;
+        use std::os::fd::{AsRawFd as _, IntoRawFd as _};
+        let (rd_fd, wr_fd) = aterm_uds::pipe()?;
+        for fd in [rd_fd.as_raw_fd(), wr_fd.as_raw_fd()] {
+            // SAFETY: both are owned descriptors the pipe just made; `F_SETFL` sets only their
+            // status flags.
+            unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) };
+        }
         let fds = [rd_fd.into_raw_fd(), wr_fd.into_raw_fd()];
         let prev_wr = SIGNAL_WR.swap(fds[1], Ordering::Relaxed);
         for (idx, &(sig, _)) in to_set.iter().enumerate() {

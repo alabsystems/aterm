@@ -476,7 +476,24 @@ pub(crate) struct NativeRoles {
     pub(crate) elevated: [u8; 3],
     pub(crate) danger: [u8; 3],
     pub(crate) success: [u8; 3],
+    /// "Not written": what a page has staged and not yet written, and nothing else
+    /// ([`NOT_WRITTEN`], held 3:1 on the page's grounds). Fixed: it follows neither the theme's
+    /// accent nor the OS's.
+    pub(crate) unwritten: [u8; 3],
+    /// [`Self::unwritten`] as text, over its own wash too.
+    pub(crate) unwritten_ink: [u8; 3],
 }
+
+/// The one colour of "not written" (the Tables design's blue, `#5B9EF0` on a dark ground,
+/// `#2F6FC4` on a light one): a staged cell, the count of them, the Write bar. It is no accent, so
+/// a Mac whose accent is green still shows a change not yet written in this blue.
+pub(crate) const NOT_WRITTEN: SystemAccent = SystemAccent {
+    on_dark: [0x5B, 0x9E, 0xF0],
+    on_light: [0x2F, 0x6F, 0xC4],
+};
+
+/// How far toward [`NativeRoles::unwritten`] a staged cell's ground is washed.
+pub(crate) const UNWRITTEN_WASH: f32 = 0.24;
 
 #[derive(Clone, Copy, Debug)]
 struct Oklch {
@@ -782,6 +799,17 @@ fn solve_roles(
         4.5,
     );
 
+    let unwritten = ensure_contrast_on(NOT_WRITTEN.for_surface(bg), &grounds, ACCENT_INK_FLOOR);
+    let unwritten_ink = ensure_contrast_on(
+        unwritten,
+        &[
+            surface,
+            elevated,
+            mix_srgb(elevated, unwritten, UNWRITTEN_WASH),
+        ],
+        ink_target,
+    );
+
     NativeRoles {
         surface,
         text_primary,
@@ -797,6 +825,8 @@ fn solve_roles(
         elevated,
         danger,
         success,
+        unwritten,
+        unwritten_ink,
     }
 }
 

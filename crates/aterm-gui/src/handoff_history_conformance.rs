@@ -86,6 +86,7 @@ fn record() -> SessionRecord {
         status_seen: None,
         autopilot_end: None,
         wakes: None,
+        agent_act: None,
     }
 }
 

@@ -197,6 +197,21 @@ impl Directory {
         }
     }
 
+    /// [`Self::observe_table`] for the one read that answers a fenced home's displaced table
+    /// from the records it holds ([`Self::observe_displaced`]): the declared-table read
+    /// `documents::application::observe_store_if_here` makes. Every other reader takes
+    /// `observe_table` and refuses such a table.
+    ///
+    /// # Errors
+    /// As [`Self::observe_table`], but for what [`Self::observe_displaced`] answers; where that
+    /// read was tried and refused, the ordinary refusal with the held read's as context.
+    pub(crate) fn observe_held_table(&self, session: &Session<'_>, scope: Scope) -> Result<Store> {
+        match self.observe_table_if_exists_as(session, scope, true)? {
+            Some(store) => Ok(store),
+            None => self.observe_store(session, scope),
+        }
+    }
+
     pub(crate) fn observe_store_if_exists(
         &self,
         session: &Session<'_>,
@@ -239,6 +254,20 @@ impl Directory {
         session: &Session<'_>,
         scope: Scope,
     ) -> Result<Option<Store>> {
+        self.observe_table_if_exists_as(session, scope, false)
+    }
+
+    /// [`Self::observe_table_if_exists`]; and where `held`, a primary observation that refuses,
+    /// for which no recovery replica answers, is tried as a fenced home's displaced table
+    /// ([`Self::observe_displaced`]), unless the recovery replica's own observation was busy:
+    /// that read is busy too, since the replica may answer the next one. What a recovery replica
+    /// answers is the same either way.
+    fn observe_table_if_exists_as(
+        &self,
+        session: &Session<'_>,
+        scope: Scope,
+        held: bool,
+    ) -> Result<Option<Store>> {
         match self.observe_store_if_exists(session, scope) {
             Ok(Some(store)) if self.is_recovery() && scope != self.catalog_scope() => {
                 match self.primary().observe_store_if_exists(session, scope) {
@@ -261,8 +290,48 @@ impl Directory {
             Err(error) if self.is_recovery() || error.is_busy() => Err(error),
             Err(original) => match self.recovery().observe_store_if_exists(session, scope) {
                 Ok(Some(store)) => Ok(Some(store)),
+                Err(error) if held && error.is_busy() => Err(error),
+                _ if held => Self::observe_displaced(session, scope, original).map(Some),
                 _ => Err(original),
             },
+        }
+    }
+
+    /// The session's own primary table `scope`, read from its witnessed prefix where its
+    /// directory binding was lost to a relocation and its home is a fenced original whose
+    /// selection record holds no completion and that holds no completion mark
+    /// ([`Store::observe_displaced`], [`crate::generation::Preserving`]); `original` is what the ordinary observation of it
+    /// refused with, no recovery replica having answered. The read is of the table's folder in
+    /// the session's own home, which `Store::observe_displaced` names itself.
+    ///
+    /// # Errors
+    /// The gate ([`crate::generation::Preserving::of`]) is asked first, of the home alone,
+    /// before anything knows whether the table is displaced. `original`, as it is, where the
+    /// home has no selection and nothing else fences it (no succession was reserved there); or
+    /// where the home's selection is the session's standing fence and the table's claim is
+    /// pending or holds its folder (nothing is displaced: the ordinary refusal was of something
+    /// else), or the held open refuses in the ordinary refusal's words. `original` with the
+    /// refusal as context where the gate refuses, whatever the ordinary refusal was of, a
+    /// table that is not displaced included (a fenced home whose selection record is missing; a
+    /// selection that completed or names another writer or lab; a home that holds a completion
+    /// mark; a selection, the mark, or where there is no selection the reservation or the
+    /// candidate link, that cannot be read), or where the held open
+    /// refuses otherwise (a prefix the claim does not witness, a record that does not
+    /// authenticate). Busy, where the held open is, or what it stood on moved while it read.
+    fn observe_displaced(session: &Session<'_>, scope: Scope, original: Error) -> Result<Store> {
+        let held = crate::generation::Preserving::of(session).and_then(|held| {
+            held.map_or(Ok(None), |held| {
+                Store::observe_displaced(session, scope, held)
+            })
+        });
+        match held {
+            Ok(Some(store)) => Ok(store),
+            Ok(None) => Err(original),
+            Err(held) if held.is_busy() => Err(held),
+            Err(held) if held.0 == original.0 => Err(original),
+            Err(held) => {
+                Err(original.context(&format!("the held read of this table refused ({held})")))
+            }
         }
     }
 
@@ -776,7 +845,22 @@ impl Directory {
     /// Read an existing catalog with default local projection policy. Missing
     /// or damaged established storage is never replaced by an empty enrollment.
     pub fn snapshot_existing(&self, session: &Session<'_>) -> Result<Snapshot> {
-        let catalog = self.observe_table(session, self.catalog_scope())?;
+        self.snapshot_of(session, &self.observe_table(session, self.catalog_scope())?)
+    }
+
+    /// [`Self::snapshot_existing`] for the one read that answers a fenced home's displaced
+    /// table from the records it holds ([`Self::observe_held_table`]): a relocation that
+    /// displaces an application table can displace the catalog beside it, which that read needs
+    /// first.
+    pub(crate) fn snapshot_existing_held(&self, session: &Session<'_>) -> Result<Snapshot> {
+        self.snapshot_of(
+            session,
+            &self.observe_held_table(session, self.catalog_scope())?,
+        )
+    }
+
+    /// The observed `catalog` projected with default local policy.
+    fn snapshot_of(&self, session: &Session<'_>, catalog: &Store) -> Result<Snapshot> {
         let directory = if catalog.is_recovery() {
             self.recovery()
         } else {
@@ -784,7 +868,7 @@ impl Directory {
         };
         directory.project(
             session,
-            directory.discovery_records_from(session, &catalog)?,
+            directory.discovery_records_from(session, catalog)?,
             &Policy::default(),
         )
     }

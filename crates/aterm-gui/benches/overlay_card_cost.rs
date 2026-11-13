@@ -2,8 +2,9 @@
 // Copyright 2026 Andrew Yates
 
 //! An open overlay card's redraw (its tray's paint and its raster), for the Overview and the
-//! palette at 1×, at 2×, and at 2× with the width cap read as device pixels: µs per redraw at
-//! p50/p90/p99 and the raster's size. A measurement for a person, never a gate: nothing asserts a
+//! palette at 1×, at 2×, and at 2× with the width cap read as device pixels, and a footer card's
+//! frame rastered afresh at 1×, at 2× and at its largest: µs per redraw at p50/p90/p99 and the
+//! raster's size. A measurement for a person, never a gate: nothing asserts a
 //! time.
 //!
 //! `targo --unverified bench -p aterm-gui --features bench-support --bench overlay_card_cost`

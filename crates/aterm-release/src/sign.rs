@@ -28,7 +28,7 @@ const STAPLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 /// ```toml
 /// signing_key = "<base64 PKCS#8 Ed25519 private key>"
 /// # Tier APPLE only (ignored while pins::APPLE_TEAM_ID is empty):
-/// notary_profile = "<name given to `xcrun notarytool store-credentials`>"
+/// notary_profile = "notary"  # set by ship provision from the vault's release-notary entry (aterm secrets need notary)
 /// # ...or, for a machine with no usable keychain, the headless fallback:
 /// # notary_apple_id = "<Apple ID>"
 /// # notary_password = "<app-specific password>"
@@ -603,11 +603,13 @@ fn resolve_apple_tier_with(
     };
     let auth = credentials.notary().ok_or_else(|| {
         format!(
-            "pins::APPLE_TEAM_ID is set to {team_id}, but {} names no notarytool credential. \
-             Run `xcrun notarytool store-credentials <name> --apple-id <id> --team-id {team_id} \
-             --password <app-specific-password>` once, then add `notary_profile = \"<name>\"` \
-             to it",
-            profile.display()
+            "pins::APPLE_TEAM_ID is set to {team_id}, but {} names no notarytool credential: \
+             `{} provision --id <machine-id>` writes `notary_profile = \"{}\"`, which the \
+             vault's {} entry sets (`aterm secrets need notary`)",
+            profile.display(),
+            crate::publish::SHIP_COMMAND,
+            crate::apple::NOTARY_PROFILE,
+            aterm_secrets::need::catalog::NOTARY_ENTRY
         )
     })?;
     let identity = locate_identity(team_id, credentials.signing_identity_sha1(), home, run)?;

@@ -4,14 +4,6 @@
 use super::*;
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 
-fn pipe_for_test() -> (OwnedFd, OwnedFd) {
-    let mut raw = [0i32; 2];
-    // SAFETY: `pipe` fills two descriptor numbers into the array.
-    assert_eq!(unsafe { libc::pipe(raw.as_mut_ptr()) }, 0, "pipe");
-    // SAFETY: Fresh pipe descriptors, exclusively owned from here.
-    unsafe { (OwnedFd::from_raw_fd(raw[0]), OwnedFd::from_raw_fd(raw[1])) }
-}
-
 #[test]
 fn a_forked_successor_adopts_the_carried_launcher_limit() {
     assert_eq!(carried_launcher_limit(Some("256"), 4096), Some(256));
@@ -186,7 +178,7 @@ fn an_older_successor_starts_at_the_limit_held_before_a_parks_raise() {
         "a same-or-newer successor inherits the room, and reads the told limit"
     );
 
-    let (read, _write) = pipe_for_test();
+    let (read, _write) = aterm_uds::pipe().expect("pipe");
     let launchd_fd = i32::try_from(launchd).expect("a descriptor number");
     // SAFETY: F_DUPFD duplicates a live descriptor at the first free number at or above
     // `launchd_fd`, with close-on-exec clear.

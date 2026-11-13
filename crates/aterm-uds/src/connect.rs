@@ -23,7 +23,7 @@ const SO_NOSIGPIPE: libc::c_int = 0x1022;
 ///
 /// # Errors
 /// Invalid paths, an expired deadline, or the original socket, descriptor,
-/// connection, polling, or peer-address error.
+/// connection or polling error.
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn until(path: &Path, deadline: Instant) -> io::Result<CtlStream> {
     until_cancelled(path, deadline, None)
@@ -44,6 +44,15 @@ pub(crate) fn until_cancelled(
     path: &Path,
     deadline: Instant,
     cancel: Option<BorrowedFd<'_>>,
+) -> io::Result<CtlStream> {
+    until_cancelled_after_connect(path, deadline, cancel, |_, _| {})
+}
+
+fn until_cancelled_after_connect(
+    path: &Path,
+    deadline: Instant,
+    cancel: Option<BorrowedFd<'_>>,
+    after_connect: impl FnOnce(&CtlStream, Option<&io::Error>),
 ) -> io::Result<CtlStream> {
     crate::ready::check_cancelled(cancel)?;
     check_deadline(deadline)?;
@@ -77,13 +86,14 @@ pub(crate) fn until_cancelled(
             length,
         )
     };
-    if connected < 0 {
-        let error = io::Error::last_os_error();
+    let error = (connected < 0).then(io::Error::last_os_error);
+    after_connect(&stream, error.as_ref());
+    if let Some(error) = error {
         match error.raw_os_error() {
             Some(libc::EINPROGRESS | libc::EINTR) => {
-                // Writability alone can describe an unconnected AF_UNIX socket.
+                // Only an initiated connect may use writability and SO_ERROR as completion.
                 wait_connected(stream.as_fd(), deadline, cancel, || {
-                    connected_to(stream.take_error()?, stream.peer_addr())
+                    connected_to(stream.take_error()?)
                 })?;
             }
             // AF_UNIX EAGAIN (full backlog) has no pending connection to poll.
@@ -196,6 +206,16 @@ pub(crate) fn tcp_until_cancelled(
     configure: impl FnOnce(&TcpStream) -> io::Result<()>,
     cancel: Option<BorrowedFd<'_>>,
 ) -> io::Result<TcpStream> {
+    tcp_until_cancelled_after_connect(addr, deadline, configure, cancel, |_, _| {})
+}
+
+fn tcp_until_cancelled_after_connect(
+    addr: &SocketAddr,
+    deadline: Instant,
+    configure: impl FnOnce(&TcpStream) -> io::Result<()>,
+    cancel: Option<BorrowedFd<'_>>,
+    after_connect: impl FnOnce(&TcpStream, Option<&io::Error>),
+) -> io::Result<TcpStream> {
     crate::ready::check_cancelled(cancel)?;
     check_deadline(deadline)?;
     let family = if addr.is_ipv4() {
@@ -209,18 +229,20 @@ pub(crate) fn tcp_until_cancelled(
     let address = Inet::new(*addr);
     let (pointer, length) = address.parts();
     // SAFETY: address owns the initialized sockaddr for the whole call.
-    if unsafe { libc::connect(stream.as_raw_fd(), pointer, length) } < 0 {
-        let error = io::Error::last_os_error();
+    let connected = unsafe { libc::connect(stream.as_raw_fd(), pointer, length) };
+    let error = (connected < 0).then(io::Error::last_os_error);
+    after_connect(&stream, error.as_ref());
+    if let Some(error) = error {
         match error.raw_os_error() {
             Some(libc::EINPROGRESS | libc::EINTR | libc::EALREADY) => {
                 wait_connected(stream.as_fd(), deadline, cancel, || {
-                    connected_to(stream.take_error()?, stream.peer_addr())
+                    connected_to(stream.take_error()?)
                 })?;
             }
             _ => return Err(error),
         }
     }
-    stream.peer_addr()?;
+    // A successful connect remains established even if the peer already sent and closed.
     crate::ready::check_cancelled(cancel)?;
     stream.set_nonblocking(false)?;
     Ok(stream)
@@ -338,11 +360,11 @@ fn check_deadline(deadline: Instant) -> io::Result<()> {
     }
 }
 
-/// Connected: no error pending on the socket, and a peer.
-fn connected_to<A>(pending: Option<io::Error>, peer: io::Result<A>) -> io::Result<()> {
+/// Completion of an initiated connect: SO_ERROR retains a failure after writability.
+fn connected_to(pending: Option<io::Error>) -> io::Result<()> {
     match pending {
         Some(error) => Err(error),
-        None => peer.map(drop),
+        None => Ok(()),
     }
 }
 

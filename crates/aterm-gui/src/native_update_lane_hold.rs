@@ -62,15 +62,18 @@ lane_holds! {
     /// An update handoff is already in flight, or the updater is applying; it commits or stands
     /// down within [`crate::app_update_handoff_boundary::HANDOFF_PENDING_BOUND`].
     HandoffInFlight => "handoff-in-flight",
-    /// A person's Install is held for the candidate's pre-park read, which ends by itself.
+    /// A person's Install is held for the candidate's pre-park read, which ends by itself, or
+    /// for the startup boot-health gate, which ends on its own clock (`BootHealth`).
     PersonInstall => "person-install",
     /// This build's own update trial is unconfirmed, or its confirmation has not answered yet.
     /// The updater answers each ask: it confirms the trial, or settles it after
     /// `aterm_update::TRIAL_SETTLE_AFTER_REFUSALS` refused proofs spanning
     /// `aterm_update::TRIAL_SETTLE_REFUSAL_SPAN` of awake time; `crate::BOOT_HEALTH_UNANSWERED_TRIES`
-    /// asks nothing answers open the gate. Its unbounded answers are the updater's
-    /// (`aterm_update::BootHealthVerdict`) and are said in the hold's words: among them a trial
-    /// whose window never draws a frame, and a sentinel the filesystem will not remove.
+    /// asks nothing answers open the gate, and so does `crate::BOOT_HEALTH_PENDING_PATIENCE`
+    /// of the updater's Pending answers (`aterm_update::BootHealthVerdict`), said in the hold's
+    /// words. Past the gate the apply lane's own admission decides with the trial armed, and its
+    /// refusal for this build's own trial names this hold too, read again every
+    /// `crate::app_native::BOOT_HEALTH_TRIAL_REREAD`.
     BootHealth => "boot-health",
     /// The stage on disk is not yet the exact armed artifact (a download or reconcile settling).
     StagePending => "stage-pending",
@@ -94,9 +97,14 @@ lane_holds! {
     /// A launch-record renewal's handoff is in flight; the update follows it.
     LaunchRecordRenewal => "launch-record-renewal",
     /// An item that cannot be cut in half (a sign-out's clicks, a publish rename, a launchd
-    /// bootstrap) is in its critical section, which is aterm's own work: each try follows it for
-    /// at most [`crate::app_update_handoff_boundary::MAX_BOUNDARY_WAIT`], and the next try follows
-    /// it again, so the hold lasts as long as the item's section does.
+    /// bootstrap, a harness's native mutation) is in its critical section, which is aterm's own
+    /// work: each try follows it for at most
+    /// [`crate::app_update_handoff_boundary::MAX_BOUNDARY_WAIT`], and the next try follows it
+    /// again, so the hold lasts as long as the item's section does. A harness native mutation's
+    /// section ends once it can start nothing more, though its processes run on
+    /// (`native_act::starts_nothing_more`): a signalled restart past its deadline, an own-image
+    /// move whose actor is gone. A restart that granted its child Execute, and an own-image move
+    /// whose actor lives on, hold until they finish or their processes exit.
     BoundaryItem => "boundary-item",
     /// A launch's Mac setup offer has a person's draft in it (a group pressed, a vault address or
     /// password typed), which the successor could not carry. It is the person's own and holds only
@@ -116,9 +124,11 @@ lane_holds! {
     /// client's unsaved work and holds only while the setup worker has not taken it (a Restore:
     /// finished it).
     SetupChoice => "setup-choice",
-    /// A Command Line Tools install's own tab is still running and cannot travel with the
-    /// handoff (its password prompt waiting on the person, or a child the successor could not
-    /// recover): it holds only while that tab's program runs.
+    /// A Mac Setup tab (a Command Line Tools install's, or a naming permission's repair) is still
+    /// running and cannot travel with the handoff (its password prompt waiting on the person, or
+    /// a child the successor could not recover): it holds only while that tab's program runs, and
+    /// an update's apply stops a Command Line Tools install whose password prompt nobody touched
+    /// for `crate::clt_install::UNTOUCHED_PROMPT_BACKSTOP`.
     DeveloperTools => "developer-tools",
     /// aterm's own sudo password sheet is up: every sheet is withdrawn within
     /// [`PASSWORD_PROMPT_BOUND`], and one nobody has touched for the askpass relay's untouched
@@ -149,8 +159,9 @@ lane_holds! {
 /// holds only while it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PersonHold {
-    /// A Command Line Tools install's tab that cannot travel with the handoff, its password
-    /// prompt waiting on them.
+    /// A Mac Setup tab that cannot travel with the handoff, its password prompt waiting on them
+    /// while they are at it: a Command Line Tools install's one nobody touched for
+    /// `crate::clt_install::UNTOUCHED_PROMPT_BACKSTOP` is stopped by an update's apply.
     DeveloperTools,
     /// Their draft in the launch's setup offer.
     SetupDraft,
@@ -175,7 +186,10 @@ impl PersonHold {
     #[must_use]
     pub(crate) const fn words(self) -> &'static str {
         match self {
-            Self::DeveloperTools => " (a person's own install tab: it holds only while it runs)",
+            Self::DeveloperTools => {
+                " (a person's own setup tab: it holds only while it runs, and a Command Line \
+                 Tools install's password prompt only while someone answers it)"
+            }
             Self::SetupDraft => " (a person's own draft: it holds only while it is there)",
             Self::SetupChoice => {
                 " (a choice someone made and not yet saved: it holds only while it is unsaved)"
@@ -204,9 +218,12 @@ impl LaneHold {
         match self {
             Self::UpdaterBusy => "the updater's running check or download ends",
             Self::HandoffInFlight => "the handoff in flight commits or stands down",
-            Self::PersonInstall => "the candidate's pre-park read ends",
+            Self::PersonInstall => {
+                "the candidate's pre-park read ends, or the startup boot-health gate opens"
+            }
             Self::BootHealth => {
-                "this build's boot-health confirmation lands, or its bound settles the trial"
+                "this build's boot-health confirmation lands, its bound settles the trial, or the \
+                 startup gate's patience passes and the apply admission decides"
             }
             Self::StagePending => "the staged download settles as the armed artifact",
             Self::ActivationSupersede => "the verified newer build replaces the installed one",
@@ -226,7 +243,10 @@ impl LaneHold {
                 "the setup worker takes the chosen Apply or queued choice or finishes the \
                  Restore, or it is stopped"
             }
-            Self::DeveloperTools => "the Command Line Tools install's tab ends",
+            Self::DeveloperTools => {
+                "the setup tab ends, or a Command Line Tools install's untouched password prompt \
+                 is stopped"
+            }
             Self::PasswordPrompt => {
                 "the sudo password prompt is answered, closed or withdrawn, or refused untouched"
             }

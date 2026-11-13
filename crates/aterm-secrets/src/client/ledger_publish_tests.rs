@@ -2,28 +2,11 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::client::log_entries_tests::join_host;
 use crate::server::{AlabNameInput, AlabNameWatcher, Options as ServerOptions};
 use crate::swarm_roster::{
     LEASE_CLOCK_MARGIN_SECS, LEASE_TTL_SECS, StewardPolicy, SwarmLease, SwarmPolicy,
 };
-
-fn join_host(paths: &Paths, source: &str, host: &str) {
-    join(
-        paths,
-        &JoinOptions {
-            source: source.to_owned(),
-            host: Some(host.to_owned()),
-            interactive: false,
-            wait: Duration::from_secs(2),
-            confirm: &|_| false,
-            password: JoinPassword::Given(None),
-            fetched: None,
-            requested: &|| {},
-            say: &|_| {},
-        },
-    )
-    .expect("join host");
-}
 
 fn start_loopback_server(store: &Path) -> crate::server::Running {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
@@ -1674,7 +1657,7 @@ fn bounded_readers_replay_local_records_before_contacting_an_endpoint() {
         .unwrap()
         .expect("the unchanged registered repository input is ready after repair");
         assert_eq!(captured.inputs, catalog);
-        assert!(captured.snapshot.is_current_now(&reader).unwrap());
+        assert!(captured.snapshot.is_current(&reader).unwrap());
         let repeated =
             apply_until(&reader, config, after, ApplyInput::Cached, None, None, true).unwrap();
         assert!(matches!(repeated, SyncOutcome::Unchanged { .. }));

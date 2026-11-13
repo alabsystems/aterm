@@ -85,6 +85,8 @@ pub struct Proc {
     /// The tab a session-mate's environment ties it to while it is held outside every job (the
     /// host's leftover reader reads that tie; its own environment is never read).
     pub tie: Option<u64>,
+    /// Its threads, where the sweep reads them (Linux).
+    pub threads: Option<u32>,
 }
 
 impl Proc {
@@ -139,6 +141,7 @@ impl Proc {
             forked: false,
             aterm: false,
             tie: None,
+            threads: None,
         }
     }
 }
@@ -725,6 +728,7 @@ fn sweep_of(p: &Proc) -> SweepProc {
         session_leader: (!zombie).then_some(p.sid == p.pid),
         has_tty: (!zombie).then_some(p.tty),
         exec: (!zombie).then_some(!p.forked),
+        threads: p.threads,
     }
 }
 

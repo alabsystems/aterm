@@ -80,8 +80,8 @@ impl Paths {
         self.keys().join("signing")
     }
 
-    /// `keys/github_token` (0600): the `[github]` machine user's token, as `aterm machines
-    /// github login` stores it, never in the login keychain.
+    /// `keys/github_token` (0600): the `[github]` machine user's token, never in the login
+    /// keychain.
     #[must_use]
     pub fn github_token(&self) -> PathBuf {
         self.keys().join("github_token")

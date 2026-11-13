@@ -762,6 +762,33 @@ fn findings_count_stopped_d_state_and_the_process_table() {
     );
 }
 
+/// On Linux the per-user limit (`RLIMIT_NPROC`) counts a user's threads, so the process table's
+/// own count does too where the sweep reads them: a build of 4,000 threads in one process is 4,000
+/// toward the limit, not 1. NEGATIVE CONTROL: the same world without thread counts (macOS, whose
+/// limit counts processes) counts processes.
+#[test]
+fn the_process_table_counts_threads_where_the_limit_does() {
+    let mut w = World::new();
+    let mut build = sleeper(7002, "cc1plus");
+    build.ppid = 1;
+    build.threads = Some(4000);
+    w.add(build);
+    let mut other = sleeper(7003, "java");
+    other.ppid = 1;
+    other.uid = 0;
+    other.threads = Some(900);
+    w.add(other);
+    let v = run_to(&mut w, 12_000, |_, _| {});
+    // aterm and the shell (one each, unread) and the build's 4,000; root's 900 are not ours.
+    assert_eq!(v.findings.own_procs, 4002);
+    let mut w = World::new();
+    let mut build = sleeper(7002, "cc1plus");
+    build.ppid = 1;
+    w.add(build);
+    let v = run_to(&mut w, 12_000, |_, _| {});
+    assert_eq!(v.findings.own_procs, 3);
+}
+
 /// A held process outside every tab's tree, adopted by launchd.
 fn held_orphan(pid: u32, name: &str, aterm: bool) -> Proc {
     let mut p = sleeper(pid, name);
@@ -1166,6 +1193,114 @@ fn a_stranded_held_row_is_named_apart_and_still_counted_held() {
         v.findings.program_check_stranded.is_empty() && v.findings.program_check_daemon.is_none(),
         "CONTROL: with no daemon judged against, nothing is named stranded: {:?}",
         v.findings
+    );
+}
+
+/// A stranded row is no part of the backed-up episode: its check went to a syspolicyd no longer
+/// running, not into the running check's line. Stranded rows alone open none, and an episode a held
+/// row opened drains two readings after it turns stranded, while it stays held with its held time
+/// (what the host's `holds_a_wait` reads); the same rows not stranded, or stranded with no daemon
+/// judged against, open one, and so does a row not stranded held beside stranded ones, whose
+/// episode's peak counts it alone; nor do stranded rows make up the three held at once that open
+/// one at a single reading.
+#[test]
+fn a_stranded_row_holds_no_episode_open_and_keeps_its_held_time() {
+    let three = |stranded: bool, daemon: Option<u32>| {
+        let mut w = World::new();
+        for (pid, name) in [(11271, "band"), (11272, "git"), (11273, "gh")] {
+            let mut p = held_orphan(pid, name, true);
+            p.stranded = stranded;
+            w.add(p);
+        }
+        w.daemon = daemon;
+        w
+    };
+    let mut w = three(true, Some(11291));
+    let v = w.observe();
+    assert_eq!(
+        v.findings.program_check_episode, None,
+        "three stranded at one reading: no queue"
+    );
+    for ticks in 1..=3 {
+        let v = w.tick(TICK_MS);
+        let held = ticks * TICK_MS;
+        assert_eq!(
+            held_rows(&v),
+            [
+                (11271, held, None),
+                (11272, held, None),
+                (11273, held, None)
+            ],
+            "a stranded row is still held"
+        );
+        assert_eq!(v.findings.program_check_stranded.len(), 3);
+        assert_eq!(
+            v.findings.program_check_episode, None,
+            "held across readings, stranded: no episode"
+        );
+    }
+    for (stranded, daemon) in [(false, Some(11291)), (true, None)] {
+        let v = three(stranded, daemon).observe();
+        assert!(
+            v.findings.program_check_episode.is_some(),
+            "CONTROL: rows not judged stranded (stranded {stranded}, daemon {daemon:?}) are the \
+             check's queue: {:?}",
+            v.findings
+        );
+    }
+    let mut w = three(true, Some(11291));
+    w.add(held_orphan(11274, "cargo", true));
+    w.observe();
+    let v = w.tick(TICK_MS);
+    assert_eq!(v.findings.program_check_stranded.len(), 3);
+    let beside = v.findings.program_check_episode.unwrap_or_else(|| {
+        panic!(
+            "CONTROL: a row not stranded, held at two readings beside stranded ones, is the \
+             check's queue: {:?}",
+            v.findings
+        )
+    });
+    assert_eq!(
+        (beside.peak, v.findings.program_check.len()),
+        (1, 4),
+        "of the four held, the episode's peak counts only the one not stranded"
+    );
+    let mut w = three(true, Some(11291));
+    w.p(11273).stranded = false;
+    let v = w.observe();
+    assert_eq!(v.findings.program_check_stranded.len(), 2);
+    assert_eq!(
+        v.findings.program_check_episode, None,
+        "two stranded and one other at one reading are not three of the check's line at once"
+    );
+
+    let mut w = World::new();
+    w.add(held_orphan(11271, "band", true));
+    w.daemon = Some(11291);
+    w.observe();
+    let v = w.tick(TICK_MS);
+    let opened = v
+        .findings
+        .program_check_episode
+        .expect("held across two readings: backed up");
+    w.p(11271).stranded = true;
+    let v = w.tick(TICK_MS);
+    assert_eq!(
+        held_rows(&v),
+        [(11271, 2 * TICK_MS, None)],
+        "turning stranded keeps its held time"
+    );
+    assert!(
+        v.findings.program_check_episode.is_some() && v.findings.program_check_drained.is_none(),
+        "one reading with none in the check's line does not close it"
+    );
+    let v = w.tick(TICK_MS);
+    assert_eq!(held_rows(&v), [(11271, 3 * TICK_MS, None)]);
+    assert_eq!(v.findings.program_check_episode, None);
+    assert_eq!(
+        v.findings.program_check_drained,
+        Some(opened),
+        "the second such reading closes it, open to its last held reading"
     );
 }
 

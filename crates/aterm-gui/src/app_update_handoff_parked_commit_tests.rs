@@ -110,7 +110,7 @@ impl Parked {
     }
 
     fn proof_ready(&mut self) -> crate::UpdateHandoffCompletion {
-        let (commit_rd, commit_wr) = std::io::pipe().expect("a commit pipe");
+        let (commit_rd, commit_wr) = aterm_uds::pipe().expect("a commit pipe");
         drop(commit_rd);
         crate::UpdateHandoffCompletion {
             attempt_id: 7,
@@ -123,6 +123,7 @@ impl Parked {
             detail: String::new(),
             input_drain_spins: 1,
             child_death: crate::ChildDeathEvidence::Unobserved,
+            successor_start: crate::app_update_handoff::SuccessorStart::Presented,
         }
     }
 
@@ -1079,6 +1080,7 @@ fn note_settles_and_the_write(parked: &mut Parked) {
     parked
         .app
         .set_system_state_handlers_for_test(crate::InitialSetupHandlers {
+            launch_history: || None,
             apply: |_, _, _, _| false,
             own_console: || true,
             check: |_, _| crate::CheckStarted::default(),

@@ -1767,6 +1767,47 @@ fn palette_filter_box(
     prims.push(DrawPrim::ClipPop);
 }
 
+/// The panels a card's drop shadow is stacked from ([`overlay_card_shadow`]).
+const SHADOW_STEPS: u16 = 8;
+
+/// The opacity of one of a shadow's panels, of 255: [`SHADOW_STEPS`] of them reach about a
+/// seventh of black against the card's edge, and with a contact shadow about a fifth.
+const SHADOW_STEP_ALPHA: u8 = 0x05;
+const SHADOW_CONTACT_STEP_ALPHA: u8 = 0x07;
+
+/// A card's drop shadow under `card` (`x`, `y`, `w`, `h`) of corner `radius`, at `pt` pixels a
+/// point: [`SHADOW_STEPS`] faint panels, each beginning 2 points under the card's top, the
+/// widest reaching 3 points past its sides and 8 below it and the rest drawn in toward the
+/// card by the square of their rank, so the shadow is deepest against the card and falls off
+/// to nothing at its reach with no step an eye can find, on a light ground as on a dark one;
+/// with `contact_shadow` each panel is deeper. A list overlay card ([`overlay_card_frame`])
+/// and a footer card's frame ([`crate::footer_card_plate`]) cast the same one.
+pub(crate) fn overlay_card_shadow(
+    card: (f32, f32, f32, f32),
+    pt: f32,
+    radius: f32,
+    contact_shadow: bool,
+) -> impl Iterator<Item = DrawPrim> {
+    let (card_x, card_y, card_w, card_h) = card;
+    let alpha = if contact_shadow {
+        SHADOW_CONTACT_STEP_ALPHA
+    } else {
+        SHADOW_STEP_ALPHA
+    };
+    (1..=SHADOW_STEPS).rev().map(move |step| {
+        let reach = f32::from(step * step) / f32::from(SHADOW_STEPS * SHADOW_STEPS);
+        let (side, below) = (3.0 * pt * reach, 8.0 * pt * reach);
+        DrawPrim::Panel {
+            x: card_x - side,
+            y: card_y + 2.0 * pt,
+            w: card_w + 2.0 * side,
+            h: card_h - 2.0 * pt + below,
+            radius: radius + side,
+            fill: rgba([0, 0, 0], alpha),
+        }
+    })
+}
+
 /// Appends the outer drop shadow, background, border, and title for a list overlay card. Its
 /// corner radius cap, shadow offsets and border are points, scaled by
 /// [`SettingsGeom::px_per_pt`] as the card's width cap is ([`overlay_card_span`]), so a Retina
@@ -1780,24 +1821,7 @@ pub(crate) fn overlay_card_frame(
     let (card_x, card_y, card_w, card_h) = card;
     let pt = g.px_per_pt;
     let radius = (g.ch * 0.6).min(14.0 * pt);
-    let mut prims = vec![DrawPrim::Panel {
-        x: card_x - 3.0 * pt,
-        y: card_y + 2.0 * pt,
-        w: card_w + 6.0 * pt,
-        h: card_h + 6.0 * pt,
-        radius: radius + 3.0 * pt,
-        fill: rgba([0, 0, 0], 0x2A),
-    }];
-    if contact_shadow {
-        prims.push(DrawPrim::Panel {
-            x: card_x - pt,
-            y: card_y + 2.0 * pt,
-            w: card_w + 2.0 * pt,
-            h: card_h + 3.0 * pt,
-            radius: radius + pt,
-            fill: rgba([0, 0, 0], 0x30),
-        });
-    }
+    let mut prims: Vec<DrawPrim> = overlay_card_shadow(card, pt, radius, contact_shadow).collect();
     prims.extend([
         DrawPrim::Panel {
             x: card_x,

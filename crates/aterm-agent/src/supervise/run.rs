@@ -411,13 +411,18 @@ pub struct IdlePoint {
     /// a break of the agent's own background work while the line stands, and offers no break's
     /// fact at all then ([`IdleHost::at_background_fact`]).
     pub line_held: Option<LineHeld>,
+    /// The point stands at a wall (a login wall, a usage limit before its reset) the loop passes
+    /// for the upgrade alone ([`IdleHost::upgrade_wall_due`]): the upgrade's step goes here and
+    /// nothing else of the host's does, as anything typed would be answered by the wall.
+    pub walled: bool,
 }
 
 pub use super::custody::LineHeld;
 
 /// A tape spells a point as it did before [`IdlePoint::held`], [`IdlePoint::theirs`],
-/// [`IdlePoint::carry_only`], [`IdlePoint::replies_held`] and [`IdlePoint::line_held`] were there
-/// whenever none of them says anything, so a tape recorded before them still replays.
+/// [`IdlePoint::carry_only`], [`IdlePoint::replies_held`], [`IdlePoint::line_held`] and
+/// [`IdlePoint::walled`] were there whenever none of them says anything, so a tape recorded
+/// before them still replays.
 impl std::fmt::Debug for IdlePoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut d = f.debug_struct("IdlePoint");
@@ -436,6 +441,9 @@ impl std::fmt::Debug for IdlePoint {
         }
         if let Some(held) = &self.line_held {
             d.field("line_held", held);
+        }
+        if self.walled {
+            d.field("walled", &true);
         }
         d.finish()
     }
@@ -2337,6 +2345,13 @@ pub struct Session<'a, C: Ctl> {
     /// The agent's left rows the host last read for the same done words, as [`Self::repo_seen`]
     /// keeps the repository's ([`Session::left_read`]).
     pub(super) left_seen: Option<(Option<u64>, Instant, crate::harness::leftover::LeftRead)>,
+    /// How the host last resolved the same words' credential lines, as [`Self::left_seen`] keeps
+    /// the left rows ([`Session::credentials_read`]).
+    pub(super) credentials_seen: Option<(
+        Option<u64>,
+        Instant,
+        super::policy::credential_need::CredentialRead,
+    )>,
     /// A fresh repository probe read [`crate::harness::repo_work::RepoRead::Unread`], not yet journaled.
     pub(super) repo_unread_unsaid: bool,
     pub(super) left_at_wall_seq: Option<u64>,
@@ -2433,7 +2448,13 @@ pub struct Session<'a, C: Ctl> {
     box_first_seen: Option<(String, Instant)>,
     countdown: Option<approval_loop::Countdown>,
     episode: Option<approval_loop::Episode>,
-    /// The last read's person count (`Some(None)`: it carried none), the next episode's baseline.
+    /// The inputs (`key`, `send`, `turn`, `paste`, `feed-bin`) the loop has written to the
+    /// session, a fenced one the server skipped not counted: a dialog's focus moved while this
+    /// stood still was moved by someone else.
+    inputs_written: u64,
+    /// The last read's person count (`Some(None)`: it carried none), the baseline of
+    /// [`Self::set_old_grace`]'s episodes.
+    #[cfg(test)]
     last_read_count: Option<Option<u64>>,
     #[cfg(test)]
     deny_cap_off: bool,
@@ -2442,15 +2463,13 @@ pub struct Session<'a, C: Ctl> {
     #[cfg(test)]
     episode_per_box: bool,
     #[cfg(test)]
-    bound_off: bool,
+    old_grace: bool,
+    #[cfg(test)]
+    settle_off: bool,
     #[cfg(test)]
     last_box: Option<String>,
     #[cfg(test)]
     read_clock: Option<(Instant, u32)>,
-    /// The `text` read (by [`Self::read_clock`]'s count) that took this long to answer, so every
-    /// read after it is asked for that much later ([`Self::set_read_lag`]).
-    #[cfg(test)]
-    read_lag: Option<(u32, Duration)>,
     stepper: approval_loop::StepperTrack,
     box_proved: Option<String>,
     calls_spent: Vec<String>,
@@ -2593,6 +2612,10 @@ pub struct Session<'a, C: Ctl> {
     /// while it was told one stands.
     probe_panel_told: bool,
     probe_fold: Option<(Option<u16>, Option<usize>)>,
+    /// What the probe in progress read of Fable's week, for a model switch that waits on it:
+    /// `Some(None)` once its `/usage` was entered, `Some(Some(row))` once its settled panel was
+    /// read (`Session::fable_sampled`).
+    probe_fable: Option<Option<(u32, Option<i64>)>>,
     probe_off: bool,
     turn_live: bool,
     probe_said: Option<String>,
@@ -2789,6 +2812,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             left_keys: Vec::new(),
             repo_seen: None,
             left_seen: None,
+            credentials_seen: None,
             repo_unread_unsaid: false,
             left_at_wall_seq: None,
             box_reason: None,
@@ -2847,6 +2871,8 @@ impl<'a, C: Ctl> Session<'a, C> {
             box_first_seen: None,
             countdown: None,
             episode: None,
+            inputs_written: 0,
+            #[cfg(test)]
             last_read_count: None,
             #[cfg(test)]
             deny_cap_off: false,
@@ -2855,13 +2881,13 @@ impl<'a, C: Ctl> Session<'a, C> {
             #[cfg(test)]
             episode_per_box: false,
             #[cfg(test)]
-            bound_off: false,
+            old_grace: false,
+            #[cfg(test)]
+            settle_off: false,
             #[cfg(test)]
             last_box: None,
             #[cfg(test)]
             read_clock: None,
-            #[cfg(test)]
-            read_lag: None,
             stepper: approval_loop::StepperTrack::default(),
             box_proved: None,
             calls_spent: Vec::new(),
@@ -2919,6 +2945,7 @@ impl<'a, C: Ctl> Session<'a, C> {
             probe: UsageProbe::Idle,
             probe_panel_told: false,
             probe_fold: None,
+            probe_fable: None,
             probe_off: false,
             turn_live: false,
             probe_said: None,
@@ -3190,12 +3217,21 @@ impl<'a, C: Ctl> Session<'a, C> {
         self.seeds_learned_state("the loop that starts an episode at every box");
     }
 
-    /// Holds an untouched permission box for a person's whole grace, as before its bound: the
-    /// bound's negative control.
+    /// Reads a box episode as the loop before [`approval_loop::PERSON_SETTLE`] did, any rise in
+    /// the person count since the read before the box a touch, and holds an untouched Claude Code
+    /// permission box for [`approval_loop::QUESTION_PERSON_GRACE`]: the settle's negative control.
     #[cfg(test)]
-    pub(crate) fn set_bound_off(&mut self) {
-        self.bound_off = true;
-        self.seeds_learned_state("the loop before the untouched box's bound");
+    pub(crate) fn set_old_grace(&mut self) {
+        self.old_grace = true;
+        self.seeds_learned_state("the loop before the untouched box's settle");
+    }
+
+    /// Answers an untouched Claude Code permission box with no settle at all, however recent the
+    /// person's last key: the settle's other negative control.
+    #[cfg(test)]
+    pub(crate) fn set_settle_off(&mut self) {
+        self.settle_off = true;
+        self.seeds_learned_state("the loop that answers an untouched box with no settle");
     }
 
     /// Places each `text` read a second after the one before, the clock its countdowns tick on.
@@ -3208,18 +3244,7 @@ impl<'a, C: Ctl> Session<'a, C> {
     #[cfg(test)]
     fn read_clock_now(&self) -> Option<Instant> {
         let (set, reads) = self.read_clock?;
-        let lag = self
-            .read_lag
-            .filter(|(slow, _)| reads > *slow)
-            .map_or(Duration::ZERO, |(_, lag)| lag);
-        Some(set + Duration::from_secs(u64::from(reads.saturating_sub(1))) + lag)
-    }
-
-    /// On [`Self::set_read_clock`]'s clock, the `text` read numbered `read` (from 1) takes `lag`
-    /// to answer: every read after it is asked for `lag` later.
-    #[cfg(test)]
-    pub(crate) fn set_read_lag(&mut self, read: u32, lag: Duration) {
-        self.read_lag = Some((read, lag));
+        Some(set + Duration::from_secs(u64::from(reads.saturating_sub(1))))
     }
 
     /// Advances any active post-wake settle deadline to the current instant for tests.
@@ -3407,6 +3432,13 @@ impl<'a, C: Ctl> Session<'a, C> {
         };
         self.watch_sleep();
         let r = r.map_err(Fail::Hard)?;
+        if claim::is_input(args) {
+            if r.skipped_person() {
+                self.episode_yielded();
+            } else if r.ok() && !r.skipped() {
+                self.inputs_written = self.inputs_written.wrapping_add(1);
+            }
+        }
         self.note_status(args, &r);
         self.cruise_carry.wrote(args, &r);
         if claim::is_input(args) && !(r.is_err("halted") || r.is_err("busy") || r.is_err("rate")) {
@@ -3682,8 +3714,11 @@ impl<'a, C: Ctl> Session<'a, C> {
         #[cfg(test)]
         let asked = self.read_clock_now().unwrap_or(asked);
         self.keep_countdown(&screen.rows, asked);
-        self.keep_episode(&screen, self.last_read_count, asked);
-        self.last_read_count = Some(screen.human_seq);
+        self.keep_episode(&screen);
+        #[cfg(test)]
+        {
+            self.last_read_count = Some(screen.human_seq);
+        }
         if self.caps.await_agent.is_none() {
             self.caps.await_agent = Some(screen.generation.is_some());
         }
@@ -7922,6 +7957,21 @@ impl<C: Ctl> Session<'_, C> {
             && (self.turn_end.account_resume_owed()
                 || self.limit_spent(Some(host.as_ref()), notice)
                 || agy_rotation_due);
+        // A wall the upgrade's own bound has outlasted ([`IdleHost::upgrade_wall_due`]): a login
+        // wall, or a usage limit the carry does not pass yet (one past its reset it does, as
+        // `spent`). Its point goes to the upgrade's step alone ([`IdlePoint::walled`]).
+        let login_wall = reading
+            .wall
+            .as_ref()
+            .is_some_and(|w| w.kind == aterm_phase::WallKind::Auth);
+        // An open episode is the limit's only where no other wall stands: at any other wall the
+        // loop withholds every point, whatever the upgrade's look found.
+        let limit_held = !spent && (limit_wall || (self.limit.is_some() && reading.wall.is_none()));
+        let mut walled =
+            (login_wall || limit_held) && self.upgrade_walled(reading.program, host.as_ref());
+        // A walled point at the limit, or at a login wall while the limit's episode stays open, is
+        // offered whatever the episode holds: it takes the upgrade's step alone.
+        let spent = spent || (walled && (limit_held || self.limit.is_some()));
         // A RELAUNCH'S CARRY-ON RESTS AT THE QUESTION ITS RESUME DRAWS: a conversation that ended
         // on a question comes back on it. Nothing else of the host's steps there.
         let carry_only = (point.phase == Phase::Question || reading.phase == Phase::Question)
@@ -7936,7 +7986,7 @@ impl<C: Ctl> Session<'_, C> {
             Some(Guard::NotIdle)
         } else if !reading.phase_authoritative {
             Some(Guard::NotAuthoritative)
-        } else if reading.wall.is_some() && !(spent && limit_wall) {
+        } else if reading.wall.is_some() && !(spent && limit_wall) && !walled {
             Some(Guard::Wall)
         } else if reading.wall.is_none() && self.turn_end.holds_left_retry() {
             // Retry wall still active off-screen.
@@ -7955,8 +8005,9 @@ impl<C: Ctl> Session<'_, C> {
         } else if self.credits_hold_here(&opts.policy, &point.screen.rows) {
             Some(Guard::Credits)
         } else if self.limit.is_none() && !limit_wall && self.standing_holds(host.as_ref()) {
-            // Transcript standing limit still active.
-            Some(Guard::LimitEpisode)
+            // Transcript standing limit still active, unless the upgrade's bound outlasted it.
+            walled = walled || self.upgrade_walled(reading.program, host.as_ref());
+            (!walled).then_some(Guard::LimitEpisode)
         } else {
             None
         };
@@ -7999,6 +8050,7 @@ impl<C: Ctl> Session<'_, C> {
                 replies_held: !self.fx.replay_lacks_host_door("host.carry_owed")
                     && self.replies_stopped,
                 line_held,
+                walled,
             };
             let step = host.at_idle_on(at);
             if let Some(step) = &step {
@@ -8147,6 +8199,16 @@ impl<C: Ctl> Session<'_, C> {
             theirs: guards.theirs(),
             ..IdlePoint::default()
         }))
+    }
+
+    /// Whether the upgrade's own look found this tab's move held only by the loop's guard at a
+    /// wall past the upgrade's bound ([`IdleHost::upgrade_wall_due`]), for an agent whose walls
+    /// the upgrade ages ([`crate::harness::upgrade::Agent::walls_age`]).
+    fn upgrade_walled(&self, program: Program, host: &dyn IdleHost) -> bool {
+        crate::harness::upgrade::Agent::of(program)
+            .is_some_and(crate::harness::upgrade::Agent::walls_age)
+            && !self.fx.replay_lacks_host_door("host.upgrade_wall_due")
+            && host.upgrade_wall_due()
     }
 
     fn policy_limit_holds(&self) -> bool {

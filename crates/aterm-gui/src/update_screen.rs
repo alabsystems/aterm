@@ -69,6 +69,47 @@ pub(crate) struct UpdateState {
     dev_build: Option<DevBuildPage>,
     /// Where this copy runs from.
     install_posture: Option<aterm_update::which_copy::InstallPosture>,
+    /// The update record's hold on a newer build ([`Self::held`]).
+    hold: Option<aterm_update::HoldView>,
+    /// The record's newest offer is newer than what runs ([`Self::behind`]).
+    behind: bool,
+}
+
+/// A newer build the update record holds now, as the page says it: the gates refuse it until its
+/// hold lapses by itself (within a day), a person asks again (Try Now), it starts cleanly
+/// elsewhere on this Mac's lineage, or a newer build is offered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeldUpdate {
+    /// The held build's name: its version, or `build <n>`.
+    pub(crate) name: String,
+    /// What failed, in a person's words ([`aterm_update_core::update_record::Cause::words`]).
+    pub(crate) why: &'static str,
+    /// When the hold lapses and the build is tried again (Unix seconds).
+    pub(crate) until: u64,
+    /// How many failures of it in a row.
+    pub(crate) tries: u8,
+}
+
+impl HeldUpdate {
+    /// When it is tried again, as a person reads it: `at 18:40` on this Mac's clock, or `within a
+    /// day` where the zone cannot be read.
+    pub(crate) fn when(&self) -> String {
+        i64::try_from(self.until)
+            .ok()
+            .and_then(crate::status_item::clock_words)
+            .map_or_else(|| "within a day".to_string(), |clock| format!("at {clock}"))
+    }
+
+    /// The detail sentence: what is held, why, and when aterm tries it again by itself.
+    pub(crate) fn sentence(&self) -> String {
+        format!(
+            "Version {} is held: {}. aterm tries it again by itself {}, or Try Now tries it \
+             now.",
+            self.name,
+            self.why,
+            self.when()
+        )
+    }
 }
 
 /// Detail under "This copy of aterm can't update itself." for a non-bundle copy.
@@ -146,6 +187,10 @@ pub(crate) struct UpdateProjection {
     pub(crate) apply_trouble: Option<ApplyTrouble>,
     /// The staged build is on hold (`App::latched_activation_trial_spent`).
     pub(crate) staged_on_hold: bool,
+    /// The update record holds a newer build now ([`UpdateState::held`]).
+    pub(crate) held: Option<HeldUpdate>,
+    /// A newer build is out and nothing is staged or held ([`UpdateState::behind`]).
+    pub(crate) behind: bool,
     /// Whether a replacement could be installed here at all.
     pub(crate) installable: UpdateInstallability,
     /// This copy is dev-marked (`ship dev-app`).
@@ -247,6 +292,8 @@ impl UpdateState {
             downloading: None,
             dev_build: None,
             install_posture: None,
+            hold: snapshot.hold.clone(),
+            behind: snapshot.behind,
         }
         .without_inapplicable_stage()
     }
@@ -313,6 +360,8 @@ impl UpdateState {
             downloading: None,
             dev_build: None,
             install_posture: None,
+            hold: status.and_then(|s| s.hold.clone()),
+            behind: status.is_some_and(|s| s.behind),
         }
         .without_inapplicable_stage()
     }
@@ -360,6 +409,52 @@ impl UpdateState {
     /// A build on offer that is on hold ([`Self::staged_on_hold`]).
     const fn on_hold(&self) -> bool {
         self.enabled && self.staged.is_some() && self.staged_on_hold
+    }
+
+    /// The update record's live hold on a build newer than the running one, which the page says
+    /// in place of "up to date" or "ready" ([`aterm_update::held_outcome`] says it the same way
+    /// on the command line). A lapsed hold says nothing here: its build is tried again.
+    pub(crate) fn held(&self) -> Option<HeldUpdate> {
+        let hold = self
+            .hold
+            .as_ref()
+            .filter(|hold| self.enabled && hold.live && hold.build > self.current_build)?;
+        Some(HeldUpdate {
+            name: if hold.version.is_empty() {
+                format!("build {}", hold.build)
+            } else {
+                hold.version.clone()
+            },
+            why: hold.cause.words(),
+            until: hold.until,
+            tries: hold.tries,
+        })
+    }
+
+    /// Why this copy is not up to date with nothing staged and nothing held now: the record's
+    /// newest offer is newer than what runs, waiting for a check to stage it, a lapsed hold on it
+    /// included. `None` otherwise; the page then may say it is up to date.
+    pub(crate) fn behind(&self) -> Option<String> {
+        if !self.enabled || self.staged.is_some() || self.held().is_some() {
+            return None;
+        }
+        let lapsed = self
+            .hold
+            .as_ref()
+            .filter(|hold| !hold.live && hold.build > self.current_build);
+        match lapsed {
+            Some(hold) => Some(format!(
+                "Version {} was held: {}. aterm tries it again on its next check.",
+                hold.name(),
+                hold.cause.words()
+            )),
+            None if self.behind => Some(
+                "A newer version is out and not installed yet. aterm downloads it on its next \
+                 check."
+                    .to_string(),
+            ),
+            None => None,
+        }
     }
 
     /// The quiet download, where the page may say it.
@@ -452,6 +547,8 @@ impl UpdateState {
             apply_is_failing: self.apply_is_failing() && self.enabled && !self.checking,
             apply_trouble: (!self.checking).then(|| self.apply_trouble()).flatten(),
             staged_on_hold: self.on_hold(),
+            held: self.held(),
+            behind: !self.checking && self.behind().is_some(),
             installable: self.installable,
             dev_build: self.dev_build.is_some(),
             channel_unreadable: self.channel_unreadable && self.enabled && !self.checking,
@@ -464,13 +561,14 @@ impl UpdateState {
     }
 
     /// Only "Up to date — …" speaks for the channel on Linux, so it says nothing while a check has
-    /// stopped answering. The ledger's other words stay: a stage rejected on this read, a rollback's,
-    /// or an error's cause.
+    /// stopped answering. The ledger's other words stay: a stage rejected on this read, a hold's,
+    /// or an error's cause. "Up to date" is judged by the predicate status uses to keep it from
+    /// standing while a newer build is held or offered ([`aterm_update::says_up_to_date`]).
     fn linux_outcome_predates_silence(&self) -> bool {
         self.linux_host
             && self.check_unanswered
             && !self.checking
-            && self.outcome.trim_start().starts_with("Up to date")
+            && aterm_update::says_up_to_date(&self.outcome)
     }
 
     /// The persistent failure is in the apply class.
@@ -487,6 +585,8 @@ impl UpdateState {
             Some("Updates are off.")
         } else if self.linux_error || self.failing_persistent || self.channel_unreadable {
             Some("Update needs attention.")
+        } else if self.held().is_some() {
+            Some("Update held.")
         } else if linux.is_some_and(|status| status.staged_build.is_some()) {
             Some("Update downloaded.")
         } else if linux.is_some_and(|status| status.trial_phase.is_some() && !status.trial_healthy)
@@ -516,6 +616,8 @@ impl UpdateState {
             } else {
                 "No update staged.".to_string()
             }
+        } else if self.held().is_some() {
+            "Update held".to_string()
         } else if self.on_hold() {
             "Update on hold".to_string()
         } else if self.staged.is_some() && self.enabled && self.apply_is_failing() {
@@ -539,6 +641,8 @@ impl UpdateState {
             "Updates are failing on this machine.".to_string()
         } else if self.check_unanswered {
             crate::native_updater_service::CHECK_DID_NOT_ANSWER.to_string()
+        } else if self.behind().is_some() {
+            "A newer version is out.".to_string()
         } else if !self.automatic_checks {
             "Automatic checks are off.".to_string()
         } else {
@@ -637,11 +741,31 @@ impl UpdateState {
                     facts.join(". ")
                 })
                 .unwrap_or_default();
-            let detail = [unanswered, identity.as_str(), outcome, direction]
-                .into_iter()
-                .filter(|part| !part.is_empty())
-                .collect::<Vec<_>>()
-                .join(". ");
+            let held = self
+                .held()
+                .map(|held| {
+                    format!(
+                        "Version {} is held: {}. aterm tries it again by itself {}, or `aterm \
+                         update retry` tries it now",
+                        held.name,
+                        held.why,
+                        held.when()
+                    )
+                })
+                .unwrap_or_default();
+            // The hold says what the ledger's "held: …" outcome would repeat.
+            let outcome = if held.is_empty() { outcome } else { "" };
+            let detail = [
+                unanswered,
+                held.as_str(),
+                identity.as_str(),
+                outcome,
+                direction,
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(". ");
             let detail = match self.automatic_checks_detail() {
                 Some(checks) if detail.is_empty() => checks,
                 Some(checks) => format!("{checks} {detail}"),
@@ -659,6 +783,12 @@ impl UpdateState {
                 (None, Some(InstallPosture::NotABundle)) => Some(NOT_A_BUNDLE_DETAIL.to_string()),
                 (None, posture) => posture.and_then(InstallPosture::remedy).map(str::to_string),
             };
+        }
+        if let Some(held) = self.held().filter(|_| !self.checking) {
+            return Some(held.sentence());
+        }
+        if let Some(behind) = self.behind().filter(|_| !self.checking) {
+            return Some(behind);
         }
         if let Some((_, v)) = self.staged.as_ref() {
             // `!self.checking` as in `projection()`: a check in flight owns the surface.

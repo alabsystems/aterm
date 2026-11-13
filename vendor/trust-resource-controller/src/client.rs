@@ -12,6 +12,13 @@ use trust_resource_provenance::{PinnedHelper, Store, process};
 
 use crate::{Channel, ContextQuery, ContextReply, ContextResponse};
 
+mod coordinator;
+pub use coordinator::{
+    AuthenticatedCoordinator, CompilerScope, CompilerScopeError, CoordinatorBroker,
+    CoordinatorBrokerEndpoint, CoordinatorBrokerServer, CoordinatorCompilerCapture,
+    CoordinatorOriginals, GraphAcknowledgement, PublicationAcknowledgement,
+};
+
 /// Delivery facts, never a claim that the original root did not launch or that
 /// any resources were released. None authorizes CPU or an execution retry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -245,14 +252,17 @@ impl Client {
 }
 
 mod member;
-pub use member::{HelperObservation, MemberError, MemberIo, ProxyChild, inherit_descriptions};
+pub use member::{
+    HelperObservation, MemberError, MemberIo, ProxyChild, explicit_inheritance_supported,
+    inherit_descriptions,
+};
 
 mod metadata;
 pub use metadata::{
     CompletedProducedOperation, ContainedProducedError, ContainedProducedMember, LinkerError,
     LinkerMember, LinkerOutcome, LinkerResult, MetadataError, MetadataIo, MetadataMember,
     MetadataOutputStream, MetadataResult, ProducedError, ProducedFailureObservation,
-    ProducedMember, ProducedResult,
+    ProducedMember, ProducedResult, SuccessfulProducedCompletion,
 };
 
 mod telemetry;
@@ -262,6 +272,7 @@ mod liveness;
 pub use liveness::HostLifeline;
 
 pub mod bootstrap_graph;
+pub mod native_job;
 pub mod paired_qualification;
 pub mod sdk;
 pub mod workload;

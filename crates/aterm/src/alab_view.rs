@@ -72,7 +72,8 @@ const RETRY_FAILED: Duration = Duration::from_secs(15);
 
 /// Whether this process may hold a lab: a release build outside a build tool's tests, with no
 /// scratch state root and no CI. The lab's roster source here, [`crate::alab_mailbox`],
-/// [`crate::alab_register`] and [`crate::alab_seen`] hold on this answer; the journal sink
+/// [`crate::alab_register`], [`crate::alab_seen`] and [`crate::alab_update`] hold on this
+/// answer; the journal sink
 /// (`crate::alab_journal`) does not ask it.
 pub(crate) fn holds() -> bool {
     lab_hooks_on(!cfg!(debug_assertions), |key| std::env::var_os(key))

@@ -342,27 +342,27 @@ fn a_record_that_crossed_the_cut_fails_records_held() {
     assert_eq!(failed(&ev), vec![RECORDS_HELD]);
 }
 
-/// A run is recorded under `docs/measured/` only where every split it held held: a record that
-/// crossed the cut or F21's split voids it, while a run whose removals plane held no F21 split
-/// (it did not get that far) stands on the cut alone.
+/// A run measures the build (its record and the console name no shortfall) only where every
+/// split it held held: a record that crossed the cut or F21's split voids it, while a run whose
+/// removals plane held no F21 split (it did not get that far) stands on the cut alone.
 ///
-/// An F21 split whose records sync went unexercised saw nothing cross, so its run is recorded
-/// (its row red).
+/// An F21 split whose records sync went unexercised saw nothing cross, so its run measures the
+/// build (its row red).
 ///
 /// NEGATIVE CONTROL (restored with cp from a backup plus touch, confirmed with cmp): in
-/// `unmeasured`, leave F21's split out (`f21` always `None`): the run whose F21 split leaked is
-/// recordable, and the test fails at `!recordable(&with_split(Some(ledgers::crossed())))`
+/// `unmeasured`, leave F21's split out (`f21` always `None`): the run whose F21 split leaked
+/// measures the build, and the test fails at `!measures(&with_split(Some(ledgers::crossed())))`
 /// (proven 2026-11-03). Make `split::Shortfall::voids` answer `true` for every shortfall: the
-/// unexercised split's run is not recorded, and the test fails at
-/// `recordable(&with_split(Some(ledgers::unexercised())))` (proven 2026-11-03).
+/// unexercised split's run measures no build, and the test fails at
+/// `measures(&with_split(Some(ledgers::unexercised())))` (proven 2026-11-03).
 #[test]
-fn a_run_whose_cut_or_f21_split_leaked_is_never_recorded() {
-    let recordable = |ev: &Evidence| unmeasured(ev, &judge(ev)).is_empty();
-    assert!(recordable(&whole()));
+fn a_run_whose_cut_or_f21_split_leaked_measures_no_build() {
+    let measures = |ev: &Evidence| unmeasured(ev, &judge(ev)).is_empty();
+    assert!(measures(&whole()));
 
     let mut cut_leaked = whole();
     cut_leaked.vault.cut_ledger = Some(ledgers::crossed());
-    assert!(!recordable(&cut_leaked));
+    assert!(!measures(&cut_leaked));
 
     let with_split = |ledger: Option<split::Ledger>| {
         let mut ev = whole();
@@ -375,13 +375,13 @@ fn a_run_whose_cut_or_f21_split_leaked_is_never_recorded() {
         });
         ev
     };
-    assert!(recordable(&with_split(Some(ledgers::held()))));
-    assert!(!recordable(&with_split(Some(ledgers::crossed()))));
-    assert!(recordable(&with_split(None)));
-    assert!(recordable(&with_split(Some(ledgers::unexercised()))));
+    assert!(measures(&with_split(Some(ledgers::held()))));
+    assert!(!measures(&with_split(Some(ledgers::crossed()))));
+    assert!(measures(&with_split(None)));
+    assert!(measures(&with_split(Some(ledgers::unexercised()))));
 }
 
-/// The not-recorded line says why each split fell short: one whose server could not be read at
+/// The not-measured line says why each split fell short: one whose server could not be read at
 /// its end is not shown to hold, never told as one something crossed, and one that leaked says
 /// so.
 ///
@@ -604,17 +604,17 @@ fn parse_reads_each_arm_and_refuses_what_it_does_not_know() {
         "a",
         "--hold",
         "90",
-        "--record",
+        "--keep",
     ]))
     .unwrap();
     assert_eq!(opts.publish, Publish::OneUrl);
     assert_eq!(opts.writers, Writers::A);
     assert_eq!(opts.hold, Duration::from_secs(90));
-    assert!(opts.record && !opts.keep);
+    assert!(opts.keep);
     let plain = parse(&[]).unwrap();
     assert_eq!(
-        (plain.publish, plain.writers, plain.hold),
-        (Publish::Policy, Writers::Both, DEFAULT_HOLD)
+        (plain.publish, plain.writers, plain.hold, plain.keep),
+        (Publish::Policy, Writers::Both, DEFAULT_HOLD, false)
     );
     for bad in [
         &["--hold", "5"][..],

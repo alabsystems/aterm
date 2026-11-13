@@ -6,6 +6,7 @@
 //! Headless, deterministic CPU terminal rasterizer turning [`RenderInput`] into an RGBA framebuffer.
 
 use aterm_hash::{FxHashMap, FxHashSet, KeyedHashMap};
+pub use aterm_scene::smoothstep;
 use emoji_cluster::ClusterShape;
 
 use aterm_core::grid::LineSize;
@@ -100,12 +101,6 @@ pub mod rounded_bar;
 pub mod scroll_translate;
 pub mod spill;
 pub mod sprites;
-#[cfg(any(
-    all(unix, not(target_os = "macos")),
-    all(test, feature = "embedded-font", target_os = "macos")
-))]
-#[cfg_attr(all(test, target_os = "macos"), allow(dead_code))]
-mod subpixel;
 #[cfg(any(test, debug_assertions))]
 #[doc(hidden)]
 pub mod test_counters;
@@ -938,16 +933,6 @@ impl GlyphImage {
     }
 }
 
-#[cfg(all(unix, not(target_os = "macos")))]
-#[derive(Clone, Debug)]
-struct SubpxImage {
-    width: usize,
-    height: usize,
-    xmin: i32,
-    ymin: i32,
-    bytes: Vec<u8>,
-}
-
 /// One glyph in a bounded semantic text run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SemanticGlyph {
@@ -1452,14 +1437,6 @@ pub struct Renderer {
     hint_mode: hinted::HintMode,
     #[cfg(any(all(unix, not(target_os = "macos")), windows))]
     hint_bank: hinted::HintBank,
-    #[cfg(all(unix, not(target_os = "macos")))]
-    subpix_mode: subpixel::SubpixelMode,
-    #[cfg(all(unix, not(target_os = "macos")))]
-    subpx_bank: hinted::HintBank,
-    #[cfg(all(unix, not(target_os = "macos")))]
-    subpx_glyphs: FxHashMap<GlyphKey, Option<SubpxImage>>,
-    #[cfg(all(unix, not(target_os = "macos")))]
-    subpx_frame: bool,
     #[cfg(target_os = "macos")]
     rasterizer: RasterKind,
     #[cfg(target_os = "macos")]
@@ -6874,14 +6851,6 @@ impl Renderer {
             hint_mode: hinted::HintMode::initial(),
             #[cfg(any(all(unix, not(target_os = "macos")), windows))]
             hint_bank: hinted::HintBank::default(),
-            #[cfg(all(unix, not(target_os = "macos")))]
-            subpix_mode: subpixel::SubpixelMode::initial(),
-            #[cfg(all(unix, not(target_os = "macos")))]
-            subpx_bank: hinted::HintBank::default(),
-            #[cfg(all(unix, not(target_os = "macos")))]
-            subpx_glyphs: FxHashMap::default(),
-            #[cfg(all(unix, not(target_os = "macos")))]
-            subpx_frame: false,
             #[cfg(target_os = "macos")]
             rasterizer: select_rasterizer(),
             #[cfg(target_os = "macos")]
@@ -8284,10 +8253,6 @@ impl Renderer {
         {
             rebuilt.hint_mode = self.hint_mode;
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            rebuilt.subpix_mode = self.subpix_mode;
-        }
         rebuilt.refresh_drawn_faces();
         Ok(rebuilt)
     }
@@ -8397,10 +8362,6 @@ impl Renderer {
         {
             fork.hint_mode = self.hint_mode;
         }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            fork.subpix_mode = self.subpix_mode;
-        }
         Some(fork)
     }
 
@@ -8413,12 +8374,6 @@ impl Renderer {
             self.hint_bank.clear();
             self.clear_glyph_images();
             self.keys.clear();
-            #[cfg(all(unix, not(target_os = "macos")))]
-            {
-                self.subpix_mode = subpixel::SubpixelMode::Off;
-                self.subpx_bank.clear();
-                self.subpx_glyphs.clear();
-            }
         }
         #[cfg(target_os = "macos")]
         {
@@ -8560,127 +8515,6 @@ impl Renderer {
         _ch: char,
     ) -> Option<(usize, usize, i32, i32, f32, Vec<u8>)> {
         None
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    fn subpx_image(&mut self, key: GlyphKey) -> Option<&SubpxImage> {
-        if !self.subpx_glyphs.contains_key(&key) {
-            let img = self.subpx_rasterize(key);
-            self.subpx_glyphs.insert(key, img);
-        }
-        self.subpx_glyphs.get(&key).and_then(|o| o.as_ref())
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    fn subpx_rasterize(&mut self, key: GlyphKey) -> Option<SubpxImage> {
-        if !matches!(key.source, FaceId::Primary | FaceId::BoldPrimary)
-            || key.style.script() != StyleBits::REGULAR
-            || key.cell_span != 0
-            || self.var_coords.is_some()
-        {
-            return None;
-        }
-        let (bytes, index, gid): (std::sync::Arc<[u8]>, u32, u16) = match key.glyph_class {
-            GlyphClass::MonoGid => {
-                if key.ch_or_id >> LIG_SLICE_SHIFT != 0 {
-                    return None;
-                }
-                let gid = key.ch_or_id as u16;
-                if key.source == FaceId::BoldPrimary {
-                    // Synthesis and an instanced face stay grayscale: this raster draws a
-                    // face as authored.
-                    if key.style.0 != StyleBits::REGULAR.0
-                        || self.bold_font_instance.drawn.is_some()
-                    {
-                        return None;
-                    }
-                    (self.bold_font_bytes.clone()?, self.bold_font_index, gid)
-                } else if key.style.0 == StyleBits::REGULAR.0 {
-                    (self.shaping_primary_bytes.clone()?, self.primary_index, gid)
-                } else {
-                    if key.style.contains(StyleBits::BOLD) && self.vf_bold_coords.is_some() {
-                        return None;
-                    }
-                    match self.run_face_pick(key.style) {
-                        FacePick::Styled { slot, synthetic }
-                            if synthetic.0 == StyleBits::REGULAR.0 =>
-                        {
-                            let sf = self.styled_faces[slot].as_ref()?;
-                            // This raster applies no instance coords.
-                            if sf.instance.drawn.is_some() {
-                                return None;
-                            }
-                            (sf.bytes.clone(), sf.index, gid)
-                        }
-                        FacePick::InjectedBold { synthetic }
-                            if synthetic.0 == StyleBits::REGULAR.0
-                                && self.bold_font_instance.drawn.is_none() =>
-                        {
-                            (self.bold_font_bytes.clone()?, 0, gid)
-                        }
-                        _ => return None,
-                    }
-                }
-            }
-            GlyphClass::Mono => {
-                if key.source != FaceId::Primary {
-                    return None;
-                }
-                let ch = key.chr()?;
-                let styled =
-                    key.style.contains(StyleBits::BOLD) || key.style.contains(StyleBits::ITALIC);
-                if styled {
-                    self.ensure_styled_faces();
-                    let (slot, remaining) = self.styled_face_slot(ch, key.style)?;
-                    if remaining.0 != StyleBits::REGULAR.0
-                        || self.styled_faces[slot]
-                            .as_ref()
-                            .is_some_and(|sf| sf.instance.drawn.is_some())
-                    {
-                        return None;
-                    }
-                    let gid = self.styled_faces[slot]
-                        .as_mut()
-                        .and_then(|sf| sf.unicode_gid(ch))?;
-                    let sf = self.styled_faces[slot].as_ref()?;
-                    (sf.bytes.clone(), sf.index, gid)
-                } else {
-                    let gid = self.primary_unicode_gid(ch)?;
-                    (self.shaping_primary_bytes.clone()?, self.primary_index, gid)
-                }
-            }
-            GlyphClass::Rgba | GlyphClass::RgbaGid | GlyphClass::RgbaCluster => return None,
-        };
-        let hint = if self.hint_mode == hinted::HintMode::Off {
-            None
-        } else {
-            self.subpx_bank.instance_with(
-                bytes.as_ptr() as usize,
-                &bytes,
-                index,
-                self.px,
-                Some(subpixel::lcd_hint_options()),
-                &[],
-                0,
-            )
-        };
-        let bgr = self.subpix_mode == subpixel::SubpixelMode::Bgr;
-        let (width, height, xmin, ymin, mut b3) =
-            subpixel::subpixel_glyph_raster(&bytes, index, gid, self.px, hint.as_deref(), bgr)?;
-        stem_darken(&mut b3, &self.stem_lut);
-        let ymin = ink_row_extent(height, |y| {
-            b3.get(y * width * 3..(y + 1) * width * 3)
-                .is_some_and(|row| row.iter().any(|&v| v > 0))
-        })
-        .and_then(|ink| seated_ymin(ink, height, ymin, self.baseline, self.cell_h))
-        .unwrap_or(ymin);
-        Some(SubpxImage {
-            width,
-            height,
-            xmin,
-            ymin,
-            bytes: b3,
-        })
     }
 
     fn fallback_mono_raster(
@@ -8840,11 +8674,6 @@ impl Renderer {
         }
         #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         self.hint_bank.clear();
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            self.subpx_bank.clear();
-            self.subpx_glyphs.clear();
-        }
     }
 
     fn fallback_face_scale(&self, norm: FaceNorm) -> f32 {
@@ -9314,8 +9143,6 @@ impl Renderer {
         self.ct_cache.clear();
         #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         self.hint_bank.clear();
-        #[cfg(all(unix, not(target_os = "macos")))]
-        self.subpx_bank.clear();
         self.refresh_drawn_faces();
         true
     }
@@ -9725,11 +9552,6 @@ impl Renderer {
         self.ct_cache.clear();
         #[cfg(any(all(unix, not(target_os = "macos")), windows))]
         self.hint_bank.clear();
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            self.subpx_bank.clear();
-            self.subpx_glyphs.clear();
-        }
     }
 
     /// Light per-window size switch (mixed DPI).
@@ -10122,15 +9944,11 @@ impl Renderer {
     /// Set the default-background opacity (0..=1, clamped; Ghostty's `background-opacity`).
     #[inline]
     pub fn set_background_opacity(&mut self, opacity: f32) {
-        let opacity = if opacity.is_finite() {
+        self.bg_opacity = if opacity.is_finite() {
             opacity.clamp(0.0, 1.0)
         } else {
             1.0
         };
-        if self.bg_opacity != opacity {
-            self.invalidate_glyph_frame_ink();
-            self.bg_opacity = opacity;
-        }
     }
 
     /// The configured default-background opacity (see [`set_background_opacity`](Self::set_background_opacity)).
@@ -10873,8 +10691,6 @@ impl Renderer {
             self.stem_gamma = gamma;
             self.stem_lut = build_stem_lut(gamma);
             self.clear_glyph_images();
-            #[cfg(all(unix, not(target_os = "macos")))]
-            self.subpx_glyphs.clear();
         }
     }
 
@@ -10903,8 +10719,6 @@ impl Renderer {
             self.clear_glyph_images();
             self.keys.clear();
             self.styled_keys.clear();
-            #[cfg(all(unix, not(target_os = "macos")))]
-            self.subpx_glyphs.clear();
             true
         }
         #[cfg(not(any(all(unix, not(target_os = "macos")), windows)))]
@@ -10929,60 +10743,6 @@ impl Renderer {
         #[cfg(not(any(all(unix, not(target_os = "macos")), windows)))]
         {
             "off"
-        }
-    }
-
-    /// Set the Linux subpixel-RGB text mode (config `font_subpixel`).
-    pub fn set_font_subpixel(&mut self, mode: &str) -> bool {
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            let mode = if hinted::HintMode::portable_forced() {
-                subpixel::SubpixelMode::Off
-            } else {
-                subpixel::SubpixelMode::parse(mode)
-            };
-            if mode == self.subpix_mode {
-                return false;
-            }
-            self.subpix_mode = mode;
-            self.subpx_glyphs.clear();
-            self.invalidate_glyph_frame_ink();
-            true
-        }
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
-        {
-            let _ = mode;
-            false
-        }
-    }
-
-    /// The active Linux subpixel mode's spelling (`"off"` / `"rgb"` / `"bgr"`), the [`Self::set_font_subpixel`] round-trip.
-    #[inline]
-    #[must_use]
-    pub fn font_subpixel(&self) -> &'static str {
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            self.subpix_mode.as_str()
-        }
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
-        {
-            "off"
-        }
-    }
-
-    /// The frame-level precondition shared by the observer and CPU blitter. Individual
-    /// keys may still use mono when the LCD rasterizer cannot represent their face/style.
-    fn input_uses_lcd_text(&self, input: &RenderInput) -> bool {
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            self.subpix_mode != subpixel::SubpixelMode::Off
-                && self.bg_opacity >= 1.0
-                && input.wallpaper.is_none()
-        }
-        #[cfg(not(all(unix, not(target_os = "macos"))))]
-        {
-            let _ = input;
-            false
         }
     }
 
@@ -11219,8 +10979,6 @@ impl Renderer {
             }
             keep
         });
-        #[cfg(all(unix, not(target_os = "macos")))]
-        self.subpx_glyphs.retain(|k, _| self.glyphs.contains_key(k));
         self.glyph_bytes = bytes;
         self.glyph_kept = (self.glyphs.len(), bytes);
         self.chrome_room_memo = None;
@@ -11230,8 +10988,6 @@ impl Renderer {
         self.invalidate_glyph_frame_ink();
         self.glyphs.clear();
         self.glyph_generation = self.glyph_generation.wrapping_add(1);
-        #[cfg(all(unix, not(target_os = "macos")))]
-        self.subpx_glyphs.clear();
         self.glyph_bytes = 0;
         self.glyph_kept = (0, 0);
         self.chrome_room_memo = None;
@@ -12244,11 +12000,6 @@ impl Renderer {
             self.keys.clear();
             self.emoji_keys.clear();
             self.styled_keys.clear();
-            #[cfg(all(unix, not(target_os = "macos")))]
-            {
-                let kept = &self.glyphs;
-                self.subpx_glyphs.retain(|key, _| kept.contains_key(key));
-            }
             self.deco_masks.borrow_mut().clear();
         }
         const CHAR_MEMO_CAP: usize = 65_536;
@@ -12428,10 +12179,6 @@ impl Renderer {
         let (rows, cols) = (input.rows, input.cols);
         let (w, h) = self.frame_size(rows, cols);
         ensure_wallpaper_px(wc, input, w, h);
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            self.subpx_frame = self.input_uses_lcd_text(input);
-        }
 
         let mut dirty = std::mem::take(&mut wc.dirty_scratch);
         let mut shift = std::mem::take(&mut wc.shift_scratch);
@@ -15300,37 +15047,6 @@ impl Renderer {
             scale.clip_y0.max(self.fg_clip.0),
             scale.clip_y1.min(self.fg_clip.1),
         );
-        #[cfg(all(unix, not(target_os = "macos")))]
-        if self.subpx_frame
-            && scale.xs.max(1) == 1
-            && scale.ys.max(1) == 1
-            && let Some(img) = self.subpx_image(key)
-        {
-            if img.width == 0 || img.height == 0 {
-                return;
-            }
-            let gx0 = cell_x + img.xmin;
-            let gy0 = cell_y + (baseline - img.height as i32 - img.ymin);
-            let reach = gy0.max(scale.clip_y0);
-            blit_subpx_1x(
-                px,
-                stride,
-                gx0,
-                gy0,
-                img.width,
-                img.height,
-                &img.bytes,
-                color,
-                bg,
-                corrected,
-                clip_y0,
-                clip_y1,
-                scale.clip_x0,
-                scale.clip_x1,
-            );
-            self.fg_ink_top = self.fg_ink_top.min(reach);
-            return;
-        }
         let mut bank = self.alpha_memo.take();
         let entry = self.cached_glyph(key);
         let (img, ink) = (&entry.img, entry.ink);
@@ -15581,120 +15297,6 @@ fn blit_mono_1x(
             } else {
                 blend(*dst, color, cov)
             };
-        }
-    }
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-#[derive(Clone, Copy)]
-struct SubpxChanPre {
-    fg_l: f32,
-    bg_l: f32,
-    fg_s: f32,
-    bg_s: f32,
-    degenerate: bool,
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-struct SubpxBlendPre {
-    corrected: bool,
-    ch: [SubpxChanPre; 3],
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-impl SubpxBlendPre {
-    fn new(fg: u32, bg: u32, corrected: bool) -> Self {
-        let mk = |sh: u32| {
-            let fb = ((fg >> sh) & 0xff) as usize;
-            let bb = ((bg >> sh) & 0xff) as usize;
-            let fg_l = SRGB_TO_LINEAR_LUT[fb];
-            let bg_l = SRGB_TO_LINEAR_LUT[bb];
-            SubpxChanPre {
-                fg_l,
-                bg_l,
-                fg_s: fb as f32 / 255.0,
-                bg_s: bb as f32 / 255.0,
-                degenerate: (fg_l - bg_l).abs() < TEXT_BLEND_EPS,
-            }
-        };
-        Self {
-            corrected,
-            ch: [mk(16), mk(8), mk(0)],
-        }
-    }
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn blend_text_subpx(dst: u32, fg: u32, pre: &SubpxBlendPre, cov: [u8; 3]) -> u32 {
-    let ch = |i: usize, sh: u32| -> (u32, f32) {
-        let t = cov[i];
-        let d = (dst >> sh) & 0xff;
-        let f = (fg >> sh) & 0xff;
-        match t {
-            0 => (d, 0.0),
-            255 => (f, 1.0),
-            _ => {
-                let mut a = f32::from(t) / 255.0;
-                let p = &pre.ch[i];
-                if pre.corrected && !p.degenerate {
-                    let blend_l = srgb_to_linear(p.fg_s * a + p.bg_s * (1.0 - a));
-                    a = ((blend_l - p.bg_l) / (p.fg_l - p.bg_l)).clamp(0.0, 1.0);
-                }
-                (blend_channel_linear(d, f, a), a)
-            }
-        }
-    };
-    let (r, _) = ch(0, 16);
-    let (g, ag) = ch(1, 8);
-    let (b, _) = ch(2, 0);
-    let tt = (((dst >> 24) & 0xff) as f32 * (1.0 - ag)).round() as u32;
-    (tt << 24) | (r << 16) | (g << 8) | b
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-#[allow(clippy::too_many_arguments)]
-fn blit_subpx_1x(
-    px: &mut [u32],
-    stride: usize,
-    gx0: i32,
-    gy0: i32,
-    width: usize,
-    height: usize,
-    bytes: &[u8],
-    color: u32,
-    bg: u32,
-    corrected: bool,
-    clip_y0: i32,
-    clip_y1: i32,
-    clip_x0: i32,
-    clip_x1: i32,
-) {
-    let pre = SubpxBlendPre::new(color, bg, corrected);
-    let px_len = px.len() as i64;
-    let gx = gx0 as i64;
-    let w = width as i64;
-    for j in 0..height {
-        let y = gy0 + j as i32;
-        if y < clip_y0 || y >= clip_y1 || y < 0 {
-            continue;
-        }
-        let yrow = y as i64 * stride as i64;
-        let x_lo = (clip_x0 as i64).max(0);
-        let x_cap = (stride as i64).min(px_len - yrow).min(clip_x1 as i64);
-        let Some((vx0, vx1)) = clip_span(gx, w, x_lo, x_cap) else {
-            continue;
-        };
-        let (i_lo, i_hi) = ((vx0 - gx) as usize, (vx1 - gx) as usize);
-        let row_off = j * width * 3;
-        let base = yrow + gx;
-        for i in i_lo..i_hi {
-            let o = row_off + i * 3;
-            let cov = [bytes[o], bytes[o + 1], bytes[o + 2]];
-            if cov == [0, 0, 0] {
-                continue;
-            }
-            let idx = (base + i as i64) as usize;
-            px[idx] = blend_text_subpx(px[idx], color, &pre, cov);
         }
     }
 }
@@ -19650,14 +19252,6 @@ impl Eq for AdmittedFontBlob {}
 /// The largest share of a reach the ribbon's full-strength core may take, so at least half of every reach is falloff and the profile never degenerates into a hard-edged bar.
 pub const RIBBON_CORE_SHARE: f32 = 0.5;
 
-/// Cubic Hermite smoothstep over `0..1`, clamping its input.
-#[inline]
-#[must_use]
-pub const fn smoothstep01(x: f32) -> f32 {
-    let x = x.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
-}
-
 /// The ribbon's transverse profile.
 #[inline]
 #[must_use]
@@ -19674,17 +19268,17 @@ pub fn ribbon_profile(d: f32, core: f32, reach: f32, shoulder: f32) -> f32 {
     } else {
         0.0
     };
-    let melt = smoothstep01((reach - d) / (reach - core));
+    let melt = smoothstep((reach - d) / (reach - core));
     if shoulder == 1.0 {
         return melt;
     }
-    let bump = smoothstep01((core - d) / core.max(f32::MIN_POSITIVE));
+    let bump = smoothstep((core - d) / core.max(f32::MIN_POSITIVE));
     melt * (shoulder + (1.0 - shoulder) * bump)
 }
 
 /// The glass's transverse profile (`docs/design/PRISM-GLASS.md` §2.2, §15.2 1.7): whole light
 /// from the spine to within `melt` px of the `reach`, melting to nothing over those px
-/// (`smoothstep01((reach - d) / melt)`), and nothing at or past the reach. A `melt` that is not
+/// (`smoothstep((reach - d) / melt)`), and nothing at or past the reach. A `melt` that is not
 /// a positive number is a hard edge. [`ribbon_profile`] cannot draw it: its core keeps at least
 /// half of every reach for its falloff ([`RIBBON_CORE_SHARE`]).
 #[inline]
@@ -19700,7 +19294,7 @@ pub fn glass_profile(d: f32, reach: f32, melt: f32) -> f32 {
     if melt.is_nan() || melt <= 0.0 {
         return 1.0;
     }
-    smoothstep01((reach - d) / melt)
+    smoothstep((reach - d) / melt)
 }
 
 /// How a ribbon's light falls off above its spine: [`ribbon_profile`] at a shoulder, or the
@@ -19774,7 +19368,7 @@ pub fn ribbon_lift_profile(d: f32, lift_span: f32, dn: f32) -> f32 {
     if !span.is_finite() || span <= 0.0 {
         return 0.0;
     }
-    1.0 - smoothstep01(d.abs() / span)
+    1.0 - smoothstep(d.abs() / span)
 }
 
 /// Rasterize the ribbon polyline (x-major) into per-cell-row [`GlowQuad`]s.
@@ -21576,10 +21170,6 @@ mod ribbon_beam_tests;
 #[cfg(test)]
 #[path = "lib_comet_beam_tests.rs"]
 mod comet_beam_tests;
-
-#[cfg(test)]
-#[path = "lib_subpixel_seat_tests.rs"]
-mod subpixel_seat_tests;
 
 #[cfg(all(test, feature = "embedded-font"))]
 #[path = "lib_glyph_cache_accounting_tests.rs"]

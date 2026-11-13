@@ -693,7 +693,7 @@ struct Bell {
 impl Bell {
     fn new() -> Option<Self> {
         use std::os::fd::{AsFd as _, AsRawFd as _};
-        let (hear, ring) = aterm_uds::kept_out(std::io::pipe).ok()?;
+        let (hear, ring) = aterm_uds::pipe().ok()?;
         for fd in [hear.as_fd(), ring.as_fd()] {
             // SAFETY: F_GETFL only reads the flags of this live borrowed descriptor.
             let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };

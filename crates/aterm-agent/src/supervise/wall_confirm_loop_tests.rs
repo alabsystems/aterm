@@ -3353,7 +3353,8 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
         DONE_CHECK_REVERSIBLE, RULE_DONE_CHECK, RULE_LIMIT_RESUME, done_check_words,
     };
     const RESET: i64 = 1_791_999_480;
-    let done = "All done: the change is committed and pushed, and every suite passes.";
+    let done =
+        "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
     let stub = "Hi! I am the local lab stub, not a model. (reply 3)";
     let measured = transcript("session-limit-cancelled-then-person-turn");
     let rows: Vec<&str> = measured.lines().skip(1).collect();
@@ -3367,7 +3368,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
         .filter(|r| {
             !r.contains("Automatic continue cancelled") && !r.contains("what is left to do?")
         })
-        .map(|r| r.replace(stub, done))
+        .map(|r| r.replace(stub, &done.replace('\n', "\\n")))
         .collect::<Vec<_>>()
         .join("\n");
     let policy = owners_policy();
@@ -3470,7 +3471,7 @@ fn a_limits_end_under_a_background_shell_types_no_keep_going_into_a_done_report(
                 false,
             ),
             (
-                "All done. Shall I delete the old release branches?",
+                "All done. Shall I delete the old release branches?\n\nATERM-TASK-DONE",
                 TurnEndAction::Type {
                     text: format!("{} {DONE_CHECK_REVERSIBLE}", done_check_words(0)),
                     rule_id: RULE_DONE_CHECK,

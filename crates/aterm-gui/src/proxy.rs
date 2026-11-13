@@ -875,7 +875,7 @@ fn prove_host_serving(
     within: std::time::Duration,
     started: impl FnOnce() -> std::time::Instant,
 ) -> std::io::Result<()> {
-    let line = probe_answer(host, token, within, started)?;
+    let line = probe_answer(host, token, within, started, || false)?;
     if is_connection_refusal(&line) {
         return Err(std::io::Error::other(format!("the host answered {line:?}")));
     }
@@ -887,6 +887,7 @@ fn probe_answer(
     token: &str,
     within: std::time::Duration,
     started: impl FnOnce() -> std::time::Instant,
+    abandoned: impl Fn() -> bool,
 ) -> std::io::Result<String> {
     let mut hello = String::with_capacity(token.len() + 16);
     hello.push_str("TOKEN ");
@@ -895,17 +896,21 @@ fn probe_answer(
     let sent = (&*host)
         .write_all(hello.as_bytes())
         .and_then(|()| (&*host).flush());
-    let answer = read_probe_line(host, within, started());
+    let answer = read_probe_line(host, within, started(), abandoned);
     match sent {
         Ok(()) => answer,
         Err(e) => answer.map_err(|_| e),
     }
 }
 
+/// The host's one-line probe answer, waited for until `within` after `start`. The wait is cut
+/// into [`HANGUP_POLL`](crate::control::HANGUP_POLL) slices and `abandoned` is asked before each:
+/// once it says so the read ends (`ConnectionAborted`) without sitting out `within`.
 fn read_probe_line(
     host: &CtlStream,
     within: std::time::Duration,
     start: std::time::Instant,
+    abandoned: impl Fn() -> bool,
 ) -> std::io::Result<String> {
     use std::io::{Error, ErrorKind};
     const MAX_PROBE_LINE: usize = 4096;
@@ -928,7 +933,14 @@ fn read_probe_line(
         if now >= deadline {
             return Err(not_accepted());
         }
-        let _ = host.set_read_timeout(Some(deadline - now));
+        if abandoned() {
+            return Err(Error::new(
+                ErrorKind::ConnectionAborted,
+                "the answer has nobody left to read it",
+            ));
+        }
+        let slice = (deadline - now).min(crate::control::HANGUP_POLL);
+        let _ = host.set_read_timeout(Some(slice));
         let read = match (&*host).read(&mut chunk) {
             Ok(0) => {
                 return Err(Error::new(
@@ -937,9 +949,14 @@ fn read_probe_line(
                 ));
             }
             Ok(n) => &chunk[..n],
-            Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
-                return Err(not_accepted());
+            // A slice that ran out is judged above: the deadline, then `abandoned`.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::Interrupted | ErrorKind::WouldBlock | ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
             }
             Err(e) => return Err(e),
         };
@@ -969,20 +986,39 @@ struct ForwardHost {
     token: String,
     pid: Option<u32>,
     listener: Option<aterm_uds::listener::ListenerId>,
+    /// How long a look waits for the host's probe answer: what its admission was given.
+    within: std::time::Duration,
 }
 
 impl ForwardHost {
-    fn gone_line(&self) -> Option<String> {
-        self.gone_line_with_clock(std::time::Instant::now)
+    /// The line that tells a client its host went away, or `None` while the host serves on.
+    /// A look waits `within` on a host that queues its connect and never answers. `client_left`
+    /// ends that wait within [`HANGUP_POLL`](crate::control::HANGUP_POLL): the line then has
+    /// nobody to read it, and there is none.
+    fn gone_line(&self, client_left: impl Fn() -> bool) -> Option<String> {
+        self.gone_line_with_clock(std::time::Instant::now, client_left)
     }
 
-    fn gone_line_with_clock(&self, started: impl FnOnce() -> std::time::Instant) -> Option<String> {
+    fn gone_line_with_clock(
+        &self,
+        started: impl FnOnce() -> std::time::Instant,
+        client_left: impl Fn() -> bool,
+    ) -> Option<String> {
         let pid = self.pid?;
-        (!self.serves(pid, started))
+        if client_left() {
+            return None;
+        }
+        let serves = self.serves(pid, started, &client_left);
+        (!serves && !client_left())
             .then(|| aterm_types::control_verbs::host_gone_line(pid, &self.sock))
     }
 
-    fn serves(&self, pid: u32, started: impl FnOnce() -> std::time::Instant) -> bool {
+    fn serves(
+        &self,
+        pid: u32,
+        started: impl FnOnce() -> std::time::Instant,
+        abandoned: impl Fn() -> bool,
+    ) -> bool {
         let Ok(look) = CtlStream::connect(&self.sock) else {
             return false;
         };
@@ -990,7 +1026,7 @@ impl ForwardHost {
         if answered.is_some_and(|answered| answered != pid) {
             return false;
         }
-        probe_answer(&look, &self.token, FORWARD_HANG, started).is_ok()
+        probe_answer(&look, &self.token, self.within, started, abandoned).is_ok()
             && match answered {
                 Some(_) => aterm_uds::listener::still_names(&self.sock, self.listener),
                 None => self
@@ -1047,6 +1083,7 @@ fn deliver_then_relay_with_clock(
         pid,
         token,
         listener,
+        within: accept_within,
     };
     let _ = relay(client, &child, host);
     Ok(())
@@ -1081,10 +1118,11 @@ fn relay_bidirectional(
             let ready = || readable_unless_stopped(child, stop);
             match copy_host_to_client(&mut from_host, &mut to_client, ready) {
                 HostLeg::HostEnded => {
-                    if !client_gone.load(SeqCst)
-                        && !aterm_uds::hangup::peer_closed(client)
-                        && let Some(line) = host.gone_line()
-                    {
+                    // Asked before the look and through its wait: a client that hangs up
+                    // meanwhile ends the relay now, not when the look's wait runs out.
+                    let client_left =
+                        || client_gone.load(SeqCst) || aterm_uds::hangup::peer_closed(client);
+                    if let Some(line) = host.gone_line(client_left) {
                         let _ = to_client.write_all(line.as_bytes());
                         let _ = to_client.flush();
                     }

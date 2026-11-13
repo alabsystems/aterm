@@ -137,7 +137,7 @@ impl Stop {
         }
         // Made before the latch is taken: on Apple `kept_out` waits for every spawn in flight,
         // and a `set` or `is_set` on another thread must not wait with it.
-        let (reader, ringer) = crate::kept_out(std::io::pipe)?;
+        let (reader, ringer) = crate::pipe()?;
         let mut latch = self.latch.lock().unwrap_or_else(PoisonError::into_inner);
         let reader = match self.bell.get() {
             // Another call's pipe became the bell first; this one closes as it drops.

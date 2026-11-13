@@ -535,8 +535,9 @@ pub enum FailureKind {
     /// as waiting; it failed only once no worker goes on with the run (it stopped, or aterm runs
     /// none). A failure nobody classified is one of these, never a person's.
     Transient,
-    /// Only a person's act ends it: a GitHub token refused or missing, a vault password to
-    /// retype, an approval only an admin Mac gives, a switch only the person flips. It needs
+    /// Only a person's act ends it: a setting only they can fix, a vault password to retype, an
+    /// approval only an admin Mac gives, a switch only the person flips. A missing or refused
+    /// credential is never one: it waits on the need ledger. It needs
     /// them at once, and no pass retries it. A reading says it as [`Standing::NeedsYou`], with
     /// its remedy in the row's note, and the run's row for it parks the run.
     NeedsPerson,
@@ -1626,6 +1627,18 @@ pub mod opt_out {
 /// own for a later pass: a hang detector (`MacosDialog::when_none_up`).
 pub const DIALOG_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How the aterm window's desk door begins its refusal of a control verb that would take the
+/// person's screen or keyboard focus for a client whose tab is not the one in front (owner
+/// ruling 2026-11-09): what a front-door client (`aterm init`'s sign-out, `aterm doctor`) tells
+/// from the verb's own answers, to ask nothing in its place ([`desk_refused`]).
+pub const DESK_REFUSED: &str = "ERR desk refused";
+
+/// Whether `reply` is the desk door's refusal ([`DESK_REFUSED`]).
+#[must_use]
+pub fn desk_refused(reply: &str) -> bool {
+    reply.starts_with(DESK_REFUSED)
+}
+
 /// Whether `[swarm] enabled` leaves this process's automatic LAN uses on: the reader a process
 /// installs ([`sharing::install`]) is asked right before such a use (Tab Control's sweep), so
 /// a person who turned sharing off sees none go by itself
@@ -1917,18 +1930,6 @@ pub mod access_record {
     #[cfg(test)]
     mod tests;
 }
-
-/// The GitHub repositories row's short note when GitHub refuses the token the vault syncs (the
-/// menu line's and `aterm doctor`'s, at most 52 characters): who renews it. The vault's
-/// `gh_access_token` is a shared `[everyone]` entry, which any member seated in the vault's
-/// membership log writes with `aterm secrets set`, no admin key needed
-/// (`docs/DESIGN-claude-setup-token-2026-11-05.md` §3.5). System State's row says it whole,
-/// with the line they run.
-pub const GITHUB_TOKEN_REFUSED: &str = "GitHub refuses your token; any member renews it";
-
-/// The one line a member runs on its Mac, with a new GitHub token copied, to save it in the vault
-/// for every Mac ([`GITHUB_TOKEN_REFUSED`]).
-pub const GITHUB_TOKEN_COMMAND: &str = "pbpaste | aterm secrets set gh_access_token";
 
 /// The Secrets vault row's value while this Mac asks ALab's members to let it in
 /// (`docs/DESIGN-fluid-swarm-2026-10-28.md` §3.6 step 3).

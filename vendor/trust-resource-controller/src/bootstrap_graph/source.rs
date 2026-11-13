@@ -6,6 +6,8 @@ use super::{Key, binding, fixed_context, read_file, refusal, write_file};
 use crate::wire::{Decoder, Encoder, header, invalid};
 use crate::{ContextReply, FileIdentity};
 
+pub mod decision;
+
 pub const RECORD_LIMIT: u64 = 16 * 1024;
 pub const ATTACHMENT_LIMIT: usize = 8192;
 pub const HOLDER_NAME: &[u8] = b".trust-build-lock";

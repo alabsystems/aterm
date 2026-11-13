@@ -8,27 +8,27 @@ fn typed_outcomes_do_not_turn_idle_or_failure_into_publication() {
     let flags = RunFlags::default();
     for (result, status, exit, index) in [
         (
-            Ok(Some(linux::Outcome {
+            Ok(Some(Summary {
                 idle: true,
-                ..linux::Outcome::default()
+                ..Summary::default()
             })),
             "idle",
             0,
             None,
         ),
         (
-            Ok(Some(linux::Outcome {
+            Ok(Some(Summary {
                 covered: true,
-                ..linux::Outcome::default()
+                ..Summary::default()
             })),
             "covered",
             0,
             None,
         ),
         (
-            Ok(Some(linux::Outcome {
+            Ok(Some(Summary {
                 published: Some(118),
-                ..linux::Outcome::default()
+                ..Summary::default()
             })),
             "published",
             0,

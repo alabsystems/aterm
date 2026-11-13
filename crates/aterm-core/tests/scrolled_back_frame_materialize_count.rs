@@ -131,7 +131,7 @@ fn a_wheel_notch_pays_only_for_the_rows_that_scrolled_in() {
 }
 
 #[test]
-fn output_arriving_while_scrolled_back_reopens_the_bill() {
+fn output_arriving_while_pinned_keeps_cached_history_rows() {
     let mut term = filled_terminal();
     let mut scratch = RenderInput::empty();
     term.scroll_display(DEPTH);
@@ -139,14 +139,39 @@ fn output_arriving_while_scrolled_back_reopens_the_bill() {
     let _ = take_viewport_row_materialize();
     frame(&mut term, &mut scratch);
     assert_eq!(take_viewport_row_materialize(), 0, "parked and warm");
+    let before_top = frame_row_trimmed(&scratch, 0);
 
     term.process(b"a line arrives while you are reading\r\n");
     frame(&mut term, &mut scratch);
-    assert!(
-        take_viewport_row_materialize() > 0,
-        "content changed under a scrolled-back viewport and the memo served the \
-         old rows anyway — that is a stale glyph on screen, not a saving"
+    assert_eq!(
+        take_viewport_row_materialize(),
+        0,
+        "live output under a repinned scrollback viewport must reuse cached history rows"
     );
+    assert_eq!(frame_row_trimmed(&scratch, 0), before_top);
+    assert_frame_matches_display(&term, &scratch);
+}
+
+#[test]
+fn output_arriving_at_scrollback_cap_reopens_the_bill() {
+    let mut term = filled_terminal();
+    term.set_scrollback_line_limit(Some(usize::try_from(DEPTH).expect("DEPTH is positive")));
+    let mut scratch = RenderInput::empty();
+    term.scroll_display(DEPTH);
+    frame(&mut term, &mut scratch);
+    let _ = take_viewport_row_materialize();
+    frame(&mut term, &mut scratch);
+    assert_eq!(take_viewport_row_materialize(), 0, "parked and warm");
+    let before_top = frame_row_trimmed(&scratch, 0);
+
+    term.process(b"a line arrives while you are reading\r\n");
+    frame(&mut term, &mut scratch);
+    let moved = take_viewport_row_materialize();
+    assert_eq!(
+        moved, 1,
+        "sliding one line at the scrollback cap must materialize only the incoming row (got {moved})"
+    );
+    assert_ne!(frame_row_trimmed(&scratch, 0), before_top);
     assert_frame_matches_display(&term, &scratch);
 }
 

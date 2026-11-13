@@ -1962,6 +1962,9 @@ fn repaint_checkpoint_within(
         .current_working_directory
         .clone()
         .filter(|cwd| cwd.len() <= 8 * 1024 && !cwd.contains('\0'));
+    // The line sizes and protected runs describe the screen this carry leaves behind, not the blank one it carries.
+    sanitized.visible_cells = aterm_core::terminal::VisibleCellsRepr::default();
+    sanitized.alt_visible_cells = aterm_core::terminal::VisibleCellsRepr::default();
     if checkpoint_meta_bound_violation(&sanitized).is_some() {
         return Some(keep_carried_title(
             keep_shell_integration_authority(blank, meta),
@@ -2709,6 +2712,10 @@ enum MetaBudget {
     Over { cost: u64 },
 }
 
+/// Bring the pool's metas under [`MAX_HANDOFF_AGGREGATE_META_BYTES`].
+///
+/// The visible rows' line sizes and protected runs go first: while the pool is over, the largest meta that carries any ([`meta_has_cell_facts`]) sheds them before [`shed_meta_step`] takes anything from any session.
+/// No build before them carried them, so a desk that fit the budget without them still carries everything it did, and a row without them restores as those builds restored it.
 #[cfg(any(unix, test))]
 fn shed_metas_to_budget(carries: &mut [WireCarry]) -> MetaBudget {
     let mut costs = carries
@@ -2718,51 +2725,26 @@ fn shed_metas_to_budget(carries: &mut [WireCarry]) -> MetaBudget {
     let mut total = costs.iter().copied().fold(0_u64, u64::saturating_add);
     let mut shed = false;
     while total > MAX_HANDOFF_AGGREGATE_META_BYTES {
-        let largest = costs
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| meta_has_sheddable(&carries[*index].checkpoint))
-            .max_by_key(|(_, cost)| **cost)
-            .map(|(index, _)| index);
-        let Some(index) = largest else {
+        let (index, what) = if let Some(index) = largest_meta(carries, &costs, meta_has_cell_facts)
+        {
+            let checkpoint = &mut carries[index].checkpoint;
+            checkpoint.visible_cells = aterm_core::grid::VisibleCells::default();
+            checkpoint.alt_visible_cells = aterm_core::grid::VisibleCells::default();
+            (
+                index,
+                "its visible rows' line sizes and DECSCA protection (each row restores single \
+                 width and unprotected, as a build before them restores it)",
+            )
+        } else if let Some(index) = largest_meta(carries, &costs, meta_has_sheddable) {
+            (index, shed_meta_step(&mut carries[index].checkpoint))
+        } else {
             return MetaBudget::Over { cost: total };
         };
-        let carry = &mut carries[index];
-        let checkpoint = &mut carry.checkpoint;
-        let shell = &mut checkpoint.shell;
-        let what = if !shell.command_marks.is_empty() || !shell.output_blocks.is_empty() {
-            shell.command_marks.clear();
-            shell.output_blocks.clear();
-            "the command marks and output blocks of its carried lines"
-        } else if shell.current_mark.is_some() || shell.current_block.is_some() {
-            shell.current_mark = None;
-            shell.current_block = None;
-            "the command mark and output block it was building"
-        } else if meta_stacks_pushed(checkpoint) {
-            checkpoint.color.clear_stack();
-            if let Some(title) = checkpoint.title.as_mut() {
-                title.stack.clear();
-            }
-            "its pushed colour and title stacks"
-        } else if meta_tab_stops_past_width(checkpoint) {
-            let cols = usize::from(checkpoint.cols);
-            for cursor in std::iter::once(&mut checkpoint.cursor).chain(&mut checkpoint.alt_cursor)
-            {
-                cursor.tab_stops.truncate(cols);
-            }
-            "its tab stops past its width"
-        } else {
-            if let Some(parser) = checkpoint.parser.as_mut() {
-                parser.osc.clear();
-                parser.osc_overflowed = true;
-            }
-            "the payload of the OSC sequence it was in the middle of (the rest is discarded at \
-             its terminator, not applied)"
-        };
+        let carry = &carries[index];
         aterm_log::warn!(
             "update apply: session {} carried without {what}: the screens' metas cost the \
              manifest {total} bytes, over its {MAX_HANDOFF_AGGREGATE_META_BYTES}-byte budget; \
-             its screen is exact",
+             its screen's text is exact",
             carry.local_id
         );
         let cost = meta_manifest_cost(&carry.checkpoint);
@@ -2777,6 +2759,66 @@ fn shed_metas_to_budget(carries: &mut [WireCarry]) -> MetaBudget {
     }
 }
 
+/// The carry whose meta costs the most (`costs`, index for index) among those `has` holds for.
+#[cfg(any(unix, test))]
+fn largest_meta(
+    carries: &[WireCarry],
+    costs: &[u64],
+    has: fn(&TerminalCheckpoint) -> bool,
+) -> Option<usize> {
+    costs
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| {
+            carries
+                .get(*index)
+                .is_some_and(|carry| has(&carry.checkpoint))
+        })
+        .max_by_key(|(_, cost)| **cost)
+        .map(|(index, _)| index)
+}
+
+/// One step of [`shed_metas_to_budget`]'s ladder on a meta [`meta_has_sheddable`] holds for: the first of its steps that applies, taken, and what it took, for the log.
+#[cfg(any(unix, test))]
+fn shed_meta_step(checkpoint: &mut TerminalCheckpoint) -> &'static str {
+    let shell = &mut checkpoint.shell;
+    if !shell.command_marks.is_empty() || !shell.output_blocks.is_empty() {
+        shell.command_marks.clear();
+        shell.output_blocks.clear();
+        "the command marks and output blocks of its carried lines"
+    } else if shell.current_mark.is_some() || shell.current_block.is_some() {
+        shell.current_mark = None;
+        shell.current_block = None;
+        "the command mark and output block it was building"
+    } else if meta_stacks_pushed(checkpoint) {
+        checkpoint.color.clear_stack();
+        if let Some(title) = checkpoint.title.as_mut() {
+            title.stack.clear();
+        }
+        "its pushed colour and title stacks"
+    } else if meta_tab_stops_past_width(checkpoint) {
+        let cols = usize::from(checkpoint.cols);
+        for cursor in std::iter::once(&mut checkpoint.cursor).chain(&mut checkpoint.alt_cursor) {
+            cursor.tab_stops.truncate(cols);
+        }
+        "its tab stops past its width"
+    } else {
+        if let Some(parser) = checkpoint.parser.as_mut() {
+            parser.osc.clear();
+            parser.osc_overflowed = true;
+        }
+        "the payload of the OSC sequence it was in the middle of (the rest is discarded at its \
+         terminator, not applied)"
+    }
+}
+
+/// Whether a meta carries visible-row line sizes or protected runs, which [`shed_metas_to_budget`] sheds before any step of its ladder.
+#[cfg(any(unix, test))]
+fn meta_has_cell_facts(checkpoint: &TerminalCheckpoint) -> bool {
+    !checkpoint.visible_cells.is_empty() || !checkpoint.alt_visible_cells.is_empty()
+}
+
+/// Whether [`shed_meta_step`] has a step left for this meta.
 #[cfg(any(unix, test))]
 fn meta_has_sheddable(checkpoint: &TerminalCheckpoint) -> bool {
     let shell = &checkpoint.shell;
@@ -2969,6 +3011,8 @@ fn held_sidecar_name(stem: &str, local_id: u64, alt: bool) -> String {
 }
 
 /// A held pane's screen meta as the manifest carries it, or why the writer will not carry the screen whatever the budgets say: a grid past the reader's link-strip bound ([`MAX_LINK_STRIP_BYTES`]) or a meta past [`MAX_HELD_META_BYTES`].
+///
+/// A meta past the bound only with its visible rows' line sizes and protected runs is carried without them: no build before them carried them, so a pane those builds carried is not left out for them.
 #[cfg(unix)]
 pub(crate) fn held_screen_meta(
     cp: &aterm_core::terminal::TerminalCheckpoint,
@@ -2980,10 +3024,70 @@ pub(crate) fn held_screen_meta(
     {
         return Err("its grid is past the link-strip bound");
     }
-    aterm_json::to_string(&CheckpointMeta::from_checkpoint(cp))
-        .ok()
+    held_meta_json(cp, true)
         .filter(|meta| meta.len() <= MAX_HELD_META_BYTES)
+        .or_else(|| {
+            meta_has_cell_facts(cp)
+                .then(|| held_meta_json(cp, false))
+                .flatten()
+                .filter(|meta| meta.len() <= MAX_HELD_META_BYTES)
+        })
         .ok_or("its screen meta is past the held bound")
+}
+
+/// A held pane's screen meta, with its visible rows' line sizes and protected runs or without them; `None` for one that does not serialize.
+#[cfg(unix)]
+fn held_meta_json(cp: &TerminalCheckpoint, with_cell_facts: bool) -> Option<String> {
+    let mut meta = CheckpointMeta::from_checkpoint(cp);
+    if !with_cell_facts {
+        meta.visible_cells = aterm_core::terminal::VisibleCellsRepr::default();
+        meta.alt_visible_cells = aterm_core::terminal::VisibleCellsRepr::default();
+    }
+    aterm_json::to_string(&meta).ok()
+}
+
+/// Take the line sizes and protected runs out of held panes' metas, the last pane first, until what that frees covers `excess`; whether any meta was rewritten.
+///
+/// Under the manifest cap they give way before a connection, a held pane or a mailbox row, as [`shed_metas_to_budget`] sheds a handed session's before anything a build before them carried.
+/// `stripped` holds the panes already asked, so each is rewritten at most once.
+#[cfg(unix)]
+fn shed_held_cell_facts(
+    carried: &mut [crate::session_store::HeldPaneCarry],
+    held: &[HeldScreen],
+    stripped: &mut Vec<u64>,
+    excess: u64,
+) -> bool {
+    let mut freed = 0_u64;
+    let mut shed = false;
+    for carry in carried.iter_mut().rev() {
+        if freed >= excess {
+            break;
+        }
+        if stripped.contains(&carry.local_id) {
+            continue;
+        }
+        stripped.push(carry.local_id);
+        let Some(bare) = held
+            .iter()
+            .find(|pane| pane.local_id == carry.local_id)
+            .filter(|pane| meta_has_cell_facts(&pane.checkpoint))
+            .and_then(|pane| held_meta_json(&pane.checkpoint, false))
+            .filter(|bare| bare.len() < carry.screen.meta.len())
+        else {
+            continue;
+        };
+        let saved = carry.screen.meta.len().saturating_sub(bare.len());
+        freed = freed.saturating_add(u64::try_from(saved).unwrap_or(u64::MAX));
+        carry.screen.meta = bare;
+        shed = true;
+        aterm_log::warn!(
+            "overlap handoff: held pane {} carried without its visible rows' line sizes and \
+             DECSCA protection, to keep the manifest under the {MAX_HANDOFF_MANIFEST_BYTES}-byte \
+             cap; its rows restore single width and unprotected",
+            carry.local_id
+        );
+    }
+    shed
 }
 
 #[cfg(unix)]
@@ -3609,6 +3713,8 @@ fn write_outgoing_with_held_for_attempt(
     let manifest_bytes =
         |toml: &str| u64::try_from(nonce.len() + 1 + toml.len()).unwrap_or(u64::MAX);
     let mut without_connections: Option<u64> = None;
+    // The held panes whose line sizes and protected runs were already asked to give way.
+    let mut facts_stripped: Vec<u64> = Vec::new();
     let toml = loop {
         let Some(toml) = manifest.to_toml().ok() else {
             for path in written_blobs {
@@ -3621,6 +3727,10 @@ fn write_outgoing_with_held_for_attempt(
             break toml;
         }
         let excess = size.saturating_sub(MAX_HANDOFF_MANIFEST_BYTES);
+        if shed_held_cell_facts(&mut manifest.held, held, &mut facts_stripped, excess) {
+            without_connections = None;
+            continue;
+        }
         if !manifest.connections.is_empty() {
             let bare = match without_connections {
                 Some(bare) => Some(bare),
@@ -3956,6 +4066,29 @@ pub(crate) const EXIT_CAPS_PASSING: &str = "passing75";
 /// This parent can distinguish unfinished boot verification from other passing refusals.
 #[cfg(unix)]
 pub(crate) const EXIT_CAPS_VERIFICATION: &str = "verification76";
+/// What the outgoing process reads on the readiness channel besides the proof, published beside
+/// its exit capabilities ([`outgoing_parent_env`]) and taken by the successor where it admits the
+/// channel ([`take_ready_fd_from`]). A successor writes nothing else there unless offered.
+#[cfg(unix)]
+pub(crate) const ENV_READY_CAPS: HandoffName = HandoffName::new("ATERM_HANDOFF_READY_CAPS");
+/// This parent reads `handoff_progress::Report`s before the proof and ends an attempt whose
+/// successor stops reporting (`app_update_handoff::ProgressWatch`).
+#[cfg(unix)]
+pub(crate) const READY_CAPS_PROGRESS: &str = "progress1";
+
+/// Whether the parent offered to read progress reports ([`ENV_READY_CAPS`]).
+#[cfg(unix)]
+fn offers_progress(caps: Option<&std::ffi::OsStr>) -> bool {
+    caps.and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|caps| caps.split(',').any(|cap| cap.trim() == READY_CAPS_PROGRESS))
+}
+
+/// [`offers_progress`] without consuming the offer, for the launched lane's claim report.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub(crate) fn parent_reads_progress(env: &HandoffEnv) -> bool {
+    offers_progress(env.os(ENV_READY_CAPS))
+}
 
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -4193,6 +4326,7 @@ pub(crate) fn outgoing_parent_env() -> Vec<(std::ffi::OsString, std::ffi::OsStri
         pairs.push(ENV_PARENT_BIRTH.pair(birth.to_wire()));
     }
     pairs.push(ENV_EXIT_CAPS.pair(format!("{EXIT_CAPS_PASSING},{EXIT_CAPS_VERIFICATION}")));
+    pairs.push(ENV_READY_CAPS.pair(READY_CAPS_PROGRESS));
     pairs
 }
 
@@ -4525,6 +4659,20 @@ pub(crate) struct ReadySignal {
     layout_digest: [u8; 32],
     screen_digest: [u8; 32],
     target: HandoffTarget,
+    /// The parent reads progress reports, and this signal's channel is armed for them
+    /// (`handoff_progress::arm`) until it drops.
+    reports: bool,
+}
+
+#[cfg(unix)]
+impl Drop for ReadySignal {
+    /// Disarm before the channel closes: a closed channel is the parent's word that no proof is
+    /// coming, and no report may reach a descriptor number reused after it.
+    fn drop(&mut self) {
+        if self.reports {
+            crate::handoff_progress::disarm(self.raw_fd());
+        }
+    }
 }
 
 /// The exact binary identity the outgoing process authorized.
@@ -4650,6 +4798,19 @@ pub(crate) const EXIT_SUCCESSOR_PASSING: i32 = 75;
 /// No boot verification verdict, emitted only when the parent advertises its interpretation.
 #[cfg(unix)]
 pub(crate) const EXIT_SUCCESSOR_VERIFICATION: i32 = 76;
+/// A successor whose parent reads no progress (`watchdog::launch_stall_policy`) and whose AppKit
+/// launch did not finish within `watchdog::launch_exit_after` of its start (the bound counted
+/// from the process's birth, never under its floor) leaves with this. Such a parent books a
+/// successor's own exit with this code as structural (0.177.0's `of_child_death` reads only 75 as
+/// a moment), as this build's `app_native::PhysicalFailureShape::of_child_death` would (75 and 76
+/// alone are moments), so a newer build replaces these bytes instead of the same hang being
+/// re-tried. That booking needs the exit observed: the outgoing process watches the pid
+/// LaunchServices named it, and a successor LaunchServices never named reads as gone before its
+/// check-in, an unobserved death. A successor whose parent reads progress never leaves with it:
+/// that parent books a hang before the dial itself. No other exit of this binary uses it. Only
+/// macOS launches a handoff successor.
+#[cfg(any(target_os = "macos", all(unix, test)))]
+pub(crate) const EXIT_SUCCESSOR_LAUNCH_STALLED: i32 = 72;
 
 /// A refusing target's negotiated exit: distinct unfinished verification where
 /// understood, legacy passing otherwise, or the ordinary refusal when neither is understood.
@@ -4803,6 +4964,7 @@ impl ReadySignal {
                 build: 0,
                 commit: "unknown".to_string(),
             }),
+            reports: false,
         }
     }
 
@@ -4820,9 +4982,13 @@ impl ReadySignal {
         .ok()
     }
 
-    /// Publish a proof that was computed before the Commit waiter was spawned.
+    /// Publish a proof that was computed before the Commit waiter was spawned. Progress reports
+    /// stop first, so the proof is the last thing the channel carries.
     #[must_use]
     pub(crate) fn signal_proof(self, proof: AdoptionProof) -> bool {
+        if self.reports {
+            crate::handoff_progress::disarm(self.raw_fd());
+        }
         write_wire(&self.fd, &proof.to_wire())
     }
 }
@@ -5147,6 +5313,7 @@ pub(crate) fn take_ready_fd_from(
     target: Option<HandoffTarget>,
     adopted_fds: &[i32],
 ) -> Option<ReadySignal> {
+    let reports = offers_progress(env.take(ENV_READY_CAPS).as_deref());
     let raw = env.take(ENV_READY_FD).and_then(|v| v.into_string().ok());
     let s = raw?.trim().to_string();
     (!s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())).then_some(())?;
@@ -5165,13 +5332,18 @@ pub(crate) fn take_ready_fd_from(
     if adopted_fds.contains(&fd.as_raw_fd()) || aterm_pty::fd_is_tty(fd.as_raw_fd()) {
         return None;
     }
-    Some(ReadySignal {
+    let signal = ReadySignal {
         fd,
         nonce: nonce?,
         layout_digest: layout_digest?,
         screen_digest: screen_digest?,
         target: target?,
-    })
+        reports,
+    };
+    if signal.reports {
+        crate::handoff_progress::arm(signal.raw_fd());
+    }
+    Some(signal)
 }
 
 /// Consume + validate the parent-to-child Commit channel from the handoff snapshot.
@@ -6009,6 +6181,7 @@ fn take_incoming_from_as(env: &mut HandoffEnv, shape: ReceiverShape) -> Incoming
                     task: rec.task.clone(),
                     autopilot_end: rec.autopilot_end.clone(),
                     wakes: rec.wakes.clone(),
+                    agent_act: rec.agent_act.clone(),
                 },
             })
         })

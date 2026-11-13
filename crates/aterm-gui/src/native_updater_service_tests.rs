@@ -92,6 +92,8 @@ fn status(staged_build: Option<u64>) -> DurableUpdateStatus {
         installable: Some(true),
         channel_unreadable: false,
         checked_at: None,
+        hold: None,
+        behind: false,
     }
 }
 
@@ -108,7 +110,6 @@ fn linux_update_status_survives_reduction_without_macos_apply_authority() {
         trial_phase: None,
         trial_starts: 0,
         trial_healthy: false,
-        refused_newer: false,
     });
     let mut service = NativeUpdaterService::new(10, "1.0.10", true);
     let CheckStart::Start(ticket) = service.request_check() else {
@@ -275,6 +276,8 @@ fn a_short_sha_is_a_usable_stage_identity_and_a_stub_is_not() {
         installable: Some(true),
         channel_unreadable: false,
         checked_at: None,
+        hold: None,
+        behind: false,
     };
     assert!(staged_from_status(11, 0, &download).is_none());
     download.staged_commit = Some("0".repeat(40));
@@ -314,6 +317,8 @@ fn a_short_sha_is_a_usable_stage_identity_and_a_stub_is_not() {
         installable: Some(true),
         channel_unreadable: false,
         checked_at: None,
+        hold: None,
+        behind: false,
     };
     let imported = staged_from_status(11, 0, &status).expect("the import must accept it");
     assert_eq!(imported.commit, stage.commit);
@@ -354,6 +359,8 @@ fn no_update_authority_names_a_build_at_or_below_the_running_one() {
         installable: Some(true),
         channel_unreadable: false,
         checked_at: None,
+        hold: None,
+        behind: false,
     };
     let installed_at = |build: u64| InstalledUpdate {
         build,
@@ -977,4 +984,54 @@ fn durable_strings_are_bounded_on_utf8_boundaries() {
         .expect("staged notes");
     assert!(notes.len() <= MAX_CHANGELOG_BYTES);
     assert!(notes.is_char_boundary(notes.len()));
+}
+
+/// THE PAGE'S HOLD IS THE RECORD'S: a reconcile's read takes it whether or not anything is
+/// staged, publishing once per change; a check's status replaces it; a disabled service holds
+/// none. NEGATIVE CONTROL: the same hold read again publishes nothing.
+#[test]
+fn the_snapshots_hold_follows_each_read_of_the_record() {
+    let hold = aterm_update::HoldView {
+        build: 11,
+        version: "1.0.11".to_string(),
+        cause: aterm_update_core::update_record::Cause::CrashLoop,
+        witness: aterm_update_core::update_record::Witness::Headless,
+        why: String::new(),
+        tries: 1,
+        until: 5_000,
+        live: true,
+        peer_lifted: false,
+    };
+    let mut service = NativeUpdaterService::new(10, "1.0.10", true);
+    let revision = service.snapshot().revision;
+    assert!(
+        service.note_hold(Some(&hold), false),
+        "an unstaged copy takes the hold"
+    );
+    assert_eq!(service.snapshot().hold.as_ref(), Some(&hold));
+    let published = service.snapshot().revision;
+    assert!(published > revision, "the change is published");
+    assert!(
+        !service.note_hold(Some(&hold), false),
+        "NEGATIVE CONTROL: the same hold"
+    );
+    assert_eq!(service.snapshot().revision, published);
+
+    let CheckStart::Start(ticket) = service.request_check() else {
+        panic!("an idle service starts a check");
+    };
+    service.finish_check(ticket, status(None));
+    assert_eq!(
+        service.snapshot().hold,
+        None,
+        "the check's read held nothing"
+    );
+
+    let mut off = NativeUpdaterService::new(10, "1.0.10", false);
+    assert!(!off.note_hold(Some(&hold), false));
+    assert_eq!(
+        off.snapshot().hold,
+        None,
+        "a disabled updater holds nothing"
+    );
 }

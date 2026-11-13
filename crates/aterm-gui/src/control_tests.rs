@@ -4552,6 +4552,7 @@ fn a_sibling_replaced_after_the_plan_is_sent_its_own_token() {
     drop(predecessor);
     std::fs::remove_file(&sock).expect("unlink the old socket");
     let successor = aterm_uds::CtlListener::bind(&sock).expect("the successor binds");
+    let path = sock.clone();
     let served = std::thread::spawn(move || {
         let (conn, _) = aterm_uds::accept(
             &successor,
@@ -4572,6 +4573,8 @@ fn a_sibling_replaced_after_the_plan_is_sent_its_own_token() {
         let mut verb = String::new();
         reader.read_line(&mut verb).expect("the verb");
         (&conn).write_all(b"OK served\n").expect("reply");
+        // This host is done, and the relay looks at its path once the connection ends.
+        crate::test_socket::leave_no_listener(&path);
         let _ = conn.shutdown(std::net::Shutdown::Both);
         probe
     });
@@ -4610,6 +4613,7 @@ fn try_proxy_forward_conforms_to_forward_handshake() {
     let sock = hosting_instance(&dir, 77070, &sid, "c0ffee02");
     let listener = aterm_uds::CtlListener::bind(&sock).expect("bind the host");
     let (handshake_tx, handshake_rx) = std::sync::mpsc::channel::<String>();
+    let path = sock.clone();
     let host_side = std::thread::spawn(move || {
         let (conn, _) = aterm_uds::accept(
             &listener,
@@ -4627,6 +4631,8 @@ fn try_proxy_forward_conforms_to_forward_handshake() {
         reader.read_line(&mut verb).expect("read the verb");
         let _ = handshake_tx.send(format!("{probe}{verb}"));
         (&conn).write_all(b"OK served\n").expect("answer");
+        // This host is done, and the relay looks at its path once the connection ends.
+        crate::test_socket::leave_no_listener(&path);
         let _ = conn.shutdown(std::net::Shutdown::Both);
     });
 
@@ -5251,52 +5257,13 @@ fn program_menu_coordinates_are_refused() {
     }
 }
 
-/// A `pipe(2)` with both ends close-on-exec as early as the platform allows.
-#[cfg(unix)]
-fn cloexec_pipe() -> (i32, i32) {
-    let mut fds = [-1i32; 2];
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    {
-        assert_eq!(
-            // SAFETY: `pipe2` fills the two-element array this frame owns,
-            // and flags both descriptors as it creates them.
-            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) },
-            0,
-            "pipe2(O_CLOEXEC)"
-        );
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "android")))]
-    {
-        assert_eq!(
-            // SAFETY: `pipe` fills the two-element array this frame owns.
-            unsafe { libc::pipe(fds.as_mut_ptr()) },
-            0,
-            "pipe(2)"
-        );
-        for fd in fds {
-            aterm_pty::set_cloexec(fd, true).expect("pipe end cloexec");
-        }
-    }
-    for fd in fds {
-        // SAFETY: `fd` is a descriptor this function just created, and
-        // `F_GETFD` takes no further argument.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        assert_ne!(flags, -1, "F_GETFD");
-        assert!(
-            flags & libc::FD_CLOEXEC != 0,
-            "a descriptor came back WITHOUT FD_CLOEXEC — the race this helper \
-             exists to close is open again"
-        );
-    }
-    (fds[0], fds[1])
-}
-
 /// A live pipe-backed session.
 #[cfg(unix)]
 fn pipe_session(local_id: u64) -> (crate::session_store::SessionHandle, std::fs::File) {
-    let (rd, wr) = cloexec_pipe();
-    let rx = unsafe { std::fs::File::from_raw_fd(rd) };
-    (registered_session(local_id, wr, b""), rx)
+    use std::os::fd::IntoRawFd;
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    let rx = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+    (registered_session(local_id, wr.into_raw_fd(), b""), rx)
 }
 
 /// Read whatever a pipe has buffered without blocking when empty.
@@ -11177,9 +11144,10 @@ fn a_wheel_cut_short_at_the_input_cap_is_not_answered_nothing_written() {
 #[test]
 #[cfg(unix)]
 fn a_full_input_queue_answers_busy_in_the_front_tab_as_in_a_background_one() {
-    let (rd, wr) = cloexec_pipe();
-    // SAFETY: `rd` is a fresh pipe end this test owns.
-    let reader = unsafe { std::fs::File::from_raw_fd(rd) };
+    use std::os::fd::IntoRawFd;
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    let reader = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+    let wr = wr.into_raw_fd();
     aterm_pty::set_nonblocking(wr, true).expect("nonblocking test master");
     let mut app = crate::App::headless_for_test_with_sink(Arc::new(SinkWriter::new(wr)));
     let (term, ctx) = {
@@ -11692,11 +11660,12 @@ fn turn_if_rows_lets_the_rows_outside_move_and_refuses_a_change_inside() {
 /// A headless window wearing the rainbow kitty, ticked once so its engine is live.
 #[cfg(unix)]
 fn rainbow_kitty_window() -> (crate::App, crate::WindowId, std::fs::File) {
-    use std::os::unix::io::FromRawFd;
-    let (rd, wr) = cloexec_pipe();
-    let rx = unsafe { std::fs::File::from_raw_fd(rd) };
-    let mut app =
-        crate::App::headless_for_test_with_sink(Arc::new(aterm_session::sink::SinkWriter::new(wr)));
+    use std::os::fd::IntoRawFd;
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    let rx = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+    let mut app = crate::App::headless_for_test_with_sink(Arc::new(
+        aterm_session::sink::SinkWriter::new(wr.into_raw_fd()),
+    ));
     app.config.motion = Some("full".into());
     app.config.cursor_trail = Some(true);
     app.config.cursor_trail_style = Some("rainbow".into());
@@ -13163,7 +13132,7 @@ fn a_fenced_typed_turn_keeps_room_for_a_wait_it_has_needed() {
 #[test]
 #[cfg(unix)]
 fn a_guarded_submit_waits_for_the_program_to_draw_the_last_key() {
-    use std::os::fd::FromRawFd;
+    use std::os::fd::AsRawFd;
     let text = "hello world";
     let opts = format!(
         "timeout={} submit_window=100 presses=1 submit=guarded:\u{276f}.hello.world",
@@ -13187,15 +13156,10 @@ fn a_guarded_submit_waits_for_the_program_to_draw_the_last_key() {
         }
     };
     for draws in [true, false] {
-        let (rd, wr) = cloexec_pipe();
-        // SAFETY: `cloexec_pipe` returned these two new descriptors; each is owned here once,
-        // and the session's sink only borrows the write end until this iteration ends.
-        let (rx, _write_end) = unsafe {
-            (
-                std::fs::File::from_raw_fd(rd),
-                std::os::fd::OwnedFd::from_raw_fd(wr),
-            )
-        };
+        // The session's sink only borrows the write end until this iteration ends.
+        let (rd, write_end) = aterm_uds::pipe().expect("pipe");
+        let rx = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+        let wr = write_end.as_raw_fd();
         aterm_pty::set_nonblocking(wr, true).expect("nonblocking test master");
         let t = composer_turn_on(wr, &composer_rule(), 76, &opts, text, &starve(draws));
         let drew = starved.take().map_or(0, |s| s.drew.get());
@@ -13228,7 +13192,7 @@ fn a_guarded_submit_waits_for_the_program_to_draw_the_last_key() {
 #[test]
 #[cfg(unix)]
 fn a_guarded_submit_takes_a_last_key_drawn_with_the_caret_left_in_place() {
-    use std::os::fd::FromRawFd;
+    use std::os::fd::AsRawFd;
     let text = "hello world";
     for (guard, matches) in [("hello.world", true), ("hello.worlds", false)] {
         let opts = format!(
@@ -13253,15 +13217,10 @@ fn a_guarded_submit_takes_a_last_key_drawn_with_the_caret_left_in_place() {
                 h.term.lock().unwrap().process(back.as_bytes());
             }
         };
-        let (rd, wr) = cloexec_pipe();
-        // SAFETY: `cloexec_pipe` returned these two new descriptors; each is owned here once,
-        // and the session's sink only borrows the write end until this iteration ends.
-        let (rx, _write_end) = unsafe {
-            (
-                std::fs::File::from_raw_fd(rd),
-                std::os::fd::OwnedFd::from_raw_fd(wr),
-            )
-        };
+        // The session's sink only borrows the write end until this iteration ends.
+        let (rd, write_end) = aterm_uds::pipe().expect("pipe");
+        let rx = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+        let wr = write_end.as_raw_fd();
         aterm_pty::set_nonblocking(wr, true).expect("nonblocking test master");
         let t = composer_turn_on(wr, &composer_rule(), 76, &opts, text, &caret_stays);
         drop(starved.take());
@@ -13292,7 +13251,7 @@ fn a_guarded_submit_takes_a_last_key_drawn_with_the_caret_left_in_place() {
 #[test]
 #[cfg(unix)]
 fn a_guarded_submit_waits_for_the_program_to_draw_the_paste_past_the_cap() {
-    use std::os::fd::FromRawFd;
+    use std::os::fd::AsRawFd;
     let (text, cap) = ("hello world", 5);
     let opts = format!(
         "timeout={} submit_window=100 presses=1 cap={cap} submit=guarded:\u{276f}.hello.world",
@@ -13316,15 +13275,10 @@ fn a_guarded_submit_waits_for_the_program_to_draw_the_paste_past_the_cap() {
         }
     };
     for draws in [true, false] {
-        let (rd, wr) = cloexec_pipe();
-        // SAFETY: `cloexec_pipe` returned these two new descriptors; each is owned here once,
-        // and the session's sink only borrows the write end until this iteration ends.
-        let (rx, _write_end) = unsafe {
-            (
-                std::fs::File::from_raw_fd(rd),
-                std::os::fd::OwnedFd::from_raw_fd(wr),
-            )
-        };
+        // The session's sink only borrows the write end until this iteration ends.
+        let (rd, write_end) = aterm_uds::pipe().expect("pipe");
+        let rx = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+        let wr = write_end.as_raw_fd();
         aterm_pty::set_nonblocking(wr, true).expect("nonblocking test master");
         let t = composer_turn_on(wr, &composer_rule(), 76, &opts, text, &starve(draws));
         let drew = starved.take().map_or(0, |s| s.drew.get());
@@ -16482,6 +16436,209 @@ fn post_refuses_an_edge_token_connection_inbox_hold() {
     assert!(post_scope_denied(Scope::Edge(EdgeToken::generate())));
 }
 
+/// `help` names the harness's lane on every verb a lane writes with, so a harness that probes it
+/// names its lane there ([`aterm_agent::harness::agent_image::LANE_OPTION`]), and `help key`
+/// names exactly the lanes the gate exempts ([`Lane::exempt`]) and each lane it does not.
+/// NEGATIVE CONTROL (run): with a lane added to the exemptions alone, the exempt words differ.
+#[test]
+fn help_names_the_harness_lane_and_exactly_the_exempt_lanes() {
+    use aterm_agent::harness::agent_image::{LANE_OPTION, Lane};
+    use std::collections::BTreeSet;
+    for verb in ["send", "key", "turn", "paste"] {
+        let help = cmd_help(verb);
+        assert!(help.contains(LANE_OPTION), "help {verb}: {help}");
+    }
+    let key = cmd_help("key");
+    let named: BTreeSet<&str> = key
+        .split(LANE_OPTION)
+        .skip(1)
+        .filter(|tail| !tail.starts_with('<'))
+        .flat_map(|tail| tail.split('`').next().unwrap_or_default().split('|'))
+        .collect();
+    let exempt: BTreeSet<&str> = Lane::ALL
+        .into_iter()
+        .filter(|lane| lane.exempt())
+        .map(Lane::word)
+        .collect();
+    assert_eq!(named, exempt, "{key}");
+    for lane in Lane::ALL.into_iter().filter(|lane| !lane.exempt()) {
+        assert!(
+            key.contains(&format!("`{}`", lane.word())),
+            "help key names {lane:?} as not exempt: {key}"
+        );
+    }
+}
+
+/// THE ONE OBSERVE GATE (H6-R1), at the input admission every harness write passes: a write the
+/// window harness makes into an agent the host observes is refused unless it names a lane THE
+/// RULING exempts (relaunch after exit, live upgrade, the codex-alab, agy and Muse Code drives);
+/// the disk resume, the disk-free ask and a write that names no lane are refused, and a
+/// confirmed agent passes every row. The write is judged, not only its connection: one naming a
+/// harness lane on any other connection (the token beside the socket, where the window's token
+/// was refused) is judged as the harness's, and one naming none there passes. An agent the host
+/// does not admit (a plain Codex that is no codex-alab; Grok Build, which no reader drives) is
+/// observed whatever the kernel read of the session kept. The rows are what the code has: every
+/// verb whose class writes input ([`Input::WRITES`]) and every lane ([`Lane::ALL`]) as the server
+/// parses it off the request, where the verb takes it ([`Input::SUPERVISED`]: every verb a lane
+/// writes with). Each lane's first refusal in a session is logged, once. NEGATIVE CONTROLS (run):
+/// with the gate's line in `admit_with` removed, the observed harness rows pass and nothing is
+/// logged; with its `a.lane.is_some()` dropped, the observed disk lanes on another connection
+/// pass; with `agent_act::withheld_with`'s unadmitted agent read as confirmed, the Codex and
+/// Grok rows pass.
+#[test]
+fn every_harness_write_lane_passes_the_one_observe_gate() {
+    use aterm_agent::harness::agent_image::{self, Act, Lane};
+    use aterm_phase::Program;
+    use std::collections::BTreeSet;
+    let ruling: BTreeSet<&str> = ["relaunch", "upgrade", "codex-alab", "agy", "muse"].into();
+    let exempt: BTreeSet<&str> = Lane::ALL
+        .into_iter()
+        .filter(|lane| lane.exempt())
+        .map(Lane::word)
+        .collect();
+    let mut wrong = Vec::new();
+    if exempt != ruling {
+        wrong.push(format!(
+            "the gate exempts {exempt:?}, THE RULING {ruling:?}"
+        ));
+    }
+    let group = i32::try_from(std::process::id()).expect("a pid");
+    let writes: Vec<&str> = aterm_types::control_verbs::VERBS
+        .iter()
+        .filter(|v| v.input_class().contains(Input::WRITES))
+        .map(|v| v.name)
+        .collect();
+    for verb in ["send", "key", "turn", "paste"] {
+        assert!(
+            input_of(verb).contains(Input::WRITES.with(Input::SUPERVISED)),
+            "a lane writes with {verb}, which names its lane: {writes:?}"
+        );
+    }
+    let lanes: Vec<Option<Lane>> = std::iter::once(None).chain(Lane::ALL.map(Some)).collect();
+    let refused_lanes = lanes
+        .iter()
+        .filter(|lane| !lane.is_some_and(Lane::exempt))
+        .count();
+    // Each foreground, the act the host's kernel read kept for the session (for an agent the
+    // host does not admit, a confirmed Claude Code's, which the gate must not take), and whether
+    // the gate observes it.
+    for (local, program, kept, observed) in [
+        (7640, "claude", Act::On, false),
+        (7641, "claude", Act::Observe, true),
+        (7642, "codex", Act::On, true),
+        (7643, "grok", Act::On, true),
+    ] {
+        let h = crate::session_store::test_handle_on(local, -1);
+        {
+            let mut timeline = h.ctx.timeline.lock().unwrap();
+            timeline.note_foreground_group(group);
+            timeline.set_program(group, Some(program.to_string()));
+        }
+        let sid = h.ctx.self_id.as_str().to_string();
+        crate::agent_act::keep_live_for_test(&sid, Program::Claude, group, kept);
+        for principal in [Principal::Instance, Principal::Harness] {
+            let _principal = ServingPrincipal::enter(principal);
+            for &verb in &writes {
+                for &named in &lanes {
+                    let words = named.map_or(String::new(), |lane| {
+                        format!("{}{} ", agent_image::LANE_OPTION, lane.word())
+                    });
+                    let (options, _) =
+                        control_input::take_leading_options(input_of(verb), &format!("{words}x"));
+                    let lane = options.harness_lane;
+                    if input_of(verb).contains(Input::SUPERVISED) && lane != named {
+                        wrong.push(format!("{verb} {named:?}: parsed {lane:?}"));
+                    }
+                    let got = admit(InputAdmission {
+                        class: input_of(verb),
+                        verb,
+                        ctx: &h.ctx,
+                        session: 0xC6_0000_0040,
+                        is_cross: true,
+                        args: b"x",
+                        unread_ok: true,
+                        usage: None,
+                        lane,
+                    });
+                    let refused = got
+                        .as_ref()
+                        .err()
+                        .is_some_and(|e| agent_image::observe_refused(e));
+                    let want = observed
+                        && (principal == Principal::Harness || lane.is_some())
+                        && !lane.is_some_and(Lane::exempt);
+                    if refused != want {
+                        wrong.push(format!(
+                            "{program} kept {kept:?} {principal:?} {verb} {lane:?}: {got:?}"
+                        ));
+                    }
+                }
+            }
+        }
+        let said = crate::agent_act::withheld_said(&sid);
+        let want_said = if observed { refused_lanes } else { 0 };
+        if said != want_said {
+            wrong.push(format!(
+                "{program} kept {kept:?}: {said} refused lanes logged, not {want_said} (once each, \
+                 over every verb)"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// THE ONE OBSERVE GATE'S WINDOW ARM (RV1): a write through the window itself (`hwkey`, a
+/// `pointer` that presses or moves, an `invoke` of a menu action that types) reaches whatever
+/// view the window delivers it to, which no session names at admission, so the window harness's
+/// own connection makes none, whatever the act; every other connection keeps it, and a read of
+/// the pointer is answered. The rows are the code's: every verb the catalog routes to the window
+/// ([`Target::App`]) under each body. NEGATIVE CONTROL (run): with the arm's principal test
+/// dropped, every other connection's window write is refused.
+#[test]
+fn the_window_harness_writes_nothing_through_the_window() {
+    use aterm_types::control_verbs::{Target, VERBS};
+    use std::collections::BTreeSet;
+    let mut wrong = Vec::new();
+    let mut refused: BTreeSet<&str> = BTreeSet::new();
+    let bodies = [
+        "",
+        "status",
+        "a",
+        "click",
+        "move 1 1",
+        "Paste",
+        "unread=ok Paste",
+        "SystemState",
+    ];
+    for v in VERBS.iter().filter(|v| v.target == Target::App) {
+        let class = v.input_class();
+        for body in bodies {
+            let reads = v.name == "pointer" && matches!(body, "" | "status");
+            let writes = crate::input_stall::writes_input(
+                class,
+                v.name,
+                control_input::take_app_unread_ok(class, body).1.as_bytes(),
+            ) && !reads;
+            for principal in [Principal::Instance, Principal::Harness] {
+                let got = harness_window_input_refusal(principal, class, v.name, body);
+                if got.is_some() != (writes && principal == Principal::Harness) {
+                    wrong.push(format!("{principal:?} {} {body:?}: {got:?}", v.name));
+                }
+                if let Some(got) = got {
+                    assert_eq!(got, HARNESS_WINDOW_INPUT);
+                    refused.insert(v.name);
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert_eq!(
+        refused,
+        BTreeSet::from(["hwkey", "invoke", "pointer"]),
+        "the window's writes the harness's connection is refused"
+    );
+}
+
 #[test]
 #[cfg(target_os = "macos")]
 fn admit_orders_its_gates() {
@@ -16539,6 +16696,7 @@ fn admit_orders_its_gates() {
             args,
             unread_ok,
             usage: usage.map(str::to_string),
+            lane: None,
         })
     };
     let words_refusal = "ERR cause: 999999 names no record of this session\n";
@@ -16554,6 +16712,7 @@ fn admit_orders_its_gates() {
                 args: b"down",
                 unread_ok: false,
                 usage: None,
+                lane: None,
             },
             || {
                 asked.set(asked.get() + 1);
@@ -16618,6 +16777,7 @@ fn admit_orders_its_gates() {
         args: &overdraw,
         unread_ok: false,
         usage: None,
+        lane: None,
     });
     assert_eq!(
         signal,
@@ -16667,6 +16827,7 @@ fn a_requests_own_words_are_told_before_the_unread_input_gate() {
                 args: rest.as_bytes(),
                 unread_ok: false,
                 usage: None,
+                lane: None,
             },
             || {
                 asked.set(asked.get() + 1);
@@ -16773,6 +16934,7 @@ fn a_person_types_into_a_held_and_stalled_session() {
             args: b"down",
             unread_ok: false,
             usage: None,
+            lane: None,
         })
     };
     assert_eq!(
@@ -16840,6 +17002,7 @@ fn the_unread_input_gate_refuses_after_the_halt_and_gives_the_id_back() {
         args: b"down",
         unread_ok: false,
         usage: None,
+        lane: None,
     }) {
         Err(refusal) => refusal,
         Ok(_) => {
@@ -17170,23 +17333,6 @@ fn the_worker_spawn_frame_detector_agrees_with_the_spawn_tokenizer() {
         spawn_frame_len(&control_request::head("spawn agent=claude len=abc"))
             .is_some_and(|len| len.is_err_and(|e| e.starts_with("ERR usage: spawn")))
     );
-    for (line, word) in [
-        ("spawn agent=gemini len=4", "gemini"),
-        (
-            "@s-ab spawn cwd=/w agent=Gemini-CLI model=m len=0",
-            "Gemini-CLI",
-        ),
-    ] {
-        assert_eq!(
-            spawn_frame_len(&control_request::head(line)),
-            Some(Err(format!(
-                "ERR spawn agent={word}: Gemini CLI is no longer supported: agy replaces it \
-                 (agent=agy)\n"
-            ))),
-            "{line}: the retired Gemini CLI's frame is refused by name, never read"
-        );
-        assert_eq!(announced_body_of(line), 0, "{line}");
-    }
     assert_eq!(announced_body_of("spawn agent=claude len=65536"), 65536);
     assert_eq!(announced_body_of("spawn agent=claude len=65537"), 0);
     assert_eq!(announced_body_of("spawn cwd=/w"), 0);
@@ -17267,17 +17413,6 @@ fn a_worker_frame_for_another_instance_is_refused_never_relayed() {
             .is_some_and(|r| r
                 .starts_with("ERR spawn agent=muse: @s-0ffcafe is not a session of this instance")),
         "{muse:?}"
-    );
-    let gemini = control_request::head("@s-0ffcafe spawn agent=gemini len=4");
-    assert_eq!(
-        worker_frame_refusal(&gemini, &store),
-        None,
-        "the retired Gemini CLI's frame is refused by its own reply"
-    );
-    assert!(
-        spawn_frame_len(&gemini).is_some_and(|len| len.is_err_and(|e| e.contains("agent=agy"))),
-        "{:?}",
-        spawn_frame_len(&gemini)
     );
     assert!(!request_waits(
         "@s-0ffcafe spawn agent=claude len=4",
@@ -17688,6 +17823,7 @@ fn a_key_that_names_no_key_leaves_its_id_for_the_retry() {
                 args: rest.as_bytes(),
                 unread_ok: false,
                 usage: None,
+                lane: None,
             },
             || input_words(Scope::Owner, "key", rest, None, &h.ctx),
         ) {
@@ -18310,8 +18446,10 @@ fn a_person_fenced_write_is_refused_after_a_persons_key_through_the_app_seam() {
     use crate::input::Source;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers, NamedKey};
     use control_input::InputFence;
-    let (rd, wr) = cloexec_pipe();
-    let rx = unsafe { std::fs::File::from_raw_fd(rd) };
+    use std::os::fd::IntoRawFd;
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    let rx = std::fs::File::from(std::os::fd::OwnedFd::from(rd));
+    let wr = wr.into_raw_fd();
     aterm_pty::set_nonblocking(wr, true).expect("nonblocking test master");
     let sink = Arc::new(SinkWriter::new(wr));
     sink.note_master_nonblocking(true);
@@ -22206,7 +22344,6 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         "spawn agent=codex-old len=5".to_owned(),
         "spawn agent=bogus len=5".to_owned(),
         "spawn agent=generic len=5".to_owned(),
-        "spawn agent=gemini".to_owned(),
         "spawn agent=agy identity=x len=5".to_owned(),
         "spawn agent=claude cwd=src len=5".to_owned(),
         format!("spawn agent=claude from={MINE} len=5"),
@@ -22232,13 +22369,6 @@ fn the_drive_gate_admits_its_allowlist_and_refuses_every_other_line() {
         assert!(
             refused.is_err(),
             "{line:?}: a forbidden drive command was admitted: {refused:?}"
-        );
-    }
-    for word in ["gemini", "Gemini", "gemini-cli"] {
-        let line = format!("spawn agent={word} model=m-1 cwd={CWD} len=5");
-        assert!(
-            gate(&line).is_err(),
-            "{line}: a retired worker was admitted"
         );
     }
     for line in [
@@ -23928,6 +24058,89 @@ fn the_lock_caps_a_granted_driver_before_the_gate_looks_at_anything() {
         panic!("a reader's line is the fleet gate's to refuse");
     };
     assert_eq!((scope, act), (reader, None));
+}
+
+/// A STOPPED LANE'S RECORD IS IN `update status`: `apply_lane=`, `apply_lane_build=`,
+/// `failure_signature=` and `next_action=` beside the refusal fields, pct-encoded, and nothing
+/// when no record stands. NEGATIVE CONTROL: dropping the lane's rows from `apply_lane_fields`
+/// fails "the record's fields".
+#[test]
+fn update_status_names_a_stopped_lanes_record_and_what_aterm_does_next() {
+    let lane = aterm_update::ApplyLaneRecord {
+        lane: "resampling".into(),
+        target_build: 901,
+        failure_signature: "structural/handoff proof ended ChildDied".into(),
+        next_action: "aterm re-samples build 901 by itself at 2026-11-12T00:00:00Z".into(),
+        at: "2026-11-11T00:00:00Z".into(),
+    };
+    let report = aterm_update::ApplyLaneReport {
+        lane: Some(lane.clone()),
+        last_refusal: "held".into(),
+        ..Default::default()
+    };
+    let fields = super::apply_lane_fields(&report);
+    for want in [
+        " apply_refusal=held".to_string(),
+        " apply_lane=resampling".to_string(),
+        " apply_lane_build=901".to_string(),
+        format!(
+            " failure_signature={}",
+            super::pct_encode(&lane.failure_signature)
+        ),
+        format!(" next_action={}", super::pct_encode(&lane.next_action)),
+        format!(" apply_lane_at={}", super::pct_encode(&lane.at)),
+    ] {
+        assert!(
+            fields.contains(&want),
+            "the record's fields: {want} in {fields}"
+        );
+    }
+    assert_eq!(
+        fields.split_whitespace().count(),
+        6,
+        "one word per field, the values pct-encoded: {fields}"
+    );
+    let none = super::apply_lane_fields(&aterm_update::ApplyLaneReport::default());
+    assert_eq!(none, "", "no record, no fields");
+}
+
+/// THE BYTES A WINDOW SAW FAIL TO START ARE IN `update status`: the windowless lanes leave a
+/// download a window here saw fail to start for a window, and nothing on demand said why the node
+/// job was not installing it. `start_failed=` names its build, with `start_failed_at=` and
+/// `start_failed_signature=` pct-encoded. Which record bears on the running build is aterm-update's
+/// to decide (`window_start_failure_for_report`, sampled there). NEGATIVE CONTROL: dropping the
+/// rows from `apply_lane_fields` fails "the record's fields".
+#[test]
+fn update_status_names_the_bytes_a_window_saw_fail_to_start() {
+    let record = aterm_update::WindowStartFailure {
+        build: 902,
+        dmg_sha256: "ab".repeat(32),
+        at: "2026-11-12T00:00:00Z".into(),
+        by_build: 901,
+        signature: "stalled (unlaunched)".into(),
+    };
+    let fields = super::apply_lane_fields(&aterm_update::ApplyLaneReport {
+        window_start_failure: Some(record.clone()),
+        ..Default::default()
+    });
+    for want in [
+        " start_failed=902".to_string(),
+        format!(" start_failed_at={}", super::pct_encode(&record.at)),
+        format!(
+            " start_failed_signature={}",
+            super::pct_encode(&record.signature)
+        ),
+    ] {
+        assert!(
+            fields.contains(&want),
+            "the record's fields: {want} in {fields}"
+        );
+    }
+    assert_eq!(
+        fields.split_whitespace().count(),
+        3,
+        "one word per field, the values pct-encoded: {fields}"
+    );
 }
 
 #[cfg(unix)]

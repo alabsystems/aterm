@@ -15,6 +15,16 @@ use std::{
 // The minimal libc facade does not export this option on either platform.
 const MULTICAST_IF: i32 = if cfg!(target_os = "linux") { 32 } else { 9 };
 
+/// The receive room, in bytes, a discovery socket asks for ([`bind`]). Its owner reads it once
+/// a polled round, not as each datagram comes, so what a round's length brings waits in the
+/// socket: 320 datagrams, the most one read takes (aterm-db's `HEARD`), come to 384,000 bytes
+/// at the largest a discovery datagram may be (`crate::lan::MAX_PACKET`), and to 737,280 where
+/// a kernel charges each datagram a 2,304-byte buffer. A kernel may grant less than is asked
+/// (Linux grants no more than its `net.core.rmem_max`): the socket keeps what it is granted,
+/// never less than it had, and a socket with no room left drops what comes, which for a
+/// beacon is a hint its sender repeats.
+const ROOM: u32 = 1 << 20;
+
 /// A socket bound to the wildcard address on `port`, sharing it (`SO_REUSEADDR`,
 /// `SO_REUSEPORT`), with `group` joined on interface `index` and a one-hop multicast limit. A
 /// LAN attachment's (`interface` named) is made by `aterm_uds::lan::udp`: on macOS by the root
@@ -50,6 +60,12 @@ pub(in crate::lan) fn bind(
     };
     aterm_uds::keep_out_of_children(&socket)?;
     socket.set_nonblocking(true)?;
+    // Only ever raised: a default already larger stays, and a refusal leaves the default.
+    if option(&socket, libc::SOL_SOCKET, libc::SO_RCVBUF)
+        .is_ok_and(|room| room < ROOM.cast_signed())
+    {
+        let _ = set_option(&socket, libc::SOL_SOCKET, libc::SO_RCVBUF, ROOM);
+    }
     if let Some(name) = interface {
         bind_interface(&socket, index, name)?;
     }
@@ -82,6 +98,14 @@ fn loopback(source: Ipv4Addr, group: Ipv4Addr, port: u16) -> io::Result<UdpSocke
     }
     socket.join_multicast_v4(&group, &source)?;
     Ok(socket)
+}
+
+/// `socket`'s receive room in bytes, as its kernel reports it (tests), with what [`bind`]
+/// asks for.
+#[cfg(test)]
+pub(in crate::lan) fn room(socket: &UdpSocket) -> io::Result<(usize, usize)> {
+    let room = option(socket, libc::SOL_SOCKET, libc::SO_RCVBUF)?;
+    Ok((usize::try_from(room).unwrap_or(0), ROOM as usize))
 }
 
 pub(in crate::lan) fn policy(

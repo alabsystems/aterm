@@ -1292,6 +1292,7 @@ fn a_rows_usage_takes_the_screen_then_the_tap_then_the_rollout() {
         cache_expires_at: None,
         version: Some("2.1.311".into()),
         model: Some("claude-opus-5-5".into()),
+        effort: None,
         ctx_left: Some(64),
         dur_us: 0,
         row: None,
@@ -1766,6 +1767,107 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
     assert!(!out.contains("\naccount "), "{out}");
 }
 
+/// The shell, the holder (or the shell's child) and the file `claude` links to in the restores
+/// below, and the wall ms the restored block's C is stamped at.
+#[cfg(unix)]
+const RESTORED_SHELL: i32 = 4000;
+#[cfg(unix)]
+const RESTORED_HOLDER: i32 = 4242;
+#[cfg(unix)]
+const RESTORED_VERSIONS: &str = "/u/jsmith/.local/share/claude/versions/2.1.271";
+#[cfg(unix)]
+const RESTORED_C_MS: u64 = 1_700_000_000_000;
+
+/// The probes a restore below reads its session with: each process's names, the group in front,
+/// each group leader's image, the shell's children, and each process's birth once it has exec'd
+/// (a test feed's starts are wall-clock microseconds: [`crate::command_ran::RanFeed::reading`]).
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+struct RestoreProbes {
+    read: fn(i32, crate::command_ran::Steering<'_>) -> crate::command_ran::ExecNames,
+    in_front: fn(i32) -> i32,
+    image: crate::holder_image::ReadImage,
+    children: fn(i32) -> Vec<i32>,
+    execd: fn(i32) -> Option<u64>,
+}
+
+/// What a seamless update's restore reads of a session whose restored block runs `typed` (a
+/// planted argument after it; `None`: the session is at a prompt, no block runs), its shell
+/// running jobs (`jobs`) or every command in its own group (pwsh), with `probes`: the detail
+/// `ctl status` gives (the same [`crate::session_status::executing_detail`] fabric status
+/// reads), the survey's and the sessions roster's, `-` for none, read right after
+/// [`crate::spawn::adopt_restored_holder`], and how many execs the restore noted. The block's C
+/// is stamped by hand at [`RESTORED_C_MS`], long before the restore. No reader carries the
+/// argument.
+#[cfg(unix)]
+fn restored_reads(typed: Option<&str>, jobs: bool, probes: RestoreProbes) -> ([String; 3], usize) {
+    use crate::command_ran::{Ran, RanFeed, Table, Window};
+    let ran = std::sync::Arc::new(Ran::with_files(
+        Box::new(
+            Table::default()
+                .program("/u/jsmith/.local/bin/claude", "2.1.271")
+                .program(RESTORED_VERSIONS, "2.1.271"),
+        ),
+        Some(std::path::Path::new("/u/jsmith").into()),
+    ));
+    ran.runs_jobs(jobs);
+    let mut before = aterm_core::terminal::Terminal::new(24, 80);
+    let line = typed.map_or_else(String::new, |typed| {
+        format!("{typed} --resume QZP9WORD8\r\n\x1b]133;C\x07")
+    });
+    before.process_at(
+        format!("\x1b]7;file://localhost/w\x07\x1b]133;A\x07$ \x1b]133;B\x07{line}").as_bytes(),
+        aterm_core::terminal::ClockReading {
+            monotonic: aterm_core::terminal::ClockReading::now().monotonic,
+            wall_ms: Some(RESTORED_C_MS),
+        },
+    );
+    let term = std::sync::Arc::new(std::sync::Mutex::new(
+        aterm_core::terminal::Terminal::from_checkpoint(&before.checkpoint()),
+    ));
+    let h = crate::session_store::test_handle_ran(7, term, std::sync::Arc::clone(&ran));
+    crate::spawn::adopt_restored_holder(
+        &h.term,
+        &h.ctx.timeline,
+        &RanFeed::reading(std::sync::Arc::clone(&ran), RESTORED_SHELL, probes.read),
+        -1,
+        RESTORED_SHELL,
+        probes.in_front,
+        probes.image,
+        probes.children,
+        probes.execd,
+    );
+    let noted = ran.within(Some(Window { from: 0, to: None })).len();
+    let status = crate::session_status::executing_detail(&h.term.lock().unwrap(), &h.ctx.ran);
+    let store = crate::session_store::new_store();
+    store.write().unwrap().register(h);
+    let survey = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &here());
+    let roster = crate::control::cmd_sessions_store(&store, None);
+    for text in [survey.as_str(), roster.as_str()] {
+        assert!(!text.contains("QZP9"), "no argument anywhere: {text}");
+    }
+    let detail = |line: &str| {
+        line.split_whitespace()
+            .find_map(|kv| kv.strip_prefix("detail="))
+            .map(aterm_codec::pct::decode)
+            .unwrap_or_default()
+    };
+    (
+        [
+            status.unwrap_or_else(|| "-".to_owned()),
+            detail(survey.lines().nth(2).unwrap_or_default()),
+            detail(&roster),
+        ],
+        noted,
+    )
+}
+
+/// The same reading in status, the survey and the sessions roster.
+#[cfg(unix)]
+fn thrice(detail: &str) -> [String; 3] {
+    [detail, detail, detail].map(str::to_owned)
+}
+
 /// H2 RULE 5 (GATE3-1): a seamless update's restore notes the holder it finds in front as the
 /// running block's job's exec with the identity of its image's file and the steers its kernel
 /// record shows (here its `PATH`), before any read, so `claude` typed through its versions link
@@ -1777,19 +1879,16 @@ fn an_instance_lists_its_account_rows_and_each_session_its_account() {
 #[cfg(unix)]
 #[test]
 fn a_restored_holder_typed_through_a_link_reads_its_typed_name() {
-    use crate::command_ran::{ExecNames, Ran, RanFeed, Steering, Table, test_id};
+    use crate::command_ran::{ExecNames, Steering, test_id};
     use crate::holder_image::HolderImage;
-    const SHELL: i32 = 4000;
-    const HOLDER: i32 = 4242;
-    const VERSIONS: &str = "/u/jsmith/.local/share/claude/versions/2.1.271";
     fn in_front(_: i32) -> i32 {
-        HOLDER
+        RESTORED_HOLDER
     }
     fn holder(pgid: i32, _: Option<&HolderImage>) -> HolderImage {
         HolderImage::of(
             pgid,
             Some(1),
-            Some(VERSIONS.into()),
+            Some(RESTORED_VERSIONS.into()),
             atpkg::image::ImageBuild::unknown(None),
             0,
         )
@@ -1806,54 +1905,241 @@ fn a_restored_holder_typed_through_a_link_reads_its_typed_name() {
         ExecNames::default()
     }
     let restored = |read: fn(i32, Steering<'_>) -> ExecNames| {
-        let ran = std::sync::Arc::new(Ran::with_files(
-            Box::new(
-                Table::default()
-                    .program("/u/jsmith/.local/bin/claude", "2.1.271")
-                    .program(VERSIONS, "2.1.271"),
-            ),
-            Some(std::path::Path::new("/u/jsmith").into()),
-        ));
-        let mut before = aterm_core::terminal::Terminal::new(24, 80);
-        before.process(
-            b"\x1b]7;file://localhost/w\x07\x1b]133;A\x07$ \x1b]133;B\x07claude --resume \
-              QZP9WORD8\r\n\x1b]133;C\x07",
-        );
-        let term = std::sync::Arc::new(std::sync::Mutex::new(
-            aterm_core::terminal::Terminal::from_checkpoint(&before.checkpoint()),
-        ));
-        let h = crate::session_store::test_handle_ran(7, term, std::sync::Arc::clone(&ran));
-        crate::spawn::adopt_restored_holder(
-            &h.term,
-            &h.ctx.timeline,
-            &RanFeed::reading(ran, SHELL, read),
-            -1,
-            SHELL,
+        let probes = RestoreProbes {
+            read,
             in_front,
-            holder,
-            |_| Vec::new(),
-        );
-        let status = crate::session_status::executing_detail(&h.term.lock().unwrap(), &h.ctx.ran);
-        let store = crate::session_store::new_store();
-        store.write().unwrap().register(h);
-        let survey = survey_rows(&store, SurveyLevel::Facts, usize::MAX, &here());
-        let row = survey.lines().nth(2).map(fields).unwrap_or_default();
-        let roster = crate::control::cmd_sessions_store(&store, None);
-        (status, row.get("detail").cloned(), roster)
+            image: holder,
+            children: |_| Vec::new(),
+            execd: |_| None,
+        };
+        restored_reads(Some("claude"), true, probes).0
     };
-    let (status, survey, roster) = restored(kernel);
-    assert_eq!(status.as_deref(), Some("claude"), "status: the typed word");
-    assert_eq!(survey.as_deref(), Some("claude"), "survey");
-    assert!(roster.contains(" detail=claude "), "sessions: {roster}");
-    let (status, survey, roster) = restored(unread);
     assert_eq!(
-        (status.as_deref(), survey.as_deref()),
-        (Some("2.1.271"), Some("2.1.271")),
+        restored(kernel),
+        thrice("claude"),
+        "status, survey and sessions: the typed word"
+    );
+    assert_eq!(
+        restored(unread),
+        thrice("2.1.271"),
         "the canonical name alone confirms nothing typed; the image stands in"
     );
-    for text in [roster.as_str(), survey.as_deref().unwrap_or_default()] {
-        assert!(!text.contains("QZP9"), "no argument anywhere: {text}");
+}
+
+/// M2 (GATE4-1): a restored holder whose executable was deleted after it started is noted by the
+/// exec name the kernel keeps alone. macOS's `proc_pidpath` names no path once the file is
+/// unlinked (as `brew upgrade`'s cleanup does under a running `nvim`), so the image has none,
+/// and the kernel keeps the name of the file it was exec'd from (`p_name`; here a program whose
+/// own file is named `claude`); Linux's `/proc/<pid>/exe` names the path it had, marked
+/// ` (deleted)`, which the image keeps unmarked and the read finds gone (here `nvim`). Either
+/// way a block typed by that very name reads it in status, the survey and the sessions roster
+/// right after the update; a block typed `QZP7M2A`, which no kernel name equals, reads `-`
+/// (the name never stands in, nor the path the image kept); and a typed path to a file the read
+/// claims the image maps reads `-` (a gone image confirms by a kernel name alone, never by a
+/// file's identity). NEGATIVE CONTROLS (scratch): the restore returning when the image has no
+/// path (as before M2) reads `-` for `claude`; the gone image's exec name noted as its file name
+/// too stands in as `claude` for `QZP7M2A`; the read's file kept reads `claude` for the path;
+/// a gone read of an image with a path noted by that path's name (as before the land) stands in
+/// as `nvim` for `QZP7M2A`.
+#[cfg(unix)]
+#[test]
+fn a_restored_holder_whose_file_is_gone_reads_the_name_the_kernel_keeps() {
+    use crate::command_ran::{ExecNames, Steering, test_id};
+    use crate::holder_image::HolderImage;
+    fn in_front(_: i32) -> i32 {
+        RESTORED_HOLDER
     }
+    fn pathless(pgid: i32, _: Option<&HolderImage>) -> HolderImage {
+        HolderImage::of(
+            pgid,
+            Some(1),
+            None,
+            atpkg::image::ImageBuild::unknown(None),
+            0,
+        )
+    }
+    fn unmarked(pgid: i32, _: Option<&HolderImage>) -> HolderImage {
+        HolderImage::of(
+            pgid,
+            Some(1),
+            Some("/opt/nvim/bin/nvim".into()),
+            atpkg::image::ImageBuild::unknown(None),
+            0,
+        )
+    }
+    fn kernel(_: i32, _: Steering<'_>) -> ExecNames {
+        ExecNames::gone(Some("claude".into()))
+    }
+    fn deleted(_: i32, _: Steering<'_>) -> ExecNames {
+        ExecNames::gone(Some("nvim".into()))
+    }
+    fn claims_a_file(_: i32, _: Steering<'_>) -> ExecNames {
+        ExecNames {
+            exec: Some("QZP7M2B".into()),
+            file: Some(test_id("2.1.271")),
+            ..ExecNames::default()
+        }
+    }
+    let restored = |typed: &str,
+                    image: crate::holder_image::ReadImage,
+                    read: fn(i32, Steering<'_>) -> ExecNames| {
+        let probes = RestoreProbes {
+            read,
+            in_front,
+            image,
+            children: |_| Vec::new(),
+            execd: |_| None,
+        };
+        restored_reads(Some(typed), true, probes).0
+    };
+    assert_eq!(
+        [
+            restored("claude", pathless, kernel),
+            restored("QZP7M2A", pathless, kernel),
+            restored("/u/jsmith/.local/bin/claude", pathless, claims_a_file),
+            restored("nvim", unmarked, deleted),
+            restored("QZP7M2A", unmarked, deleted),
+        ],
+        [
+            thrice("claude"),
+            thrice("-"),
+            thrice("-"),
+            thrice("nvim"),
+            thrice("-"),
+        ],
+        "the kernel's name, by equality alone"
+    );
+}
+
+/// M2 (GATE4-2): pwsh runs every command in its own group, so after a seamless update the
+/// foreground group is the shell's and its running command is one of the shell's children. The
+/// restore notes each live child that has exec'd since its fork with the identity a restored
+/// holder's is noted with, placed by its birth: here `claude` through its versions link reads
+/// `claude` in status, the survey and the sessions roster whether it started before the running
+/// block or in it; for a block typed `QZP7M2A` (an alias, a function), a child started in the
+/// block's window stands in as its program, `2.1.271`, as its exec heard live did, while one
+/// started before it (a `Start-Process` an earlier block left running) never does, so that block
+/// reads `-`; a fork that has not exec'd (it maps the shell's image) is never noted, so `pwsh`
+/// typed reads `-`, while a nested `pwsh` that has exec'd reads `pwsh`; a child whose file is
+/// gone reads the name the kernel keeps for a block typed by it and never stands in; a shell
+/// that runs jobs reads none of its children; and a restore at a prompt notes nothing.
+/// NEGATIVE CONTROLS (scratch): no children read (as before M2) reads `-` for `claude`; the
+/// children read in a shell that runs jobs reads `claude` there; every child placed by its stamp
+/// (as before the land) reads `-` for `QZP7M2A` in the block's own child; every child placed
+/// as the block's own stands in as `2.1.271` for the older child; the exec evidence ignored
+/// reads `pwsh` for the fork; a child skipped for the shell's file (as before the land) reads
+/// `-` for the nested `pwsh`; the gone image's exec name noted as its file name too (the test
+/// above's) stands in as `nvim` for `QZP7M2A` here as well; children read with no block running
+/// notes them at a prompt.
+#[cfg(unix)]
+#[test]
+fn a_restored_pwsh_command_reads_the_shells_child_that_runs_it() {
+    use crate::command_ran::{ExecNames, Steering, test_id};
+    use crate::holder_image::HolderImage;
+    const FORK: i32 = 4243;
+    const LATE: i32 = 4244;
+    const NESTED: i32 = 4245;
+    const GONE: i32 = 4246;
+    const PWSH: &str = "/opt/pwsh/pwsh";
+    /// A start five seconds after the block's C, in wall-clock microseconds; `1`: long before.
+    const LATE_US: u64 = (RESTORED_C_MS + 5_000) * 1_000;
+    fn in_front(_: i32) -> i32 {
+        RESTORED_SHELL
+    }
+    fn born(pid: i32) -> u64 {
+        if matches!(pid, LATE | NESTED | GONE) {
+            LATE_US
+        } else {
+            1
+        }
+    }
+    fn image(pgid: i32, _: Option<&HolderImage>) -> HolderImage {
+        let exe = match pgid {
+            RESTORED_HOLDER | LATE => Some(RESTORED_VERSIONS.into()),
+            GONE => None,
+            _ => Some(PWSH.into()),
+        };
+        let start = exe.is_some().then(|| born(pgid));
+        HolderImage::of(pgid, start, exe, atpkg::image::ImageBuild::unknown(None), 0)
+    }
+    fn kernel(pid: i32, _: Steering<'_>) -> ExecNames {
+        match pid {
+            RESTORED_HOLDER | LATE => ExecNames {
+                image: Some("2.1.271".into()),
+                file: Some(test_id("2.1.271")),
+                env_path: Some("/u/jsmith/.local/bin:/usr/bin".into()),
+                ..ExecNames::default()
+            },
+            GONE => ExecNames::gone(Some("nvim".into())),
+            _ => ExecNames {
+                image: Some("pwsh".into()),
+                exec: Some("pwsh".into()),
+                file: Some(test_id("pwsh")),
+                ..ExecNames::default()
+            },
+        }
+    }
+    fn execd(pid: i32) -> Option<u64> {
+        (pid != FORK).then(|| born(pid))
+    }
+    fn older(_: i32) -> Vec<i32> {
+        vec![RESTORED_SHELL, RESTORED_HOLDER]
+    }
+    fn late(_: i32) -> Vec<i32> {
+        vec![RESTORED_SHELL, LATE]
+    }
+    fn fork(_: i32) -> Vec<i32> {
+        vec![FORK]
+    }
+    fn nested(_: i32) -> Vec<i32> {
+        vec![NESTED]
+    }
+    fn gone(_: i32) -> Vec<i32> {
+        vec![GONE]
+    }
+    let restored = |typed: Option<&str>, jobs: bool, children: fn(i32) -> Vec<i32>| {
+        let probes = RestoreProbes {
+            read: kernel,
+            in_front,
+            image,
+            children,
+            execd,
+        };
+        restored_reads(typed, jobs, probes)
+    };
+    let read = |typed: &str, jobs: bool, children: fn(i32) -> Vec<i32>| {
+        restored(Some(typed), jobs, children).0
+    };
+    assert_eq!(
+        [
+            read("claude", false, older),
+            read("claude", false, late),
+            read("QZP7M2A", false, late),
+            read("QZP7M2A", false, older),
+            read("pwsh", false, fork),
+            read("pwsh", false, nested),
+            read("nvim", false, gone),
+            read("QZP7M2A", false, gone),
+            read("claude", true, older),
+        ],
+        [
+            thrice("claude"),
+            thrice("claude"),
+            thrice("2.1.271"),
+            thrice("-"),
+            thrice("-"),
+            thrice("pwsh"),
+            thrice("nvim"),
+            thrice("-"),
+            thrice("-"),
+        ],
+        "pwsh's exec'd children, placed by their birth; never in a shell that runs jobs"
+    );
+    assert_eq!(
+        restored(None, false, late),
+        (thrice("-"), 0),
+        "a restore at a prompt notes no child"
+    );
 }
 
 #[test]
@@ -2331,6 +2617,52 @@ fn a_step_of_words_and_a_post_that_tie_is_the_screens() {
     );
     assert_eq!(step_of(words(), None).as_deref(), Some("Running"));
     assert_eq!(step_of(None, None), None);
+}
+
+/// `holder=` adds one counted row, this host's kernel on exactly that identity, at either level.
+/// NEGATIVE CONTROLS: a request without it has no such row, and a malformed or repeated word is
+/// refused rather than read as some other identity.
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+#[test]
+fn a_holder_query_adds_a_counted_kernel_judgement_of_exactly_that_identity() {
+    use aterm_ctl::release_holder::Identity;
+    let store = crate::session_store::new_store();
+    let pid = std::process::id();
+    let (boot, start) = aterm_agent::release_progress::identity(pid).unwrap();
+    let me = Identity { pid, boot, start };
+    let reused = Identity {
+        start: start + 1,
+        ..me.clone()
+    };
+    let judged = |rest: &str, asked: &Identity| {
+        let reply = cmd_survey(&store, rest, SurveyLevel::Content, usize::MAX, &here());
+        let mut lines = reply.lines();
+        let count: usize = lines.next().unwrap()["OK ".len()..].parse().unwrap();
+        let rows: Vec<&str> = lines.collect();
+        assert_eq!(rows.len(), count, "{reply}");
+        rows.iter()
+            .filter_map(|row| asked.read(row))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(judged(&me.arg(), &me), [Some(true)]);
+    assert_eq!(judged(&format!("facts {}", me.arg()), &me), [Some(true)]);
+    assert_eq!(
+        judged(&format!("content {}", reused.arg()), &reused),
+        [Some(false)]
+    );
+    assert!(judged("facts", &me).is_empty());
+    for bad in [
+        "holder=1.ab".to_owned(),
+        "facts content".to_owned(),
+        format!("{} {}", me.arg(), me.arg()),
+        format!("{} everything", me.arg()),
+    ] {
+        assert!(
+            cmd_survey(&store, &bad, SurveyLevel::Content, usize::MAX, &here())
+                .starts_with("ERR usage: survey"),
+            "{bad}"
+        );
+    }
 }
 
 #[test]

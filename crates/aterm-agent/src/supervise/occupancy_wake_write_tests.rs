@@ -1043,7 +1043,7 @@ fn a_reconciled_release_is_retold_at_the_successors_first_break() {
 fn needs_break_screen() -> Vec<String> {
     let mut r = rows(&[
         "⏺ The build runs in the background; the docs are next.",
-        "  NEEDS YOU: the release credential",
+        "  NEEDS YOU: the release permission",
         "",
         "✻ Crunched for 9m 27s · done 11:07 AM · 1 shell still running",
         "",
@@ -1094,7 +1094,7 @@ fn a_due_wakes_line_leaves_the_breaks_needs_raised() {
         );
         let up = raised(&woke);
         assert_eq!(up.len(), 1, "wants {wants}: {:#?}", woke.requests());
-        assert!(up[0].contains("the release credential"), "{up:#?}");
+        assert!(up[0].contains("the release permission"), "{up:#?}");
         let none = run("wake-needs-none", false, wants);
         assert_eq!(
             raised(&none).len(),

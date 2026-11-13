@@ -12,11 +12,16 @@
 //! worker's sid in the clone's repair record ([`RECORD_FILE`], beside the release journal). The
 //! record outlives the run, so a cut that fails again on the same inputs names the worker
 //! already on them and opens none, while a new hop, version or prover is a new hash and opens
-//! one. Outside an aterm session `open` starts nothing and gives the command to run instead
+//! one. A red of `--open-next` judges main's tip, which is another commit at every try, so its
+//! hash is of the version it opens after alone ([`opening_hash`]): one worker per opened
+//! version. Outside an aterm session `open` starts nothing and gives the command to run instead
 //! ([`command`]). A spawn that fails, or a record that cannot be read or kept, is said
 //! ([`Opened::lines`]) and changes nothing else: the cut still ends with its own refusal.
 //!
 //! The spawn is injected ([`Spawner`]): [`Ctl`] is the real one, and a test's records its tasks.
+//! A cut the release pump runs has no session of its own, so its worker starts in the newest
+//! local aterm instead ([`Unattended`], chosen by [`spawner`]). The worker's report ends with one
+//! line the pump reads ([`verdict`]): `FIX <commit>`, or `NO-FIX <why>`.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -45,6 +50,7 @@ const SPAWN_TIMEOUT_SECS: &str = "60";
 const TASK_END: &str = "ATERM_REPAIR_TASK";
 
 const HASH_DOMAIN: &[u8] = b"aterm-release-repair-v1";
+const OPENING_DOMAIN: &[u8] = b"aterm-release-repair-open-next-v1";
 
 /// A cut's red and its inputs: what its repair worker is told.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,24 +77,47 @@ pub struct Failure {
     pub trustc: String,
     /// Epoch seconds the cut stopped.
     pub at: u64,
+    /// For a red of `--open-next`: the cut version it opens the next one after. `commit` is
+    /// then main's tip as that try read it, and `version` the one it would have opened.
+    pub opening: Option<String>,
 }
 
-/// The cut's input hash: SHA-256 over the version, R and the prover's `trustc` commit, which
-/// decide what the cut judges. What failed, its log and the time are not inputs: a cut that fails
-/// again on the same inputs is the same failure, whichever gate says it first.
-#[must_use]
-pub fn input_hash(failure: &Failure) -> String {
+fn hashed(parts: &[&[u8]]) -> String {
     let mut hash = aterm_digest::Sha256::new();
-    for part in [
-        HASH_DOMAIN,
-        failure.version.as_bytes(),
-        failure.commit.as_bytes(),
-        failure.trustc.as_bytes(),
-    ] {
+    for part in parts {
         hash.update((part.len() as u64).to_le_bytes());
         hash.update(part);
     }
     aterm_codec::hex::encode_lower(&hash.finalize())
+}
+
+/// The cut's input hash: SHA-256 over the version, R and the prover's `trustc` commit, which
+/// decide what the cut judges. What failed, its log and the time are not inputs: a cut that fails
+/// again on the same inputs is the same failure, whichever gate says it first. A red of
+/// `--open-next` is [`opening_hash`] of the version it opens after.
+#[must_use]
+pub fn input_hash(failure: &Failure) -> String {
+    match &failure.opening {
+        Some(from) => opening_hash(from),
+        None => cut_hash(&failure.version, &failure.commit, &failure.trustc),
+    }
+}
+
+fn cut_hash(version: &str, commit: &str, trustc: &str) -> String {
+    hashed(&[
+        HASH_DOMAIN,
+        version.as_bytes(),
+        commit.as_bytes(),
+        trustc.as_bytes(),
+    ])
+}
+
+/// The input hash of every red of opening the version after `from`: of `from` alone, because
+/// each try judges whatever commit main's tip then is, and a red that main's movement does not
+/// clear is one failure with one worker.
+#[must_use]
+pub fn opening_hash(from: &str) -> String {
+    hashed(&[OPENING_DOMAIN, from.as_bytes()])
 }
 
 /// The clone's repair record: the workers its failed cuts opened, one per failing input hash.
@@ -117,6 +146,16 @@ pub struct Worker {
     pub trustc: String,
     /// Epoch seconds the cut stopped.
     pub at: u64,
+}
+
+impl Worker {
+    /// Whether it was opened on a red of the commit it names, as a cut of a line judges one:
+    /// its hash is of its own version, commit and prover. A worker of an `--open-next` red is
+    /// kept under [`opening_hash`] and is no red of any line.
+    #[must_use]
+    pub fn of_cut(&self) -> bool {
+        self.hash == cut_hash(&self.version, &self.commit, &self.trustc)
+    }
 }
 
 impl Record {
@@ -163,6 +202,10 @@ pub trait Spawner {
     fn spawn(&mut self, cwd: &Path, task: &str) -> Result<String, String>;
 }
 
+/// The environment variable the release pump sets on each cut it runs
+/// ([`crate::pump`]): a red of such a cut opens its worker without a session ([`spawner`]).
+pub const PUMP_ENV: &str = "ATERM_RELEASE_PUMP";
+
 /// The real spawner: in a session when `ATERM_SESSION_ID` names one, and `aterm ctl`
 /// ([`spawn_args`]) with the task on stdin, each socket read and write bounded by a minute.
 pub struct Ctl;
@@ -173,36 +216,191 @@ impl Spawner for Ctl {
     }
 
     fn spawn(&mut self, cwd: &Path, task: &str) -> Result<String, String> {
-        use aterm_uds::spawnfd::Stdio;
-        let mut child = aterm_uds::spawnfd::command("aterm")
-            .args(["ctl", "--timeout", SPAWN_TIMEOUT_SECS])
-            .args(spawn_args(cwd))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("cannot run aterm ctl: {e}"))?;
-        // aterm ctl reads the whole task before it asks the aterm; a write it cut short is told
-        // by its answer.
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = std::io::Write::write_all(&mut stdin, task.as_bytes());
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("aterm ctl: {e}"))?;
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        if out.status.success()
-            && let Some(sid) = sid_of(&stdout)
-        {
-            return Ok(sid);
-        }
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let said = [stderr.trim(), stdout.trim()]
-            .into_iter()
-            .find(|said| !said.is_empty())
-            .unwrap_or("no answer");
-        Err(format!("aterm ctl exited {}: {said}", out.status))
+        ctl_spawn(&spawn_args(cwd), task)
     }
+}
+
+/// The spawner of a cut no session runs (the release pump's, under launchd): `aterm ctl`
+/// ([`unattended_args`]) names no session, so it reaches the newest aterm of this Mac, which
+/// starts the worker in a background tab. With no aterm running, or one that takes no workers,
+/// the spawn fails, [`open`] says so and records nothing, and the next red of the same inputs
+/// tries again.
+pub struct Unattended;
+
+impl Spawner for Unattended {
+    fn in_session(&self) -> bool {
+        true
+    }
+
+    fn spawn(&mut self, cwd: &Path, task: &str) -> Result<String, String> {
+        ctl_spawn(&unattended_args(cwd), task)
+    }
+}
+
+/// The spawner of this cut: [`Ctl`] in a session or for a cut a person runs (which prints the
+/// command outside one), [`Unattended`] for a pump's cut outside a session.
+#[must_use]
+pub fn spawner(in_session: bool, pump: bool) -> Box<dyn Spawner> {
+    if unattended(in_session, pump) {
+        Box::new(Unattended)
+    } else {
+        Box::new(Ctl)
+    }
+}
+
+/// Whether a cut's worker starts with no session: only a pump's cut outside one.
+#[must_use]
+pub const fn unattended(in_session: bool, pump: bool) -> bool {
+    pump && !in_session
+}
+
+fn ctl_spawn(words: &[String], task: &str) -> Result<String, String> {
+    use aterm_uds::spawnfd::Stdio;
+    let mut child = aterm_uds::spawnfd::command("aterm")
+        .args(["ctl", "--timeout", SPAWN_TIMEOUT_SECS])
+        .args(words)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot run aterm ctl: {e}"))?;
+    // aterm ctl reads the whole task before it asks the aterm; a write it cut short is told
+    // by its answer.
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = std::io::Write::write_all(&mut stdin, task.as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("aterm ctl: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    if out.status.success()
+        && let Some(sid) = sid_of(&stdout)
+    {
+        return Ok(sid);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let said = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .find(|said| !said.is_empty())
+        .unwrap_or("no answer");
+    Err(format!("aterm ctl exited {}: {said}", out.status))
+}
+
+/// `aterm ctl`'s words that start the worker in `cwd` from no session, its task read from
+/// stdin: the newest local aterm takes it, in a tab it does not bring to the front.
+#[must_use]
+pub fn unattended_args(cwd: &Path) -> Vec<String> {
+    vec![
+        "spawn".into(),
+        "raise=f".into(),
+        "agent=claude".into(),
+        format!("cwd={}", cwd.display()),
+        "-".into(),
+    ]
+}
+
+/// `aterm ctl`'s answer for a sid no session of the aterm has.
+const GONE: &str = "no such session";
+
+/// One `aterm ctl` read of the worker `sid` (`task`, `result`), bounded like the spawn.
+fn ctl_read(sid: &str, verb: &str) -> Result<String, String> {
+    let out = aterm_uds::spawnfd::command("aterm")
+        .args(["ctl", "--timeout", SPAWN_TIMEOUT_SECS])
+        .args([format!("@{sid}").as_str(), verb])
+        .output()
+        .map_err(|e| format!("cannot run aterm ctl: {e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    if out.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let said = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .find(|said| !said.is_empty())
+        .unwrap_or("no answer")
+        .to_string();
+    Err(format!(
+        "aterm ctl @{sid} {verb} exited {}: {said}",
+        out.status
+    ))
+}
+
+/// What the worker `sid` reports now, read from the aterm that runs it.
+#[must_use]
+pub fn report(sid: &str) -> crate::pump::Report {
+    report_from(ctl_read(sid, "task"), || ctl_read(sid, "result"))
+}
+
+/// A worker's report from its task record (`state=<word> …`) and, once it ended, its final
+/// report. Its state is one of `aterm ctl`'s `working|done|exited|stalled|failed|-`: `working`
+/// (and a word this does not know) is still working; `done`, `exited`, `stalled` and `failed`
+/// have ended, with the report's [`verdict`] and, without one, no fix; `-` is a session that
+/// runs no task, which ended without a fix. A session the aterm no longer has (`no such
+/// session`: its tab was closed, or the aterm restarted) ended without a fix too. Any other
+/// record or report that cannot be read is unread, never an ended worker.
+pub fn report_from(
+    task: Result<String, String>,
+    result: impl FnOnce() -> Result<String, String>,
+) -> crate::pump::Report {
+    use crate::pump::Report;
+    let task = match task {
+        Ok(task) => task,
+        Err(why) if why.contains(GONE) => {
+            return Report::NoFix(format!("its session is gone ({why})"));
+        }
+        Err(why) => return Report::Unread(why),
+    };
+    let Some(state) = task
+        .split_whitespace()
+        .find_map(|word| word.strip_prefix("state="))
+    else {
+        return Report::Unread(format!(
+            "its task record names no state: {}",
+            one_line(&task)
+        ));
+    };
+    if state == "-" {
+        return Report::NoFix("its session runs no task".into());
+    }
+    if !matches!(state, "done" | "exited" | "stalled" | "failed") {
+        return Report::Working;
+    }
+    match result().map(|report| verdict(&report)) {
+        Err(why) if why.contains(GONE) => Report::NoFix(format!("its session is gone ({why})")),
+        Err(why) => Report::Unread(why),
+        Ok(Some(Ok(commit))) => Report::Fix(commit),
+        Ok(Some(Err(why))) => Report::NoFix(why),
+        Ok(None) => Report::NoFix(format!(
+            "its task is {state} and its report ends with neither `FIX <commit>` nor `NO-FIX \
+             <why>`"
+        )),
+    }
+}
+
+/// What a worker's final report says of its fix, read from its last verdict line: `Ok(commit)`
+/// for `FIX <40 hex>`, `Err(why)` for `NO-FIX <why>`, `None` where no line is either. A line
+/// may be wrapped as a report formats it (backticks, emphasis, a list mark, a closing period).
+#[must_use]
+pub fn verdict(report: &str) -> Option<Result<String, String>> {
+    report.lines().rev().find_map(|line| {
+        let line = line.trim_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '`' | '*' | '_' | '-' | '>' | '.')
+        });
+        if let Some(why) = line.strip_prefix("NO-FIX") {
+            let why = why.trim_start_matches([':', ' ', '`']).trim();
+            return Some(Err(if why.is_empty() {
+                "no reason given".to_string()
+            } else {
+                why.to_string()
+            }));
+        }
+        let commit = line
+            .strip_prefix("FIX")?
+            .trim_start_matches([':', ' ', '`'])
+            .trim();
+        (commit.len() == 40 && commit.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then(|| Ok(commit.to_ascii_lowercase()))
+    })
 }
 
 /// The sid of a worker spawn's answer, `OK <sid> …`.
@@ -345,9 +543,11 @@ pub fn task(clone: &Path, failure: &Failure, hash: &str) -> String {
          that worktree once it has landed.\n\
          4. Do not run `ship release`, publish, or read the release credentials. The cut carries \
          your fix with `targo --unverified ship release --fix <the fix's own non-merge commit>`, \
-         so end your report with that commit.\n\
-         5. If the cause is not in the source (this machine, a service, a credential), change \
-         nothing and say what it is.\n",
+         so end your report with one line that names that commit in full: `FIX <its 40 hex \
+         digits>`.\n\
+         5. If the cause is not in the source (this machine, a service, a credential), or you \
+         could not finish, change nothing and end your report with one line: `NO-FIX <what it \
+         is>`.\n",
     );
     // The why, the detail and the remedy share what is left, a third each.
     let share = MAX_TASK_BYTES.saturating_sub(head.len() + tail.len()) / 3;

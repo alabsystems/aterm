@@ -31,12 +31,12 @@ fn scratch() -> aterm_tempfile::TempDir {
 }
 
 const STALE: &str = "agh.intent.42-0123456789ab.stale";
-const MISSING: &str = "agh.config.missing";
+const OTHER: &str = "agh.other.thing";
 const INVALID: &str = "agh.config.invalid";
 
 #[test]
 fn each_need_shape_states_one_entry_under_its_own_key() {
-    for key in [STALE, MISSING, INVALID] {
+    for key in [STALE, INVALID] {
         let made = entries(&[need(key)]);
         assert_eq!(made.len(), 1, "{key}");
         assert_eq!(made[0].key(), key);
@@ -61,7 +61,8 @@ fn an_invalid_config_entry_carries_the_need_s_own_step() {
 #[test]
 fn a_need_of_another_shape_states_nothing() {
     for key in [
-        "agh.other.thing",
+        OTHER,
+        "agh.config.missing",
         "agh.intent.42-0123456789AB.stale",
         "agh.intent.x-0123456789ab.stale",
         "agh.intent.42-0123456789a.stale",
@@ -83,7 +84,7 @@ fn read_skips_what_is_not_a_need() {
     let outside = root.path().join("outside");
     std::fs::create_dir(&dir).unwrap();
     std::fs::create_dir(&outside).unwrap();
-    std::fs::write(dir.join(format!("{MISSING}.json")), json(MISSING, 1)).unwrap();
+    std::fs::write(dir.join(format!("{OTHER}.json")), json(OTHER, 1)).unwrap();
     std::fs::write(outside.join(format!("{INVALID}.json")), json(INVALID, 1)).unwrap();
     std::os::unix::fs::symlink(
         outside.join(format!("{INVALID}.json")),
@@ -111,7 +112,7 @@ fn read_skips_what_is_not_a_need() {
     let needs = rx
         .recv_timeout(Duration::from_secs(60))
         .expect("read returned: a FIFO never blocks it");
-    assert_eq!(needs, vec![need(MISSING)]);
+    assert_eq!(needs, vec![need(OTHER)]);
     assert_eq!(read(&dir.join("absent")), Vec::new());
 }
 
@@ -147,9 +148,9 @@ fn needs_are_stated_at_most_once_a_minute_and_end_when_their_files_go() {
     let under = |app: &crate::App| app.messages.digest_keys_under("agh.");
     let t0 = Instant::now();
 
-    std::fs::write(dir.join(format!("{MISSING}.json")), json(MISSING, 1)).unwrap();
+    std::fs::write(dir.join(format!("{STALE}.json")), json(STALE, 1)).unwrap();
     app.hand_agh_needs(t0);
-    assert_eq!(under(&app), vec![MISSING.to_string()]);
+    assert_eq!(under(&app), vec![STALE.to_string()]);
 
     std::fs::write(dir.join(format!("{INVALID}.json")), json(INVALID, 1)).unwrap();
     app.hand_agh_needs(t0 + Duration::from_secs(30));
@@ -157,7 +158,7 @@ fn needs_are_stated_at_most_once_a_minute_and_end_when_their_files_go() {
     app.hand_agh_needs(t0 + Duration::from_secs(61));
     assert_eq!(under(&app).len(), 2);
 
-    std::fs::remove_file(dir.join(format!("{MISSING}.json"))).unwrap();
+    std::fs::remove_file(dir.join(format!("{STALE}.json"))).unwrap();
     std::fs::remove_file(dir.join(format!("{INVALID}.json"))).unwrap();
     app.hand_agh_needs(t0 + Duration::from_secs(122));
     assert_eq!(
@@ -172,7 +173,7 @@ fn needs_are_stated_at_most_once_a_minute_and_end_when_their_files_go() {
 
 /// NEGATIVE CONTROL: Non-need `.json` files (`00.json`..`39.json`) and invalid `agh.*.json`
 /// files sorting lexicographically before real needs (`agh.config.invalid.json`,
-/// `agh.config.missing.json`) must not consume [`NEEDS_MAX`] slots and hide real needs.
+/// `agh.intent.….stale.json`) must not consume [`NEEDS_MAX`] slots and hide real needs.
 #[cfg(unix)]
 #[test]
 fn non_need_and_corrupt_json_files_sorting_first_do_not_starve_real_needs() {
@@ -183,8 +184,8 @@ fn non_need_and_corrupt_json_files_sorting_first_do_not_starve_real_needs() {
         std::fs::write(dir.join(format!("agh.{i:02}.json")), b"{corrupt").unwrap();
     }
     std::fs::write(dir.join(format!("{INVALID}.json")), json(INVALID, 1)).unwrap();
-    std::fs::write(dir.join(format!("{MISSING}.json")), json(MISSING, 1)).unwrap();
+    std::fs::write(dir.join(format!("{STALE}.json")), json(STALE, 1)).unwrap();
 
     let found = read(dir);
-    assert_eq!(found, vec![need(INVALID), need(MISSING)]);
+    assert_eq!(found, vec![need(INVALID), need(STALE)]);
 }

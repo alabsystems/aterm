@@ -64,6 +64,69 @@ pub(crate) fn observe(root: &Path, base: &str, tree: &str, now: impl FnOnce() ->
     })
 }
 
+/// How many of main's newest commits past a line's head are asked for a lane record: one read
+/// each, so the pump's advisory stays a bounded cost.
+pub(crate) const CANDIDATE_WINDOW: usize = 64;
+
+/// The newest of `commits` (each with its tree, newest first) whose lane record is a pass on
+/// that exact tree. A record of another tree, a claim, a red and an unjudged commit are passed
+/// over; a read that fails ends the search with what it could not answer.
+pub(crate) fn newest_pass_of(
+    commits: &[(String, String)],
+    mut record: impl FnMut(&str) -> Result<Option<String>, String>,
+) -> Result<Option<String>, String> {
+    for (commit, tree) in commits {
+        let Some(text) = record(tree)? else {
+            continue;
+        };
+        let verdict: Verdict = aterm_toml::from_str(&text).map_err(|e| e.to_string())?;
+        if verdict.tree == *tree && verdict.state == "pass" {
+            return Ok(Some(commit.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The newest commit of origin/main past `head`, among its newest [`CANDIDATE_WINDOW`], that
+/// the main lane judged a pass: a candidate for a session's `--commit REV --supersede`, never
+/// a base the release selects by itself. `None` where there is none or the lane cannot be read.
+pub(crate) fn newest_pass(root: &Path, head: &str) -> Option<String> {
+    let git = crate::ledger::GitCli::new(root);
+    let listed = crate::ledger::git_ok(
+        &git,
+        &[
+            "log",
+            "--format=%H %T",
+            "-n",
+            &CANDIDATE_WINDOW.to_string(),
+            "--ancestry-path",
+            &format!("{head}..origin/main"),
+        ],
+    )
+    .ok()?
+    .stdout_utf8();
+    let commits: Vec<(String, String)> = listed
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(commit, tree)| (commit.to_string(), tree.to_string()))
+        .collect();
+    if commits.is_empty() {
+        return None;
+    }
+    let remote = crate::github_remote::Remote::origin(root).ok()?;
+    let journal = remote.get(JOURNAL).ok()??;
+    newest_pass_of(&commits, |tree| {
+        let Some(bytes) = remote.lane_record(&journal, tree)? else {
+            return Ok(None);
+        };
+        String::from_utf8(bytes)
+            .map(Some)
+            .map_err(|e| e.to_string())
+    })
+    .ok()
+    .flatten()
+}
+
 #[cfg(test)]
 #[path = "main_lane_tests.rs"]
 mod tests;

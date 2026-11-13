@@ -673,6 +673,8 @@ fn plan_with(
                 Install::Absent
             }
         },
+        lane_targo: &|| Ok(None),
+        unserved: &|_, _| None,
         pin: &|| pin.clone(),
         resolve: &|_, toolchain| resolved(name, toolchain),
         trust_checkout: &|| None,
@@ -740,6 +742,8 @@ fn plan_resolving(
         strict: &|| false,
         upstream: &|| Some(PathBuf::from(UP)),
         branded: &|_, _| Install::Absent,
+        lane_targo: &|| Ok(None),
+        unserved: &|_, _| None,
         pin: &|| None,
         resolve,
         trust_checkout: &|| checkout.map(PathBuf::from),
@@ -877,6 +881,8 @@ fn storeless_on(
         strict: &|| strict,
         upstream: &|| upstream.map(PathBuf::from),
         branded: &|_, _| panic!("no store: nothing branded is looked up"),
+        lane_targo: &|| Ok(None),
+        unserved: &|_, _| None,
         pin: &|| panic!("no store: no pin is named"),
         resolve,
         trust_checkout: &|| checkout.map(PathBuf::from),
@@ -1002,6 +1008,8 @@ fn a_child_of_a_command_the_reroute_ran_is_quiet_and_judged() {
             strict: &|| false,
             upstream: &|| Some(PathBuf::from(UP)),
             branded: &|tool, _| Install::Runs(store(tool)),
+            lane_targo: &|| Ok(None),
+            unserved: &|_, _| None,
             pin: &|| panic!("a child names no pin"),
             resolve,
             trust_checkout: checkout,
@@ -1077,6 +1085,8 @@ fn a_branded_tool_that_cannot_run_names_the_fix_that_works() {
             assert_eq!((tool, program), ("clean", "clean"));
             Install::Shim(shim.clone())
         },
+        lane_targo: &|| Ok(None),
+        unserved: &|_, _| None,
         pin: &|| None,
         resolve: &|_, _| panic!("a DIRECT row resolves nothing"),
         trust_checkout: &|| panic!("a DIRECT row is judged in no checkout"),
@@ -1100,6 +1110,8 @@ fn a_branded_tool_that_cannot_run_names_the_fix_that_works() {
                     assert_eq!(program, "trust", "{tool}");
                     Install::ShimLost
                 },
+                lane_targo: &|| Ok(None),
+                unserved: &|_, _| None,
                 pin: &|| None,
                 resolve: &|_, _| panic!("a DIRECT row resolves nothing"),
                 trust_checkout: &|| None,
@@ -1153,6 +1165,8 @@ fn a_pending_branded_tool_runs_upstream_rather_than_wait_for_it() {
                         stub.clone()
                     })
                 },
+                lane_targo: &|| Ok(None),
+                unserved: &|_, _| None,
                 pin: &|| None,
                 resolve: &|_, _| panic!("nothing is resolved"),
                 trust_checkout: &|| None,
@@ -1186,6 +1200,269 @@ fn a_pending_branded_tool_runs_upstream_rather_than_wait_for_it() {
         },
         "an explicit lane has no upstream to fall back to"
     );
+}
+
+fn explicit_lane(call: &[&str], lane: Result<Option<&str>, &str>, unserved: Option<&str>) -> Plan {
+    let machine = Machine {
+        passthrough: false,
+        announced: false,
+        announce: &|| true,
+        strict: &|| false,
+        upstream: &|| Some(PathBuf::from(UP)),
+        branded: &|tool, program| {
+            assert_eq!((tool, program), ("targo", "trust"));
+            Install::Absent
+        },
+        lane_targo: &|| {
+            lane.map(|found| {
+                found.map(|target| Managed {
+                    target: PathBuf::from(target),
+                    env: crate::shim_env::ShimEnv::NONE,
+                })
+            })
+            .map_err(str::to_string)
+        },
+        unserved: &|tool, program| {
+            assert_eq!((tool, program), ("targo", "trust"));
+            unserved.map(str::to_string)
+        },
+        pin: &|| None,
+        resolve: &|_, _| panic!("an explicit lane resolves no upstream"),
+        trust_checkout: &|| None,
+    };
+    plan(row_for("cargo").unwrap(), &args(call), &machine)
+}
+
+/// AN EXPLICIT LANE RUNS THE TRUST TARGO THIS MACHINE HAS, STORE OR NOT: with no store `targo`,
+/// `cargo --unverified …` and `cargo trust …` run the Trust `targo` [`lane_targo`] finds
+/// (`TRUST_STAGE2_BIN`'s where set, else on PATH, else rustup's `trust` toolchain), saying which;
+/// with none, the refusal names the act that puts one here: its install, or, where no Trust build
+/// serves this target, the local sysroot, `TRUST_STAGE2_BIN` among it since the lane reads that
+/// first; and a `TRUST_STAGE2_BIN` the lane refused is said as that. NEGATIVE CONTROLS: with the
+/// lane's `or_else` over `lane_targo` removed (2026-11-11), `cargo --unverified build` was
+/// `Plan::Missing` ("targo is not installed") although a Trust targo was found; with the refused
+/// arm removed (2026-11-12), a refused override was answered as an unserved install.
+#[test]
+fn an_explicit_lane_runs_the_trust_targo_this_machine_has_store_or_not() {
+    let found = "/home/u/.local/bin/targo";
+    for call in [&["--unverified", "build"][..], &["trust", "build"]] {
+        assert_eq!(
+            explicit_lane(call, Ok(Some(found)), None),
+            Plan::Branded {
+                say: explicit_lane_found_note("cargo", "targo", Path::new(found)),
+                copy: Managed {
+                    target: PathBuf::from(found),
+                    env: crate::shim_env::ShimEnv::NONE,
+                },
+                args: args(call),
+            },
+            "{call:?}"
+        );
+        assert_eq!(
+            explicit_lane(call, Ok(None), None),
+            Plan::Missing {
+                say: not_installed_message("cargo", "targo", "trust"),
+            },
+            "{call:?}"
+        );
+        let state =
+            "unavailable on aarch64-unknown-linux-gnu: no build is published for this target";
+        let Plan::Missing { say } = explicit_lane(call, Ok(None), Some(state)) else {
+            panic!("{call:?}: nothing to run");
+        };
+        assert_eq!(
+            say,
+            unserved_message("cargo", "targo", "trust", state, EXPLICIT_LANE_LOCAL_REMEDY)
+        );
+        assert!(
+            say.contains("TRUST_STAGE2_BIN") && !say.contains("pkg install"),
+            "{say}"
+        );
+        let refused = "TRUST_STAGE2_BIN=/opt/stock/bin's targo is not Trust by its -vV";
+        assert_eq!(
+            explicit_lane(call, Err(refused), Some(state)),
+            Plan::Missing {
+                say: stage2_refused_message("cargo", "targo", refused),
+            },
+            "{call:?}: a refused override is said, never run past"
+        );
+    }
+}
+
+/// A ROW'S REFUSAL NAMES ONLY THE LOCAL BUILD THAT ROW RUNS: where no Trust build serves this
+/// machine, a DIRECT row (`rustfmt`, which runs only the store's `trustfmt`) names the dev link
+/// that lays it, never the `TRUST_STAGE2_BIN` it does not read. NEGATIVE CONTROL (2026-11-12):
+/// with the DIRECT arm passing `EXPLICIT_LANE_LOCAL_REMEDY`, the rustfmt refusal named
+/// TRUST_STAGE2_BIN.
+#[test]
+fn a_rows_refusal_names_only_the_local_build_that_row_runs() {
+    let state = "unavailable on aarch64-unknown-linux-gnu: no build is published for this target";
+    let machine = Machine {
+        passthrough: false,
+        announced: false,
+        announce: &|| true,
+        strict: &|| false,
+        upstream: &|| None,
+        branded: &|tool, program| {
+            assert_eq!((tool, program), ("trustfmt", "trust"));
+            Install::Absent
+        },
+        lane_targo: &|| panic!("a DIRECT row runs no explicit lane"),
+        unserved: &|tool, program| {
+            assert_eq!((tool, program), ("trustfmt", "trust"));
+            Some(state.to_string())
+        },
+        pin: &|| None,
+        resolve: &|_, _| panic!("a DIRECT row resolves nothing"),
+        trust_checkout: &|| None,
+    };
+    let Plan::Missing { say } = plan(row_for("rustfmt").unwrap(), &args(&["x.rs"]), &machine)
+    else {
+        panic!("nothing runs");
+    };
+    assert_eq!(
+        say,
+        unserved_message(
+            "rustfmt",
+            "trustfmt",
+            "trust",
+            state,
+            &crate::serving::local_remedy("trust")
+        )
+    );
+    assert!(
+        say.contains("aterm pkg link trust") && !say.contains("TRUST_STAGE2_BIN"),
+        "{say}"
+    );
+}
+
+/// [`lane_targo`] FINDS TARGO AS `aterm help rust` DOES, AND ONLY A TRUST ONE: the `targo` PATH
+/// runs outside the store and the reroute dirs, else rustup's `trust` toolchain's, each only
+/// once its `-vV` says Trust. NEGATIVE CONTROL (2026-11-11): with the `.find(|candidate|
+/// trust(candidate))` filter replaced by `.next()`, the stock targo on PATH was taken.
+#[cfg(unix)]
+#[test]
+fn lane_targo_finds_targo_as_help_rust_does_and_only_a_trust_one() {
+    let l = layout("lane-targo");
+    let scratch = crate::testdir::dir("atpkg-reroute-lane-targo-");
+    let exe = |at: &Path| {
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        std::fs::write(at, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(at, std::fs::Permissions::from_mode(0o755)).unwrap();
+        at.to_path_buf()
+    };
+    let store = exe(&l.bin_dir().join("targo"));
+    let stock = exe(&scratch.join("stock/targo"));
+    let local = exe(&scratch.join("local/targo"));
+    let rustup = scratch.join("rustup");
+    let toolchain = exe(&rustup.join("toolchains/trust/bin/targo"));
+    let path =
+        std::env::join_paths([l.bin_dir(), scratch.join("stock"), scratch.join("local")]).unwrap();
+    let found = |trusted: &[&PathBuf], rustup: Option<&Path>| {
+        lane_targo(&l, None, Some(path.as_os_str()), rustup, &|candidate| {
+            assert_ne!(
+                candidate,
+                store.as_path(),
+                "the store's own is never a candidate"
+            );
+            trusted.iter().any(|t| t.as_path() == candidate)
+        })
+        .expect("no TRUST_STAGE2_BIN is set")
+        .map(|managed| managed.target)
+    };
+    assert_eq!(
+        found(&[&stock, &local, &toolchain], Some(&rustup)),
+        Some(stock.clone()),
+        "the targo PATH runs, ahead of rustup's"
+    );
+    assert_eq!(
+        found(&[&local, &toolchain], Some(&rustup)),
+        Some(toolchain.clone()),
+        "a stock targo first on PATH is passed over, and shadows the one behind it"
+    );
+    assert_eq!(found(&[&local], Some(&rustup)), None);
+    assert_eq!(found(&[&toolchain], None), None);
+}
+
+/// AN EXPLICIT LANE TAKES `TRUST_STAGE2_BIN`'S TARGO FIRST, AS TOOLCHAIN DISCOVERY DOES: with the
+/// variable naming a bin whose `targo` answers `-vV` as Trust (a stand-in, judged by the same
+/// check the lane runs) and no targo on PATH or in rustup, that targo is the lane's, and ahead
+/// of a Trust one on PATH; set, it is never fallen back from: one whose `-vV` is stock, a bin
+/// with no targo and a pending stub there (never asked) are each refused, naming the bin, with
+/// a Trust targo on PATH. NEGATIVE CONTROLS (2026-11-12): with `lane_targo`'s `stage2` arm left
+/// out, the lane found nothing with only TRUST_STAGE2_BIN's targo; with a refused `stage2`
+/// falling through to PATH, the stock one there ran PATH's targo.
+#[cfg(unix)]
+#[test]
+fn an_explicit_lane_takes_trust_stage2_bins_targo_first() {
+    let l = layout("lane-stage2");
+    let scratch = crate::testdir::dir("atpkg-reroute-lane-stage2-");
+    let vv = |marks: &str| {
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = -vV ]; then\necho 'cargo 1.99.0-dev (7d5533b2b 2026-09-23)'\n\
+             echo 'release: 1.99.0-dev'\n{marks}echo 'commit-hash: \
+             7d5533b2bb9c9417bc09c27f1acd9d0b808f8f15'\nexit 0\nfi\nexit 3\n"
+        )
+    };
+    let trust_vv = crate::test_programs::assessed("targo-trust", &vv("echo 'trust: 0.1.0'\n"));
+    let stock_vv = crate::test_programs::assessed("targo-stock", &vv(""));
+    let lay = |dir: &str, program: &Path| {
+        let at = scratch.join(dir).join("targo");
+        std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&at);
+        std::os::unix::fs::symlink(program, &at).unwrap();
+        at
+    };
+    let stage2 = lay("stage2", &trust_vv);
+    let on_path = lay("onpath", &trust_vv);
+    let empty = std::ffi::OsString::new();
+    let path = std::env::join_paths([scratch.join("onpath")]).unwrap();
+    let lane = |stage2: Option<&Path>, path: &std::ffi::OsStr| {
+        lane_targo(&l, stage2, Some(path), None, &|candidate| {
+            is_trust_targo(candidate, Some(&scratch), None, None, None)
+        })
+        .map(|found| found.map(|managed| managed.target))
+    };
+    let refused = |bin: &Path, result: Result<Option<PathBuf>, String>| match result {
+        Err(why) => assert!(
+            why.contains("TRUST_STAGE2_BIN") && why.contains(&bin.display().to_string()),
+            "{why}"
+        ),
+        Ok(found) => panic!("{} was fallen back from to {found:?}", bin.display()),
+    };
+    let bin = scratch.join("stage2");
+    assert_eq!(
+        lane(Some(&bin), &empty),
+        Ok(Some(stage2.clone())),
+        "TRUST_STAGE2_BIN's Trust targo, with none on PATH or in rustup"
+    );
+    assert_eq!(
+        lane(Some(&bin), &path),
+        Ok(Some(stage2.clone())),
+        "ahead of PATH's"
+    );
+    assert_eq!(lane(None, &path), Ok(Some(on_path)), "unset, PATH's");
+    assert_eq!(lane(None, &empty), Ok(None));
+    lay("stage2", &stock_vv);
+    refused(&bin, lane(Some(&bin), &path));
+    refused(&bin, lane(Some(&bin), &empty));
+    let bare = scratch.join("bare");
+    std::fs::create_dir_all(&bare).unwrap();
+    refused(&bare, lane(Some(&bare), &path));
+    let pending = scratch.join("pending");
+    std::fs::create_dir_all(&pending).unwrap();
+    let targo = crate::store::ToolName::new("targo").unwrap();
+    crate::stub::write_pending_stub(&l, &targo).unwrap();
+    std::fs::copy(l.shim(&targo), pending.join("targo")).unwrap();
+    assert!(crate::stub::is_pending_stub(&pending.join("targo")));
+    refused(
+        &pending,
+        lane_targo(&l, Some(&pending), Some(&path), None, &|candidate| {
+            panic!("{} was asked", candidate.display())
+        })
+        .map(|found| found.map(|managed| managed.target)),
+    );
+    let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
 /// [`installed`] on a real store: a laid shim runs; with it lost, the live build says
@@ -1236,63 +1513,85 @@ fn a_branded_tool_is_read_off_the_store_the_way_atpkg_run_reads_it() {
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
 
+/// A TOOL IS UNSERVED ONLY WHEN THE SIGNED MANIFESTS SAY SO AND NOTHING RUNS IT: the store's
+/// verdict on its program (`serving::here`), asked only while nothing here runs the tool, is
+/// the answer, and a recorded `unavailable on` row is not. NEGATIVE CONTROL (2026-11-11): with
+/// `unserved_judged` reading the recorded row in place of the verdict, as it did, a signed
+/// Unserved verdict read None.
+#[cfg(unix)]
 #[test]
-fn a_tool_is_unserved_only_when_its_row_says_so_and_nothing_runs_it() {
+fn a_tool_is_unserved_only_when_the_signed_manifests_say_so_and_nothing_runs_it() {
+    use crate::serving::Serving;
     let l = layout("unserved");
     std::fs::create_dir_all(&l.prefix).unwrap();
-    let write_row = |state: &str| {
-        let mut programs = std::collections::BTreeMap::new();
-        programs.insert(
-            "trust".to_string(),
-            crate::ProgramStatus {
-                installed_build: None,
-                state: state.to_string(),
-                tree_root: String::new(),
-            },
-        );
-        crate::status::write(
-            &l,
-            &crate::Status {
-                schema: 1,
-                programs,
-                ..Default::default()
-            },
-        )
-        .unwrap();
-    };
+    let unavailable = crate::state::unavailable("aarch64-unknown-linux-gnu", "");
+    let judged = |verdict: Serving| unserved_judged(&l, "targo", "trust", &|| verdict.clone());
     assert_eq!(
         unserved_here(&l, "targo", "trust"),
         None,
-        "no row yet: the tool may still arrive"
+        "no index: no verdict"
     );
-    let unavailable = crate::state::unavailable("aarch64-unknown-linux-gnu", "");
-    write_row(&unavailable);
     assert_eq!(
-        unserved_here(&l, "targo", "trust").as_deref(),
+        judged(Serving::Unserved(unavailable.clone())).as_deref(),
         Some(unavailable.as_str()),
-        "nothing here and the row says no build for this target"
+        "nothing here and no build for this target"
+    );
+    assert_eq!(
+        judged(Serving::Unknown),
+        None,
+        "no verdict: the tool may still arrive"
+    );
+    assert_eq!(judged(Serving::Served), None);
+    let mut programs = std::collections::BTreeMap::new();
+    programs.insert(
+        "trust".to_string(),
+        crate::ProgramStatus {
+            installed_build: None,
+            state: unavailable.clone(),
+            tree_root: String::new(),
+        },
+    );
+    crate::status::write(
+        &l,
+        &crate::Status {
+            schema: 1,
+            programs,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        unserved_here(&l, "targo", "trust"),
+        None,
+        "a recorded row is a pass's record, not a verdict"
     );
     let targo = crate::store::ToolName::new("targo").unwrap();
     crate::stub::write_pending_stub(&l, &targo).unwrap();
     assert_eq!(
-        unserved_here(&l, "targo", "trust").as_deref(),
+        judged(Serving::Unserved(unavailable.clone())).as_deref(),
         Some(unavailable.as_str()),
-        "a pending stub waits on the same row"
+        "a pending stub runs nothing either"
     );
-    write_row(&crate::state::held_failed(
-        "x",
-        "now: aterm pkg install trust",
-    ));
+    std::fs::remove_file(l.shim(&targo)).unwrap();
+    let d = l.build_dir("trust", 7);
+    std::fs::create_dir_all(d.join("bin")).unwrap();
+    let exe = d.join("bin").join("targo");
+    std::fs::write(&exe, b"#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::store::mark_build_ready(&d).unwrap();
+    crate::activate::install_shims(
+        &l,
+        &d,
+        &["targo".to_string()],
+        crate::activate::Aliases::Off,
+    )
+    .unwrap();
+    crate::activate::activate_build(&l, &d).unwrap();
     assert_eq!(
-        unserved_here(&l, "targo", "trust"),
-        None,
-        "a held row is a fault on a served target, not an unserved one"
-    );
-    write_row(&unavailable);
-    assert_eq!(
-        unserved_here(&l, "tippy", "ay"),
-        None,
-        "another program's row says nothing of this one"
+        unserved_judged(&l, "targo", "trust", &|| panic!(
+            "a laid shim runs: nothing is asked"
+        )),
+        None
     );
     let _ = std::fs::remove_dir_all(&l.prefix);
 }
@@ -1622,6 +1921,8 @@ fn inside_a_trust_checkout_only_trust_runs_by_name() {
         strict: &|| false,
         upstream: &|| Some(PathBuf::from(UP)),
         branded: &|_, _| Install::Absent,
+        lane_targo: &|| Ok(None),
+        unserved: &|_, _| None,
         pin: &|| None,
         resolve: &|_, _| panic!("the escape resolves nothing"),
         trust_checkout: &|| panic!("the escape is judged in no checkout"),
@@ -2399,6 +2700,8 @@ fn an_upstream_cargo_gets_the_build_cache_only_where_its_release_reads_it() {
             strict: &|| false,
             upstream: &|| Some(PathBuf::from(UP)),
             branded: &|_, _| Install::Absent,
+            lane_targo: &|| Ok(None),
+            unserved: &|_, _| None,
             pin: &|| None,
             resolve: &|_, _| Resolved {
                 real: PathBuf::from(UP),
@@ -2439,6 +2742,8 @@ fn trust_cargo_reads_twins_before_any_placement_decision() {
         strict: &|| false,
         upstream: &|| Some(PathBuf::from(UP)),
         branded: &|_, _| Install::Absent,
+        lane_targo: &|| Ok(None),
+        unserved: &|_, _| None,
         pin: &|| None,
         resolve: &|_, toolchain| {
             assert_eq!(toolchain, Some("trust"));
@@ -2462,6 +2767,7 @@ fn trust_cargo_reads_twins_before_any_placement_decision() {
                 cwd: None,
                 env: &lookup,
                 read: &|_| Ok(None),
+                read_manifest: &|_| Ok(None),
                 writable: &|_| None,
             };
             let calls = std::cell::Cell::new(0);

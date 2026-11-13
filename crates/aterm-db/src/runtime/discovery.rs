@@ -23,6 +23,15 @@ pub(crate) const MAX_UNVERIFIED_ENDPOINTS: usize = 2 * MAX_PEERS;
 const PER_IP: usize = 2;
 const EXPIRES: Duration = Duration::from_secs(45);
 const VERIFIED_EXPIRES: Duration = Duration::from_secs(600);
+/// The longest a peer's quiet rounds dialled in hold back this side's own dial of its endpoint
+/// ([`Hints::vouch`]), counted from the endpoint's last completed round. Only a round this side
+/// dials verifies an endpoint, and one not verified again within [`VERIFIED_EXPIRES`] is
+/// dropped, so the dial of an endpoint held back comes due at least this often, and from then
+/// it is picked before the ordinary scan's turn ([`Hints::next_allowed`]): it waits for a place
+/// and the dial spacing, behind a follow-up or a led candidate that is due, and not for the
+/// scan to come round to it.
+const REVERIFY: Duration = Duration::from_secs(480);
+const _: () = assert!(REVERIFY.as_secs() < VERIFIED_EXPIRES.as_secs());
 const WIRE_LEN: usize = 38;
 /// Progress can take three extra turns before ordinary discovery gets another turn.
 const FOLLOW_UP_BURST: usize = 3;
@@ -223,6 +232,19 @@ struct Peer {
     /// round ([`Hints::vouch`]): once per failure streak, so a dead endpoint of a live seat
     /// still backs off.
     pulled: bool,
+    /// A local append came while its round ran ([`Hints::announce`]): where the round repairs,
+    /// its next dial comes within the follow-up interval ([`Hints::finish`]).
+    told: bool,
+    /// Its last round completed and moved nothing, its hint names no table still to take
+    /// ([`Repair::owes`]), and its next dial waits out the ordinary interval after it
+    /// ([`Hints::finish`]): nothing has asked for a sooner one since (a push, a local append, a
+    /// seat's new build). Only such an endpoint is held back by its seat's quiet rounds dialled
+    /// in ([`Hints::vouch`]).
+    resting: bool,
+    /// A quiet round its seat dialled in has moved its next dial later since it was last picked
+    /// ([`Hints::vouch`]): once its last completed round is [`REVERIFY`] old it is picked
+    /// before the ordinary scan ([`Hints::next_allowed`]).
+    held: bool,
     repair: Repair,
 }
 
@@ -244,6 +266,9 @@ impl Peer {
             failures: 0,
             deferring: false,
             pulled: false,
+            told: false,
+            resting: false,
+            held: false,
             repair: Repair::default(),
         }
     }
@@ -640,23 +665,49 @@ impl Hints {
     /// endpoint bound to another seat is left alone, so an address one seat takes over from
     /// another moves nothing of the other's. Nothing is verified here: an endpoint is, only by a
     /// round dialled to it.
-    pub(super) fn vouch(&mut self, ip: IpAddr, actor: astream_wire::sync::Actor, now: Instant) {
+    ///
+    /// `quiet` says the round moved nothing. The pair then has nothing to exchange that this
+    /// side knows of, and the round it would dial next would find the same: each of the seat's
+    /// endpoints at rest ([`Peer::resting`]) whose dial is not yet due waits the ordinary
+    /// interval again from `now` instead of dialling inside it, so a quiet pair runs one round
+    /// an interval where each side ran its own. Never past [`REVERIFY`] after the endpoint's
+    /// last completed round: its dial is due then and goes before the ordinary scan
+    /// ([`Peer::held`]), since only a round this side dials keeps the endpoint verified. An
+    /// endpoint already due is left as it is: it waits for a place or for the scan's turn, and
+    /// holding it back would have the scan pass it by for a whole round of the other
+    /// endpoints, which on a Mac with many endpoints can outlast [`VERIFIED_EXPIRES`]. An
+    /// endpoint a push, a local append or a new build made due, one whose own last round moved
+    /// records, failed or left its hint a table to take, and every endpoint while a push runs,
+    /// is not held back either.
+    pub(super) fn vouch(
+        &mut self,
+        ip: IpAddr,
+        actor: astream_wire::sync::Actor,
+        quiet: bool,
+        now: Instant,
+    ) {
         self.vouch_address(ip, now);
         self.attempt = self.attempt.wrapping_add(1);
-        let quiet = now + retry_delay(&self.own, self.attempt);
+        let interval = now + retry_delay(&self.own, self.attempt);
         #[cfg(test)]
         let repulls = mutant(&REPULLS);
         #[cfg(not(test))]
         let repulls = false;
+        let defers = quiet && !self.hurrying;
         for (address, peer) in &mut self.peers {
             if peer.repair.actor() == Some(actor) {
+                let deferred = defers && peer.resting && !peer.busy && peer.next > now;
+                if deferred {
+                    peer.next = peer.next.max(interval.min(peer.seen + REVERIFY));
+                    peer.held = true;
+                }
                 if peer.pulled && !repulls {
                     continue;
                 }
                 peer.pulled = true;
                 peer.failures = 0;
-                if !peer.busy {
-                    peer.next = peer.next.min(quiet);
+                if !peer.busy && !deferred {
+                    peer.next = peer.next.min(interval);
                 }
             } else if address.ip() == ip
                 && peer.repair.actor().is_none()
@@ -751,6 +802,7 @@ impl Hints {
                         || peer.repair.actor() == Some(*actor)
                     {
                         peer.next = now;
+                        peer.resting = false;
                     }
                 }
             }
@@ -1019,9 +1071,24 @@ impl Hints {
         } else {
             None
         };
+        // An endpoint its seat's quiet rounds held back ([`Self::vouch`]) is due for the round
+        // that verifies it again once its last is [`REVERIFY`] old: it goes before the ordinary
+        // scan, the longest unverified first, and leaves the scan's place where it was, so it
+        // waits for a place and never for the scan to come round.
+        let reverify = if follow_up.is_none() && led.is_none() {
+            self.peers
+                .iter()
+                .filter(|(a, p)| {
+                    p.held && now.saturating_duration_since(p.seen) >= REVERIFY && eligible(a, p)
+                })
+                .min_by_key(|(a, p)| (p.seen, **a))
+                .map(|(a, _)| *a)
+        } else {
+            None
+        };
         // The ordinary scan goes round every endpoint in this node's order ([`Self::spread`]),
         // from the one after where it last stopped.
-        let address = follow_up.or(led).or_else(|| {
+        let address = follow_up.or(led).or(reverify).or_else(|| {
             let place = |a: &SocketAddr| (self.spread(a), *a);
             let after = cursor.as_ref().map(place);
             let mut first = None;
@@ -1039,13 +1106,15 @@ impl Hints {
         })?;
         let peer = self.peers.get_mut(&address).unwrap();
         peer.busy = true;
+        peer.resting = false;
+        peer.held = false;
         // Change jitter on every attempt: fixed per-owner jitter can keep two
         // peers with nearby deadlines colliding at the runtime's tick cadence.
         self.attempt = self.attempt.wrapping_add(1);
         peer.next = now + retry_delay(&self.own, self.attempt);
         if follow_up.is_some() {
             self.follow_up_left -= 1;
-        } else if led.is_none() {
+        } else if led.is_none() && reverify.is_none() {
             // A preferred transfer must not rewind the ordinary scan and keep
             // selecting the same neighbor after every burst.
             if allow_discovery {
@@ -1112,6 +1181,7 @@ impl Hints {
             .filter(|(address, peer)| peer.verified && !speaks_bus(bus, addresses, address, peer))
         {
             peer.quiet_push = false;
+            peer.resting = false;
             if peer.busy {
                 peer.hurried = true;
             } else {
@@ -1121,6 +1191,30 @@ impl Hints {
         }
         self.hurrying = hurried > 0;
         hurried
+    }
+    /// This process appended to a table: dial each established peer now rather than at its
+    /// turn (the endpoint's hints name the table, `crate::control::Endpoint::announce`). One
+    /// whose round runs now is dialled again within the follow-up interval of that round's end,
+    /// if it repairs ([`Self::finish`]): the round may have read the table before the record.
+    /// A `Bus` speaker is left to the mesh, and an endpoint that is unverified or failing keeps
+    /// its own schedule: the table reaches it at its turn. Only `next` moves: each dial still
+    /// waits for a place and its spacing, so an append starts no dial that a due endpoint could
+    /// not have started. How many endpoints it told.
+    pub(super) fn announce(&mut self, now: Instant) -> usize {
+        let mut told = 0;
+        let (bus, addresses) = (&self.bus, &self.addresses);
+        for (_, peer) in self.peers.iter_mut().filter(|(address, peer)| {
+            peer.established() && !speaks_bus(bus, addresses, address, peer)
+        }) {
+            peer.resting = false;
+            if peer.busy {
+                peer.told = true;
+            } else {
+                peer.next = peer.next.min(now);
+            }
+            told += 1;
+        }
+        told
     }
     /// The push ended: each peer's rounds keep their ordinary spacing again.
     pub(super) fn calm(&mut self) {
@@ -1188,11 +1282,8 @@ impl Hints {
             // confirmation turn. A transferred page re-arms it; repeated silence does not.
             peer.quiet_push = !transferred;
         }
-        peer.next = if hurried || follow_push {
-            now
-        } else {
-            now + delay
-        };
+        let sooner = hurried || follow_push;
+        peer.next = if sooner { now } else { now + delay };
         // A deferred round authenticated its peer and completed its control exchange: the
         // endpoint is established, though the round repaired nothing.
         let completed = success || outcome == Outcome::Deferred;
@@ -1223,6 +1314,24 @@ impl Hints {
         peer.busy = false;
         peer.failed = !completed;
         peer.repair = repair;
+        // A local append came while this round ran, which may have read its table before the
+        // record: where the round repaired, the next comes within the follow-up interval, as
+        // after a transfer, and not at once, so appends that keep coming leave each round its
+        // wait. A failed round keeps its backoff and a deferred one its own wait: the table
+        // stays in the endpoint's hint for the round after.
+        let told = std::mem::take(&mut peer.told) && success;
+        if told {
+            peer.next = peer
+                .next
+                .min(now + follow_up_delay(&self.own, self.attempt));
+        }
+        // An endpoint whose hint still names a table to take (announced, or one whose witness
+        // differed) is not at rest: its seat's quiet rounds dialled in do not hold its dial
+        // back ([`Self::vouch`]).
+        peer.resting = outcome == (Outcome::Repaired { transferred: false })
+            && !sooner
+            && !told
+            && !peer.repair.owes();
         #[cfg(test)]
         let spent = spent && !mutant(&UNSPENT);
         if spent {

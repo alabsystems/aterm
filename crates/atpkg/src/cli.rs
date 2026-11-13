@@ -298,8 +298,10 @@ const TABLE: &[Verb] = &[
                 <size>`; --json: `reserved_mem`, `reserved_disk`), a held build's memory what \
                 its holder stepped it to as its run began (`stepped`), a waiter of memory that \
                 cannot start yet the most a claim behind it may take and go first without \
-                delaying it (`spares`), and a waiter whose disk is more than its volume has free \
-                above the floor is `unservable`",
+                delaying it (`spares`), or that no claim's end can start it, so it reserves none \
+                and each claim behind it that fits goes first, background work aside behind a \
+                release's (`stuck`), and a waiter whose disk \
+                is more than its volume has free above the floor is `unservable`",
         arity: Arity::Own,
         program_flags: None,
         mutates_store: false,
@@ -1105,27 +1107,85 @@ fn cmd_help() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn not_installed_fix(name: &str) -> String {
+/// `name` is not installed, and the act that puts it here: its install, unless the store's
+/// signed manifests say no build of it serves this target ([`crate::serving::here`]), where it
+/// is the local build that does ([`crate::serving::local_remedy`]).
+fn not_installed_fix(layout: &crate::store::Layout, name: &str) -> String {
+    not_installed_judged(name, &crate::serving::here(layout, name))
+}
+
+/// [`not_installed_fix`] with `verdict` the store's word on `name` here.
+fn not_installed_judged(name: &str, verdict: &crate::serving::Serving) -> String {
+    match verdict {
+        crate::serving::Serving::Unserved(state) => format!(
+            "atpkg: {name} is not installed: {state}; {}",
+            crate::serving::local_remedy(name)
+        ),
+        crate::serving::Serving::Served | crate::serving::Serving::Unknown => install_fix(name),
+    }
+}
+
+fn install_fix(name: &str) -> String {
     format!("atpkg: {name} is not installed (fix: aterm pkg install {name})")
 }
 
+/// Why `tool` does not run here ([`not_runnable_judged`] on the store's word on its program,
+/// [`crate::serving::here`]).
 fn not_runnable_line(layout: &crate::store::Layout, tool: &str) -> String {
     let program = crate::stub::program_of_in(layout, tool);
-    let program = program.as_str();
-    let stated = crate::status::read(layout)
-        .and_then(|s| s.programs.get(program).map(|row| row.state.clone()))
-        .filter(|state| {
-            state.starts_with(crate::state::UNAVAILABLE_PREFIX)
-                || state.starts_with(crate::state::HELD_FAILED_PREFIX)
-        });
-    not_runnable_words(tool, program, stated.as_deref())
+    not_runnable_judged(
+        layout,
+        tool,
+        &program,
+        &crate::serving::here(layout, &program),
+    )
+}
+
+/// Why `tool`, which `program` ships, does not run here: no build of `program` for this target
+/// as `verdict` says, with the local build that puts it here; else a held install's recorded
+/// row; else that it is not installed ([`unrunnable_state`]).
+fn not_runnable_judged(
+    layout: &crate::store::Layout,
+    tool: &str,
+    program: &str,
+    verdict: &crate::serving::Serving,
+) -> String {
+    not_runnable_words(
+        tool,
+        program,
+        unrunnable_state(layout, program, verdict).as_deref(),
+    )
+}
+
+/// THE STATE OF A PROGRAM NOTHING HERE RUNS, for every line that says why (`which`, the
+/// not-runnable line, a pending stub's wait): no build of `program` serves this target as
+/// `verdict` (the store's signed word, [`crate::serving::here`]) says, with the local build that
+/// puts it here ([`crate::serving::local_remedy`]); else a held install's recorded row. `None`
+/// when neither, where the line's act is the install. A recorded `unavailable on` row is a
+/// pass's record, not a verdict.
+fn unrunnable_state(
+    layout: &crate::store::Layout,
+    program: &str,
+    verdict: &crate::serving::Serving,
+) -> Option<String> {
+    match verdict {
+        crate::serving::Serving::Unserved(state) => Some(format!(
+            "{state}; {}",
+            crate::serving::local_remedy(program)
+        )),
+        crate::serving::Serving::Served | crate::serving::Serving::Unknown => {
+            crate::status::read(layout)
+                .and_then(|s| s.programs.get(program).map(|row| row.state.clone()))
+                .filter(|state| state.starts_with(crate::state::HELD_FAILED_PREFIX))
+        }
+    }
 }
 
 fn not_runnable_words(tool: &str, program: &str, state: Option<&str>) -> String {
     match (state, tool == program) {
         (Some(state), true) => format!("atpkg: {tool}: {state}"),
         (Some(state), false) => format!("atpkg: {tool} comes with {program}: {state}"),
-        (None, true) => not_installed_fix(tool),
+        (None, true) => install_fix(tool),
         (None, false) => format!(
             "atpkg: {tool} comes with {program}, which is not installed (fix: aterm pkg install \
              {program})"
@@ -2499,7 +2559,7 @@ fn wait_then_run(
         }
     }
     if crate::stub::pending_stub_exists(layout, tool) {
-        eprintln!("{}", not_installed_fix(program));
+        eprintln!("{}", not_installed_fix(layout, program));
         return ExitCode::from(127);
     }
     #[cfg(unix)]
@@ -2768,8 +2828,38 @@ fn pending_not_running(
     asker: crate::progress::Asker,
     say: &mut dyn FnMut(String),
 ) {
+    pending_not_running_judged(
+        layout,
+        program,
+        asker,
+        &|| crate::serving::here(layout, program.as_str()),
+        say,
+    );
+}
+
+/// [`pending_not_running`] with the store's word on `program` here read through `verdict`, in
+/// [`unrunnable_state`]'s order: where no build of it serves this target, it is not coming, and
+/// the local build that puts it here is said in place of a request, whatever an earlier install
+/// attempt recorded; else a held or failed install answers.
+fn pending_not_running_judged(
+    layout: &crate::store::Layout,
+    program: &crate::store::ToolName,
+    asker: crate::progress::Asker,
+    verdict: &dyn Fn() -> crate::serving::Serving,
+    say: &mut dyn FnMut(String),
+) {
     let name = program.as_str();
-    if let Some(status) = crate::status::read(layout) {
+    // Before the held and `error` arms: an install no build serves cannot be retried into place.
+    if let crate::serving::Serving::Unserved(state) = verdict() {
+        say(format!(
+            "atpkg: {name} is not coming on its own: {}; {}",
+            crate::progress::sanitize_for_tty(&state, PENDING_ERROR_CAP),
+            crate::serving::local_remedy(name)
+        ));
+        return;
+    }
+    let status = crate::status::read(layout);
+    if let Some(status) = &status {
         // Before the `error` arm, which would promise a retry.
         if let Some(row) = status.programs.get(name)
             && let Some(held) = row.state.strip_prefix(crate::state::HELD_FAILED_PREFIX)
@@ -2788,27 +2878,17 @@ fn pending_not_running(
             let _ = crate::progress::append_bump(layout, program, asker);
             return;
         }
-        if let Some(row) = status.programs.get(name)
-            && row.state.starts_with(crate::state::UNAVAILABLE_PREFIX)
-        {
-            say(format!(
-                "atpkg: {name} is not coming on its own: {} — Settings ▸ Packages \
-                 shows details.",
-                crate::progress::sanitize_for_tty(&row.state, PENDING_ERROR_CAP)
-            ));
-            return;
-        }
-        if let Some(row) = status.programs.get("*toolset*")
-            && let Some(why) = row.state.strip_prefix("blocked: ")
-        {
-            say(format!(
-                "atpkg: {name} is not coming on its own: {} — Settings ▸ Packages \
-                 shows details.",
-                crate::progress::sanitize_for_tty(why, PENDING_ERROR_CAP)
-            ));
-            let _ = crate::progress::append_bump(layout, program, asker);
-            return;
-        }
+    }
+    if let Some(row) = status.as_ref().and_then(|s| s.programs.get("*toolset*"))
+        && let Some(why) = row.state.strip_prefix("blocked: ")
+    {
+        say(format!(
+            "atpkg: {name} is not coming on its own: {} — Settings ▸ Packages \
+             shows details.",
+            crate::progress::sanitize_for_tty(why, PENDING_ERROR_CAP)
+        ));
+        let _ = crate::progress::append_bump(layout, program, asker);
+        return;
     }
     let bumped = crate::progress::append_bump(layout, program, asker).is_ok();
     say(if bumped {
@@ -3279,6 +3359,20 @@ fn which_line_in(
     path_var: Option<&std::ffi::OsStr>,
     env: crate::reroute::StubEnv,
 ) -> Result<String, String> {
+    which_line_judged(layout, tool, path_var, env, &|program| {
+        crate::serving::here(layout, program)
+    })
+}
+
+/// [`which_line_in`] with the store's word on a program here read through `verdict`
+/// ([`crate::serving::here`]), asked only of a program nothing here runs ([`unrunnable_state`]).
+fn which_line_judged(
+    layout: &crate::store::Layout,
+    tool: &str,
+    path_var: Option<&std::ffi::OsStr>,
+    env: crate::reroute::StubEnv,
+    verdict: &dyn Fn(&str) -> crate::serving::Serving,
+) -> Result<String, String> {
     // A rerouted upstream name is answered by the table, ahead of the deny-list gate and
     // the store: inside an aterm session the reroute dir is first on PATH, so the stub is
     // the copy that runs, and the managed bin/ never carries these names — `cargo`/`rustc`
@@ -3451,10 +3545,11 @@ fn which_line_in(
             None => crate::stub::describe(tool).is_some(),
         }
     {
-        let row = row_of(crate::stub::program_of(tool)).map(|r| r.state);
+        let program = crate::stub::program_of(tool);
+        let state = unrunnable_state(layout, program, &verdict(program));
         return Ok(index_program_shadowed_by_unrelated_line(
             tool,
-            row.as_deref(),
+            state.as_deref(),
             stubbed,
             path,
         ));
@@ -3472,10 +3567,7 @@ fn which_line_in(
     if stubbed {
         let program = crate::stub::program_of_in(layout, tool);
         let program = program.as_str();
-        let waiting = row_of(program).map(|r| r.state).filter(|st| {
-            st.starts_with(crate::state::UNAVAILABLE_PREFIX)
-                || st.starts_with(crate::state::HELD_FAILED_PREFIX)
-        });
+        let waiting = unrunnable_state(layout, program, &verdict(program));
         return Ok(match waiting {
             Some(st) => format!("{tool} → {} (pending stub) — {st}", shim.display()),
             None => format!(
@@ -3485,21 +3577,22 @@ fn which_line_in(
             ),
         });
     }
-    if let Some(row) = row_of(tool)
-        && (row.state.starts_with(crate::state::UNAVAILABLE_PREFIX)
-            || row.state.starts_with(crate::state::HELD_FAILED_PREFIX))
-    {
-        return Ok(format!("{tool} → (nothing runs) — {}", row.state));
+    if let Some(state) = unrunnable_state(layout, tool, &verdict(tool)) {
+        return Ok(format!("{tool} → (nothing runs) — {state}"));
     }
     if let Some(base) = tn.alias_base() {
         return Err(no_alias_line(layout, tool, base.as_str()));
     }
-    if let Some(line) =
-        unserved_which_line(&crate::stub::program_of_in(layout, tool), index.as_deref())
-    {
+    let program = crate::stub::program_of_in(layout, tool);
+    if let Some(line) = unserved_which_line(&program, index.as_deref()) {
         return Err(line);
     }
-    Err(not_runnable_line(layout, tool))
+    Err(not_runnable_judged(
+        layout,
+        tool,
+        &program,
+        &verdict(&program),
+    ))
 }
 
 fn upstream_clause(program: &str, exe: &std::path::Path) -> String {
@@ -3550,25 +3643,22 @@ fn dev_linked_program_line(
     line
 }
 
+/// `tool`, an index program nothing here runs, beside the unrelated binary of its name on PATH:
+/// `state` ([`unrunnable_state`]) where it says why, else its install.
 fn index_program_shadowed_by_unrelated_line(
     tool: &str,
-    row_state: Option<&str>,
+    state: Option<&str>,
     stubbed: bool,
     path: &std::path::Path,
 ) -> String {
-    let truth = match row_state {
-        Some(st)
-            if st.starts_with(crate::state::UNAVAILABLE_PREFIX)
-                || st.starts_with(crate::state::HELD_FAILED_PREFIX) =>
-        {
-            format!("(nothing runs) — {st}")
-        }
-        _ if stubbed => format!(
+    let truth = match state {
+        Some(st) => format!("(nothing runs) — {st}"),
+        None if stubbed => format!(
             "(nothing runs) — not installed yet: the next pass installs it (now: aterm pkg \
              install {})",
             crate::stub::program_of(tool)
         ),
-        _ => format!("(nothing runs) — not installed (fix: aterm pkg install {tool})"),
+        None => format!("(nothing runs) — not installed (fix: aterm pkg install {tool})"),
     };
     format!(
         "{tool} → {truth}\n{} on PATH is an unrelated binary, not this program",
@@ -3680,13 +3770,16 @@ fn no_alias_line_for(
         ),
         Some(_) => format!(
             "atpkg: {alias} names nothing yet — {}",
-            not_installed_fix(base)
+            not_installed_fix(layout, base)
         ),
         None if crate::which(layout, base).is_some() => format!(
             "atpkg: no alias {alias} — {base} is not one of ALab's own tools, or the next \
              pass lays it (aterm pkg update); type {base}"
         ),
-        None => format!("atpkg: no alias {alias} — {}", not_installed_fix(base)),
+        None => format!(
+            "atpkg: no alias {alias} — {}",
+            not_installed_fix(layout, base)
+        ),
     }
 }
 
@@ -5776,12 +5869,25 @@ fn removed_programs(
     )))
 }
 
-/// The default set on `triple` before `[packages].exclude` narrows it, the one list every
-/// surface completes and judges (`install --default-set`, the update pass that follows
-/// `seed`, `pkg doctor`'s toolset row): every program the index lists, an ALab harness
-/// included ([`crate::manifest::Index::installable`];
-/// docs/OWNER_RULINGS.md, 2026-10-27), and its vendor half ([`vendor_set_here`]).
+/// The default set on `here`'s target before `[packages].exclude` narrows it, the list
+/// `pkg doctor`'s toolset row (and `aterm status`, which reads it) judges: [`default_set_listed`]
+/// less every program the store's signed manifests say has no build there
+/// ([`crate::serving::Targets`]; one with no verdict stays in).
 pub(crate) fn default_set_here(
+    index: &crate::manifest::Index,
+    here: &crate::serving::Targets,
+) -> std::collections::BTreeSet<String> {
+    let mut set = default_set_listed(index, here.triple());
+    set.retain(|program| here.unserved(program).is_none());
+    set
+}
+
+/// The default set the index lists for `triple`, before any program's builds are weighed, the
+/// list the passes complete (`install --default-set`, the update pass that follows `seed`),
+/// whose prescan reads each missing member's pinned manifest itself: every program the index
+/// lists, an ALab harness included ([`crate::manifest::Index::installable`];
+/// docs/OWNER_RULINGS.md, 2026-10-27), and its vendor half ([`vendor_set_here`]).
+pub(crate) fn default_set_listed(
     index: &crate::manifest::Index,
     triple: &str,
 ) -> std::collections::BTreeSet<String> {
@@ -5812,16 +5918,49 @@ pub(crate) fn vendor_set_here(
         .collect()
 }
 
-/// The programs this machine keeps complete: [`default_set_here`] less `[packages].exclude`.
-/// A removal (`aterm pkg uninstall`) is the caller's to weigh ([`removed_programs`]).
+/// The programs this machine is judged complete against: [`default_set_here`] less
+/// `[packages].exclude`. A removal (`aterm pkg uninstall`) is the caller's to weigh
+/// ([`removed_programs`]).
 pub(crate) fn wanted_programs(
+    index: &crate::manifest::Index,
+    cfg: &crate::config::PackagesConfig,
+    here: &crate::serving::Targets,
+) -> std::collections::BTreeSet<String> {
+    let mut set = default_set_here(index, here);
+    set.retain(|program| !cfg.exclude().iter().any(|excluded| excluded == program));
+    set
+}
+
+/// The programs the passes keep complete: [`default_set_listed`] less `[packages].exclude`.
+/// A removal (`aterm pkg uninstall`) is the caller's to weigh ([`removed_programs`]).
+pub(crate) fn wanted_listed(
     index: &crate::manifest::Index,
     cfg: &crate::config::PackagesConfig,
     triple: &str,
 ) -> std::collections::BTreeSet<String> {
-    let mut set = default_set_here(index, triple);
+    let mut set = default_set_listed(index, triple);
     set.retain(|program| !cfg.exclude().iter().any(|excluded| excluded == program));
     set
+}
+
+/// [`crate::serving::learn`] for this machine: the pinned manifest of every program `index`
+/// lists that is neither active nor dev-linked here, so the readers of
+/// [`crate::serving::Targets`] judge each against signed rows, whether or not this pass may
+/// install anything.
+fn learn_targets(
+    layout: &crate::store::Layout,
+    fetcher: &dyn crate::flow::Fetcher,
+    index: &crate::TrustedIndex,
+) {
+    let active = crate::active_builds(layout);
+    let absent = index
+        .installable(&[])
+        .into_iter()
+        .filter(|program| {
+            !active.contains_key(program) && !crate::linkmode::is_linked(layout, program)
+        })
+        .collect();
+    crate::serving::learn(fetcher, layout, index, current_triple(), &absent);
 }
 
 fn reconcile_system_satisfied_with(
@@ -6899,8 +7038,9 @@ pub(crate) fn cache_plan_words(why: crate::build_cache::Unused) -> String {
         } => format!(
             "partial cleanup candidate: {incremental} incremental crate folder(s), {units} \
              unit(s) built by a compiler that is no longer the store's current one and \
-             {superseded} unit(s) its last passing release run superseded with another build of \
-             the same package and kind, each unwritten for {} or more",
+             {superseded} unit(s) no kept check run uses beside another build of the same \
+             package and kind; each unwritten for {} or more, or retired by the last check run \
+             to end there and unwritten since that run began",
             days(after)
         ),
         Unused::Stayed { stayed, freed } => format!(
@@ -10111,6 +10251,9 @@ fn run_update_pass_in<'scope, 'env>(
     {
         pass_index = Some(index);
     }
+    if !complete_the_set && let Some(index) = pass_index.as_ref() {
+        learn_targets(layout, fetcher, index);
+    }
     if complete_the_set {
         let before_net = crate::active_builds(layout);
         let toolchain_flipped = |layout: &crate::store::Layout| {
@@ -10566,9 +10709,10 @@ fn install_default_set_inner(
         };
     };
     let ch = &ch;
+    learn_targets(layout, fetcher, index);
     let groups = crate::apply::plan_groups_here(layout, index, ch, current_triple());
     let mut installed = crate::active_builds(layout);
-    let mut wanted = wanted_programs(index, cfg, current_triple());
+    let mut wanted = wanted_listed(index, cfg, current_triple());
     for p in &removed {
         wanted.remove(p);
     }
@@ -11129,7 +11273,7 @@ fn prefetch_set_manifests(
         return;
     };
     let groups = crate::apply::plan_groups_here(layout, index, &ch, triple);
-    let mut wanted = wanted_programs(index, cfg, triple);
+    let mut wanted = wanted_listed(index, cfg, triple);
     let Ok(removed) = removed_programs(layout).inspect_err(|error| eprintln!("atpkg: {error}"))
     else {
         return;
@@ -11777,7 +11921,7 @@ fn seed_serviceable(
         layout,
         fetcher,
         index,
-        &wanted_programs(index, cfg, current_triple()),
+        &wanted_listed(index, cfg, current_triple()),
         removed,
     )
 }
@@ -11895,7 +12039,7 @@ fn index_serves(
     if !seed_serviceable(layout, fetcher, index, cfg, &removed).is_empty() {
         return IndexServes::Yes;
     }
-    let unnarrowed = default_set_here(index, current_triple());
+    let unnarrowed = default_set_listed(index, current_triple());
     let everything = serviceable_among(
         layout,
         fetcher,
@@ -12245,7 +12389,7 @@ fn recorded_unusable_body(
     if state != crate::state::TOOLSET_UNSERVED {
         let index = read_cached_index()?;
         let removed = removed_programs(layout).ok()?;
-        if wanted_programs(&index, cfg, current_triple())
+        if wanted_listed(&index, cfg, current_triple())
             .iter()
             .any(|program| !removed.contains(program))
         {
@@ -14205,7 +14349,7 @@ fn verify_outcome_line(
                  reinstalls it and records one"
             ),
         ),
-        NotInstalled => (true, not_installed_fix(name)),
+        NotInstalled => (true, not_installed_fix(layout, name)),
         Unreadable { build, error } => (
             true,
             format!("atpkg: {} unreadable: {error}", display(*build)),

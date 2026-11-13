@@ -316,8 +316,11 @@ fn a_tag_or_blob_in_the_control_namespace_never_becomes_a_commit_observation() {
     }
 }
 
+/// A GITHUB PUSH IS ONE WRITE: agh's write makes every check its dry run makes before it sends,
+/// and each agh push re-verifies the pushed history while the expected ref is free to move, so
+/// no rehearsal comes first.
 #[test]
-fn github_push_dry_runs_the_same_exact_graph_and_lease_before_its_only_write() {
+fn github_push_is_one_write_of_the_exact_graph_and_lease() {
     let root = aterm_tempfile::tempdir().unwrap();
     for before in [Some(BEFORE), None] {
         let calls = Cell::new(0);
@@ -325,11 +328,10 @@ fn github_push_dry_runs_the_same_exact_graph_and_lease_before_its_only_write() {
             if let Some(out) = url(tool, args) {
                 return Ok(out);
             }
-            let call = calls.get();
-            calls.set(call + 1);
+            calls.set(calls.get() + 1);
             assert_eq!(&args[..3], words(&["repo", "push", "fixture/repo"]));
             assert_eq!(args[3], root.path().as_os_str());
-            assert_eq!(args.last().unwrap() == "--dry-run", call == 0);
+            assert!(args.iter().all(|word| word != "--dry-run"), "{args:?}");
             assert_eq!(
                 input(args),
                 json!([{"ref":"refs/aterm/judged","before":before.unwrap_or(ZERO),"after":AFTER}])
@@ -344,35 +346,109 @@ fn github_push_dry_runs_the_same_exact_graph_and_lease_before_its_only_write() {
             ),
             Ok(Pushed::Done)
         ));
-        assert_eq!(calls.get(), 2);
+        assert_eq!(calls.get(), 1);
     }
 }
 
+/// A write agh refused for the expected ref is a rejection; any other failure with no typed
+/// diagnostic (an unknown outcome, a could-not-run or an authentication failure that names no
+/// side effect) is an error, and the write is never made a second time here.
 #[test]
-fn a_rejected_dry_run_never_writes_and_an_unknown_write_never_replays() {
+fn a_rejected_write_is_typed_and_an_untyped_failure_never_replays() {
     let root = aterm_tempfile::tempdir().unwrap();
-    for (dry_code, actual_code) in [(9, 0), (13, 0), (4, 0), (0, 9), (0, 13), (0, 4)] {
+    for code in [9, 13, 4, 3] {
         let calls = Cell::new(0);
         let run = |tool, args: &[OsString]| {
             if let Some(out) = url(tool, args) {
                 return Ok(out);
             }
-            let call = calls.get();
-            calls.set(call + 1);
-            assert!(call < 2, "no replay");
-            Ok(out(if call == 0 { dry_code } else { actual_code }, ""))
+            calls.set(calls.get() + 1);
+            Ok(out(code, ""))
         };
         let result = Remote::open(root.path(), "origin", &run).unwrap().push(
             "refs/heads/main",
             Some(BEFORE),
             AFTER,
         );
-        if dry_code == 9 || (dry_code == 0 && actual_code == 9) {
+        if code == 9 {
             assert!(matches!(result, Ok(Pushed::Rejected(_))))
         } else {
-            assert!(result.is_err())
+            assert!(result.is_err(), "exit {code}")
         }
-        assert_eq!(calls.get(), if dry_code == 0 { 2 } else { 1 });
+        assert_eq!(calls.get(), 1, "no replay");
+    }
+}
+
+/// agh's own diagnostic of `error`, as its failed command prints it on stderr.
+fn diagnosed(error: &agh::error::Error) -> Output {
+    let mut result = out(i32::from(error.exit()), "");
+    result.stderr = format!(
+        "human diagnostic is not parsed\n{}\n",
+        error.to_json(&agh::redact::Redactor::new())
+    )
+    .into_bytes();
+    result
+}
+
+/// ONLY AGH'S OWN WORD THAT NOTHING WAS SENT LETS A WRITE BE MADE AGAIN: a could-not-run, rate
+/// or server failure whose one diagnostic names no side effect is [`Pushed::Unsent`]. NEGATIVE
+/// CONTROLS: the same failure with an unknown or applied side effect, for another repository,
+/// with a second diagnostic, with an exit its diagnostic does not name, and a refusal of any
+/// other kind, stay errors.
+#[test]
+fn only_agh_saying_it_sent_nothing_lets_the_write_be_made_again() {
+    use agh::error::{Error, Kind, SideEffect};
+    let root = aterm_tempfile::tempdir().unwrap();
+    let pushed = |refused: Output| {
+        let run = move |tool, args: &[OsString]| {
+            if let Some(result) = url(tool, args) {
+                return Ok(result);
+            }
+            Ok(Output {
+                status: refused.status,
+                stdout: refused.stdout.clone(),
+                stderr: refused.stderr.clone(),
+            })
+        };
+        Remote::open(root.path(), "origin", &run).unwrap().push(
+            "refs/heads/main",
+            Some(BEFORE),
+            AFTER,
+        )
+    };
+    for kind in [Kind::CouldNotRun, Kind::RateLimited, Kind::Server] {
+        let error = Error::new(kind, "the network went away before the send");
+        assert!(
+            matches!(pushed(diagnosed(&error)), Ok(Pushed::Unsent(_))),
+            "{kind:?}"
+        );
+        let ours = error.clone().with_repo("fixture/repo".to_owned());
+        assert!(matches!(pushed(diagnosed(&ours)), Ok(Pushed::Unsent(_))));
+        for effect in [SideEffect::Unknown, SideEffect::Applied] {
+            let sent = error.clone().with_side_effect(effect);
+            assert!(pushed(diagnosed(&sent)).is_err(), "{kind:?} {effect:?}");
+        }
+        let theirs = error.clone().with_repo("other/repo".to_owned());
+        assert!(pushed(diagnosed(&theirs)).is_err(), "{kind:?} elsewhere");
+        let mut twice = diagnosed(&error);
+        let again = twice.stderr.clone();
+        twice.stderr.extend(again);
+        assert!(pushed(twice).is_err(), "{kind:?} with two diagnostics");
+        let mut other_exit = diagnosed(&error);
+        other_exit.status = std::process::ExitStatus::from_raw(4 << 8);
+        assert!(pushed(other_exit).is_err(), "{kind:?} under another exit");
+    }
+    for kind in [
+        Kind::Refused,
+        Kind::Usage,
+        Kind::Unauthenticated,
+        Kind::Forbidden,
+        Kind::Invalid,
+        Kind::OutcomeUnknown,
+        Kind::Failed,
+    ] {
+        let error = Error::new(kind, "not a failure another attempt cures");
+        assert!(pushed(diagnosed(&error)).is_err(), "{kind:?}");
     }
 }
 
@@ -436,26 +512,18 @@ fn only_exact_structured_presend_intent_refusals_allow_observation() {
         )
         .into_bytes();
     assert!(blocking_intent(&duplicate, "fixture/repo").is_none());
-    for actual in [false, true] {
-        let calls = Cell::new(0);
-        let run = |tool, args: &[OsString]| {
-            if let Some(result) = url(tool, args) {
-                return Ok(result);
-            }
-            let call = calls.get();
-            calls.set(call + 1);
-            assert_eq!(args.last().unwrap() == "--dry-run", call == 0);
-            Ok(if actual && call == 0 {
-                out(0, "")
-            } else {
-                refused_out(&valid)
-            })
-        };
-        assert!(matches!(Remote::open(root.path(), "origin", &run).unwrap()
-            .push("refs/heads/main", Some(BEFORE), AFTER),
-            Ok(Pushed::Blocked { intent, .. }) if intent.as_str() == INTENT));
-        assert_eq!(calls.get(), if actual { 2 } else { 1 });
-    }
+    let calls = Cell::new(0);
+    let run = |tool, args: &[OsString]| {
+        if let Some(result) = url(tool, args) {
+            return Ok(result);
+        }
+        calls.set(calls.get() + 1);
+        Ok(refused_out(&valid))
+    };
+    assert!(matches!(Remote::open(root.path(), "origin", &run).unwrap()
+        .push("refs/heads/main", Some(BEFORE), AFTER),
+        Ok(Pushed::Blocked { intent, .. }) if intent.as_str() == INTENT));
+    assert_eq!(calls.get(), 1);
 }
 
 #[test]

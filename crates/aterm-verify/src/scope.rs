@@ -20,9 +20,11 @@ pub struct Changed {
     /// error on an all-binary selection.
     pub any_lib: bool,
     /// The packages the change itself touched, by `-p` spec: a member's files, a
-    /// `Cargo.lock` or `[workspace.dependencies]` row, a vendored fork
+    /// `Cargo.lock` or `[workspace.dependencies]` row, a vendored fork; and the members whose
+    /// library, binaries, build script or unplaced files spell a changed path of another member
     /// ([`crate::changed::select`]). Not all are in `crates`; the rest of `crates` is
-    /// there only because it depends on one or a test of its reads a changed file.
+    /// there only because it depends on one, a test of its reads a changed file, or its tests or
+    /// doc comments alone spell one.
     pub seeds: Vec<String>,
     /// The packages, by name, whose test, bench and example targets the cone's lint compiles
     /// ([`Selection::Narrowed`](crate::changed::Selection::Narrowed)'s `all_targets`).
@@ -36,7 +38,10 @@ pub struct Changed {
     /// ([`Scope::gated_spec_of`]).
     pub direct_dependents: Vec<String>,
     /// The packages among [`Changed::seeds`], by name, whose change is confined to the package
-    /// itself, its own tests and comments no macro reads among them
+    /// itself, its own tests and comments no macro reads among them, whose reads of another
+    /// package's changed file sit only in its tests, benches and examples, and that observe no
+    /// changed path of another member through code a dependent links, or, where they do, whose
+    /// paths no member observes and none of which is a reader, so main judged them alone too
     /// ([`Selection::Narrowed`](crate::changed::Selection::Narrowed)'s `alone`): no build of a
     /// dependent reads it ([`Scope::reaches_dependents`]).
     pub alone: Vec<String>,

@@ -203,18 +203,17 @@ fn cleanup_without_a_forwarder_ends_observed_work_before_releasing_the_claim() {
 }
 
 fn jobserver_style_handle() -> std::io::PipeReader {
-    let (reader, mut writer) = std::io::pipe().unwrap();
+    let (reader, mut writer) = aterm_uds::pipe().unwrap();
     writer.write_all(b"shared-jobserver-handle\n").unwrap();
     drop(writer);
     // SAFETY: the pipe reader is owned here and remains open through the native child wait.
-    // Only its close-on-exec flag changes, so the actual child must inherit this handle.
+    // Only its descriptor flags change: close-on-exec, and the close-on-fork mark
+    // `aterm_uds::pipe` sets where the kernel keeps it, both go, so the actual child must
+    // inherit this handle.
     let flags = unsafe {
         let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFD);
         assert!(flags >= 0);
-        assert_eq!(
-            libc::fcntl(reader.as_raw_fd(), libc::F_SETFD, flags & !libc::FD_CLOEXEC),
-            0
-        );
+        assert_eq!(libc::fcntl(reader.as_raw_fd(), libc::F_SETFD, 0), 0);
         flags
     };
     assert_ne!(flags & libc::FD_CLOEXEC, 0);

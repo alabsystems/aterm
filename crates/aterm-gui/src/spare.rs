@@ -3094,6 +3094,7 @@ impl Wake {
             | Wake::HeldAgentMessages(..)
             | Wake::Record(..)
             | Wake::Notice { .. }
+            | Wake::DeskAsked { .. }
             | Wake::DevToolsHandOverAsked { .. }
             | Wake::PermissionWalkAsked { .. }
             | Wake::PkgProgress { .. }

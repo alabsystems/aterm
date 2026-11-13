@@ -8,6 +8,7 @@ use crate::supervise::policy::approval::{
     PriorityWord, RULE_ANSWER_LAND, RULE_ANSWER_LONG_TERM, RULE_ANSWER_SHORT_TERM, RULE_PLAN,
     RULE_PROSE_LONG_TERM, RULE_PROSE_SHORT_TERM,
 };
+use crate::supervise::policy::credential_need::RULE_CREDENTIAL;
 use crate::supervise::policy::go_ahead::RULE_GO_AHEAD;
 use crate::supervise::policy::question::{RULE_ANSWER_RECOMMENDED, is_question_rule};
 use crate::supervise::policy::turn_end::{
@@ -169,6 +170,7 @@ fn is_dialog_key(rule: &str) -> bool {
 fn is_prose_answer(rule: &str) -> bool {
     rule == RULE_LAND_ANSWER
         || rule == RULE_GO_AHEAD
+        || rule == RULE_CREDENTIAL
         || PriorityWord::ALL
             .into_iter()
             .any(|p| p.prose_rule_id() == rule)
@@ -252,6 +254,7 @@ pub fn self_claim_act(act: &str) -> Option<(&'static str, String)> {
         | RULE_ANSWER_LAND
         | RULE_LAND_ANSWER
         | RULE_GO_AHEAD
+        | RULE_CREDENTIAL
         | RULE_ANSWER
         | RULE_PROSE_LONG_TERM
         | RULE_PROSE_SHORT_TERM => "answer",

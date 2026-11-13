@@ -66,9 +66,11 @@ pub mod program_watch;
 #[cfg(unix)]
 mod records_storage;
 #[cfg(unix)]
+pub mod registry;
+#[cfg(unix)]
 pub mod release_keychain;
 #[cfg(unix)]
-pub mod release_ring;
+pub(crate) mod release_ring;
 #[cfg(unix)]
 pub mod server;
 #[cfg(unix)]
@@ -243,8 +245,9 @@ pub enum ErrorKind {
     /// Another local Commons custody observation held its lock past a bounded
     /// wait. Nothing was observed; retry after it finishes.
     CustodyBusy,
-    /// A local vault writer prevented a fresh Commons source observation.
-    /// Retry from a new observation after the writer releases its lock.
+    /// A local vault writer held the state lock through the reader's wait for it (none, for a
+    /// reader that does not wait), so nothing was read. Retry from a new observation after the
+    /// writer releases its lock.
     VaultBusy,
     /// A valid local vault observation differs from the source or applied
     /// version captured earlier. The old observation grants no access; a

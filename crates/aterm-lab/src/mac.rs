@@ -125,6 +125,8 @@ targo --unverified lab mac <verb> — the macOS guest lane: a disposable tart VM
   provision     locate Tart or fetch the pinned version when absent; no app build, image pull, VM clone or boot
   commons-startup --aterm FILE --record NEW_DIR [--image REF]
                 the existing guarded Commons startup component in one disposable guest; see `mac commons-startup --help`
+  codex-source-proof --aterm FILE --package DIR --record NEW_DIR [--image REF]
+                debug lab only: the guarded native SDK source component in a disposable SIP-on guest
   dmg [--image REF] [--fda] [--keep]
                 the disk-image acceptance in a fresh guest: atpkg's, aterm-containment's, aterm-uds' and
                 aterm-update's dmg_acceptance benches, built here with --no-run (nothing is attached on this
@@ -154,6 +156,8 @@ pub fn cmd_mac(args: &[String]) -> Res {
     match args.first().map(String::as_str) {
         Some("provision") => cmd_provision(&args[1..]),
         Some("commons-startup") => crate::mac_commons_startup::cmd(&args[1..]),
+        #[cfg(debug_assertions)]
+        Some("codex-source-proof") => crate::mac_codex_source_proof::cmd(&args[1..]),
         Some("dmg") => cmd_dmg(&args[1..]),
         Some("nux") => crate::mac_nux::cmd_nux(&args[1..]),
         Some("runtime") => crate::mac_runtime::run(&args[1..]),

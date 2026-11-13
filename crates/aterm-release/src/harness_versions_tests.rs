@@ -155,54 +155,6 @@ fn only_a_moved_harness_under_an_unchanged_version_owes() {
     assert!(born.is_empty(), "a harness new in the window owes nothing");
 }
 
-#[test]
-fn an_entry_lands_under_unreleased_changed() {
-    let log = "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- **Old.**\n\n## [0.1.0] - x\n";
-    let new = with_unreleased_entry(log, "- **New.**").unwrap();
-    assert!(
-        new.contains("### Changed\n\n- **New.**\n\n- **Old.**"),
-        "{new}"
-    );
-    let bare = "# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - x\n";
-    let new = with_unreleased_entry(bare, "- **New.**").unwrap();
-    assert_eq!(
-        new,
-        "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- **New.**\n\n## [0.1.0] - x\n"
-    );
-    assert!(crate::changelog::gate_unreleased(&new).is_ok(), "{new}");
-    // Keep a Changelog orders Added before the newly created Changed subsection.
-    let added = "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- **Old.**\n";
-    let grown = with_unreleased_entry(added, "- **New.**").unwrap();
-    assert!(grown.find("### Added").unwrap() < grown.find("### Changed").unwrap());
-    crate::changelog::gate_unreleased(&grown).unwrap();
-    assert_eq!(
-        with_unreleased_entry("# Changelog\n\n## [Unreleased]", "- **New.**").unwrap(),
-        "# Changelog\n\n## [Unreleased]\n\n### Changed\n\n- **New.**\n"
-    );
-    // The heading as the changelog gate reads it: a suffix stays, and a CR or blanks
-    // ending its line leave no blank-looking line behind the entry.
-    assert_eq!(
-        with_unreleased_entry("## [Unreleased] - next\n\n## [0.1.0] - x\n", "- **New.**").unwrap(),
-        "## [Unreleased] - next\n\n### Changed\n\n- **New.**\n\n## [0.1.0] - x\n"
-    );
-    assert_eq!(
-        with_unreleased_entry("## [Unreleased] \r\n\n## [0.1.0] - x\n", "- **New.**").unwrap(),
-        "## [Unreleased]\n\n### Changed\n\n- **New.**\n\n## [0.1.0] - x\n"
-    );
-    assert_eq!(with_unreleased_entry("# Changelog\n", "- x"), None);
-}
-
-#[test]
-fn heading_examples_in_the_preamble_are_not_sections() {
-    let preamble = "# Changelog\n\nWrite under `## [Unreleased]`, in `### Changed`.\n\n";
-    assert_eq!(with_unreleased_entry(preamble, "- new"), None);
-    let log = format!("{preamble}## [Unreleased]\n\n### Changed\n\n- old\n");
-    assert_eq!(
-        with_unreleased_entry(&log, "- new").unwrap(),
-        format!("{preamble}## [Unreleased]\n\n### Changed\n\n- new\n\n- old\n")
-    );
-}
-
 /// A scratch history: a release tag, then changes to two harnesses (`claude` and `muse`) and a
 /// non-harness file (`footer.rs`), leaving `agy`, `grok` and `kimi` untouched.
 fn history(dir: &Path, bump_too: bool) -> (String, String) {
@@ -289,16 +241,23 @@ fn the_gate_refuses_a_moved_lane_and_passes_its_bump() {
     );
 }
 
+/// T-R10. `SHIP HARNESS-BUMP WRITES THE VERSION FILES AND NOTHING ELSE`: no changelog line and
+/// no entry file; the release derives the announcement from the version files, naming exactly
+/// the raised harnesses in canonical order, and a second run owes and writes nothing.
+/// NEGATIVE CONTROL: before the bump commit nothing rose, so nothing is announced; a harness
+/// that moves later in the same window joins the one derived line.
 #[test]
 fn harness_bump_writes_what_the_gate_asks_for() {
     let tmp = aterm_tempfile::TempDir::new().unwrap();
-    let (released, _) = history(tmp.path(), false);
-    std::fs::write(
-        tmp.path().join("CHANGELOG.md"),
-        "## [Unreleased]\n\n### Changed\n\n- **Harness versions since v0.0.0: `alab claude harness 0.1`.**\n\n## [0.1.0] - x\n",
-    )
-    .unwrap();
+    let (released, head) = history(tmp.path(), false);
+    let log_before = "## [Unreleased]\n\n### Changed\n\n- A note.\n\n## [0.1.0] - x\n";
+    std::fs::write(tmp.path().join("CHANGELOG.md"), log_before).unwrap();
     let git = Git::new(tmp.path());
+    assert_eq!(
+        announcement(&git, Some(("0.1.0", &released)), &head).unwrap(),
+        None,
+        "nothing rose before the bump"
+    );
     let owed = bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
     assert_eq!(
         owed.iter().map(|o| o.harness).collect::<Vec<_>>(),
@@ -313,32 +272,26 @@ fn harness_bump_writes_what_the_gate_asks_for() {
         let text = std::fs::read_to_string(tmp.path().join(h.version_file())).unwrap();
         assert_eq!(declared(&text), Some((0, 1)), "{h:?} stays at 0.1");
     }
-    let log = std::fs::read_to_string(tmp.path().join("CHANGELOG.md")).unwrap();
-    assert_eq!(log.matches(crate::changelog::HARNESS_ENTRY_HEAD).count(), 1);
-    assert!(!log.contains("since v0.0.0:"));
-    assert!(log.contains("`alab claude harness 0.2`"), "{log}");
-    assert!(log.contains("`alab muse harness 0.2`"), "{log}");
-    assert!(!log.contains("`alab agy harness"), "{log}");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("CHANGELOG.md")).unwrap(),
+        log_before,
+        "the bump writes no changelog line"
+    );
     assert!(
-        !log.contains("codex harness"),
-        "Codex versions its own binary: {log}"
+        !tmp.path().join(crate::changelog::FRAGMENT_DIR).exists(),
+        "the bump writes no entry file"
     );
     assert_eq!(
         written(&owed),
         vec![
             CliHarness::ClaudeCode.version_file().to_string(),
             CliHarness::Muse.version_file().to_string(),
-            crate::changelog::CHANGELOG_FILE.to_string(),
         ],
         "the files a bump commit carries"
     );
     let again = bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
     assert!(again.is_empty(), "a second run owes nothing");
-    assert_eq!(written(&again), [crate::changelog::CHANGELOG_FILE]);
-    assert_eq!(
-        std::fs::read_to_string(tmp.path().join("CHANGELOG.md")).unwrap(),
-        log
-    );
+    assert!(written(&again).is_empty());
     let run = |args: &[&str]| {
         let out = git_cmd(tmp.path(), args);
         assert!(out.status.success(), "{args:?}");
@@ -346,48 +299,50 @@ fn harness_bump_writes_what_the_gate_asks_for() {
     run(&["commit", "-qam", "bump"]);
     let head = crate::ledger::rev_parse(&git, "HEAD").unwrap();
     assert!(gate(&git, ("0.1.0", &released), &head).is_ok());
-
-    // NEGATIVE CONTROL: when another harness moves later in the same release window (including
-    // an untracked file under a harness source directory), `ship harness-bump` updates the
-    // existing `Harness versions since v0.1.0:` bullet in place with all bumped harnesses in
-    // canonical order rather than inserting a second duplicate bullet.
-    let dir_prefix = CliHarness::ALL.iter().find_map(|h| {
-        h.sources()
-            .iter()
-            .find(|s| s.ends_with('/'))
-            .map(|s| (*h, *s))
-    });
-    if let Some((dir_harness, prefix)) = dir_prefix
-        && !matches!(dir_harness, CliHarness::ClaudeCode | CliHarness::Muse)
-    {
-        let untracked = tmp.path().join(format!("{prefix}new_untracked_helper.rs"));
-        std::fs::create_dir_all(untracked.parent().unwrap()).unwrap();
-        std::fs::write(&untracked, "fn helper() {}\n").unwrap();
-        let third = bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
-        assert_eq!(third.len(), 1);
-        assert_eq!(third[0].harness, dir_harness);
-    } else {
-        let agy_src = tmp
-            .path()
-            .join("crates/aterm-agent/src/harness/upgrade_agy.rs");
-        std::fs::write(&agy_src, "fn agy() {}\n").unwrap();
-        run(&["add", "crates/aterm-agent/src/harness/upgrade_agy.rs"]);
-        let third = bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
-        assert_eq!(third.len(), 1);
-        assert_eq!(third[0].harness, CliHarness::Agy);
-    }
-    let updated_log = std::fs::read_to_string(tmp.path().join("CHANGELOG.md")).unwrap();
+    let line = announcement(&git, Some(("0.1.0", &released)), &head)
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        updated_log
-            .matches("Harness versions since v0.1.0:")
-            .count(),
-        1,
-        "must update existing bullet in place: {updated_log}"
+        line,
+        format!(
+            "{}0.1.0: `alab claude harness 0.2`, `alab muse harness 0.2`.** Each harness's \
+             minor moves once per release in which it changed.",
+            crate::changelog::HARNESS_ENTRY_HEAD
+        )
     );
     assert!(
-        updated_log.contains("`alab claude harness 0.2`")
-            && updated_log.contains("`alab muse harness 0.2`"),
-        "{updated_log}"
+        !line.contains("codex harness"),
+        "Codex versions its own binary"
+    );
+    notes_gate(&format!("## [0.2.0] - d\n\n{line}\n"), "0.2.0").unwrap();
+    assert_eq!(
+        announcement(&git, None, &head).unwrap(),
+        None,
+        "no release precedes"
+    );
+
+    let agy_src = tmp
+        .path()
+        .join("crates/aterm-agent/src/harness/upgrade_agy.rs");
+    std::fs::write(&agy_src, "fn agy() {}\n").unwrap();
+    run(&["add", "crates/aterm-agent/src/harness/upgrade_agy.rs"]);
+    let third = bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
+    assert_eq!(third.len(), 1);
+    assert_eq!(third[0].harness, CliHarness::Agy);
+    run(&["commit", "-qam", "agy moves later in the window"]);
+    let head = crate::ledger::rev_parse(&git, "HEAD").unwrap();
+    let line = announcement(&git, Some(("0.1.0", &released)), &head)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        line.matches(crate::changelog::HARNESS_ENTRY_HEAD).count(),
+        1
+    );
+    assert!(
+        line.contains(
+            "0.1.0: `alab claude harness 0.2`, `alab agy harness 0.2`, `alab muse harness 0.2`.**"
+        ),
+        "one line, every raised harness in canonical order: {line}"
     );
 }
 
@@ -408,19 +363,35 @@ fn announcement_matches_versions_in_release_objects() {
         "- **Harness versions since v0.1.0: `alab claude harness 0.2`, `alab muse harness 0.2`, `alab agy harness 0.1`.**",
         "- **Harness versions since v0.1.0: `alab claude harness 0.9`, `alab muse harness 0.2`.**",
     ] {
-        std::fs::write(&path, format!("## [Unreleased]\n\n{entry}\n\n## [0.1.0]\n")).unwrap();
+        // A recut ships its rolled section as it stands, so its announcement is judged.
+        std::fs::write(
+            &path,
+            format!("## [Unreleased]\n\n## [0.2.0] - d\n\n{entry}\n\n## [0.1.0]\n"),
+        )
+        .unwrap();
         run(&["commit", "-qam", "candidate notes"]);
         assert!(gate(&git, ("0.1.0", &released), "HEAD").is_ok());
         // Syntax alone cannot discover these planted version defects.
-        notes_gate(&format!("## [Unreleased]\n\n{entry}\n"), "Unreleased").unwrap();
+        notes_gate(&format!("## [0.2.0] - d\n\n{entry}\n"), "0.2.0").unwrap();
         assert!(
             notes_gate_at(&git, ("0.1.0", &released), "HEAD", "0.2.0").is_err(),
             "accepted {entry}"
         );
+        // A fresh window's hand-written line is no announcement: the roll drops it.
+        std::fs::write(&path, format!("## [Unreleased]\n\n{entry}\n\n## [0.1.0]\n")).unwrap();
+        run(&["commit", "-qam", "unreleased notes"]);
+        notes_gate_at(&git, ("0.1.0", &released), "HEAD", "0.2.0").unwrap();
     }
-    // NEGATIVE CONTROL: exactly the versions that moved passes, even though
-    // the preceding release's prose did not announce its shipped versions.
-    bump(tmp.path(), &git, ("0.1.0", &released)).unwrap();
+    // NEGATIVE CONTROL: the derived announcement, exactly the versions that moved, passes,
+    // even though the preceding release's prose did not announce its shipped versions.
+    let derived = announcement(&git, Some(("0.1.0", &released)), "HEAD")
+        .unwrap()
+        .unwrap();
+    std::fs::write(
+        &path,
+        format!("## [Unreleased]\n\n## [0.2.0] - d\n\n{derived}\n\n## [0.1.0]\n"),
+    )
+    .unwrap();
     run(&["commit", "-qam", "derived notes"]);
     notes_gate_at(&git, ("0.1.0", &released), "HEAD", "0.2.0").unwrap();
 }
@@ -458,7 +429,8 @@ fn an_unchanged_intervening_release_does_not_stale_an_announcement() {
         std::fs::write(
             tmp.path().join("CHANGELOG.md"),
             format!(
-                "## [Unreleased]\n\n{announcement}\n\n## [0.2.0]\n\n- Unrelated public change.\n"
+                "## [Unreleased]\n\n## [0.3.0] - d\n\n{announcement}\n\n## [0.2.0]\n\n\
+                 - Unrelated public change.\n"
             ),
         )
         .unwrap();
@@ -468,7 +440,8 @@ fn an_unchanged_intervening_release_does_not_stale_an_announcement() {
     // NEGATIVE CONTROL: the same history still owes both actual increases.
     std::fs::write(
         tmp.path().join("CHANGELOG.md"),
-        "## [Unreleased]\n\n- **Harness versions since v0.1.0: `alab claude harness 0.2`.**\n",
+        "## [Unreleased]\n\n## [0.3.0] - d\n\n\
+         - **Harness versions since v0.1.0: `alab claude harness 0.2`.**\n",
     )
     .unwrap();
     run(&["commit", "-qam", "missing muse announcement"]);
@@ -494,13 +467,19 @@ fn an_unchanged_intervening_release_does_not_stale_an_announcement() {
         one(2),
     )
     .unwrap();
+    std::fs::write(
+        tmp.path().join("CHANGELOG.md"),
+        "## [Unreleased]\n\n## [0.4.0] - d\n\n\
+         - **Harness versions since v0.1.0: `alab claude harness 0.2`.**\n",
+    )
+    .unwrap();
     run(&["commit", "-qam", "claude changes after muse shipped"]);
     notes_gate_at(&git, ("0.3.0", &muse_public), "HEAD", "0.4.0").unwrap();
     // NEGATIVE CONTROL: repeating that shipped bump in the new announcement
     // is still wrong; it must contain exactly this window's actual increases.
     std::fs::write(
         tmp.path().join("CHANGELOG.md"),
-        "## [Unreleased]\n\n- **Harness versions since v0.1.0: `alab claude harness 0.2`, `alab muse harness 0.2`.**\n",
+        "## [Unreleased]\n\n## [0.4.0] - d\n\n- **Harness versions since v0.1.0: `alab claude harness 0.2`, `alab muse harness 0.2`.**\n",
     ).unwrap();
     run(&[
         "commit",
@@ -508,77 +487,6 @@ fn an_unchanged_intervening_release_does_not_stale_an_announcement() {
         "reannounce the already-shipped muse version",
     ]);
     assert!(notes_gate_at(&git, ("0.3.0", &muse_public), "HEAD", "0.4.0").is_err());
-}
-
-#[test]
-fn a_release_landing_after_the_bump_rederives_the_announcement() {
-    let tmp = aterm_tempfile::TempDir::new().unwrap();
-    history(tmp.path(), true);
-    let run = |args: &[&str]| {
-        let out = git_cmd(tmp.path(), args);
-        assert!(out.status.success(), "{args:?}");
-        String::from_utf8(out.stdout).unwrap().trim().to_owned()
-    };
-    // The next public release already carries Claude's bump, while Muse's
-    // bump reaches main after that release was cut.
-    let muse = tmp.path().join(CliHarness::Muse.version_file());
-    std::fs::write(&muse, one(1)).unwrap();
-    run(&["commit", "-qam", "public release carrying claude"]);
-    let released = run(&["rev-parse", "HEAD"]);
-    std::fs::write(&muse, one(2)).unwrap();
-    let path = tmp.path().join("CHANGELOG.md");
-    let stale = "## [Unreleased]\n\n### Changed\n\n- **Harness versions since v0.1.0:\n  `alab claude harness 0.2`, `alab muse harness 0.2`.**\n\n- Keep this change.\n\n## [0.2.0] - date\n\n- Published notes.\n";
-    std::fs::write(&path, stale).unwrap();
-    run(&["commit", "-qam", "late harness announcement"]);
-
-    // NEGATIVE CONTROL: the former upsert only replaced a matching release
-    // prefix. Its fallback adds a second bullet for this exact history.
-    let entry = "- **Harness versions since v0.2.0: `alab muse harness 0.2`.**";
-    let old_prefix = format!("{}0.2.0: ", crate::changelog::HARNESS_ENTRY_HEAD);
-    assert!(!stale.lines().any(|line| line.starts_with(&old_prefix)));
-    let legacy = with_unreleased_entry(stale, entry).unwrap();
-    assert_eq!(
-        legacy.matches(crate::changelog::HARNESS_ENTRY_HEAD).count(),
-        2
-    );
-    notes_gate(&legacy, "Unreleased").unwrap();
-
-    let git = Git::new(tmp.path());
-    for original in [stale.to_owned(), legacy] {
-        std::fs::write(&path, original).unwrap();
-        assert!(
-            bump(tmp.path(), &git, ("0.2.0", &released))
-                .unwrap()
-                .is_empty()
-        );
-        let repaired = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(
-            repaired
-                .matches(crate::changelog::HARNESS_ENTRY_HEAD)
-                .count(),
-            1
-        );
-        assert!(repaired.contains("Harness versions since v0.2.0:"));
-        assert!(repaired.contains("`alab muse harness 0.2`"));
-        assert!(!repaired.contains("alab claude harness"));
-        assert!(repaired.contains("- Keep this change."));
-        assert!(repaired.ends_with("## [0.2.0] - date\n\n- Published notes.\n"));
-        notes_gate(&repaired, "Unreleased").unwrap();
-        bump(tmp.path(), &git, ("0.2.0", &released)).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), repaired);
-    }
-
-    // Once every version is already public, the derived announcement is empty.
-    run(&["commit", "-qam", "public release carrying every harness"]);
-    let all_released = run(&["rev-parse", "HEAD"]);
-    assert!(
-        bump(tmp.path(), &git, ("0.3.0", &all_released))
-            .unwrap()
-            .is_empty()
-    );
-    let repaired = std::fs::read_to_string(path).unwrap();
-    assert!(!repaired.contains(crate::changelog::HARNESS_ENTRY_HEAD));
-    assert!(repaired.contains("- Keep this change."));
 }
 
 #[test]
@@ -650,12 +558,6 @@ fn applying_a_bump_uses_native_release_objects_and_stops_before_untrusted_writes
             Some((0, 2))
         );
     }
-    let changelog = source.join(crate::changelog::CHANGELOG_FILE);
-    let stale = std::fs::read_to_string(&changelog).unwrap().replace(
-        "Harness versions since v0.1.0:",
-        "Harness versions since v0.0.0:",
-    );
-    std::fs::write(&changelog, stale).unwrap();
     assert!(
         apply_with(&source, &LocalOnly(&local), &origin)
             .unwrap()
@@ -663,15 +565,6 @@ fn applying_a_bump_uses_native_release_objects_and_stops_before_untrusted_writes
             .1
             .is_empty(),
         "one release window never bumps twice"
-    );
-    let repaired = std::fs::read_to_string(&changelog).unwrap();
-    assert!(repaired.contains("Harness versions since v0.1.0:"));
-    assert!(!repaired.contains("Harness versions since v0.0.0:"));
-    assert_eq!(
-        repaired
-            .matches(crate::changelog::HARNESS_ENTRY_HEAD)
-            .count(),
-        1
     );
     let paths = [
         CliHarness::ClaudeCode.version_file(),
@@ -771,36 +664,4 @@ fn the_last_daily_counter_is_inspectable_without_allocating_a_successor() {
 
 fn git_cmd(dir: &Path, args: &[&str]) -> std::process::Output {
     git().arg("-C").arg(dir).args(args).output().unwrap()
-}
-
-#[test]
-fn a_new_harness_window_replaces_every_older_unreleased_line() {
-    let old = format!(
-        "{}0.188.0: old tool.**",
-        crate::changelog::HARNESS_ENTRY_HEAD
-    );
-    let entry = format!(
-        "{}0.191.0: new tool.**",
-        crate::changelog::HARNESS_ENTRY_HEAD
-    );
-    let text = format!(
-        "## [Unreleased]\n\n### Changed\n\n{old}\n  Older continuation.\n\n{old}\n\n- Handwritten note.\n\n## [0.191.0] - date\n\n{old}\n"
-    );
-    let new = upsert_unreleased_harness_entry(&text, Some(&entry)).unwrap();
-    let body = crate::changelog::real_body(&new, "Unreleased").join("\n");
-    assert_eq!(
-        body.matches(crate::changelog::HARNESS_ENTRY_HEAD).count(),
-        1
-    );
-    assert!(body.contains(&entry));
-    assert!(!body.contains("0.188.0") && !body.contains("Older continuation"));
-    assert!(body.contains("Handwritten note"));
-    assert!(
-        new.ends_with(&format!("{old}\n")),
-        "published notes stay verbatim"
-    );
-    assert_eq!(
-        upsert_unreleased_harness_entry(&new, Some(&entry)).unwrap(),
-        new
-    );
 }

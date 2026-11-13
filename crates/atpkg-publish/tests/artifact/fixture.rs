@@ -7,6 +7,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use atpkg_publish::ctx::Ctx;
+use atpkg_publish::host::fake::FakeHost;
+
 pub use super::super::shared::scratch;
 use super::super::shared::{Made, Tree, made_once};
 
@@ -134,16 +137,24 @@ pub const MINTED_LEDGER: &str =
 /// Where the switch reads the ledger.
 pub const LEDGER: &str = "bootstrap/trust-stage0/seed-ledger.toml";
 
-/// A trust checkout at `dir` whose origin (the bare `<dir>.git`) has `ledger` on main,
-/// fetched — the receipt switch's input. Seven git processes and a push's receive-pack,
-/// so the pair is made once per process for each ledger, by the first caller, and laid
-/// down for every caller after: the checkout names its origin `<dir>.git`, which laying
-/// the checkout moves with it.
-pub fn trust_repo(dir: &Path, ledger: &str) -> PathBuf {
-    static MADE: Made<String, Arc<Tree>> = Mutex::new(BTreeMap::new());
-    let bare = dir.with_extension("git");
+/// The bare origin [`trust_checkout`] gives a checkout at `dir` of `staging`'s `trust`:
+/// `<dir>.origin/<staging>/trust.git`, a local path `names_repo` reads as `<staging>/trust`.
+#[must_use]
+pub fn trust_origin(dir: &Path, staging: &str) -> PathBuf {
+    dir.with_extension("origin").join(staging).join("trust.git")
+}
+
+/// A trust checkout at `dir` whose origin, [`trust_origin`], has `ledger` on main, fetched:
+/// the receipt switch's input. Seven git processes and a push's receive-pack, so the pair is
+/// made once per process for each owner and ledger, by the first caller, and laid down for
+/// every caller after: the checkout names its origin under `<dir>.origin`, which laying the
+/// checkout moves with it.
+pub fn trust_checkout(dir: &Path, ledger: &str, staging: &str) -> PathBuf {
+    static MADE: Made<(String, String), Arc<Tree>> = Mutex::new(BTreeMap::new());
+    let bare = trust_origin(dir, staging);
     let mut made_here = false;
-    let origin = made_once(&MADE, &ledger.to_string(), dir, |dir| {
+    let key = (staging.to_string(), ledger.to_string());
+    let origin = made_once(&MADE, &key, dir, |dir| {
         made_here = true;
         bare_origin(&bare);
         std::fs::create_dir_all(dir).expect("mkdir checkout");
@@ -159,6 +170,17 @@ pub fn trust_repo(dir: &Path, ledger: &str) -> PathBuf {
     if !made_here {
         origin.lay(&bare);
     }
+    bare
+}
+
+/// [`trust_checkout`] of `ctx`'s staging owner, its origin `host`'s clone source of
+/// `ctx.staging_slug("trust")`: the native arm reads the switch at the main of record
+/// (`git::main_of_record`, through the host's `fetch_main`), never through the checkout's own
+/// `origin`.
+pub fn trust_repo(dir: &Path, ledger: &str, ctx: &Ctx, host: &FakeHost) -> PathBuf {
+    let slug = ctx.staging_slug("trust");
+    let bare = trust_checkout(dir, ledger, &slug.owner);
+    host.add_clone_source(&slug, &bare);
     bare
 }
 
@@ -310,6 +332,9 @@ pub struct FakeTools {
     pub same_unsigned: bool,
     /// The relocator's refusal, when it should refuse.
     pub relocate_refusal: Option<String>,
+    /// A run whose arguments carry this word never ends: it answers as a child ended at its
+    /// deadline does.
+    pub overruns: Option<&'static str>,
     log: Mutex<Vec<String>>,
     runs: Mutex<Vec<Run>>,
 }
@@ -324,6 +349,7 @@ impl FakeTools {
             answer: Box::new(|_| None),
             same_unsigned: false,
             relocate_refusal: None,
+            overruns: None,
             log: Mutex::new(Vec::new()),
             runs: Mutex::new(Vec::new()),
         }
@@ -395,6 +421,12 @@ impl Tools for FakeTools {
                 Some(t) => ran(0, &t, ""),
                 None => ran(1, "", "not a compiler"),
             });
+        }
+        if self
+            .overruns
+            .is_some_and(|word| run.argv().iter().any(|a| a == word))
+        {
+            return Err(RunError::TimedOut);
         }
         Ok((self.answer)(run).unwrap_or_else(|| ran(0, "", "")))
     }

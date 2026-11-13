@@ -758,7 +758,7 @@ fn a_concurrent_first_dead_seen_horizon_limits_the_stale_cleanup_reader() {
     let (ended, lines) = start_pass(dir.path(), &k);
     let signals = k.signals.borrow().clone();
     let text = std::fs::read_to_string(&path).unwrap();
-    let admitted = read_records(dir.path()).unwrap();
+    let admitted = read_records(dir.path(), None).unwrap();
     assert_eq!(
         ended, 0,
         "the later table cannot widen the first horizon: {lines:?}"
@@ -776,6 +776,31 @@ fn a_concurrent_first_dead_seen_horizon_limits_the_stale_cleanup_reader() {
             .count(),
         1
     );
+}
+
+/// A record of an earlier boot that was cut short does not hold up the start pass: it is removed
+/// with that boot's other records, and this boot's dead run is judged. (On m22 one such record,
+/// two lines run together on 2026-11-03, kept every verify run's records for nine days: each
+/// start pass said "could not admit all verify run records" and each run-end sweep kept its own.)
+/// NEGATIVE CONTROL: with `read_records` refusing an incomplete record of any boot, the pass
+/// says it could not admit the records, and both stay.
+#[test]
+fn a_torn_record_of_an_earlier_boot_is_removed_and_the_dead_run_is_judged() {
+    let mut k = FakeKernel::default();
+    with_me(&mut k, 5_000);
+    let torn = "run v=1 boot=A id=5-1 uniqueid=1 start=1 sid=-\n\
+        closed pgid=7dead_seen uniqueid=9 at=9\n";
+    let dir = records(&[("41983-999.run", &dead_record()), ("5-1.run", torn)]);
+    assert!(read_records(dir.path(), None).is_err());
+    let (ended, lines) = start_pass(dir.path(), &k);
+    assert_eq!(ended, 0);
+    assert!(
+        lines.iter().all(|line| !line.contains("could not admit")),
+        "{lines:?}"
+    );
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("41983"), "{lines:?}");
+    assert!(!dir.path().join("5-1.run").exists(), "another boot's");
 }
 
 /// A dead run's record is kept with `dead_seen` appended once while any member remains named or unjudged, and removed once nothing is left.
@@ -1171,7 +1196,7 @@ fn a_non_directory_does_not_admit_an_empty_records_snapshot() {
     let path = dir.path().join("verify-runs");
     let bytes = dead_record();
     std::fs::write(&path, &bytes).expect("non-directory fixture");
-    assert!(read_records(&path).is_err());
+    assert!(read_records(&path, None).is_err());
     let k = FakeKernel::default();
     let (ended, _) = start_pass(&path, &k);
     assert_eq!(ended, 0);
@@ -1855,7 +1880,7 @@ fn a_stage_groups_line_is_bounded_whatever_its_label() {
         );
         assert!(group.len() < 600, "{} bytes: {group}", group.len());
     }
-    let read = read_records(dir.path()).expect("the record reads back whole");
+    let read = read_records(dir.path(), None).expect("the record reads back whole");
     assert_eq!(read.len(), 1, "{text}");
     assert_eq!(read[0].1.groups[0].stage, fits, "{text}");
     let cut = &read[0].1.groups[1].stage;

@@ -29,8 +29,8 @@ fn discovery_and_rejected_browser_spawn_reach_a_hostless_outcome() {
     .unwrap();
     note_met(MetWord::BlockPage, Some("old.example"));
     let cmd = headless_browser_command(&browser, tmp.path(), &|_| None);
-    let (cmd_read, _cmd_write) = std::io::pipe().unwrap();
-    let (_out_read, out_write) = std::io::pipe().unwrap();
+    let (cmd_read, _cmd_write) = aterm_uds::pipe().unwrap();
+    let (_out_read, out_write) = aterm_uds::pipe().unwrap();
     let error = start_browser(cmd, cmd_read.into(), out_write.into()).unwrap_err();
     assert!(!error.contains("private"));
     let expected = super::super::open_url::Met::new(MetWord::BrowserStart, None);

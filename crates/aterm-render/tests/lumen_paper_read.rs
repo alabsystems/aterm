@@ -165,9 +165,7 @@ fn typed_frames(
             true,
             look.cursor,
         );
-        if spec.tall {
-            r.fx.set_ribbon_shape(true, spec.flat);
-        }
+        r.fx.set_ribbon_shape(spec.tall, spec.flat);
     }
     r.post = true;
     controls(&mut r.fx);

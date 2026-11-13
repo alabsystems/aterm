@@ -5046,7 +5046,7 @@ fn a_cd_cdpath_may_place_is_read_from_a_directory_the_check_cannot_place() {
         // when no home rule's path lexically leads the read (`cd ./sub` would stay a read).
         ("cd sub && cat README.md", inside),
         ("cd sub && cat .claude.json", inside),
-        ("cd crates/aterm-agent && cat SPECS.md", inside),
+        ("cd crates/aterm-agent && cat NOTES.md", inside),
         ("cd crates && grep -rn token .", inside),
         ("cd crates && grep -rn token", inside),
         ("cd src && rg -n token", inside),
@@ -9323,7 +9323,7 @@ fn shell_word(dir: &Path) -> String {
 
 fn scratch_git(dir: &Path, args: &[&str]) {
     let out = aterm_uds::deadline::output_until(
-        aterm_uds::spawnfd::command(crate::test_program::git())
+        crate::test_program::kept_git_command()
             .args(args)
             .current_dir(dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")

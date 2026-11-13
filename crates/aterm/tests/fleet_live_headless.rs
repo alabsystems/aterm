@@ -4508,6 +4508,9 @@ fn a_granted_member_does_only_what_the_driven_macs_fleet_access_admits() {
             "the header says access={want} beside drive=1: {head}"
         );
     };
+    // A folder the driven machine holds on any OS (`/private/tmp` is macOS's alone).
+    let cwd = format!("cwd={}", held.tmp.display());
+    let spawn = ["spawn", cwd.as_str(), "why=look"];
     let refused = |args: &[&str], level: &str, needs: &str| {
         let out = drive_in(&driver.tmp, &target, args);
         let said = String::from_utf8_lossy(&out.stderr);
@@ -4534,7 +4537,7 @@ fn a_granted_member_does_only_what_the_driven_macs_fleet_access_admits() {
         "read",
         "write",
     );
-    refused(&["spawn", "cwd=/private/tmp", "why=look"], "read", "full");
+    refused(&spawn, "read", "full");
     assert_eq!(field(&status(&held, &sid), "hold_by"), Some("-"));
     assert_eq!(sessions(), before, "nothing was started");
 
@@ -4542,7 +4545,7 @@ fn a_granted_member_does_only_what_the_driven_macs_fleet_access_admits() {
     header("write");
     drive_ok(&driver.tmp, &target, &["hold", &sid, "on"]);
     assert_eq!(field(&status(&held, &sid), "hold_by"), Some("remote"));
-    refused(&["spawn", "cwd=/private/tmp", "why=look"], "write", "full");
+    refused(&spawn, "write", "full");
     assert_eq!(sessions(), before, "nothing was started");
 
     // A drop: the member can hand the session back no more, so this Mac does, at the next
@@ -4562,11 +4565,7 @@ fn a_granted_member_does_only_what_the_driven_macs_fleet_access_admits() {
 
     fleet_ok(&held.tmp, &["access", "full"], None);
     header("full");
-    let (spawned, _) = drive_ok(
-        &driver.tmp,
-        &target,
-        &["spawn", "cwd=/private/tmp", "why=look"],
-    );
+    let (spawned, _) = drive_ok(&driver.tmp, &target, &spawn);
     assert!(spawned.starts_with("OK s-"), "{spawned}");
     assert_eq!(sessions(), before + 1, "the spawn opened one session");
     // And the drop leaves what was started running, and readable.

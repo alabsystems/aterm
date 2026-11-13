@@ -376,6 +376,29 @@ pub(crate) fn seat_label(log: &Log, actor: &MemberId) -> String {
     label_of(log, &log.membership(), actor)
 }
 
+/// Every seat `log` has held, a Mac now out included: its actor, the Commons machine its binding
+/// names, and its label as the log shows it. What names the writer of a record a removed Mac
+/// signed while it was a member.
+#[must_use]
+pub fn seats_ever(log: &Log) -> Vec<(MemberId, [u8; 16], String)> {
+    let membership = log.membership_ref();
+    let mut seats: Vec<(MemberId, [u8; 16], String)> = membership
+        .members()
+        .iter()
+        .map(|(actor, member)| (*actor, *member.binding.machine(), member.label.clone()))
+        .collect();
+    for actor in membership.removed().keys() {
+        if let Some((_, entrant)) = earliest_admit_of(log, actor) {
+            seats.push((
+                *actor,
+                *entrant.request.binding().machine(),
+                entrant.label.clone(),
+            ));
+        }
+    }
+    seats
+}
+
 /// The label of the Mac whose age recipient is `recipient`, as `log` shows it: a member, a Mac
 /// now out or a founder the genesis lists; `a Mac` where the log names none (`claude_token`'s
 /// exposure).

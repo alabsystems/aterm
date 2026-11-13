@@ -17,6 +17,14 @@ use std::time::Duration;
 /// endpoint's intermittent HTTP 500 is usually still answering a moment later.
 pub const RETRY_PAUSE: Duration = Duration::from_secs(5);
 
+/// The suffix a publisher that writes over GitHub's REST API with a token stages a replacement
+/// asset under during a [`Replace::Clobber`]: it uploads `{name}.atpkg-staged`, deletes `name`,
+/// then renames the staged copy. Lane snapshots installed before agh became the only host still
+/// publish that way, and a replace cut short leaves the staged copy alone on the release. The
+/// one-version guard (D51, `artifact::upload`) therefore reads a staged manifest under this
+/// name too, and `AghHost`'s clobber deletes such a leftover before it replaces the same name.
+pub const STAGED: &str = ".atpkg-staged";
+
 /// `<owner>/<repo>` on the release host.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Slug {
@@ -123,6 +131,24 @@ pub trait ReleaseHost {
     /// [`HostError::NotFound`] when there is none — an answer, unlike
     /// [`HostError::Unreachable`]; otherwise why it failed.
     fn release(&self, slug: &Slug, tag: &str) -> Result<Release, HostError>;
+
+    /// Complete an existing release only through this host's original native
+    /// create intent. This never creates a new release or adopts an unowned one.
+    /// `false` means no existing owned object could be completed.
+    /// # Errors
+    /// Unsupported recovery, unknown ownership, permission or changed bytes.
+    fn complete_created(
+        &self,
+        _slug: &Slug,
+        _tag: &str,
+        _title: &str,
+        _notes: &str,
+        _files: &[PathBuf],
+    ) -> Result<bool, HostError> {
+        Err(HostError::Refused(
+            "the release host has no native create-intent recovery".into(),
+        ))
+    }
 
     /// Downloads `assets` of release `tag` into `dir`.
     ///

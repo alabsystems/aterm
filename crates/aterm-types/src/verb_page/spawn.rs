@@ -44,7 +44,8 @@ pub(crate) const PAGE: Page = Page {
         ),
         row(
             "raise=<t|f>",
-            "bring it to front (default true with no window named, else false)",
+            "bring it to front (default true with no window named, else false); from a tab not in \
+             front of the person it opens behind",
         ),
         row("cwd=<path>", "its folder"),
         row(
@@ -145,10 +146,8 @@ pub(crate) const PAGE: Page = Page {
                 ),
                 para(
                     "It replies `GO <n>`, reads `<n>` task bytes (`1..=65536`, no NUL; `ERR spawn \
-                     agent=<word>: the task is <n> bytes (max 65536)` beyond; `agent=gemini`, the \
-                     retired Gemini CLI, is `ERR spawn agent=gemini: Gemini CLI is no longer \
-                     supported: agy replaces it (agent=agy)`; `aterm ctl spawn agent=<word> \
-                     [model=<m>] [cwd=<p>] -` reads stdin), writes `<state>/tasks/` \
+                     agent=<word>: the task is <n> bytes (max 65536)` beyond; `aterm ctl spawn \
+                     agent=<word> [model=<m>] [cwd=<p>] -` reads stdin), writes `<state>/tasks/` \
                      (`ATERM_TASK_FILE`), and at the login shell's (`zsh`/`bash`/`fish`) first \
                      prompt launches the interactive agent (`--prompt-interactive=` for `agy`; \
                      `--trust-workspace`, `--contributor-mode off` and `--reasoning-effort xhigh` \

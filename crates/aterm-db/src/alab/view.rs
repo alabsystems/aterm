@@ -46,6 +46,14 @@ pub struct Machine {
     /// The nickname's text, automatic-write provenance and conflict state.
     pub nickname: MachineNickname,
     pub aliases: Vec<String>,
+    /// The registry's status word (`planned`, `active`, `parked`, `lost`).
+    pub status: Option<String>,
+    /// The operating system the registry records for it.
+    pub os: Option<String>,
+    /// The chip the registry records for it.
+    pub chip: Option<String>,
+    /// The memory the registry records for it, in GB.
+    pub ram_gb: Option<u64>,
     pub live: bool,
 }
 
@@ -53,6 +61,8 @@ pub struct Machine {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
     pub pk: String,
+    /// The provider's key (`anthropic`, `openai`, …).
+    pub provider: Option<String>,
     /// The canonical realm (`claude`, `codex`, `kimi:global`, …).
     pub realm: Option<String>,
     /// What the row is called: the owner's or the import's label, else its default
@@ -66,6 +76,8 @@ pub struct Account {
     /// The provider identity, when the login is an alias.
     pub identity: Option<String>,
     pub status: Option<String>,
+    /// The plan's key, where the registry names one.
+    pub plan: Option<String>,
     pub region: Option<String>,
     pub flow: Option<String>,
     pub browser: Option<String>,
@@ -164,10 +176,36 @@ fn label_number(label: Option<&str>) -> u64 {
 }
 
 impl LabView {
+    /// Read canonical identities from the authenticated registry view.
+    pub fn read_view(
+        view: &crate::typed::View,
+        facts: &OwnedRead,
+        obs: &OwnedRead,
+        me_uuid: Option<&str>,
+    ) -> Self {
+        Self::read_projected(&view.cells, view.project(&MACHINE), facts, obs, me_uuid)
+    }
+
     /// Project `cells`, this Mac's facts row among `facts` at `me_uuid` (32 hex), and the
     /// mailbox observations `obs`.
-    pub fn read(cells: &Cells, facts: &OwnedRead, obs: &OwnedRead, me_uuid: Option<&str>) -> Self {
-        let machines: BTreeMap<String, Machine> = cell::project(&MACHINE, cells)
+    #[cfg(test)]
+    pub(crate) fn read(
+        cells: &Cells,
+        facts: &OwnedRead,
+        obs: &OwnedRead,
+        me_uuid: Option<&str>,
+    ) -> Self {
+        Self::read_projected(cells, cell::project(&MACHINE, cells), facts, obs, me_uuid)
+    }
+
+    fn read_projected(
+        cells: &Cells,
+        machines: cell::Projection,
+        facts: &OwnedRead,
+        obs: &OwnedRead,
+        me_uuid: Option<&str>,
+    ) -> Self {
+        let machines: BTreeMap<String, Machine> = machines
             .rows
             .into_iter()
             .map(|(pk, row)| {
@@ -184,6 +222,10 @@ impl LabView {
                     label: unconflicted_text(&row, "label"),
                     nickname: machine_nickname(&row),
                     aliases,
+                    status: text(&row, "status"),
+                    os: text(&row, "os"),
+                    chip: text(&row, "chip"),
+                    ram_gb: row.get("ram_gb").and_then(Value::as_u64),
                     live: row.live(),
                 };
                 (pk, machine)
@@ -200,11 +242,13 @@ impl LabView {
             .map(|(pk, row)| {
                 let account = Account {
                     label: registry::account_label(&pk, &row),
+                    provider: text(&row, "provider"),
                     realm: text(&row, "realm"),
                     legacy_label: text(&row, "legacy_label"),
                     login: address(row.get("login").and_then(Value::as_str)),
                     identity: address(row.get("identity").and_then(Value::as_str)),
                     status: text(&row, "status"),
+                    plan: text(&row, "plan"),
                     region: text(&row, "region"),
                     flow: text(&row, "flow"),
                     browser: text(&row, "browser"),

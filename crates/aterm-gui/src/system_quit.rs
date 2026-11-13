@@ -3,7 +3,8 @@
 
 //! The quit the system asked for (a logout, a restart or a shutdown), the quit System Settings
 //! asked for to reopen aterm ([`crate::quit_reopen`]), and the end of a failed event loop, after
-//! which the agents aterm hosted relaunch at the next start. The first two are the person's
+//! which the agents aterm hosted relaunch at the next start, with the status a run ends with
+//! ([`run_end_status`]). The first two are the person's
 //! answer already, so aterm puts no question of its own before them ([`explicit`]).
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,6 +42,63 @@ pub(crate) const EXIT_WINDOW_SYSTEM_GONE: i32 = 69;
 
 /// The exit status of a run whose event loop failed some other way.
 pub(crate) const EXIT_EVENT_LOOP_FAILED: i32 = 70;
+
+/// The exit status of a run whose first window surface could not be created (sysexits'
+/// `EX_CANTCREAT`, "cannot create output"). A handoff parent books it, as any failing exit,
+/// against the bytes it launched (`PhysicalFailureShape::successor_failed_to_start`), where exit 0
+/// reads as the successor's ordinary refusal and marks nothing.
+pub(crate) const EXIT_FIRST_SURFACE_FAILED: i32 = 73;
+
+/// The status a run ends with: its failed event loop's own ([`EXIT_WINDOW_SYSTEM_GONE`],
+/// [`EXIT_EVENT_LOOP_FAILED`]) where `loop_failed` names one, else
+/// [`EXIT_FIRST_SURFACE_FAILED`] where its first window surface could not be created, else 0.
+pub(crate) const fn run_end_status(loop_failed: Option<i32>, first_surface_failed: bool) -> i32 {
+    match loop_failed {
+        Some(status) => status,
+        None if first_surface_failed => EXIT_FIRST_SURFACE_FAILED,
+        None => 0,
+    }
+}
+
+/// What the event loop does once its first window's surface was attached, or could not be
+/// created ([`crate::App::first_surface_attached`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FirstSurface {
+    /// The surface is there: the run goes on.
+    Attached,
+    /// It could not be created, and the loop exits now.
+    ExitNow,
+    /// It could not be created, and the loop exits once the account drain lets it
+    /// (`Continuation::StartupFailure`).
+    ExitOnceDrained,
+}
+
+impl crate::App {
+    /// The first window's surface was `attached`, or could not be created: then the run is marked
+    /// to end with [`EXIT_FIRST_SURFACE_FAILED`] ([`crate::App::end_status`]), and the answer says
+    /// whether the loop exits now or once the account drain lets it.
+    pub(crate) fn first_surface_attached(&mut self, attached: bool) -> FirstSurface {
+        if attached {
+            return FirstSurface::Attached;
+        }
+        crate::logging::stderr_line!(
+            "aterm-gui: could not create the initial window surface; exiting with status \
+             {EXIT_FIRST_SURFACE_FAILED}"
+        );
+        self.first_surface_failed = true;
+        if self.initial_surface_exit_ready() {
+            FirstSurface::ExitNow
+        } else {
+            FirstSurface::ExitOnceDrained
+        }
+    }
+
+    /// The status this run ends with ([`run_end_status`]), its event loop having failed with
+    /// `loop_failed`'s status or not.
+    pub(crate) const fn end_status(&self, loop_failed: Option<i32>) -> i32 {
+        run_end_status(loop_failed, self.first_surface_failed)
+    }
+}
 
 /// Whether quit reason `code` is a logout, a restart or a shutdown.
 #[cfg(any(target_os = "macos", test))]

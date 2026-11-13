@@ -15,7 +15,8 @@ pub(crate) const PAGE: Page = Page {
             "a digest of every session of every instance here (and of the fleet's Macs)",
         ),
         row(
-            "aterm ctl survey [--json] [--sid <s-…>] [--fleet | --host <h>]",
+            "aterm ctl survey [--json] [--sid <s-…>] [--fleet | --host <h> [--holder \
+             <pid>.<boot>.<start>]]",
             "the rows themselves, one session (--sid), every Mac or one other Mac",
         ),
         row(
@@ -23,7 +24,7 @@ pub(crate) const PAGE: Page = Page {
             "`log n` and `brief all` in one digest",
         ),
         row(
-            "survey [facts|content]",
+            "survey [facts|content] [holder=<pid>.<boot>.<start>]",
             "the raw request one instance answers (owner, and fleet-readable under `[fleet] \
              allow`); `aterm ctl` sends it and takes no facts|content word",
         ),
@@ -31,6 +32,12 @@ pub(crate) const PAGE: Page = Page {
     options: &[
         row("--fleet", "every fleet member's sessions too"),
         row("--host <h>", "another Mac's"),
+        row(
+            "--holder <pid>.<boot>.<start>",
+            "with --host: that Mac's kernel judges one process, a release line's holder; \
+             --json gives `release_holder` ({\"alive\":true|false|null}, null where no row came \
+             or the Mac did not prove the node asked) and `proven_node`",
+        ),
         row(
             "--timeout <s>",
             "after `survey`, with --fleet or --host: each peer's deadline (default 3, at most \
@@ -47,8 +54,8 @@ pub(crate) const PAGE: Page = Page {
         row(
             "OK <n>",
             "then an `instance` header row, one `session` row per session, then `release_line`, \
-             `account` (one per pooled account), `repo` (content) and `server_heard` rows (`help \
-             survey instance`)",
+             `account` (one per pooled account), `repo` (content) and `server_heard` rows, and a \
+             `release_holder` row where the request named `holder=` (`help survey instance`)",
         ),
         row(
             "instance",
@@ -86,7 +93,8 @@ pub(crate) const PAGE: Page = Page {
             rows: &[
                 para(
                     "Owner-only and fleet-readable (`[fleet] allow`). The raw control request is \
-                     `survey [facts|content]`. It replies `OK <n>`, an `instance pid= host=<pct> \
+                     `survey [facts|content] [holder=<pid>.<boot>.<start>]`. It replies `OK \
+                     <n>`, an `instance pid= host=<pct> \
                      version= sessions=<n> level=<facts|content> cut=<n> at_ms=<unix ms> \
                      node=<32 hex|-> instances=<n> label=<pct|-> window=<0|1> window_last=<unix \
                      s|-> ssh_host_key=<pct|-> accounts=<n> accounts_unread=<cli>[,…]|-> \
@@ -135,7 +143,11 @@ pub(crate) const PAGE: Page = Page {
                      a `repo name=<pct> path= head= branch= main= behind= fetched_at= \
                      dirty=<0|1|->` row per checkout of that read, and one `server_heard \
                      vault=<pct> subject=<age1…> at=<unix s>` row per subscriber a vault served \
-                     here last heard from.",
+                     here last heard from. A request naming `holder=` ends with one \
+                     `release_holder alive=<0|1|-> pid= boot= start=` row: this Mac's kernel, \
+                     read for that request, on exactly that process (`0` only on another boot, no \
+                     such pid, an exited one or another start; `-` where the kernel did not \
+                     say).",
                 ),
             ],
         },

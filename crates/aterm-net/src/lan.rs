@@ -19,7 +19,7 @@ mod multicast;
 mod native;
 pub use listener::Listener;
 pub(crate) use listener::Witness as ListenerWitness;
-pub use multicast::Multicast;
+pub use multicast::{Heard, Multicast};
 
 /// Loopback is an explicit local/test transport, never inferred as a LAN.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -445,6 +445,31 @@ thread_local! {
 /// unseen.
 const ATTACHMENTS_REREAD: Duration = Duration::from_secs(10);
 
+/// Keep no read of the attachments: the next [`local_attachments`] of each asks the OS. A
+/// listener that heard a change on its own routing socket ([`Listener::drain_changes`]) judges
+/// by what the OS says now, whether or not the socket that moves the generation
+/// ([`native::interface_generation`], another socket) has been handed the message yet.
+fn forget_attachments() {
+    kept_attachments(AttachmentMemo::forget);
+}
+
+/// The instant by which a listener bound to `local` that hears nothing must judge its
+/// attachment by a fresh read all the same. On macOS, where the kernel drops a routing message
+/// from a full socket and says nothing, that is when the read it last judged by stops being kept
+/// ([`ATTACHMENTS_REREAD`] after it was made, so the recheck then reads again), or one
+/// [`crate::slots::ACCEPT_POLL`] from now where none is kept (no generation, so every recheck
+/// reads). `None` on Linux: rtnetlink reports a lost message as an error on the listener's own
+/// socket, which withdraws it ([`Listener::drain_changes`]).
+fn unheard_look(local: SocketAddr) -> Option<Instant> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    Some(
+        kept_attachments(|memo| memo.kept_until(Some(local), None))
+            .unwrap_or_else(|| attachments_clock() + crate::slots::ACCEPT_POLL),
+    )
+}
+
 /// The attachments read under one interface generation, for each `(local, selected)` asked.
 struct AttachmentMemo {
     held: std::sync::Mutex<Vec<HeldAttachments>>,
@@ -466,6 +491,25 @@ impl AttachmentMemo {
         Self {
             held: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// When the read kept for `local` and `selected` passes [`ATTACHMENTS_REREAD`], whatever
+    /// generation it was read under. `None` where none is kept.
+    fn kept_until(&self, local: Option<SocketAddr>, selected: Option<u32>) -> Option<Instant> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|held| held.local == local && held.selected == selected)
+            .map(|held| held.read_at + ATTACHMENTS_REREAD)
+    }
+
+    /// Keep nothing: the next read of each `(local, selected)` runs its `read`.
+    fn forget(&self) {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     /// The attachments `read` gives for `local` and `selected`, kept under `generation` (taken

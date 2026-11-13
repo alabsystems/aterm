@@ -1127,6 +1127,18 @@ fn preview_summaries_name_the_setting_in_plain_words() {
     assert_eq!(sample.candidate_badge(), "Sample: Nord");
     assert_ne!(sample.paint_fingerprint(), pair.paint_fingerprint());
 
+    let legacy_name = SettingsPreviewSpec::appearance(14.0)
+        .with_terminal_theme_identity(PreviewThemeIdentity {
+            label: "aterm Night".to_string(),
+            light: false,
+        })
+        .with_focus(crate::prefs::EDIT_THEME, "Aterm Night");
+    assert_eq!(legacy_name.candidate_badge(), "Theme: aterm Night");
+    assert_eq!(
+        legacy_name.with_theme_sample(true).candidate_badge(),
+        "Sample: aterm Night"
+    );
+
     let ligatures = SettingsPreviewSpec::typography(12.0)
         .with_focus(crate::prefs::EDIT_LIGATURES, "true")
         .with_focus_label("Ligatures");
@@ -1284,7 +1296,7 @@ fn theme_stage_speaks_and_badges_the_theme_as_painted() {
         SettingsPreviewSpec::appearance(14.0)
             .with_terminal_theme(NORD)
             .with_terminal_theme_identity(PreviewThemeIdentity {
-                label: "Default".to_string(),
+                label: value.to_string(),
                 light: false,
             })
             .with_focus(crate::prefs::EDIT_THEME, value)
@@ -2514,15 +2526,16 @@ fn rainbow_cursor(raw: &'static str) -> CursorPreviewSpec {
 }
 
 #[test]
-fn the_preview_s_rainbow_is_the_underline() {
+fn the_preview_s_rainbow_draws_its_band() {
     let theme = Theme::default();
     let rainbow = rainbow_cursor("rainbow");
     let cfg = rainbow.glow_config(theme, 0.5, true);
-    assert!(!cfg.ribbon_tall && !cfg.ribbon_flat);
+    assert!(cfg.ribbon_tall && !cfg.ribbon_flat);
     assert_eq!(rainbow.effective_trail_style_raw(), "rainbow");
-    // A retired name is no style: the card draws the default, the same underline.
-    let retired = rainbow_cursor("rainbow kitty tall");
-    assert!(!retired.glow_config(theme, 0.5, true).ribbon_tall);
+    // A retired name is no style: the card draws the default, the same band.
+    let retired = rainbow_cursor("rainbow kitty underline");
+    let retired = retired.glow_config(theme, 0.5, true);
+    assert!(retired.ribbon_tall && !retired.ribbon_flat);
 }
 
 /// The rainbow kitty looks the light fork's companion pins preview.
@@ -2640,13 +2653,7 @@ fn the_preview_s_glass_keeps_the_page_law() {
     let cursor = rainbow_cursor("rainbow");
     let bed = |clear: bool| {
         let cfg = cursor.glow_config_at(paper, 0.5, clear, Live::Glass);
-        // The glass is the tall body's bed: the card's own rainbow, the underline, lays none,
-        // so the bed read here is the engine's tall config under the card's light.
-        let tall = aterm_effects::cursor_glow::GlowConfig {
-            ribbon_tall: true,
-            ..cfg
-        };
-        let lut = BedInkLut::synced(&rk::Config::from_glow(&tall, false));
+        let lut = BedInkLut::synced(&rk::Config::from_glow(&cfg, false));
         (cfg.light, lut.glass_lit())
     };
     let (light, glass) = bed(true);
@@ -5856,8 +5863,12 @@ fn no_light_stands_cut_at_the_cards_edge() {
         !drops.is_empty(),
         "negative control: Water's drops drawn cut at the edge"
     );
-    // The rainbow's control went with its tall band: the underline has no exit to cut.
-    for (raw, ground, rows) in [("fire", ("dark", dark), 3), ("fire", ("light", light), 3)] {
+    for (raw, ground, rows) in [
+        ("rainbow", ("dark", dark), 4),
+        ("rainbow", ("light", light), 4),
+        ("fire", ("dark", dark), 3),
+        ("fire", ("light", light), 3),
+    ] {
         let cut = with_law_off(rows, &|c| c.rises_kept = false, raw, ground);
         assert!(
             !cut.is_empty(),
@@ -6074,12 +6085,10 @@ fn the_cards_letters_read_under_every_light() {
                 thin_ink: card_thin_ink(theme, prepared, scale),
                 ..aterm_effects::host::PageFacts::OPAQUE
             };
-            // The rainbow is the underline, which lays no glass; a frame that does lay it
-            // (the engine's tall body) is still judged in that frame.
             if page.glass() {
                 assert!(
-                    glass_frames == 0 || (judged_glass_frames > 0 && retained_word_frames > 0),
-                    "{face} at {scale}x: an admitted page that lays glass must retain it beneath an ordinary word and pass its finite unchanged judge in that frame"
+                    glass_frames > 0 && judged_glass_frames > 0 && retained_word_frames > 0,
+                    "{face} at {scale}x: an admitted page must retain nonzero final glass beneath an ordinary word and pass its finite unchanged judge in that frame"
                 );
             }
         }

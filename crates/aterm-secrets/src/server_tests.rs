@@ -301,29 +301,76 @@ fn the_first_envelope_is_trusted_on_first_use_and_served_with_an_etag() {
     running.stop();
 }
 
+/// An empty store's note says who may give it a first version and how one comes, each only where
+/// that holds: off macOS no server finds this one or is pulled from, a pull brings a first version
+/// only for a pinned name, and no note says a Mac in the vault fills every store, which a Linux
+/// member's store, empty for good, disproved.
 #[test]
-fn a_store_that_holds_no_vault_says_a_mac_in_the_vault_puts_its_copy_here() {
+fn a_store_that_holds_no_vault_says_how_a_first_version_comes() {
     let root = aterm_tempfile::tempdir().expect("tempdir");
     let running = run(&options(
         &root.path().join("served"),
         Duration::from_millis(200),
     ));
     let pins = [("alab".to_string(), OLD)];
-    let unheld =
-        |pins: &[(String, [u8; 32])]| unheld_note(&running.shared.lock_server_state(), pins);
-    let pinned = unheld(&pins).expect("an empty store says so");
+    let unheld = |pins: &[(String, [u8; 32])], bonjour| {
+        unheld_note(&running.shared.lock_server_state(), pins, bonjour, false)
+    };
+    let advertised = unheld(&pins, Bonjour::Advertised).expect("an empty store says so");
     assert!(
-        pinned.contains("a Mac in the vault puts its copy here"),
-        "{pinned}"
+        advertised.contains("a vault this server pins (alab)")
+            && advertised.contains("a subscriber whose vault source is this server")
+            && advertised.contains("for alab, pulled from a server this one finds over Bonjour"),
+        "{advertised}"
     );
+    let unpinned_advertised = unheld(&[], Bonjour::Advertised).expect("an empty store says so");
     assert!(
-        pinned.contains("a vault this server pins (alab)"),
-        "{pinned}"
+        unpinned_advertised.contains("pulls no first version")
+            && !unpinned_advertised.contains("pulled from a"),
+        "{unpinned_advertised}"
     );
-    let unpinned = unheld(&[]).expect("an empty store says so");
-    assert!(unpinned.contains("only from this Mac"), "{unpinned}");
+    // A role decider can pin a vault after start, so its unpinned note promises no lasting
+    // refusal.
+    let decided = unheld_note(
+        &running.shared.lock_server_state(),
+        &[],
+        Bonjour::Advertised,
+        true,
+    )
+    .expect("an empty store says so");
+    assert!(
+        decided.contains("until it pins a vault")
+            && decided.contains("only for a vault it comes to pin")
+            && !decided.contains("pulls no first version"),
+        "{decided}"
+    );
+    let absent = unheld(&pins, Bonjour::Absent).expect("an empty store says so");
+    assert!(
+        absent.contains("Bonjour on macOS only")
+            && absent.contains("only a machine that names its address reaches it")
+            && !absent.contains("pulled from a server"),
+        "{absent}"
+    );
+    let unadvertised = unheld(&pins, Bonjour::Unadvertised).expect("an empty store says so");
+    assert!(
+        unadvertised.contains("advertises nothing") && !unadvertised.contains("pulled from a"),
+        "{unadvertised}"
+    );
+    for said in [&advertised, &absent, &unadvertised] {
+        assert!(!said.contains("Mac in the vault"), "{said}");
+    }
+    let unpinned = unheld(&[], Bonjour::Absent).expect("an empty store says so");
+    assert!(unpinned.contains("only from this machine"), "{unpinned}");
+    assert_eq!(
+        Bonjour::here(true),
+        if cfg!(target_os = "macos") {
+            Bonjour::Advertised
+        } else {
+            Bonjour::Absent
+        }
+    );
     put(&running, &envelope(&OLD, 1)).expect("trusted on first use");
-    assert_eq!(unheld(&pins), None);
+    assert_eq!(unheld(&pins, Bonjour::Absent), None);
     running.stop();
 }
 
@@ -2410,6 +2457,81 @@ fn a_put_is_refused_while_a_publish_holds_the_lock_and_clears_a_lock_its_dead_ho
         }
     }
     running.stop();
+}
+
+/// The route readers ask the routing table before they connect, and connect only where the
+/// table leaves the question open: the IPv4 reader takes the table's word, its "none" included,
+/// and connects where the table was not read; the IPv6 reader makes no connect where the table
+/// says no route takes the destination, and otherwise takes the connected socket's address.
+/// A connect toward a destination no route takes is what makes the kernel send an `RTM_MISS` to
+/// every routing socket on the Mac, so the connect not being made is the whole property
+/// (`aterm_uds`'s live tests hold that the asks themselves are heard by nobody).
+///
+/// NEGATIVE CONTROLS (2026-11-12): with `primary_ipv6_by` connecting whatever `routed` said,
+/// this fails at "no route: no connect" (`left: 1, right: 0`); with `primary_ipv4_by` connecting
+/// first (`connected(to).or_else(|| asked(to).flatten())`), it gives the socket's address for
+/// the table's (`left: Some(192.0.2.8), right: Some(192.0.2.7)`).
+#[test]
+fn a_route_reader_makes_no_connect_the_routing_table_already_answered() {
+    let connects = std::cell::Cell::new(0);
+    let table: Ipv4Addr = "192.0.2.7".parse().expect("address");
+    let socket: Ipv4Addr = "192.0.2.8".parse().expect("address");
+    let connected = |to: Ipv4Addr| {
+        assert_eq!(to, Ipv4Addr::new(192, 0, 2, 1));
+        connects.set(connects.get() + 1);
+        Some(socket)
+    };
+    assert_eq!(
+        primary_ipv4_by(|_| Some(Some(table)), connected),
+        Some(table)
+    );
+    assert_eq!(primary_ipv4_by(|_| Some(None), connected), None);
+    assert_eq!(
+        connects.get(),
+        0,
+        "the table's word is taken with no connect"
+    );
+    assert_eq!(primary_ipv4_by(|_| None, connected), Some(socket));
+    assert_eq!(
+        connects.get(),
+        1,
+        "the table was not read: the connect asks"
+    );
+
+    let connects = std::cell::Cell::new(0);
+    let source: Ipv6Addr = "2001:db8::8".parse().expect("address");
+    let connected = |to: Ipv6Addr| {
+        assert_eq!(to, "2001:db8::1".parse::<Ipv6Addr>().expect("address"));
+        connects.set(connects.get() + 1);
+        Some(source)
+    };
+    // Where no route takes the destination the connect has no address either: only its being
+    // made tells the two apart, and that is what the kernel answers with an `RTM_MISS`.
+    let unrouted = |to: Ipv6Addr| connected(to).and(None);
+    assert_eq!(primary_ipv6_by(|_| Some(false), unrouted), None);
+    assert_eq!(connects.get(), 0, "no route: no connect");
+    assert_eq!(primary_ipv6_by(|_| Some(true), connected), Some(source));
+    assert_eq!(connects.get(), 1, "a route: the kernel's own source");
+    assert_eq!(primary_ipv6_by(|_| None, connected), Some(source));
+    assert_eq!(
+        connects.get(),
+        2,
+        "the table was not read: the connect asks"
+    );
+}
+
+/// On this Mac, each route reader gives the address the connected socket takes, as it did when
+/// the connect was all it asked: toward TEST-NET-1 and the IPv6 documentation prefix, which
+/// only a default route takes, so the connects this test makes ask macOS nothing and send no
+/// packet. Both are `None` on a Mac with no such route.
+#[cfg(target_os = "macos")]
+#[test]
+fn the_route_readers_give_the_address_a_connected_socket_takes() {
+    assert_eq!(primary_ipv4(), source_ipv4(Ipv4Addr::new(192, 0, 2, 1), 9));
+    assert_eq!(
+        primary_ipv6(),
+        source_ipv6("2001:db8::1".parse().expect("address"))
+    );
 }
 
 #[test]

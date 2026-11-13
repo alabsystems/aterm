@@ -299,10 +299,12 @@ fn a_sha256_repository_reads_its_baseline_through_a_view_of_its_own_format() {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let head = fixture_git(root, &["rev-parse", "HEAD"]);
     assert_eq!(head.len(), 64, "a SHA-256 commit: {head}");
-    assert_eq!(
-        baseline(root, "HEAD", &path).unwrap(),
-        ("0.8.0".to_string(), head)
-    );
+    let reads = Reads {
+        root,
+        path_env: &path,
+    };
+    let (_, version, commit) = candidate_baseline(&reads, "HEAD").unwrap();
+    assert_eq!((version, commit), ("0.8.0".to_string(), head));
 }
 
 #[test]

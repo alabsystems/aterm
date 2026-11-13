@@ -2053,7 +2053,7 @@ pub(crate) fn a_box_beside_an_older_report(now_unix: i64) -> Vec<SessionRow> {
     let report = crate::needs::NeedFacts {
         attention: vec![crate::needs::AttentionFact {
             owner: crate::harness_host::NEEDS_ATTENTION_OWNER.to_string(),
-            text: "claude needs you: the release credential to sign 0.48.0 (+1 more) \u{2014} carrying on"
+            text: "claude needs you: the release permission to sign 0.48.0 (+1 more) \u{2014} carrying on"
                 .to_string(),
             kind: Some(aterm_types::needs::AttentionKind::Ask),
         }],

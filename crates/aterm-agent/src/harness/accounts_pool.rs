@@ -3043,8 +3043,77 @@ pub fn cold_launch_env(
     read: ReadUsage<'_>,
     program: Option<&Path>,
 ) -> Result<Option<LoginEnv>, String> {
+    cold_launch_env_asked(seat, cli, env, read, program, None).map(|asked| asked.pick)
+}
+
+/// What [`cold_launch_env_asked`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColdAsked {
+    /// The login the relaunch starts under; `None` keeps the one it ran on.
+    pub pick: Option<LoginEnv>,
+    /// Why the account its restart asked for was not taken: its refusal word
+    /// ([`MOVE_UNREAD`] and the words beside it), or what its admission failed on. `None` where
+    /// none was asked or the relaunch starts on it.
+    pub kept: Option<String>,
+}
+
+/// [`cold_launch_env`] for a relaunch whose restart asked for an account (`wanted`, the stamp's:
+/// `aterm ctl restart account=<label>` or `account-auto`). The asked row is honoured here, once,
+/// and only where it proves it serves: it is none of the row the session ran on or another row
+/// of that account, it is signed in on this Mac, not held for another, not at a limit, its login
+/// names its own account ([`check_login_identity`], as the row it ran on must), the program
+/// keeps a row's login its own, and it holds a usage reading no older than [`USAGE_FRESH_S`]
+/// under its current login, read now with `read` where that is due, one of the launch's
+/// [`LAUNCH_READS`]. Any failure of that keeps the decision [`cold_launch_env`] makes with none
+/// asked (so a session whose own row serves is never held down by the account it asked for),
+/// names why in [`ColdAsked::kept`], and keeps what the asked row's read recorded. Taking it
+/// writes no pin, no active row and no rotation: the move is that one process's.
+///
+/// # Errors
+/// As [`cold_launch_env`].
+pub fn cold_launch_env_asked(
+    seat: &Seat<'_>,
+    cli: Cli,
+    env: &[(&str, &str)],
+    read: ReadUsage<'_>,
+    program: Option<&Path>,
+    wanted: Option<&super::restart_stamp::Wanted>,
+) -> Result<ColdAsked, String> {
     let who = accounts::ProcessLogin::of_env_for(cli, env.iter().copied());
-    cold_launch_who(seat, cli, who, read, program)
+    let mut asked = ColdAsk {
+        wanted,
+        kept: wanted.map(|_| MOVE_UNMANAGED.to_owned()),
+    };
+    let pick = cold_launch_who_capturing(
+        seat,
+        cli,
+        who,
+        read,
+        program,
+        &mut asked,
+        &mut |_, _| Ok(()),
+    )?;
+    Ok(ColdAsked {
+        pick,
+        kept: asked.kept,
+    })
+}
+
+/// The account a cold relaunch's restart asked for, and why it was not taken
+/// ([`cold_launch_env_asked`]): [`MOVE_UNMANAGED`] until the admission reaches the asked row.
+struct ColdAsk<'a> {
+    wanted: Option<&'a super::restart_stamp::Wanted>,
+    kept: Option<String>,
+}
+
+impl ColdAsk<'_> {
+    /// A relaunch whose restart asked for no account.
+    const fn none() -> Self {
+        Self {
+            wanted: None,
+            kept: None,
+        }
+    }
 }
 
 /// A selected login and the canonical account intent captured under its actual writer.
@@ -3084,7 +3153,15 @@ pub fn cold_launch_admitted(
         intent = Some(execution::capture_held(seat, cli, &effective, current)?);
         Ok(())
     };
-    let pick = cold_launch_who_capturing(seat, cli, who, read, program, &mut capture)?;
+    let pick = cold_launch_who_capturing(
+        seat,
+        cli,
+        who,
+        read,
+        program,
+        &mut ColdAsk::none(),
+        &mut capture,
+    )?;
     Ok(ColdLaunchAdmission {
         pick,
         intent: intent.ok_or("cold selection has no execution intent")?,
@@ -3101,7 +3178,15 @@ pub fn cold_launch_who(
     read: ReadUsage<'_>,
     program: Option<&Path>,
 ) -> Result<Option<LoginEnv>, String> {
-    cold_launch_who_capturing(seat, cli, who, read, program, &mut |_, _| Ok(()))
+    cold_launch_who_capturing(
+        seat,
+        cli,
+        who,
+        read,
+        program,
+        &mut ColdAsk::none(),
+        &mut |_, _| Ok(()),
+    )
 }
 
 #[cfg_attr(
@@ -3118,6 +3203,7 @@ fn cold_launch_who_capturing(
     who: accounts::ProcessLogin,
     read: ReadUsage<'_>,
     program: Option<&Path>,
+    asked: &mut ColdAsk<'_>,
     capture: &mut ColdCapture<'_>,
 ) -> Result<Option<LoginEnv>, String> {
     if !cli.accounts().measured || seat.keyring_held(cli) {
@@ -3172,6 +3258,9 @@ fn cold_launch_who_capturing(
     let rebound = who.me(&snapshot.roster).account.is_none();
     let mode = seat.mode_for(cli);
     if mode == Mode::Off {
+        if asked.wanted.is_some() {
+            asked.kept = Some(MOVE_OFF.to_owned());
+        }
         return finish_cold_login(
             seat,
             cli,
@@ -3181,6 +3270,41 @@ fn cold_launch_who_capturing(
             program,
             capture,
         );
+    }
+    let mut launch = provider_read::Launch::launch_use(LaunchUse(()));
+    // The row the restart asked for, as the records named it before anything was read: a pick
+    // below that lands on it took it, whatever stopped the asked path itself.
+    let mut target = None;
+    if let Some(wanted) = asked.wanted.filter(|_| cli == Cli::Codex) {
+        let enrolled = accounts::enrolled_in(cli, &snapshot.roster, seat.home);
+        target = asked_row(
+            &snapshot.roster,
+            &snapshot.state,
+            &enrolled,
+            wanted,
+            seat.now,
+        )
+        .ok()
+        .map(|row| row.label.clone());
+        // The account its restart asked for, tried before the row it ran on is judged: no
+        // failure here leaves this function, so the decision below stands as with none asked.
+        let taken = asked_cold_login(
+            seat,
+            cli,
+            &mut snapshot,
+            (&ran, wanted),
+            read,
+            (mode, program),
+            &mut launch,
+            capture,
+        );
+        match taken {
+            Ok(login) => {
+                asked.kept = None;
+                return Ok(Some(login));
+            }
+            Err(why) => asked.kept = Some(why),
+        }
     }
     let enrolled = accounts::enrolled_in(cli, &snapshot.roster, seat.home);
     let isolated = ran.dir.is_none() || default_only(cli, &snapshot.roster, program).is_none();
@@ -3196,7 +3320,6 @@ fn cold_launch_who_capturing(
             && state.lease_verdict(&ran.label, seat.now).is_ok()
     };
     let mut usable = serves(&snapshot.state);
-    let mut launch = provider_read::Launch::launch_use(LaunchUse(()));
     if usable
         && usage_due(seat, cli, &snapshot, &ran)
         && (ran.dir.is_none() || default_only(cli, &snapshot.roster, program).is_none())
@@ -3254,7 +3377,363 @@ fn cold_launch_who_capturing(
             capture,
         );
     }
+    if pick
+        .as_ref()
+        .is_some_and(|pick| target.as_ref() == Some(&pick.label))
+    {
+        asked.kept = None;
+    }
     Ok(pick)
+}
+
+/// The login of the account a cold relaunch's restart asked for ([`cold_launch_env_asked`]), where
+/// that row proves it serves: judged on record ([`asked_row_refusal`]), read with `read` where
+/// its usage is due, judged again on what that read recorded, admitted under the writer as any
+/// cold login is ([`finish_cold_login`]), and only then claimed for this Mac, so a failed
+/// admission claims nothing. What the read recorded (a sample, a wall, a sign-out) stays in
+/// `snapshot` and on record whatever comes after it: it is what the provider said of that row,
+/// not a judgement of this ask.
+///
+/// # Errors
+/// The refusal word, or what the read, the claim or the admission failed on. Nothing is started.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the seat, its pool and snapshot, the two rows, the reader and its allowance, the \
+              program's rule and the capture"
+)]
+fn asked_cold_login(
+    seat: &Seat<'_>,
+    cli: Cli,
+    snapshot: &mut PoolSnapshot,
+    (ran, wanted): (&Row, &super::restart_stamp::Wanted),
+    read: ReadUsage<'_>,
+    (mode, program): (Mode, Option<&Path>),
+    launch: &mut provider_read::Launch,
+    capture: &mut ColdCapture<'_>,
+) -> Result<LoginEnv, String> {
+    let enrolled = accounts::enrolled_in(cli, &snapshot.roster, seat.home);
+    let target = asked_row(
+        &snapshot.roster,
+        &snapshot.state,
+        &enrolled,
+        wanted,
+        seat.now,
+    )?
+    .clone();
+    let judged = |snapshot: &PoolSnapshot| {
+        asked_row_refusal(
+            cli,
+            (&snapshot.roster, &snapshot.state, &enrolled),
+            (ran, &target),
+            (seat.home, program),
+            seat.now,
+        )
+        .map_or(Ok(()), |why| Err(why.to_owned()))
+    };
+    judged(snapshot)?;
+    if usage_due(seat, cli, snapshot, &target) {
+        let use_token =
+            provider_read::Use::launch_read_use(launch, row_read_account(cli, &target, seat.home))
+                .ok_or("launch reads spent")?;
+        snapshot.state = poll_usage(seat, cli, snapshot, &target, read, use_token)?.0;
+        judged(snapshot)?;
+        // An unanswered read leaves the row as unproven as it was: nothing starts on it.
+        if usage_due(seat, cli, snapshot, &target) {
+            return Err(MOVE_UNREAD.to_owned());
+        }
+    }
+    // Admitted under the writer before it is claimed: an admission that fails leaves this Mac no
+    // claim on a row no session here starts on, which other Macs would read as held.
+    let login = finish_cold_login(seat, cli, snapshot, &target, (mode, true), program, capture)?
+        .ok_or_else(|| "the asked account's login was not prepared".to_owned())?;
+    match seat.claim(cli, super::claims::Act::Claim(&target.label)) {
+        super::claims::Touched::HeldElsewhere(_) | super::claims::Touched::PreparationOnly => {
+            Err(MOVE_HELD.to_owned())
+        }
+        super::claims::Touched::Unrecorded(_)
+            if !snapshot.state.home_accounts.contains(&target.label) =>
+        {
+            Err(MOVE_HELD.to_owned())
+        }
+        _ => Ok(login),
+    }
+}
+
+/// `restart account=`'s refusal words ([`asked_row_refusal`], [`ColdAsked::kept`]): the session
+/// is not one of a pool's stored logins on a program that keeps a row's login its own.
+pub const MOVE_UNMANAGED: &str = "account-unmanaged";
+/// `[harness] accounts = off`: no session moves.
+pub const MOVE_OFF: &str = "account-off";
+/// No row of the roster has the asked label.
+pub const MOVE_UNKNOWN: &str = "account-unknown";
+/// The pool has no row a launch would start on.
+pub const MOVE_NO_CHOICE: &str = "account-no-choice";
+/// The session already runs on the asked row.
+pub const MOVE_CURRENT: &str = "account-current";
+/// The asked row is another row of the account the session runs on.
+pub const MOVE_SAME: &str = "account-same";
+/// The asked row has no login on this Mac.
+pub const MOVE_NOT_ENROLLED: &str = "account-not-enrolled";
+/// The asked row is signed out here.
+pub const MOVE_SIGNED_OUT: &str = "account-signed-out";
+/// A usage wall stands on the asked row.
+pub const MOVE_LIMITED: &str = "account-limited";
+/// The asked row is held for another Mac, or its claim here is refused.
+pub const MOVE_HELD: &str = "account-held";
+/// A login names another account than its row's: the asked row's, or the session's own.
+pub const MOVE_IDENTITY: &str = "account-identity";
+/// The asked row's usage could not be read, or the pool's records could not.
+pub const MOVE_UNREAD: &str = "account-unread";
+
+/// The row `wanted` names in `roster`: its label's, or the row a launch would start on as
+/// `state` stands ([`accounts::launch_row`]).
+///
+/// # Errors
+/// [`MOVE_UNKNOWN`] or [`MOVE_NO_CHOICE`].
+fn asked_row<'a>(
+    roster: &'a Roster,
+    state: &accounts::State,
+    enrolled: &std::collections::BTreeSet<String>,
+    wanted: &super::restart_stamp::Wanted,
+    now: i64,
+) -> Result<&'a Row, &'static str> {
+    match wanted {
+        super::restart_stamp::Wanted::Row(label) => roster.row(label).ok_or(MOVE_UNKNOWN),
+        super::restart_stamp::Wanted::Pool => {
+            accounts::launch_row(roster, state, enrolled, now).ok_or(MOVE_NO_CHOICE)
+        }
+    }
+}
+
+/// Why a Codex session on the row `ran` is not moved to `target` on its asking, as the records
+/// stand (no provider is read): the word `restart account=` refuses with and a relaunch keeps its
+/// row on. The rule is the usage-limit handoff's ([`native_quota_target`]) without its wall: a
+/// row whose login names another account neither takes a session nor hands one off, a row of the
+/// session's own account is no move, and a row is no target while its last reads answered no
+/// figure ([`handoff_reads`]). A row that is low but not at a limit is the asker's to choose.
+fn asked_row_refusal(
+    cli: Cli,
+    (roster, state, enrolled): (
+        &Roster,
+        &accounts::State,
+        &std::collections::BTreeSet<String>,
+    ),
+    (ran, target): (&Row, &Row),
+    (home, program): (&Path, Option<&Path>),
+    now: i64,
+) -> Option<&'static str> {
+    if target.label == ran.label {
+        return Some(MOVE_CURRENT);
+    }
+    match accounts::condition(target, state, enrolled.contains(&target.label), now) {
+        accounts::Condition::NotEnrolled => return Some(MOVE_NOT_ENROLLED),
+        accounts::Condition::SignedOut => return Some(MOVE_SIGNED_OUT),
+        _ if target.held_by.is_some() || state.lease_verdict(&target.label, now).is_err() => {
+            return Some(MOVE_HELD);
+        }
+        accounts::Condition::Limited { .. } => return Some(MOVE_LIMITED),
+        _ => {}
+    }
+    if check_login_identity(cli, ran, home).is_err()
+        || check_login_identity(cli, target, home).is_err()
+    {
+        return Some(MOVE_IDENTITY);
+    }
+    if one_account(cli, ran, target, home) {
+        return Some(MOVE_SAME);
+    }
+    if target.dir.is_some() && default_only(cli, roster, program).is_some() {
+        return Some(MOVE_UNMANAGED);
+    }
+    (!handoff_reads(target, state, now)).then_some(MOVE_UNREAD)
+}
+
+/// Whether rows `a` and `b` are one provider account as far as this Mac reads without asking a
+/// provider: the address each expects (the default login's own where its row names none,
+/// [`accounts::default_login_address`]) is one address, or the logins they store name one
+/// account ([`super::codex_app_login::renewal_identity`], what a handoff's fresh read compares).
+fn one_account(cli: Cli, a: &Row, b: &Row, home: &Path) -> bool {
+    let address = |row: &Row| {
+        row.expected_identity_email()
+            .map(str::to_owned)
+            .or_else(|| {
+                row.dir
+                    .is_none()
+                    .then(|| accounts::default_login_address(cli, home))?
+            })
+    };
+    let stored = |row: &Row| {
+        let dir = row
+            .dir
+            .as_deref()
+            .filter(|dir| !dir.is_empty())
+            .map_or_else(
+                || home.join(cli.accounts().default_home),
+                std::path::PathBuf::from,
+            );
+        (cli == Cli::Codex)
+            .then(|| super::codex_app_login::renewal_identity(&dir))
+            .flatten()
+    };
+    address(a)
+        .zip(address(b))
+        .is_some_and(|(a, b)| accounts::email_matches(&a, &b))
+        || stored(a)
+            .zip(stored(b))
+            .is_some_and(|(a, b)| a.account == b.account)
+}
+
+/// What a running Codex session may ask the pool for as its records stand ([`moves`]): the row it
+/// runs on, the row a new launch would get, and for every row why a move to it would be refused.
+/// A judgement on record, made with no provider read, no lock and no claim; the relaunch that
+/// follows an accepted ask still proves the row ([`cold_launch_env_asked`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Moves {
+    /// The row the session runs on.
+    pub ran: String,
+    /// The row a new launch would start on ([`accounts::launch_row`]).
+    pub choice: Option<String>,
+    /// Whether the owner pinned the pool to its active row.
+    pub pinned: bool,
+    /// The pool's rotation mode; under [`Mode::Off`] no session moves.
+    pub mode: Mode,
+    /// Whether the session's program keeps a row's login its own (`CODEX_AUTH_PATH`): one that
+    /// does not runs only on this machine's own login, so nothing moves it.
+    pub own_login: bool,
+    /// Every roster row in roster order, with the word a move to it is refused by
+    /// ([`asked_row_refusal`]); `None` where it may be asked.
+    pub rows: Vec<(String, Option<&'static str>)>,
+}
+
+impl Moves {
+    /// Whether the pool moves this session at all, whatever row is asked: the session's own
+    /// side of [`Self::refusal`] refuses nothing.
+    #[must_use]
+    pub fn offered(&self) -> bool {
+        self.session_refusal().is_none()
+    }
+
+    /// Why the pool moves this session to no row at all: its program keeps no row's login its
+    /// own ([`MOVE_UNMANAGED`]: the login its launch named is not the one it runs on, so no row
+    /// is its own to move off), or rotation is off ([`MOVE_OFF`]).
+    fn session_refusal(&self) -> Option<&'static str> {
+        if !self.own_login {
+            Some(MOVE_UNMANAGED)
+        } else if self.mode == Mode::Off {
+            Some(MOVE_OFF)
+        } else {
+            None
+        }
+    }
+
+    /// Why a move to `wanted` is refused on record, by `restart account=`'s word; `None` where
+    /// the restart may be carried. One predicate for the act and a snapshot's `select`.
+    #[must_use]
+    pub fn refusal(&self, wanted: &super::restart_stamp::Wanted) -> Option<&'static str> {
+        if let Some(why) = self.session_refusal() {
+            return Some(why);
+        }
+        let label = match wanted {
+            super::restart_stamp::Wanted::Row(label) => label.as_str(),
+            super::restart_stamp::Wanted::Pool => match &self.choice {
+                Some(choice) => choice.as_str(),
+                None => return Some(MOVE_NO_CHOICE),
+            },
+        };
+        self.rows
+            .iter()
+            .find(|(row, _)| row == label)
+            .map_or(Some(MOVE_UNKNOWN), |(_, why)| *why)
+    }
+}
+
+/// What the `cli` session whose launch carried the seam variables `env`, running `program`
+/// (`None` where it is not known), may ask the pool for ([`Moves`]). The row it runs on is the
+/// one its cold relaunch would be judged on ([`cold_row`]), and each row is judged by the rule
+/// that relaunch's admission applies first ([`asked_row_refusal`]), so the act and the admission
+/// agree on every word the records decide.
+///
+/// # Errors
+/// [`MOVE_UNMANAGED`]: the pool moves no session of this kind (another CLI, a login kept in the
+/// keyring, a login that is no row of the pool or one its row has moved off). [`MOVE_UNREAD`]:
+/// its records cannot be read.
+pub fn moves(
+    seat: &Seat<'_>,
+    cli: Cli,
+    env: &[(&str, &str)],
+    program: Option<&Path>,
+) -> Result<Moves, &'static str> {
+    if cli != Cli::Codex || takes_no_row(cli, seat.keyring_held(cli)) {
+        return Err(MOVE_UNMANAGED);
+    }
+    moves_in(seat, cli, &move_records(seat, cli)?, env, program)
+}
+
+/// `cli`'s account records as a running session's move is judged on them ([`moves_in`]): read
+/// with no lock and no write, and each row's recorded sign-out projected onto the login its
+/// directory holds now, as the admission's snapshot is ([`snapshot_held`]). A report that says a
+/// row's condition beside its move reads both off these.
+///
+/// # Errors
+/// [`MOVE_UNREAD`]: the records cannot be read.
+pub fn move_records(seat: &Seat<'_>, cli: Cli) -> Result<accounts::AccountRecords, &'static str> {
+    let path = seat.config_dir.join(cli.accounts().roster_file);
+    let store = seat.store(cli);
+    let mut records = store
+        .peek_account_records(&path, seat.now)
+        .map_err(|_| MOVE_UNREAD)?;
+    store.hydrate_auth_contexts(&mut records.state, &records.roster);
+    Ok(records)
+}
+
+/// [`moves`] on `records`, read by [`move_records`].
+///
+/// # Errors
+/// As [`moves`], but for records that cannot be read.
+pub fn moves_in(
+    seat: &Seat<'_>,
+    cli: Cli,
+    records: &accounts::AccountRecords,
+    env: &[(&str, &str)],
+    program: Option<&Path>,
+) -> Result<Moves, &'static str> {
+    if cli != Cli::Codex || takes_no_row(cli, seat.keyring_held(cli)) {
+        return Err(MOVE_UNMANAGED);
+    }
+    let who = accounts::ProcessLogin::of_env_for(cli, env.iter().copied());
+    // A login its row has moved off ([`accounts::Roster::row_left`]) names that row, but no row
+    // holds it now: the session runs on no row a move may name as its own, and its relaunch
+    // with none asked already starts on the row's new login.
+    if who.me(&records.roster).account.is_none() {
+        return Err(MOVE_UNMANAGED);
+    }
+    let ran =
+        cold_row(cli, &records.roster, &who, &env_of(&who), seat.home).ok_or(MOVE_UNMANAGED)?;
+    let enrolled = accounts::enrolled_in(cli, &records.roster, seat.home);
+    let rows = records
+        .roster
+        .rows
+        .iter()
+        .map(|row| {
+            let why = asked_row_refusal(
+                cli,
+                (&records.roster, &records.state, &enrolled),
+                (ran, row),
+                (seat.home, program),
+                seat.now,
+            );
+            (row.label.clone(), why)
+        })
+        .collect();
+    Ok(Moves {
+        ran: ran.label.clone(),
+        choice: accounts::launch_row(&records.roster, &records.state, &enrolled, seat.now)
+            .map(|row| row.label.clone()),
+        pinned: records.state.pinned,
+        mode: seat.mode_for(cli),
+        own_login: default_only(cli, &records.roster, program).is_none(),
+        rows,
+    })
 }
 
 /// The row a cold start on `who` (a process started with `env`, `KEY=value` entries) runs on:

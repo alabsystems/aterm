@@ -88,7 +88,7 @@ fn lit_video() -> ScanReport {
 
 fn status(style: &str, extra: &str) -> StatusRow {
     StatusRow::new(format!(
-        "trail style=\"{style}\" resolved=rainbow-kitty effective=true ribbon_look=underline {extra}"
+        "trail style=\"{style}\" resolved=rainbow-kitty effective=true ribbon_look=tall {extra}"
     ))
 }
 
@@ -307,7 +307,7 @@ fn a_spelling_that_resolved_elsewhere_is_red() {
     let resolved = |resolved: &str| Ledger {
         rows: Some(vec![
             StatusRow::new(format!(
-                "trail style=\"rainbow\" resolved={resolved} ribbon_look=underline"
+                "trail style=\"rainbow\" resolved={resolved} ribbon_look=tall"
             ));
             67
         ]),
@@ -523,10 +523,10 @@ fn reached(px: usize) -> ScanReport {
 #[test]
 fn a_reach_row_is_red_for_a_body_too_short_or_too_tall() {
     let ledger = rainbow_rows(67, "");
-    let tall = reach_row(Reach::Underline, Style::Rainbow);
+    let tall = reach_row(Reach::Tall, Style::Rainbow);
     assert!(tall.validate().is_ok());
     let cell_h = lit_burst().cell.h;
-    let (lo, hi) = Reach::Underline.bounds();
+    let (lo, hi) = Reach::Tall.bounds();
     let lo_px = (lo * cell_h).div_ceil(100);
     let hi_px = hi * cell_h / 100;
     assert!(
@@ -576,11 +576,11 @@ fn a_reach_row_is_red_for_a_body_too_short_or_too_tall() {
 
 #[test]
 fn a_reach_row_that_cannot_measure_its_body_is_refused() {
-    assert!(reach_row(Reach::Underline, Style::Off).validate().is_err());
+    assert!(reach_row(Reach::Tall, Style::Off).validate().is_err());
     assert!(
         PaintRow {
             scene: Scene::Prompt,
-            ..reach_row(Reach::Underline, Style::Rainbow)
+            ..reach_row(Reach::Tall, Style::Rainbow)
         }
         .validate()
         .is_err()
@@ -588,7 +588,7 @@ fn a_reach_row_that_cannot_measure_its_body_is_refused() {
     assert!(
         PaintRow {
             capture: Capture::PinnedVideo,
-            ..reach_row(Reach::Underline, Style::Rainbow)
+            ..reach_row(Reach::Tall, Style::Rainbow)
         }
         .validate()
         .is_err()
@@ -596,7 +596,7 @@ fn a_reach_row_that_cannot_measure_its_body_is_refused() {
     assert!(
         PaintRow {
             split: Some(Split::V),
-            ..reach_row(Reach::Underline, Style::Rainbow)
+            ..reach_row(Reach::Tall, Style::Rainbow)
         }
         .validate()
         .is_err()
@@ -604,21 +604,21 @@ fn a_reach_row_that_cannot_measure_its_body_is_refused() {
     assert!(
         PaintRow {
             keys: "",
-            ..reach_row(Reach::Underline, Style::Rainbow)
+            ..reach_row(Reach::Tall, Style::Rainbow)
         }
         .validate()
         .is_err()
     );
     for style in [Style::Default, Style::Rainbow] {
         assert!(
-            reach_row(Reach::Underline, style).validate().is_ok(),
+            reach_row(Reach::Tall, style).validate().is_ok(),
             "{style:?}"
         );
     }
-    // No style lays the tall body: the one rainbow theme is the underline.
+    // No style lays the underline body: the one rainbow theme is the tall band.
     for style in [Style::Default, Style::Rainbow, Style::Off] {
         assert!(
-            reach_row(Reach::Tall, style).validate().is_err(),
+            reach_row(Reach::Underline, style).validate().is_err(),
             "{style:?}"
         );
     }

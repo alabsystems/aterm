@@ -177,21 +177,6 @@ fn entry(need: &AghNeed) -> Option<Entry> {
         .more(&need.what)
         .more(&need.why)
         .more(&need.then)
-    } else if rest == "config.missing" {
-        Entry::new(
-            Family::Agh,
-            "config",
-            "missing",
-            "agh.toml missing for the lanes",
-            Why::Spent {
-                tried: Reason::new("looked for the lanes' agh.toml"),
-                reason: Reason::new(
-                    "there is none, and they route their GitHub identities through it",
-                ),
-            },
-            Then::step("Provision agh.toml as docs/RUNBOOK-atpkg-republish.md says"),
-        )
-        .more(&need.what)
     } else if rest == "config.invalid" {
         Entry::new(
             Family::Agh,

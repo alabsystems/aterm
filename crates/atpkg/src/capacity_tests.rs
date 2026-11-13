@@ -623,3 +623,62 @@ fn a_waiter_that_cannot_start_names_what_it_spares() {
         ]
     );
 }
+
+/// THE LISTING NAMES A WAITER NO CLAIM'S END CAN START (CAP3, KI-1111-25). On 40 GiB available
+/// with no claim held, a 41 GiB waiter with a byte spare beside it lacks memory no claim holds
+/// and is never admitted alone: it is STUCK, reserves none of its need against the claims behind
+/// it, and its line says the claims behind it that fit go first; a 3 GiB waiter behind it can
+/// start, and has nothing to name. In the JSON it is `stuck`, with no `spares` figure and a
+/// `reserved_mem` of 0, where the line before this rule said no claim behind it goes first.
+#[test]
+fn a_waiter_no_claims_end_can_start_is_named_stuck() {
+    let (r, _) = data();
+    let claims = [
+        mem_claim(
+            1,
+            100,
+            Need::new("slice budget").mem(41 * GIB).margin(1),
+            false,
+        ),
+        mem_claim(2, 200, Need::new("test e").mem(3 * GIB), false),
+    ];
+    let shown = claim_lines(&r, &[], &claims);
+    assert!(
+        shown[0].contains(&format!(
+            "reserves {}: it cannot start yet and no claim's end can start it (it waits for \
+             memory no claim holds), so each claim behind it that fits goes first",
+            gib(0)
+        )),
+        "{}",
+        shown[0]
+    );
+    assert!(!shown[1].contains("cannot start"), "{}", shown[1]);
+    let release = [mem_claim(
+        1,
+        100,
+        Need::new("slice budget")
+            .rank(aterm_capacity::Rank::Release)
+            .mem(41 * GIB)
+            .margin(1),
+        false,
+    )];
+    let shown_release = claim_lines(&r, &[], &release);
+    assert!(
+        shown_release[0].contains(
+            "so each claim behind it that fits goes first (background work aside, which yields \
+             to a release's claim)"
+        ),
+        "{}",
+        shown_release[0]
+    );
+    let report = json_report(&r, &[], &claims, None);
+    assert_eq!(
+        json_claims(&report, "stuck"),
+        [Value::from(true), Value::from(false)]
+    );
+    assert_eq!(json_claims(&report, "spares"), [Value::Null, Value::Null]);
+    assert_eq!(
+        json_claims(&report, "reserved_mem"),
+        [Value::from(0u64), Value::from(3 * GIB)]
+    );
+}

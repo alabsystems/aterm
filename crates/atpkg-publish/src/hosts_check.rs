@@ -5,15 +5,16 @@
 //! `atpkg-publish hosts check` (§16.2): whether this builder's agh.toml is ready for
 //! `--host agh-staging` or `--host agh`, read-only.
 //!
-//! It reads explicit configuration and recorded vault identities, and sends nothing. A
-//! writer whose token is not in a token file fails its check: a lane unit carries
-//! no token variable, and agh's git credential helper reads only token files, so a unit reads
-//! what this check read. `--lane linux` additionally reads and authenticates the fresh signed
+//! It reads explicit configuration, recorded vault identities, and the trust checkout's origin
+//! and the seed ledger its origin/main carries, and sends nothing. A writer whose token is not
+//! in a token file fails its check: a lane unit carries no token variable, and agh's git
+//! credential helper reads only token files, so a unit reads what this check read. `--lane linux` additionally reads and authenticates the fresh signed
 //! channel to select the repositories that lane may serve; the generic inventory sends nothing.
 
 use agh::config::Dirs;
 use agh::policy::Tier;
 
+use crate::artifact::lineage_switch::{self, Switch};
 use crate::ctx::{Ctx, HostChoice};
 use crate::error::{Error, Result};
 use crate::host::agh::{AghHost, CALLER};
@@ -29,7 +30,8 @@ const NEEDS_CONFIG: &str = "needs valid configured identity routing";
 /// One check's verdict.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HostCheck {
-    /// `config`, `staging_writer`, `public_writer`, `grants` or `drafts`.
+    /// `config`, `staging_writer`, `public_writer`, `grants`, `drafts` or `trust_origin`; for
+    /// the tip lane also `program_grants`.
     pub name: &'static str,
     /// Whether it holds.
     pub ok: bool,
@@ -47,17 +49,79 @@ impl HostCheck {
     }
 }
 
-/// The distinct `repo` of [`crate::programs::PROGRAMS`], in table order: every repository the
-/// lanes write or clone besides the index repository.
+/// The distinct `repo` of the lane-tracked rows of [`crate::programs::PROGRAMS`]
+/// ([`crate::programs::ProgramDef::lane_tracked`]), in table order: besides the index
+/// repository, the repositories the alab lane clones, stages to and publishes to, and so
+/// preflights before it claims a build (`lane::alab`). A repository only package or bottle rows
+/// name is not among them: those builds enter the channel through an explicit pin, not through
+/// this lane.
 #[must_use]
-pub fn program_repos() -> Vec<String> {
+pub fn alab_program_repos() -> Vec<String> {
     let mut repos: Vec<String> = Vec::new();
     for p in crate::programs::PROGRAMS {
-        if !repos.iter().any(|r| r == p.repo) {
+        if p.lane_tracked() && !repos.iter().any(|r| r == p.repo) {
             repos.push(p.repo.to_string());
         }
     }
     repos
+}
+
+/// The repositories of the programs the tip lane and its ready dispatcher may carry
+/// ([`crate::lane::ready::queueable`]), in table order.
+#[must_use]
+pub fn tip_program_repos() -> Vec<String> {
+    let mut repos: Vec<String> = Vec::new();
+    for p in crate::programs::PROGRAMS {
+        if crate::lane::ready::queueable(p.name).is_ok() && !repos.iter().any(|r| r == p.repo) {
+            repos.push(p.repo.to_string());
+        }
+    }
+    repos
+}
+
+/// [`check`] for the tip lane. Which of its programs may publish is the lifecycle registry's
+/// to say at each run, and this check sends no request, so it cannot know a repository whose
+/// public tier is closed from one that is open. It therefore requires the public owner's grant
+/// on the index repository alone, and reports the program repositories that have none in the
+/// passing row `program_grants`: a queued build of one is refused at publish and set aside by
+/// the dispatcher, and a grant is only ever the answer for a repository the registry holds
+/// active with an open public tier.
+#[must_use]
+pub fn check_tip(ctx: &Ctx, dirs: &agh::config::Dirs, choice: HostChoice) -> Vec<HostCheck> {
+    let programs = tip_program_repos();
+    let mut checks = check_scoped(ctx, dirs, choice, false, &programs, Some(&[]));
+    let Ok(client) = config(dirs) else {
+        return checks;
+    };
+    let public = ctx.accounts.public.as_str();
+    let written = choice == HostChoice::Agh && client.router().tier_of(public) == Tier::Release;
+    let ungranted: Vec<String> = programs
+        .iter()
+        .filter(|_| written)
+        .map(|repo| format!("{public}/{repo}"))
+        .filter(|slug| !granted(&client, slug))
+        .collect();
+    checks.push(HostCheck::new(
+        "program_grants",
+        true,
+        if ungranted.is_empty() {
+            format!("{CALLER} may write every program repository the tip lane can queue")
+        } else {
+            format!(
+                "no grant on: {}. A queued build of one is refused at publish and set aside. \
+                 Grant a repository only when the lifecycle registry holds it active with an \
+                 open public tier; one it closes or holds needs none and gets none",
+                ungranted.join(", ")
+            )
+        },
+    ));
+    checks
+}
+
+fn granted(client: &agh::Github, slug: &str) -> bool {
+    slug.split_once('/').is_some_and(|(owner, repo)| {
+        agh::Slug::new(owner, repo).is_ok_and(|s| client.router().grant(CALLER, &s).is_ok())
+    })
 }
 
 /// Repositories selected by the Linux lane's signed channel pins, across its default targets.
@@ -97,7 +161,8 @@ fn linux_program_repos(index: &atpkg::Index) -> Result<Vec<String>> {
 /// owners as the lane. An unselected table entry is not publication authority.
 ///
 /// # Errors
-/// What fetching and verifying the fresh signed head answers, or a channel with no pins.
+/// What fetching and verifying the fresh signed head answers, or a channel with no pins. When
+/// `trust_origin` failed, the head's error carries that row's detail after its own.
 pub fn check_linux(
     ctx: &Ctx,
     dirs: &Dirs,
@@ -105,11 +170,23 @@ pub fn check_linux(
     keyless: bool,
 ) -> Result<Vec<HostCheck>> {
     let preliminary = check(ctx, dirs, choice, keyless, &[]);
-    if !failed(&preliminary).is_empty() {
+    // The trust checkout is local: it does not decide whether the head can be read, and the
+    // grants are judged whatever it says. A head that cannot be read still names a failed
+    // trust origin, so neither fault hides the other.
+    if failed(&preliminary)
+        .iter()
+        .any(|name| *name != TRUST_ORIGIN)
+    {
         return Ok(preliminary);
     }
-    let scratch = crate::channel::Scratch::new("linux-hosts-check")?;
-    let (_, head) = crate::quad::fetch_head(ctx, &ctx.index_slug(), scratch.path())?;
+    let head = crate::channel::Scratch::new("linux-hosts-check").and_then(|scratch| {
+        crate::quad::fetch_head(ctx, &ctx.index_slug(), scratch.path()).map(|(_, head)| head)
+    });
+    let origin = preliminary.iter().find(|c| c.name == TRUST_ORIGIN && !c.ok);
+    let head = head.map_err(|error| match origin {
+        Some(row) => error.with_note(&format!("{TRUST_ORIGIN} failed too: {}", row.detail)),
+        None => error,
+    })?;
     Ok(check(
         ctx,
         dirs,
@@ -117,6 +194,62 @@ pub fn check_linux(
         keyless,
         &linux_program_repos(&head.index)?,
     ))
+}
+
+/// The name of the row [`trust_origin`] judges.
+const TRUST_ORIGIN: &str = "trust_origin";
+
+/// The `trust_origin` row: whether the trust checkout a pack reads its lineage switch from
+/// ([`lineage_switch::default_trust_repo`]) lets that switch read what the trust repository's
+/// main says. [`lineage_switch::read`] reads the checkout alone first
+/// ([`lineage_switch::read_locally`]): a minted ledger at its `refs/remotes/origin/main` reads
+/// live, and no checkout, no origin/main or no readable ledger there reads unknown, whatever
+/// its origin names, so the row holds, naming an origin that would not serve. Only a dormant
+/// ledger there leaves the switch to the trust repository's live main, which under agh is read
+/// through `git::main_of_record`. That refuses a checkout not admitted for local reads, or whose
+/// `origin` does not name the staging owner's `trust` repository, and the switch then reads
+/// unknown, never dormant, which a pack holds to the required lineage policy
+/// (`Switch::policy`): the row fails exactly there. It reads local Git only and needs no
+/// agh.toml, so it is judged whatever `config` says.
+fn trust_origin(ctx: &Ctx) -> HostCheck {
+    let repo = lineage_switch::default_trust_repo(ctx);
+    let shown = ctx.shown(&repo);
+    let slug = ctx.staging_slug("trust");
+    let why = match crate::git::source_with_origin(&repo, &slug) {
+        Ok(_) => {
+            return HostCheck::new(TRUST_ORIGIN, true, format!("{shown}'s origin names {slug}"));
+        }
+        Err(why) => why,
+    };
+    match lineage_switch::read_locally(ctx, &repo) {
+        lineage_switch::Local::Settled(switch) => {
+            let reads = match switch {
+                Switch::Live => "live: its origin/main carries a minted re-pin".to_string(),
+                Switch::Unknown(unknown) => {
+                    format!("unknown, held to the required lineage policy: {unknown}")
+                }
+                Switch::Dormant => "dormant".to_string(),
+            };
+            HostCheck::new(
+                TRUST_ORIGIN,
+                true,
+                format!(
+                    "{shown} would not serve as {slug}'s checkout ({why}), and that decides \
+                     nothing: the checkout alone reads the lineage switch {reads}"
+                ),
+            )
+        }
+        lineage_switch::Local::Deferred(here) => HostCheck::new(
+            TRUST_ORIGIN,
+            false,
+            format!(
+                "{shown} cannot serve as {slug}'s checkout: {why}. Its origin/main ({}) carries \
+                 a dormant ledger, so the lineage switch reads {slug}'s main through that origin \
+                 ({RUNBOOK})",
+                &here[..here.len().min(10)]
+            ),
+        ),
+    }
 }
 
 /// The router agh.toml under `dirs` builds, or the failing `config` detail.
@@ -173,6 +306,19 @@ pub fn check(
     keyless: bool,
     programs: &[String],
 ) -> Vec<HostCheck> {
+    check_scoped(ctx, dirs, choice, keyless, programs, None)
+}
+
+/// [`check`], with the program repositories whose grant the public owner must carry given
+/// apart (`None`: the same `programs` as every other owner).
+fn check_scoped(
+    ctx: &Ctx,
+    dirs: &agh::config::Dirs,
+    choice: HostChoice,
+    keyless: bool,
+    programs: &[String],
+    public_programs: Option<&[String]>,
+) -> Vec<HostCheck> {
     let client = match config(dirs) {
         Ok(client) => client,
         Err(detail) => {
@@ -180,6 +326,7 @@ pub fn check(
             for name in ["staging_writer", "public_writer", "grants", "drafts"] {
                 checks.push(HostCheck::new(name, false, NEEDS_CONFIG));
             }
+            checks.push(trust_origin(ctx));
             return checks;
         }
     };
@@ -224,6 +371,10 @@ pub fn check(
     owners.retain(|o| client.router().tier_of(o) == Tier::Release);
     let mut slugs: Vec<String> = Vec::new();
     for owner in &owners {
+        let programs = match public_programs {
+            Some(narrowed) if owner.eq_ignore_ascii_case(public) => narrowed,
+            _ => programs,
+        };
         let repos =
             std::iter::once(atpkg::manifest::INDEX_REPO).chain(programs.iter().map(String::as_str));
         for repo in repos {
@@ -235,12 +386,7 @@ pub fn check(
     }
     let missing: Vec<&str> = slugs
         .iter()
-        .filter(|slug| {
-            let granted = slug.split_once('/').is_some_and(|(owner, repo)| {
-                agh::Slug::new(owner, repo).is_ok_and(|s| client.router().grant(CALLER, &s).is_ok())
-            });
-            !granted
-        })
+        .filter(|slug| !granted(&client, slug))
         .map(String::as_str)
         .collect();
     checks.push(if !missing.is_empty() {
@@ -285,6 +431,7 @@ pub fn check(
     } else {
         HostCheck::new("drafts", false, unproven.join("; "))
     });
+    checks.push(trust_origin(ctx));
     checks
 }
 
@@ -317,7 +464,7 @@ pub(crate) fn render(choice: HostChoice, checks: &[HostCheck]) -> String {
 
 /// The CLI verb: `atpkg-publish hosts check [--host agh-staging|agh] [--unit-env] [--keyless]
 /// [--lane alab|linux]`. Linux scope authenticates the fresh signed channel; without a lane,
-/// this remains the local inventory check over the whole producer table.
+/// this is the local check of the alab lane's repositories ([`alab_program_repos`]).
 /// It prints one JSON object, `{"checks":[…],"host":"…","ok":…}`, and exits 0 when every
 /// check holds, else 1 (Refused). `--keyless` judges a staging-only lane only on a builder
 /// with no machine key: a keyed builder's run writes the public owner, so it is judged keyed.
@@ -347,13 +494,15 @@ pub fn run(ctx: &Ctx, args: &[String]) -> Result<()> {
     })?;
     let checks = if lane == Some(LaneKind::Linux) {
         check_linux(ctx, &dirs, choice, stages_only(ctx, keyless))?
+    } else if lane == Some(LaneKind::Tip) {
+        check_tip(ctx, &dirs, choice)
     } else {
         check(
             ctx,
             &dirs,
             choice,
             stages_only(ctx, keyless),
-            &program_repos(),
+            &alab_program_repos(),
         )
     };
     println!("{}", render(choice, &checks));
@@ -407,7 +556,7 @@ fn parse(args: &[String]) -> Result<CheckFlags> {
             "--lane" => {
                 let value = it
                     .next()
-                    .ok_or_else(|| Error::usage("--lane needs alab or linux"))?;
+                    .ok_or_else(|| Error::usage("--lane needs alab, linux or tip"))?;
                 lane = Some(LaneKind::parse(value)?);
                 continue;
             }

@@ -9,8 +9,8 @@
 //! reserved) reach what this Mac can ever have available, its memory less what is wired
 //! ([`aterm_capacity::never`]), and an interrupt ends the wait as NOT RUN, nothing booted.
 //! A run on a VM already up claims its vCPUs alone, which never waits. The guest's builds run
-//! as many jobs as cores the claim was granted (`CARGO_BUILD_JOBS`); the guest's shape stays
-//! the owner's.
+//! as many jobs as cores the claim was granted (`CARGO_BUILD_JOBS`); admission never changes
+//! the guest's shape (the lane's sizes, lima's memory as the run's `--memory` sets it).
 //!
 //! Once booted, the VM's processes ([`vm_procs`]: QEMU, lima's host agent, the
 //! Virtualization.framework process or krunkit holding its disk) are credited to the claim
@@ -33,7 +33,8 @@ use aterm_json::{Map, Value};
 
 use crate::Fail;
 
-/// A lane VM's fixed shape: the owner's sizes, which admission never changes.
+/// A lane VM's shape: the lane's sizes (lima's memory as the run's `--memory` sets it), which
+/// admission never changes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Guest {
     /// The lane, as its lines begin: `linux`, `windows`.
@@ -71,11 +72,15 @@ pub const WINDOWS: Guest = Guest {
 };
 
 impl Guest {
-    /// lima's instance `vm` ([`LIMA`]'s shape: the lane's VM, or its GPU instance under `--gpu`,
-    /// which lima makes the same size).
+    /// lima's instance `vm` booted with `memory_gib` GiB ([`LIMA`]'s shape otherwise: the lane's
+    /// VM, or its GPU instance under `--gpu`, which lima makes the same size).
     #[must_use]
-    pub const fn lima(vm: &'static str) -> Guest {
-        Guest { vm, ..LIMA }
+    pub const fn lima(vm: &'static str, memory_gib: u32) -> Guest {
+        Guest {
+            vm,
+            memory: (memory_gib as u64) << 30,
+            ..LIMA
+        }
     }
 
     /// The claim `verb` (`lab linux proof`) takes on this VM: to boot it (`booting`), the

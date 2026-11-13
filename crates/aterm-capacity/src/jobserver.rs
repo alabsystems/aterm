@@ -264,16 +264,18 @@ impl Jobserver {
         }
     }
 
-    /// The tokens currently assigned to this handle's branch. A plain or creating handle owns
-    /// its whole pool; an adopted isolated branch observes monotonic allocation growth from the
-    /// coordinator's side record. Use [`Self::grant`] for Cargo's eventual dispatch ceiling.
+    /// The dispatch budget retained by this handle. A plain or creating handle reports its
+    /// whole pool; an adopted branch keeps its largest published allocation. Lending a free
+    /// token does not revoke a client's budget: the FIFO still bounds live work. Use
+    /// [`Self::grant`] for Cargo's eventual dispatch ceiling.
     #[must_use]
     pub fn slots(&self) -> u32 {
         if self.created {
             return self.slots;
         }
-        // An isolated branch's allocation only grows while it is alive. Its coordinator
-        // publishes that growth so later test plans can use returned shares as Cargo does.
+        // A client keeps its largest observed dispatch budget. The coordinator can lend a
+        // free token to another branch without revoking in-flight work; the FIFO remains the
+        // concurrency bound. Published growth lets later test plans use returned shares.
         let observed = self
             .published_share()
             .map(|(grant, allocated)| {

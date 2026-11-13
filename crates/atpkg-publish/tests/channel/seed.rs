@@ -6,6 +6,7 @@
 use std::path::{Path, PathBuf};
 
 use atpkg_publish::channel::seed::{self, GENERATED_MARKER, publish_refusals};
+use atpkg_publish::ctx::HostChoice;
 use atpkg_publish::host::Slug;
 
 use super::{Rig, git};
@@ -46,8 +47,12 @@ fn fixture(label: &str) -> Fixture {
     fixture_with(label, true)
 }
 
+/// The `gh` arm's context, said outright: these tests read the re-pin through the consumer's
+/// own `origin` (`git fetch origin main`), which only `HostChoice::Gh` keeps;
+/// `native_seed` reads it at the main of record.
 fn fixture_with(label: &str, archives_published: bool) -> Fixture {
-    let rig = Rig::new(label);
+    let mut rig = Rig::new(label);
+    rig.ctx = rig.ctx.clone().with_host_choice(HostChoice::Gh);
     let origin = rig.path("trust-origin");
     std::fs::create_dir_all(&origin).expect("mkdir");
     git(&origin, &["init", "-q", "-b", "main"]);

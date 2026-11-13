@@ -245,10 +245,12 @@ pub(super) fn app_with_private_pty() -> (
     [i32; 2],
 ) {
     use aterm_session::sink::SinkWriter;
+    use std::os::fd::IntoRawFd;
     use std::sync::Arc;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(

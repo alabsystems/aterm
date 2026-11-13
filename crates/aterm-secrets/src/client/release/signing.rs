@@ -132,10 +132,6 @@ pub fn signing_status(paths: &Paths) -> crate::Result<SigningStatus> {
             fsx::kind(&paths.home.join(RELEASE_PROFILE)),
             Ok(fsx::Kind::File)
         )
-        && !matches!(
-            fsx::kind(&paths.home.join(LEGACY_RELEASE_PROFILE)),
-            Ok(fsx::Kind::File)
-        )
     {
         return Ok(SigningStatus::NotApplicable(
             "this vault has no shared release ring".into(),
@@ -210,10 +206,7 @@ struct Material {
 }
 
 fn profile_identity(paths: &Paths) -> crate::Result<Option<String>> {
-    let profile = match fsx::read_private(&paths.home.join(RELEASE_PROFILE), MAX_READ)? {
-        Some(profile) => Some(profile),
-        None => fsx::read_private(&paths.home.join(LEGACY_RELEASE_PROFILE), MAX_READ)?,
-    };
+    let profile = fsx::read_private(&paths.home.join(RELEASE_PROFILE), MAX_READ)?;
     let Some(profile) = profile else {
         return Ok(None);
     };
@@ -332,14 +325,7 @@ fn effective_identity_with(
     profile: &Path,
     authorized: bool,
 ) -> crate::Result<Option<String>> {
-    let selected = if matches!(
-        fsx::kind(&paths.home.join(RELEASE_PROFILE)),
-        Ok(fsx::Kind::File)
-    ) {
-        paths.home.join(RELEASE_PROFILE)
-    } else {
-        paths.home.join(LEGACY_RELEASE_PROFILE)
-    };
+    let selected = paths.home.join(RELEASE_PROFILE);
     let same_profile = matches!(fsx::kind(profile), Ok(fsx::Kind::File))
         && matches!(fsx::kind(&selected), Ok(fsx::Kind::File))
         && std::fs::canonicalize(profile)

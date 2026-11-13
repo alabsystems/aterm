@@ -23,6 +23,7 @@ pub(super) enum Purpose {
     Metadata(SealedMetadataRequest),
     Resolver(trust_resource_controller::resolver::SealedResolverQueryRequest),
     WorkloadQuery(trust_resource_controller::workload::host::CompilerQuery),
+    NativeJobQuery(trust_resource_controller::native_job::query::CompilerQuery),
 }
 impl Purpose {
     pub(super) fn authorize(&self, check: &mut members::Authorization) {
@@ -32,12 +33,20 @@ impl Purpose {
             Self::WorkloadQuery(query) => Some(query.clone()),
             _ => None,
         };
+        check.native_job_query = match self {
+            Self::NativeJobQuery(query) => Some(query.clone()),
+            _ => None,
+        };
+    }
+    pub(super) fn cooperative_query(&self) -> bool {
+        matches!(self, Self::WorkloadQuery(_) | Self::NativeJobQuery(_))
     }
     pub(super) fn member(&self) -> &trust_resource_controller::Request {
         match self {
             Self::Metadata(request) => &request.member,
             Self::Resolver(request) => &request.member,
             Self::WorkloadQuery(request) => &request.member,
+            Self::NativeJobQuery(request) => &request.member,
         }
     }
     fn root(&self) -> &[u8] {
@@ -45,6 +54,7 @@ impl Purpose {
             Self::Metadata(request) => &request.root,
             Self::Resolver(request) => &request.root,
             Self::WorkloadQuery(request) => &request.root,
+            Self::NativeJobQuery(request) => &request.sdk_root,
         }
     }
     fn digest(&self) -> &[u8; 32] {
@@ -52,6 +62,7 @@ impl Purpose {
             Self::Metadata(request) => &request.program_sha256,
             Self::Resolver(request) => &request.program_sha256,
             Self::WorkloadQuery(request) => &request.program_sha256,
+            Self::NativeJobQuery(request) => &request.compiler.sha256,
         }
     }
     fn validate(&self) -> io::Result<()> {
@@ -59,6 +70,7 @@ impl Purpose {
             Self::Metadata(request) => request.validate(),
             Self::Resolver(request) => request.validate(),
             Self::WorkloadQuery(request) => request.validate(),
+            Self::NativeJobQuery(request) => request.validate(),
         }
     }
     fn validate_prepared(&self, prepared: &MetadataPrepared) -> io::Result<()> {
@@ -66,6 +78,7 @@ impl Purpose {
             Self::Metadata(request) => prepared.validate_for(request),
             Self::Resolver(request) => request.validate_prepared(prepared),
             Self::WorkloadQuery(request) => request.validate_prepared(prepared),
+            Self::NativeJobQuery(request) => request.validate_prepared(prepared),
         }
     }
 }
@@ -78,14 +91,18 @@ pub(super) struct RootGnu {
     handoff: jobserver_utils::ScopedHandoff,
 }
 #[cfg(target_os = "macos")]
+fn duplicate_pipe(pipe: &[OwnedFd; 2]) -> io::Result<[OwnedFd; 2]> {
+    // Keep creation and close-on-fork marking under the same spawn exclusion.
+    // Moving the protected tuple into an array creates no new descriptor.
+    aterm_uds::kept_out(|| Ok((pipe[0].try_clone()?, pipe[1].try_clone()?)))
+        .map(|(read, write)| [read, write])
+}
+#[cfg(target_os = "macos")]
 impl RootGnu {
     pub(super) fn new() -> io::Result<Self> {
-        let (read, write) = aterm_uds::kept_out(io::pipe)?;
+        let (read, write) = aterm_uds::pipe()?;
         let pipe = [OwnedFd::from(read), OwnedFd::from(write)];
-        let handoff = jobserver_utils::ScopedHandoff::jobserver(
-            [pipe[0].try_clone()?, pipe[1].try_clone()?],
-            [3, 4],
-        )?;
+        let handoff = jobserver_utils::ScopedHandoff::jobserver(duplicate_pipe(&pipe)?, [3, 4])?;
         Ok(Self { pipe, handoff })
     }
     pub(super) fn configure(
@@ -96,10 +113,8 @@ impl RootGnu {
         if command.guard_targets().len() != 0 {
             return Err(refused("metadata GNU would replace inherited custody"));
         }
-        extra.extend([
-            (self.pipe[0].try_clone()?, 3),
-            (self.pipe[1].try_clone()?, 4),
-        ]);
+        let [read, write] = duplicate_pipe(&self.pipe)?;
+        extra.extend([(read, 3), (write, 4)]);
         command.inherit_guards_at(extra)?;
         for key in ["MAKEFLAGS", "MFLAGS", "CARGO_MAKEFLAGS"] {
             command.env(key, "-j --jobserver-fds=3,4 --jobserver-auth=3,4");
@@ -317,9 +332,7 @@ pub(super) fn prepare_with_held(
             trust_resource_controller::GnuTransport::NumericPipe { read, write } => {
                 vec![read.target, write.target]
             }
-            trust_resource_controller::GnuTransport::None
-                if matches!(purpose, Purpose::WorkloadQuery(_)) =>
-            {
+            trust_resource_controller::GnuTransport::None if purpose.cooperative_query() => {
                 Vec::new()
             }
             _ => return Err(refused("metadata requires its original numeric GNU pair")),

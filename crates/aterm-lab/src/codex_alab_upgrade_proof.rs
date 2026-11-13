@@ -217,13 +217,19 @@ fn handoff(
         .and_then(J::as_i64)
         .expect("observed deadline");
     println!("  saved record: {}", before.py());
-    proof.upgrade_leg_with_limits(leg, new, HANG, HANG)?;
+    proof.upgrade_leg(leg, new)?;
     let mut after = None;
     let active = Proof::wait_for(HANG, Duration::from_millis(250), || {
         after = Proof::record(leg, pid);
-        after
-            .as_ref()
-            .is_some_and(|record| active_image_record(record, &new_version, pid))
+        after.as_ref().is_some_and(|record| {
+            active_image_record(record, &new_version, pid)
+                && super::observed_upgrade(
+                    record,
+                    pid,
+                    super::exec_generation(&before),
+                    &new.join("bin/codex"),
+                )
+        })
     })?;
     proof.check(
         "upgrade-only: the new image's own record reports its active native claim before its restored deadline is read",
@@ -465,11 +471,21 @@ fn absent(path: &Path) -> bool {
 /// Exercise the producer's physical fallback, then the native crash repair, before
 /// handing the same paced conversation to the ordinary live-upgrade witness.
 pub(super) fn raw_legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), Fail> {
+    use std::os::unix::fs::MetadataExt as _;
+
     let prefix = proof.h.join("Library/Application Support/aterm/pkg");
     let entry = prefix.join("store/codex/exec/codex");
     let primary = prefix.join("bin/codex");
     let physical = old.join("bin/codex");
-    let newly_created = absent(&entry);
+    let previous_entry = match std::fs::symlink_metadata(&entry) {
+        Ok(metadata) => Some((metadata.dev(), metadata.ino())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(
+                format!("cannot observe {} before linking: {error}", entry.display()).into(),
+            );
+        }
+    };
     proof.link(old).map_err(Fail::die)?;
     proof.inst.await_socket(instance::BOOT)?;
     let _ = proof.inst.ctl(&["ready"]);
@@ -498,12 +514,12 @@ pub(super) fn raw_legs(proof: &mut Proof, old: &Path, new: &Path) -> Result<(), 
         "raw: the supplied native host produced all managed fallback exports",
         produced,
     );
-    let removable = newly_created
-        && std::fs::symlink_metadata(&entry)
-            .is_ok_and(|metadata| metadata.file_type().is_symlink())
-        && std::fs::canonicalize(&physical)
-            .ok()
-            .is_some_and(|physical| std::fs::canonicalize(&entry).ok() == Some(physical));
+    let removable = std::fs::symlink_metadata(&entry).is_ok_and(|metadata| {
+        metadata.file_type().is_symlink()
+            && previous_entry != Some((metadata.dev(), metadata.ino()))
+    }) && std::fs::canonicalize(&physical)
+        .ok()
+        .is_some_and(|physical| std::fs::canonicalize(&entry).ok() == Some(physical));
     proof.check(
         "raw: only the newly produced stable entry symlink is removed",
         removable,

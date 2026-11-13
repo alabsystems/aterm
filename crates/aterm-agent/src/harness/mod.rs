@@ -83,6 +83,7 @@ pub mod codex_source_registry;
 pub mod codex_steps;
 pub mod codex_tap;
 pub mod contract;
+pub mod credential_read;
 pub mod credit_offers;
 mod decimal;
 pub mod disk;
@@ -136,6 +137,8 @@ mod native_launch;
 pub mod native_receipts;
 #[cfg(unix)]
 mod pending_native_store;
+#[cfg(unix)]
+pub mod source_exec_journal;
 #[cfg(all(unix, debug_assertions))]
 pub use native_launch::{
     FixtureStage as NativeLauncherFixtureStage, fixture_entry as native_launcher_fixture_entry,
@@ -151,6 +154,7 @@ pub mod observed_account;
 pub mod open_url;
 pub mod outlook;
 pub mod permission_click;
+mod process_lifetime;
 pub mod profile;
 pub mod provider_read;
 #[cfg(any(test, debug_assertions, feature = "dev-seams"))]
@@ -348,7 +352,7 @@ pub(crate) fn fake_instance(
     // inherited copy of these sockets (`aterm_uds::kept_out`).
     let listener =
         aterm_uds::kept_out(|| std::os::unix::net::UnixListener::bind(sock)).expect("bind");
-    let (cancelled, cancel) = std::io::pipe().expect("server cancellation");
+    let (cancelled, cancel) = aterm_uds::pipe().expect("server cancellation");
     let active = std::sync::Arc::new(std::sync::Mutex::new(None));
     let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));

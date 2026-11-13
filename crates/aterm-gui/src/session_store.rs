@@ -185,6 +185,15 @@ pub(crate) struct SessionRecord {
         deserialize_with = "lenient_row"
     )]
     pub wakes: Option<String>,
+    /// The host's confirmation of the session's agent (`crate::agent_act::carry_row`, one row),
+    /// read back leniently: a row this build cannot read keeps nothing, and the successor reads
+    /// the agent's image afresh.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "lenient_row"
+    )]
+    pub agent_act: Option<String>,
 }
 
 /// Formats a `(pid, local_id)` crash-journal key as `<pid>:<id>`.
@@ -962,6 +971,7 @@ impl SessionHandoff {
                         autopilot_end: None,
                         log_seq,
                         wakes: crate::occupancy_wakes::carry_row(h.sid.as_str()),
+                        agent_act: crate::agent_act::carry_row(h.sid.as_str()),
                     }
                 })
                 .collect(),

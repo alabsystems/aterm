@@ -38,10 +38,10 @@ const OVERLONG_MESSAGE: &str = "API Error: Claude's response exceeded the 32000 
 const LONG: Duration = Duration::from_secs(4 * 60);
 /// A turn too short to be work: a yield that asks is one.
 const SHORT: Duration = Duration::from_secs(30);
-/// A turn's last words: progress, the vendor's done report, the defense the
-/// defend prompt asks for, and a question.
+/// A turn's last words: progress, a done claim in the token line an older primer
+/// taught, the defense the defend prompt asks for, and a question.
 const PROGRESS: &str = "Stage 2 landed; the parser is next.";
-const REPORT: &str = "Everything is already done; nothing left to do.";
+const REPORT: &str = "Everything is already done; nothing left to do.\nATERM-TASK-DONE";
 const DEFENSE: &str = "Nothing left: the parser and its tests are on origin/main.\n\
                        - The suite passes on main.";
 const QUESTION: &str = "Does the parser have to keep the old syntax?";
@@ -164,6 +164,7 @@ fn point(
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::of_found(dirty.then(finding)),
         leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
+        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
         fact: None,
         wake: None,
     }

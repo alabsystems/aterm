@@ -1018,9 +1018,9 @@ fn holds_auth_path_mark(exe: &Path) -> std::io::Result<bool> {
 /// Whether the regular file at `path` holds `needle`, read [`SCAN_CHUNK`] bytes a step.
 fn file_holds(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
     use std::io::Read as _;
-    let Some((&first, _)) = needle.split_first() else {
+    if needle.is_empty() {
         return Ok(true);
-    };
+    }
     let mut file = super::footer::open_regular(path)
         .ok_or_else(|| std::io::Error::other("not a regular file"))?;
     let keep = needle.len() - 1;
@@ -1034,10 +1034,7 @@ fn file_holds(path: &Path, needle: &[u8]) -> std::io::Result<bool> {
             Err(e) => return Err(e),
         };
         let end = held + n;
-        if buf[..end]
-            .windows(needle.len())
-            .any(|w| w[0] == first && w == needle)
-        {
+        if aterm_search::contains_bytes(&buf[..end], needle) {
             return Ok(true);
         }
         let tail = keep.min(end);

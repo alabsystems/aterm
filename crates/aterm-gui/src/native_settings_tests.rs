@@ -1913,7 +1913,47 @@ fn update_status(staged: bool) -> aterm_update::UpdateStatus {
         failing_persistent: false,
         failing_checks_kind: String::new(),
         channel_unreadable: false,
+        hold: None,
+        last: None,
+        offered: None,
+        behind: false,
     }
+}
+
+/// TRY NOW ON A HELD BUILD: while the update record holds a newer build, the page's one action
+/// is Try Now (`updates/retry`, which ends the hold and tries the build), never "Update to Latest
+/// Now", which the gates would refuse. NEGATIVE CONTROL: a lapsed hold leaves the install button.
+#[test]
+fn a_held_build_offers_try_now_in_place_of_the_install_button() {
+    crate::tray_raster::prepare_ui_fonts_for_direct_view_test();
+    let mut status = update_status(true);
+    let hold = |live| aterm_update::HoldView {
+        build: 2,
+        version: "0.2.0".to_string(),
+        cause: aterm_update_core::update_record::Cause::Unproven,
+        witness: aterm_update_core::update_record::Witness::Window,
+        why: String::new(),
+        tries: 1,
+        until: 1_789_000_000,
+        live,
+        peer_lifted: false,
+    };
+    status.hold = Some(hold(true));
+    let held = UpdateState::from_status(1, "0.1.0", Some(&status), false).projection();
+    let node = update_action_node(&held, 32.0, 400.0);
+    assert_eq!(node.key.as_str(), "updates/retry");
+    assert_eq!(
+        update_action_words(&held, 400.0).as_deref(),
+        Some("Try Now")
+    );
+    assert_eq!(compact_update_headline(&held), "Held");
+    status.hold = Some(hold(false));
+    let lapsed = UpdateState::from_status(1, "0.1.0", Some(&status), false).projection();
+    assert_eq!(
+        update_action_node(&lapsed, 32.0, 400.0).key.as_str(),
+        "updates/install-now",
+        "NEGATIVE CONTROL: a lapsed hold is tried again by itself"
+    );
 }
 
 fn view_cx() -> ViewCx<'static> {
@@ -6770,19 +6810,26 @@ fn a_theme_pair_reads_as_its_two_themes_on_the_control() {
         control.clone()
     };
     let mut fitted = Vec::new();
-    for (seed, dark, light) in [
+    for (seed, canonical, dark, light) in [
         (
             "dark:Aterm Night,light:Aterm Day",
-            "Aterm Night",
-            "Aterm Day",
+            "dark:aterm Night,light:aterm Day",
+            "aterm Night",
+            "aterm Day",
         ),
-        ("dark:Aterm Night", "Aterm Night", "Aterm Day"),
         (
+            "dark:Aterm Night",
+            "dark:aterm Night",
+            "aterm Night",
+            "aterm Day",
+        ),
+        (
+            "dark:Harbor Dusk,light:Default Light",
             "dark:Harbor Dusk,light:Default Light",
             "Harbor Dusk",
             "Default Light",
         ),
-        ("dark:Nord,light:Day", "Nord", "Day"),
+        ("dark:Nord,light:Day", "dark:Nord,light:Day", "Nord", "Day"),
     ] {
         let control = control(seed);
         let visual = control.spec.visual_label.clone().expect("visual label");
@@ -6798,8 +6845,8 @@ fn a_theme_pair_reads_as_its_two_themes_on_the_control() {
             };
             assert!(at(dark) < at(light), "dark first: {shown}");
         }
-        let full = prefs::theme_pair_label(seed).expect("a pair");
-        let short = prefs::theme_pair_short_label(seed).expect("a pair");
+        let full = prefs::theme_pair_label(canonical).expect("a pair");
+        let short = format!("{dark} / {light}");
         assert!(
             control.spec.label.ends_with(&full),
             "{}",
@@ -6816,20 +6863,15 @@ fn a_theme_pair_reads_as_its_two_themes_on_the_control() {
         "both the whole and the shortened label are exercised: {fitted:?}"
     );
     assert_eq!(prefs::theme_pair_label("Aterm Night"), None);
-    assert_eq!(prefs::theme_pair_short_label("Aterm Night"), None);
     assert_eq!(
         control("Aterm Night").spec.visual_label.as_deref(),
-        Some("Aterm Night")
+        Some("aterm Night")
     );
     let same = "dark:Aterm Day,light:Aterm Day";
     assert_eq!(prefs::theme_pair_label(same).as_deref(), Some("Aterm Day"));
-    assert_eq!(
-        prefs::theme_pair_short_label(same).as_deref(),
-        Some("Aterm Day")
-    );
     let control = control(same);
-    assert_eq!(control.spec.visual_label.as_deref(), Some("Aterm Day"));
-    assert_eq!(control.value, SemanticValue::Text("Aterm Day".to_string()));
+    assert_eq!(control.spec.visual_label.as_deref(), Some("aterm Day"));
+    assert_eq!(control.value, SemanticValue::Text("aterm Day".to_string()));
 }
 
 #[test]
@@ -6869,8 +6911,8 @@ fn a_theme_picked_over_an_unset_theme_is_its_plain_name() {
         let index = picker
             .options
             .iter()
-            .position(|option| option.value.as_deref() == Some("Aterm Day"))
-            .expect("Aterm Day row");
+            .position(|option| option.value.as_deref() == Some("aterm Day"))
+            .expect("aterm Day row");
         let saved = runtime
             .dispatch(
                 instance,
@@ -6888,11 +6930,11 @@ fn a_theme_picked_over_an_unset_theme_is_its_plain_name() {
             .and_then(|edit| edit.value)
             .expect("one theme write")
     };
-    assert_eq!(pick(""), "Aterm Day");
-    assert_eq!(pick("theme = \"Dracula\"\n"), "Aterm Day");
+    assert_eq!(pick(""), "aterm Day");
+    assert_eq!(pick("theme = \"Dracula\"\n"), "aterm Day");
     assert_eq!(
         pick("theme = \"dark:Nord,light:Default Light\"\n"),
-        "dark:Nord,light:Aterm Day"
+        "dark:Nord,light:aterm Day"
     );
 }
 
@@ -11268,7 +11310,6 @@ fn the_update_card_carries_both_switches_and_their_labels_fit() {
             trial_phase: None,
             trial_starts: 0,
             trial_healthy: false,
-            refused_newer: false,
         });
         assert!(
             runtime.replace_settings_update(
@@ -11696,7 +11737,6 @@ fn a_short_compact_page_pairs_the_status_card_with_the_check_switch() {
         trial_phase: None,
         trial_starts: 0,
         trial_healthy: false,
-        refused_newer: false,
     };
     let mut revision = 1;
     for (state, staged, running, saved) in [
@@ -13988,7 +14028,6 @@ fn linux_update_status_settings_preserves_manual_authority_and_effective_policy(
         trial_phase: None,
         trial_starts: 0,
         trial_healthy: false,
-        refused_newer: false,
     };
     let mut status = update_status(false);
     status.linux = Some(facts(Some(2)));
@@ -14262,7 +14301,6 @@ fn a_linux_short_landscape_page_paints_a_failed_checks_cause() {
             trial_phase: None,
             trial_starts: 0,
             trial_healthy: false,
-            refused_newer: false,
         });
         status.failing_checks = 1;
         status.outcome = cause.into();
@@ -14493,7 +14531,6 @@ fn compact_update_rungs_never_call_a_page_current_while_checks_are_off() {
         trial_phase: None,
         trial_starts: 0,
         trial_healthy: false,
-        refused_newer: false,
     });
     let idle = |running: bool| {
         compact_update_headline(

@@ -406,6 +406,9 @@ impl EpochController {
             Err(SpawnFailure::Refused(error)) => {
                 Err(self.retain_launch_error(LaunchError::Refused(error)))
             }
+            Err(SpawnFailure::Unbound { spawned, error }) => {
+                Err(self.retain_launch_error(LaunchError::Unbound { spawned, error }))
+            }
         }
     }
 

@@ -5,8 +5,152 @@
 //! builds aterm's `restore_bench` bench for its arm's profile ([`bench_build::prepare`]), runs it
 //! once per arm (`clean`, what ships; `copy`, each region restored from a heap copy; `lookalike`,
 //! that copy with the look-alike tail planted in every region, the seam's own copy and plant off
-//! the readings), and writes each run as a dated entry under `docs/measured/restore/` with its
+//! the readings), and writes each run as a dated entry in the verify state directory with its
 //! provenance and the load beside it.
+//!
+//! # The restore ledger — what a crashed window's tabs cost to bring back
+//!
+//! A window killed without a word (SIGKILL, a jetsam kill, a crash) leaves its shells in the
+//! keeper's custody, each beside its crash-restore region. The next launch says HELLO to the
+//! keeper, is offered every orphaned session, and admits them one after another before its
+//! first frame (`keeper_link::boot`: per offer `admit_recovered_master`, whose
+//! `crash_restore::restore_offered` runs `aterm_restore::recover` over the region). This ledger
+//! holds what that costs, from the successor's spawn to its tabs back. The runner is the
+//! `restore-e2e` lane of `verify perf` (this module); the
+//! measurement is `crates/aterm/benches/restore_bench.rs` (`tests/restore_bench/run.rs`, its
+//! grammar in `spec.rs`), whose pure readings and tables the `restore_bench` test target checks.
+//!
+//! ```sh
+//! targo --unverified verify perf restore-e2e --no-windows
+//! # knobs (defaults shown):
+//! targo --unverified verify perf restore-e2e --no-windows --profile dev --sessions 1,8,32 \
+//!   --rounds 3 --lines 5000 --arm clean,copy,lookalike --lookalike-kib 6912
+//! # the optimized build (cargo profile opt-test):
+//! targo --unverified verify perf restore-e2e --no-windows --profile opt
+//! # what ships and the look-alike arm, interleaved A B B A:
+//! targo --unverified verify perf restore-e2e --no-windows --arm clean,lookalike --passes 2
+//! ```
+//!
+//! `--sessions` rises, each at most 64; `--rounds` is at most 20, `--lines` at most 100,000, and
+//! `--lookalike-kib` at most 8192, only when the plan holds the lookalike arm. The lane refuses
+//! what the bench would before it builds. It opens no window and runs on macOS only.
+//!
+//! Each run writes `<date>-restore-e2e.md` (the tables under the run's provenance) and
+//! `<date>-restore-e2e.json` (every round's raw readings and each size's summary) into the verify
+//! state directory, `<target>/verify/.ubd/perf.noindex/restore/` ([`super::ledger_dir`]); a second
+//! run on one day gets `-2`, `-3`, …. An entry is local state and never edited: a number a claim
+//! rests on goes in the lab tracker with the command that produced it (`goals.py measure`). A list
+//! of arms is one build, then one run and one entry per arm in the plan
+//! (`--passes` repeats it, reversed on odd passes); each entry's **Run** line reproduces its arm
+//! alone, and `--json-out` takes a plan of one run.
+//!
+//! ## What runs
+//!
+//! Each round is one scratch world (`tests/support/keeper_world.rs`, the live lane's own):
+//!
+//! 1. This build's `aterm keeper serve --no-relaunch`, and a headless instance A with
+//!    `[keeper] enabled = true`.
+//! 2. A runs `--sessions` sessions, each printing `--lines` lines of history
+//!    (`seq -f 'line %g' 1 <lines>`) and a marker. The round waits, per session, for the marker,
+//!    the prompt below it, `journal_tail=0` and `journal_ring_lag=0`, then for the keeper's
+//!    `claimed=N` and `journals=N`.
+//! 3. A is SIGKILLed by its own pid (never `pkill`) and reaped; the keeper says `orphaned=N`.
+//! 4. B boots in the same world. Both keep a window's desk (layout, journals, restore pass)
+//!    without its wait for glass (`ATERM_DEBUG_HEADLESS_RESTORE` under the world's own
+//!    `ATERM_STATE_HOME`, `desk::Desk::LabHeadless`). A window places the sessions after the first
+//!    once its first frame is on glass; a headless instance does it at its first park, so the
+//!    placement reading leaves out a window's first present (`first_present_ms`).
+//!
+//! Every wait for an application event is a one-minute hang detector; nothing asserts a time.
+//! The keeper's first exec of its fresh code copy has the shared first-exec bound, and a copy that
+//! never showed it ran stays in place. Each round checks that its arm took, from B's `metrics`. A
+//! debug or test build of B counts `restore_experiment_copies=`, `restore_experiment_plants=` and
+//! `restore_experiment_refused=`:
+//! clean needs all zero, copy one copy per offer, lookalike one copy and one plant per offer, and
+//! no arm a refusal. B's seam counters must agree, and in the lookalike arm every recovered session
+//! must have lost history to the plant. A failed copy or plant falls back to the original region,
+//! so it cannot pass as an experimental timing. Completion needs exactly A's session IDs, each
+//! restored and imported (membership, not tab order). A round that fails any of these fails the
+//! run, and no entry is written.
+//!
+//! ## The readings
+//!
+//! On B's own clocks (`metrics`: `process_birth_to_rust_main_ms`; `startup_keeper_offers=
+//! _hello_ms= _admit_ms= _admit_max_ms= _placed_ms= _imported_ms=`; and, with debug assertions,
+//! which both profiles keep, `startup_keeper_seam_copies= _plants= _ms=`). The admission runs
+//! before B's control socket exists, so nothing outside can see it.
+//!
+//! - **birth → HELLO answered**: B's process birth to the keeper's answer to its boot HELLO.
+//! - **HELLO → every offer admitted**: the one-after-another admission; **slowest one offer** is
+//!   its longest single admission.
+//! - **HELLO → every session placed**: the restore pass that places every recovered session
+//!   drained (where the history imports start): a person's tabs all there, less a window's first
+//!   present.
+//! - **HELLO → every import settled**: every session's history import done (`—` with none).
+//! - **the seam's own work** (`startup_keeper_seam_ms`): the copy and lookalike arms' copying and
+//!   planting. Every reading above leaves it out, since a really damaged region never pays it; the
+//!   bench's readings below hold it, because it runs before B's control socket listens.
+//!
+//! B's recovery-count fence (`keeper_link::RecoveryCountAdmission`): until the keeper confirmed every
+//! adopted session's new journal, B refuses every control request (`ERR recovery-count-custody
+//! unconfirmed`), so no ID or history anchor escapes while an old journal is offerable. The fence
+//! refuses `aterm ctl` clients (agents, scripts, the bench) and nothing else: B's restore pass,
+//! history imports and glass do not read it. What it waits on: each adopted session's new journal
+//! goes to the keeper as a COMPANION between two SYNCs on the keeper link
+//! (`aterm_keeper::client::send_companion`), and the link's worker reading the keeper's answer to
+//! the second confirms it (`ReadObserver`). On B's own clocks again (`startup_keeper_fence_cohort=
+//! _sync_sent_ms= _sync_answer_max_ms= _fence_ms= _served_ms=`), from the HELLO and less the seam:
+//!
+//! - **HELLO → last confirming SYNC written**: the last of those second SYNCs, of the ones whose
+//!   answers confirmed a journal.
+//! - **slowest one SYNC → its answer read**: the longest any one journal waited on the keeper's
+//!   answer and the worker's read of it.
+//! - **HELLO → the fence lifted**: the last answer read, once every old journal authority (the
+//!   cohort, one per offer with a region) has one.
+//! - **HELLO → first request past it**: the first control request the fence let through.
+//!
+//! On the bench's clock, from just before B's spawn; everything after ready waits on that fence.
+//!
+//! - **spawn → ready**: B's ready signal, written once its control socket listens.
+//! - **spawn → served past the fence**: the first request B answers, asked every 2 ms; a refused
+//!   request reads only the fence's flag, so asking does not move the lift. **served's window**,
+//!   from the last refused request (or ready) to the answer, is the most it can be late.
+//!   **ready → served** is how long a client that dials at ready waits on the fence.
+//! - **spawn → every `restore=` read**: the first sweep in which every session reads
+//!   `restore=exact|screen|meta`.
+//! - **HELLO → every `restore=` read**: that less B's birth → HELLO (so it also holds the gap from
+//!   the bench's spawn call to B's birth).
+//! - **spawn → every import in**: the first sweep in which every session's `lines` plus
+//!   `history_lost=` reach A's count, with `journal=live journal_ring_lag=0`; a META rung has
+//!   nothing to import.
+//! - **longest sweep**: the polled readings' resolution (a sweep every 2 ms).
+//!
+//! Each round's row also gives `restore=`, `restore_why=`, the summed `history_lost=`, A's and
+//! B's lines, the copies and plants, and the load just before B's spawn.
+//!
+//! ## The arms
+//!
+//! - `clean`: B restores each offered region as the keeper holds it. What ships.
+//! - `copy`: B restores each region from a copy in its heap
+//!   (`ATERM_DEBUG_CRASH_RESTORE_LOOKALIKE_KIB=0`, debug and test builds): against clean, what a
+//!   heap copy rather than the mapped region changes, the lookalike arm's residue.
+//! - `lookalike`: that copy with `aterm_restore::plant::lookalike_tail` planted
+//!   (`…_LOOKALIKE_KIB=<--lookalike-kib>`): the newest history chunk's payload damaged and frame
+//!   look-alikes past the ring's commit, up to its lap: `benches/resync_walk.rs`'s `lookalike-tail`
+//!   case, the damage the resync's bound was built for, in every region at once. It is the
+//!   costliest tail in an optimized build (`docs/DESIGN-crash-restore-2026-10-20.md` §3: 5.8 ms
+//!   against 3.6 ms for a random tail of the full ring), not in a dev one (`resync_walk` under
+//!   `--profile test`, 2026-10-27, three runs each: 38.7 ms over a random tail against 8.8 ms over
+//!   this one). The lane plants no random tail.
+//!
+//! The keeper's region is only read; the copy and the plant are the seam's own work, off B's clocks.
+//!
+//! ## How to compare two runs
+//!
+//! Same machine, same day, one build, the arms interleaved (`--passes 2`: A B B A), and the load
+//! beside every number: the lane waits for a quiet machine before it starts (`--admit wait`, the
+//! default), and each round records `vm.loadavg` before B. A `dev` and an `opt` entry measure
+//! different code generation and do not compare.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -223,13 +367,9 @@ fn measure(args: &Args) -> Result<String, Halt> {
             "run it on a Mac",
         ));
     }
-    let ledger_dir = workspace_root().join("docs/measured/restore");
-    if !ledger_dir.join("README.md").is_file() {
-        return Err(Halt::skip(
-            format!("no restore ledger at {}", ledger_dir.display()),
-            "run the lane in the development checkout, which carries docs/measured/restore",
-        ));
-    }
+    let ledger_dir = super::ledger_dir("restore");
+    std::fs::create_dir_all(&ledger_dir)
+        .map_err(|e| format!("could not make {}: {e}", ledger_dir.display()))?;
     let driver = crate::perf::driver::cargo_driver()?;
     let (targo, built, load_before) =
         bench_build::prepare(driver, args.profile, &args.build_args())?;
@@ -267,7 +407,7 @@ fn run_arm(
         (bench_spec::ENV, &words),
         (bench_spec::OUT_ENV, scratch.path()),
         PROGRESS,
-        "the restore bench",
+        built,
         bench_build::Entry::Timed,
     )?;
     let read = |name: &str| {
@@ -310,7 +450,7 @@ fn run_arm(
     };
     let header = Provenance {
         heading: &format!("Restore end to end: the {} arm", arm.word()),
-        protocol: "docs/measured/restore/README.md",
+        protocol: "crates/aterm-verify/src/perf/restore_e2e.rs",
         date: &date,
         machine: &arena::chip(),
         macos: &arena::macos_version(),
@@ -335,7 +475,7 @@ fn run_arm(
     crate::write_fresh(&json_path, &json)
         .map_err(|e| format!("could not write {}: {e}", json_path.display()))?;
     eprintln!(
-        "ledger entry written: {} (+ {}) — commit both to record the run",
+        "ledger entry written: {} (+ {})",
         md_path.display(),
         json_path.display()
     );

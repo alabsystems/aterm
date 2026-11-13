@@ -135,6 +135,7 @@ impl Deadline {
                     let _ = socket.shutdown(Shutdown::Both);
                 }
             })?;
+        crate::runtime::census::count(crate::runtime::census::Event::DeadlineSpawn);
         Ok(Self {
             done,
             join: Some(join),

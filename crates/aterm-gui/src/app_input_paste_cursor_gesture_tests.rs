@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+use std::os::fd::IntoRawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -15,8 +16,9 @@ use crate::{App, WindowId};
 
 /// Drive the genuine asynchronous input seam.
 fn program_move_after_paste(text: &str, queue_behind_existing: bool) -> bool {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = Arc::new(SinkWriter::new(pipe[1]));
     let mut app = App::headless_for_test_with_sink(sink.clone());
     let wid = WindowId(0);
@@ -104,8 +106,9 @@ fn delivered_paste_then_hop(
     hop: u16,
     apply: bool,
 ) -> (u64, &'static str, Option<InsertWidth>) {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = Arc::new(SinkWriter::new(pipe[1]));
     let mut app = App::headless_for_test_with_sink(sink.clone());
     let wid = WindowId(0);
@@ -235,8 +238,9 @@ fn a_queued_keys_receipt_stamps_only_the_window_that_typed_it() {
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
     for style in ["rainbow", "comet"] {
         for queued in [false, true] {
-            let mut pipe = [0; 2];
-            assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+            let pipe = aterm_uds::pipe()
+                .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+                .expect("pipe");
             let sink = Arc::new(SinkWriter::new(pipe[1]));
             let mut app = App::headless_for_test_with_sink(sink.clone());
             app.recompute_sparkle();
@@ -382,8 +386,9 @@ fn prelude_paste_then_hop(
 ) -> (u64, &'static str, Option<(u64, u64)>) {
     use crate::app_render::CursorFxInputs;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = Arc::new(SinkWriter::new(pipe[1]));
     let mut app = App::headless_for_test_with_sink(sink.clone());
     let wid = WindowId(0);
@@ -469,8 +474,9 @@ fn a_paste_before_33_to_128_queued_keys_keeps_its_first_visible_echo() {
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 
     for queued_keys in [33, aterm_effects::cursor_glow::TYPED_STAMP_DEPTH] {
-        let mut pipe = [0; 2];
-        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+        let pipe = aterm_uds::pipe()
+            .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+            .expect("pipe");
         let sink = Arc::new(SinkWriter::new(pipe[1]));
         let mut app = App::headless_for_test_with_sink(sink.clone());
         let wid = WindowId(0);
@@ -571,8 +577,9 @@ fn a_delayed_paste_frame_leaves_later_queued_keys_for_their_own_echo() {
     use crate::cursor_glow::ProbeTrust;
     use aterm_types::keyboard::{Key, KeyEventType, Modifiers};
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = Arc::new(SinkWriter::new(pipe[1]));
     let mut app = App::headless_for_test_with_sink(sink.clone());
     let wid = WindowId(0);

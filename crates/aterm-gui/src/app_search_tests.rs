@@ -11,12 +11,14 @@ use crate::{App, WindowId, term_lock};
 /// control verb put nothing on the PTY.
 #[cfg(unix)]
 fn app_observing_pty() -> (App, [i32; 2]) {
+    use std::os::fd::IntoRawFd;
     use std::sync::Arc;
 
     use aterm_session::sink::SinkWriter;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(

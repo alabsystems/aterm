@@ -333,31 +333,8 @@ pub(crate) struct MenuColors {
 pub(crate) fn menu_colors(palette: impl Into<chrome_band::ChromePalette>) -> MenuColors {
     let palette = palette.into();
     let fg = rgb(palette.theme.fg);
-    let card_bg = chrome_band::mix3(chrome_band::band_colors(palette).bar_bg, fg, 0.08);
-    menu_colors_on(palette, card_bg)
-}
-
-const fn rgb(c: u32) -> [u8; 3] {
-    [
-        ((c >> 16) & 0xff) as u8,
-        ((c >> 8) & 0xff) as u8,
-        (c & 0xff) as u8,
-    ]
-}
-
-/// The card's colours on the pane's own ground: a card that wears the harness glass stands on
-/// the ground its glass inks are solved on (`docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
-/// §4.1), never the band's grey, on which Day's letters floored to 4.5:1 turn olive and brown.
-pub(crate) fn glass_menu_colors(palette: impl Into<chrome_band::ChromePalette>) -> MenuColors {
-    let palette = palette.into();
-    let ground = rgb(palette.theme.bg);
-    menu_colors_on(palette, ground)
-}
-
-/// The card's colours on `card_bg`: every ink floored against it.
-fn menu_colors_on(palette: chrome_band::ChromePalette, card_bg: [u8; 3]) -> MenuColors {
-    let fg = rgb(palette.theme.fg);
     let band = chrome_band::band_colors(palette);
+    let card_bg = chrome_band::mix3(band.bar_bg, fg, 0.08);
     let value = chrome_band::ensure_contrast(fg, card_bg, 4.5);
     let label = chrome_band::ensure_contrast(band.label, card_bg, 4.5);
     let rule = chrome_band::mix3(card_bg, value, 0.34);
@@ -374,6 +351,14 @@ fn menu_colors_on(palette: chrome_band::ChromePalette, card_bg: [u8; 3]) -> Menu
             ..band
         },
     }
+}
+
+const fn rgb(c: u32) -> [u8; 3] {
+    [
+        ((c >> 16) & 0xff) as u8,
+        ((c >> 8) & 0xff) as u8,
+        (c & 0xff) as u8,
+    ]
 }
 
 /// Write `s` into `row` starting at `col` up to `end`, emitting continuation cells for wide chars.

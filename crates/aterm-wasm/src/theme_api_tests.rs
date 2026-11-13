@@ -217,7 +217,7 @@ fn split_follows_set_color_scheme() {
         .expect("signature split");
     assert_eq!(
         t.web_theme.installed.as_ref().map(|d| d.id.as_str()),
-        Some("Aterm Night")
+        Some("aterm Night")
     );
     while t.term.take_response().is_some() {}
     t.set_color_scheme(false);
@@ -230,7 +230,7 @@ fn split_follows_set_color_scheme() {
     let state = t.theme_state();
     assert!(
         state.contains(
-            "\"id\":\"Aterm Day\",\"side\":\"light\",\"reported\":\"light\",\"source\":\"builtin\""
+            "\"id\":\"aterm Day\",\"side\":\"light\",\"reported\":\"light\",\"source\":\"builtin\""
         ),
         "{state}"
     );

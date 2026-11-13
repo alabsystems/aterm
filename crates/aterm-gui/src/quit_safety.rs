@@ -424,6 +424,19 @@ pub(crate) fn session_root(pid: i32) -> Option<SessionRoot> {
 /// `pid`'s `proc_pidinfo(PROC_PIDTBSDINFO)` record: an exact-size read that names `pid` (a record about another pid is no witness).
 #[cfg(target_os = "macos")]
 pub(crate) fn pid_bsdinfo(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
+    bsdinfo_of(pid, 0)
+}
+
+/// [`pid_bsdinfo`], which also answers for a process that has exited and is not yet reaped (a
+/// zombie, whose record says `pbi_status == SZOMB`): XNU looks among zombies for this flavor
+/// only when its argument is nonzero.
+#[cfg(target_os = "macos")]
+pub(crate) fn pid_bsdinfo_unreaped_too(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
+    bsdinfo_of(pid, 1)
+}
+
+#[cfg(target_os = "macos")]
+fn bsdinfo_of(pid: libc::pid_t, zombies: u64) -> Option<libc::proc_bsdinfo> {
     let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
     let size = i32::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
     // SAFETY: `info` points at `size` writable bytes of exactly the structure
@@ -432,7 +445,7 @@ pub(crate) fn pid_bsdinfo(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
         libc::proc_pidinfo(
             pid,
             libc::PROC_PIDTBSDINFO,
-            0,
+            zombies,
             info.as_mut_ptr().cast(),
             size,
         )

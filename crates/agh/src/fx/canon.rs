@@ -582,17 +582,23 @@ pub fn git_request(run: &crate::git::GitRun) -> Vec<u8> {
             reference,
             into,
             anonymous,
-            checkout_closure,
-            checkout_cache,
+            scope,
             ..
         } => {
             let mut text = format!(
                 "git fetch-ref {slug}\nref {reference}\ninto {into}\nanonymous {anonymous}"
             );
-            if *checkout_closure {
-                text.push_str("\ncheckout closure");
-                if checkout_cache.is_some() {
-                    text.push_str("\ncheckout cache present");
+            match scope {
+                crate::git::FetchScope::NativeExact => {}
+                crate::git::FetchScope::MetadataOnly => text.push_str("\nmetadata only"),
+                crate::git::FetchScope::SelectedCheckout { cache } => {
+                    text.push_str("\ncheckout closure");
+                    if cache.is_some() {
+                        text.push_str("\ncheckout cache present");
+                    }
+                }
+                crate::git::FetchScope::FullSource { .. } => {
+                    text.push_str("\nfull source object cache present");
                 }
             }
             text

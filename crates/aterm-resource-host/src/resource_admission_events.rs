@@ -27,6 +27,7 @@ pub(in super::super) struct Events {
     accounted: bool,
     observe_accounting: bool,
     workload: bool,
+    native_job: Option<[u8; 32]>,
     linker: Option<trust_resource_controller::Loan>,
     produced: Option<(
         trust_resource_controller::workload::host::produced::Key,
@@ -98,6 +99,7 @@ impl Events {
             accounted: false,
             observe_accounting: false,
             workload: false,
+            native_job: None,
             linker: None,
             produced: None,
             contained: None,
@@ -204,6 +206,16 @@ impl Events {
             )?;
             let bytes = match event {
                 trust_resource_controller::MetadataEvent::Completed(completed) => {
+                    if let Some(invocation_sha256) = self.native_job {
+                        return self.enqueue(
+                            trust_resource_controller::native_job::query::Completion {
+                                invocation_sha256,
+                                completed,
+                                observation,
+                            }
+                            .encode()?,
+                        );
+                    }
                     if let Some(loan) = self.linker {
                         return self.enqueue(
                             trust_resource_controller::linker::Completion {
@@ -246,6 +258,18 @@ impl Events {
         self.account()?;
         self.metadata_root = Some(root);
         self.workload = true;
+        Ok(())
+    }
+    pub(in super::super) fn native_job(
+        &mut self,
+        root: [u8; 16],
+        digest: [u8; 32],
+    ) -> io::Result<()> {
+        if digest == [0; 32] {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        self.workload(root)?;
+        self.native_job = Some(digest);
         Ok(())
     }
     pub(in super::super) fn linker(

@@ -176,7 +176,7 @@ fn headless_host_actor_if_requested() {
     let mut jobs = Vec::new();
     for (index, held) in [first, second].into_iter().enumerate() {
         let job_world = world.join(index.to_string());
-        let (input, writer) = std::io::pipe().unwrap();
+        let (input, writer) = aterm_uds::pipe().unwrap();
         let (cancel, cancellation) = Cancellation::channel(Duration::from_millis(100)).unwrap();
         let worker_world = job_world.clone();
         let worker = std::thread::spawn(move || {

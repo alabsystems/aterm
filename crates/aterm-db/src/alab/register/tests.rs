@@ -35,6 +35,211 @@ const ME: &str = "11111111111111111111111111111111";
 const OLD: &str = "22222222222222222222222222222222";
 
 #[test]
+fn two_macs_born_apart_on_one_free_number_settle_to_one_holder_on_every_replica() {
+    disconnected_number_claims(false, false);
+}
+
+#[test]
+fn a_generation_roll_preserves_the_settled_number_claim_after_releasing_its_history() {
+    disconnected_number_claims(true, false);
+}
+
+#[test]
+fn a_persons_number_choice_stays_a_clash_label_after_repair_and_roll() {
+    disconnected_number_claims(true, true);
+}
+
+fn disconnected_number_claims(roll_generation: bool, person_choice: bool) {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let registries = [
+        Registry::at(lab.paths[0].clone()),
+        Registry::at(lab.paths[1].clone()),
+    ];
+    registries[0].open().unwrap();
+    registries[0].seed().unwrap();
+    repair_commons(&lab, 6);
+    let probes = [
+        Probe {
+            hosts: vec!["m777777.local".into()],
+            ..probe()
+        },
+        Probe {
+            hosts: vec!["m777777.local".into()],
+            node: Some(OTHER_NODE.into()),
+            platform_uuid: "C3396674-FCD3-52E5-A1C1-BD5B9E8F5C44".into(),
+            ..probe()
+        },
+    ];
+    let mut births = Vec::new();
+    let mut claims = Vec::new();
+    for i in 0..2 {
+        // There is no repair between births. Local observation times run backwards, and
+        // neither writer reserves the number on its peer before committing its own row.
+        let registered = registries[i]
+            .register(
+                &lab_config(&lab, i),
+                &probes[i],
+                true,
+                NOW - i as u64 * 86_400_000,
+            )
+            .unwrap();
+        let Outcome::Born { mac } = registered.outcome else {
+            panic!(
+                "the disconnected machine must be born: {:?}",
+                registered.outcome
+            );
+        };
+        let view = registries[i].view().unwrap();
+        assert_eq!(
+            view.project(&MACHINE).rows[&mac].get("label"),
+            Some(&json!("m777777"))
+        );
+        let key = format!("{mac}.label");
+        let claim = view
+            .ops
+            .iter()
+            .find(|operation| {
+                operation.changes.iter().any(|change| {
+                    change.collection == MACHINE.name
+                        && change.key == key
+                        && change.value.as_ref().and_then(|value| value.get("x"))
+                            == Some(&json!("m777777"))
+                })
+            })
+            .expect("the local birth has a label claim")
+            .id;
+        births.push(mac);
+        claims.push(claim);
+    }
+    let winner = usize::from(claims[1] < claims[0]);
+    repair_commons(&lab, 6);
+    let mut agreed = None;
+    for registry in &registries {
+        let machines = registry.view().unwrap().project(&MACHINE);
+        let labels: Vec<_> = births
+            .iter()
+            .map(|mac| {
+                machines.rows[mac]
+                    .get("label")
+                    .and_then(Value::as_str)
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect();
+        assert_eq!(labels.iter().filter(|label| *label == "m777777").count(), 1);
+        assert_eq!(labels[winner], "m777777");
+        assert!(labels[1 - winner].starts_with("m777777-"));
+        if let Some(agreed) = &agreed {
+            assert_eq!(&labels, agreed);
+        } else {
+            agreed = Some(labels);
+        }
+    }
+    let command = |words: &[&str]| {
+        let words: Vec<_> = words.iter().map(|word| (*word).to_owned()).collect();
+        match crate::att::command::run(
+            &lab.paths[0],
+            &words,
+            &mut |_, _, _| panic!("a read opens no editor"),
+            &mut |_| {},
+        )
+        .unwrap()
+        {
+            crate::att::command::Output::Json(value) => value,
+            _ => panic!("a JSON read returns JSON"),
+        }
+    };
+    let scanned = command(&[
+        "scan",
+        "alab/registry",
+        "machine",
+        "--json",
+        "--where",
+        "label=m777777",
+    ]);
+    assert_eq!(scanned["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(scanned["rows"][0]["pk"], json!(births[winner]));
+    let shown = command(&["get", "alab/registry", "machine", &births[1 - winner]]);
+    assert_eq!(
+        shown["row"]["label"],
+        json!(agreed.as_ref().unwrap()[1 - winner])
+    );
+    assert_eq!(shown["claim_candidates"]["label"], json!("m777777"));
+    if roll_generation {
+        registries[0].roll(true, NOW).unwrap();
+        repair_commons(&lab, 6);
+        registries[1].release(NOW).unwrap();
+        repair_commons(&lab, 6);
+        assert!(registries[0].roll(true, NOW).unwrap().sealed);
+        repair_commons(&lab, 6);
+        registries[1].release(NOW).unwrap();
+        for registry in &registries {
+            assert_eq!(registry.generation().generation, 2);
+            let machines = registry.view().unwrap().project(&MACHINE);
+            for (mac, label) in births.iter().zip(agreed.as_ref().unwrap()) {
+                assert_eq!(
+                    machines.rows[mac].get("label"),
+                    Some(&json!(label)),
+                    "rolling and releasing the old generation must preserve claim order"
+                );
+            }
+        }
+    }
+    let loser = 1 - winner;
+    if person_choice {
+        registries[loser]
+            .write(vec![vec![
+                cell::change(
+                    &MACHINE,
+                    CellKey {
+                        pk: &births[loser],
+                        col: "label",
+                        elem: None,
+                    },
+                    &CellValue::owner(MACHINE.version, json!("m777777")),
+                )
+                .unwrap(),
+            ]])
+            .unwrap();
+        repair_commons(&lab, 6);
+    }
+    registries[loser]
+        .register(
+            &lab_config(&lab, loser),
+            &probes[loser],
+            true,
+            // A converged collision is identity work, not a daily facts refresh.
+            NOW,
+        )
+        .unwrap();
+    repair_commons(&lab, 6);
+    for registry in &registries {
+        let machines = registry.view().unwrap().project(&MACHINE);
+        assert_eq!(
+            machines.rows[&births[winner]].get("label"),
+            Some(&json!("m777777"))
+        );
+        let fresh = machines.rows[&births[loser]]
+            .get("label")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert_ne!(fresh, "m777777");
+        if person_choice {
+            assert_eq!(fresh, agreed.as_ref().unwrap()[loser]);
+            assert_eq!(
+                machines.rows[&births[loser]].fields["label"].value(),
+                Some(&json!("m777777"))
+            );
+        } else {
+            assert!(
+                !fresh.contains('-'),
+                "the automatic loser chooses a fresh bare number"
+            );
+        }
+    }
+}
+
+#[test]
 fn a_chosen_number_updates_the_bound_registry_row_without_waiting_a_day() {
     let own = keys::machine_pk(ME);
     let other = keys::machine_pk(OLD);
@@ -84,7 +289,7 @@ fn a_chosen_number_updates_the_bound_registry_row_without_waiting_a_day() {
     ]);
     let live = [ME.to_owned(), OLD.to_owned()].into();
     assert!(
-        super::plan(
+        super::plan_projected(
             &Input {
                 me: &chosen,
                 probe: &probe(),
@@ -93,7 +298,8 @@ fn a_chosen_number_updates_the_bound_registry_row_without_waiting_a_day() {
                 now_ms: NOW
             },
             &other_holds,
-            &held
+            &held,
+            &cell::project(&MACHINE, &other_holds)
         )
         .is_err()
     );
@@ -105,7 +311,7 @@ fn a_chosen_number_updates_the_bound_registry_row_without_waiting_a_day() {
         .raw
         .insert("label".into());
     assert!(
-        chosen_number(
+        number_change(
             &Input {
                 me: &chosen,
                 probe: &probe(),
@@ -265,6 +471,7 @@ fn me() -> Me {
         chosen: None,
         hw_hint: HINT.into(),
         enrolled_ms: None,
+        former: Vec::new(),
     }
 }
 
@@ -346,7 +553,7 @@ fn run(
     read: &OwnedRead,
 ) -> Plan {
     let live: BTreeSet<String> = live.iter().map(|uuid| (*uuid).to_owned()).collect();
-    plan(
+    plan_projected(
         &Input {
             me,
             probe,
@@ -356,6 +563,7 @@ fn run(
         },
         cells,
         read,
+        &cell::project(&MACHINE, cells),
     )
     .unwrap()
 }
@@ -370,6 +578,14 @@ fn written_row(plan: &Plan) -> &Value {
 
 fn kinds(plan: &Plan) -> Vec<&'static str> {
     plan.findings.iter().map(|f| f.kind).collect()
+}
+
+/// An earlier writer of a lineage, seated under `label`.
+fn writer(uuid: &str, label: Option<&str>) -> Former {
+    Former {
+        uuid: uuid.into(),
+        label: label.map(str::to_owned),
+    }
 }
 
 /// A row an earlier enrollment left: gone from the roster, seen long before this one enrolled.
@@ -877,6 +1093,61 @@ fn a_birth_waits_for_a_round_and_lands_with_its_machine_and_model() {
     assert_eq!(written_row(&plan)["label"], json!("m1"));
 }
 
+/// A bound Mac whose machine row's label is in conflict keeps the label its facts row states,
+/// whatever its seat is called: a writer successor is seated under a later label (`m381` for
+/// m22) and its lineage is read only until it is bound, so its seat's label must not be written
+/// over the row's, at a record of the quota each way.
+/// NEGATIVE CONTROL: with the refresh falling back to `Me::label`, the outcome is
+/// `Refreshed { .. }`, which the `assert_eq!` prints.
+#[test]
+fn a_bound_rows_label_outlasts_a_conflicted_machine_label() {
+    use crate::typed::cell::{Candidate, Field};
+    let born = run(&me(), &probe(), &[ME], true, &Cells::new(), &facts(&[]));
+    let Outcome::Born { mac } = born.outcome.clone() else {
+        panic!("{:?}", born.outcome);
+    };
+    let mut stored = written_row(&born).clone();
+    if let Value::Object(object) = &mut stored {
+        object.insert("seen".into(), json!(399));
+    }
+    let held = stored["label"].as_str().unwrap().to_owned();
+    let cells = apply(&[born.changes]);
+    let mut machines = cell::project(&MACHINE, &cells);
+    machines.rows.get_mut(&mac).unwrap().fields.insert(
+        "label".into(),
+        Field::Conflict {
+            candidates: [held.as_str(), "m381"]
+                .into_iter()
+                .map(|label| Candidate {
+                    operation: [1; 32],
+                    value: CellValue::owner(MACHINE.version, json!(label)),
+                })
+                .collect(),
+            provisional: Some(json!(held)),
+        },
+    );
+    let successor = Me {
+        label: Some("m381".into()),
+        ..me()
+    };
+    let live = [ME.to_owned()].into();
+    let plan = plan_projected(
+        &Input {
+            me: &successor,
+            probe: &probe(),
+            live: &live,
+            heard: true,
+            now_ms: NOW,
+        },
+        &cells,
+        &facts(&[(ME, stored)]),
+        &machines,
+    )
+    .unwrap();
+    assert_eq!(plan.outcome, Outcome::Unchanged);
+    assert!(plan.changes.is_empty());
+}
+
 /// A row is rewritten only on a change or when `seen` is 30 days old: a same reading writes
 /// nothing; a changed one writes once, at most once a day; a read that failed keeps the cell; the
 /// binding, the predecessor and the Mac's merge acknowledgment always carry over; and the order
@@ -1035,8 +1306,12 @@ fn the_hardware_hint_keeps_the_bytes_ring_computed() {
 /// `check` names two live enrollments bound to one machine, one hint on two live uuids, a row
 /// that binds no known machine, and facts that differ from the owner's statement; gone uuids
 /// are history, not findings.
-/// NEGATIVE CONTROL: with `checks::facts` not filtering to `live`, the gone uuid's row joins and
-/// the last assertion fails.
+/// NEGATIVE CONTROLS: with `checks::facts` not filtering to `live`, the gone uuid's row joins and
+/// the `one` assertion fails; with it counting every enrollment of a group as a root, the
+/// `succeeded` assertion lists `facts-bind-one-machine` and `hw-hint-clone`; with it following
+/// one `predecessor` only, the `chain` assertion lists them; with it not counting `forked`, the
+/// `fork` assertion is empty; with it reading only each member's own `predecessor` for the fork
+/// (a chain's later links left out), the `hidden` assertion is empty.
 #[test]
 fn check_reports_shared_bindings_and_hints_among_live_macs() {
     let mac = "mc-1000000000000001";
@@ -1073,6 +1348,70 @@ fn check_reports_shared_bindings_and_hints_among_live_macs() {
         .map(|f| f.kind)
         .collect();
     assert_eq!(found, ["facts-differ"]);
+    // A writer successor names the enrollment it succeeded, which stays seated: one Mac, twice
+    // enrolled, shares nothing. A third enrollment that succeeded neither is another Mac.
+    let third = "33333333333333333333333333333333";
+    let later = json!({"n": 1, "mac": mac, "hw_hint": HINT, "ram_gb": 128, "predecessor": OLD});
+    let succeeded = facts(&[(ME, later.clone()), (OLD, row(mac))]);
+    let found: Vec<&str> = checks::facts(&succeeded, &live, &machines)
+        .iter()
+        .map(|f| f.kind)
+        .collect();
+    assert_eq!(found, ["facts-differ", "facts-differ"]);
+    let cloned = facts(&[(ME, later), (OLD, row(mac)), (third, row(mac))]);
+    let three: BTreeSet<String> = [ME, OLD, third].into_iter().map(str::to_owned).collect();
+    let shared: Vec<_> = checks::facts(&cloned, &three, &machines)
+        .into_iter()
+        .filter(|f| f.kind != "facts-differ")
+        .map(|f| (f.kind, f.pks.len()))
+        .collect();
+    assert_eq!(
+        shared,
+        [("facts-bind-one-machine", 3), ("hw-hint-clone", 3)]
+    );
+    // Twice succeeded, and the vault removed the middle seat: its row still links the two ends.
+    let newest = json!({"n": 1, "mac": mac, "hw_hint": HINT, "ram_gb": 128, "predecessor": third});
+    let middle = json!({"n": 1, "mac": mac, "hw_hint": HINT, "ram_gb": 128, "predecessor": OLD});
+    let chain = facts(&[(ME, newest), (third, middle), (OLD, row(mac))]);
+    let found: Vec<&str> = checks::facts(&chain, &live, &machines)
+        .iter()
+        .map(|f| f.kind)
+        .collect();
+    assert_eq!(found, ["facts-differ", "facts-differ"]);
+    // Two enrollments that both succeeded one writer: a home has one successor, so one of them
+    // is a copy of it, which states the original's hint where it is a VM's clone.
+    let later = json!({"n": 1, "mac": mac, "hw_hint": HINT, "ram_gb": 128, "predecessor": OLD});
+    let fork = facts(&[(ME, later.clone()), (third, later), (OLD, row(mac))]);
+    let shared: Vec<_> = checks::facts(&fork, &three, &machines)
+        .into_iter()
+        .filter(|f| f.kind != "facts-differ")
+        .map(|f| (f.kind, f.pks.len()))
+        .collect();
+    assert_eq!(
+        shared,
+        [("facts-bind-one-machine", 3), ("hw-hint-clone", 3)]
+    );
+    // The fork shows through a removed seat too: the Mac's middle seat is gone, and a copy
+    // succeeded the same writer that seat did.
+    let fourth = "44444444444444444444444444444444";
+    let newest = json!({"n": 1, "mac": mac, "hw_hint": HINT, "ram_gb": 128, "predecessor": third});
+    let gone = json!({"n": 1, "mac": mac, "hw_hint": HINT, "ram_gb": 128, "predecessor": OLD});
+    let hidden = facts(&[
+        (ME, newest),
+        (third, gone.clone()),
+        (fourth, gone),
+        (OLD, row(mac)),
+    ]);
+    let seated: BTreeSet<String> = [ME, OLD, fourth].into_iter().map(str::to_owned).collect();
+    let shared: Vec<_> = checks::facts(&hidden, &seated, &machines)
+        .into_iter()
+        .filter(|f| f.kind != "facts-differ")
+        .map(|f| (f.kind, f.pks.len()))
+        .collect();
+    assert_eq!(
+        shared,
+        [("facts-bind-one-machine", 3), ("hw-hint-clone", 3)]
+    );
 }
 
 fn lab_config(lab: &Lab, n: usize) -> std::path::PathBuf {
@@ -1200,7 +1539,7 @@ fn a_lab_registry_moves_machine_schema_and_publishes_its_own_node_once() {
     assert_eq!(registry.publish_schema().unwrap(), 0);
     assert!(matches!(
         registry.view().unwrap().schema(MACHINE.name),
-        SchemaState::One { version: 2, .. }
+        SchemaState::One { version, .. } if version == MACHINE.version
     ));
     let done = registry
         .register(&lab_config(&lab, 0), &probe(), true, NOW)
@@ -1477,7 +1816,7 @@ fn a_hostname_supplies_a_label_without_replacing_the_enrollment_identity() {
 /// NEGATIVE CONTROL: with `check` ignoring `this_mac`, `registration` is null and the first
 /// assertion fails.
 #[test]
-fn check_answers_why_this_mac_is_unregistered_and_writes_nothing() {
+fn check_previews_a_settled_node_claim_without_writing() {
     struct Reader(std::path::PathBuf);
     impl super::super::import::Vendors for Reader {
         fn mark(&self, _: &str, _: &str, _: &str) -> super::super::import::Mark {
@@ -1514,13 +1853,34 @@ fn check_answers_why_this_mac_is_unregistered_and_writes_nothing() {
         super::super::command::run(&lab.paths[0], &words, Some(&reader), &mut review, NOW).unwrap();
     assert_eq!(
         report["registration"]["outcome"],
-        json!("held"),
+        json!("adopts"),
         "{}",
         report["registration"]
     );
+    assert_eq!(
+        report["registration"]["machine"],
+        json!("mc-1000000000000001")
+    );
+    let projected = registry.view().unwrap().project(&MACHINE);
+    assert_eq!(
+        projected
+            .rows
+            .values()
+            .filter(|row| row.get("node").is_some())
+            .count(),
+        1
+    );
+    assert_eq!(
+        projected
+            .rows
+            .values()
+            .filter(|row| row.fields["node"].value() == Some(&json!(NODE)))
+            .count(),
+        2
+    );
     let lab_findings = report["lab"].as_array().unwrap();
     assert!(
-        lab_findings
+        !lab_findings
             .iter()
             .any(|found| found["finding"] == json!("node-ambiguous")),
         "{lab_findings:?}"
@@ -2149,4 +2509,464 @@ fn a_mac_adopts_the_row_a_merge_kept() {
         Outcome::Adopted { mac, .. } => assert_eq!(mac, keep),
         other => panic!("{other:?}"),
     }
+}
+
+/// A writer succession gives a Mac a new Commons uuid while the one it succeeded is still seated
+/// and was seen yesterday: without the lineage that earlier row is a clone's (`hw-hint-live`) and
+/// its machine another Mac's (`node-bound-elsewhere`), so the Mac births a second row. Its verified
+/// lineage names the earlier uuid as this Mac: it adopts that machine, links the predecessor and
+/// has nothing to report. The newest earlier writer with a row decides, and a machine row the
+/// owner ended holds the Mac exactly as its own row would. The lineage proves one home, not one
+/// Mac: where the earlier writer's row states other hardware, the home was copied, and rule 0
+/// gives the copy nothing of the original's (while the original is seated, no other rule does).
+/// NEGATIVE CONTROLS: with `pick` not calling `succession`, the successor is `Born { .. }`, which
+/// the first `assert_eq!` on `kept.outcome` prints; with `resolved` not comparing the hints, the
+/// copied home is `Adopted { rule: Succession, .. }`, which the `matches!` on `copied.outcome`
+/// prints; with it voiding the whole lineage at any other hardware, `again` is `Held`
+/// (`node-ambiguous`: both rows name this node); with it dropping every writer before the
+/// other-hardware one, so is `back`.
+#[test]
+fn a_writer_successor_keeps_the_machine_its_earlier_writer_bound() {
+    let (mac, later) = ("mc-1000000000000001", "mc-1000000000000002");
+    let third = "33333333333333333333333333333333";
+    let row = |pk, label: &str, lifecycle: &str| {
+        machine(
+            pk,
+            &[
+                ("label", json!(label)),
+                ("status", json!("active")),
+                ("node", json!(NODE)),
+                ("row", json!(lifecycle)),
+            ],
+        )
+    };
+    let cells = apply(&[row(mac, "m7", "live")]);
+    let earlier = facts(&[(OLD, old_row(mac, 399))]);
+    let unproven = run(&me(), &probe(), &[ME, OLD], true, &cells, &earlier);
+    assert!(
+        matches!(unproven.outcome, Outcome::Born { .. }),
+        "{:?}",
+        unproven.outcome
+    );
+    assert_eq!(kinds(&unproven), ["hw-hint-live", "node-bound-elsewhere"]);
+    let successor = Me {
+        former: vec![writer(OLD, None)],
+        ..me()
+    };
+    let kept = run(&successor, &probe(), &[ME, OLD], true, &cells, &earlier);
+    assert_eq!(
+        kept.outcome,
+        Outcome::Adopted {
+            rule: Rule::Succession,
+            mac: mac.into()
+        }
+    );
+    assert_eq!(written_row(&kept)["predecessor"], json!(OLD));
+    assert_eq!(written_row(&kept)["mac"], json!(mac));
+    assert!(kept.findings.is_empty(), "{:?}", kept.findings);
+    // Two successions: the newest earlier writer's machine, not the first one's.
+    let twice = Me {
+        former: vec![writer(OLD, None), writer(third, None)],
+        ..me()
+    };
+    let both = apply(&[row(mac, "m7", "live"), row(later, "m70", "live")]);
+    let moved = run(
+        &twice,
+        &probe(),
+        &[ME, OLD],
+        true,
+        &both,
+        &facts(&[(OLD, old_row(mac, 300)), (third, old_row(later, 399))]),
+    );
+    assert_eq!(
+        moved.outcome,
+        Outcome::Adopted {
+            rule: Rule::Succession,
+            mac: later.into()
+        }
+    );
+    assert_eq!(written_row(&moved)["predecessor"], json!(third));
+    // An earlier writer that never registered binds nothing: the rule goes on, here to the node.
+    let unregistered = run(&successor, &probe(), &[ME, OLD], true, &cells, &facts(&[]));
+    assert_eq!(
+        unregistered.outcome,
+        Outcome::Adopted {
+            rule: Rule::Node,
+            mac: mac.into()
+        }
+    );
+    // The owner ended the machine: the binding is for good, so the successor waits.
+    let ended = run(
+        &successor,
+        &probe(),
+        &[ME, OLD],
+        true,
+        &apply(&[row(mac, "m7", "retired")]),
+        &earlier,
+    );
+    assert_eq!(ended.outcome, Outcome::Held);
+    assert_eq!(kinds(&ended), ["bound-machine-retired"]);
+    assert!(ended.changes.is_empty());
+    // A home copied to another Mac: its writer succeeds the original's by itself, and the
+    // original's row states the original's hardware.
+    let original = json!({"r": 1, "n": 3, "mac": mac, "label": "m7", "hw_hint": "bbbbbbbbbbbbbbbb", "seen": 399, "hosts": []});
+    let copied = run(
+        &Me {
+            label: Some("m8".into()),
+            former: vec![writer(OLD, Some("m7"))],
+            ..me()
+        },
+        &probe(),
+        &[ME, OLD],
+        true,
+        &cells,
+        &facts(&[(OLD, original)]),
+    );
+    assert!(
+        matches!(copied.outcome, Outcome::Born { .. }),
+        "{:?}",
+        copied.outcome
+    );
+    assert_eq!(
+        kinds(&copied),
+        ["succession-other-hardware", "node-bound-elsewhere"]
+    );
+    assert_eq!(written_row(&copied).get("predecessor"), None);
+    // The copy's own later succession: the original's writer is still first in its lineage, and
+    // the copy's earlier writer, on this hardware, is this Mac: only the original's is dropped.
+    let original = json!({"r": 1, "n": 3, "mac": mac, "label": "m7", "hw_hint": "bbbbbbbbbbbbbbbb", "seen": 399, "hosts": []});
+    let again = run(
+        &Me {
+            former: vec![writer(OLD, Some("m7")), writer(third, Some("m70"))],
+            ..me()
+        },
+        &probe(),
+        &[ME, OLD, third],
+        true,
+        &both,
+        &facts(&[(OLD, original), (third, old_row(later, 399))]),
+    );
+    assert_eq!(
+        again.outcome,
+        Outcome::Adopted {
+            rule: Rule::Succession,
+            mac: later.into()
+        }
+    );
+    assert_eq!(written_row(&again)["predecessor"], json!(third));
+    assert_eq!(kinds(&again), ["succession-other-hardware"]);
+    // The home went to another Mac and came back: the first writer's row states this hardware,
+    // so its machine is this Mac's, whatever the writer between them registered elsewhere.
+    let away = json!({"r": 1, "n": 3, "mac": later, "label": "m70", "hw_hint": "bbbbbbbbbbbbbbbb", "seen": 399, "hosts": []});
+    let back = run(
+        &Me {
+            former: vec![writer(OLD, Some("m7")), writer(third, Some("m70"))],
+            ..me()
+        },
+        &probe(),
+        &[ME, OLD, third],
+        true,
+        &both,
+        &facts(&[(OLD, old_row(mac, 399)), (third, away)]),
+    );
+    assert_eq!(
+        back.outcome,
+        Outcome::Adopted {
+            rule: Rule::Succession,
+            mac: mac.into()
+        }
+    );
+    assert_eq!(written_row(&back)["predecessor"], json!(OLD));
+    assert_eq!(kinds(&back), ["succession-other-hardware"]);
+}
+
+/// A writer successor is seated under a new label (m22's sat in the roster as m381 beside m22)
+/// while the machine row an import planned for the Mac carries the first seat's. The Mac goes by
+/// the first label along its lineage, so it adopts that row; read from its own seat alone it
+/// finds no row and births one. A seat the vault removed states no label, and a number the Mac
+/// signed stands over every seat's.
+/// NEGATIVE CONTROLS: with `resolved` taking the newest earlier seat's label (`.rev()`), the
+/// `twice` assertion reads `Born { .. }`; with it keeping the Mac's own seat's, so does `first`;
+/// with it not comparing the hints, `copied` is `Adopted { rule: Planned, .. }`; with it keeping
+/// an unregistered writer beside an other-hardware one (`true` for the `None` arm of
+/// `resolved`'s filter), `before` and `after` are `Adopted { .. }`.
+#[test]
+fn a_writer_successor_goes_by_its_first_seats_label() {
+    let third = "33333333333333333333333333333333";
+    let planned = keys::machine_pk("m22");
+    let cells = apply(&[machine(
+        &planned,
+        &[("label", json!("m22")), ("status", json!("planned"))],
+    )]);
+    let none = facts(&[]);
+    let seated = |former: Vec<Former>| Me {
+        label: Some("m381".into()),
+        former,
+        ..me()
+    };
+    let outcome = |me: &Me| run(me, &probe(), &[ME, OLD], true, &cells, &none).outcome;
+    let adopted = Outcome::Adopted {
+        rule: Rule::Planned,
+        mac: planned.clone(),
+    };
+    let own_seat = outcome(&seated(Vec::new()));
+    assert!(matches!(own_seat, Outcome::Born { .. }), "{own_seat:?}");
+    let first = outcome(&seated(vec![writer(OLD, Some("m22"))]));
+    assert_eq!(first, adopted);
+    // Two successions: the first seat's label, not the newest earlier one's.
+    let twice = outcome(&seated(vec![
+        writer(OLD, Some("m22")),
+        writer(third, Some("m99")),
+    ]));
+    assert_eq!(twice, adopted);
+    // The first seat is gone from the vault: the next writer's stands.
+    let removed = outcome(&seated(vec![writer(OLD, None), writer(third, Some("m22"))]));
+    assert_eq!(removed, adopted);
+    let unseated = outcome(&seated(vec![writer(OLD, None)]));
+    assert!(matches!(unseated, Outcome::Born { .. }), "{unseated:?}");
+    // A home copied to other hardware takes the original's label no more than its machine.
+    let original = json!({"r": 1, "n": 3, "mac": "mc-1000000000000001", "label": "m22", "hw_hint": "bbbbbbbbbbbbbbbb", "seen": 399, "hosts": []});
+    let copied = run(
+        &seated(vec![writer(OLD, Some("m22"))]),
+        &probe(),
+        &[ME, OLD],
+        true,
+        &cells,
+        &facts(&[(OLD, original)]),
+    );
+    assert!(
+        matches!(copied.outcome, Outcome::Born { .. }),
+        "{:?}",
+        copied.outcome
+    );
+    assert_eq!(kinds(&copied), ["succession-other-hardware"]);
+    // A writer that never registered lends no label once any writer states other hardware,
+    // whichever side of it the writer sits: nothing says which Mac the home was on when it ran
+    // (the original's second writer and the copy's first look the same).
+    let original = json!({"r": 1, "n": 3, "mac": "mc-1000000000000001", "label": "m9", "hw_hint": "bbbbbbbbbbbbbbbb", "seen": 399, "hosts": []});
+    let after = run(
+        &seated(vec![writer(OLD, Some("m9")), writer(third, Some("m22"))]),
+        &probe(),
+        &[ME, OLD, third],
+        true,
+        &cells,
+        &facts(&[(OLD, original)]),
+    );
+    assert!(
+        matches!(after.outcome, Outcome::Born { .. }),
+        "{:?}",
+        after.outcome
+    );
+    let fourth = "44444444444444444444444444444444";
+    let elsewhere = json!({"r": 1, "n": 3, "mac": "mc-1000000000000001", "label": "m9", "hw_hint": "bbbbbbbbbbbbbbbb", "seen": 399, "hosts": []});
+    let before = run(
+        &seated(vec![writer(fourth, Some("m22")), writer(OLD, Some("m9"))]),
+        &probe(),
+        &[ME, OLD, fourth],
+        true,
+        &cells,
+        &facts(&[(OLD, elsewhere)]),
+    );
+    assert!(
+        matches!(before.outcome, Outcome::Born { .. }),
+        "{:?}",
+        before.outcome
+    );
+    // A number the Mac signed is its label whatever its seats say.
+    let signed = run(
+        &Me {
+            chosen: Some("m381".into()),
+            ..seated(vec![writer(OLD, Some("m22"))])
+        },
+        &probe(),
+        &[ME, OLD],
+        true,
+        &cells,
+        &none,
+    );
+    assert!(
+        matches!(signed.outcome, Outcome::Born { .. }),
+        "{:?}",
+        signed.outcome
+    );
+    assert_eq!(written_row(&signed)["label"], json!("m381"));
+}
+
+/// A pass that failed is tried again after `RETRY_EVERY`, not after the six hours a pass that
+/// decided something rests: m22's pass of 2026-11-12 failed on a table that moved under its read
+/// and the Mac stayed out of the registry until the next rest ended. Each failure after another
+/// doubles the rest, up to the long one, so a standing error costs no more host reads than it
+/// did. Within a rest no round wakes a pass, and once one decides the long rest is back.
+/// NEGATIVE CONTROLS: with `turn` never counting a failed pass, the first retry is at rest: the
+/// `expect` on `again` panics; with `rest_after` not doubling, the turn at `twice + RETRY_EVERY`
+/// runs a pass and its `is_none` assertion fails.
+#[test]
+fn a_failed_pass_is_tried_again_soon_and_a_pass_that_decided_rests() {
+    use super::run::{PASS_EVERY, RETRY_EVERY, rest_after};
+    assert_eq!(rest_after(0), PASS_EVERY);
+    assert_eq!(rest_after(1), RETRY_EVERY);
+    assert_eq!(rest_after(2), RETRY_EVERY * 2);
+    assert_eq!(rest_after(7), RETRY_EVERY * 64);
+    assert_eq!(rest_after(8), PASS_EVERY);
+    assert_eq!(rest_after(u32::MAX), PASS_EVERY);
+    let lab = Lab::new(&[Role::Writer]);
+    name_macs(&lab);
+    let paths = lab.paths[0].clone();
+    let registry = Registry::at(paths.clone());
+    registry.open().unwrap();
+    registry.seed().unwrap();
+    let table = registry.table().unwrap().unwrap();
+    let config = lab_config(&lab, 0);
+    let held = std::fs::read(&config).ok();
+    std::fs::write(&config, "[commons\n").unwrap();
+    let mut passes = Passes::new(
+        paths.clone(),
+        config.clone(),
+        || Some(probe()),
+        table_at(&paths),
+    );
+    let at = Instant::now();
+    let drained = BTreeSet::from([table]);
+    let failed = passes.turn(&drained, at, NOW).unwrap();
+    assert!(failed.is_err());
+    let soon = at + RETRY_EVERY - std::time::Duration::from_secs(1);
+    assert!(passes.turn(&drained, soon, NOW).is_none());
+    let twice = at + RETRY_EVERY;
+    let again = passes
+        .turn(&drained, twice, NOW)
+        .expect("a failed pass is due again after the short rest");
+    assert!(again.is_err());
+    match held {
+        Some(bytes) => std::fs::write(&config, bytes).unwrap(),
+        None => std::fs::remove_file(&config).unwrap(),
+    }
+    // Two failures in a row: twice the short rest.
+    assert!(passes.turn(&drained, twice + RETRY_EVERY, NOW).is_none());
+    let decided = twice + RETRY_EVERY * 2;
+    let retried = passes
+        .turn(&drained, decided, NOW)
+        .expect("a pass that failed twice is due after twice the short rest")
+        .unwrap();
+    assert!(
+        matches!(retried.outcome, Outcome::Adopted { .. }),
+        "{:?}",
+        retried.outcome
+    );
+    // That pass decided: the long rest again, counted from it.
+    assert!(
+        passes
+            .turn(&drained, decided + RETRY_EVERY * 4, NOW)
+            .is_none()
+    );
+    assert!(passes.turn(&drained, decided + PASS_EVERY, NOW).is_some());
+}
+
+/// End to end on a real lab: a Mac registers, its writer is succeeded, and the successor's pass
+/// adopts the machine the earlier writer bound and links it as predecessor, whether the pass is
+/// given the successor's own home or the original one. The successor holds a seat of its own
+/// (`m2` here), and the earlier writer's uuid is still seated with the same hardware hint, so
+/// without the lineage the pass reads a clone and adopts the row planned for `m2`.
+/// NEGATIVE CONTROLS: with `Registry::register`'s `lineage` closure answering `Ok(Vec::new())`,
+/// or reading the lineage from `self.paths` in place of `origin`, the first `assert_eq!` reads
+/// `` left: Adopted { rule: Planned, mac: "mc-…" } ``, another row.
+#[test]
+fn a_writer_successor_registers_onto_the_machine_its_earlier_writer_bound() {
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    name_macs(&lab);
+    let original = lab.paths[0].clone();
+    let config = lab_config(&lab, 0);
+    if !config.exists() {
+        aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+    }
+    let registry = Registry::at(original.clone());
+    registry.open().unwrap();
+    registry.seed().unwrap();
+    let first = registry.register(&config, &probe(), true, NOW).unwrap();
+    let Outcome::Adopted {
+        rule: Rule::Planned,
+        mac,
+    } = first.outcome
+    else {
+        panic!("{:?}", first.outcome);
+    };
+    let earlier = keys::uuid32(&machine_of(&lab, 0));
+    let successor = keys::uuid32(&machine_of(&lab, 1));
+    let selected = crate::generation::test_complete_successor(
+        lab._home.path(),
+        &original,
+        &lab.paths[1],
+        &config,
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap();
+    lab.paths[1] = selected.clone();
+    let later = NOW + 86_400_000;
+    let second = Registry::at(selected)
+        .register(&config, &probe(), true, later)
+        .unwrap();
+    assert_eq!(
+        second.outcome,
+        Outcome::Adopted {
+            rule: Rule::Succession,
+            mac: mac.clone()
+        }
+    );
+    assert!(second.findings.is_empty(), "{:?}", second.findings);
+    let view = registry.view().unwrap();
+    let row = &view.owned[MACHINE_FACTS.name].rows[&successor].value;
+    assert_eq!(row["mac"], json!(mac));
+    assert_eq!(row["predecessor"], json!(earlier));
+    // The original home selects the same writer: nothing more to decide or to write.
+    let again = registry.register(&config, &probe(), true, later).unwrap();
+    assert_eq!(again.outcome, Outcome::Unchanged);
+    assert_eq!(again.records, 0);
+}
+
+/// End to end where the earlier writer never registered (m22's had been fenced since before the
+/// registry held its row): the successor is seated as `m2`, and its lineage's first seat is `m1`,
+/// so its pass adopts the row planned for `m1`, the one the earlier writer's own pass would have.
+/// NEGATIVE CONTROL: with `store::me` giving each earlier writer no label, the successor adopts
+/// the row planned for `m2`: the `assert_eq!` on the adopted row's label reads `Some("m2")`.
+#[test]
+fn a_writer_successor_adopts_the_row_planned_for_its_first_seat() {
+    let mut lab = Lab::new(&[Role::Writer, Role::Writer]);
+    name_macs(&lab);
+    let original = lab.paths[0].clone();
+    let config = lab_config(&lab, 0);
+    if !config.exists() {
+        aterm_uds::atomic_file::write(&config, b"", 0o600).unwrap();
+    }
+    let registry = Registry::at(original.clone());
+    registry.open().unwrap();
+    registry.seed().unwrap();
+    let successor = keys::uuid32(&machine_of(&lab, 1));
+    let selected = crate::generation::test_complete_successor(
+        lab._home.path(),
+        &original,
+        &lab.paths[1],
+        &config,
+        Instant::now() + aterm_spec::wait::MUST_HAPPEN,
+    )
+    .unwrap();
+    lab.paths[1] = selected.clone();
+    let registered = Registry::at(selected)
+        .register(&config, &probe(), true, NOW)
+        .unwrap();
+    let Outcome::Adopted {
+        rule: Rule::Planned,
+        mac,
+    } = registered.outcome
+    else {
+        panic!("{:?}", registered.outcome);
+    };
+    assert!(registered.findings.is_empty(), "{:?}", registered.findings);
+    let view = registry.view().unwrap();
+    let machines = view.project(&MACHINE);
+    assert_eq!(
+        machines.rows[&mac].get("label").and_then(Value::as_str),
+        Some("m1")
+    );
+    let row = &view.owned[MACHINE_FACTS.name].rows[&successor].value;
+    assert_eq!(row["mac"], json!(mac));
+    assert_eq!(row.get("predecessor"), None);
 }

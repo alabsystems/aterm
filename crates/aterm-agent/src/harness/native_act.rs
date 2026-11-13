@@ -1073,7 +1073,7 @@ impl BootStamp {
         stamp.canonical().then_some(stamp)
     }
 
-    fn canonical(&self) -> bool {
+    pub(super) fn canonical(&self) -> bool {
         self.host.split_once(':').is_some_and(|(os, id)| {
             !os.is_empty()
                 && os.bytes().all(|b| b.is_ascii_lowercase())

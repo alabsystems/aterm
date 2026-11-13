@@ -2431,7 +2431,7 @@ fn load_reads_a_snapshot_from_a_pipe_and_refuses_a_directory() {
         let words: Vec<String> = list.iter().map(|w| (*w).to_owned()).collect();
         try_run_with(&words, move || Ok(dir))
     };
-    let (reader, mut writer) = std::io::pipe().expect("pipe");
+    let (reader, mut writer) = aterm_uds::pipe().expect("pipe");
     let doc = br#"{"computers": [{"label": "m1", "notes": "from a pipe"}]}"#;
     let feeder = std::thread::spawn(move || writer.write_all(doc));
     let named = format!("/dev/fd/{}", reader.as_raw_fd());

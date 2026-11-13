@@ -458,6 +458,68 @@ pub fn output_within_complete_stdout_records_from(
     )
 }
 
+/// Complete separator-terminated records with explicit cancellation. `keep` may
+/// stream records into owned storage while returning false to retain no heap
+/// output. A final unterminated record is refused. This collector owns its
+/// direct child with process-group cancellation. This establishes no descendant-
+/// drain proof; cleanup may outlive the work deadline.
+///
+/// # Errors
+/// The same errors as [`output_within_complete_stdout_records_from`], a stop,
+/// or an unterminated final record. Cancellation uses the same owning collector.
+pub fn output_within_complete_stdout_records_from_unless(
+    cmd: &mut Command,
+    stdin: Stdio,
+    within: Duration,
+    separator: u8,
+    limit: usize,
+    keep: impl FnMut(&[u8]) -> bool + Send + 'static,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Output, CompleteOutputError> {
+    if limit > MAX_COMPLETE_STDOUT_BYTES {
+        return Err(CompleteOutputError::StdoutTooLarge {
+            limit: MAX_COMPLETE_STDOUT_BYTES,
+        });
+    }
+    capture(
+        cmd,
+        stdin,
+        super::saturating_after(Instant::now(), within),
+        || {},
+        move |pipe, stream| drain_stdout_records_policy(pipe, stream, separator, limit, keep, true),
+        Some(stopped),
+    )
+}
+
+/// Progress-bounded twin of [`output_within_complete_stdout_records_from_unless`].
+/// Input is null, as for the existing progress-bounded complete-stdout collector.
+///
+/// # Errors
+/// Complete-record, explicit-stop and native-progress failures are preserved.
+pub fn output_while_process_progressing_complete_stdout_records_unless(
+    cmd: &mut Command,
+    window: Duration,
+    waiting_on: impl Into<String>,
+    separator: u8,
+    limit: usize,
+    keep: impl FnMut(&[u8]) -> bool + Send + 'static,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<Output, CompleteProgressError> {
+    if limit > MAX_COMPLETE_STDOUT_BYTES {
+        return Err(CompleteOutputError::StdoutTooLarge {
+            limit: MAX_COMPLETE_STDOUT_BYTES,
+        }
+        .into());
+    }
+    capture_progress(
+        cmd,
+        window,
+        waiting_on.into(),
+        move |pipe, stream| drain_stdout_records_policy(pipe, stream, separator, limit, keep, true),
+        Some(stopped),
+    )
+}
+
 /// As [`output_until_complete_stdout`], reporting successful process creation before any
 /// output reader starts. A later reader-start error must not be treated as no dispatch.
 /// Every post-spawn return or unwind retains the original child until its positive owning
@@ -952,12 +1014,24 @@ fn read_records(
     read_records_counted(stream, separator, limit, &AtomicU64::new(0), keep)
 }
 
+#[cfg(test)]
 fn read_records_counted(
+    stream: impl Read,
+    separator: u8,
+    limit: usize,
+    total: &AtomicU64,
+    keep: impl FnMut(&[u8]) -> bool,
+) -> Result<Vec<u8>, CompleteOutputError> {
+    read_records_counted_policy(stream, separator, limit, total, keep, false)
+}
+
+fn read_records_counted_policy(
     mut stream: impl Read,
     separator: u8,
     limit: usize,
     total: &AtomicU64,
     mut keep: impl FnMut(&[u8]) -> bool,
+    require_terminator: bool,
 ) -> Result<Vec<u8>, CompleteOutputError> {
     let mut kept = Vec::new();
     let mut record = Vec::new();
@@ -1008,6 +1082,9 @@ fn read_records_counted(
             drop(std::mem::take(&mut kept));
         }
     }
+    if require_terminator && !record.is_empty() && !too_large {
+        return Err(CompleteOutputError::StdoutIncomplete);
+    }
     if too_large || (!record.is_empty() && !offer(&record, &record, &mut kept)) {
         return Err(CompleteOutputError::StdoutTooLarge { limit });
     }
@@ -1022,13 +1099,32 @@ fn drain_stdout_records(
     limit: usize,
     keep: impl FnMut(&[u8]) -> bool + Send + 'static,
 ) -> io::Result<CompleteDrain> {
+    drain_stdout_records_policy(pipe, stream, separator, limit, keep, false)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn drain_stdout_records_policy(
+    pipe: Option<PipeEnd>,
+    stream: impl Read + Send + 'static,
+    separator: u8,
+    limit: usize,
+    keep: impl FnMut(&[u8]) -> bool + Send + 'static,
+    require_terminator: bool,
+) -> io::Result<CompleteDrain> {
     let (finished, ended) = mpsc::sync_channel(1);
     let total = Arc::new(AtomicU64::new(0));
     let counted = Arc::clone(&total);
     std::thread::Builder::new()
         .name("child-complete-records".into())
         .spawn(move || {
-            let result = read_records_counted(stream, separator, limit, &counted, keep);
+            let result = read_records_counted_policy(
+                stream,
+                separator,
+                limit,
+                &counted,
+                keep,
+                require_terminator,
+            );
             let _ = finished.send(result);
         })?;
     Ok(CompleteDrain { ended, total, pipe })

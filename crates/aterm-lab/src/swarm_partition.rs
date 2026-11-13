@@ -64,12 +64,12 @@
 //! reached the other, naming the plane that carried it, so a leak is the lab's failure, never a
 //! verdict on the product.
 //!
-//! A run whose splits held is a measurement of the build, whatever it finds, so `--record` writes
-//! it under `docs/measured/` red or green. Only a run whose cut or F21's split is not shown to
-//! hold is never recorded there, and the console says why ([`split::Shortfall`]: something
-//! crossed, a holder could not be read, or the lab could not hold or heal it).
-//! `--label WORD` names the record for what it measured (a negative control's build, say) beside
-//! its arm's name, so it never replaces another run's record of the same day.
+//! Every run writes its record to the lab's state (`results/swarm-partition<arm>-<time>.md`). A
+//! run whose splits held is a measurement of the build, whatever it finds, red or green. A run
+//! whose cut or F21's split is not shown to hold measures no build, and its record and the
+//! console say why ([`split::Shortfall`]: something crossed, a holder could not be read, or the
+//! lab could not hold or heal it). `--label WORD` names the record for what it measured (a
+//! negative control's build, say) beside its arm's name.
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -131,7 +131,7 @@ pub const AGENT_SEAM: &str = "ATERM_LAB_PARTITION_AGENT";
 const RUNNERS_FILE: &str = ".lab-converge-runs";
 
 /// The usage line.
-pub const USAGE: &str = "swarm partition [--one-url] [--writers both|a] [--minter-away] [--hold SECS] [--aterm PATH] [--keep] [--record] [--label WORD]";
+pub const USAGE: &str = "swarm partition [--one-url] [--writers both|a] [--minter-away] [--hold SECS] [--aterm PATH] [--keep] [--label WORD]";
 
 /// One of the two islands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -187,8 +187,6 @@ pub struct Opts {
     pub hold: Duration,
     /// `--keep`: leave the worlds behind.
     pub keep: bool,
-    /// `--record`: write the record under `docs/measured/`.
-    pub record: bool,
     /// `--label`: a word the record's name carries beside its arm's.
     pub label: Option<String>,
 }
@@ -216,7 +214,6 @@ pub fn parse(args: &[String]) -> Result<Opts, Fail> {
         minter_away: false,
         hold: DEFAULT_HOLD,
         keep: false,
-        record: false,
         label: None,
     };
     let mut it = args.iter();
@@ -226,7 +223,6 @@ pub fn parse(args: &[String]) -> Result<Opts, Fail> {
             "--one-url" => opts.publish = Publish::OneUrl,
             "--minter-away" => opts.minter_away = true,
             "--keep" => opts.keep = true,
-            "--record" => opts.record = true,
             "--label" => {
                 opts.label = Some(
                     it.next()
@@ -3699,15 +3695,12 @@ pub fn cmd_partition(args: &[String]) -> Res {
     println!("\n{text}");
     let failed = checks.iter().filter(|c| !c.pass).count();
     let unmeasured = unmeasured(&ev, &checks);
-    match write_record(&lane, &text, &checks, opts.record && unmeasured.is_empty()) {
+    match write_record(&lane, &text, &checks, &unmeasured) {
         Ok(path) => println!("written: {path}"),
         Err(e) => println!("could not write the record: {e}"),
     }
-    if opts.record && !unmeasured.is_empty() {
-        println!(
-            "not recorded under docs/measured: {}, so the run is not shown to measure the build",
-            unmeasured.join("; ")
-        );
+    if !unmeasured.is_empty() {
+        println!("{}", not_shown(&unmeasured));
     }
     if failed == 0 {
         println!("swarm partition: every check held");
@@ -3744,6 +3737,14 @@ fn unmeasured(ev: &Evidence, checks: &[Check]) -> Vec<String> {
     out
 }
 
+/// What the record and the console say of a run [`unmeasured`] names reasons for.
+fn not_shown(unmeasured: &[String]) -> String {
+    format!(
+        "{}, so the run is not shown to measure the build",
+        unmeasured.join("; ")
+    )
+}
+
 /// A lane that could not be brought up or run through measured nothing: exit 3, not a finding.
 fn could_not_run(f: Fail) -> Fail {
     if f.code == 1 {
@@ -3777,30 +3778,25 @@ fn record_arm(opts: &Opts) -> (String, String) {
     (arm, flags)
 }
 
-/// Write the run's record under `docs/measured/` when `to_docs`, else under the lab's results.
+/// Write the run's record, whatever its checks found, to the lab's state:
+/// `results/swarm-partition<arm>-<UTC time>.md` ([`record_arm`]), one file per run, saying
+/// whether its splits held ([`unmeasured`]).
 fn write_record(
     lane: &Lane,
     text: &str,
     checks: &[Check],
-    to_docs: bool,
+    unmeasured: &[String],
 ) -> Result<String, String> {
     let p = crate::paths::paths();
     let stamp = crate::util::utc_stamp(crate::util::now_secs());
     let date = stamp.get(..10).unwrap_or("undated").to_owned();
     let (arm, flags) = record_arm(&lane.opts);
-    let path = if to_docs {
-        p.repo
-            .join("docs/measured")
-            .join(format!("swarm-partition{arm}-{date}.md"))
-    } else {
-        p.need_state()?.join("results").join(format!(
-            "swarm-partition{arm}-{}.md",
-            stamp.get(..19).unwrap_or(&stamp).replace(':', "")
-        ))
-    };
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-    }
+    let dir = p.need_state()?.join("results");
+    let path = dir.join(format!(
+        "swarm-partition{arm}-{}.md",
+        stamp.get(..19).unwrap_or(&stamp).replace(':', "")
+    ));
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let commit = aterm_uds::spawnfd::command("/usr/bin/git")
         .arg("-C")
         .arg(&p.repo)
@@ -3827,9 +3823,19 @@ fn write_record(
         checks.len()
     );
     let _ = writeln!(body);
+    let held = if unmeasured.is_empty() {
+        "which the cut checks and both splits' ledgers (the cut's, and F21's split after the heal) \
+         show it honoured, so the run measures the build"
+            .to_owned()
+    } else {
+        format!(
+            "which this run does not show it honoured: {}",
+            not_shown(unmeasured)
+        )
+    };
     let _ = writeln!(
         body,
-        "The aterm under test is `{}`; every Mac is a private world on this Mac's loopback, and the cut is the `ATERM_DEBUG_PARTITION` seam (`crates/aterm-uds/src/partition.rs`), which the cut checks and both splits' ledgers (the cut's, and F21's split after the heal) show it honoured (a run where any leaked is never written here). The fleet heartbeat runs every {HEARTBEAT_MS} ms here (production: 180 s), and since every Mac registers from 127.0.0.1, a book records up to {JOINED_PER_ADDRESS} members from one address (production: 4); every other period and bound is production's. The Commons plane is the lab driving production's repair exchange on each Mac's custody; the accounts plane is a model run of main's account claims on two Macs' table replicas on a simulated clock.",
+        "The aterm under test is `{}`; every Mac is a private world on this Mac's loopback, and the cut is the `ATERM_DEBUG_PARTITION` seam (`crates/aterm-uds/src/partition.rs`), {held}. The fleet heartbeat runs every {HEARTBEAT_MS} ms here (production: 180 s), and since every Mac registers from 127.0.0.1, a book records up to {JOINED_PER_ADDRESS} members from one address (production: 4); every other period and bound is production's. The Commons plane is the lab driving production's repair exchange on each Mac's custody; the accounts plane is a model run of main's account claims on two Macs' table replicas on a simulated clock.",
         lane.world
             .aterm
             .strip_prefix(&p.repo)

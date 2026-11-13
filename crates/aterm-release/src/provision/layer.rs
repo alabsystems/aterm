@@ -86,8 +86,7 @@ pub(crate) trait ReleaseHost: Send + Sync {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SigningGap {
     /// The canonical ring under `~/.aterm/release-ring/` (key, record, roster pair), the one
-    /// the release's step 1 and the engine read, does not authorize a cut: a vault that
-    /// delivers its roster only at the legacy `~/.aterm/roster/` leaves this, which
+    /// the release's step 1 and the engine read, does not authorize a cut, which
     /// `ship provision --id` restores from `dist/` or the release channel.
     Ring(String),
     /// The ring is whole, but the signing tools or a signature failed.
@@ -410,8 +409,8 @@ impl LayerItem {
                 "clone the site repo and name it: SITE_DIR, or publish/site.toml's dir".into(),
             ),
             Kind::SiteKey => Remedy::Command(
-                "put the site deployer's service-account key where publish/site.toml's \
-                 firebase_sa_key names it (or name it: FIREBASE_SA_KEY)"
+                "`aterm secrets need site-deployer-key` (the vault lands it where \
+                 publish/site.toml's firebase_sa_key names it)"
                     .into(),
             ),
         }

@@ -1675,9 +1675,8 @@ pub(crate) enum SystemStateAction {
     /// already open, comes to the front (`App::go_to_developer_tools_installer`). It starts no
     /// install and asks for no permission.
     GoToToolsInstaller,
-    /// A Copy Command: the line a member runs to save a new GitHub token
-    /// ([`aterm_types::macos_setup::GITHUB_TOKEN_COMMAND`]), or the one an admin Mac runs to
-    /// approve this Mac, goes on the clipboard, for a person's press alone.
+    /// A Copy Command: the line an admin Mac runs to approve this Mac goes on the clipboard, for
+    /// a person's press alone.
     CopyCommand { command: String, by_person: bool },
     /// The Secrets vault row's Join under its phrase field: ALab lets this Mac in with the phrase
     /// a member shows once its person pressed Allow (`InitialSetupHandlers::join_phrase`), its
@@ -1883,10 +1882,6 @@ pub(crate) struct RowView {
     /// and nothing installs them (Low Data Mode holding them back included), so a press opens
     /// their terminal tab (§3.3).
     pub(crate) install_tools: bool,
-    /// The GitHub repositories row's Copy Command button: GitHub refuses the vault's token, and
-    /// any member saves a new one, with the line it copies
-    /// ([`aterm_types::macos_setup::GITHUB_TOKEN_COMMAND`]).
-    pub(crate) copy_command: bool,
     /// Where the row stands (`None`: not read yet).
     pub(crate) standing: Option<Standing>,
     /// The row changed after aterm set it and read it back (design §6.6, by whoever changed it):
@@ -1983,10 +1978,21 @@ fn row_view_as(
         .find(|seen| seen.subject == subject);
     let missing = unconfirmed || reading.is_none_or(|seen| seen.standing == Standing::Unknown);
     let previous = status.last_known_for(vault_url, subject);
+    let last_read = !missing
+        && reading.is_some_and(|seen| {
+            seen.read_at().is_some_and(|at| at != 0)
+                && !matches!(seen.standing, Standing::Unknown | Standing::Failed)
+                && seen
+                    .now
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+        });
     let progress = if progress == Some(true) {
         "A new reading is queued."
-    } else {
+    } else if previous.is_some() || last_read {
         "Checking again…"
+    } else {
+        "Checking…"
     };
     if missing && let Some(previous) = previous {
         let value = if previous.standing == Standing::AtLogin {
@@ -2032,7 +2038,6 @@ fn row_view_as(
             row.open = None;
             row.turn_on_sync = false;
             row.install_tools = false;
-            row.copy_command = false;
         }
     } else if checking {
         if row.chip == Some(Chip::InPlace) {
@@ -2042,7 +2047,10 @@ fn row_view_as(
                 row.value = RowValue::LastKnown(value.clone());
             }
         }
-        row.label.push_str(&format!(", as last read. {progress}"));
+        if last_read {
+            row.label.push_str(", as last read");
+        }
+        row.label.push_str(&format!(". {progress}"));
     }
     if matches!(
         row.standing,
@@ -2106,7 +2114,6 @@ fn row_view_current(
             open: None,
             turn_on_sync: false,
             install_tools: false,
-            copy_command: false,
             standing,
             changed_since: false,
             label: format!("{name}: {spoken_read}, left as is"),
@@ -2129,7 +2136,6 @@ fn row_view_current(
             open: None,
             turn_on_sync: false,
             install_tools: false,
-            copy_command: false,
             standing,
             changed_since: false,
             label: if offered {
@@ -2228,11 +2234,6 @@ fn row_view_current(
         }
         _ => None,
     };
-    let token_refused = subject == Subject::Setting(Setting::Repositories)
-        && standing == Some(Standing::NeedsYou)
-        && reading.and_then(|o| o.note.as_deref())
-            == Some(aterm_types::macos_setup::GITHUB_TOKEN_REFUSED);
-    let copy_command = !review && token_refused;
     // The vault read in place at Sync off is the person's opt-out: its row turns it back on,
     // quietly, unless it reads as what Apply will do, which acts on nothing yet. The base plan's
     // vault read in place not joined, where none answers, has no sync to turn on.
@@ -2382,9 +2383,6 @@ fn row_view_current(
                         .map_or(TOOLS_NEEDED_NOTE, NotOpened::note)
                         .to_owned(),
                 ),
-                // GitHub refuses the vault's token: the note says who renews it and the line they
-                // run, which the row's Copy Command puts on the clipboard.
-                _ if token_refused => Some(GITHUB_TOKEN_RENEW_NOTE.to_owned()),
                 _ => explained(),
             };
             (
@@ -2459,22 +2457,11 @@ fn row_view_current(
             tools,
             Some(ToolsWait::Missing { .. } | ToolsWait::LowData | ToolsWait::Coming)
         ),
-        copy_command,
         standing,
         changed_since,
         label,
     }
 }
-
-/// The GitHub repositories row's note when GitHub refuses the vault's token
-/// ([`aterm_types::macos_setup::GITHUB_TOKEN_REFUSED`]): who renews it, and the exact line they
-/// run, which the row's Copy Command ([`COPY_TOKEN_COMMAND`]) copies.
-pub(crate) const GITHUB_TOKEN_RENEW_NOTE: &str = "GitHub refuses your token, and any member of \
-     the vault can save a new one: with a new token from GitHub copied, run this here or on any \
-     member Mac: pbpaste | aterm secrets set gh_access_token";
-
-/// The GitHub repositories row's Copy Command button ([`RowView::copy_command`]).
-pub(crate) const COPY_TOKEN_COMMAND: &str = "system-state/row/repositories/copy-command";
 
 /// What a screen reader hears of a row whose step aterm tries again by itself (§3.5), after its
 /// value, beside the calm `Waiting` chip, whose word it opens with: the next try is aterm's.
@@ -2711,7 +2698,6 @@ fn rows_as_they_stand(status: &SetupStatus) -> Vec<RowView> {
                 open: None,
                 turn_on_sync: false,
                 install_tools: false,
-                copy_command: false,
                 standing: reading.map(|observation| observation.standing),
                 changed_since: false,
                 label,
@@ -4960,14 +4946,6 @@ impl SystemStateApp {
                 self.actions
                     .push_back(SystemStateAction::GoToToolsInstaller);
             }
-            COPY_TOKEN_COMMAND => {
-                if self.reviewed_rows().iter().any(|row| row.copy_command) {
-                    self.actions.push_back(SystemStateAction::CopyCommand {
-                        command: aterm_types::macos_setup::GITHUB_TOKEN_COMMAND.to_owned(),
-                        by_person: self.by_person,
-                    });
-                }
-            }
             lines::COPY_APPROVE_COMMAND => {
                 let command = self
                     .reviewed_rows()
@@ -5198,10 +5176,10 @@ const GITHUB_STOPPED: &str = "GitHub stopped answering partway through.";
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
 pub(crate) const GITHUB_UNREACHED: &str = "GitHub can't be reached";
 
-/// The repositories' note where GitHub refuses the token the vault syncs, in
-/// `init_observe`'s words (`Wait::TokenRefused`).
+/// The repositories' note where init.toml's GitHub account is not the token's, in
+/// `init_observe`'s words (`Wait::OtherAccount`).
 #[cfg(any(debug_assertions, feature = "dev-seams"))]
-pub(crate) const GITHUB_TOKEN_REFUSED: &str = aterm_types::macos_setup::GITHUB_TOKEN_REFUSED;
+pub(crate) const GITHUB_OTHER_ACCOUNT: &str = "GitHub account setting differs from the token's";
 
 /// The page's scenarios for looking at it without a Mac to set up
 /// (`ATERM_DEV_SYSTEM_STATE_FIXTURE`), in the order [`fixture_status`] draws them: the names its
@@ -5238,7 +5216,7 @@ pub(crate) const FIXTURES: &[&str] = &[
     "widened",
     "widen-stopped",
     "failed",
-    "github-sign-in",
+    "github-account",
     "required-dependencies@developer",
     "named-result-failed",
     "named-results-failed",
@@ -5833,12 +5811,12 @@ pub(crate) fn fixture_status(name: &str) -> Option<SetupStatus> {
             );
             status.observed = with(in_place(), vec![repositories]);
         }
-        "github-sign-in" => {
-            // GitHub refuses the token the vault syncs, as `init_observe` reads the
-            // repositories then: a person renews it, so the row needs them, with the remedy in
-            // its note, and no run retries it (§3.6).
+        "github-account" => {
+            // init.toml's GitHub account is not the one the vault's token signs in as, as
+            // `init_observe` reads the repositories then: a person fixes the setting, so the
+            // row needs them, with the remedy in its note, and no run retries it (§3.6).
             let mut repositories = setting(Setting::Repositories, NeedsYou, Some("Needs sign-in"));
-            repositories.note = Some(GITHUB_TOKEN_REFUSED.to_owned());
+            repositories.note = Some(GITHUB_OTHER_ACCOUNT.to_owned());
             status.observed = with(in_place(), vec![repositories]);
         }
         "named-result-failed" => {

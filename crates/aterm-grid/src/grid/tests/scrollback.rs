@@ -579,6 +579,39 @@ fn tiered_limit_below_ring_cap_recaps_the_ring() {
     grid.assert_invariants();
 }
 
+/// Raising the limit never shrinks history: the setter installs the new store share before the
+/// staged rows settle into the store.
+#[test]
+fn raising_the_tiered_limit_keeps_the_staged_lines() {
+    for (raise_to, oldest) in [(200, "L0"), (30, "L28")] {
+        let scrollback = Scrollback::new(100, 1000, 10_000_000);
+        let mut grid = Grid::with_tiered_scrollback(3, 20, 8, scrollback);
+        grid.set_scrollback_line_limit(Some(20));
+        feed_numbered_lines(&mut grid, 0, 60);
+        let before = grid.scrollback_lines();
+        assert_eq!(history_text(&grid, 0), "L0");
+        assert_eq!(history_text(&grid, before - 1), "L57");
+        assert!(
+            grid.storage.lazy_buffer_lines() > 20,
+            "precondition: more staged than the old total holds"
+        );
+
+        grid.set_scrollback_line_limit(Some(raise_to));
+        assert_eq!(
+            grid.scrollback_lines(),
+            before.min(raise_to),
+            "raise to {raise_to}: history keeps what it showed, up to the new total"
+        );
+        assert_eq!(history_text(&grid, 0), oldest, "raise to {raise_to}");
+        assert_eq!(
+            history_text(&grid, grid.scrollback_lines() - 1),
+            "L57",
+            "raise to {raise_to}: the newest line stays"
+        );
+        grid.assert_invariants();
+    }
+}
+
 #[test]
 fn tiered_limit_equal_to_ring_cap_discards_evictions_without_store_churn() {
     let scrollback = Scrollback::new(100, 1000, 10_000_000);

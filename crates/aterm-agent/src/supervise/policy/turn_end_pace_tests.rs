@@ -10,7 +10,8 @@ const MUSE_LIMIT: &str = "Usage limit reached · /upgrade for increased limits, 
                           to reset at 1:06 PM";
 const WORK_REPLY: &str = "Implemented the parser; the lexer is next.";
 const NEXT_REPLY: &str = "Wrote the lexer's tests; its error paths are next.";
-const DONE_CLAIM: &str = "All done: the change is committed and pushed, and every suite passes.";
+const DONE_CLAIM: &str =
+    "All done: the change is committed and pushed, and every suite passes.\n\nATERM-TASK-DONE";
 
 /// What the policy decides at `r`, read at `now`, past the take window:
 /// where it waits on the worker to take the act just typed, its decision at

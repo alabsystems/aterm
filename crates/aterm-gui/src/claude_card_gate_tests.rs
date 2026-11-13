@@ -1319,6 +1319,7 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
             probe,
             image,
             |_| Vec::new(),
+            |_| None,
         );
         let view = term.lock().unwrap().holder_view();
         let timeline = timeline.lock().unwrap();
@@ -1392,6 +1393,7 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
         in_front,
         claude,
         |_| Vec::new(),
+        |_| None,
     );
     {
         let timeline = timeline.lock().unwrap();
@@ -1431,6 +1433,7 @@ fn a_restore_re_derives_the_holder_from_the_kernel() {
         shell_in_front_now,
         claude,
         |_| Vec::new(),
+        |_| None,
     );
     assert!(
         noted(&quiet).is_empty(),
@@ -1495,6 +1498,7 @@ fn a_restore_books_the_groups_its_carried_stopped_drawers_lead() {
             in_front,
             claude,
             children,
+            |_| None,
         );
         let timeline = timeline.lock().unwrap();
         let groups = timeline.drawer_groups();

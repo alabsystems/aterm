@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use super::lineage_switch::{self, Switch};
 use super::pkgdoc::{self, Header, Kind, Row};
-use super::tools::{HostTools, Run, Tools};
+use super::tools::{HostTools, Run, RunError, Tools};
 use super::{arch, package, sign, tarwrite, toolchain, upload};
 use crate::api::{Build, PackOutcome, PackRequest, Packer, Signing};
 use crate::ctx::Ctx;
@@ -667,6 +667,14 @@ fn metadata(
     checkout: &Path,
     program: &str,
 ) -> Result<Metadata> {
+    parse_metadata(&metadata_bytes(tools, tc, checkout)?, program)
+}
+
+fn metadata_bytes(
+    tools: &dyn Tools,
+    tc: &toolchain::Toolchain,
+    checkout: &Path,
+) -> Result<Vec<u8>> {
     let mut run = Run::new(
         tc.targo(),
         ["metadata", "--no-deps", "--format-version", "1"],
@@ -683,7 +691,18 @@ fn metadata(
             tail(&ran.stderr, 5)
         )));
     }
-    parse_metadata(&ran.stdout, program)
+    Ok(ran.stdout)
+}
+
+/// `targo metadata --no-deps --format-version 1` of `checkout`, as the toolchain a pack of it
+/// would build with prints it: what [`parse_metadata`] and [`super::qualify::parse`] read. The
+/// toolchain is leased for the read.
+/// # Errors
+/// No resolvable toolchain, a `targo metadata` that could not run, or its refusal.
+pub fn metadata_json(ctx: &Ctx, tools: &dyn Tools, checkout: &Path) -> Result<Vec<u8>> {
+    let tc = toolchain::resolve(ctx, None)?;
+    let _lease = toolchain::lease(ctx, &tc.bin, "atpkg-publish qualify (metadata)")?;
+    metadata_bytes(tools, &tc, checkout)
 }
 
 /// Remove ambient compiler-policy and routing replacements from both config
@@ -798,6 +817,8 @@ fn native_floor_args(
             .map(|(key, value)| (key.clone(), value.into())),
     );
     query.env.push(("RUSTC".into(), tc.trustc().into()));
+    // A bounded build bounds the configuration read it starts with.
+    query.deadline = request.build_within;
     let ran = tools
         .run(&query)
         .map_err(|e| Error::cannot_run(format!("read Cargo configuration: {e}")))?;
@@ -920,9 +941,37 @@ fn build(
     if let Some(v) = harness_version {
         run.env.push((HARNESS_VERSION_ENV.into(), v.into()));
     }
-    let ran = tools
-        .run(&run)
-        .map_err(|e| Error::cannot_run(format!("the build: {e}")))?;
+    let ran = match request.build_within {
+        None => tools
+            .run(&run)
+            .map_err(|e| Error::cannot_run(format!("the build: {e}")))?,
+        Some(within) => {
+            // A bounded collector keeps a stream's tail, and the build's JSON messages name
+            // every executable: the bounded build is the one whose stdout must be complete.
+            run.deadline = Some(within);
+            match tools.run_complete(&run, aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES) {
+                Ok(ran) => ran,
+                Err(RunError::TimedOut) => {
+                    return Err(Error::refused(format!(
+                        "the build of {} did not finish within its bound of {} s and was ended",
+                        request.program,
+                        within.as_secs()
+                    )));
+                }
+                Err(e @ RunError::Spawn(_)) => {
+                    return Err(Error::cannot_run(format!("the build: {e}")));
+                }
+                // The build ran and left no usable result (its messages were cut short or
+                // outgrew what a pack reads): a defect of this build, not of the machine.
+                Err(e @ RunError::AfterStart(_)) => {
+                    return Err(Error::refused(format!(
+                        "the build of {}: {e}",
+                        request.program
+                    )));
+                }
+            }
+        }
+    };
     if !ran.success() {
         return Err(Error::refused(
             diagnostics::Failure::capture(&run, &ran).refusal(stage_dir),
@@ -1412,5 +1461,6 @@ pub fn parse_args(ctx: &mut Ctx, args: &[String], tools: &dyn Tools) -> Result<P
         signing,
         upload,
         env: Vec::new(),
+        build_within: None,
     })
 }

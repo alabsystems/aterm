@@ -19,22 +19,11 @@ pub(crate) use lazy_fetch::NoLazyFetch;
 const READ_BUDGET: Duration = Duration::from_secs(300);
 /// `git fetch origin` of a large history.
 const FETCH_BUDGET: Duration = Duration::from_secs(1800);
-/// Nothing else runs under a git that changes a ref or a worktree, for this one run (no
-/// configuration is written): no repository hook (a hook directory that does not exist), no
-/// fsmonitor hook or daemon `core.fsmonitor` names (a merge's index update and a status each
-/// start one; set empty, which every git reads as none, where `false` names a hook program to
-/// git 2.16 to 2.35), and no automatic maintenance. A merge or a fetch otherwise ends by
-/// starting `git maintenance run --auto --detach`, whose fork can still hold the run's stdout
-/// in its process group when git exits, and a drain that sees it refuses the run's output
-/// ([`System::run_complete_stdout`]).
-pub(crate) const NO_SIDE_RUNS: [&str; 6] = [
-    "-c",
-    "core.hooksPath=/dev/null",
-    "-c",
-    "core.fsmonitor=",
-    "-c",
-    "maintenance.auto=false",
-];
+/// Nothing else runs under a git that changes a ref or a worktree, for this one run: no hook,
+/// fsmonitor or automatic maintenance (agh's [`agh::git::lazy_fetch::NO_SIDE_RUNS`], which the
+/// lazy-fetch question runs under too), whose detached fork a drain would see holding the run's
+/// stdout and refuse its output for ([`System::run_complete_stdout`]).
+pub(crate) use agh::git::lazy_fetch::NO_SIDE_RUNS;
 
 /// The keys of every hook and filter driver a config names: a `hook` or `filter` section with a
 /// subsection, the empty one (`[hook ""]`) included.
@@ -139,9 +128,9 @@ impl Programs {
 /// build, else native Git), in `path` when given, with no prompt (`GIT_TERMINAL_PROMPT=0`,
 /// and an empty `GIT_ASKPASS`, which keeps a person's `core.askPass` from running), no
 /// optional index lock (`GIT_OPTIONAL_LOCKS=0`, so a read never races the person's own git),
-/// and no fetch of an object a partial clone lacks (`GIT_NO_LAZY_FETCH=1`, which git 2.44 and
+/// and no fetch of an object a partial clone lacks (`GIT_NO_LAZY_FETCH=1`, which git 2.45 and
 /// later and the May 2024 security releases from 2.39.4 on honour, and an older git ignores,
-/// which [`NoLazyFetch::of`] tells apart): a read of a missing object fails rather than reaching
+/// which [`lazy_fetch::of`] tells apart): a read of a missing object fails rather than reaching
 /// a remote by itself, outside aterm's credential route. Only a run that must complete a partial
 /// clone's worktree, under [`network`], lifts it ([`lazily`]).
 pub(crate) fn git(sys: &dyn System, user: &User, path: Option<&Path>) -> Cmd {

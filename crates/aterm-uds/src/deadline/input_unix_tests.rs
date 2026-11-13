@@ -159,7 +159,7 @@ fn cooperative_stream_errors_and_unwind_allow_root_cleanup_before_retirement() {
     for panic in [false, true] {
         let dir = aterm_tempfile::tempdir().unwrap();
         let cleaned = dir.path().join("cleaned");
-        let (reader, writer) = crate::kept_out(std::io::pipe).unwrap();
+        let (reader, writer) = crate::pipe().unwrap();
         let writer = std::cell::RefCell::new(Some(writer));
         let pid = std::cell::Cell::new(None);
         let mut retire = || {

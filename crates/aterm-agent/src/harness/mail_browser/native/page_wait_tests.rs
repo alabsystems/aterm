@@ -50,8 +50,8 @@ impl Page {
             path,
             is_headless_shell: true,
         };
-        let (command_read, command_write) = std::io::pipe().unwrap();
-        let (event_read, event_write) = std::io::pipe().unwrap();
+        let (command_read, command_write) = aterm_uds::pipe().unwrap();
+        let (event_read, event_write) = aterm_uds::pipe().unwrap();
         let command = browser::headless_browser_command(&executable, &profile, &|key| match key {
             "HOME" => Some(home.as_os_str().to_os_string()),
             "XDG_CONFIG_HOME" | "XDG_CACHE_HOME" | "XDG_DATA_HOME" | "XDG_RUNTIME_DIR" => {

@@ -128,8 +128,7 @@ impl Style {
     /// The `style="…"` the engine must report, and the tokens that bind it to what it resolved to.
     #[must_use]
     pub const fn binding(self) -> (&'static str, &'static [(&'static str, &'static str)]) {
-        const RAINBOW: &[(&str, &str)] =
-            &[("resolved", "rainbow-kitty"), ("ribbon_look", "underline")];
+        const RAINBOW: &[(&str, &str)] = &[("resolved", "rainbow-kitty"), ("ribbon_look", "tall")];
         match self {
             Self::Default | Self::Rainbow => ("rainbow", RAINBOW),
             Self::Off => ("off", &[("effective", "false")]),
@@ -206,12 +205,12 @@ pub enum Split {
 /// least `lo` and at most `hi` hundredths of a cell above that edge.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reach {
-    /// The tall body (aterm-effects `TALL_UP_CH` above its spine, `TALL_CORE_CH` of it at full
-    /// strength). No style lays it now; the scanner keeps measuring it on its recorded frames
-    /// while the engine keeps the body.
+    /// The `rainbow` theme's body, its band behind the typed words (aterm-effects `TALL_UP_CH`
+    /// above its spine, `TALL_CORE_CH` of it at full strength).
     Tall,
-    /// The `rainbow` theme's body (aterm-effects `UNDERLINE_UP_CH` above its spine, `LEAD_CH`
-    /// at full strength and the rest a wash at `SHOULDER_UNDERLINE`).
+    /// The underline body (aterm-effects `UNDERLINE_UP_CH` above its spine, `LEAD_CH` at full
+    /// strength and the rest a wash at `SHOULDER_UNDERLINE`). No style lays it now; the scanner
+    /// keeps its bounds while the engine keeps the body.
     Underline,
 }
 
@@ -237,8 +236,8 @@ impl Reach {
     #[must_use]
     pub const fn laid_by(self, style: Style) -> bool {
         match self {
-            Self::Tall => false,
-            Self::Underline => matches!(style, Style::Default | Style::Rainbow),
+            Self::Tall => matches!(style, Style::Default | Style::Rainbow),
+            Self::Underline => false,
         }
     }
 

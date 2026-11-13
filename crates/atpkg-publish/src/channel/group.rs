@@ -969,6 +969,7 @@ pub fn publish_group(
                 signing: signing.clone(),
                 upload,
                 env: Vec::new(),
+                build_within: None,
             },
         )?;
         builds.insert(program.clone(), outcome.build);

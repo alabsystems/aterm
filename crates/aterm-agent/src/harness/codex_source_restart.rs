@@ -10,9 +10,19 @@ pub(super) struct NativeRestart {
     pub(super) child: Process,
     granted: AtomicBool,
     revoked: AtomicBool,
+    #[cfg(target_os = "macos")]
+    entry_generation: std::sync::OnceLock<i32>,
 }
 impl NativeRestart {
     pub(super) fn admits(&self, process: &Process) -> bool {
+        #[cfg(target_os = "macos")]
+        if self
+            .entry_generation
+            .get()
+            .is_some_and(|bound| kernel_generation(process.pid) != Some(*bound))
+        {
+            return false;
+        }
         !self.revoked.load(Ordering::Acquire)
             && self.granted.load(Ordering::Acquire)
             && self.child.pid == process.pid
@@ -21,9 +31,34 @@ impl NativeRestart {
             && self.child.group == process.group
             && self.child.session == process.session
     }
+    // Bind once at the real constructor front door, not on a later activation
+    // request. A second exec of the same inode must not reuse SDK admission.
+    pub(super) fn bind_generation(&self, process: &Process) -> Result<(), Error> {
+        if !self.admits(process) {
+            return Err(Error::Denied);
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let generation = kernel_generation(process.pid).ok_or(Error::Unavailable)?;
+            if Process::observe(process.pid).as_ref() != Some(process)
+                || kernel_generation(process.pid) != Some(generation)
+                || *self.entry_generation.get_or_init(|| generation) != generation
+            {
+                return Err(Error::Stale);
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = process;
+        Ok(())
+    }
     pub(super) fn cancelled(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
     }
+}
+
+#[cfg(target_os = "macos")]
+fn kernel_generation(pid: u32) -> Option<i32> {
+    aterm_uds::process::read_identity(i32::try_from(pid).ok()?)?.idversion
 }
 
 pub struct RestartReservation {
@@ -85,6 +120,34 @@ impl std::fmt::Debug for SourceExecReservation {
 impl SourceExecReservation {
     pub fn command(&self) -> &RestartCommand {
         self.restart.command()
+    }
+
+    /// Observe entry through this exact granted constructor. A matching image
+    /// or PID alone does not establish SDK admission. This publishes no grant.
+    pub fn entered(&self, process: &Process) -> Result<bool, Error> {
+        if process == &self.restart.native.child
+            || process.image != self.restart.command.image
+            || !self.restart.native.admits(process)
+            || Process::observe(process.pid).as_ref() != Some(process)
+        {
+            return Ok(false);
+        }
+        let state = self.restart._launch.state.upgrade().ok_or(Error::Stale)?;
+        let state = lock(&state)?;
+        Ok(state
+            .actors
+            .get(&actor_key(&self.caller))
+            .is_some_and(|actor| actor.process == *process)
+            && state
+                .launches
+                .get(&self.restart._launch.token)
+                .is_some_and(|launch| {
+                    launch.process.as_ref() == Some(process)
+                        && launch
+                            .native_restart
+                            .as_ref()
+                            .is_some_and(|native| Arc::ptr_eq(native, &self.restart.native))
+                }))
     }
 
     /// Called by the native operation owner only when publishing its exact Go.
@@ -304,6 +367,8 @@ impl Registry {
             child: child.clone(),
             granted: AtomicBool::new(false),
             revoked: AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            entry_generation: std::sync::OnceLock::new(),
         });
         let token = aterm_uds::rand::hex_token::<16>().map_err(|_| Error::Unavailable)?;
         let mut state = lock(&self.state)?;

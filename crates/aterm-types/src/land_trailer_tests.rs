@@ -305,3 +305,45 @@ fn a_recheck_is_read_whole_and_older_readers_pass_it_over() {
         before
     );
 }
+
+/// A receipt still being written reads back exactly through [`Stated::of_block`], whatever it
+/// holds so far: nothing, interrupted judgments only, a judgment with a later recheck, or a
+/// composition with inherited items; a malformed line still spoils it. NEGATIVE CONTROL: the
+/// landing's own reader, [`Stated::of_trailers`], refuses each one with no judgment.
+#[test]
+fn a_receipt_being_written_reads_back_whole_through_its_block() {
+    let receipts = [
+        Stated::default(),
+        Stated {
+            interrupted: vec![interrupted('a', 'b', 'c'), interrupted('d', 'c', 'e')],
+            ..Stated::default()
+        },
+        Stated {
+            checked: vec![judged('a', 'b')],
+            interrupted: vec![interrupted('f', 'b', 'c')],
+            rechecked: vec![rechecked('c', 'd', 1)],
+            ..Stated::default()
+        },
+        Stated {
+            checked: vec![judged('a', 'b'), judged('c', 'd')],
+            composed_onto: Some(id('e')),
+            inherited: vec!["-p other --lib -- flaky_case".into()],
+            ..Stated::default()
+        },
+    ];
+    for stated in receipts {
+        let block = stated.trailers();
+        assert_eq!(Stated::of_block(&block), Some(stated.clone()), "{block}");
+        assert_eq!(
+            Stated::of_trailers(&block),
+            (!stated.checked.is_empty()).then(|| stated.clone()),
+            "{block}"
+        );
+        let spoiled = format!(
+            "{block}{INTERRUPTED}: {} base=abc tip={} secs=1\n",
+            id('a'),
+            id('b')
+        );
+        assert_eq!(Stated::of_block(&spoiled), None, "{spoiled}");
+    }
+}

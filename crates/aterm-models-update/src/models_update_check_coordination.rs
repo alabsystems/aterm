@@ -91,21 +91,27 @@ pub fn native_update_progress_delivery_model() -> Model {
     }
 }
 
-/// An answer that opens the gate, or the updater's own named hold, comes before this boot
-/// chains another update; asks nothing answers open the gate after `UnansweredTries`.
+/// An answer that opens the gate comes before this boot chains another update; asks nothing
+/// answers open the gate after `UnansweredTries`, and the updater's answers that the trial is
+/// pending open it once its patience has passed.
 ///
 /// `state` is 0 awaiting, 1 in flight, 2 open (confirmed, or settled at its bound). `Failure`
 /// is an answer that the trial is still pending: the updater holds, names why (`held`) and is
-/// asked again. `Unanswered` is an ask the updater could not answer, `Unavailable` one that
-/// was never queued, `Overdue` one whose answer never came; each counts toward
-/// `UnansweredTries`, after which the apply lane's own admission decides. So a miss leaves the
-/// gate awaiting either held by the updater's own answer or counted (`AMissIsHeldOrCounted`).
+/// asked again, and the first such answer starts the gate's patience (`waited` 1), which no
+/// later answer restarts; `Lapse` is that patience running out (`waited` 2), after which the
+/// apply lane's own admission decides while the trial stays armed. `Unanswered` is an ask the
+/// updater could not answer, `Unavailable` one that was never queued, `Overdue` one whose
+/// answer never came; each counts toward `UnansweredTries`, after which the admission decides
+/// too. So a miss leaves the gate awaiting either held by the updater's own answer or counted
+/// (`AMissIsHeldOrCounted`), and a held gate is always on its patience's clock
+/// (`AHoldIsClocked`).
 ///
-/// Dial 1 is `UnansweredForgotten` alone, because the liveness audit isolates its mutant on the
-/// `Buggy = 1` baseline and the dead-action audit credits it only where that baseline holds:
-/// the forgotten count lands lawful after a named hold (`held == 1`), so it is no violation
-/// step by itself. The mutants written inside committed actions are dials 2 (`Unavailable`),
-/// 3 (`Queue`) and 4 (`Apply`).
+/// Dial 1 holds `UnansweredForgotten` and `PendingUnclocked`, the two waits that never end
+/// (a count that is dropped, a Pending answer that starts no clock, the gate before its
+/// patience): the liveness audit isolates each on the `Buggy = 1` baseline. The forgotten count
+/// lands lawful after a named hold (`held == 1`), so it is no violation step by itself; the
+/// unclocked answer breaks `AHoldIsClocked` as well. The mutants written inside committed
+/// actions are dials 2 (`Unavailable`), 3 (`Queue`) and 4 (`Apply`).
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 pub fn native_update_boot_health_confirmation_model() -> Model {
@@ -121,6 +127,7 @@ pub fn native_update_boot_health_confirmation_model() -> Model {
             var health_at_apply = 0;
             var unanswered = 0;
             var held = 0;
+            var waited = 0;
             var released_at_apply = 0;
 
             action Queue when ((state == 0 || (Buggy == 3 && state == 1)) && outstanding <= 1) {
@@ -143,6 +150,10 @@ pub fn native_update_boot_health_confirmation_model() -> Model {
                 retry = 1;
                 unanswered = 0;
                 held = 1;
+                waited = if waited == 0 { 1 } else { waited };
+            }
+            action Lapse when (waited == 1 && state <= 1) {
+                waited = 2;
             }
             action Unanswered when (state == 1) {
                 state = 0;
@@ -171,15 +182,25 @@ pub fn native_update_boot_health_confirmation_model() -> Model {
                 applied == 0
                     && (state == 2
                         || UnansweredTries <= unanswered
+                        || waited == 2
                         || (Buggy == 4 && state == 1))
             ) {
                 applied = 1;
                 health_at_apply = state;
-                released_at_apply = if UnansweredTries <= unanswered { 1 } else { 0 };
+                released_at_apply =
+                    if UnansweredTries <= unanswered || waited == 2 { 1 } else { 0 };
             }
 
             action UnansweredForgotten when (Buggy == 1 && state == 0 && unanswered > 0) {
                 unanswered = 0;
+            }
+            action PendingUnclocked when (Buggy == 1 && state == 1) {
+                state = 0;
+                outstanding = 0;
+                missed = 1;
+                retry = 1;
+                unanswered = 0;
+                held = 1;
             }
 
             invariant ConfirmedBeforeApply:
@@ -188,29 +209,32 @@ pub fn native_update_boot_health_confirmation_model() -> Model {
             invariant OneConfirmationInFlight: outstanding <= 1;
             invariant AMissIsHeldOrCounted:
                 state > 0 || missed == 0 || held == 1 || unanswered > 0;
+            invariant AHoldIsClocked: held == 0 || waited > 0;
             bound UnansweredIsFinite: unanswered <= UnansweredTries;
         }
     }
 }
 
-/// [`native_update_boot_health_confirmation_model`]'s progress claim: every ask ends with the
-/// gate open or with the updater holding by name. The mutant drops the unanswered count.
+/// [`native_update_boot_health_confirmation_model`]'s progress claim: the gate opens, by an
+/// answer, by the unanswered count, or by its patience with the updater's Pending answers;
+/// the updater's named hold is no end. The mutants drop the unanswered count and answer Pending
+/// with no clock, as the gate did before its patience.
 #[must_use]
 #[cfg_attr(trust_verify, trust::skip)]
 #[aterm_spec::liveness(native_update_boot_health_confirmation_model)]
 pub fn native_update_boot_health_confirmation_liveness() -> Liveness {
     Liveness {
-        name: "TheGateOpensOrTheUpdaterHolds",
+        name: "TheGateOpens",
         goal: or_(
             eq(var("state"), int(2)),
             or_(
                 le(cst("UnansweredTries"), var("unanswered")),
-                eq(var("held"), int(1)),
+                eq(var("waited"), int(2)),
             ),
         ),
-        weak: vec!["Queue", "Overdue"],
+        weak: vec!["Queue", "Overdue", "Lapse"],
         strong: vec![],
-        mutants: vec!["UnansweredForgotten"],
+        mutants: vec!["UnansweredForgotten", "PendingUnclocked"],
     }
 }
 

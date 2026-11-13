@@ -330,7 +330,7 @@ fn another_threads_runner_joins_the_wait() {
             None,
             "a wait owed nothing has no deadline"
         );
-        let (exit, mut exits) = std::io::pipe().expect("an exit's stand-in");
+        let (exit, mut exits) = aterm_uds::pipe().expect("an exit's stand-in");
         *project.exit.lock().unwrap() = Some(Arc::new(OwnedFd::from(exit)));
         bell.ring();
         let wait = waiting.recv_timeout(HANG).expect("the ring ends the wait");
@@ -365,7 +365,7 @@ fn another_threads_runner_joins_the_wait() {
 fn a_runners_exit_owes_a_look() {
     use std::io::Write as _;
     let project = Owes::default();
-    let (exit, mut exits) = std::io::pipe().expect("an exit's stand-in");
+    let (exit, mut exits) = aterm_uds::pipe().expect("an exit's stand-in");
     *project.exit.lock().unwrap() = Some(Arc::new(OwnedFd::from(exit)));
     let members = Mutex::new(MembersAsked::default());
     driving(&project, Rings::default(), &members, |waiting| {
@@ -591,7 +591,7 @@ fn stand_in() -> (NativeChanges, std::os::unix::net::UnixDatagram) {
 fn unrelated_network_events_never_end_the_native_wait() {
     use std::os::fd::AsFd as _;
     let (mut changes, kernel) = stand_in();
-    let (quiet, _writer) = std::io::pipe().expect("a broker descriptor nobody writes");
+    let (quiet, _writer) = aterm_uds::pipe().expect("a broker descriptor nobody writes");
     let flooding = std::sync::Arc::new(AtomicBool::new(true));
     let (flooded, floods) = std::sync::mpsc::channel();
     let (begun, beginning) = std::sync::mpsc::channel();
@@ -652,7 +652,7 @@ fn a_failed_route_socket_is_waited_out() {
         route: Ok(crate::network::RouteChanges::over(heard.into())),
         open: Box::new(crate::network::RouteChanges::open),
     };
-    let (quiet, _writer) = std::io::pipe().expect("a broker descriptor nobody writes");
+    let (quiet, _writer) = aterm_uds::pipe().expect("a broker descriptor nobody writes");
     let most = Duration::from_millis(300);
     for _ in 0..2 {
         let began = Instant::now();
@@ -689,7 +689,7 @@ fn a_failure_that_passes_never_deafens_the_worker() {
         route: Ok(crate::network::RouteChanges::over(heard.into())),
         open: Box::new(crate::network::RouteChanges::open),
     };
-    let (quiet, _writer) = std::io::pipe().expect("a broker descriptor nobody writes");
+    let (quiet, _writer) = aterm_uds::pipe().expect("a broker descriptor nobody writes");
     assert!(!changes.wait(
         Some(Instant::now() + Duration::from_millis(300)),
         &[quiet.as_fd()]
@@ -726,7 +726,7 @@ fn a_failure_that_passes_never_deafens_the_worker() {
 fn a_ready_broker_descriptor_ends_the_native_wait() {
     use std::io::Write as _;
     use std::os::fd::AsFd as _;
-    let (ready, mut ring) = std::io::pipe().expect("a broker descriptor");
+    let (ready, mut ring) = aterm_uds::pipe().expect("a broker descriptor");
     ring.write_all(&[1]).expect("the broker's arrival");
     let (mut changes, _kernel) = stand_in();
     let began = Instant::now();

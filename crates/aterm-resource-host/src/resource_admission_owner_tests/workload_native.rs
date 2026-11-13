@@ -23,6 +23,8 @@ const CASE: &str = "ATERM_WORKLOAD_NATIVE_TEST_CASE";
 const LOCK_CHECKPOINT: [u8; 32] = [38; 32];
 #[path = "workload_native/linker.rs"]
 mod linker;
+#[path = "workload_native/native_job.rs"]
+mod native_job;
 fn descriptor_population() -> (libc::rlim_t, usize) {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
@@ -39,10 +41,17 @@ fn descriptor_population() -> (libc::rlim_t, usize) {
 }
 
 fn attempt_budget(full: bool) -> Duration {
-    if full { Duration::from_secs(600) } else { HANG }
+    if full {
+        Duration::from_secs(600)
+    } else {
+        workload_budget(1)
+    }
 }
 fn population_budget() -> Duration {
-    wire::budget::Budget::new(32, HANG.as_nanos().try_into().unwrap())
+    workload_budget(32)
+}
+fn workload_budget(repetitions: u32) -> Duration {
+    wire::budget::Budget::new(repetitions, HANG.as_nanos().try_into().unwrap())
         .unwrap()
         .root_duration()
 }
@@ -120,6 +129,9 @@ static ROOT_MARKER: Marker = Marker(wire::WORKLOAD_PROTOCOL_MARKER);
 #[used]
 #[unsafe(link_section = "__TEXT,__trust_member")]
 static MEMBER_MARKER: Marker = Marker(wire::WORKLOAD_MEMBER_PROTOCOL_MARKER);
+#[used]
+#[unsafe(link_section = "__TEXT,__trust_jobroot")]
+static NATIVE_MARKER: Marker = Marker(control::native_job::PROTOCOL_MARKER);
 extern "C" fn entry() {
     linker::early_entry();
     #[cfg(target_arch = "aarch64")]
@@ -134,6 +146,11 @@ extern "C" fn entry() {
         })
     {
         std::process::exit(std::panic::catch_unwind(contained::target).unwrap_or(101));
+    }
+    if std::env::args_os().skip(1).collect::<Vec<_>>()
+        == [OsString::from(control::native_job::STARTUP_ARGUMENT)]
+    {
+        std::process::exit(std::panic::catch_unwind(native_job::root).unwrap_or(101));
     }
     if std::env::args_os().skip(1).collect::<Vec<_>>()
         != [OsString::from(wire::WORKLOAD_STARTUP_ARGUMENT)]
@@ -336,19 +353,22 @@ fn host_process() {
         } else {
             1
         },
-        // Each full-population action keeps its one-minute hang detector within the
-        // protocol's checked complete containment plan. Real-linker preparation retains
-        // its separate attempt budget; ordinary phases fit their whole-attempt minute.
-        timeout_ns: if case == "contained-full-population" || linker::selected(&case) {
-            HANG
-        } else {
-            Duration::from_secs(5)
-        }
-        .as_nanos() as u64,
+        // Each action keeps its minute inside the checked complete-attempt allowance above.
+        // Preparation and retirement cannot consume the declared action's hang window.
+        timeout_ns: HANG.as_nanos() as u64,
     };
-    let bytes = invocation.encode().unwrap();
+    let native = case.starts_with("native-");
+    let native_plan = native.then(|| native_job::plan(&invocation));
+    let bytes = match &native_plan {
+        Some(plan) => plan.encode().unwrap(),
+        None => invocation.encode().unwrap(),
+    };
+    let digest = match &native_plan {
+        Some(plan) => aterm_digest::Sha256::digest(plan.binding_preimage().unwrap()),
+        None => aterm_digest::Sha256::digest(&bytes),
+    };
     progress.completed("invocation-encoded");
-    let (root_input, mut continuation) = std::io::pipe().unwrap();
+    let (root_input, mut continuation) = aterm_uds::pipe().unwrap();
     continuation
         .write_all(&(bytes.len() as u32).to_be_bytes())
         .unwrap();
@@ -358,7 +378,13 @@ fn host_process() {
     pending.events.account().unwrap();
     pending.submission.request.argv = vec![
         service.as_os_str().as_bytes().to_vec(),
-        wire::WORKLOAD_STARTUP_ARGUMENT.as_bytes().to_vec(),
+        if native {
+            control::native_job::STARTUP_ARGUMENT
+        } else {
+            wire::WORKLOAD_STARTUP_ARGUMENT
+        }
+        .as_bytes()
+        .to_vec(),
     ];
     pending.submission.request.cpu_units = 2;
     pending.submission.request.cwd = source.as_os_str().as_bytes().to_vec();
@@ -484,9 +510,9 @@ fn host_process() {
                 io::ErrorKind::WouldBlock
             );
             locks_observed = true;
-            if case != "cancel" {
+            if !case.ends_with("cancel") {
                 let ack = wire::Continuation {
-                    invocation_sha256: aterm_digest::Sha256::digest(&bytes),
+                    invocation_sha256: digest,
                     root_attempt: binding.attempt,
                     checkpoint: 1,
                     checkpoint_sha256: LOCK_CHECKPOINT,
@@ -501,7 +527,7 @@ fn host_process() {
             }
             progress.completed("original-output-locks-observed");
         }
-        if case == "cancel" && !cancelled && source.join("ready").is_file() {
+        if case.ends_with("cancel") && !cancelled && source.join("ready").is_file() {
             assert!(crate::actor::control_eof_before_reap_test(binding.clone()).unwrap());
             aterm_ctl::resource_admission_transport::write_frame(
                 &events,
@@ -583,10 +609,10 @@ fn host_process() {
         "actual transferred output lock was never observed held; original terminal {outcome:?}/{cause:?}; stderr {}",
         fs::read_to_string(&stderr).unwrap(),
     );
-    if case == "unknown" || case == "cancel" {
+    if case.ends_with("unknown") || case.ends_with("cancel") {
         assert_eq!(
             cause,
-            if case == "cancel" {
+            if case.ends_with("cancel") {
                 CompletionCause::Cancelled
             } else {
                 CompletionCause::HostFault

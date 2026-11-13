@@ -161,7 +161,7 @@ fn agys_drawing_is_held_to_its_measured_screens() {
 }
 
 const RULES: &str = "Run the full suite before you push.\n\nNever force-push; a NEEDS YOU: line \
-                     is for credentials only.\n";
+                     is for permissions only.\n";
 
 const PLAIN_RULES: &str = "Run the full suite before you push.\n\nNever force-push.\n";
 
@@ -368,8 +368,8 @@ fn no_acts_own_words_name_a_need_a_defense_or_a_done() {
             assert!(!clean_defense(Some(&rows)), "{name} at {width}: {rows}");
         }
         assert_eq!(
-            needs::needs_you(&format!("{act}\nNEEDS YOU: the signing key")),
-            ["the signing key"],
+            needs::needs_you(&format!("{act}\nNEEDS YOU: the signing nod")),
+            ["the signing nod"],
             "{name}"
         );
     }
@@ -436,9 +436,9 @@ fn an_acts_rows_cut_at_the_rows_top_name_no_need_and_land_nothing() {
 }
 
 const OWNER_NEED_RULES: &str =
-    "Run the full suite before you push.\n\nNEEDS YOU: the release key, which only I hold.\n";
+    "Run the full suite before you push.\n\nNEEDS YOU: the release nod, which only I hold.\n";
 
-const OWNER_NEED: &str = "the release key, which only I hold.)";
+const OWNER_NEED: &str = "the release nod, which only I hold.)";
 
 #[test]
 fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
@@ -502,7 +502,7 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
                     let at_cut = format!("{name} at {cols}, {drop} rows above");
                     assert!(r.opens_cut, "{at_cut}");
                     cuts += 1;
-                    owners += usize::from(named.iter().any(|n| n.starts_with("the release key")));
+                    owners += usize::from(named.iter().any(|n| n.starts_with("the release nod")));
                     for worked in [Some(3 * MIN), None] {
                         assert_eq!(
                             needs_after(act, &r, worked),
@@ -518,7 +518,7 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
                 }
             }
         }
-        let said = format!("{PROGRESS}\n\nNEEDS YOU: the signing key");
+        let said = format!("{PROGRESS}\n\nNEEDS YOU: the signing nod");
         let whole = agy_screen(80, &typed(act), &said);
         let at = whole
             .iter()
@@ -529,7 +529,7 @@ fn a_cut_opening_on_the_acts_own_rows_names_no_need() {
         for worked in [Some(3 * MIN), None] {
             assert_eq!(
                 needs_after(act, &r, worked),
-                ["the signing key"],
+                ["the signing nod"],
                 "CONTROL: {name}, worked {worked:?}"
             );
         }
@@ -615,7 +615,7 @@ fn a_carrys_own_rows_name_no_need() {
 #[test]
 fn a_reader_that_bounds_its_messages_drops_nothing_from_a_cut() {
     let act = continuation_text(&cfg(), Some(&rules_line(OWNER_NEED_RULES)));
-    let own = "NEEDS YOU: the release key, which only I hold.";
+    let own = "NEEDS YOU: the release nod, which only I hold.";
     let take = TurnEndTiming::default().take_within;
     let needs_after = |r: &TurnEndReading, worked: Option<Duration>| {
         let mut st = TurnEndState::default();
@@ -684,7 +684,7 @@ fn a_reader_that_bounds_its_messages_drops_nothing_from_a_cut() {
         for worked in [Some(3 * MIN), None] {
             assert_eq!(
                 needs_after(&r, worked),
-                ["the release key, which only I hold."],
+                ["the release nod, which only I hold."],
                 "{name}, worked {worked:?}"
             );
         }

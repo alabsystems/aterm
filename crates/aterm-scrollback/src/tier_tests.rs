@@ -18,6 +18,7 @@ impl WarmTier {
             let old_bytes = block.compressed.len();
             let new_bytes = compressed.len();
             block.compressed = compressed;
+            block.encoded_line_count = 0;
             self.bytes_used.set(WarmTier::adjust_bytes(
                 self.bytes_used.get(),
                 old_bytes,
@@ -170,6 +171,7 @@ fn warm_tier_cumulative_index_matches_rebuild_across_front_and_back_ops() {
             rebuilt.push_front(WarmBlock {
                 compressed: block.compressed.clone(),
                 line_count: block.line_count,
+                encoded_line_count: block.encoded_line_count,
                 decompress_failures: Cell::new(block.decompress_failures.get()),
             });
         }
@@ -253,6 +255,7 @@ fn warm_block_decompress_rejects_oversized_lz4_prefix() {
     let mut block = WarmBlock {
         compressed: forged,
         line_count: 1,
+        encoded_line_count: 0,
         decompress_failures: Cell::new(0),
     };
 
@@ -319,4 +322,39 @@ fn rows_of_links_past_the_page_cap_age_out_whole() {
             "line {i}"
         );
     }
+}
+
+#[test]
+fn with_line_and_untrimmed_cold_promotion_match_get_line_across_tiers() {
+    let mut sb = Scrollback::with_block_size(8, 16, usize::MAX, 4);
+    for i in 0..40usize {
+        sb.push_line(Line::from(&*format!("tier-row-{i:03}")));
+    }
+    assert!(sb.cold_line_count() > 0, "oldest blocks promoted to cold");
+    assert!(sb.warm_line_count() > 0, "middle blocks reside in warm");
+    assert!(sb.hot_line_count() > 0, "newest lines reside in hot");
+
+    for idx in 0..sb.line_count() {
+        let owned = sb
+            .get_line(idx)
+            .expect("get_line decode")
+            .expect("in range")
+            .to_string();
+        let borrowed = sb
+            .with_line(idx, |line| line.to_string())
+            .expect("with_line decode")
+            .expect("in range");
+        assert_eq!(borrowed, owned, "with_line({idx})");
+
+        let rev = sb.line_count() - 1 - idx;
+        let borrowed_rev = sb
+            .with_line_rev(rev, |line| line.to_string())
+            .expect("with_line_rev decode")
+            .expect("in range");
+        assert_eq!(borrowed_rev, owned, "with_line_rev({rev})");
+    }
+    assert_eq!(
+        sb.with_line(sb.line_count(), |l| l.to_string()).unwrap(),
+        None
+    );
 }

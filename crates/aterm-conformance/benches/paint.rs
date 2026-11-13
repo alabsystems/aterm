@@ -171,7 +171,7 @@ mod measuring {
             },
         ),
         (
-            "the_rainbow_spelling_paints_the_underline_ribbon",
+            "the_rainbow_spelling_paints_its_band",
             trail(
                 Scene::Prompt,
                 MATURE_RUN,
@@ -223,9 +223,9 @@ mod measuring {
             },
         ),
         (
-            "the_underline_body_stands_within_its_reach_above_the_typed_row",
+            "the_band_stands_within_its_reach_above_the_typed_row",
             PaintRow {
-                reach: Some(Reach::Underline),
+                reach: Some(Reach::Tall),
                 ..trail(
                     Scene::Plane,
                     MATURE_RUN,

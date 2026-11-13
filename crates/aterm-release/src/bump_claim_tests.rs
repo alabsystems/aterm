@@ -150,11 +150,11 @@ fn fixture_origin_bump_races_compose_redo_and_exhaust_cleanly() {
         let pushed = remote.refresh_main().unwrap();
         if races == 3 {
             assert!(qualified.is_none());
+            let lost = result.unwrap_err();
+            assert!(lost.why.contains("main moved under the bump three times"));
             assert!(
-                result
-                    .unwrap_err()
-                    .why
-                    .contains("main moved under the bump three times")
+                lost.could_not_run && lost.failing.is_none(),
+                "a lost race is a resumable stop, never a red or a refusal to wait out"
             );
             assert_eq!(text(&f.git(), &["rev-parse", "HEAD"]).unwrap(), pushed);
         } else {
@@ -387,7 +387,7 @@ fn a_declared_path_the_bump_left_as_it_was_is_no_mismatch_and_an_undeclared_chan
         vec![
             "Cargo.toml".into(),
             "Cargo.lock".into(),
-            "CHANGELOG.md".into(),
+            aterm_phase::CliHarness::ClaudeCode.version_file().into(),
         ],
     )
     .unwrap();

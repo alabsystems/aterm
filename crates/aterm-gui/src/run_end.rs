@@ -67,6 +67,7 @@ impl App {
     /// The run's end, once ([`RunEnd`]): a second call, and a call on an App that never ran a
     /// loop, does nothing. The process exits after it (lib.rs, or AppKit).
     pub(crate) fn end_run(&mut self) {
+        self.restored_workers.clear();
         let Some(end) = self.run_end.take() else {
             return;
         };

@@ -699,11 +699,11 @@ pub fn lays_the_bundled_cell() -> bool {
 /// What a replay's `style` word asks for: a `cursor_trail_style`, the pet beside it, and the
 /// rainbow's ribbon body.
 ///
-/// The word is `[tall |flat ]<cursor_trail_style>[ + cat| + dog]`. `rainbow` is the shipped
-/// theme, the underline, and `rainbow + cat` the shipped default beside its pet. `tall` and
-/// `flat` name the two ribbon bodies no built-in theme picks
-/// ([`EffectsPipeline::set_ribbon_shape`]): the replays keep judging them while the engine
-/// keeps them.
+/// The word is `[underline |flat ]<cursor_trail_style>[ + cat| + dog]`. `rainbow` is the
+/// shipped theme, the tall body (its band behind the words, its rail under them), and
+/// `rainbow + cat` the shipped default beside its pet. `underline` and `flat` name the two
+/// ribbon bodies no built-in theme picks ([`EffectsPipeline::set_ribbon_shape`]): the replays
+/// keep judging them while the engine keeps them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spec<'a> {
     pub trail: &'a str,
@@ -724,12 +724,12 @@ impl<'a> Spec<'a> {
             ),
             None => (word, None),
         };
-        let (trail, tall, flat) = if let Some(trail) = body.strip_prefix("tall ") {
-            (trail, true, false)
+        let (trail, tall, flat) = if let Some(trail) = body.strip_prefix("underline ") {
+            (trail, false, false)
         } else if let Some(trail) = body.strip_prefix("flat ") {
             (trail, true, true)
         } else {
-            (body, false, false)
+            (body, true, false)
         };
         assert!(
             aterm_effects::cursor_glow::spellings::row(trail).is_some(),
@@ -765,9 +765,7 @@ pub fn set_glow(
         true,
         cursor,
     );
-    if spec.tall {
-        fx.set_ribbon_shape(true, spec.flat);
-    }
+    fx.set_ribbon_shape(spec.tall, spec.flat);
 }
 
 impl Replay {
@@ -1824,13 +1822,13 @@ pub fn worst(judged: &[Judged]) -> Option<(u64, Letter)> {
 }
 
 pub const STYLES: [&str; 17] = [
-    "tall rainbow + cat",
     "rainbow + cat",
+    "underline rainbow + cat",
+    "underline rainbow + dog",
+    "underline rainbow",
     "rainbow + dog",
-    "rainbow",
-    "tall rainbow + dog",
     "flat rainbow + cat",
-    "tall rainbow",
+    "rainbow",
     "fire + dog",
     "phaser",
     "fire",
@@ -1950,9 +1948,7 @@ fn replay_with(
             true,
             look.cursor,
         );
-        if spec.tall {
-            r.fx.set_ribbon_shape(true, spec.flat);
-        }
+        r.fx.set_ribbon_shape(spec.tall, spec.flat);
     }
     r.fx.set_letter_guard(guard);
     r.fx.set_bloom_spares_letters(spares);
@@ -2038,9 +2034,9 @@ const BAR_SCENES: [Scene; 8] = [
 ];
 /// The bundled JetBrains Mono, Linux's face: [`a_dim_letter_keeps_its_own_reading`]'s underlined
 /// controls replay in it on every OS, in the 13 x 29 px cells they were measured in at
-/// [`GALLERY_PX`]. The face and its cells carry over, the raster does not: macOS rasterizes it
-/// through CoreText, Windows through the hinted coverage fill without Linux's subpixel modes, so
-/// the controls' margins there are unmeasured.
+/// [`GALLERY_PX`]. The face and its cells carry over; macOS's raster does not, since it
+/// rasterizes the face through CoreText, and Windows runs Linux's hinted coverage fill but has
+/// not been measured, so the controls' margins on both are unmeasured.
 const JETBRAINS_MONO: &[u8] = include_bytes!("../assets/bundled/JetBrainsMono-Regular.ttf");
 /// The size [`a_dim_letter_keeps_its_own_reading`]'s ring control replays at where the window's
 /// face does not lay the gallery's row at [`GALLERY_PX`] ([`lays_the_gallery_row`]): at 19 px
@@ -2178,7 +2174,7 @@ fn without_the_letter_guard_the_trails_bury_letters() {
         ("sparkle", DARK, Scene::Typing),
         ("water", DARK, Scene::Typing),
         ("water", DEFAULT_LIGHT, water),
-        ("tall rainbow", DARK, Scene::Burst),
+        ("rainbow", DARK, Scene::Burst),
     ];
     if cfg!(target_os = "macos") {
         jobs.extend([
@@ -2733,7 +2729,7 @@ fn a_dim_letter_keeps_its_own_reading() {
     // does not (Linux's measured cell). The nyan rainbow's wrapped line, round 27's control, is
     // read by its ring at that size too.
     let fire = ("fire", DIM_GREY, Scene::Wrapped);
-    let nyan = ("tall rainbow", SOLARIZED_DARK, Scene::Wrapped);
+    let nyan = ("rainbow", SOLARIZED_DARK, Scene::Wrapped);
     let px = if lays_the_gallery_row() {
         GALLERY_PX
     } else {
@@ -2770,7 +2766,7 @@ fn a_dim_letter_keeps_its_own_reading() {
     // The underlined lines' controls, in the face and cell they were measured in: a letter read
     // by its solid ink against its grounds' least and greatest luminance, and the rails parting
     // round no underline's stroke.
-    let underlined = ("rainbow + cat", SOLARIZED_DARK, Scene::Underlined);
+    let underlined = ("underline rainbow + cat", SOLARIZED_DARK, Scene::Underlined);
     let luma = Knobs {
         channels: false,
         face: Some(JETBRAINS_MONO),
@@ -2781,11 +2777,7 @@ fn a_dim_letter_keeps_its_own_reading() {
         "control: read by its grounds' luminance, {underlined:?} still keeps 97% of every dim \
          letter's own reading"
     );
-    let over_selection = (
-        "tall rainbow + cat",
-        SOLARIZED_DARK,
-        Scene::UnderlinedContext,
-    );
+    let over_selection = ("rainbow + cat", SOLARIZED_DARK, Scene::UnderlinedContext);
     let shallow = Knobs {
         feet_deep: false,
         face: Some(JETBRAINS_MONO),
@@ -2813,7 +2805,7 @@ fn a_dim_letter_keeps_its_own_reading() {
     );
     let controls = [
         ("sparkle", DIM_GREY, Scene::Typing),
-        ("tall rainbow + cat", DIM_GREY, Scene::Burst),
+        ("rainbow + cat", DIM_GREY, Scene::Burst),
         ("laser", SOLARIZED_DARK, Scene::EnterBottom),
         ("water", SOLARIZED_DARK, Scene::Typing),
     ];
@@ -3883,9 +3875,7 @@ fn a_dim_page_s_rail_is_one_stroke() {
                 true,
                 SOLARIZED_DARK.cursor,
             );
-            if spec.tall {
-                r.fx.set_ribbon_shape(true, spec.flat);
-            }
+            r.fx.set_ribbon_shape(spec.tall, spec.flat);
         }
         r.fx.set_letter_guard_rails_clear(clear);
         r.rail = true;
@@ -3908,8 +3898,18 @@ fn a_dim_page_s_rail_is_one_stroke() {
     let jobs = [
         ("classic", pink, Scene::Typing, true),
         ("comet", TrailColor::Automatic, Scene::Typing, false),
-        ("rainbow + cat", TrailColor::Automatic, Scene::Typing, true),
-        ("rainbow + cat", TrailColor::Automatic, Scene::Burst, true),
+        (
+            "underline rainbow + cat",
+            TrailColor::Automatic,
+            Scene::Typing,
+            true,
+        ),
+        (
+            "underline rainbow + cat",
+            TrailColor::Automatic,
+            Scene::Burst,
+            true,
+        ),
     ];
     for (style, color, scene, controlled) in jobs {
         let Some((share, ms, peak)) = read(style, color, scene, true) else {
@@ -4235,7 +4235,7 @@ fn the_letter_under_the_caret_reads() {
 /// combining marks unread when `unread` (`EffectsPipeline::set_frame_marks_unread`). Returns
 /// the worst judged reading of a row-5 letter and how many letter-frames fall under [`BAR`].
 fn accented_row_under_the_foot(accented: &str, unread: bool) -> (f64, usize) {
-    let mut r = Replay::new("tall rainbow + cat", DARK, TrailColor::Automatic);
+    let mut r = Replay::new("rainbow + cat", DARK, TrailColor::Automatic);
     r.letters = true;
     r.fx.set_frame_marks_unread(unread);
     let mut row = " ".repeat(7);

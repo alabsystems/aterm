@@ -681,6 +681,8 @@ fn a_claim_that_fits_is_admitted_and_one_that_does_not_waits() {
             available: 40 * GIB,
             reserved: 30 * GIB,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }]
     );
     assert_eq!(short.holders.len(), 1, "{short}");
@@ -1057,6 +1059,8 @@ fn a_stream_of_small_claims_goes_first_past_a_waiting_large_one_only_within_its_
                 available: 40 * GIB,
                 reserved: 60 * GIB,
                 passes: Some(0),
+                stuck_ahead: 0,
+                stuck: false,
             }],
             "C{i} waits behind A, B and the ten"
         );
@@ -1126,6 +1130,8 @@ fn a_stream_of_small_claims_goes_first_past_a_waiting_large_one_only_within_its_
             available: 40 * GIB,
             reserved: 40 * GIB,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }]
     );
     assert!(
@@ -1576,6 +1582,7 @@ fn release_rank_orders_memory_waiters_and_reserves_cores_without_preempting_ordi
         record: r,
         used: TreeUse::default(),
         credited: TreeUse::default(),
+        seen: true,
     };
     let release = Need::new("release")
         .rank(Rank::Release)
@@ -1691,6 +1698,7 @@ fn a_waiting_ordinary_disk_claim_cannot_deadlock_its_background_disk_holder() {
         record,
         used: TreeUse::default(),
         credited: TreeUse::default(),
+        seen: true,
     };
     assert_eq!(
         decide(
@@ -1869,13 +1877,25 @@ fn standin_queues_a_release_memory_turn() {
 
 /// `--admit now` cannot spend memory a queued Release or same-rank lead needs before it is held.
 /// This is decided after ancestor filtering, so it changes no anti-ABBA escape for work inside a
-/// held parent. NEGATIVE CONTROL: removing the guard admits the forced stage at the 36 GiB
-/// reading. At 59 GiB the same stage is safe backfill, so it remains an immediate normal grant.
+/// held parent. A held 20 GiB claim whose tree holds what it claims funds each 42 GiB turn at
+/// 36 GiB (its end brings what the turn lacks), so the turn keeps its place and spares 13 GiB:
+/// the 16 GiB stage is short by the ordinary rule, which `Now` would override. NEGATIVE
+/// CONTROL: removing the guard admits the forced stage at the 36 GiB reading. At 59 GiB the same
+/// stage is safe backfill, so it remains an immediate normal grant. (A turn no claim's end can
+/// start holds back no claim behind it, KI-1111-25, so the stage there is a normal grant too.)
 #[cfg(unix)]
 #[test]
 fn admit_now_cannot_bypass_a_release_or_leading_memory_turn() {
     let s = scratch("release-memory-override");
     let m = Fixed::new(Reading::of_gib(96, 36, 28));
+    let funder = admitted(enter(&s, &m, Need::new("funding holder").mem_gib(20)), &m);
+    m.set_procs(Some(Procs::of(vec![Proc {
+        pid: std::process::id(),
+        ppid: 1,
+        charged: 20 * GIB,
+        footprint: 20 * GIB,
+        ..Proc::default()
+    }])));
     struct StandIn {
         child: aterm_uds::spawnfd::Child,
         dir: PathBuf,
@@ -1994,6 +2014,7 @@ fn admit_now_cannot_bypass_a_release_or_leading_memory_turn() {
         other => panic!("leading memory reservation was overridden: {other:?}"),
     }
     leading.finish();
+    drop(funder);
 }
 
 /// `--admit now` cannot enter beside an unrelated cold Release slice that holds memory ALONE.
@@ -2418,6 +2439,7 @@ fn a_holders_own_use_is_not_reserved_twice() {
                 written: 0,
             },
             credited: TreeUse::default(),
+            seen: true,
         }]
     };
     assert!(decide(&b, (1, 1, 0), &m, &using(0), 1).is_err());
@@ -2430,6 +2452,8 @@ fn a_holders_own_use_is_not_reserved_twice() {
             available: 40 * GIB,
             reserved: 25 * GIB,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }]
     );
     assert!(decide(&b, (1, 1, 0), &m, &using(10 * GIB), 1).is_ok());
@@ -2464,6 +2488,8 @@ fn one_holders_tree_is_credited_once_across_its_claims() {
             available: 40 * GIB,
             reserved: 40 * GIB,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }],
         "60 GiB of peaks less the tree's 20 GiB, credited once"
     );
@@ -2525,6 +2551,8 @@ fn a_child_claimants_use_is_credited_to_it_alone() {
             available: 40 * GIB,
             reserved: 38 * GIB,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }],
         "P's 28 GiB and Q's 10 GiB"
     );
@@ -2628,6 +2656,8 @@ fn a_process_that_holds_the_quiet_machine_waits_behind_no_waiter() {
             available: 40 * GIB,
             reserved: 48 * GIB,
             passes: Some(8 * GIB),
+            stuck_ahead: 0,
+            stuck: false,
         }]
     );
     let plain_run = counted(vec![&disk, &lab, &b12, &b13], 10, None, None);
@@ -2747,6 +2777,7 @@ fn disk_is_held_above_the_floor() {
             written,
         },
         credited: TreeUse::default(),
+        seen: true,
     };
     assert!(decide(&need, (1, 1, 0), &r, &[other(&there, 0)], 1).is_ok());
     let short = decide(&need, (1, 1, 0), &r, &[other(&here, 0)], 1).expect_err("68 less 50");
@@ -2798,6 +2829,7 @@ fn plain(record: &Record) -> Other<'_> {
         record,
         used: TreeUse::default(),
         credited: TreeUse::default(),
+        seen: true,
     }
 }
 
@@ -2974,6 +3006,8 @@ fn an_unservable_waiters_memory_is_still_reserved() {
             available: 40 * GIB,
             reserved: 20 * GIB,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }]
     );
     assert_eq!(
@@ -3923,6 +3957,7 @@ fn a_quiet_claim_is_alone_on_a_quiet_machine() {
         record: &other,
         used: TreeUse::default(),
         credited: TreeUse::default(),
+        seen: true,
     }];
     let short = decide(&need, (1, 1, 0), &r, &o, 1).expect_err("one quiet claim at a time");
     assert_eq!(
@@ -4700,6 +4735,7 @@ fn a_grant_is_a_share_of_the_room_the_held_claims_leave() {
         record: r,
         used: TreeUse::default(),
         credited: TreeUse::default(),
+        seen: true,
     };
     let want = |n| Need::new("guest").cores(n);
     let held = [other(&lima)];
@@ -4784,6 +4820,8 @@ fn a_margin_is_asked_of_the_room_and_never_reserved() {
             available: 30 * GIB,
             reserved: 16 * GIB,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }]
     );
     assert_eq!(
@@ -4858,6 +4896,8 @@ fn a_vms_own_processes_are_credited_against_its_claim() {
             available: 30 * GIB,
             reserved: 16 * GIB,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }],
         "uncredited, the VM's 14 GiB is reserved again"
     );
@@ -4878,6 +4918,8 @@ fn a_vms_own_processes_are_credited_against_its_claim() {
             available: 30 * GIB,
             reserved: 10 * GIB,
             passes: None,
+            stuck_ahead: 0,
+            stuck: false,
         }],
         "lima's 2 GiB not yet resident and Windows' 8"
     );
@@ -6814,6 +6856,7 @@ fn a_claim_that_can_never_fit_runs_alone_and_keeps_every_other_memory_claim_wait
                 written: 0,
             },
             credited: TreeUse::default(),
+            seen: true,
         }
     }
     for f in [0, 5, 20] {
@@ -6882,6 +6925,7 @@ fn an_isolation_wait_names_its_holders_instead_of_zero_memory_shortfall() {
             record: &held,
             used: TreeUse::default(),
             credited: TreeUse::default(),
+            seen: true,
         }],
         1,
     )
@@ -6905,6 +6949,7 @@ fn an_isolation_wait_names_its_holders_instead_of_zero_memory_shortfall() {
             record: &held,
             used: TreeUse::default(),
             credited: TreeUse::default(),
+            seen: true,
         }],
         1,
     )
@@ -7009,11 +7054,13 @@ fn saturating_reservations_and_wrote_bounds_never_wrap_or_pass_record_max() {
             record: &a,
             used: TreeUse::default(),
             credited: TreeUse::default(),
+            seen: true,
         },
         Other {
             record: &b,
             used: TreeUse::default(),
             credited: TreeUse::default(),
+            seen: true,
         },
     ];
     let short = decide(
@@ -7033,6 +7080,8 @@ fn saturating_reservations_and_wrote_bounds_never_wrap_or_pass_record_max() {
                 available: 40 * GIB,
                 reserved: u64::MAX,
                 passes: None,
+                stuck_ahead: 0,
+                stuck: false,
             },
             Short::Disk {
                 need: GIB,

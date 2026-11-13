@@ -298,6 +298,7 @@ pub(super) fn upgrade_visit(
     let tab = opts.only_sid.clone()?;
     let session_key = key(&tab);
     let report = |pid: u32| Report {
+        rung: None,
         pid,
         tab: tab.clone(),
         session: session_key.clone(),

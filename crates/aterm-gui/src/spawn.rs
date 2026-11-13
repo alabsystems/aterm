@@ -301,20 +301,52 @@ fn spawn_shell_type(
 
 /// The shell a session runs, as aterm launched it: the one it integrated, else the one it
 /// spawns for `shell_hint`; for a shell adopted across a seamless update (`adopted`), the one
-/// its process `pid` maps, read once (`Unknown` where it cannot be read).
+/// its process `pid` runs, read once ([`adopted_shell`]).
 fn launched_shell(
     adopted: bool,
     pid: i32,
     integrated: Option<aterm_core::shell_integration::ShellType>,
     shell_hint: Option<&str>,
 ) -> aterm_core::shell_integration::ShellType {
-    use aterm_core::shell_integration::ShellType;
     if adopted {
-        return crate::spare::shell_image(pid).map_or(ShellType::Unknown, |image| {
-            ShellType::detect(&image.to_string_lossy())
-        });
+        return adopted_shell(crate::spare::shell_image(pid), || kept_exec_names(pid));
     }
     integrated.unwrap_or_else(|| detect_spawn_shell(shell_hint))
+}
+
+/// The names the kernel keeps for process `pid`'s exec ([`crate::command_ran::kernel_names`]).
+#[cfg(unix)]
+fn kept_exec_names(pid: i32) -> Vec<String> {
+    crate::command_ran::kernel_names(pid)
+        .iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// No exec name is read off unix.
+#[cfg(not(unix))]
+fn kept_exec_names(_pid: i32) -> Vec<String> {
+    Vec::new()
+}
+
+/// The shell an adopted session's process runs: the one its image's path (`image`) names; else,
+/// its file gone since its exec (a PowerShell upgrade under a running pwsh: macOS's
+/// `proc_pidpath` then names no path, and Linux's link only a ` (deleted)` one), the one a name
+/// the kernel keeps for its exec (`kept`: [`crate::command_ran::kernel_names`]) names; `Unknown`
+/// where none does, which runs jobs (fail closed).
+fn adopted_shell(
+    image: Option<std::path::PathBuf>,
+    kept: impl FnOnce() -> Vec<String>,
+) -> aterm_core::shell_integration::ShellType {
+    use aterm_core::shell_integration::ShellType;
+    match image {
+        Some(image) => ShellType::detect(&image.to_string_lossy()),
+        None => kept()
+            .iter()
+            .map(|name| ShellType::detect(name))
+            .find(|shell| *shell != ShellType::Unknown)
+            .unwrap_or(ShellType::Unknown),
+    }
 }
 
 /// Whether `shell` runs each command as a job of its own ([`crate::command_ran::Ran::runs_jobs`]):
@@ -602,11 +634,14 @@ pub(crate) struct SessionFactory {
     pub(crate) proc_connector: crate::exec_edges::ConnectorSeam,
     /// The birth of a process that has exec'd since its fork (`crate::fg_sample::execd_start`):
     /// a PTY reader with no process watch hears the image of a sampled edge's leader only once
-    /// it has with that same birth ([`sampled_edge_image`]; the test App's inert arm reads none).
+    /// it has with that same birth ([`sampled_edge_image`]), and a restore notes a pwsh child
+    /// only then, placed by that birth ([`adopt_restored_holder`]; the test App's inert arm reads
+    /// none).
     #[cfg(unix)]
     pub(crate) leader_execd: fn(i32) -> Option<u64>,
     /// The shell's live children, read after a restore for the groups its carried stopped
-    /// drawers lead ([`shell_children`]).
+    /// drawers lead and, where the shell runs its commands in its own group (pwsh), for the
+    /// running command ([`shell_children`]).
     #[cfg(unix)]
     pub(crate) shell_children: fn(i32) -> Vec<i32>,
     /// How a Windows PTY reader lists its session's job for the programs its commands ran
@@ -1094,6 +1129,8 @@ pub(crate) struct Adopted {
     pub autopilot_end: Option<String>,
     /// The record's book of declared wakes (`SessionRecord::wakes`), unparsed.
     pub wakes: Option<String>,
+    /// The record's confirmation of the session's agent (`SessionRecord::agent_act`), unparsed.
+    pub agent_act: Option<String>,
 }
 
 /// Seed a seamless update's carried end, or a proven self-claim's carried face, onto an adopted
@@ -1121,17 +1158,22 @@ pub(crate) fn seed_adopted_end(
 }
 
 /// A seamless update's carried rows onto adopted session `id`, before it is registered: its task
-/// record, its Autopilot end and its book of declared wakes.
+/// record, its Autopilot end, its book of declared wakes and the host's confirmation of its agent
+/// (`agent_act`, [`crate::agent_act::adopt_carried`]).
 pub(crate) fn seed_adopted_rows(
     ctx: &SessionCtx,
     id: u64,
     task: Option<&str>,
     end: Option<&str>,
     wakes: Option<&str>,
+    agent_act: Option<&str>,
 ) {
     crate::task_record::seed_carried(ctx, task);
     seed_adopted_end(&ctx.timeline, end);
     crate::occupancy_wakes::seed_carried(id, ctx.self_id.as_str(), wakes);
+    if let Some(row) = agent_act {
+        crate::agent_act::adopt_carried(ctx.self_id.as_str(), row);
+    }
 }
 
 /// Mark an adopted session's timeline, cast and temporal recorder as starting at the handoff
@@ -1514,6 +1556,8 @@ pub(crate) fn spawn_session(
         .as_ref()
         .and_then(|adopted| adopted.autopilot_end.clone());
     let adopt_wakes: Option<String> = adopt.as_ref().and_then(|adopted| adopted.wakes.clone());
+    let adopt_agent_act: Option<String> =
+        adopt.as_ref().and_then(|adopted| adopted.agent_act.clone());
     let substitute = records_shell_start(adopt.is_some(), factory.exec_command.as_deref())
         .then(|| {
             substitute_shell(
@@ -1886,6 +1930,7 @@ pub(crate) fn spawn_session(
         adopt_task.as_deref(),
         adopt_end.as_deref(),
         adopt_wakes.as_deref(),
+        adopt_agent_act.as_deref(),
     );
 
     if adopt_checkpoint.is_some() || adopted {
@@ -1918,6 +1963,7 @@ pub(crate) fn spawn_session(
             factory.fg_probe,
             factory.edge_image,
             factory.shell_children,
+            factory.leader_execd,
         );
         factory.edge_inbox.push(id);
     }
@@ -4126,7 +4172,7 @@ pub(crate) fn sampled_edge_image(
 #[cfg(unix)]
 #[expect(
     clippy::too_many_arguments,
-    reason = "the session's engine, timeline and ran log beside the factory's three probes"
+    reason = "the session's engine, timeline and ran log beside the factory's four probes"
 )]
 pub(crate) fn adopt_restored_holder(
     term: &Mutex<Terminal>,
@@ -4137,6 +4183,7 @@ pub(crate) fn adopt_restored_holder(
     fg_probe: fn(i32) -> i32,
     edge_image: crate::holder_image::ReadImage,
     children: fn(i32) -> Vec<i32>,
+    execd: fn(i32) -> Option<u64>,
 ) -> aterm_core::terminal::HolderAdoption {
     let cursor = {
         let timeline = timeline.lock().unwrap_or_else(|p| p.into_inner());
@@ -4147,10 +4194,8 @@ pub(crate) fn adopt_restored_holder(
     };
     let (running, pgid) = {
         let term = term_lock(term);
-        let running = term
-            .current_block()
-            .filter(|b| b.state == aterm_types::BlockState::Executing)
-            .map(|b| b.id);
+        let running =
+            crate::session_status::executing_block(&term).map(|(block, window)| (block.id, window));
         (running, fg_probe(master))
     };
     let image = (pgid > 0).then(|| Arc::new(edge_image(pgid, None)));
@@ -4159,7 +4204,12 @@ pub(crate) fn adopt_restored_holder(
         // read now while it runs, is noted as the running block's job's, with its file's
         // identity and steers, before the blocks are read, so the read the restore logs and the
         // next sweep confirm the word the person typed (a `claude` through its link).
-        ran.restored(image, running);
+        ran.restored(image, running.map(|(block, _)| block));
+    } else if pgid == root_pgid {
+        // The shell's own group in front: the shell itself is no command's, but pwsh runs its
+        // commands in that group, so the running command is one of its live children that has
+        // exec'd, each placed by its birth (nothing in a shell that runs jobs).
+        ran.restored_in_shell_group(running, children, edge_image, execd);
     }
     let blocks = cursor.map(|(from, since_wall)| {
         crate::session_status::block_read(&term_lock(term), from, since_wall, ran.ran())
@@ -4241,9 +4291,9 @@ fn restored_drawer_groups(
     led
 }
 
-/// The shell's live children, which a restore's carried stopped drawers lead
-/// (`SessionFactory::shell_children` as shipped; the process watch, and so a retirement, exists
-/// only on Darwin).
+/// The shell's live children, which a restore's carried stopped drawers lead and among which a
+/// pwsh session's running command runs (`SessionFactory::shell_children` as shipped; the process
+/// watch, and so a retirement, exists only on Darwin, and elsewhere a restore reads none).
 #[cfg(unix)]
 pub(crate) fn shell_children(shell: i32) -> Vec<i32> {
     #[cfg(target_vendor = "apple")]

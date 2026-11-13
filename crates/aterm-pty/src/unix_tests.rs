@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use std::os::fd::IntoRawFd as _;
 
 const HANG_DETECTOR: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -90,7 +91,8 @@ fn a_wake_pipe_is_kept_out_of_children_where_the_kernel_keeps_the_mark() {
     let kernel_keeps = cfg!(target_vendor = "apple") && {
         let mut probe = [0i32; 2];
         // SAFETY: valid 2-int out-array for pipe(2).
-        assert_eq!(unsafe { libc::pipe(probe.as_mut_ptr()) }, 0, "probe pipe");
+        let made = unsafe { libc::pipe(probe.as_mut_ptr()) };
+        assert_eq!(made, 0, "probe pipe");
         let flags = fd_flags(probe[0], "the probe's read end");
         // SAFETY: `F_SETFD` sets the descriptor-flag word of this test's own fresh read end.
         let set = unsafe { libc::fcntl(probe[0], libc::F_SETFD, flags | FD_CLOFORK) } == 0;
@@ -121,10 +123,8 @@ fn a_wake_pipe_is_kept_out_of_children_where_the_kernel_keeps_the_mark() {
 fn read_or_wake_answers_exited_when_the_shell_exits_while_the_slave_is_held() {
     use std::os::fd::AsRawFd as _;
     use std::sync::mpsc;
-    let mut m = [0i32; 2];
-    // SAFETY: valid 2-int out-array for pipe(2).
-    assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-    let (master_rd, master_wr) = (m[0], m[1]);
+    let (master_rd, master_wr) = aterm_uds::pipe().expect("pipe");
+    let (master_rd, master_wr) = (master_rd.into_raw_fd(), master_wr.into_raw_fd());
     let mut shell = aterm_uds::spawnfd::command("/bin/sh")
         .args(["-c", "read _"])
         .stdin(aterm_uds::spawnfd::Stdio::piped())
@@ -202,10 +202,8 @@ fn read_or_wake_answers_exited_when_the_shell_exits_while_the_slave_is_held() {
 
 #[test]
 fn drain_more_nonblocking_delivers_interactive_burst_on_first_quiet_read() {
-    let mut m = [0i32; 2];
-    // SAFETY: valid 2-int out-array for pipe(2).
-    assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-    let (rd, wr) = (m[0], m[1]);
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
     set_nonblocking(rd, true).expect("nonblock read end");
     // SAFETY: bounded write to this test's live pipe end.
     assert_eq!(unsafe { libc::write(wr, b"echo".as_ptr().cast(), 4) }, 4);
@@ -248,10 +246,8 @@ fn drain_more_nonblocking_hot_caps_a_continuous_stream_at_the_hot_budget() {
         ("hot", always_hot as fn() -> bool, true),
         ("cold", never_hot as fn() -> bool, false),
     ] {
-        let mut m = [0i32; 2];
-        // SAFETY: valid 2-int out-array for pipe(2).
-        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-        let (rd, wr) = (m[0], m[1]);
+        let (rd, wr) = aterm_uds::pipe().expect("pipe");
+        let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
         set_nonblocking(rd, true).expect("nonblock read end");
         let chunk = [0xC3u8; 2048];
         // SAFETY: bounded write to this test's live pipe end.
@@ -308,10 +304,8 @@ fn drain_more_nonblocking_hot_caps_a_continuous_stream_at_the_hot_budget() {
 
 #[test]
 fn drain_more_nonblocking_gathers_saturated_burst_and_survives_eof() {
-    let mut m = [0i32; 2];
-    // SAFETY: valid 2-int out-array for pipe(2).
-    assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-    let (rd, wr) = (m[0], m[1]);
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
     set_nonblocking(rd, true).expect("nonblock read end");
     let payload = [0xA5u8; 8192];
     // SAFETY: bounded write to this test's live pipe end (8 KiB fits the default pipe buffer).
@@ -348,10 +342,8 @@ fn drain_more_nonblocking_parks_yield_to_wake_and_leave_the_byte() {
     const IDLE_WAIT_US: u32 = 90_000_000;
     super::BUDGET_FOR_TEST.with(|b| b.set(Some(HANG_DETECTOR)));
     for (park, in_flight) in [("bridge poll", 1usize), ("idle wait", 0)] {
-        let mut m = [0i32; 2];
-        // SAFETY: valid 2-int out-array for pipe(2).
-        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-        let (rd, wr) = (m[0], m[1]);
+        let (rd, wr) = aterm_uds::pipe().expect("pipe");
+        let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
         set_nonblocking(rd, true).expect("nonblock read end");
         let payload = [0x9Cu8; 4096];
         // SAFETY: bounded write to this test's live pipe end.
@@ -405,10 +397,8 @@ fn drain_more_nonblocking_fence_delivers_before_a_park() {
     super::BUDGET_FOR_TEST.with(|b| b.set(Some(std::time::Duration::from_secs(60))));
     let chunk = [0xC3u8; 2048];
     let run = |cut: bool| -> (usize, u32, isize) {
-        let mut m = [0i32; 2];
-        // SAFETY: valid 2-int out-array for pipe(2).
-        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-        let (rd, wr) = (m[0], m[1]);
+        let (rd, wr) = aterm_uds::pipe().expect("pipe");
+        let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
         set_nonblocking(rd, true).expect("nonblock read end");
         // SAFETY: bounded write to this test's live pipe end.
         assert_eq!(
@@ -476,11 +466,10 @@ fn drain_more_nonblocking_fence_delivers_before_a_park() {
 fn the_process_watch_is_heard_before_the_master_in_every_poll() {
     use std::sync::atomic::AtomicUsize;
     let pipe = || {
-        let mut m = [0i32; 2];
-        // SAFETY: valid 2-int out-array for pipe(2).
-        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-        set_nonblocking(m[0], true).expect("nonblock read end");
-        (m[0], m[1])
+        let (rd, wr) = aterm_uds::pipe().expect("pipe");
+        let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
+        set_nonblocking(rd, true).expect("nonblock read end");
+        (rd, wr)
     };
     let put = |fd: i32, bytes: &[u8]| {
         // SAFETY: bounded write to this test's live pipe end.
@@ -592,11 +581,10 @@ fn the_process_watch_is_heard_before_the_master_in_every_poll() {
 #[test]
 fn no_batch_ends_past_an_exec_the_watch_could_hear() {
     let pipe = || {
-        let mut m = [0i32; 2];
-        // SAFETY: valid 2-int out-array for pipe(2).
-        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-        set_nonblocking(m[0], true).expect("nonblock read end");
-        (m[0], m[1])
+        let (rd, wr) = aterm_uds::pipe().expect("pipe");
+        let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
+        set_nonblocking(rd, true).expect("nonblock read end");
+        (rd, wr)
     };
     let put = |fd: i32, bytes: &[u8]| {
         // SAFETY: bounded write to this test's live pipe end.
@@ -697,10 +685,9 @@ fn no_batch_ends_past_an_exec_the_watch_could_hear() {
 #[test]
 fn the_blocking_fallback_hears_the_watch_at_each_chunk() {
     let pipe = || {
-        let mut m = [0i32; 2];
-        // SAFETY: valid 2-int out-array for pipe(2).
-        assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-        (m[0], m[1])
+        let (rd, wr) = aterm_uds::pipe().expect("pipe");
+        let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
+        (rd, wr)
     };
     let put = |fd: i32, bytes: &[u8]| {
         // SAFETY: bounded write to this test's live pipe end.
@@ -747,10 +734,8 @@ fn drain_more_nonblocking_idle_wait_bridges_refill_into_same_batch() {
     const IDLE_WAIT_US: u32 = 60_000_000;
     const CHUNK_LEN: usize = 2048;
     super::BUDGET_FOR_TEST.with(|b| b.set(Some(std::time::Duration::from_secs(60))));
-    let mut m = [0i32; 2];
-    // SAFETY: valid 2-int out-array for pipe(2).
-    assert_eq!(unsafe { libc::pipe(m.as_mut_ptr()) }, 0, "pipe");
-    let (rd, wr) = (m[0], m[1]);
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
     set_nonblocking(rd, true).expect("nonblock read end");
     let chunk = [0xB4u8; CHUNK_LEN];
     // SAFETY: bounded write to this test's live pipe end.
@@ -1197,19 +1182,13 @@ fn an_unrelated_exec_inherits_no_end_of_a_live_pty_or_status_channel() {
 }
 
 fn racy_status_pipe() -> (libc::c_int, libc::c_int) {
-    let mut fds = [0 as libc::c_int; 2];
-    // SAFETY: `pipe` fills exactly the two-element array it is given.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
-    // SAFETY: both fds are live; `F_SETFD` only sets a flag word.
-    unsafe {
-        libc::fcntl(fds[0], libc::F_SETFD, libc::FD_CLOEXEC);
-        libc::fcntl(fds[1], libc::F_SETFD, libc::FD_CLOEXEC);
-    }
+    let (rd, wr) = aterm_uds::pipe().expect("pipe");
+    let (rd, wr) = (rd.into_raw_fd(), wr.into_raw_fd());
     assert!(
-        fd_set_nonblocking(fds[0]),
+        fd_set_nonblocking(rd),
         "the read end must be non-blocking, as the real carrier makes it"
     );
-    (fds[0], fds[1])
+    (rd, wr)
 }
 
 #[test]
@@ -2513,7 +2492,7 @@ fn unread_input_len_counts_the_keys_the_program_has_not_read() {
         Some(5),
         "canonical: the partial line written with it is not counted"
     );
-    let (r, w) = std::io::pipe().expect("pipe");
+    let (r, w) = aterm_uds::pipe().expect("pipe");
     assert_eq!(
         unread_input_len(std::os::fd::AsRawFd::as_raw_fd(&r)),
         None,
@@ -4068,10 +4047,11 @@ fn a_child_forked_while_the_watchdog_is_held_grants_without_it() {
     held_rx
         .recv_timeout(HANG_DETECTOR)
         .expect("the holder has the watchdog's lock");
-    let mut ends = [0 as libc::c_int; 2];
-    // SAFETY: `ends` is two writable descriptor slots, which `pipe` fills on success.
-    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0, "a pipe");
+    let (said_end, tell_end) = aterm_uds::pipe().expect("a pipe");
+    let ends = [said_end.into_raw_fd(), tell_end.into_raw_fd()];
     aterm_uds::spawnfd::pass_libnotify_gate();
+    // The child writes the write end, kept out of every fork it is not handed to.
+    let handing = aterm_uds::spawn_lock::handing(&[ends[1]]);
     // SAFETY: the child runs the grant on a stand-in that returns at once and touches no
     // descriptor, then calls only `write` and `_exit`.
     let pid = unsafe { libc::fork() };
@@ -4086,6 +4066,7 @@ fn a_child_forked_while_the_watchdog_is_held_grants_without_it() {
             libc::_exit(0);
         }
     }
+    drop(handing);
     drop(go_tx);
     holder.join().expect("the holder lets go");
     // SAFETY: closing the write end this process holds; the child holds its own.

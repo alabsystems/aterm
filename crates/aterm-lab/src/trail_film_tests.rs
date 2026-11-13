@@ -409,6 +409,38 @@ fn a_flash_is_the_pet_s_the_caret_s_or_the_trail_s_by_where_it_lay() {
 }
 
 #[test]
+fn a_turn_on_the_frame_a_body_left_its_pixel_is_the_body_s() {
+    // Seven turns 144 ms apart; the pet's box holds the pixel on the frames of the first three. The fourth
+    // falls on the frame after the box last held it (`gone` ms before), when its coat gave way to the page.
+    let times: Vec<u32> = (1..=7).map(|k| 144 * k).collect();
+    let read = |gone: u32| {
+        let turns: HashMap<u32, Vec<u32>> = [(10, times.clone())].into_iter().collect();
+        let mut boxes: HashMap<u32, Boxes> = times
+            .iter()
+            .enumerate()
+            .map(|(k, &t)| {
+                let body = if k < 3 { vec![(8, 12, 0, 1)] } else { vec![] };
+                (t, (body, None, vec![]))
+            })
+            .collect();
+        for was in [times[3] - 32, times[3] - 16] {
+            let body = if was == times[3] - gone {
+                vec![(8, 12, 0, 1)]
+            } else {
+                vec![]
+            };
+            boxes.insert(was, (body, None, vec![]));
+        }
+        by_place(&turns, (2, 16), W, &boxes).map(|read| read.over)
+    };
+    let (none, this) = (Vec::<u32>::new, || vec![10u32]);
+    // Gone the frame before the turn: four of seven are the pet's.
+    assert_eq!(read(16), [this(), none(), none(), none()]);
+    // Control: gone two frames before, the turn is not the box's leaving, and three of seven stay the trail's.
+    assert_eq!(read(32), [none(), none(), none(), this()]);
+}
+
+#[test]
 fn a_pixel_the_pet_and_the_caret_shared_is_not_the_trail_s_own() {
     // Seven turns 144 ms apart. `pet` of them fall in the pet's box, the next `caret` in the caret's cell and
     // the next `icon` in a word icon's box.

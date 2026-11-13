@@ -191,6 +191,47 @@ impl Outbox {
         }
     }
 
+    /// Data-only private fixture diagnostics. Static labels cannot expose a
+    /// request identifier, response payload, credential or source permission.
+    #[cfg(all(unix, debug_assertions))]
+    pub(super) fn fixture_constructor_reply(
+        &self,
+        request: &str,
+    ) -> Option<(&'static str, &'static str)> {
+        let mut words = request.split_ascii_whitespace();
+        words.next()?;
+        if words.next()? != "codex-auth" {
+            return None;
+        }
+        let action = match words.next()? {
+            "member-peer" => "peer",
+            "member-open" => "open",
+            _ => return None,
+        };
+        let Segment::Bytes(bytes) = self.segments.front()? else {
+            return Some((action, "non-byte-reply"));
+        };
+        let line = std::str::from_utf8(bytes).ok()?;
+        let class = if line.starts_with("OK codex-auth member-waiting ") {
+            "waiting"
+        } else if line.starts_with("OK codex-auth ") {
+            "ok"
+        } else if line.starts_with("ERR codex-auth unavailable") {
+            "unavailable"
+        } else if line.starts_with("ERR codex-auth busy") {
+            "busy"
+        } else if line.starts_with("ERR codex-auth denied") {
+            "denied"
+        } else if line.starts_with("ERR codex-auth stale") {
+            "stale"
+        } else if line.starts_with("ERR codex-auth unsupported") {
+            "unsupported"
+        } else {
+            "other"
+        };
+        Some((action, class))
+    }
+
     /// Return sanitized correlation only from a real production reply.
     #[cfg(all(unix, debug_assertions))]
     pub(super) fn fixture_source_outcome(&self, request: &str) -> Option<aterm_json::Value> {

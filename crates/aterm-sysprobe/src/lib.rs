@@ -407,18 +407,35 @@ impl GroupMemory {
     }
 }
 
-/// The memory of `pid`'s whole PROCESS GROUP ([`GroupMemory`]): a Claude Code's Bun process and the children it forks into its own group. Windows has no process group, so there it is the memory of `pid`'s PROCESS TREE: the private commit of `pid`, of each live process whose chain of live parents reaches it, and of each orphan started in one of that tree's consoles since `pid` was (Windows gives a process whose parent exited no new parent, which is how Git Bash leaves every script it runs; [`windows::tree_adopting`]), from one sweep ([`windows::tree_memory`]), with `pid` as the group's id. A pid Windows handed to a newer process is never read as a child (the sweep checks each parent's creation time). Not counted: an orphan with no console, or one whose console's creator has exited too, so the figure is a floor.
+/// The memory of `pid`'s whole PROCESS GROUP ([`GroupMemory`]): a Claude Code's Bun process and
+/// the children it forks into its own group (on Linux their anonymous memory, resident or swapped
+/// out, [`linux::Root::group_memory`]). Windows has no process group, so there it is the memory of
+/// `pid`'s PROCESS TREE: the private commit of `pid`, of each live process whose chain of live
+/// parents reaches it, and of each orphan started in one of that tree's consoles since `pid` was
+/// (Windows gives a process whose parent exited no new parent, which is how Git Bash leaves every
+/// script it runs; [`windows::tree_adopting`]), from one sweep ([`windows::tree_memory`]), with
+/// `pid` as the group's id. A pid Windows handed to a newer process is never read as a child (the
+/// sweep checks each parent's creation time). Not counted: an orphan with no console, or one whose
+/// console's creator has exited too, so the figure is a floor.
 #[must_use]
 pub fn group_memory(pid: u32) -> Option<GroupMemory> {
     #[cfg(target_os = "macos")]
     {
         macos::group_memory(pid)
     }
+    #[cfg(target_os = "linux")]
+    {
+        linux::Root::system().group_memory(pid)
+    }
     #[cfg(all(windows, target_pointer_width = "64"))]
     {
         win::group_memory(pid)
     }
-    #[cfg(not(any(target_os = "macos", all(windows, target_pointer_width = "64"))))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         let _ = pid;
         None
@@ -576,18 +593,31 @@ pub fn physical_memory_mib() -> Option<u64> {
     }
 }
 
-/// The kernel's memory pressure level now (`kern.memorystatus_vm_pressure_level`, one `sysctl`), `None` where unknown (Linux). On Windows the level [`memory_detail`] reads: `warn` once the commit charge is at 90 % of its limit or the low-memory notification is set, else `normal`; Windows names no `critical`.
+/// The kernel's memory pressure level now: on macOS `kern.memorystatus_vm_pressure_level` (one
+/// `sysctl`), on Linux PSI held to `MemAvailable` ([`linux::Root::pressure`]: one read of
+/// `/proc/pressure/memory` and one of `/proc/meminfo`), and on Windows the level [`memory_detail`]
+/// reads (`warn` once the commit charge is at 90 % of its limit or the low-memory notification is
+/// set, else `normal`; Windows names no `critical`); `None` where unknown (Linux without PSI,
+/// every other platform).
 #[must_use]
 pub fn memory_pressure() -> Option<MemoryLevel> {
     #[cfg(target_os = "macos")]
     {
         macos::memory_pressure()
     }
+    #[cfg(target_os = "linux")]
+    {
+        linux::Root::system().pressure().ok()
+    }
     #[cfg(all(windows, target_pointer_width = "64"))]
     {
         win::memory_detail().and_then(|m| m.pressure)
     }
-    #[cfg(not(any(target_os = "macos", all(windows, target_pointer_width = "64"))))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "linux",
+        all(windows, target_pointer_width = "64")
+    )))]
     {
         None
     }
@@ -606,7 +636,7 @@ pub fn swapped_kib() -> Option<u64> {
         let page_kib = *PAGE_KIB.get_or_init(|| {
             read_bounded_bytes(Path::new("/proc/self/auxv"))
                 .ok()
-                .and_then(|b| linux::auxv_value(&b, 6))
+                .and_then(|b| linux::auxv_value(&b, linux::AT_PAGESZ))
                 .map(|b| b / 1024)
                 .filter(|k| *k > 0)
                 .unwrap_or(4)
@@ -772,6 +802,8 @@ pub const fn pressure_of(level: i64) -> Option<MemoryLevel> {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+mod linux_live_tests;
 #[cfg(test)]
 mod linux_tests;
 #[cfg(test)]

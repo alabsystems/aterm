@@ -36,8 +36,8 @@ fn webmail_challenge_then_maildir_success_leaves_no_credential_need() {
         if fallback {
             cfg.dir = Some(maildir.clone());
         }
-        let (commands, to_browser) = std::io::pipe().unwrap();
-        let (from_browser, mut replies) = std::io::pipe().unwrap();
+        let (commands, to_browser) = aterm_uds::pipe().unwrap();
+        let (from_browser, mut replies) = aterm_uds::pipe().unwrap();
         let browser = std::thread::spawn(move || {
             let mut commands = commands;
             let mut pending = Vec::new();

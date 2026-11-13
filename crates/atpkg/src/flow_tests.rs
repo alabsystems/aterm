@@ -3834,6 +3834,159 @@ fn unreadable_pins_abort_a_group_before_staging() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn pins_changed_during_the_last_download_are_read_before_activation() {
+    struct ChangesPins {
+        inner: Fake,
+        layout: Layout,
+        change: &'static str,
+        changed: std::sync::atomic::AtomicBool,
+    }
+    impl Fetcher for ChangesPins {
+        fn index_candidates(&self) -> Result<Vec<Candidate>, String> {
+            self.inner.index_candidates()
+        }
+        fn pkg_manifest(
+            &self,
+            repo: &str,
+            program: &str,
+            build: u64,
+        ) -> Result<(Vec<u8>, Vec<u8>), String> {
+            self.inner.pkg_manifest(repo, program, build)
+        }
+        fn download(&self, repo: &str, asset: &str, dest: &Path) -> Result<(), String> {
+            self.inner.download(repo, asset, dest)?;
+            if asset == "trust-4821.tar.zst" {
+                match self.change {
+                    "unreadable" => {
+                        std::fs::write(self.layout.prefix.join("pins"), b"ay\n\xff")
+                            .map_err(|error| error.to_string())?;
+                    }
+                    change => {
+                        let program = if change == "revoked" || change == "released" {
+                            "ay"
+                        } else {
+                            change
+                        };
+                        crate::pin::set_pinned(&self.layout, program, true)
+                            .map_err(|error| error.to_string())?;
+                        if change == "released" {
+                            crate::pin::set_pinned(&self.layout, program, false)
+                                .map_err(|error| error.to_string())?;
+                        }
+                    }
+                }
+                self.changed
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        }
+    }
+
+    for change in [
+        "ay",
+        "trust",
+        "unreadable",
+        "unrelated",
+        "released",
+        "revoked",
+    ] {
+        let dir = scratch("pin-before-activation");
+        let layout = layout(&dir);
+        seed_build(&layout, "ay", 17, true);
+        seed_build(&layout, "trust", 4820, true);
+        let installed = crate::ops::active_builds(&layout);
+        let fake = ChangesPins {
+            inner: if change == "revoked" {
+                group_fixture_yanking_ay17(&dir)
+            } else {
+                group_fixture(&dir)
+            },
+            layout: layout.clone(),
+            change,
+            changed: std::sync::atomic::AtomicBool::new(false),
+        };
+        let report = apply_channel(
+            &fake,
+            &layout,
+            &anchor(),
+            "stable",
+            TRIPLE,
+            &installed,
+            &[],
+            fl(0),
+            0,
+        )
+        .unwrap();
+        assert!(fake.changed.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(report.groups.len(), 1);
+        if matches!(change, "ay" | "trust" | "unreadable") {
+            assert!(
+                matches!(&report.groups[0].1,
+                    TxnOutcome::Aborted { during_flip: true, why, rolled_back, .. }
+                    if why.contains("local pins") && rolled_back.is_empty()),
+                "{change}: {:?}",
+                report.groups[0].1,
+            );
+            assert_eq!(crate::ops::active_builds(&layout), installed, "{change}");
+        } else {
+            assert!(
+                matches!(&report.groups[0].1, TxnOutcome::Applied(_)),
+                "{change}: {:?}",
+                report.groups[0].1,
+            );
+            assert_eq!(crate::ops::active_builds(&layout).get("ay"), Some(&18));
+            assert_eq!(crate::ops::active_builds(&layout).get("trust"), Some(&4821));
+        }
+    }
+}
+
+#[test]
+fn a_pin_between_member_activations_rolls_the_group_back() {
+    let dir = scratch("pin-between-activations");
+    let layout = layout(&dir);
+    let fake = group_fixture(&dir);
+    seed_build(&layout, "ay", 17, true);
+    seed_build(&layout, "trust", 4820, true);
+    let installed = crate::ops::active_builds(&layout);
+    let index = verify_select_fresh(&fake, &layout, &anchor(), fl(0), 0).unwrap();
+    let group = Group {
+        group: Some("rustc".into()),
+        members: vec!["ay".into(), "trust".into()],
+    };
+    let changed = std::cell::Cell::new(false);
+    let current = || {
+        if crate::ops::active_builds(&layout).get("ay") == Some(&18) {
+            crate::pin::set_pinned(&layout, "trust", true).map_err(|error| error.to_string())?;
+            changed.set(true);
+        }
+        Ok(())
+    };
+    let (outcome, applied) = bootstrap_group_guarded(
+        &fake,
+        &layout,
+        &index,
+        "stable",
+        TRIPLE,
+        &group,
+        &installed,
+        &mut BTreeMap::new(),
+        &crate::quiet::FlipGate::NOW,
+        &current,
+    )
+    .unwrap();
+    assert!(changed.get(), "the first member activated before the pin");
+    assert!(
+        matches!(&outcome, TxnOutcome::Aborted {
+            failed, during_flip: true, why, rolled_back,
+        } if failed == "trust" && why.contains("local pins")
+            && rolled_back == &vec![("ay".to_string(), Ok(()))]),
+        "{outcome:?}",
+    );
+    assert!(applied.is_empty());
+    assert_eq!(crate::ops::active_builds(&layout), installed);
+}
+
 fn group_fixture_yanking_ay17(dir: &Path) -> Fake {
     let mut f = group_fixture(dir);
     let index_body = format!(

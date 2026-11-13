@@ -163,7 +163,7 @@ fn read_batches_stop_on_end_or_read_failure() {
 fn a_partial_read_batch_leaves_native_input_ready_for_another_turn() {
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsFd as _;
-    let (mut read, mut write) = crate::kept_out(std::io::pipe).unwrap();
+    let (mut read, mut write) = crate::pipe().unwrap();
     let input: Vec<u8> = (0..49).collect();
     write.write_all(&input).unwrap();
     drop(write);

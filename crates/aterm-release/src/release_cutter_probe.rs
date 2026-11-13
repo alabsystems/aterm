@@ -45,6 +45,8 @@ fn step_one(args: &[OsString]) -> Result<(), String> {
     };
     let prover = real.prover(None)?;
     let started = std::time::Instant::now();
+    real.fetch_engine_origin()
+        .map_err(|refusal| format!("publication engine snapshot refused: {refusal:?}"))?;
     let blocks = real.commit_gates(&candidate, dry).found;
     let mut refusals: Vec<_> = blocks.iter().map(|r| r.why.clone()).collect();
     let mut unavailable = blocks.iter().any(|r| r.could_not_run);

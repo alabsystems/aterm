@@ -67,7 +67,7 @@ fn the_relay_ends_when_screen_sharing_closes_while_its_input_is_still_open() {
         let mut s = accept(&l);
         s.write_all(BANNER).unwrap();
     });
-    let (input, held_open) = io::pipe().unwrap();
+    let (input, held_open) = aterm_uds::pipe().unwrap();
     let mut out = Vec::new();
     assert_eq!(screen(&enabled(), port, input, &mut out), ExitCode::SUCCESS);
     server.join().unwrap();
@@ -96,7 +96,7 @@ fn when_standard_output_is_gone_the_relay_ends_and_closes_the_connection() {
         let mut rest = Vec::new();
         s.read_to_end(&mut rest).map(|_| rest)
     });
-    let (input, held_open) = io::pipe().unwrap();
+    let (input, held_open) = aterm_uds::pipe().unwrap();
     assert_eq!(
         screen(&enabled(), port, input, &mut Gone),
         ExitCode::FAILURE
@@ -192,7 +192,7 @@ fn without_screen_sharing_enabled_in_launchd_nothing_connects() {
     }
     let fake = enabled();
     let mut out = Vec::new();
-    let (input, held_open) = io::pipe().unwrap();
+    let (input, held_open) = aterm_uds::pipe().unwrap();
     let server = std::thread::spawn(move || drop(accept(&l)));
     assert_eq!(screen(&fake, port, input, &mut out), ExitCode::SUCCESS);
     server.join().unwrap();

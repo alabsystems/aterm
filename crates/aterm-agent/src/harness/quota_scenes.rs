@@ -300,6 +300,7 @@ pub fn tap_words(view: &QuotaView) -> String {
         cache_expires_at: None,
         version: None,
         model: None,
+        effort: None,
         ctx_left: None,
         dur_us: 0,
         row: Some(Row::Own),

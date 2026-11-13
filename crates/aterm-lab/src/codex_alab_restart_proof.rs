@@ -32,9 +32,69 @@ pub(super) fn legs(proof: &mut Proof, pkg: &Path) -> Result<(), Fail> {
     )?;
     let next_package = proof.s.join("pkg-b");
     leg(proof, &target, pkg, &next_package)?;
+    if proof.fails.is_empty() {
+        restored_task(proof, &target, &next_package, pkg)?;
+    }
     if !proof.fails.is_empty() {
         proof.diagnose(&[&target]);
     }
+    Ok(())
+}
+
+/// The dedicated lane also exercises the restored-task restart preflight with the real
+/// package. The keeper lane qualifies cold restore; the real-child/runner regression holds
+/// its exit watch across the handoff. Here the public task command supplies that record shape,
+/// without agent metadata, so admission must use the offered live process's actual program.
+fn restored_task(
+    proof: &mut Proof,
+    target: &Leg,
+    before_package: &Path,
+    after_package: &Path,
+) -> Result<(), Stopped> {
+    let marked = proof.on(&target.sid, &["task", "mark", "working", "why=restored"]);
+    let before = proof.on(&target.sid, &["task"]).first();
+    let rev = field(&before, "rev");
+    if !proof.check(
+        &format!(
+            "restart: a restored working task is present ({})",
+            marked.first()
+        ),
+        marked.code == 0
+            && field(&before, "state").as_deref() == Some("working")
+            && field(&before, "why").as_deref() == Some("restored")
+            && rev.is_some(),
+    ) {
+        return Ok(());
+    }
+
+    leg(proof, target, before_package, after_package)?;
+    let after = proof.on(&target.sid, &["task"]).first();
+    proof.check(
+        &format!(
+            "restart: the restored task survives without an exit or reopen revision ({after})"
+        ),
+        field(&after, "state").as_deref() == Some("working")
+            && field(&after, "why").as_deref() == Some("restored")
+            && field(&after, "rev") == rev,
+    );
+
+    // Complete the logical task after the actual restart, then read the public waiter. An
+    // explicit done stays done even while the resumed TUI remains available in its terminal.
+    let done = proof.on(&target.sid, &["task", "mark", "done"]);
+    let waited = proof.on(&target.sid, &["await", "task", "since=0", "timeout=60000"]);
+    let selector = format!("@{} ", target.sid);
+    let row = waited
+        .stdout
+        .lines()
+        .find(|line| line.starts_with(&selector))
+        .unwrap_or_default();
+    proof.check(
+        &format!("restart: the task waiter reports its subsequent completion ({row})"),
+        done.code == 0
+            && waited.code == 0
+            && field(row, "state").as_deref() == Some("done")
+            && field(row, "conclusion").as_deref() == Some("finished"),
+    );
     Ok(())
 }
 
@@ -55,14 +115,20 @@ pub(super) fn leg(
                     .get("resumeArgv")
                     .and_then(J::as_arr)
                     .is_some_and(|argv| !argv.is_empty())
-                && record.get("cwd").and_then(J::as_str).is_some())
+                && record.get("cwd").and_then(J::as_str).is_some()
+                && {
+                    // A crash relaunch can publish idle before its host releases the hand.
+                    // Wait for that boundary before issuing the one person-input probe.
+                    let lease = proof.on(&target.sid, &["lease", "status"]);
+                    lease.code == 0 && lease.first() == "OK lease none"
+                })
             .then_some((pid, record))
         });
         before.is_some()
     })?;
     let Some((pid, before)) = before else {
         proof.check(
-            "restart: an idle, proven codex-alab has a resume record",
+            "restart: an idle, proven codex-alab has a resume record and no relaunch lease",
             false,
         );
         return Ok(());

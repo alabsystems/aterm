@@ -291,6 +291,9 @@ pub(crate) struct BlockFact {
     pub(crate) detail: Option<String>,
     /// Whether `detail` names the command's own program, which no later read betters (`false`: the wrapper or interpreter that ran while the program was not yet heard, [`crate::session_status::Reading::own`]).
     pub(crate) detail_final: bool,
+    /// Its line's top-level shape (how many elements, and which the detail reads), which says whose
+    /// process group its status describes ([`StatusOf`]); never a word of the line.
+    pub(crate) shape: crate::session_status::LineShape,
 }
 
 /// What the status sweep read of the shell's blocks under its one terminal guard ([`crate::session_status::block_read`]): the blocks that ran a command from the log's [`SessionLog::block_cursor`] on, OLDEST first, at most [`crate::session_status::BLOCK_READ_MAX`] of them.
@@ -390,8 +393,70 @@ impl Detailed {
 
 #[derive(Clone, Copy, Debug)]
 enum CmdEnd {
-    Exit(Option<i32>),
+    /// The block's D: the shell's status for the line (`None`: a D with none), and whose process
+    /// group that status describes.
+    Exit(Option<i32>, StatusOf),
     Unknown,
+}
+
+/// WHOSE STATUS A COMMAND'S D CARRIES (review RV2, E2-R2): the shell reports one status for a
+/// line, its last top-level element's ([`crate::session_status::LineShape`]). A run that held the
+/// front until its command ended takes that status ([`SessionLog::run_end`]) only where its process
+/// group ran that element; every other run under the line keeps its path's own word.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusOf {
+    /// The line is one element (a pipeline is one job): every run under it ran it.
+    Line,
+    /// The line holds more than one element and the status is its last's, which the program whose
+    /// name's fingerprint this is ran ([`name_fp`]; `0`: no program's name is known to be that
+    /// element's alone, so no run is known to have run it).
+    Last(u64),
+}
+
+impl StatusOf {
+    /// Whose status `fact`'s D carries: the line's only element's, or its last's, named by the
+    /// detail's program word only where that word is the last element's own and no earlier
+    /// element's: the detail reads that element, no earlier element may have run its program
+    /// ([`crate::session_status::LineShape::names_last`]), and it names the element's own program
+    /// ([`BlockFact::detail_final`]), not a stand-in, which is the first program the line's jobs
+    /// ran, and so may be an earlier element's (`vim notes; ll`, `ll` an alias, reads `vim`).
+    fn of(fact: &BlockFact) -> Self {
+        if fact.shape.elements <= 1 {
+            return Self::Line;
+        }
+        let program = fact
+            .detail
+            .as_deref()
+            .filter(|_| fact.shape.names_last() && fact.detail_final)
+            .and_then(crate::session_status::detail_program);
+        Self::Last(program.map_or(0, |word| name_fp(Some(word))))
+    }
+
+    /// Whether the run whose program's name has fingerprint `fp` ([`name_fp`]) ran the element
+    /// whose status this is.
+    const fn describes(self, fp: u64) -> bool {
+        match self {
+            Self::Line => true,
+            Self::Last(of) => of != 0 && of == fp,
+        }
+    }
+}
+
+/// THE STATUS A SHELL GIVES A JOB IT STOPPED (review RV2, E2-R1): bash and zsh report a
+/// foreground job a signal stopped (Ctrl-Z's `SIGTSTP`, `SIGSTOP`, `SIGTTIN`, `SIGTTOU`) as 128
+/// plus that signal's number, as they report one a signal ended, and return to the prompt, so the
+/// block's D carries it (zsh 5.9, bash 3.2 and bash 5.3 on macOS: 146 for Ctrl-Z, measured
+/// 2026-11-08). The job has not ended: it waits, stopped, for `fg` or `bg`. The numbers are
+/// Darwin's (17, 18, 21, 22) and Linux's (19, 20, 21, 22), as the shell may run on either (a
+/// remote one, over ssh); neither system ends a process by the other's (17 and 20 are Linux's and
+/// Darwin's `SIGCHLD`, 18 and 19 their `SIGCONT`, whose actions never end one), so past a stop
+/// only a program that exits with one of these codes itself reads so. The status alone cannot
+/// tell that exit from a stop, and aterm's integrations report no stop, though each shell's job
+/// table shows one at the prompt (bash's and zsh's `jobs -s`, zsh's `$jobstates`, fish's `jobs`).
+/// fish reports 0 for a stopped job, so, its job table unread, a job fish stopped reads as an
+/// exit 0.
+const fn stopped_status(code: i32) -> bool {
+    matches!(code, 145..=150)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -607,6 +672,9 @@ struct LeftFront {
     run: Node,
     kind: Kind,
     pgid: i32,
+    /// Its program's name's fingerprint ([`name_fp`]), which says whether its command's status
+    /// is its own ([`StatusOf::describes`]).
+    name_fp: u64,
     cmd: Node,
 }
 
@@ -754,9 +822,12 @@ impl SessionLog {
     }
 }
 
+/// A command's end by its status: a job the shell stopped ([`stopped_status`]) has not ended, so
+/// neither failed nor `ok` (`unknown`, its `code=` kept: no `failure` is raised for a Ctrl-Z).
 const fn run_out(code: Option<i32>) -> (RunOut, Conf) {
     match code {
         Some(0) => (RunOut::Ok, Conf::Exact),
+        Some(code) if stopped_status(code) => (RunOut::Unknown, Conf::Strong),
         Some(_) => (RunOut::Fail, Conf::Exact),
         None => (RunOut::Unknown, Conf::Strong),
     }
@@ -1286,7 +1357,7 @@ impl SessionLog {
                     let end = stamp_at_wall(at, done.ended_ms.unwrap_or(at.wall_ms));
                     self.cmd = None;
                     self.amend_detail(&mut c, fact, end);
-                    self.end_cmd(c, CmdEnd::Exit(done.exit_code), end);
+                    self.end_cmd(c, CmdEnd::Exit(done.exit_code, StatusOf::of(fact)), end);
                 }
                 (Some(mut c), BlockEnd::Unended { ended_ms }) => {
                     let end = stamp_at_wall(at, ended_ms.unwrap_or(at.wall_ms));
@@ -1398,7 +1469,7 @@ impl SessionLog {
                         child_end: None,
                         detailed: Detailed::of(fact),
                     };
-                    self.end_cmd(c, CmdEnd::Exit(done.exit_code), end);
+                    self.end_cmd(c, CmdEnd::Exit(done.exit_code, StatusOf::of(fact)), end);
                 }
             }
             BlockEnd::Unended { .. } => {}
@@ -1551,10 +1622,14 @@ impl SessionLog {
     /// `signal` with its asker while an end aterm asked of its group `pgid` stands; else, when it
     /// held the front until its command ended (`cmd`), that command's end, a failure read as
     /// `gone`, since the command alone carries `code=` and the one `failure` it raises (D3); else
-    /// the path's own word.
+    /// the path's own word. A command's end is the run's only where its status is the run's own
+    /// (review RV2): the status of the line's element the run's program, named `fp`
+    /// ([`name_fp`]), ran ([`StatusOf::describes`]), and an end, not the stop of a job the shell
+    /// stopped ([`stopped_status`]), which waits for its `fg`; past either the run keeps the
+    /// path's word.
     fn run_end(
         &self,
-        pgid: i32,
+        (pgid, fp): (i32, u64),
         default: RunOut,
         cmd: Option<CmdEnd>,
         at: Stamp,
@@ -1564,11 +1639,21 @@ impl SessionLog {
         }
         let out = match cmd {
             None => default,
-            Some(CmdEnd::Exit(Some(0))) => RunOut::Ok,
-            Some(CmdEnd::Exit(Some(_))) => RunOut::Gone,
-            Some(CmdEnd::Exit(None) | CmdEnd::Unknown) => RunOut::Unknown,
+            Some(CmdEnd::Exit(_, of)) if !of.describes(fp) => default,
+            Some(CmdEnd::Exit(Some(code), _)) if stopped_status(code) => default,
+            Some(CmdEnd::Exit(Some(0), _)) => RunOut::Ok,
+            Some(CmdEnd::Exit(Some(_), _)) => RunOut::Gone,
+            Some(CmdEnd::Exit(None, _) | CmdEnd::Unknown) => RunOut::Unknown,
         };
         (out, None)
+    }
+
+    /// The fingerprint of the name of agent run `a`'s program ([`name_fp`]): its group's front
+    /// run's, as the resolver named that group's leader, else the reader's own name for it.
+    fn agent_fp(&self, a: &AgentRun) -> u64 {
+        self.fg
+            .filter(|f| f.pgid == a.pgid)
+            .map_or_else(|| name_fp(Some(a.who.name())), |f| f.name_fp)
     }
 
     /// The runs that left the front for the shell before `cmd`'s D take its end now, `how`
@@ -1577,7 +1662,7 @@ impl SessionLog {
     fn amend_left_front(&mut self, cmd: Node, how: CmdEnd, at: Stamp) {
         let left = std::mem::take(&mut self.left_front);
         for l in left.iter().filter(|l| l.cmd == cmd) {
-            let (out, by) = self.run_end(l.pgid, RunOut::Unknown, Some(how), at);
+            let (out, by) = self.run_end((l.pgid, l.name_fp), RunOut::Unknown, Some(how), at);
             if out == RunOut::Unknown {
                 continue;
             }
@@ -1594,7 +1679,7 @@ impl SessionLog {
 
     fn close_cmd(&mut self, node: Node, how: CmdEnd, wall_ms: Option<u64>, at: Stamp) {
         let (mut out, mut conf, code) = match how {
-            CmdEnd::Exit(code) => {
+            CmdEnd::Exit(code, _) => {
                 let (out, conf) = run_out(code);
                 (out, conf, code)
             }
@@ -1784,26 +1869,27 @@ impl SessionLog {
         let cmd = self.cmd.filter(|_| to_shell);
         let mut left = Vec::new();
         if let Some(a) = self.agent.as_ref().filter(|a| a.pgid != pgid) {
-            left.extend(self.leaving_front(a.node, a.pgid, cmd, at));
+            left.extend(self.leaving_front(a.node, (a.pgid, self.agent_fp(a)), cmd, at));
             self.close_agent(None, at);
         }
         if let Some(fg) = self.fg.filter(|f| f.pgid != pgid) {
-            left.extend(self.leaving_front(fg.node, fg.pgid, cmd, at));
+            left.extend(self.leaving_front(fg.node, (fg.pgid, fg.name_fp), cmd, at));
             self.close_front_run(fg, None, at);
             self.fg = None;
         }
         self.keep_left_front(left);
     }
 
-    /// A RUN CLOSES BEFORE ITS COMMAND'S END IS READ: run `node` of group `pgid` is about to close
-    /// `unknown` on a path that is not that end (the front back at the shell, its group's leader
-    /// no longer named, the screen no longer showing its agent). Read before the close: it is
-    /// kept for `cmd`'s end to amend ([`Self::amend_left_front`]) when it descends from `cmd`
-    /// and no end aterm asked of its group stands (that close is `signal` already).
+    /// A RUN CLOSES BEFORE ITS COMMAND'S END IS READ: run `node` of group `pgid`, its program
+    /// named `name_fp` ([`name_fp`]), is about to close `unknown` on a path that is not that end
+    /// (the front back at the shell, its group's leader no longer named, the screen no longer
+    /// showing its agent). Read before the close: it is kept for `cmd`'s end to amend
+    /// ([`Self::amend_left_front`]) when it descends from `cmd` and no end aterm asked of its group
+    /// stands (that close is `signal` already).
     fn leaving_front(
         &self,
         node: Node,
-        pgid: i32,
+        (pgid, name_fp): (i32, u64),
         cmd: Option<CmdRun>,
         at: Stamp,
     ) -> Option<LeftFront> {
@@ -1815,6 +1901,7 @@ impl SessionLog {
                 run: node,
                 kind,
                 pgid,
+                name_fp,
                 cmd: c.node,
             })
     }
@@ -2011,7 +2098,7 @@ impl SessionLog {
                 // front back, or a pipeline's leader went first): its run ends as one that left
                 // the front does ([`Self::foreground_moved`]), on the ask that stands for its
                 // group or, kept, on its command's end.
-                let left = self.leaving_front(fg.node, fg.pgid, under, at);
+                let left = self.leaving_front(fg.node, (fg.pgid, fg.name_fp), under, at);
                 self.close_front_run(fg, None, at);
                 self.keep_left_front(left);
             }
@@ -2130,7 +2217,8 @@ impl SessionLog {
             // The named agent's run is the front run: closing it is the
             // front run's to do (`foreground_moved`).
             if self.fg.is_none_or(|f| f.node != a.node) {
-                let (out, by) = self.run_end(a.pgid, RunOut::Unknown, cmd, at);
+                let fp = self.agent_fp(&a);
+                let (out, by) = self.run_end((a.pgid, fp), RunOut::Unknown, cmd, at);
                 self.close_run(a.node, out, by, at);
             }
         }
@@ -2139,7 +2227,7 @@ impl SessionLog {
     /// The front run `fg` ends at `at`, its command's end `cmd` when it held the front until
     /// then ([`Self::run_end`]).
     fn close_front_run(&mut self, fg: FgRun, cmd: Option<CmdEnd>, at: Stamp) {
-        let (out, by) = self.run_end(fg.pgid, RunOut::Unknown, cmd, at);
+        let (out, by) = self.run_end((fg.pgid, fg.name_fp), RunOut::Unknown, cmd, at);
         self.close_run(fg.node, out, by, at);
     }
 
@@ -2222,7 +2310,7 @@ impl SessionLog {
             let left = self
                 .agent
                 .as_ref()
-                .and_then(|a| self.leaving_front(a.node, a.pgid, self.cmd, at));
+                .and_then(|a| self.leaving_front(a.node, (a.pgid, self.agent_fp(a)), self.cmd, at));
             self.close_agent(None, at);
             self.keep_left_front(left);
             return None;

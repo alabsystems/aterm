@@ -520,6 +520,61 @@ fn pressure_and_claimed_shortages_never_earn_the_serial_escape() {
         drop(holder);
     }
 }
+
+/// A parent its own look names STUCK (no claim's end it can wait for brings what it lacks) earns
+/// the serial escape under normal pressure though claims hold memory beside it: builds that fit
+/// go first past a stuck parent and are held, and a stream of them must not keep resetting its
+/// patience bound (ATERM-KI-1111-25). NEGATIVE CONTROLS: the same holder with a shortage its end
+/// may bring, and a stuck parent under pressure, earn none; a parent with no holder and nothing
+/// reserved earns it as before.
+#[test]
+fn a_stuck_parent_earns_the_serial_escape_beside_claims_that_went_first() {
+    use aterm_capacity::{Holder, Reading, Short, Shortfall};
+    use aterm_sysprobe::MemoryLevel;
+    const GIB: u64 = 1 << 30;
+    let went_first = Holder {
+        pid: 4242,
+        what: "test build".to_owned(),
+        checkout: String::new(),
+        held: true,
+        age: std::time::Duration::from_secs(60),
+        mem: 0,
+        claimed: 3 * GIB,
+        alone: false,
+        disk: 0,
+        quiet: false,
+        order: (2, 4242, 0),
+        stalled: None,
+        credit: Vec::new(),
+        overrun: None,
+    };
+    let short = |stuck: bool, holders: Vec<Holder>| Shortfall {
+        shorts: vec![Short::Memory {
+            need: 42 * GIB,
+            margin: 1,
+            available: 32 * GIB,
+            reserved: 0,
+            passes: None,
+            stuck_ahead: 0,
+            stuck,
+        }],
+        holders,
+    };
+    let mut normal = Reading::of_gib(128, 32, 18);
+    normal.pressure = Some(MemoryLevel::Normal);
+    let mut warn = normal.clone();
+    warn.pressure = Some(MemoryLevel::Warn);
+    assert!(super::serial_escape(
+        &short(true, vec![went_first.clone()]),
+        &normal
+    ));
+    assert!(!super::serial_escape(
+        &short(false, vec![went_first.clone()]),
+        &normal
+    ));
+    assert!(!super::serial_escape(&short(true, vec![went_first]), &warn));
+    assert!(super::serial_escape(&short(false, Vec::new()), &normal));
+}
 #[test]
 fn wrapped_compilers_keep_cargos_stdout_in_the_run_before_the_driver_finishes() {
     use std::io::Write as _;

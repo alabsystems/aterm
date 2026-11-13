@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use std::os::fd::IntoRawFd;
 use std::time::{Duration, Instant};
 
 fn run_to_zombie(script: &str) -> i32 {
@@ -374,9 +375,9 @@ fn a_shell_that_ends_at_start_keeps_its_pane_whoever_reads_the_status() {
 fn a_shell_that_got_input_closes_as_before_even_on_exit_1() {
     let at = Instant::now();
     let pid = run_to_zombie("exit 1");
-    let mut fds = [0; 2];
-    // SAFETY: a fresh two-slot out-param for `pipe(2)`.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let fds = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(fds[1]));
     let (mut app, wid, id) = app_with_sink(pid, started("zsh", at), eof_at_start(at), sink.clone());
     sink.write_frame(b"\x04")
@@ -399,9 +400,9 @@ fn a_shell_that_got_input_closes_as_before_even_on_exit_1() {
 fn a_shell_that_was_only_answered_keeps_its_pane() {
     let at = Instant::now();
     let pid = run_to_zombie("exit 1");
-    let mut fds = [0; 2];
-    // SAFETY: a fresh two-slot out-param for `pipe(2)`.
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let fds = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let sink = std::sync::Arc::new(aterm_session::sink::SinkWriter::new(fds[1]));
     let (mut app, wid, id) =
         app_with_sink(pid, started("fish", at), eof_at_start(at), sink.clone());

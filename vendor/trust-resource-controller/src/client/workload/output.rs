@@ -54,7 +54,9 @@ impl WorkloadControl {
     /// every guard was switched to close-only BEFORE any duplicate/SCM offer.
     /// These borrowed descriptions come directly from that capsule, not opens,
     /// paths, saved records, generic files or another worktree. No compiler was
-    /// dispatched; all earlier query loans retired. No guard is omitted or
+    /// dispatched for legacy40/60. Distinct native49/v3 may add another declared
+    /// output only after all earlier actual member/phase/loan owners retired.
+    /// All earlier query loans retired. No guard is omitted or
     /// truncated to satisfy MAX_LOCKS. The caller retains the same capsule
     /// through actual compilation/actions, and Host retains received originals
     /// independently through real root/cohort settlement. No re-lock is allowed.
@@ -68,13 +70,19 @@ impl WorkloadControl {
             || self.drained
             || self.pending.is_some()
             || self.active_phase.is_some()
-            || self.output_locks.is_some()
+            || (self.native_outputs.is_none() && self.output_locks.is_some())
+            || self.native_outputs.as_ref().is_some_and(|roots| {
+                !roots.contains(&request.output_root)
+                    || self.retained_outputs.contains_key(&request.output_root)
+            })
             || request.key.root_attempt != self.root_attempt
             || request.key.invocation_sha256 != self.invocation_sha256
         {
             return Err(WorkloadControlError::BeforeRequest(refused()));
         }
-        let payload = request.encode().map_err(WorkloadControlError::BeforeRequest)?;
+        let payload = request
+            .encode()
+            .map_err(WorkloadControlError::BeforeRequest)?;
         originals(request, descriptions).map_err(WorkloadControlError::BeforeRequest)?;
         let result = (|| {
             self.host.validate(deadline)?;
@@ -95,9 +103,81 @@ impl WorkloadControl {
         match result {
             Ok(Reply::Retained { .. }) => {
                 self.output_locks = Some(request.clone());
-                Ok(RetainedOutputLocks { request: request.clone() })
+                if self.native_outputs.is_some() {
+                    self.retained_outputs
+                        .insert(request.output_root.clone(), request.clone());
+                }
+                Ok(RetainedOutputLocks {
+                    request: request.clone(),
+                })
             }
             Ok(Reply::Refused { reason, .. }) => Err(WorkloadControlError::Refused { reason }),
+            Err(error) => {
+                self.failed = true;
+                Err(WorkloadControlError::Unknown(error))
+            }
+        }
+    }
+    /// Select only a genuine retained original receipt in the SAME distinct
+    /// native startup. The actual broker/Host must positively drain the current
+    /// bank, phase and member owners before calling; this never acquires locks.
+    pub fn select_output_locks(
+        &mut self,
+        retained: &RetainedOutputLocks,
+        attempt: [u8; 16],
+        deadline: Instant,
+    ) -> Result<(), WorkloadControlError> {
+        let request = &retained.request;
+        let before = (|| -> io::Result<_> {
+            if self.failed
+                || self.drained
+                || self.pending.is_some()
+                || self.active_phase.is_some()
+                || self.local_active.is_some()
+                || self
+                    .native_outputs
+                    .as_ref()
+                    .is_none_or(|roots| !roots.contains(&request.output_root))
+                || self.retained_outputs.get(&request.output_root) != Some(request)
+                || request.key.root_attempt != self.root_attempt
+                || request.key.invocation_sha256 != self.invocation_sha256
+            {
+                return Err(refused());
+            }
+            let selection = output::Selection {
+                retained: request.clone(),
+                sequence: self
+                    .last_output_selection
+                    .checked_add(1)
+                    .ok_or_else(refused)?,
+                attempt,
+            };
+            let bytes = selection.encode()?;
+            Ok((selection, bytes))
+        })()
+        .map_err(WorkloadControlError::BeforeRequest)?;
+        let (selection, bytes) = before;
+        let received = (|| -> io::Result<_> {
+            self.host.validate(deadline)?;
+            self.channel.send(&bytes, deadline)?;
+            let reply =
+                output::SelectionReply::decode(&self.channel.receive(deadline)?, &selection)?;
+            self.host.validate(deadline)?;
+            Ok(reply)
+        })();
+        match received {
+            Ok(reply) => {
+                self.last_output_selection = selection.sequence;
+                match reply.decision {
+                    output::SelectionDecision::Selected => {
+                        self.output_locks = Some(request.clone());
+                        Ok(())
+                    }
+                    output::SelectionDecision::Refused { reason } => {
+                        Err(WorkloadControlError::Refused { reason })
+                    }
+                }
+            }
             Err(error) => {
                 self.failed = true;
                 Err(WorkloadControlError::Unknown(error))

@@ -669,8 +669,8 @@ pub(crate) fn alab_tcp() -> Option<Arc<aterm_secrets::discover::Watch>> {
     ALAB_TCP.get().cloned()
 }
 
-/// How long after a browse connection ended another starts.
-#[cfg(all(not(test), target_os = "macos"))]
+/// The retry after a browse connection ends with no new broker generation heard.
+#[cfg(target_os = "macos")]
 const BROWSE_AGAIN: Duration = Duration::from_secs(60);
 
 /// How long the browse, waiting for sharing to be on ([`keep_browse`]), waits before it looks
@@ -678,9 +678,9 @@ const BROWSE_AGAIN: Duration = Duration::from_secs(60);
 #[cfg(all(not(test), target_os = "macos"))]
 const OFF_LOOK: Duration = Duration::from_secs(10);
 
-/// How often a running browse looks at `[swarm] enabled` while it hears nothing
+/// How often a running or retrying browse looks at `[swarm] enabled` while it hears nothing
 /// ([`aterm_uds::lan::Events::next_within`]): one `stat` ([`aterm_secrets::swarm::Switch`]).
-#[cfg(all(not(test), target_os = "macos"))]
+#[cfg(target_os = "macos")]
 const SHARING_LOOK: Duration = Duration::from_secs(5);
 
 /// What the browse's keeper says in aterm.log once per change ([`keep_browse`]).
@@ -739,6 +739,7 @@ fn keep_browse(
 fn hear_browse(watch: &Arc<aterm_secrets::discover::Watch>, moved: &Arc<Moved>) {
     let watch = Arc::clone(watch);
     let mut step = moved.watch();
+    let mut arrivals = aterm_uds::lan::Arrivals::new();
     let spawned = std::thread::Builder::new()
         .name("aterm-moved-bonjour".to_owned())
         .spawn(move || {
@@ -756,7 +757,12 @@ fn hear_browse(watch: &Arc<aterm_secrets::discover::Watch>, moved: &Arc<Moved>) 
                     let _ = step.wait(OFF_LOOK);
                 },
                 |sharing| {
-                    browse_until_off(aterm_agent::node_service::ALAB_TCP_SERVICE, &watch, sharing);
+                    browse_until_off(
+                        aterm_agent::node_service::ALAB_TCP_SERVICE,
+                        &watch,
+                        sharing,
+                        &mut arrivals,
+                    );
                     true
                 },
                 |line| aterm_log::info!("{line}"),
@@ -768,24 +774,24 @@ fn hear_browse(watch: &Arc<aterm_secrets::discover::Watch>, moved: &Arc<Moved>) 
 }
 
 /// Browse `service` on `local.` through the root LAN broker while `sharing` stays on, each event
-/// reaching `watch` ([`aterm_secrets::discover::Watch::hear`]), a fresh request [`BROWSE_AGAIN`]
-/// after one that failed or found no broker (its words, the broker's, said once); it returns once
-/// sharing is off (looked at each [`SHARING_LOOK`] the browse hears nothing, and before each
-/// event).
+/// reaching `watch` ([`aterm_secrets::discover::Watch::hear`]), a fresh request when a new broker
+/// generation answers or [`BROWSE_AGAIN`] after one failed (its words, the broker's, said once).
+/// It returns once sharing is off (looked at each [`SHARING_LOOK`] the browse hears nothing,
+/// and before each event).
 #[cfg(all(not(test), target_os = "macos"))]
 fn browse_until_off(
     service: &str,
     watch: &aterm_secrets::discover::Watch,
     sharing: &mut dyn FnMut() -> bool,
+    arrivals: &mut aterm_uds::lan::Arrivals,
 ) {
     use aterm_uds::lan::Event;
-    let mut said = false;
-    while sharing() {
+    browse_until_off_with(sharing, arrivals, BROWSE_AGAIN, |sharing| {
         watch.began_browse();
-        let ended = match aterm_uds::lan::browse(service, "local.") {
+        match aterm_uds::lan::browse(service, "local.") {
             Ok(mut events) => loop {
                 if !sharing() {
-                    return;
+                    return Ok(());
                 }
                 match events.next_within(SHARING_LOOK) {
                     Ok(None) => {}
@@ -796,16 +802,73 @@ fn browse_until_off(
                         watch.hear(false, instance.interface, &instance.name);
                     }
                     Ok(Some(_)) => {}
-                    Err(error) => break error,
+                    Err(error) => break Err(error),
                 }
             },
-            Err(error) => error,
-        };
+            Err(error) => Err(error),
+        }
+    });
+}
+
+/// The ordinary browse retry is interruptible by a checked broker generation. Arm before
+/// each attempt, so an install or replacement during that attempt remains owed to the wait.
+#[cfg(target_os = "macos")]
+fn browse_until_off_with(
+    sharing: &mut dyn FnMut() -> bool,
+    arrivals: &mut aterm_uds::lan::Arrivals,
+    retry: Duration,
+    mut browse: impl FnMut(&mut dyn FnMut() -> bool) -> Result<(), aterm_uds::lan::LanError>,
+) {
+    let mut said = false;
+    while sharing() {
+        let _ = arrivals.poll();
+        if !sharing() {
+            return;
+        }
+        let Err(ended) = browse(sharing) else { return };
         if !said {
             said = true;
             aterm_log::warn!("network moved: the _alab._tcp browse ended: {ended}");
         }
-        std::thread::sleep(BROWSE_AGAIN);
+        wait_for_browse_retry(arrivals, sharing, retry);
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_browse_retry(
+    arrivals: &mut aterm_uds::lan::Arrivals,
+    sharing: &mut dyn FnMut() -> bool,
+    retry: Duration,
+) {
+    let deadline = Instant::now() + retry;
+    while sharing() {
+        // Only a new, checked generation ends the ordinary retry. A false reading says
+        // nothing about an already answered generation; failed watches keep the timed retry.
+        let watched = match arrivals.poll() {
+            Ok(true) => return,
+            Ok(false) => true,
+            Err(_) => false,
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        let pause = if watched {
+            arrivals.wait_for(left)
+        } else {
+            left
+        }
+        .min(SHARING_LOOK);
+        let until = Instant::now() + pause;
+        if let Some(fd) = watched.then(|| arrivals.watch_fd()).flatten()
+            && aterm_uds::ready::any_until(&[fd], until).is_ok()
+        {
+            continue;
+        }
+        // Missing/failed descriptors must not turn the error path into a busy loop.
+        if let Some(left) = until.checked_duration_since(Instant::now()) {
+            std::thread::sleep(left);
+        }
     }
 }
 

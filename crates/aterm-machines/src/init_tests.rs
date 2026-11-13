@@ -8580,6 +8580,81 @@ fn a_terminal_runs_admitted_sign_outs_without_a_presence_gate() {
     );
 }
 
+/// A sign-out that stands aside waiting with its second field's words, clicking nothing
+/// ([`crate::init_accounts::waits_for_the_person`]).
+struct StoodAsideWith(String, String);
+
+impl Item for StoodAsideWith {
+    fn id(&self) -> String {
+        self.0.clone()
+    }
+    fn family(&self) -> &'static str {
+        "init.messages"
+    }
+    fn title(&self) -> String {
+        self.0.clone()
+    }
+    fn probe(&self, _: &dyn System, _: &Ctx) -> Probe {
+        change()
+    }
+    fn apply(&self, _: &dyn System, _: &Ctx) -> Result<(), String> {
+        Ok(())
+    }
+    fn revert(&self) -> Option<String> {
+        None
+    }
+    fn stood_aside(&self) -> Option<aterm_converge::StoodAside> {
+        Some(aterm_converge::StoodAside::Waiting(self.1.clone()))
+    }
+}
+
+/// The run's sign-out rows where each sign-out stands aside waiting with `why`.
+fn sign_outs_waiting_with(why: &str) -> Vec<ItemReport> {
+    let mut sys = alice_at(501);
+    sys.terminal = true;
+    sys.agent = None;
+    let prepare = |_: &dyn System, ctx: &Ctx, _: Mode, _: &Reading<'_>| {
+        let items: Vec<Box<dyn Item>> = crate::init_accounts::items(ctx)
+            .unwrap()
+            .into_iter()
+            .map(|item| Box::new(StoodAsideWith(item.id(), why.to_string())) as Box<dyn Item>)
+            .collect();
+        Ok((vec![(items, place(Class::Preference))], Picked::ALL))
+    };
+    let (rows, _) = converge_held(&sys, &Options::default(), &prepare, &NoRecords, &|| true);
+    rows.unwrap()
+        .into_iter()
+        .filter(|row| crate::init_accounts::signs_out(&row.id))
+        .collect()
+}
+
+/// A SIGN-OUT THAT WAITS FOR THE PERSON IS NO FAILURE AND SAYS WHY (owner ruling
+/// 2026-11-09): one a coding agent's run reached, and one whose tab was not in front, are
+/// deferred to the person in words that say so and name their way on. NEGATIVE CONTROL: a sign-out waiting on anything else keeps its own outcome.
+#[test]
+fn a_sign_out_an_agent_reached_or_behind_another_tab_is_deferred_to_the_person() {
+    for (why, words) in [
+        (crate::init_accounts::agents_run(), AN_AGENTS_RUN),
+        (crate::init_accounts::tab_behind(), TAB_NOT_IN_FRONT),
+    ] {
+        let rows = sign_outs_waiting_with(&why);
+        assert!(!rows.is_empty());
+        assert!(
+            rows.iter().all(|row| row.outcome == Outcome::Deferred
+                && row.why.as_deref() == Some(words)
+                && waits_for_a_person(row)),
+            "{why}: {rows:#?}"
+        );
+    }
+    let rows = sign_outs_waiting_with("another macOS dialog is still up");
+    assert!(!rows.is_empty());
+    assert!(
+        rows.iter()
+            .all(|row| !waits_for_a_person(row) && !is_a_sign_out_wait(row.why.as_deref())),
+        "control: {rows:#?}"
+    );
+}
+
 /// [`naming`] promises the narrowest run that sets one group up and nothing else, and the
 /// held line offers it to turn one group back on: on an ALab Mac the Dock's way back sets
 /// the Dock alone, not the Widgets the person also left as is (`--profile` set both).

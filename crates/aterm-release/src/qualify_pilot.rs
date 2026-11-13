@@ -24,6 +24,65 @@ pub(crate) struct Options {
     warm_slices: bool,
     cold_tree: bool,
     build_return: BuildReturn,
+    queued_tree_share: QueuedTreeShare,
+    cores: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum QueuedTreeShare {
+    Retained,
+    Resume,
+    #[default]
+    Lend,
+    Matched,
+    LendingMatched,
+    Compare,
+    LendingCompare,
+}
+
+impl QueuedTreeShare {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Retained => "retained",
+            Self::Resume => "resume",
+            Self::Lend => "lend",
+            Self::Matched => "matched",
+            Self::LendingMatched => "lend-matched",
+            Self::Compare => "compare",
+            Self::LendingCompare => "lend-compare",
+        }
+    }
+
+    fn for_take(self, take: &str) -> Self {
+        if self == Self::Compare {
+            match take {
+                "before" | "current" | "warmup" => Self::Retained,
+                "resumed" => Self::Resume,
+                _ => unreachable!("comparison requires a named policy take"),
+            }
+        } else if self == Self::LendingCompare {
+            match take {
+                "before" | "warmup" => Self::Retained,
+                "current" => Self::Resume,
+                "lent" => Self::Lend,
+                _ => unreachable!("lending comparison requires a named policy take"),
+            }
+        } else if self == Self::LendingMatched {
+            match take {
+                "before" | "warmup" => Self::Resume,
+                "after" => Self::Lend,
+                _ => unreachable!("matched lending requires a named policy take"),
+            }
+        } else if self == Self::Matched {
+            match take {
+                "before" | "warmup" => Self::Retained,
+                "after" => Self::Resume,
+                _ => unreachable!("matched queued-tree shares require a named take"),
+            }
+        } else {
+            self
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -234,9 +293,42 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
     let mut warm_slices = None;
     let mut cold_tree = None;
     let mut build_return = None;
+    let mut queued_tree_share = None;
+    let mut cores = None;
     while let Some(flag) = args.next() {
         let value = args.next().ok_or_else(|| format!("{flag} needs a value"))?;
         match flag.as_str() {
+            "--queued-tree-share"
+                if queued_tree_share.is_none()
+                    && matches!(
+                        value.as_str(),
+                        "retained"
+                            | "resume"
+                            | "lend"
+                            | "matched"
+                            | "lend-matched"
+                            | "compare"
+                            | "lend-compare"
+                    ) =>
+            {
+                queued_tree_share = Some(match value.as_str() {
+                    "retained" => QueuedTreeShare::Retained,
+                    "resume" => QueuedTreeShare::Resume,
+                    "lend" => QueuedTreeShare::Lend,
+                    "matched" => QueuedTreeShare::Matched,
+                    "lend-matched" => QueuedTreeShare::LendingMatched,
+                    "lend-compare" => QueuedTreeShare::LendingCompare,
+                    _ => QueuedTreeShare::Compare,
+                });
+            }
+            "--cores" if cores.is_none() => {
+                let count = value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|count| *count > 0)
+                    .ok_or("--cores needs a positive core count")?;
+                cores = Some(count);
+            }
             "--build-return"
                 if build_return.is_none()
                     && matches!(value.as_str(), "early" | "retained" | "matched") =>
@@ -307,9 +399,28 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
         warm_slices: warm_slices.unwrap_or(real_export),
         cold_tree: cold_tree.unwrap_or(false),
         build_return: build_return.unwrap_or_default(),
+        queued_tree_share: queued_tree_share.unwrap_or_default(),
+        cores,
     };
     if matches!(options.mode.as_str(), "series" | "matched") != options.before.is_some() {
         return Err("series and matched require --before-verify PATH".into());
+    }
+    if matches!(
+        options.queued_tree_share,
+        QueuedTreeShare::Matched | QueuedTreeShare::LendingMatched
+    ) && (options.mode != "matched" || options.before.as_ref() != Some(&options.verify))
+    {
+        return Err(
+            "matched queued-tree shares require --mode matched and the same verifier in both arms"
+                .into(),
+        );
+    }
+    if matches!(
+        options.queued_tree_share,
+        QueuedTreeShare::Compare | QueuedTreeShare::LendingCompare
+    ) && (options.mode != "matched" || options.build_return != BuildReturn::Early)
+    {
+        return Err("queued-tree comparison requires matched mode and early build return".into());
     }
     if options.build_return == BuildReturn::Matched && options.mode != "matched" {
         return Err("matched build returns require --mode matched".into());
@@ -348,10 +459,18 @@ pub(crate) fn parse(args: impl Iterator<Item = String>) -> Result<Options, Strin
 }
 
 impl Options {
-    /// Calibration uses the same held grant as the following ABBA. Its complete green
+    /// Calibration uses the same held grant as the following interleaved takes. Its green
     /// control run learns that width's memory peak before either measured arm starts.
     fn order(&self) -> Vec<&str> {
-        let mut takes = order(&self.mode);
+        let mut takes = if self.queued_tree_share == QueuedTreeShare::LendingCompare {
+            vec!["before", "current", "lent", "lent", "current", "before"]
+        } else if self.queued_tree_share == QueuedTreeShare::Compare {
+            vec![
+                "before", "current", "resumed", "resumed", "current", "before",
+            ]
+        } else {
+            order(&self.mode)
+        };
         if self.warmup {
             takes.insert(0, "warmup");
         }
@@ -385,7 +504,29 @@ impl Options {
             warm_slices: self.warm_slices,
             cold_tree: self.cold_tree,
             build_return: self.build_return.for_take(mode),
+            queued_tree_share: self.queued_tree_share.for_take(mode),
+            cores: self.cores,
         })
+    }
+
+    fn requested_cores(&self, host: u32) -> Result<u32, String> {
+        let requested = self.cores.unwrap_or(host);
+        if requested > host {
+            return Err(format!(
+                "requested {requested} cores on a {host}-core host; no take started"
+            ));
+        }
+        Ok(requested)
+    }
+
+    fn require_grant(&self, requested: u32, granted: u32) -> Result<(), String> {
+        require_series_grant(&self.mode, requested, granted)?;
+        if self.cores.is_some() && requested != granted {
+            return Err(format!(
+                "requested a fixed {requested}-core pool, got {granted}; no take started"
+            ));
+        }
+        Ok(())
     }
 
     fn export_seconds(&self) -> Option<u64> {
@@ -1200,10 +1341,11 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     std::fs::create_dir(&root)
         .map_err(|e| format!("create unique pilot (existing evidence retained): {e}"))?;
+    let requested_cores = opts.requested_cores(aterm_capacity::cores())?;
     let claim = aterm_capacity::admit(
         aterm_capacity::Need::new("qualify-pilot core pool")
             .rank(aterm_capacity::Rank::Release)
-            .cores(aterm_capacity::cores())
+            .cores(requested_cores)
             .disk(200 << 30, &root)
             .scratch(),
         aterm_capacity::Admit::Wait,
@@ -1226,7 +1368,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
     crate::durable::write_fresh(&root.join("admission.json"), admission.to_string())
         .map_err(|e| e.to_string())?;
     eprintln!("qualify-pilot-admission: {admission}");
-    require_series_grant(&opts.mode, aterm_capacity::cores(), claim.cores())?;
+    opts.require_grant(requested_cores, claim.cores())?;
     let modes = opts.order();
     let history = aterm_types::dirs::account_state_dir()
         .map(|root| {
@@ -1247,6 +1389,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
             "source":commit.trim(), "arm":mode, "measured":*mode != "warmup",
             "slots":claim.cores(), "verify":options.verify,
             "planted_red":options.planted_red, "build_return":options.build_return.as_str(),
+            "queued_tree_share":options.queued_tree_share.as_str(),
         });
         crate::durable::write_fresh(&at.join("take.json"), take.to_string())
             .map_err(|error| error.to_string())?;
@@ -1276,6 +1419,7 @@ pub(crate) fn run(repo: &Path, opts: &Options) -> Result<(), String> {
                 .real_export
                 .then(|| {
                     let mut environment = crate::release_steps::verify_environment();
+                    isolate_side_lanes(&at, &mut environment)?;
                     if opts.cold_tree {
                         environment.cargo_target_dir = Some(cold_tree_target(repo)?);
                     }
@@ -1325,6 +1469,27 @@ fn apply_real_tree_environment(
 ) {
     environment.apply_cargo_selectors(command);
     command.env("HOME", &environment.home);
+    command.env_remove(aterm_verify::SIDE_LANES_ENV);
+    if let Some(dir) = &environment.side_lanes_dir {
+        command.env(aterm_verify::SIDE_LANES_ENV, dir);
+    }
+}
+
+/// Cold side targets need no authority to delete a previous build or its live mappings.
+/// The native target stays fixed so its actual Cargo freshness can be compared.
+fn isolate_side_lanes(
+    at: &Path,
+    environment: &mut aterm_verify::EnvSnapshot,
+) -> Result<(), String> {
+    let side = at.join("tree-lanes.noindex");
+    std::fs::create_dir(&side).map_err(|error| {
+        format!(
+            "create fresh verification side targets {}: {error}",
+            side.display()
+        )
+    })?;
+    environment.side_lanes_dir = Some(side);
+    Ok(())
 }
 
 fn cold_tree_target(repo: &Path) -> Result<PathBuf, String> {
@@ -1416,10 +1581,16 @@ fn prepare_real_tree(
     }
     let lint = aterm_verify::plan::lane_dir(&ctx, aterm_verify::plan::Lane::TippyTarget)
         .ok_or("the full tree has no lint lane")?;
-    if lint.exists()
-        && !atpkg::build_cache::remove_unbuilt(&lint).map_err(|error| error.to_string())?
-    {
-        return Err("the owned lint lane is in use; no matched take started".into());
+    if environment.side_lanes_dir.is_some() {
+        if lint.exists() {
+            return Err(
+                "the selected cold lint target already exists; no matched take started".into(),
+            );
+        }
+    } else if lint.exists() {
+        return Err(
+            "real measurements require fresh isolated side targets; no matched take started".into(),
+        );
     }
     let index = ctx.target_dir.join("verify/test-executables.json");
     match std::fs::remove_file(index) {
@@ -1442,9 +1613,15 @@ fn frozen_arguments(opts: &Options, verify: &Path) -> Vec<OsString> {
         opts.tree_work.as_str().into(),
         "--build-return".into(),
         opts.build_return.as_str().into(),
+        "--queued-tree-share".into(),
+        opts.queued_tree_share.as_str().into(),
     ];
     if let Some(before) = &opts.before {
-        let before = if opts.build_return == BuildReturn::Matched {
+        let before = if opts.build_return == BuildReturn::Matched
+            || matches!(
+                opts.queued_tree_share,
+                QueuedTreeShare::Matched | QueuedTreeShare::LendingMatched
+            ) {
             verify
         } else {
             before
@@ -1468,6 +1645,9 @@ fn frozen_arguments(opts: &Options, verify: &Path) -> Vec<OsString> {
     ]);
     if let Some(seconds) = opts.export_seconds {
         args.extend(["--export-seconds".into(), seconds.to_string().into()]);
+    }
+    if let Some(cores) = opts.cores {
+        args.extend(["--cores".into(), cores.to_string().into()]);
     }
     args
 }
@@ -1770,6 +1950,11 @@ fn matching_tree_claim(
     outcome
 }
 
+struct TreeMemoryReady {
+    report: aterm_json::Value,
+    shared: Option<crate::release_steps::SharedTreeMemory>,
+}
+
 /// Wait until the verifier has durably requested lint memory, while the build's slice parent is
 /// already held and every compile-capable jobserver token is still behind the pilot's barrier.
 /// A held request opens the concurrent schedule. An exact queued request opens production's
@@ -1781,7 +1966,7 @@ fn await_tree_memory(
     tree_pid: u32,
     ended: &std::sync::atomic::AtomicBool,
     barrier_slots: u32,
-) -> Result<aterm_json::Value, String> {
+) -> Result<TreeMemoryReady, String> {
     let ledger = aterm_capacity::Ledger::user().ok_or("no user capacity ledger")?;
     let shapes = tippy_claim_shapes()?;
     let waiting = Instant::now();
@@ -1805,7 +1990,9 @@ fn await_tree_memory(
                 let held = state == crate::release_steps::TreeLintClaim::Held;
                 let queued = state == crate::release_steps::TreeLintClaim::Waiting;
                 let invalid = state == crate::release_steps::TreeLintClaim::Invalid;
-                return Ok(aterm_json::json!({
+                return Ok(TreeMemoryReady {
+                    shared: crate::release_steps::SharedTreeMemory::new(&claim, state),
+                    report: aterm_json::json!({
                     "event":"tree-memory-ready",
                     "held":held,
                     "queued":queued,
@@ -1817,7 +2004,8 @@ fn await_tree_memory(
                     "tree_pid":tree_pid,
                     "barrier_slots":barrier_slots,
                     "waiting_s":waiting.elapsed().as_secs_f64(),
-                }));
+                    }),
+                });
             }
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -1960,6 +2148,7 @@ fn one(
         graph_wall_s,
         memory_ready,
         tree_memory_ready,
+        tree_cpu_transfers,
         build_usage,
         appkit,
     ) = std::thread::scope(|scope| -> Result<_, String> {
@@ -2111,14 +2300,17 @@ fn one(
                     .map_err(|_| "release tree ended before reporting its process".to_owned())
             },
         )?;
-        let tree_memory_ready = if barrier_slots > 0 {
+        let (tree_memory_ready, shared_tree) = if barrier_slots > 0 {
             let tree_pid = match old_order_tree_pid {
                 Some(pid) => pid,
                 None => tree_pid
                     .recv()
                     .map_err(|_| "release tree ended before reporting its process".to_owned())?,
             };
-            let ready = await_tree_memory(tree_pid, &tree_ended, barrier_slots)?;
+            let TreeMemoryReady {
+                report: ready,
+                shared,
+            } = await_tree_memory(tree_pid, &tree_ended, barrier_slots)?;
             if ready["queued"].as_bool() == Some(true) || ready["invalid"].as_bool() == Some(true) {
                 if let Some(reservation) = barrier
                     .lock()
@@ -2138,14 +2330,17 @@ fn one(
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .take();
             }
-            ready
+            (ready, shared)
         } else {
-            aterm_json::json!({
-                "event":"tree-memory-ready",
-                "held":false,
-                "mode":if opts.mode == "tree" { "tree-first-probe" } else { "not-release-shaped" },
-                "barrier_slots":0,
-            })
+            (
+                aterm_json::json!({
+                    "event":"tree-memory-ready",
+                    "held":false,
+                    "mode":if opts.mode == "tree" { "tree-first-probe" } else { "not-release-shaped" },
+                    "barrier_slots":0,
+                }),
+                None,
+            )
         };
         let export = export_seconds.map(|seconds| {
             let shares = &shares;
@@ -2168,6 +2363,36 @@ fn one(
                 }
             })
         });
+        let tree_cpu_transfers = if matches!(
+            opts.queued_tree_share,
+            QueuedTreeShare::Resume | QueuedTreeShare::Lend
+        ) {
+            shared_tree.map(|queued| {
+                let ended = std::sync::Arc::clone(&tree_ended);
+                let shares = &shares;
+                let policy = opts.queued_tree_share;
+                scope.spawn(move || {
+                    let ledger = aterm_capacity::Ledger::user()?;
+                    let finished = || {
+                        ended.load(std::sync::atomic::Ordering::SeqCst)
+                            || crate::interrupt::caught().is_some()
+                    };
+                    let held = || queued.held(&ledger);
+                    let pause = || std::thread::sleep(Duration::from_secs(1));
+                    if policy == QueuedTreeShare::Lend {
+                        crate::release_steps::await_tree_cpu_lending(
+                            shares, &queued, &finished, held, pause,
+                        )
+                    } else {
+                        crate::release_steps::await_tree_cpu_resumption(
+                            shares, &queued, &finished, held, pause,
+                        )
+                    }
+                })
+            })
+        } else {
+            None
+        };
         let prefetched = serial_ended
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2221,6 +2446,14 @@ fn one(
                     .map_err(|_| "pilot export panicked".to_owned())?
             })
             .transpose()?;
+        let tree_cpu_transfers = tree_cpu_transfers
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| "pilot tree CPU observer panicked".to_owned())
+            })
+            .transpose()?
+            .flatten();
         let graph_wall_s = started.elapsed().as_secs_f64();
         let serial_export = if opts.real_export
             && !opts.planted_red
@@ -2249,6 +2482,7 @@ fn one(
             graph_wall_s,
             memory_ready,
             tree_memory_ready,
+            tree_cpu_transfers,
             aterm_json::json!({
                 "pid":child_pid,
                 "cpu_s":build_usage.cpu.as_secs_f64(),
@@ -2279,6 +2513,7 @@ fn one(
     let report = aterm_json::json!({
         "mode":opts.mode, "tree_work":opts.tree_work.as_str(),
         "build_return":opts.build_return.as_str(),
+        "queued_tree_share":opts.queued_tree_share.as_str(),
         "tree_cache":if opts.cold_tree {"cold"} else {"warm"},
         "slice_cache":if opts.warm_slices {"warm"} else {"cold"},
         "source":commit, "slots":slots, "started_at_unix_s":started_at_unix_s,
@@ -2293,6 +2528,7 @@ fn one(
         "export_share":export_share,
         "branch_fifos":{"build":shares.pool(false).path(),"tree":shares.pool(true).path()},
         "slice_memory_ready":memory_ready, "tree_memory_ready":tree_memory_ready,
+        "tree_cpu_transfers":tree_cpu_transfers,
         "build_child":build_usage, "verify_sha256":verify_sha256, "verify":opts.verify,
     });
     crate::durable::write_fresh(&root.join("result.json"), report.to_string())

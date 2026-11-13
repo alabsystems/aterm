@@ -42,6 +42,7 @@ fn main() {
     println!("cpu_layout   {layout:?}");
     println!("core_ticks   {:?}", probe.core_ticks());
     println!("memory       {:?}", aterm_sysprobe::memory_detail());
+    println!("pressure     {:?}", aterm_sysprobe::memory_pressure());
     println!("gpu          {:?}", aterm_sysprobe::gpu());
     match aterm_sysprobe::gpu_clients() {
         Some(c) => {

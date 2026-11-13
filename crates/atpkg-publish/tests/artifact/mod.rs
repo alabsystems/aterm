@@ -19,6 +19,7 @@ mod pack;
 mod package;
 mod pkgdoc;
 mod project_toolchain;
+mod qualify;
 mod sign;
 mod tarwrite;
 mod toolchain;

@@ -959,14 +959,32 @@ fn materialization_observation_explains_each_guard_without_reading_or_mutating_i
             matches!(observed, MaterializationObservation::Blocked(reason) if reason == expected)
         );
         assert!(!called.get());
-        assert!(!materialization_ready_for(paths, config).unwrap());
-        assert!(
-            with_materialization_ready::<()>(paths, config, || {
-                panic!("a blocked legacy reader must not run")
-            })
-            .unwrap()
-            .is_none()
-        );
+        // A reader that gates work waits a writer out; one that outlasts the wait is said
+        // as that, never as a vault that is not ready.
+        let (ready, gated) = with_current_wait(Duration::from_millis(20), || {
+            (
+                materialization_ready_for(paths, config),
+                with_materialization_ready::<()>(paths, config, || {
+                    panic!("a blocked legacy reader must not run")
+                }),
+            )
+        });
+        match expected {
+            MaterializationBlocker::WriterBusy => {
+                assert_eq!(
+                    ready.err().map(|e| e.kind()),
+                    Some(crate::ErrorKind::VaultBusy)
+                );
+                assert_eq!(
+                    gated.err().map(|e| e.kind()),
+                    Some(crate::ErrorKind::VaultBusy)
+                );
+            }
+            _ => {
+                assert!(!ready.unwrap());
+                assert!(gated.unwrap().is_none());
+            }
+        }
         assert_eq!(std::fs::read(paths.state_file()).ok(), before_state);
         assert_eq!(std::fs::read(paths.source_file()).ok(), before_config);
     }
@@ -983,14 +1001,14 @@ fn materialization_observation_explains_each_guard_without_reading_or_mutating_i
         followed: Vec::new(),
         host: "reader".into(),
     };
-    blocked(&paths, &initial, MaterializationBlocker::LockUnavailable);
+    blocked(&paths, &initial, MaterializationBlocker::LockMissing);
     assert!(!paths.home.exists());
     drop(StateLock::take(&paths).unwrap());
     blocked(&paths, &initial, MaterializationBlocker::Unconfigured);
     join_pinned(&paths, source.to_str().unwrap(), "reader");
     let configured = config(&paths).unwrap().unwrap();
     let writer = StateLock::take(&paths).unwrap();
-    blocked(&paths, &configured, MaterializationBlocker::LockUnavailable);
+    blocked(&paths, &configured, MaterializationBlocker::WriterBusy);
     drop(writer);
     let mut changed = configured.clone();
     changed.name.push_str("-other");
@@ -1126,20 +1144,31 @@ fn readiness_observation_yields_to_writers_and_coexists_with_shared_readers() {
     fsx::write_atomic(&source, b"token=inert-token\n", 0o600).unwrap();
     let reader = Paths::for_home(&root.path().join("reader"));
     join_pinned(&reader, source.to_str().unwrap(), "reader");
+    let configured = config(&reader).unwrap().unwrap();
     let writer = StateLock::take(&reader).unwrap();
     let (send, receive) = std::sync::mpsc::channel();
     let observing = reader.clone();
     let worker = std::thread::spawn(move || {
-        send.send(materialization_ready(&observing)).unwrap();
+        send.send(observe_materialization(&observing, &configured, || Ok(())))
+            .unwrap();
     });
-    let result = receive.recv_timeout(Duration::from_secs(60));
-    drop(writer);
-    worker.join().unwrap();
-    assert!(
-        !result
-            .expect("readiness must not wait for the writer")
-            .unwrap()
+    let status = receive.recv_timeout(Duration::from_secs(60));
+    // A readiness check waits the writer out and reads the vault once it lets go: the
+    // writer lets go only from inside that wait.
+    let mut writer = Some(writer);
+    let (ready, tries) = test_while_state_lock_held(
+        move || drop(writer.take()),
+        || materialization_ready(&reader),
     );
+    worker.join().unwrap();
+    assert!(matches!(
+        status
+            .expect("a status read must not wait for the writer")
+            .unwrap(),
+        MaterializationObservation::Blocked(MaterializationBlocker::WriterBusy)
+    ));
+    assert!(ready.unwrap());
+    assert!(tries >= 1, "the readiness check met the writer and waited");
     assert!(materialization_ready(&reader).unwrap());
 
     let shared = StateLock::observe(&reader).unwrap().expect("first reader");
@@ -1809,12 +1838,6 @@ fn materialization_capture_holds_local_reads_and_fences_the_version() {
         "not a new version"
     );
 
-    {
-        let _writer = StateLock::take(&paths).unwrap();
-        assert!(state_lock_busy(&paths).unwrap());
-    }
-    assert!(!state_lock_busy(&paths).unwrap());
-
     fsx::write_atomic(&source, b"token=inert-next-token\n", 0o600).unwrap();
     sync(&paths, None).unwrap();
     assert!(materialization_ready(&paths).unwrap());
@@ -1830,12 +1853,14 @@ fn materialization_capture_holds_local_reads_and_fences_the_version() {
         .is_none()
     );
     let writer = StateLock::take(&paths).unwrap();
-    assert!(
+    let busy = with_current_wait(Duration::from_millis(20), || {
         with_materialization_ready::<()>(&paths, &current, || {
             panic!("an active sync must not read inputs")
         })
-        .unwrap()
-        .is_none()
+    });
+    assert_eq!(
+        busy.err().map(|error| error.kind()),
+        Some(crate::ErrorKind::VaultBusy)
     );
     drop(writer);
     assert!(

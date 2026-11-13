@@ -125,6 +125,49 @@ fn automation_unanswered(consent: AutomationConsent) -> String {
     )
 }
 
+/// Why a sign-out waits when a coding agent started the run: its macOS questions, the app it
+/// brings forward and its clicks would land on the screen of a person who asked for none of
+/// them (owner ruling 2026-11-09).
+pub(crate) fn agents_run() -> String {
+    "a coding agent started this run, not a person; signing out waits for you".into()
+}
+
+/// Why a sign-out waits when the aterm window refused its Accessibility walk: the run's tab is
+/// not the one in front of the person ([`AccessibilityWalk::Behind`]).
+pub(crate) fn tab_behind() -> String {
+    "this run's tab is not the one in front of you; signing out waits for you".into()
+}
+
+/// Why a sign-out put nothing on the screen and waits for the person to start it
+/// ([`waits_for_the_person`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Waits {
+    /// A coding agent started the run ([`System::agent_ancestor`]).
+    AgentsRun,
+    /// The run's tab was not the one in front ([`AccessibilityWalk::Behind`]).
+    TabBehind,
+}
+
+/// Whether `row` is a sign-out that put nothing on the screen because the run was not the
+/// person's to show them (a coding agent's, [`agents_run`]; a tab behind, [`tab_behind`]), and
+/// which: it asked and clicked nothing, and waits for the person to start it.
+#[must_use]
+pub fn waits_for_the_person(row: &crate::model::ItemReport) -> Option<Waits> {
+    let Some(aterm_converge::StoodAside::Waiting(why)) = &row.stood_aside else {
+        return None;
+    };
+    if !signs_out(&row.id) {
+        return None;
+    }
+    if *why == agents_run() {
+        Some(Waits::AgentsRun)
+    } else if *why == tab_behind() {
+        Some(Waits::TabBehind)
+    } else {
+        None
+    }
+}
+
 /// Why a sign-out of `service` clicked nothing for `user`'s session (`why`,
 /// [`SessionReach::waits`]).
 fn session_wait(service: Service, why: &str) -> String {
@@ -299,6 +342,14 @@ impl Item for SignOut {
 
     fn apply(&self, sys: &dyn System, _ctx: &Ctx) -> Result<(), String> {
         self.stand(None);
+        // A person stage (init-on-by-default design §6.4; owner ruling 2026-11-09): its macOS
+        // questions, the app it brings forward and its clicks put things on the person's screen,
+        // so a run a coding agent started (with a terminal, which would ask macOS below) asks
+        // and clicks nothing; the person starts it.
+        if sys.agent_ancestor().is_some() {
+            self.stand(Some(aterm_converge::StoodAside::Waiting(agents_run())));
+            return Ok(());
+        }
         let tty = sys.has_tty();
         // With no terminal nothing here asks macOS anything or opens an app for a person: the
         // session, the Accessibility grant and macOS's Automation answer are only read, before
@@ -328,6 +379,10 @@ impl Item for SignOut {
         };
         if tty {
             if !self.accessible(sys)? {
+                // The window's desk door refused the walk: nothing comes forward by hand either.
+                if self.stood_aside().is_some() {
+                    return Ok(());
+                }
                 return self.by_hand(sys);
             }
             if self.stands_for_automation(sys)? {
@@ -529,6 +584,17 @@ impl SignOut {
                 self.service.name(),
                 responsible(sys)
             )),
+            AccessibilityWalk::Behind => {
+                say(&format!(
+                    "signing out of {} clicks its Sign Out, which needs Accessibility for {}: \
+                     this tab is not the one in front of you, so init brings nothing up for it; \
+                     run `aterm init --sign-out` from the tab you are looking at",
+                    self.service.name(),
+                    responsible(sys)
+                ));
+                self.stand(Some(aterm_converge::StoodAside::Waiting(tab_behind())));
+                return Ok(false);
+            }
             AccessibilityWalk::NotTaken => {
                 say(&format!(
                     "signing out of {} clicks its Sign Out, which needs Accessibility for {}: \

@@ -797,6 +797,52 @@ impl<'a> Releases<'a> {
         Ok((objects, cut))
     }
 
+    /// Recover only an existing release owned by this journal's create intent.
+    /// This performs no POST, upload or publish, and starts no new intent.
+    /// `None` means no existing owned object is recoverable, not that a prior
+    /// create was never sent.
+    /// # Errors
+    /// Permission, ambiguous/open outcome, conflicting intent, or changed body.
+    pub fn recover_created(
+        &self,
+        permit: &Permit,
+        req: &DraftRequest,
+        intents: &dyn IntentStore,
+    ) -> Result<Option<Ensured<ReleaseObject>>> {
+        self.write_checks(permit)?;
+        path::refuse_bad_tag(&req.tag_name)
+            .map_err(|error| error.with_repo(self.slug.to_string()))?;
+        notes_bound(&req.body).map_err(|error| error.with_repo(self.slug.to_string()))?;
+        match self.guard_view(Some(permit)).create_step(req, intents)? {
+            CreateStep::Begin { .. } => Ok(None),
+            CreateStep::Refuse(error) => Err(error),
+            CreateStep::StillOpen { intent } => Err(self.still_open(&intent, &req.tag_name)),
+            CreateStep::Converge {
+                release,
+                intent,
+                observe,
+            } => {
+                if release.body.as_deref().unwrap_or("") != req.body
+                    || req
+                        .target_commitish
+                        .as_ref()
+                        .is_some_and(|target| *target != release.target_commitish)
+                {
+                    return Err(self.guard_failed(
+                        "the journal's created release changed its body or target".into(),
+                    ));
+                }
+                if observe {
+                    intents.observe(&intent, Some(release.id))?;
+                }
+                Ok(Some(Ensured {
+                    object: *release,
+                    effect: Effect::Converged,
+                }))
+            }
+        }
+    }
+
     /// Create a draft (design §11.2's four steps). The pre-check, a WriterRead
     /// `recent_objects_for_tag`, decides:
     /// - one draft matching an open intent of this journal for the tag →

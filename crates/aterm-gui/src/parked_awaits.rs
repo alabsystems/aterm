@@ -4,7 +4,9 @@
 //! The `await`s this aterm's control server holds parked, each by the client process it serves:
 //! the jobs pass's evidence that a quiet process waits on aterm ([`JobProc::aterm_wait`]), never a
 //! guess from its name or arguments. An `aterm ctl await task …`, `aterm ctl @self await wake …`
-//! and `amacs --wait` (its `await edit`) each park here while the server waits for them.
+//! and `amacs --wait` (its `await edit`) each park here while the server waits for them, and so
+//! does `await elsewhere` ([`elsewhere`]): the client holds it on its own aterm while another
+//! aterm on this Mac, or another Mac, serves the wait it is in.
 //!
 //! [`JobProc::aterm_wait`]: aterm_vitals::jobs::JobProc::aterm_wait
 
@@ -115,6 +117,32 @@ fn enter_in<'a>(parked: &'a Parked, verb: &str, rest: &str) -> Option<Held<'a>> 
     let wait = timeout_ms(rest).unwrap_or(aterm_control::wire::WAIT_MAX_MS);
     let until = Instant::now() + Duration::from_millis(wait) + GRACE;
     Some(parked.hold(pid, birth, until))
+}
+
+/// Whether `rest` (an `await`'s words) is `await elsewhere [timeout=<ms>]`.
+pub(crate) fn is_elsewhere(rest: &str) -> bool {
+    rest.split_whitespace().next() == Some("elsewhere")
+}
+
+/// SERVES `await elsewhere [timeout=<ms>]`, parked for its client the while ([`enter`]): it holds
+/// until the client hangs up (`hung_up`, asked every [`aterm_control::hangup::HANGUP_POLL`]) or
+/// its timeout (clamped as every await's; [`aterm_control::wire::WAIT_DEFAULT_MS`] with none) passes,
+/// `OK elsewhere status=timeout`. Nothing else ends it: the wait it vouches for is served by
+/// another aterm (a sibling on this Mac, or another Mac over the fleet), which the client alone
+/// hears from, so this aterm's jobs pass reads the client as waiting on aterm.
+pub(crate) fn elsewhere(rest: &str, hung_up: impl Fn() -> bool) -> String {
+    let wait = timeout_ms(rest).unwrap_or(aterm_control::wire::WAIT_DEFAULT_MS);
+    let until = Instant::now() + Duration::from_millis(wait);
+    loop {
+        if hung_up() {
+            return crate::control::HUNG_UP_REPLY.to_string();
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return "OK elsewhere status=timeout\n".to_string();
+        }
+        std::thread::sleep(left.min(aterm_control::hangup::HANGUP_POLL));
+    }
 }
 
 /// The process `pid`'s start as the jobs engine's reader reads it, so the pass compares like with

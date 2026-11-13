@@ -227,7 +227,16 @@ fn serve_connection_observed(
         let _final_reply = FINAL_REPLIES
             .enter(&request.head())
             .or_else(|| context.owed_input_reply(&request));
+        let dispatch_started = Instant::now();
         let disposition = context.serve_line(request, scope, &stream, &mut reader, &mut out);
+        let constructor = observe.and_then(|_| out.fixture_constructor_reply(&line));
+        if let Some((action, class)) = constructor {
+            eprintln!(
+                "Source qualification native: action={action} reply={class} dispatch_us={}",
+                dispatch_started.elapsed().as_micros()
+            );
+        }
+        let observation_started = Instant::now();
         if observe.is_some_and(|observe| {
             observe(
                 serving_peer_pid(),
@@ -240,6 +249,12 @@ fn serve_connection_observed(
             // close the real socket before any of that Outbox is transmitted.
             stream.shutdown(std::net::Shutdown::Both)?;
             return Ok(true);
+        }
+        if let Some((action, _)) = constructor {
+            eprintln!(
+                "Source qualification native: action={action} observation_us={}",
+                observation_started.elapsed().as_micros()
+            );
         }
         if let Some((action, operation)) = native_trace {
             // Record only after actual dispatch has returned. The controller can
@@ -292,7 +307,14 @@ fn serve_connection_observed(
             fixture_pause_reply(&context.sock_dir, "signal")?;
             return Ok(true);
         }
+        let write_started = Instant::now();
         out.finish_waiting(&stream, &mut reader)?;
+        if let Some((action, _)) = constructor {
+            eprintln!(
+                "Source qualification native: action={action} written_us={}",
+                write_started.elapsed().as_micros()
+            );
+        }
         match disposition {
             Some(ServeDisposition::Close) => return Ok(true),
             Some(ServeDisposition::Subscribe { request, scope }) if real_child => {

@@ -1,6 +1,52 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+#[test]
+fn an_open_file_scan_follows_the_inode_after_its_name_is_replaced() {
+    struct Child(crate::spawnfd::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = aterm_tempfile::tempdir().expect("scratch");
+    let name = dir.path().join("gate");
+    std::fs::write(&name, b"original").expect("original gate");
+    let original = std::fs::File::open(&name).expect("open gate");
+    let program = crate::deadline::stand_in(std::path::Path::new("/bin/sleep"));
+    let child = Child(
+        crate::spawnfd::command(program)
+            .arg("600")
+            .stdin(original.try_clone().expect("child's descriptor"))
+            .stdout(crate::spawnfd::Stdio::null())
+            .stderr(crate::spawnfd::Stdio::null())
+            .spawn()
+            .expect("spawn holder"),
+    );
+    let started = std::time::Instant::now();
+    while !super::scan_open_file_holders(&original, &[])
+        .expect("original inode's holders")
+        .holds(child.0.id())
+    {
+        assert!(started.elapsed() < std::time::Duration::from_secs(60));
+        crate::deadline::poll_yield();
+    }
+    std::fs::rename(&name, dir.path().join("old-gate")).expect("move original");
+    std::fs::write(&name, b"replacement").expect("replace name");
+    assert!(
+        super::scan_open_file_holders(&original, &[])
+            .expect("pinned inode's holders")
+            .holds(child.0.id())
+    );
+    assert!(
+        !super::scan_file_holders(&name, &[])
+            .expect("replacement inode's holders")
+            .holds(child.0.id())
+    );
+}
+
 /// Leave a socket file after closing its listener. On Apple, exclude a parallel test's
 /// spawn across bind and drop, even on a kernel without close-on-fork.
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]

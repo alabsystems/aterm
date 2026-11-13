@@ -40,6 +40,9 @@ mod registry;
 #[path = "build_cache_retired_history.rs"]
 mod history;
 
+#[path = "build_cache_retired_lazy_fetch.rs"]
+mod lazy_fetch;
+
 /// Nothing in a leftover was written for this long before it goes.
 pub const UNWRITTEN: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
@@ -105,6 +108,17 @@ pub struct Answer {
     pub err: String,
 }
 
+impl Answer {
+    /// No run started, for `why`.
+    fn unrun(why: String) -> Self {
+        Self {
+            code: None,
+            out: String::new(),
+            err: why,
+        }
+    }
+}
+
 /// How git is asked: the live one ([`GitCli`]) in production, the same in tests on scratch repos.
 pub trait Git {
     /// `git -C <dir> <args>`, with git's optional locks off so no read writes its index.
@@ -136,10 +150,25 @@ pub trait Git {
     }
 }
 
-/// `git` on `PATH`, with lazy fetching disabled. A Git that cannot take the explicit
-/// no-fetch option refuses the read, so it cannot authorize snapshot retirement.
+/// The first `git` on `PATH`, run as [`GitProgram`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct GitCli;
+
+impl GitCli {
+    /// The first `git` on `PATH`, or no run, for why.
+    fn program() -> Result<PathBuf, Answer> {
+        crate::vendor::first_on_path("git", std::env::var_os("PATH").as_deref())
+            .ok_or_else(|| Answer::unrun("git did not start: no git on PATH".to_owned()))
+    }
+}
+
+/// The git program at a path, its reads kept from fetching an object a partial clone lacks:
+/// `GIT_NO_LAZY_FETCH=1` on every run, which a child git inherits, and `--no-lazy-fetch` where
+/// git takes it; a git that refuses the option runs only where it was seen to obey the variable
+/// ([`lazy_fetch::guard`]). Any other git starts no run, so it cannot authorize snapshot
+/// retirement. No run inherits a `GIT_*` variable this process holds
+/// ([`lazy_fetch::without_git_environment`]).
+struct GitProgram<'a>(&'a Path);
 
 /// `path` without a Windows verbatim drive prefix (`\\?\C:\…`), which git reads as a host name.
 fn git_path(path: &Path) -> &Path {
@@ -155,8 +184,40 @@ impl Git for GitCli {
     }
 
     fn run_with_alt(&self, dir: &Path, args: &[&str], alt: Option<&Path>) -> Answer {
-        let mut cmd = aterm_uds::spawnfd::command("git");
-        cmd.arg("--no-lazy-fetch")
+        match Self::program() {
+            Ok(program) => GitProgram(&program).run_with_alt(dir, args, alt),
+            Err(unrun) => unrun,
+        }
+    }
+
+    fn read_history(
+        &self,
+        dir: &Path,
+        args: &[&str],
+        input: &[u8],
+        objects: Option<&Path>,
+        deadline: std::time::Instant,
+    ) -> Answer {
+        match Self::program() {
+            Ok(program) => GitProgram(&program).read_history(dir, args, input, objects, deadline),
+            Err(unrun) => unrun,
+        }
+    }
+}
+
+impl Git for GitProgram<'_> {
+    fn run(&self, dir: &Path, args: &[&str]) -> Answer {
+        self.run_with_alt(dir, args, None)
+    }
+
+    fn run_with_alt(&self, dir: &Path, args: &[&str], alt: Option<&Path>) -> Answer {
+        let guard = match lazy_fetch::guard(self.0) {
+            Ok(guard) => guard,
+            Err(why) => return Answer::unrun(why),
+        };
+        let mut cmd = aterm_uds::spawnfd::command(self.0);
+        lazy_fetch::without_git_environment(&mut cmd);
+        cmd.args(guard.option())
             .arg("-C")
             .arg(git_path(dir))
             .args(args)
@@ -174,11 +235,7 @@ impl Git for GitCli {
                 out: String::from_utf8_lossy(&o.stdout).into_owned(),
                 err: String::from_utf8_lossy(&o.stderr).trim().to_owned(),
             },
-            Err(e) => Answer {
-                code: None,
-                out: String::new(),
-                err: format!("git did not start: {e}"),
-            },
+            Err(e) => Answer::unrun(format!("git did not start: {e}")),
         }
     }
 
@@ -190,17 +247,13 @@ impl Git for GitCli {
         objects: Option<&Path>,
         deadline: std::time::Instant,
     ) -> Answer {
-        let mut cmd = aterm_uds::spawnfd::command("git");
-        for (name, _) in std::env::vars_os() {
-            if name
-                .as_encoded_bytes()
-                .get(..4)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"GIT_"))
-            {
-                cmd.env_remove(name);
-            }
-        }
-        cmd.arg("--no-lazy-fetch")
+        let guard = match lazy_fetch::guard(self.0) {
+            Ok(guard) => guard,
+            Err(why) => return Answer::unrun(why),
+        };
+        let mut cmd = aterm_uds::spawnfd::command(self.0);
+        lazy_fetch::without_git_environment(&mut cmd);
+        cmd.args(guard.option())
             .arg("--no-pager")
             .arg("--no-optional-locks")
             .arg("--no-replace-objects")
@@ -238,17 +291,9 @@ impl Git for GitCli {
                     out,
                     err,
                 },
-                _ => Answer {
-                    code: None,
-                    out: String::new(),
-                    err: "Git history metadata is not complete UTF-8".to_owned(),
-                },
+                _ => Answer::unrun("Git history metadata is not complete UTF-8".to_owned()),
             },
-            Err(error) => Answer {
-                code: None,
-                out: String::new(),
-                err: format!("Git history read did not complete: {error}"),
-            },
+            Err(error) => Answer::unrun(format!("Git history read did not complete: {error}")),
         }
     }
 }
@@ -298,8 +343,21 @@ fn beside(checkout: &Path, suffix: &str) -> Option<PathBuf> {
     Some(checkout.with_file_name(name))
 }
 
+/// Whether a pass may look at `checkout` at all: it lies in no folder that is never looked
+/// into (`aterm_toolchain::checkout::never_looked_at`: Documents, Desktop, Downloads, a volume)
+/// and under no root macOS guards with a consent dialog
+/// ([`crate::protected::under_protected_root`]). Read off the path alone, before the first
+/// stat: the daily pass runs with nobody asking, and judging a snapshot there (a `git` child,
+/// a walk of its tree) would put macOS's question on the person's screen (owner ruling
+/// 2026-11-09). What the retired gate left in such a folder stays for its owner.
+fn looked_into(home: &Path, checkout: &Path) -> bool {
+    crate::build_cache::checkout::never_looked_at(checkout, Some(home)).is_none()
+        && !crate::protected::under_protected_root(home, checkout)
+}
+
 /// The main checkouts whose snapshot may be on disk: `home`'s own children, and `workspaces`
-/// (the build cache's), each with a `<name>-verify.noindex` or `-verify-cells.noindex` beside it.
+/// (the build cache's), each with a `<name>-verify.noindex` or `-verify-cells.noindex` beside it,
+/// leaving out one a pass never looks into ([`looked_into`]).
 fn checkouts(home: &Path, workspaces: &[PathBuf]) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = std::fs::read_dir(home)
         .into_iter()
@@ -315,6 +373,7 @@ fn checkouts(home: &Path, workspaces: &[PathBuf]) -> Vec<PathBuf> {
             Some(home.join(stem))
         })
         .chain(workspaces.iter().cloned())
+        .filter(|c| looked_into(home, c))
         .filter(|c| main_checkout(c))
         .filter(|c| {
             [SNAPSHOT, CELLS, pending::SUFFIX]

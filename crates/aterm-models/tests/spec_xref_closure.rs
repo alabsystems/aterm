@@ -128,6 +128,20 @@ fn spec_xref_closure() {
         aterm_types::clt_mark::reading as *const (),
         aterm_types::clt_mark::clt_episode_environment as fn(),
     ));
+    // The update record's `NativeUpdateHold` anchors, and their waivers' host.
+    std::hint::black_box((
+        aterm_update_core::update_record::hold_until as *const (),
+        aterm_update_core::update_record::UpdateRecord::holds as *const (),
+        aterm_update_core::update_record::UpdateRecord::set_hold as *const (),
+        aterm_update_core::update_record::UpdateRecord::end_hold as *const (),
+        aterm_update_core::update_record::UpdateRecord::peer_lift as *const (),
+        aterm_update_core::update_record::UpdateRecord::offer as *const (),
+        aterm_update_core::update_record::UpdateRecord::arm_trial as *const (),
+        aterm_update_core::update_record::UpdateRecord::revert as *const (),
+        aterm_update_core::update_record::UpdateRecord::unproven as *const (),
+        aterm_update_core::update_record::UpdateRecord::confirm as *const (),
+        aterm_update_core::update_record::update_hold_environment as fn(),
+    ));
     // aterm-capacity's `CapacityCohort` waivers' host, beside its cohort ledger's anchors.
     #[cfg(unix)]
     std::hint::black_box(aterm_capacity::capacity_cohort_environment as fn());
@@ -470,6 +484,14 @@ fn spec_xref_closure() {
             "{machine} must participate in source-to-model closure"
         );
     }
+
+    assert!(
+        report
+            .coverage
+            .iter()
+            .any(|coverage| coverage.machine == "NativeUpdateHold" && coverage.active),
+        "NativeUpdateHold must participate in source-to-model closure"
+    );
 
     eprintln!("spec_xref_closure: per-machine coverage ledger:");
     for c in &report.coverage {

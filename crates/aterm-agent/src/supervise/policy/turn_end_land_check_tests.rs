@@ -287,7 +287,7 @@ fn the_same_list_twice_holds_quoted() {
 /// stands. Negative control: a nudge typed in the rest.
 #[test]
 fn a_need_only_answer_types_nothing_more() {
-    let need = "NEEDS YOU: rotate the deploy key";
+    let need = "NEEDS YOU: rotate the deploy nod";
     assert_eq!(
         land_check::land_check_answer(need, None, false),
         CheckAnswer::Needs { rest_landed: true }
@@ -337,7 +337,7 @@ fn following(
 /// `rejudged`) types `land-nudge@v1` into the rest and `land-answer@v1` at the question.
 #[test]
 fn the_checks_answer_survives_a_loop_that_follows() {
-    let need = "NEEDS YOU: rotate the deploy key";
+    let need = "NEEDS YOU: rotate the deploy nod";
     let (mut st, now) = instructed(t0());
     let (b, answer, then) = checked(&mut st, &worked(DEFENSE), now, need);
     assert_eq!(b, TurnEndAction::Nothing, "{st:?}");
@@ -621,7 +621,7 @@ fn a_short_tool_turn_is_no_new_work_for_the_check() {
 /// Negative control: the need taken down at every `LANDED`.
 #[test]
 fn a_landed_answer_over_a_dirty_repository_keeps_the_need() {
-    let defense = format!("NEEDS YOU: rotate the deploy key\n\n{DEFENSE}");
+    let defense = format!("NEEDS YOU: rotate the deploy nod\n\n{DEFENSE}");
     let (mut st, now) = instructed(t0());
     let r = worked(&defense);
     let a = at(&mut st, &r, now);
@@ -641,7 +641,7 @@ fn a_landed_answer_over_a_dirty_repository_keeps_the_need() {
     assert!(!st.landed(), "{st:?}");
     assert_eq!(
         st.standing_needs(),
-        ["rotate the deploy key".to_string()],
+        ["rotate the deploy nod".to_string()],
         "the need stands"
     );
 }
@@ -894,14 +894,14 @@ fn a_need_an_earlier_message_of_the_checks_turn_retracted_lands() {
     st.acted(&a, &r, now);
     let answer = TurnEndReading {
         turn_said: Some(format!(
-            "{RETRACTED_BEFORE}\n\nNEEDS YOU: rotate the deploy key"
+            "{RETRACTED_BEFORE}\n\nNEEDS YOU: rotate the deploy nod"
         )),
         ..worked(LANDED_WORD)
     };
     let (b, _) = decided(&mut st, &answer, now + 4 * MIN);
     assert_eq!(b, TurnEndAction::Nothing, "{st:?}");
     assert!(!st.landed() && st.land_resting(), "{st:?}");
-    assert_eq!(st.standing_needs(), ["rotate the deploy key"], "{st:?}");
+    assert_eq!(st.standing_needs(), ["rotate the deploy nod"], "{st:?}");
 }
 
 /// A NONE THAT IS NOT THE AGENT'S OWN LAST WORD TAKES DOWN NO NEED AN EARLIER POINT RAISED (the
@@ -984,7 +984,7 @@ fn a_none_not_the_agents_own_last_word_keeps_an_earlier_points_need() {
 /// needs (the first round's park) types `land@v1` into the rest and takes the need down.
 #[test]
 fn an_off_no_person_set_keeps_lands_rest_on_a_need() {
-    let need = "NEEDS YOU: rotate the deploy key";
+    let need = "NEEDS YOU: rotate the deploy nod";
     let rest = || {
         let (mut st, now) = instructed(t0());
         let (b, answer, then) = checked(&mut st, &worked(DEFENSE), now, need);
@@ -1003,7 +1003,7 @@ fn an_off_no_person_set_keeps_lands_rest_on_a_need() {
         assert!(!matches!(a, TurnEndAction::Type { .. }), "{wait:?}: {a:?}");
     }
     assert!(st.land_resting(), "{st:?}");
-    assert_eq!(st.standing_needs(), ["rotate the deploy key"], "{st:?}");
+    assert_eq!(st.standing_needs(), ["rotate the deploy nod"], "{st:?}");
     // The person's own lift from that Off.
     let (mut st, still, then) = rest();
     assert_eq!(st.park_off_held(), OffStood::Resting);

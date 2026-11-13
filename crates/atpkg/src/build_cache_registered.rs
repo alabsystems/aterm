@@ -1230,13 +1230,19 @@ pub fn prepare_default_target(root: &Path) -> std::io::Result<()> {
 
 /// Take the producer's terminal exclusive root gate, preserving contention and other I/O kinds.
 #[cfg(unix)]
-fn try_producer_gate(file: std::fs::File, root: &Path) -> std::io::Result<crate::lock::Flock> {
+fn try_producer_gate(
+    file: std::fs::File,
+    root: &Path,
+    gate: &Path,
+) -> std::io::Result<crate::lock::Flock> {
+    let probe = aterm_uds::kept_out(|| file.try_clone());
     crate::lock::Flock::try_lock(file).map_err(|error| match error {
         std::fs::TryLockError::WouldBlock => std::io::Error::new(
             std::io::ErrorKind::WouldBlock,
             format!(
-                "the managed build cache {} is busy: its registration gate is held",
-                root.display()
+                "the managed build cache {} is busy: its registration gate is held; gate={gate:?}; {}",
+                root.display(),
+                gate_openers(probe),
             ),
         ),
         std::fs::TryLockError::Error(error) => std::io::Error::new(
@@ -1247,6 +1253,60 @@ fn try_producer_gate(file: std::fs::File, root: &Path) -> std::io::Result<crate:
             ),
         ),
     })
+}
+
+/// Descriptor evidence is diagnostic only: a process with the gate open need not hold its
+/// lock. The open file keeps the scan on the original inode even when its pathname moves.
+/// Preserve incomplete readings; this is never lock or cleanup authority.
+#[cfg(unix)]
+fn gate_openers(probe: std::io::Result<std::fs::File>) -> String {
+    let probe = match probe {
+        Ok(probe) => probe,
+        Err(why) => return format!("gate descriptor scan unavailable: {why}"),
+    };
+    match aterm_uds::holders::scan_open_file_holders(&probe, &[]) {
+        Ok(scan) => describe_gate_openers(&scan, aterm_uds::holders::exe_of),
+        Err(why) => format!("gate descriptor scan unavailable: {why}"),
+    }
+}
+
+#[cfg(unix)]
+fn describe_gate_openers(
+    scan: &aterm_uds::holders::HolderScan,
+    mut executable: impl FnMut(u32) -> aterm_uds::holders::Exe,
+) -> String {
+    const SHOWN: usize = 8;
+    let mut words = Vec::new();
+    for &pid in scan.holders.iter().take(SHOWN) {
+        let observer = if pid == std::process::id() {
+            "observer; "
+        } else {
+            ""
+        };
+        words.push(match executable(pid) {
+            aterm_uds::holders::Exe::At(path) => format!("pid {pid} ({observer}{path:?})"),
+            aterm_uds::holders::Exe::Unnamed => {
+                format!("pid {pid} ({observer}executable unreadable)")
+            }
+            aterm_uds::holders::Exe::Exited => {
+                format!("pid {pid} ({observer}exited during the read)")
+            }
+        });
+    }
+    if scan.holders.len() > SHOWN {
+        words.push(format!("{} more", scan.holders.len() - SHOWN));
+    }
+    let open = if words.is_empty() {
+        "none observed".into()
+    } else {
+        words.join(", ")
+    };
+    format!(
+        "processes with the gate open (not proof of lock ownership): {open}; descriptor tables: {} scanned, {} unreadable, {} sealed",
+        scan.scanned,
+        scan.unreadable.len(),
+        scan.sealed.len(),
+    )
 }
 
 /// A producer must not continue on a previously owned cache if it cannot be admitted.
@@ -1288,13 +1348,7 @@ fn create_with_policy(
         };
         must_record = declared;
         let parent = root.parent()?;
-        if !canonical_existing_ancestor(home, parent)
-            || std::fs::canonicalize(workspace).ok().as_deref() != Some(workspace)
-            || !super::checkout::MANIFESTS.iter().any(|name| {
-                std::fs::symlink_metadata(workspace.join(name))
-                    .is_ok_and(|metadata| metadata.is_file())
-            })
-        {
+        if !canonical_existing_ancestor(home, parent) || !workspace_is_owner(home, workspace) {
             return None;
         }
         if already_recorded(home, root, workspace) {
@@ -1317,7 +1371,7 @@ fn create_with_policy(
         must_record = true;
         // The record may be between fresh creation and publication, so a busy gate is never
         // permission to use the directory without recording this producer's owner.
-        let _held = match try_producer_gate(lock, root) {
+        let _held = match try_producer_gate(lock, root, &lock_path) {
             Ok(held) => held,
             Err(error) => {
                 refusal = Some(error);
@@ -1639,12 +1693,7 @@ fn admit_linked(
     use std::os::unix::fs::OpenOptionsExt as _;
     let stop = || std::io::Error::other("the managed build cache's owner could not be recorded");
     let root = linked.real.as_path();
-    if !scope(home, workspace)
-        || std::fs::canonicalize(workspace).ok().as_deref() != Some(workspace)
-        || !super::checkout::MANIFESTS.iter().any(|name| {
-            std::fs::symlink_metadata(workspace.join(name)).is_ok_and(|metadata| metadata.is_file())
-        })
-    {
+    if !workspace_is_owner(home, workspace) {
         return Err(stop());
     }
     if recorded_while(home, root, workspace, &|| linked.still()) {
@@ -1666,8 +1715,9 @@ fn admit_linked(
     let _admission = crate::lock::Flock::lock(admission)?;
     let key = key(root).ok_or_else(stop)?;
     let path = index.join(format!("{key}.json"));
-    let gate = open_gate(&gate_path(&path).ok_or_else(stop)?).ok_or_else(stop)?;
-    let _held = try_producer_gate(gate, root)?;
+    let lock_path = gate_path(&path).ok_or_else(stop)?;
+    let gate = open_gate(&lock_path).ok_or_else(stop)?;
+    let _held = try_producer_gate(gate, root, &lock_path)?;
     if !linked.still() {
         return Ok(Err(LinkRefusal::Changed));
     }
@@ -1780,51 +1830,189 @@ fn pending_owned(home: &Path, receipt: &Receipt, pending: &Pending) -> bool {
                 })))
 }
 
-fn workspace(home: &Path, manifest: &Path) -> Option<PathBuf> {
-    let manifest = std::fs::canonicalize(manifest).ok()?;
+/// The same canonical directory and regular-manifest eligibility is required before
+/// selecting an owner, creating a root or admitting a producer through a linked root.
+fn workspace_is_owner(home: &Path, workspace: &Path) -> bool {
+    scope(home, workspace)
+        && std::fs::canonicalize(workspace).ok().as_deref() == Some(workspace)
+        && super::checkout::MANIFESTS.iter().any(|name| {
+            std::fs::symlink_metadata(workspace.join(name)).is_ok_and(|metadata| metadata.is_file())
+        })
+}
+
+/// Resolve the workspace on every supported driver's reading of its package home. Search
+/// boundaries use Targo's logical manifest spelling; custody records canonical directories.
+fn workspace(
+    home: &Path,
+    manifest: &Path,
+    args: &[String],
+    tool: super::Tool,
+    machine: &super::Machine<'_>,
+) -> Option<PathBuf> {
+    let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
+    let cwd = targo_cwd(&args[at..], machine).ok()??;
+    let moved = super::Machine {
+        cwd: Some(&cwd),
+        ..*machine
+    };
+    let homes = super::package_homes(tool, &moved);
+    let mut selected = None;
+    for package_home in homes {
+        let package_home = normalize_with_cwd(package_home, Some(&cwd))?;
+        let owner = workspace_at(home, manifest, &package_home)?;
+        if selected.as_ref().is_some_and(|prior| prior != &owner) {
+            return None;
+        }
+        selected = Some(owner);
+    }
+    selected
+}
+
+/// Every supported initial-manifest reading must resolve to the same canonical owner.
+fn workspace_choices(
+    home: &Path,
+    manifests: &[PathBuf],
+    args: &[String],
+    tool: super::Tool,
+    machine: &super::Machine<'_>,
+) -> Option<PathBuf> {
+    let mut selected = None;
+    for manifest in manifests {
+        let owner = workspace(home, manifest, args, tool, machine)?;
+        if selected.as_ref().is_some_and(|prior| prior != &owner) {
+            return None;
+        }
+        selected = Some(owner);
+    }
+    selected
+}
+
+/// A missing ancestor manifest is absent; unreadable, oversized or malformed data cannot
+/// prove a workspace owner. Read links as Targo does without changing their definition base.
+fn workspace_manifest(
+    home: &Path,
+    member: &Path,
+    file: &Path,
+) -> Result<Option<aterm_toml::Value>, ()> {
+    let real = match std::fs::canonicalize(file) {
+        Ok(real) => real,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
+    };
+    let directory = real.parent().ok_or(())?;
+    // Inspect actual ancestors outside managed scope to detect an external workspace,
+    // but a redirected manifest outside that ancestry grants no permission to read it.
+    if !scope(home, directory) && !member.starts_with(directory) {
+        return Err(());
+    }
+    let text = crate::metadata_io::read_bounded_regular_utf8(&real, 1 << 20).map_err(|_| ())?;
+    aterm_toml::from_str(&text).map(Some).map_err(|_| ())
+}
+
+/// Targo's root selection excludes literal prefixes unless an explicit member prefix wins.
+/// Unsupported field types stay unresolved instead of falling back to the member package.
+fn workspace_includes(root: &Path, table: &aterm_toml::Value, member: &Path) -> Option<bool> {
+    let table = table.as_table()?;
+    let paths = |name| -> Option<Vec<&str>> {
+        match table.get(name) {
+            None => Some(Vec::new()),
+            Some(value) => value
+                .as_array()?
+                .iter()
+                .map(aterm_toml::Value::as_str)
+                .collect(),
+        }
+    };
+    let included = paths("members")?
+        .iter()
+        .any(|path| member.starts_with(root.join(path)));
+    let excluded = paths("exclude")?
+        .iter()
+        .any(|path| member.starts_with(root.join(path)));
+    Some(included || !excluded)
+}
+
+fn workspace_definition(
+    home: &Path,
+    package: &Path,
+    file: &Path,
+    value: &aterm_toml::Value,
+    member: &Path,
+) -> Option<Option<PathBuf>> {
+    let directory = file.parent()?;
+    let pointer = value
+        .get("package")
+        .and_then(|package| package.get("workspace"));
+    if let Some(table) = value.get("workspace") {
+        if pointer.is_some() {
+            return None;
+        }
+        return Some(
+            workspace_includes(directory, table, member)?.then(|| directory.to_path_buf()),
+        );
+    }
+    let Some(pointer) = pointer else {
+        return Some(None);
+    };
+    let root = normalize_with_cwd(PathBuf::from(pointer.as_str()?), Some(directory))?;
+    if !scope(home, &std::fs::canonicalize(&root).ok()?) {
+        return None;
+    }
+    let definition = workspace_manifest(home, package, &root.join("Cargo.toml")).ok()??;
+    let table = definition.get("workspace")?;
+    // Validate the same root fields before accepting an explicit pointer. Exclusion is
+    // interpreted by the driver's later membership validation, not another parent search.
+    workspace_includes(&root, table, member)?;
+    Some(Some(root))
+}
+
+fn workspace_at(home: &Path, manifest: &Path, package_home: &Path) -> Option<PathBuf> {
+    let manifest = normalize_with_cwd(manifest.to_path_buf(), None)?;
+    let real = std::fs::canonicalize(&manifest).ok()?;
     if !super::checkout::MANIFESTS
         .iter()
-        .any(|name| manifest.file_name() == Some(name.as_ref()))
+        .any(|name| real.file_name() == Some(name.as_ref()))
+        || !scope(home, real.parent()?)
     {
         return None;
     }
     let package = manifest.parent()?;
-    if !scope(home, package) {
+    let package_owner = std::fs::canonicalize(package).ok()?;
+    if !scope(home, &package_owner) {
         return None;
     }
-    let text = crate::metadata_io::read_bounded_regular_utf8(&manifest, 1 << 20).ok()?;
-    let parsed = aterm_toml::from_str::<aterm_toml::Value>(&text).ok()?;
-    if parsed.get("workspace").is_some() {
-        return Some(package.to_path_buf());
-    }
-    if let Some(explicit) = parsed
-        .get("package")
-        .and_then(|table| table.get("workspace"))
-        .and_then(aterm_toml::Value::as_str)
-    {
-        let owner = std::fs::canonicalize(package.join(explicit)).ok()?;
-        if !scope(home, &owner) {
+    let owner = |root: PathBuf| {
+        let root = std::fs::canonicalize(root).ok()?;
+        // Workspace members are loaded as Cargo.toml and checked by manifest identity.
+        // Native initial discovery does not make Targo.toml a member of an ancestor's
+        // Cargo workspace, even when both files describe the same package directory.
+        if root != package_owner && manifest.file_name() != Some("Cargo.toml".as_ref()) {
             return None;
         }
-        let text =
-            crate::metadata_io::read_bounded_regular_utf8(&owner.join("Cargo.toml"), 1 << 20)
-                .ok()?;
-        let parsed = aterm_toml::from_str::<aterm_toml::Value>(&text).ok()?;
-        return parsed.get("workspace").is_some().then_some(owner);
+        workspace_is_owner(home, &root).then_some(root)
+    };
+    let parsed = workspace_manifest(home, &package_owner, &manifest).ok()??;
+    if let Some(root) = workspace_definition(home, &package_owner, &manifest, &parsed, &manifest)? {
+        return owner(root);
     }
-    for ancestor in package.ancestors().skip(1).take(32) {
-        if !scope(home, ancestor) {
+    for ancestor in package.ancestors().skip(1) {
+        // Match Targo's finite ancestor iterator: never cross a packaged-source boundary;
+        // visit the package home itself, then stop before its parent.
+        if ancestor.ends_with("target/package") {
             break;
         }
         let path = ancestor.join("Cargo.toml");
-        if let Ok(text) = crate::metadata_io::read_bounded_regular_utf8(&path, 1 << 20) {
-            let parsed = aterm_toml::from_str::<aterm_toml::Value>(&text).ok()?;
-            if parsed.get("workspace").is_some() {
-                return Some(ancestor.to_path_buf());
-            }
+        if let Some(parsed) = workspace_manifest(home, &package_owner, &path).ok()?
+            && let Some(root) =
+                workspace_definition(home, &package_owner, &path, &parsed, &manifest)?
+        {
+            return owner(root);
+        }
+        if ancestor == package_home {
+            break;
         }
     }
-    Some(package.to_path_buf())
+    owner(package.to_path_buf())
 }
 
 #[cfg(unix)]
@@ -2100,7 +2288,7 @@ const READING_VERBS: &[&str] = &[
 /// keeps. Which verbs run without a lane is [`crate::reroute::LANE_FREE_QUERIES`], a separate
 /// rule. No alias or external `cargo-<verb>` can take a builtin's name: Targo and cargo run the
 /// builtin.
-const RESOLVING_VERBS: &[&str] = &["fetch", "tree", "metadata", "generate-lockfile"];
+const RESOLVING_VERBS: &[&str] = &["fetch", "tree", "metadata", "generate-lockfile", "update"];
 
 /// WHETHER A RESOLVING VERB'S LOCKFILE MAY LAND UNDER A TARGET OR BUILD DIRECTORY, which Targo then
 /// makes, `CACHEDIR.TAG` and all (`ops/lockfile.rs`): an embedded manifest, whose lock root is in
@@ -2609,6 +2797,16 @@ fn non_producing_command(args: &[String], tool: super::Tool, machine: &super::Ma
                 return matches!(word, "help" | "clean")
                     || READING_VERBS.contains(&word)
                     || (RESOLVING_VERBS.contains(&word)
+                        // Older Cargo versions' update --breaking/-b rewrites workspace
+                        // manifests. Only ordinary lock updates take this path, even
+                        // when a current driver no longer accepts that older flag.
+                        && !(word == "update"
+                            && line.iter().any(|arg| {
+                                arg == "--breaking"
+                                    || arg.starts_with("--breaking=")
+                                    || super::shorts(arg)
+                                        .is_some_and(|cluster| cluster.flags.contains('b'))
+                            }))
                         && !lockfile_may_land_in_a_target(&line, machine));
             }
         }
@@ -2677,15 +2875,22 @@ fn observe_with_placement(
     let at = usize::from(tool.is_cargo() && args.first().is_some_and(|arg| arg.starts_with('+')));
     // A `+toolchain` is no word `-C` is read from ([`super::directory_arg`]).
     let alias = |verb: &str| user_alias(verb, args, tool, machine);
+    // The placement this call was handed, else the one it would get. A handed placement is never
+    // decided again: admission makes the cache's parents, after which a fresh decision may name
+    // the cache instead of the workspace fallback chosen in a home that had none.
+    let placement = selected
+        .cloned()
+        .or_else(|| super::decide(args, tool, machine));
     let chosen = explicit_call_cache(args, tool, machine, &alias)
         .map(|chosen| (chosen, false))
         .or_else(|| {
-            let manifest = super::local_fallback_manifest(args, tool, machine, &alias)?;
-            let owner = workspace(home, &manifest)?;
+            let manifest =
+                super::local_fallback_manifests(args, tool, machine, placement.as_ref()?, &alias)?;
+            let owner = workspace_choices(home, &manifest, args, tool, machine)?;
             Some((
                 super::ExplicitCache {
                     target: owner.join("target"),
-                    manifest,
+                    manifests: manifest,
                     intermediates: None,
                 },
                 true,
@@ -2740,7 +2945,7 @@ fn observe_with_placement(
             Observation::Unmanaged
         });
     };
-    let Some(owner) = workspace(home, &chosen.manifest) else {
+    let Some(owner) = workspace_choices(home, &chosen.manifests, args, tool, machine) else {
         let target = under_home(&chosen.target, home).unwrap_or_else(|| chosen.target.clone());
         return suppress_unresolved(home, &target).map(|protected| {
             if protected {
@@ -2753,9 +2958,6 @@ fn observe_with_placement(
     if let Some(intermediates) = &chosen.intermediates {
         return observe_configured_outputs(home, &owner, &chosen.target, intermediates);
     }
-    let placement = selected
-        .cloned()
-        .or_else(|| super::decide(args, tool, machine));
     let quiet = matches!(
         placement.as_ref(),
         Some(super::BuildDir::Target(_) | super::BuildDir::TrustEnv(_))
@@ -3019,6 +3221,16 @@ fn with_machine<T>(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(_) => Err(()),
         },
+        read_manifest: &|path| match crate::metadata_io::read_bounded_regular_utf8(path, 1 << 20) {
+            Ok(text) => Ok(Some(text)),
+            // The metadata reader also calls redirected/non-regular inputs NotFound.
+            // Only actual absence may advance initial discovery; existence grants no owner.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => match path.try_exists() {
+                Ok(false) => Ok(None),
+                Ok(true) | Err(_) => Err(()),
+            },
+            Err(_) => Err(()),
+        },
         writable: &super::writable,
     })
 }
@@ -3158,6 +3370,15 @@ fn observe_selected_placement(
     selected: &super::BuildDir,
     require_explicit: bool,
 ) -> std::io::Result<bool> {
+    // Bind the actual selected call before admission mutates its own cache
+    // parents. The maintained still_selected keeps that location afterward;
+    // configuration, environment and physical ownership remain live inputs.
+    if super::decide(args, tool, machine).as_ref() != Some(selected) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the selected compiler build-directory plan changed before admission; no build started",
+        ));
+    }
     let observed = observe_for_producer_with_placement(
         args,
         tool,
@@ -3171,15 +3392,29 @@ fn observe_selected_placement(
         Observation::Owned | Observation::IntermediatesOwned
     ) && !non_producing_command(args, tool, machine)
     {
+        // Judge the plan before writing the placement's directory, so a refused admission
+        // leaves no build directory behind; the writability answer is held, so the cache
+        // parents admission just laid do not flip it.
+        still_placed(args, tool, machine, selected)?;
         prepare_unowned_placement(args, tool, home, machine, selected)?;
     }
-    if super::decide(args, tool, machine).as_ref() != Some(selected) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "the selected compiler build-directory plan changed during admission; no build started",
-        ));
-    }
+    still_placed(args, tool, machine, selected)?;
     Ok(observed == Observation::Owned)
+}
+
+fn still_placed(
+    args: &[String],
+    tool: super::Tool,
+    machine: &super::Machine<'_>,
+    selected: &super::BuildDir,
+) -> std::io::Result<()> {
+    if super::still_selected(args, tool, machine, selected) {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        "the selected compiler build-directory plan changed during admission; no build started",
+    ))
 }
 
 /// Scope limits cache custody, not the privacy of intermediates the shim selected. Observe
@@ -3210,11 +3445,13 @@ fn prepare_unowned_placement(
         }
         chosen.target
     } else {
-        let manifest = super::local_fallback_manifest(args, tool, machine, &|verb| {
+        let manifest = super::local_fallback_manifests(args, tool, machine, selected, &|verb| {
             user_alias(verb, args, tool, machine)
         })
         .ok_or_else(stop)?;
-        workspace(home, &manifest).ok_or_else(stop)?.join("target")
+        workspace_choices(home, &manifest, args, tool, machine)
+            .ok_or_else(stop)?
+            .join("target")
     };
     prepare_target_build_dir(&target)
 }
@@ -3265,7 +3502,13 @@ fn under_shared_cache(home: &Path, path: &Path, machine: &super::Machine<'_>) ->
 /// never looks into, app data and a file provider's domain are. A build of it owes no managed
 /// custody, wherever its target is.
 fn never_managed(home: &Path, manifest: &Path) -> bool {
-    let resolved = std::fs::canonicalize(manifest).unwrap_or_else(|_| manifest.to_path_buf());
+    // Only an actual manifest file identifies a package through its links. An existing
+    // non-file selected in a managed directory must refuse, not borrow the target
+    // directory's parent (HOME itself or foreign scope) to pass as an unmanaged package.
+    let resolved = std::fs::canonicalize(manifest)
+        .ok()
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| manifest.to_path_buf());
     resolved
         .parent()
         .is_none_or(|package| !scope(home, package))
@@ -3400,17 +3643,31 @@ fn owes_custody(
         let Some(cwd) = cwd.filter(|c| c.starts_with(home) && *c != home) else {
             return false;
         };
-        let found = cwd
-            .ancestors()
-            .take_while(|p| p.starts_with(home) && *p != home)
-            .take(32)
-            .find_map(|dir| {
-                super::checkout::MANIFESTS
-                    .iter()
-                    .map(|name| dir.join(name))
-                    .find(|path| !matches!((machine.read)(path), Ok(None)) || path.is_file())
+        // A failed read still identifies a package whose outputs may require custody.
+        // Use the command's supported readings: known native discovery must retain
+        // foreign-source pass-through; uncertain compatibility discovery must agree.
+        // Filesystem presence may require refusal when either supplied reader is opaque;
+        // it never authorizes an owner or changes configuration discovery semantics.
+        let evidence = |observation: Result<Option<String>, ()>, path: &Path| match observation {
+            Ok(None) if path.is_file() => Err(()),
+            observation => observation,
+        };
+        let read = |path: &Path| evidence((machine.read)(path), path);
+        let read_manifest = |path: &Path| evidence((machine.read_manifest)(path), path);
+        let moved = super::Machine {
+            cwd: Some(cwd),
+            read: &read,
+            read_manifest: &read_manifest,
+            ..*machine
+        };
+        let managed = super::initial_manifest_readings(args, tool, &moved)
+            .into_iter()
+            .any(|observation| match observation {
+                super::InitialManifest::Absent => false,
+                super::InitialManifest::Readable(path)
+                | super::InitialManifest::Unreadable(path) => !never_managed(home, &path),
             });
-        if found.is_none_or(|manifest| never_managed(home, &manifest)) {
+        if !managed {
             return false;
         }
         cwd.to_path_buf()
@@ -3563,7 +3820,7 @@ fn observe_for_producer_with_placement(
         && explicit_call_cache(args, tool, machine, &|verb| {
             user_alias(verb, args, tool, machine)
         })
-        .and_then(|chosen| workspace(home, &chosen.manifest))
+        .and_then(|chosen| workspace_choices(home, &chosen.manifests, args, tool, machine))
         .is_none()
     {
         return Err(refusal());
@@ -3994,12 +4251,17 @@ pub(super) fn plan_on(
         if receipt.retained {
             continue;
         }
-        if coordination
-            .as_ref()
-            .is_some_and(|guard| !guard.current(home, &receipt))
-        {
-            continue;
-        }
+        let advisory = match coordination {
+            Some(guard) => match guard.into_advisory(home, &receipt) {
+                Some(snapshot) => Some(snapshot),
+                None => continue,
+            },
+            None if receipt.package.is_none() => None,
+            None => continue,
+        };
+        // This snapshot supplies advisory candidates, never removal authority. Inventory can
+        // be expensive; let producers update custody while it runs. Reclaim rechecks its gates.
+        drop(_held_record);
         if let Some(pending) = &receipt.pending {
             if pending_owned(home, &receipt, pending) {
                 planned.push(super::Planned::staged(
@@ -4027,8 +4289,8 @@ pub(super) fn plan_on(
                 .map(super::Planned::stage),
         );
         let held = super::hold(&seen.locks).is_none();
-        if let Some(coordinator) = coordination {
-            if let Some(why) = coordinator.reason(home, &receipt) {
+        if let Some(snapshot) = advisory {
+            if let Some(why) = snapshot.reason() {
                 planned.push(super::Planned {
                     path: cache.root.clone(),
                     paths: vec![cache.root],
@@ -4425,6 +4687,14 @@ fn reclaim_selected_on<'policy>(
             if !takes {
                 continue;
             }
+            let Some(parent) = cache.root.parent() else {
+                fence.note(&cache.root, super::KeepReason::CannotStage);
+                continue;
+            };
+            // Its root moves into a stage made beside it: whether its name can be taken out of
+            // its folder is read before the intent, as a leaf's is, so a root flagged before the
+            // pass is kept with no intent on record, rather than asked for, refused at its rename
+            // and asked for again every other pass, as before.
             if !fence.admit(
                 &cache.root,
                 super::KeepReason::RegistrationChanged,
@@ -4439,16 +4709,16 @@ fn reclaim_selected_on<'policy>(
                 !coordination
                     .as_ref()
                     .is_some_and(|guard| !guard.current(home, &receipt)),
+            ) || !fence.admit(
+                &cache.root,
+                super::KeepReason::CannotStage,
+                super::movable(&cache.root, parent),
             ) || !fence.clear(&cache.root, &cache.root)
                 || !intents.ask(&cache.root, why)
                 || !fence.clear(&cache.root, &cache.root)
             {
                 continue;
             }
-            let Some(parent) = cache.root.parent() else {
-                fence.note(&cache.root, super::KeepReason::CannotStage);
-                continue;
-            };
             let Ok(stage) = aterm_tempfile::Builder::new()
                 .prefix("atpkg-cache-retiring-")
                 .tempdir_in(parent)

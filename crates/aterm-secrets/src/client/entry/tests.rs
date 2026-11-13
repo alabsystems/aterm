@@ -1299,7 +1299,10 @@ fn a_fleet_code_read_before_the_apply_finished_says_so_rather_than_none() {
     for (fault, said) in [
         ("failed", "did not finish"),
         ("pending", "did not finish"),
-        ("busy", "applying on this machine now"),
+        (
+            "busy",
+            "a vault pass on this machine has held the vault's state lock",
+        ),
     ] {
         let guard = match fault {
             "failed" => {
@@ -1316,7 +1319,9 @@ fn a_fleet_code_read_before_the_apply_finished_says_so_rather_than_none() {
             "busy" => Some(StateLock::take(&f.paths).unwrap()),
             _ => unreachable!(),
         };
-        let read = fleet::reserved_code(&f.paths, &expected);
+        let read = with_current_wait(Duration::from_millis(50), || {
+            fleet::reserved_code(&f.paths, &expected)
+        });
         drop(guard);
         match read {
             Err(error) => assert!(error.to_string().contains(said), "{fault}: {error}"),
@@ -1325,6 +1330,16 @@ fn a_fleet_code_read_before_the_apply_finished_says_so_rather_than_none() {
         save_state(&f.paths, &held).unwrap();
     }
     assert!(fleet::reserved_code(&f.paths, &expected).unwrap().is_some());
+    // A pass released within the wait is waited out: the code is read, not refused. NEGATIVE
+    // CONTROL (2026-11-11): with `StateLock::observe_judging` observing once, this read is the
+    // busy error the converge pass's `sync.fleet` row failed on.
+    let mut pass = Some(StateLock::take(&f.paths).unwrap());
+    let (read, tries) = test_while_state_lock_held(
+        move || drop(pass.take()),
+        || fleet::reserved_code(&f.paths, &expected),
+    );
+    assert!(read.unwrap().is_some());
+    assert!(tries >= 1, "the read met the held pass and waited");
 }
 
 #[test]

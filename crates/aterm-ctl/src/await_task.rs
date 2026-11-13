@@ -249,6 +249,12 @@ fn group(targets: Vec<Target>, pinned: bool, default: &str, dir: Option<&Path>) 
     groups
 }
 
+/// Whether any of `groups` is served by an aterm other than the one at `own`: a worker another
+/// aterm on this Mac hosts ([`group`]), or every target where the socket was pinned elsewhere.
+fn served_elsewhere(groups: &[Group], own: &str) -> bool {
+    groups.iter().any(|g| !same_socket_path(&g.sock, own))
+}
+
 enum Leg {
     /// `OK <n>`: the instance has the news the combine asked for.
     Answered(Vec<String>),
@@ -1096,6 +1102,11 @@ pub(crate) fn run_await_task(
         })
         .collect();
     let groups = group(targets, pinned, default, dir.as_deref());
+    let own = crate::own_instance_sock();
+    let _vouch = own
+        .as_deref()
+        .filter(|own| served_elsewhere(&groups, own))
+        .and_then(crate::vouch::hold);
     let legs = Legs {
         max: LEG_MAX,
         send: Arc::new(socket_leg),
@@ -1115,6 +1126,8 @@ pub(crate) fn run_driven(
     host: &str,
     drive: crate::FleetDriveFn,
 ) -> io::Result<ExitCode> {
+    // Another Mac serves this wait: this Mac's aterm vouches for it while it runs.
+    let _vouch = crate::own_instance_sock().and_then(|own| crate::vouch::hold(&own));
     // A Mac a person named answers for whatever sids it is asked: the board's keeper, which
     // asks each worker at its own Mac, keeps their rows.
     print_waited(
@@ -1131,6 +1144,7 @@ pub(crate) fn run_driven_any(
     drive: crate::FleetDriveFn,
     survey: Option<crate::FleetSurveyFn>,
 ) -> io::Result<ExitCode> {
+    let _vouch = crate::own_instance_sock().and_then(|own| crate::vouch::hold(&own));
     let (waited, at) = driven_wait_any(parts, total, drive, survey)?;
     // Each worker the board holds was asked at the Mac its row names.
     print_waited(waited, &at, crate::board::Writes::Rows)
@@ -1488,6 +1502,9 @@ pub(crate) fn run_board_wait(
     drive: Option<crate::FleetDriveFn>,
     follow: &redial::Redial,
 ) -> io::Result<ExitCode> {
+    // A board's workers are asked where each is hosted, another aterm or another Mac among them:
+    // this process's own aterm vouches for the wait while it runs.
+    let _vouch = crate::own_instance_sock().and_then(|own| crate::vouch::hold(&own));
     let at = site.at;
     let mut words = parts.to_vec();
     words.remove(2);

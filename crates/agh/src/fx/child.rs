@@ -18,6 +18,10 @@ use crate::error::{Error, Result, SideEffect};
 /// A child's bound when nothing names another.
 const DEFAULT_BUDGET: Duration = Duration::from_secs(60);
 
+/// Maximum complete record spool, shared by the native writer and its consumer.
+#[cfg(unix)]
+pub(crate) const MAX_RECORD_SPOOL_BYTES: usize = deadline::MAX_COMPLETE_LISTING_BYTES;
+
 /// One child.
 #[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
@@ -46,6 +50,10 @@ pub struct ChildSpec {
     pub(crate) input: Option<Vec<u8>>,
     #[cfg(unix)]
     config_input: Option<ConfigQuery>,
+    /// Complete newline records spooled to one new owned regular file. This
+    /// changes storage, never the one-MiB diagnostic retention policy.
+    #[cfg(unix)]
+    pub(crate) stdout_records: Option<PathBuf>,
 }
 
 /// A child execution bound based on evidence of progress, not elapsed wall time.
@@ -62,6 +70,7 @@ pub struct ProgressBound {
 #[cfg(unix)]
 pub(crate) enum ConfigQuery {
     Names { read_only: bool },
+    CommitRead,
     WorktreeFlag,
 }
 
@@ -78,6 +87,7 @@ impl ConfigQuery {
                 "--name-only",
                 "-z",
             ],
+            Self::CommitRead => &["config", "--file", "-", "--no-includes", "--list", "-z"],
             Self::WorktreeFlag => &[
                 "config",
                 "--file",
@@ -119,6 +129,8 @@ impl ChildSpec {
             input: None,
             #[cfg(unix)]
             config_input: None,
+            #[cfg(unix)]
+            stdout_records: None,
         }
     }
 
@@ -169,7 +181,7 @@ impl ChildSpec {
     }
 
     /// Git configuration can contain secrets. Only use this for the runner's
-    /// fixed name-only or boolean queries: their stdout contains no values,
+    /// fixed parsers: their stdout is projected to a safe verdict or boolean,
     /// and their stderr is withheld before it reaches Fx recording or errors.
     #[cfg(unix)]
     pub(crate) fn config_input(mut self, bytes: &[u8], query: ConfigQuery) -> ChildSpec {
@@ -345,6 +357,15 @@ pub(crate) fn run_unless(spec: &ChildSpec, stopped: &mut dyn FnMut() -> bool) ->
     } else {
         spawnfd::Stdio::null()
     };
+    #[cfg(unix)]
+    if let Some(path) = &spec.stdout_records {
+        if spec.config_input.is_some() || spec.input.is_some() {
+            return Err(Error::local(
+                "record spool requires a fixed input-free query",
+            ));
+        }
+        return run_record_spool(spec, &mut cmd, input, path, stopped);
+    }
     let output = match &spec.progress {
         Some(progress) => deadline::output_from_while_process_progressing_unless(
             &mut cmd,
@@ -384,6 +405,92 @@ pub(crate) fn run_unless(spec: &ChildSpec, stopped: &mut dyn FnMut() -> bool) ->
     Ok(out)
 }
 
+/// This uses the same owning group collector and caller stop token. Complete
+/// EOF is required; escaped descendants remain outside the collector contract.
+#[cfg(unix)]
+fn run_record_spool(
+    spec: &ChildSpec,
+    cmd: &mut spawnfd::Command,
+    input: spawnfd::Stdio,
+    path: &Path,
+    stopped: &mut dyn FnMut() -> bool,
+) -> Result<ChildOut> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    use std::sync::{Arc, OnceLock};
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::local("record spool has no parent"))?;
+    aterm_uds::private_file::check_private_dir(parent)
+        .map_err(|error| Error::local(format!("record spool directory: {error}")))?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|error| Error::local(format!("record spool: {error}")))?;
+    let failure = Arc::new(OnceLock::<String>::new());
+    let observed = failure.clone();
+    let mut written = 0usize;
+    let consume = move |record: &[u8]| {
+        if observed.get().is_none() {
+            let next = written.checked_add(record.len() + 1);
+            if next.is_none_or(|n| n > MAX_RECORD_SPOOL_BYTES) {
+                let _ = observed.set("record spool exceeds its finite byte bound".into());
+            } else if let Err(error) = file.write_all(record).and_then(|_| file.write_all(b"\n")) {
+                let _ = observed.set(format!("record spool write: {error}"));
+            } else {
+                written = next.unwrap();
+            }
+        }
+        false // all inventory DATA is on disk, never retained in ChildOut's heap
+    };
+    let failed_sink = failure.clone();
+    let mut stop_on_failure = || stopped() || failed_sink.get().is_some();
+    let captured = match &spec.progress {
+        Some(progress) => {
+            deadline::output_while_process_progressing_complete_stdout_records_unless(
+                cmd,
+                progress.window,
+                &progress.waiting_on,
+                b'\n',
+                42,
+                consume,
+                &mut stop_on_failure,
+            )
+            .map_err(|error| error.to_string())
+        }
+        None => deadline::output_within_complete_stdout_records_from_unless(
+            cmd,
+            input,
+            spec.budget,
+            b'\n',
+            42,
+            consume,
+            &mut stop_on_failure,
+        )
+        .map_err(|error| error.to_string()),
+    };
+    drop(stop_on_failure);
+    if let Some(why) = failure.get().cloned() {
+        return Err(Error::local(why).with_side_effect(SideEffect::Unknown));
+    }
+    let output = captured.map_err(|why| {
+        if stopped() {
+            interrupted(SideEffect::Unknown)
+        } else {
+            Error::local(format!("complete record spool: {why}"))
+                .with_side_effect(SideEffect::Unknown)
+        }
+    })?;
+    Ok(ChildOut {
+        code: output.status.code(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+    })
+}
+
 fn interrupted(effect: SideEffect) -> Error {
     Error::new(
         crate::error::Kind::Interrupted,
@@ -398,6 +505,9 @@ fn config_output(spec: &ChildSpec, mut out: ChildOut) -> ChildOut {
         out.stdout = match query {
             ConfigQuery::Names { read_only } if out.code == Some(0) => {
                 crate::git::project_config_names(&out.stdout, read_only)
+            }
+            ConfigQuery::CommitRead if out.code == Some(0) => {
+                crate::git::project_commit_config(&out.stdout)
             }
             ConfigQuery::WorktreeFlag
                 if out.code == Some(0)

@@ -13,8 +13,10 @@ pub(crate) const FOCUS_OUT: &[u8] = b"\x1b[O";
 
 /// A session sink whose writes land in the returned pipe's non-blocking read end.
 pub(crate) fn observer() -> ([i32; 2], Arc<SinkWriter>) {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    use std::os::fd::IntoRawFd;
+    let pipe = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(

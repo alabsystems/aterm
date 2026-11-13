@@ -75,6 +75,7 @@ fn record(local_id: u64) -> SessionRecord {
         status_seen: None,
         autopilot_end: None,
         wakes: None,
+        agent_act: None,
     }
 }
 
@@ -1479,26 +1480,6 @@ fn top_line(t: &Terminal) -> String {
         .unwrap_or_default()
 }
 
-/// A pipe whose read end never blocks: the test's stand-in for a PTY master.
-#[cfg(unix)]
-fn nonblocking_pipe() -> [i32; 2] {
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-    for fd in pipe {
-        assert_eq!(
-            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
-            0
-        );
-    }
-    let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
-    assert!(flags >= 0);
-    assert_eq!(
-        unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        0
-    );
-    pipe
-}
-
 /// What reaches a session after its adopt without anyone typing into it.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1519,13 +1500,16 @@ enum AfterAdopt {
 #[cfg(unix)]
 #[test]
 fn a_report_or_an_engine_reply_after_the_adopt_leaves_the_viewport_restore() {
+    use std::os::fd::AsRawFd as _;
     for after in [
         AfterAdopt::FocusReport,
         AfterAdopt::EngineReply,
         AfterAdopt::Key,
     ] {
-        let pipe = nonblocking_pipe();
-        let sink = Arc::new(aterm_session::sink::SinkWriter::new(pipe[1]));
+        // The test's stand-in for a PTY master, its read end never blocking.
+        let (read, write) = aterm_uds::pipe().expect("pipe");
+        aterm_pty::set_nonblocking(read.as_raw_fd(), true).expect("a nonblocking read end");
+        let sink = Arc::new(aterm_session::sink::SinkWriter::new(write.as_raw_fd()));
         let mut app = crate::App::headless_for_test_with_sink(Arc::clone(&sink));
         let wid = crate::WindowId(0);
         let session = app.front_terminal_mirror(wid).expect("a session").session;
@@ -1556,7 +1540,7 @@ fn a_report_or_an_engine_reply_after_the_adopt_leaves_the_viewport_restore() {
             }
         }
         let mut wrote = [0u8; 64];
-        let n = unsafe { libc::read(pipe[0], wrote.as_mut_ptr().cast(), wrote.len()) };
+        let n = unsafe { libc::read(read.as_raw_fd(), wrote.as_mut_ptr().cast(), wrote.len()) };
         let wrote = &wrote[..usize::try_from(n).unwrap_or(0)];
         match after {
             AfterAdopt::FocusReport => assert_eq!(wrote, b"\x1b[I", "the focus-in was sent"),
@@ -1577,10 +1561,7 @@ fn a_report_or_an_engine_reply_after_the_adopt_leaves_the_viewport_restore() {
         drop(ctx);
         drop(app);
         drop(sink);
-        unsafe {
-            libc::close(pipe[0]);
-            libc::close(pipe[1]);
-        }
+        drop((read, write));
     }
 }
 
@@ -1591,23 +1572,24 @@ fn a_report_or_an_engine_reply_after_the_adopt_leaves_the_viewport_restore() {
 #[cfg(unix)]
 #[test]
 fn a_pending_viewport_restore_keeps_no_pty_master_open() {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::AsRawFd as _;
 
-    let pipe = nonblocking_pipe();
-    let master = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-    let sink = Arc::new(aterm_session::sink::SinkWriter::new_owned(master));
+    // The test's stand-in for a PTY master, its read end never blocking.
+    let (read, master) = aterm_uds::pipe().expect("pipe");
+    aterm_pty::set_nonblocking(read.as_raw_fd(), true).expect("a nonblocking read end");
+    let sink = Arc::new(aterm_session::sink::SinkWriter::new_owned(master.into()));
     let input = Arc::new(crate::app_input::OutputEchoTracker::default());
     let dir = aterm_tempfile::tempdir().unwrap();
     let (successor, mut adopted) = scrolled_back_adoption(dir.path());
     adopted.watch_input(&input);
     let mut byte = [0u8; 1];
     // SAFETY: the pipe's read descriptor is live and byte is a writable one-byte buffer.
-    let held_read = unsafe { libc::read(pipe[0], byte.as_mut_ptr().cast(), 1) };
+    let held_read = unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
     let held_error = std::io::Error::last_os_error();
     assert_eq!(held_read, -1, "the live sink keeps the pipe open");
     assert_eq!(held_error.kind(), std::io::ErrorKind::WouldBlock);
     drop(sink);
-    let n = unsafe { libc::read(pipe[0], byte.as_mut_ptr().cast(), 1) };
+    let n = unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
     assert_eq!(
         n, 0,
         "the master closed when its tab did (EOF), import pending"
@@ -1618,9 +1600,7 @@ fn a_pending_viewport_restore_keeps_no_pty_master_open() {
         1000,
         "nothing was sent: the view is put back"
     );
-    unsafe {
-        libc::close(pipe[0]);
-    }
+    drop(read);
 }
 
 #[test]

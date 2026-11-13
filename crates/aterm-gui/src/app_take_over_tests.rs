@@ -1606,7 +1606,7 @@ fn next_need_starts_at_a_stopped_need_before_an_older_report() {
     app.push_stub_tab(wid, crate::stub_session(second));
     let second_ctx = app.pool.get(second).expect("pooled").ctx.clone();
     let report = crate::needs::HarnessAsk::told(
-        &["the release credential to sign 0.48.0".to_string()],
+        &["the release permission to sign 0.48.0".to_string()],
         aterm_phase::Program::Claude,
     );
     assert!(report.is_some(), "a report");

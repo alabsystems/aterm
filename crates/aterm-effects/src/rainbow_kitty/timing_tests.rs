@@ -3,6 +3,23 @@
 
 use super::*;
 
+#[test]
+fn easing_keeps_timing_nan_policy_and_curve_endpoints() {
+    assert_eq!(smoothstep01(f32::NAN), 0.0);
+    assert_eq!(smoothstep01(f32::NEG_INFINITY), 0.0);
+    assert_eq!(smoothstep01(f32::INFINITY), 1.0);
+    for (progress, eased) in [
+        (0.0, 0.0),
+        (0.25, 0.15625),
+        (0.5, 0.5),
+        (0.75, 0.84375),
+        (1.0, 1.0),
+    ] {
+        assert_eq!(smoothstep01(progress), eased);
+    }
+    assert!(aterm_scene::smoothstep(f32::NAN).is_nan());
+}
+
 /// The shared clocks are total, monotone and held to their bands: garbage
 /// in is the floor, more distance (or a slower tempo) never shortens a
 /// clock, and the rain fits inside its gesture for every flight.

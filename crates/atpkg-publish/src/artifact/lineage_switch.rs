@@ -57,13 +57,28 @@ pub fn read(ctx: &Ctx, trust_repo: &Path) -> Result<Switch> {
     Ok(read_switch(ctx, trust_repo))
 }
 
-fn read_switch(ctx: &Ctx, repo: &Path) -> Switch {
+/// What `repo`'s own refs say of the switch before [`read`] asks any host or origin.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Local {
+    /// The checkout alone settles the switch, whatever its origin names: [`Switch::Live`] when
+    /// its `refs/remotes/origin/main` carries a minted ledger, and [`Switch::Unknown`] when
+    /// there is no checkout, no origin/main, or no readable ledger there.
+    Settled(Switch),
+    /// Its `refs/remotes/origin/main` (this commit) carries a dormant ledger, so the switch is
+    /// what the trust repository's live main says: [`read`] asks the staging host's main of
+    /// record through the checkout's origin, or the origin itself under the `gh` host.
+    Deferred(String),
+}
+
+/// [`Local`] for `repo`: local Git reads alone, no request.
+#[must_use]
+pub fn read_locally(ctx: &Ctx, repo: &Path) -> Local {
     let shown = ctx.shown(repo);
     if repo.as_os_str().is_empty() || !repo.is_dir() {
-        return Switch::Unknown(format!(
+        return Local::Settled(Switch::Unknown(format!(
             "there is no trust checkout at {shown} to read it from; clone the trust repo \
              there and pack again"
-        ));
+        )));
     }
     let fetch = format!("git -C {shown} fetch origin main");
     let Some(here) = git_ok(
@@ -75,20 +90,27 @@ fn read_switch(ctx: &Ctx, repo: &Path) -> Switch {
             "refs/remotes/origin/main^{commit}",
         ],
     ) else {
-        return Switch::Unknown(format!(
+        return Local::Settled(Switch::Unknown(format!(
             "{shown} has no origin/main; run `{fetch}` and pack again"
-        ));
+        )));
     };
     match ledger_at(repo, &here) {
-        Ledger::Dormant => {}
-        Ledger::Minted => return Switch::Live,
-        Ledger::Unreadable => {
-            return Switch::Unknown(format!(
-                "{shown}'s origin/main ({}) has no readable {LEDGER}",
-                short(&here)
-            ));
-        }
+        Ledger::Dormant => Local::Deferred(here),
+        Ledger::Minted => Local::Settled(Switch::Live),
+        Ledger::Unreadable => Local::Settled(Switch::Unknown(format!(
+            "{shown}'s origin/main ({}) has no readable {LEDGER}",
+            short(&here)
+        ))),
     }
+}
+
+fn read_switch(ctx: &Ctx, repo: &Path) -> Switch {
+    let here = match read_locally(ctx, repo) {
+        Local::Settled(switch) => return switch,
+        Local::Deferred(here) => here,
+    };
+    let shown = ctx.shown(repo);
+    let fetch = format!("git -C {shown} fetch origin main");
     let required = |why: String| {
         Switch::Unknown(format!(
             "{shown}'s origin/main ({}) carries no minted re-pin, but {why}, so nothing shows \

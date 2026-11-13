@@ -44,6 +44,30 @@ impl PendingCustodyRestore {
                 .is_ok();
         Ok([legacy, profile, callback, exchange])
     }
+
+    /// [`Self::resources_available`] once every holder has let go, or its last observation when
+    /// `budget` passes first. A release is not seen at once: the callback listener is not made
+    /// through [`aterm_uds::kept_out`], and Linux ignores the close-on-fork mark anyway, so a
+    /// child another test thread forks meanwhile holds a copy of it until its `exec` closes it
+    /// (a parked fork, until it is let go), and the port listens until then. The profile and
+    /// exchange locks unlock explicitly, so they go at once. Callers pass the one-minute hang
+    /// detector; a resource nothing lets go fails there.
+    ///
+    /// # Errors
+    /// As [`Self::resources_available`], at once.
+    pub fn resources_released_within(
+        &self,
+        budget: std::time::Duration,
+    ) -> Result<[bool; 4], String> {
+        let deadline = std::time::Instant::now() + budget;
+        loop {
+            let resources = self.resources_available()?;
+            if resources == [true; 4] || std::time::Instant::now() >= deadline {
+                return Ok(resources);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
 }
 
 impl PendingCustodyFixture {

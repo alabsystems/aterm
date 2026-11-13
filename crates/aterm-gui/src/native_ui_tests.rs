@@ -5085,6 +5085,9 @@ fn a_resting_controls_rim_holds_3_to_1_against_its_ground() {
         StyleRef::Code,
         StyleRef::Chip,
         StyleRef::Note,
+        StyleRef::Faint,
+        StyleRef::FaintNote,
+        StyleRef::Unwritten,
     ];
     let action = || ActionId::new("test/control");
     let mut controls: Vec<(String, UiContent)> = Vec::new();

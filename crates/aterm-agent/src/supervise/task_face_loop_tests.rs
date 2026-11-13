@@ -341,7 +341,7 @@ fn a_restart_whose_first_read_is_the_landed_tasks_own_wake_keeps_the_landing() {
 fn a_cruise_done_claim_tells_no_end_and_a_persons_exchange_is_theirs() {
     for (last, check) in [
         ("Committed and pushed.\nATERM-TASK-DONE", false),
-        ("All done. Nothing left to do.", true),
+        ("All done. Nothing left to do.\n\nATERM-TASK-DONE", true),
     ] {
         let host = Arc::new(Faces::default());
         let mut screens = vec![busy_screen(), ended(PROGRESS), busy_screen(), ended(last)];
@@ -1328,7 +1328,7 @@ fn a_restarted_loop_lands_on_its_checks_landed_answer() {
 /// `land-nudge@v1` into the agent that can only wait for the person.
 #[test]
 fn a_rest_on_a_need_survives_a_loop_that_follows() {
-    let need = "NEEDS YOU: rotate the deploy key in the dashboard";
+    let need = "NEEDS YOU: rotate the deploy nod in the dashboard";
     let (dir, path) = files("rest-restarted", &[], &[]);
     let host = Arc::new(Faces::default());
     let screens = vec![
@@ -1376,7 +1376,7 @@ fn a_rest_on_a_need_survives_a_loop_that_follows() {
 fn an_off_no_person_set_keeps_lands_rest_at_the_loop() {
     use crate::supervise::approvals::{OFF_STOOD, OFF_STOOD_RESTING};
     use crate::supervise::policy::land_check::WAITS_ON_YOU;
-    let need = "NEEDS YOU: rotate the deploy key in the dashboard";
+    let need = "NEEDS YOU: rotate the deploy nod in the dashboard";
     let screens = || {
         vec![
             busy_screen(),
@@ -1482,7 +1482,7 @@ fn an_off_no_person_set_keeps_lands_rest_at_the_loop() {
 #[test]
 fn the_needs_entry_says_the_work_waits_on_you_where_nothing_carries_on() {
     use crate::harness::hold_said::NeedTail;
-    let need = "NEEDS YOU: rotate the deploy key in the dashboard";
+    let need = "NEEDS YOU: rotate the deploy nod in the dashboard";
     let ends = |tail: NeedTail| format!(" \u{2014} {}", tail.words());
     let entries = |m: &Mock| -> Vec<String> {
         m.requests
@@ -1551,7 +1551,7 @@ fn the_needs_entry_says_the_work_waits_on_you_where_nothing_carries_on() {
 #[test]
 fn the_needs_entry_says_the_work_waits_on_you_where_the_loop_stopped_typing() {
     use crate::harness::hold_said::NeedTail;
-    let blocked = "Blocked on the key.\nNEEDS YOU: add the deploy key in the dashboard";
+    let blocked = "Blocked on the nod.\nNEEDS YOU: add the deploy nod in the dashboard";
     let ends = |tail: NeedTail| format!(" \u{2014} {}", tail.words());
     let told = |word: &'static str, gates: Vec<usize>, tag: &str| {
         let (dir, path) = files(tag, &[], &[]);
@@ -1595,7 +1595,7 @@ fn the_needs_entry_says_the_work_waits_on_you_where_the_loop_stopped_typing() {
     assert!(
         entries
             .last()
-            .is_some_and(|e| e.contains("needs you: add the deploy key")
+            .is_some_and(|e| e.contains("needs you: add the deploy nod")
                 && e.ends_with(&ends(NeedTail::WaitsOnYou))),
         "the held repeat: {entries:#?}\n{lines:#?}"
     );
@@ -1615,7 +1615,7 @@ fn the_needs_entry_says_the_work_waits_on_you_where_the_loop_stopped_typing() {
 #[test]
 fn a_need_beside_a_failed_conclusion_says_the_work_waits_on_you() {
     use crate::harness::hold_said::NeedTail;
-    let need = "NEEDS YOU: rotate the deploy key in the dashboard";
+    let need = "NEEDS YOU: rotate the deploy nod in the dashboard";
     let told = |tag: &str, said: String| {
         let (dir, path) = files(tag, &[], &[]);
         let (lines, _, m) = run_kept_tracked(
@@ -3107,7 +3107,7 @@ fn a_tall_wake_with_a_need_above_the_screen_keeps_no_landing() {
             "⏺ The deploy finished.".to_string(),
         ];
         if need {
-            drawn.push("  NEEDS YOU: the signing credential expired".to_string());
+            drawn.push("  NEEDS YOU: the signing permission expired".to_string());
         }
         for call in 0..calls {
             drawn.extend([
@@ -3160,7 +3160,7 @@ fn a_tall_wake_with_a_need_above_the_screen_keeps_no_landing() {
         );
         let _ = std::fs::remove_dir_all(&dir);
         let raised = m.needs_calls.iter().any(|c| {
-            c.starts_with("set attention owner=needs ") && c.contains("the signing credential")
+            c.starts_with("set attention owner=needs ") && c.contains("the signing permission")
         });
         (tall, turns, host.told(), raised, lines)
     };

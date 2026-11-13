@@ -31,7 +31,7 @@ impl Review for Notes {
     }
 }
 
-const NEED: &str = "the App Store signing credential";
+const NEED: &str = "the App Store signing permission";
 
 fn said(lines: &[&str]) -> Vec<String> {
     let mut drawn = vec![format!("⏺ {}", lines[0])];
@@ -1770,7 +1770,7 @@ fn slow_needs_metadata_never_starves_an_existing_look() {
 fn a_set_that_moves_under_the_same_entry_is_told() {
     let (a, b, c) = (
         NEED,
-        "the release credential to sign 0.48.0",
+        "the release permission to sign 0.48.0",
         "a reply on the pricing page wording",
     );
     let host = Arc::new(Hears::default());
@@ -1818,7 +1818,7 @@ fn a_set_that_moves_under_the_same_entry_is_told() {
 #[test]
 fn a_lost_request_leaves_the_window_told_what_stands() {
     let lost = || replaced("aterm (pid 10) went away before it answered (exit 75)");
-    let other = "the release credential to sign 0.48.0";
+    let other = "the release permission to sign 0.48.0";
     let three = |first: &str, second: &str| {
         vec![
             busy_screen(),

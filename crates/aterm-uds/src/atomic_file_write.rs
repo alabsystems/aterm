@@ -18,6 +18,23 @@ pub fn write(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     write_checked(path, bytes, mode, || Ok(()))
 }
 
+/// [`write`], telling where it failed: the outer `Err` before the rename (`path` is as it was),
+/// the inner one from the directory's flush after it (`path` holds `bytes`, but its entry may
+/// not survive a power loss). A writer that promises something once the bytes are in place,
+/// such as an outbox that answers `queued`, keeps that promise on the inner `Err`.
+/// # Errors
+/// As [`write`], split as above.
+pub fn write_landed(path: &Path, bytes: &[u8], mode: u32) -> io::Result<io::Result<()>> {
+    write_landing(
+        path,
+        bytes,
+        mode,
+        || Ok(()),
+        Some(Flush::Durable),
+        best_effort(Flush::dir),
+    )
+}
+
 /// [`write`], finished by `flush`. Every arm writes a temporary beside `path` and renames it
 /// over `path`, so while the machine runs a reader finds `path` as it was or holding all of
 /// `bytes`, never part of them. The arms differ in what a power loss may leave:

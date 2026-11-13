@@ -591,6 +591,34 @@ pub(super) struct Coordination {
 #[cfg(not(unix))]
 pub(super) struct Coordination;
 
+/// A validated planning snapshot. It holds no coordinator and grants no removal authority.
+pub(super) struct Advisory {
+    receipt: Receipt,
+}
+
+impl Advisory {
+    pub(super) fn reason(&self) -> Option<super::super::Unused> {
+        #[cfg(unix)]
+        {
+            reason_for_snapshot(&self.receipt, &Live)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = &self.receipt;
+            None
+        }
+    }
+}
+
+impl Coordination {
+    /// Validate while coordinated, then consume the guard before advisory inspection begins.
+    pub(super) fn into_advisory(self, home: &Path, receipt: &Receipt) -> Option<Advisory> {
+        self.current(home, receipt).then(|| Advisory {
+            receipt: receipt.clone(),
+        })
+    }
+}
+
 #[cfg(not(unix))]
 pub(super) fn coordinate(_: &Path, receipt: &Receipt) -> Result<Option<Coordination>, ()> {
     if receipt.package.is_some() {
@@ -604,9 +632,6 @@ pub(super) fn coordinate(_: &Path, receipt: &Receipt) -> Result<Option<Coordinat
 impl Coordination {
     pub(super) fn current(&self, _: &Path, _: &Receipt) -> bool {
         false
-    }
-    pub(super) fn reason(&self, _: &Path, _: &Receipt) -> Option<super::super::Unused> {
-        None
     }
 }
 
@@ -677,10 +702,6 @@ impl Coordination {
         recover_active(home, path, receipt, &self.declaration, fence, kernel)
     }
 
-    pub(super) fn reason(&self, home: &Path, receipt: &Receipt) -> Option<super::super::Unused> {
-        self.reason_on(home, receipt, &Live)
-    }
-
     pub(super) fn reason_on(
         &self,
         home: &Path,
@@ -690,18 +711,23 @@ impl Coordination {
         if !self.current(home, receipt) {
             return None;
         }
-        let policy = receipt.package.as_ref()?;
-        let bytes = footprint(&receipt.root)?;
-        if policy.superseded {
-            return Some(super::super::Unused::PackageSuperseded);
-        }
-        let low_disk = kernel.free(&receipt.root)? < DISK_FLOOR;
-        (bytes > policy.budget() || low_disk).then_some(super::super::Unused::PackageBudget {
-            allocated: bytes,
-            budget: policy.budget(),
-            low_disk,
-        })
+        reason_for_snapshot(receipt, kernel)
     }
+}
+
+#[cfg(unix)]
+fn reason_for_snapshot(receipt: &Receipt, kernel: &dyn Kernel) -> Option<super::super::Unused> {
+    let policy = receipt.package.as_ref()?;
+    let bytes = footprint(&receipt.root)?;
+    if policy.superseded {
+        return Some(super::super::Unused::PackageSuperseded);
+    }
+    let low_disk = kernel.free(&receipt.root)? < DISK_FLOOR;
+    (bytes > policy.budget() || low_disk).then_some(super::super::Unused::PackageBudget {
+        allocated: bytes,
+        budget: policy.budget(),
+        low_disk,
+    })
 }
 
 #[cfg(unix)]
@@ -844,8 +870,12 @@ fn admit_on(
     if !held_coordinator(home, &declaration) {
         return Err("package coordinator is not held by the producer guardian".into());
     }
-    let workspace =
-        super::workspace(home, args.manifest).ok_or("package workspace cannot be established")?;
+    let cwd =
+        std::env::current_dir().map_err(|_| "package working directory cannot be established")?;
+    let workspace = super::with_machine(Some(&cwd), &|name| std::env::var_os(name), |machine| {
+        super::workspace(home, args.manifest, &[], super::super::Tool::Targo, machine)
+    })
+    .ok_or("package workspace cannot be established")?;
     let path = receipt_path(home, args.target).ok_or("package target cannot be addressed")?;
     let existing = super::read(&path);
     if existing

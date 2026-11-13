@@ -300,6 +300,7 @@ pub(super) fn self_claimed_after_exit(
     let session = key(&tab);
     let from = snap.version.clone().unwrap_or_else(|| "-".to_string());
     let mut r = Report {
+        rung: None,
         pid: snap.pid,
         tab: tab.clone(),
         session: session.clone(),
@@ -328,6 +329,16 @@ pub(super) fn self_claimed_after_exit(
         Ok(prior) => prior,
         Err(_) => return said(r, format!("wait:{}", super::UNREAD_SAVED_RECORD)),
     };
+    let cause_word = match cause {
+        ExitCause::Stall => CAUSE_STALL,
+        ExitCause::Asked => CAUSE_ASKED,
+        ExitCause::HostEnded => CAUSE_HOST,
+        ExitCause::Exit | ExitCause::Carried => CAUSE_EXIT,
+    };
+    // The receipt an earlier record of this very exit read from its restart's stamp, which that
+    // record's filing consumed: an attempt whose admission settled another row closes that record
+    // below and files a new one, which keeps the receipt the stamp can no longer give.
+    let mut receipt = None;
     if let Some(mut st) = prior.filter(St::in_flight) {
         let want_cwd = resume.cwd.as_deref().unwrap_or(snap.cwd.as_str());
         // A record an earlier build wrote names its TUI by pid alone: it takes the start the
@@ -342,6 +353,9 @@ pub(super) fn self_claimed_after_exit(
         {
             st.resume_start.clone_from(&snap.start);
             return carry_in_flight_with(opts, r, st, &session, k);
+        }
+        if st.names(snap.pid, &snap.start) && st.cause == cause_word {
+            receipt = st.line_input.clone();
         }
         if !opts.dry_run {
             st.close_overtaken("resumed-elsewhere", now_s());
@@ -389,17 +403,11 @@ pub(super) fn self_claimed_after_exit(
         from: from.clone(),
         to: from,
         source: SAME_PROGRAM.to_string(),
-        cause: match cause {
-            ExitCause::Stall => CAUSE_STALL,
-            ExitCause::Asked => CAUSE_ASKED,
-            ExitCause::HostEnded => CAUSE_HOST,
-            ExitCause::Exit | ExitCause::Carried => CAUSE_EXIT,
-        }
-        .to_string(),
+        cause: cause_word.to_string(),
         salt: now,
         exited_at: now,
         phase: Phase::Exiting { at_s: now },
-        line_input: super::super::relaunch::restart_input(opts, snap, cause),
+        line_input: super::super::relaunch::restart_input(opts, snap, cause).or(receipt),
         ..St::default()
     };
     save(opts, &session, &st);
@@ -535,6 +543,7 @@ fn relaunch_held(
         PromptLook::of(st),
         || lock_free(k),
         |c, pid, tab| k.in_tab(c, pid, tab),
+        super::agent_image::Lane::CodexAlab,
     );
     let unanswered = typed == Err(RelaunchLineError::Unanswered);
     match typed {
@@ -756,6 +765,7 @@ pub(super) fn carry_in_flight_with(
     k: &dyn AlabKernel,
 ) -> Report {
     let r = Report {
+        rung: None,
         pid: st.pid,
         tab: st.tab.clone(),
         session: session.to_string(),
@@ -890,6 +900,7 @@ pub(super) fn in_flight_records(
             continue;
         }
         let r = Report {
+            rung: None,
             pid: st.pid,
             tab: st.tab.clone(),
             session: session.clone(),
@@ -1016,6 +1027,7 @@ pub(super) fn snapshot_with_claim(
         },
     };
     Ok(super::super::relaunch::Snapshot {
+        lifetime: None,
         auth_observed: false,
         launch_env: None,
         tab: tab.to_string(),

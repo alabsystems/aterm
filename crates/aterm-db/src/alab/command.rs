@@ -69,7 +69,10 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
                     and waits; it is removed once closed.\n\
                     --apply into a registry this Mac holds nothing of waits while a peer's\n\
                     recent repair round shows the lab holds it. It exits 1 where it wrote the\n\
-                    rows but not the providers they name: run it again\n\
+                    rows but not the providers they name: run it again. A Mac the vault's roster\n\
+                    seats is matched to the row it has; one with no row gets a row only where a\n\
+                    source names it, and registers itself otherwise (`adopt --dry-run\n\
+                    --findings` lists those)\n\
   import --fleet-db --digest\n\
                     the replica's keyed digest under the newest [everyone] epoch held here (its\n\
                     first 8 hex) and its row counts, so two holders compare replicas; never a\n\
@@ -82,9 +85,11 @@ pub const USAGE: &str = "aterm db alab — the ALab lab model on Commons (Unix)\
                     reference and unique clash, what this Mac's self-registration decides\n\
                     now and why (registration; its findings join lab), writing nothing, and\n\
                     whether this Mac's journal is on\n\
-  adopt [--dry-run|--apply]\n\
+  adopt [--dry-run|--apply] [--findings]\n\
                     bind the Macs the vault's swarm roster names to their machine rows, by fleet\n\
-                    node, host, then label or alias; never births a row\n\
+                    node, host, then label or alias; never births a row. --findings lists each\n\
+                    finding, a Mac no row answers among them, where the report otherwise counts\n\
+                    them by kind\n\
   merge [--dry-run|--apply]\n\
                     fold each machine row that shares a name with a node-bound row into that\n\
                     row (merged_into): the Mac's current name is its label and the others its\n\
@@ -1119,10 +1124,10 @@ fn uncovered(
             vendors,
             sealer,
             now_ms,
-            births: true,
+            births: import::Births::Named,
             unread: &[],
         };
-        let plan = import::plan(&input, &view.cells)?;
+        let plan = import::plan(&input, view)?;
         let projections: BTreeMap<&str, Projection> = [
             &registry::ADDRESS,
             &registry::MAILBOX,
@@ -1415,7 +1420,7 @@ impl Sources<'_> {
             vendors: self.vendors,
             sealer,
             now_ms: self.now_ms,
-            births: true,
+            births: import::Births::Named,
             unread: self.unread,
         }
     }
@@ -1441,7 +1446,7 @@ fn dry_plan_with<T>(
                    sealer: &dyn Sealer,
                    extra: &mut Option<T>|
      -> Result<(Plan, &'static str, usize)> {
-        let plan = import::plan(&sources.input(sealer), &view.cells)?;
+        let plan = import::plan(&sources.input(sealer), view)?;
         let seeds = crate::att::pack(super::seeds::rows_for(&view.cells)?)?.len();
         let _ = extra;
         Ok((
@@ -1466,7 +1471,7 @@ fn dry_plan_with<T>(
         }
         Err(_) => {
             let cells = Default::default();
-            let plan = import::plan(&sources.input(&Unheld), &cells)?;
+            let plan = import::plan_unheld(&sources.input(&Unheld))?;
             let seeds = crate::att::pack(super::seeds::rows_for(&cells)?)?.len();
             Ok((plan, "not held here", seeds, None))
         }
@@ -1628,7 +1633,7 @@ fn import(
         let pass = std::time::Instant::now() + IMPORT_PASS;
         let (plan, applied) = handle.commit_sealed_until(true, pass, |view, sealer| {
             empty_view_guard(paths, view.ops.len(), catalog, now_ms)?;
-            let mut plan = import::plan(&sources.input(sealer), &view.cells)?;
+            let mut plan = import::plan(&sources.input(sealer), view)?;
             let rows = std::mem::take(&mut plan.rows);
             Ok((plan, rows))
         })?;
@@ -1818,13 +1823,13 @@ fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
         vendors: &NoSheets,
         sealer: &Unheld,
         now_ms,
-        births: false,
+        births: import::Births::None,
         unread: &[],
     };
     let handle = Handle::at(paths.clone(), &att::REGISTRY);
     if args.apply {
         let (plan, applied) = handle.commit_derived(false, |view| {
-            let mut plan = import::plan(&input, &view.cells)?;
+            let mut plan = import::plan(&input, view)?;
             let rows = std::mem::take(&mut plan.rows);
             Ok((plan, rows))
         })?;
@@ -1835,7 +1840,7 @@ fn adopt(paths: &Paths, args: &Args, now_ms: u64) -> Result<Value> {
         return Ok(report);
     }
     let view = handle.view()?;
-    let plan = import::plan(&input, &view.cells)?;
+    let plan = import::plan(&input, &view)?;
     let mut report = summary(&plan, &[], &macs, "held", args.findings);
     insert(&mut report, "dry_run", json!(true));
     insert(

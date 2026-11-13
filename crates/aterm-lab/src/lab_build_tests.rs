@@ -49,9 +49,14 @@ fn the_commit_is_the_checkouts_read_at_run_time() {
     assert!(head.bytes().all(|b| b.is_ascii_hexdigit()), "{head}");
     assert!(check_build(&format!("aterm-lab+g{head}")).is_ok());
 
-    // The measured ledger is no part of the stamp; any other change is.
-    std::fs::create_dir_all(repo.join("docs/measured")).expect("ledger");
-    std::fs::write(repo.join("docs/measured/run.md"), "x").expect("ledger entry");
+    // The ledger folder the shared stamp rule excludes (`stamp_paths::PATHSPEC`) is no part of
+    // the stamp; any other change is.
+    let ledger = stamp_paths::PATHSPEC
+        .iter()
+        .find_map(|spec| spec.strip_prefix(":(top,exclude)"))
+        .expect("the stamp rule excludes the ledger folder");
+    std::fs::create_dir_all(repo.join(ledger)).expect("ledger");
+    std::fs::write(repo.join(ledger).join("run.md"), "x").expect("ledger entry");
     assert_eq!(commit_of(&repo), head, "a ledger entry leaves it clean");
     std::fs::write(repo.join("new.rs"), "x").expect("a new file");
     assert_eq!(

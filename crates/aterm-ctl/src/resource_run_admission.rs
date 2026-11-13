@@ -69,27 +69,41 @@ pub(super) fn run(wire: &super::super::ConnWire, sid: &str, args: &Args) -> io::
         timeout_ms: resources.timeout_ms,
     };
     request.validate()?;
-    if !capability_value(wire).is_ok_and(|value| {
-        value["ready"].as_bool() == Some(true)
-            && (!args.accounted
-                || value["accounting"].as_str() == Some("owning-wait-accounting-v1"))
-            && (args.expected_store.is_none()
-                || value["root_store_expectation"].as_str()
-                    == Some(transport::store_expectation::CAPABILITY))
-    }) {
+    let preflight = capability_value(wire).and_then(|value| {
+        if value["ready"].as_bool() != Some(true) {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "retained host custody is not ready before submission",
+            ));
+        }
+        if args.accounted && value["accounting"].as_str() != Some("owning-wait-accounting-v1")
+            || args.expected_store.is_some()
+                && if transport::native_store::eligible(&request) {
+                    value["native_job_root_store_expectation"].as_str()
+                        != Some(transport::native_store::CAPABILITY)
+                } else {
+                    value["root_store_expectation"].as_str()
+                        != Some(transport::store_expectation::CAPABILITY)
+                }
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "retained host lacks the required custody protocol before submission",
+            ));
+        }
+        Ok(())
+    });
+    if let Err(error) = preflight {
         emit(
             &mut status,
             &EventFrame {
                 binding: request.binding.clone(),
                 event: Event::Refused {
-                    reason: "retained host custody unavailable before submission".into(),
+                    reason: format!("retained host preflight: {error}"),
                 },
             },
         )?;
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "retained host custody unavailable before submission",
-        ));
+        return Err(error);
     }
     let (events, host_events) = aterm_uds::kept_out(CtlStream::pair)?;
     let fds = transport::Attachments {
@@ -99,7 +113,11 @@ pub(super) fn run(wire: &super::super::ConnWire, sid: &str, args: &Args) -> io::
         events: host_events.into(),
     };
     let attached = if let Some(expected) = &args.expected_store {
-        transport::store_expectation::attach(
+        (if transport::native_store::eligible(&request) {
+            transport::native_store::attach
+        } else {
+            transport::store_expectation::attach
+        })(
             &wire.path,
             &request,
             fds,
@@ -143,21 +161,36 @@ fn capabilities(wire: &super::super::ConnWire) -> io::Result<ExitCode> {
 }
 
 fn capability_value(wire: &super::super::ConnWire) -> io::Result<aterm_json::Value> {
-    let reply = wire.request(&["resource-admission-v3".into(), "capabilities".into()]);
-    let value = match reply {
-        Ok(reply)
-            if reply.status == "OK resource-admission-v3 capabilities"
-                && reply.lines.len() == 1 =>
+    let reply = wire.request(&["resource-admission-v3".into(), "capabilities".into()])?;
+    if reply.status != "OK resource-admission-v3 capabilities" {
+        let kind = if reply
+            .status
+            .starts_with("ERR resource-admission-v3 refused ")
         {
-            let value: aterm_json::Value = aterm_json::from_str(&reply.lines[0])
-                .map_err(|_| io::Error::other("invalid host capability response"))?;
-            if value["version"].as_u64() != Some(3) || value["ready"].as_bool().is_none() {
-                return Err(io::Error::other("invalid host capability response"));
-            }
-            value
-        }
-        _ => aterm_json::json!({"version":3,"ready":false,"reason":"host protocol unavailable"}),
-    };
+            io::ErrorKind::PermissionDenied
+        } else {
+            io::ErrorKind::InvalidData
+        };
+        return Err(io::Error::new(kind, reply.status));
+    }
+    if reply.lines.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid host capability response",
+        ));
+    }
+    let value: aterm_json::Value = aterm_json::from_str(&reply.lines[0]).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid host capability response",
+        )
+    })?;
+    if value["version"].as_u64() != Some(3) || value["ready"].as_bool().is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid host capability response",
+        ));
+    }
     Ok(value)
 }
 

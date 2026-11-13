@@ -14,13 +14,17 @@ fn the_park_notes_its_carry_and_the_commit_closes_only_the_rest() {
     let shown = parent
         .post_message(Message::new(tags::CONFIG, Severity::Warn, "Disk nearly full").line("why"));
     let unrevealed = parent.post_message(
-        Message::new(tags::PACKAGES, Severity::Info, "Checking ALab tools")
-            .in_flight()
-            .key("toolchain.pass")
-            .hold(Hold::Live {
-                stale_after: STALE_TAILED,
-            })
-            .reveal_after(PROGRESS_GRACE),
+        Message::new(
+            tags::PACKAGES,
+            Severity::Info,
+            crate::toolchain_words::CHECKING_ALAB,
+        )
+        .in_flight()
+        .key("toolchain.pass")
+        .hold(Hold::Live {
+            stale_after: STALE_TAILED,
+        })
+        .reveal_after(PROGRESS_GRACE),
     );
     let window = parent.park_window_carry(0).expect("a window");
     let carried: Vec<u64> = window.messages.iter().map(|m| m.id).collect();

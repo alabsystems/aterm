@@ -53,7 +53,10 @@ impl ProofUses {
                 (
                     active + uses.active.len(),
                     pending + uses.pending.len(),
-                    ending + uses.ending.len(),
+                    // Exact End replay records outlive actual scope retirement.
+                    // Count only native captures which have not retired yet,
+                    // as the production credential-use admission check does.
+                    ending + uses.ending.values().filter(|use_| !use_.settled()).count(),
                 )
             })
     }

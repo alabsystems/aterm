@@ -133,12 +133,8 @@ pub(super) fn notary_profile(
 ) -> Result<String> {
     scope.require(&journal.subject, deadline)?;
     let modern = scope.paths.home.join(super::super::RELEASE_PROFILE);
-    let old = scope.paths.home.join(super::super::LEGACY_RELEASE_PROFILE);
-    let bytes = match crate::fsx::read_private(&modern, super::super::MAX_READ)? {
-        Some(bytes) => bytes,
-        None => crate::fsx::read_private(&old, super::super::MAX_READ)?
-            .ok_or_else(|| Error::new("probe has no authorized release profile"))?,
-    };
+    let bytes = crate::fsx::read_private(&modern, super::super::MAX_READ)?
+        .ok_or_else(|| Error::new("probe has no authorized release profile"))?;
     // Parse only the public profile-name assignment. Do not copy the profile's private
     // signing key into an extra TOML value merely to read one nonsecret field.
     let text = bytes

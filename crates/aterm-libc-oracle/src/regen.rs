@@ -29,7 +29,7 @@ use crate::union::Union;
 use crate::verdict::CouldNotRun;
 
 /// The reference libc's version, in the rustdoc dumps' names.
-pub const REFERENCE_VERSION: &str = "0.2.186";
+pub const REFERENCE_VERSION: &str = "0.2.191";
 
 /// The generator each module's seal line names ([`aterm_census::seal`]).
 pub const GENERATOR: &str = "`aterm-libc-oracle regen`";

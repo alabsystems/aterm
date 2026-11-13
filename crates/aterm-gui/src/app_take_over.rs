@@ -1001,6 +1001,21 @@ impl App {
         out
     }
 
+    /// Why the press being dispatched brings no other app up for `what` (a browser for a link,
+    /// Finder for a folder), which would come up over what the person is looking at: no person
+    /// is known to stand behind it ([`Self::gesture_unvouched`]: a control client's `act`, an
+    /// accessibility client's request, another process's relayed input). Logged; `None` for a
+    /// person's own click or key (owner ruling 2026-11-09).
+    pub(crate) fn other_app_press_refusal(&self, what: &str) -> Option<String> {
+        self.gesture_unvouched()?;
+        aterm_log::info!(
+            "desk: {what} was not opened for a press no person is known to stand behind"
+        );
+        Some(format!(
+            "{what} opens for a person's own click or key; press it in the window"
+        ))
+    }
+
     /// Whether a copy or a paste being dispatched is refused for its clipboard: a control
     /// client's gesture against the person's own clipboard. A debug build pointed at a lab file
     /// copies to nobody's clipboard ([`crate::control::reaches_persons_clipboard`]), so a lab's

@@ -26,6 +26,10 @@ pub(crate) struct CommitGateRecord {
     version: String,
     inputs: String,
     tags: String,
+    /// The run that judged (its log directory's name): what a later run that carries this
+    /// verdict names. No part of the judgment's inputs, so never compared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    run: Option<String>,
 }
 
 impl CommitGateRecord {
@@ -35,7 +39,14 @@ impl CommitGateRecord {
             version: version.into(),
             inputs,
             tags,
+            run: None,
         }
+    }
+
+    /// This record as the run named `run` writes it.
+    pub(crate) fn judged_by(mut self, run: &str) -> Self {
+        self.run = Some(run.into());
+        self
     }
 
     fn path(git: &dyn GitRunner) -> Result<PathBuf> {
@@ -51,15 +62,32 @@ impl CommitGateRecord {
     }
 
     pub(crate) fn adopt(&self, git: &dyn GitRunner) -> Result<()> {
+        self.recorded(git).map(|_| ())
+    }
+
+    /// The run whose recorded judgment has exactly this source, version, inputs seal and
+    /// advertised tag set: `None` in it where a record written before runs were named agrees.
+    ///
+    /// # Errors
+    /// No record, one that does not parse, or one of another judgment.
+    pub(crate) fn recorded(&self, git: &dyn GitRunner) -> Result<Option<String>> {
         let record = read_bounded_string(&Self::path(git)?, 1 << 20)
             .map_err(|e| Error::new(format!("read qualify's commit gates: {e}")))?;
         let recorded: Self = aterm_toml::from_str(&record)
             .map_err(|e| Error::new(format!("parse qualify's commit gates: {e}")))?;
-        self.agrees(&recorded)
+        self.agrees(&recorded)?;
+        Ok(recorded.run)
     }
 
     fn agrees(&self, recorded: &Self) -> Result<()> {
-        if self != recorded {
+        if (&self.source, &self.version, &self.inputs, &self.tags)
+            != (
+                &recorded.source,
+                &recorded.version,
+                &recorded.inputs,
+                &recorded.tags,
+            )
+        {
             return Err(Error::new(
                 "qualify's fixture/policy record has another source, version, inputs seal or advertised tag set; nothing was claimed",
             ));
@@ -1846,7 +1874,7 @@ pub fn harness_versions_before_bump_at(
 /// # Errors
 /// The ledger or origin's tags cannot be read, the ledger names earlier releases none of which
 /// shipped, or the previous release's commit is not in this clone.
-fn harness_versions_base(
+pub(crate) fn harness_versions_base(
     git: &dyn GitRunner,
     origin: &dyn crate::ledger::Origin,
     commit: &str,
@@ -1918,7 +1946,9 @@ pub fn channel_version_gate(repo: &Path, version: &str, offline: bool) -> Result
                 "the public channel {slug} is not readable with the available credential, so \
                  this cut cannot confirm it carries v{version} (GitHub's 404 means missing \
                  or unauthorized).\n\
-                 fix:  provide ~/.secrets/gh_access_token_alabsystems, or cut with --dry-run"
+                 fix:  the release-org token at {} reads it (`aterm secrets need gh:release` \
+                 asks the lab's Macs for one), or cut with --dry-run",
+                crate::publish::channel_token_pointer()
             )));
         }
         return Ok(None);
@@ -2246,7 +2276,8 @@ pub fn submodules_on_declared_branch(
     )))
 }
 
-/// What a claim commit changes on top of the commit it claims.
+/// What a claim commit changes on top of the commit it claims, beside the changelog entry
+/// files under `changes/` it deletes ([`claims_only`]).
 pub const CLAIM_FILES: [&str; 2] = [crate::changelog::CHANGELOG_FILE, crate::ledger::LEDGER_FILE];
 
 /// The cutter is its commit's own.
@@ -2321,12 +2352,13 @@ fn own_cutter_stamp_of(
             "cutter identity: content-proved from {} itself",
             short(commit)
         )),
-        // The cut claims R in a child commit that adds only CLAIM_FILES, which no cutter
-        // compiles in, so R's content proof covers it as it covers R. Without this a resume
+        // The cut claims R in a child commit that changes only CLAIM_FILES and deletes the
+        // changelog entry files it shipped, none of which a cutter compiles in, so R's content
+        // proof covers it as it covers R. Without this a resume
         // past the claim could run no cutter at all: the release flow freezes R's.
         Ok(crate::cutter::Stamp::Proved(stamp)) if claims_only(git, stamp, commit) => Ok(format!(
             "cutter identity: content-proved from {}, whose claim commit {} adds only its \
-                 ledger line and changelog roll",
+                 ledger line and changelog roll, and deletes the entry files it shipped",
             short(stamp),
             short(commit)
         )),
@@ -2397,7 +2429,7 @@ pub fn own_cutter_with(
     if claims_only(git, stamp, commit) {
         return Ok(format!(
             "cutter identity: built from {}, whose claim commit {} adds only its ledger \
-             line and changelog roll",
+             line and changelog roll, and deletes the entry files it shipped",
             short(stamp),
             short(commit)
         ));
@@ -2407,8 +2439,9 @@ pub fn own_cutter_with(
     ))
 }
 
-/// Whether `commit` is `stamp`'s claim commit: its first parent is `stamp` and it changes
-/// at least one of [`CLAIM_FILES`] and nothing else.
+/// Whether `commit` is `stamp`'s claim commit: its first parent is `stamp`, and against it it
+/// modifies one or both of [`CLAIM_FILES`] and deletes changelog entry files under `changes/`,
+/// and nothing else: no file added or changed there, nothing else moved.
 fn claims_only(git: &dyn GitRunner, stamp: &str, commit: &str) -> bool {
     let parent = git
         .git(&["rev-parse", "--verify", "-q", &format!("{commit}^1")])
@@ -2418,19 +2451,24 @@ fn claims_only(git: &dyn GitRunner, stamp: &str, commit: &str) -> bool {
     if parent.as_deref() != Some(stamp) {
         return false;
     }
-    let Ok(out) = git.git(&["diff", "--name-only", "--no-renames", stamp, commit]) else {
+    let Ok(out) = git.git(&["diff", "--name-status", "--no-renames", "-z", stamp, commit]) else {
         return false;
     };
     if !out.success() {
         return false;
     }
     let text = out.stdout_utf8();
-    let changed: Vec<&str> = text
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
-    !changed.is_empty() && changed.iter().all(|p| CLAIM_FILES.contains(p))
+    let fields: Vec<&str> = text.split('\0').filter(|f| !f.is_empty()).collect();
+    if fields.is_empty() || fields.len() % 2 != 0 {
+        return false;
+    }
+    let dir = format!("{}/", crate::changelog::FRAGMENT_DIR);
+    fields.chunks(2).any(|pair| pair[0] == "M")
+        && fields.chunks(2).all(|pair| match pair {
+            ["M", path] => CLAIM_FILES.contains(path),
+            ["D", path] => path.starts_with(&dir),
+            _ => false,
+        })
 }
 
 /// [`own_cutter`] as a gate, with its remedy.
@@ -2493,56 +2531,31 @@ fn tag_gate(
     Ok(())
 }
 
-/// The changelog gate (changelog.rs) for a commit, read from its objects.
+/// The changelog gate (changelog.rs) for a commit, read from its objects: the notes a release
+/// of `commit` would ship. A fresh window is `[Unreleased]` assembled from the raw entries still
+/// there and the entry files under `changes/` ([`changelog::Window`]); a recut is its
+/// `## [version]` section as it stands. Either is judged by the structural rules and against
+/// every earlier release's shipped entries in `catalog`'s tags ([`changelog::gate_published`]).
+/// The fresh window is judged without the derived harness announcement, which changes no
+/// verdict: it is generated well-formed, counts as no release note and no shipped entry, and its
+/// own rule is the harness versions gate's.
 ///
 /// # Errors
-/// The commit holds no changelog, or the cut's changelog refusal.
+/// The commit holds no changelog, an entry file breaks a rule, or the cut's changelog refusal.
 pub fn changelog_gate_at(
     git: &dyn GitRunner,
     commit: &str,
     version: &str,
     catalog: &str,
 ) -> Result<(String, changelog::GateSummary)> {
-    changelog_gate_at_with(git, commit, version, catalog, |at, text, section, keys| {
-        changelog::gate_history(git, at, text, section, keys)
-    })
-}
-
-fn changelog_gate_at_with(
-    git: &dyn GitRunner,
-    commit: &str,
-    version: &str,
-    catalog: &str,
-    mut audit: impl FnMut(&str, &str, &str, &std::collections::BTreeSet<String>) -> Result<()>,
-) -> Result<(String, changelog::GateSummary)> {
-    let text = GateTree::Commit { git, commit }.text(changelog::CHANGELOG_FILE)?;
-    let section = if changelog::has_section(&text, version) {
-        version
+    let window = changelog::Window::at(git, commit, version)?;
+    let (section, text) = if window.is_recut(version) {
+        (version, window.raw.clone())
     } else {
-        "Unreleased"
+        ("Unreleased", window.assembled(None)?)
     };
     let found = changelog_section_gate(&text, section)?;
-    let publication = changelog::gate_published(git, commit, version, &text, section, catalog)?;
-    let mut pending: std::collections::BTreeSet<_> =
-        changelog::note_keys(&text, section).into_iter().collect();
-    if let Some(publication) = publication {
-        let published = pending
-            .intersection(&publication.entries)
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        pending.retain(|key| !publication.entries.contains(key));
-        if !published.is_empty() {
-            audit(
-                &publication.source,
-                &publication.text,
-                &publication.section,
-                &published,
-            )?;
-        }
-    }
-    if !pending.is_empty() {
-        audit(commit, &text, section, &pending)?;
-    }
+    changelog::gate_published(git, version, &text, section, catalog)?;
     Ok((section.to_string(), found))
 }
 
@@ -3087,19 +3100,16 @@ pub fn github_identity_gate(offline: bool) -> Result<Option<String>> {
     if offline {
         return Ok(None);
     }
-    let token_path = crate::publish::channel_token_path().map_or_else(
-        || "~/.secrets/gh_access_token_alabsystems".to_string(),
-        |path| path.display().to_string(),
-    );
     if !crate::github::has_token() {
         return Err(Error::new(format!(
-            "no release token in {token_path}: the cut publishes as the release org's token, \
-             so put it there (one line, nothing else); nothing was claimed"
+            "the cut publishes as the release org's token, and {}; nothing was claimed",
+            crate::publish::no_channel_token()
         )));
     }
     let user = crate::github::get("user").map_err(|e| {
         Error::new(format!(
-            "GitHub did not take the release token in {token_path}: {e}; nothing was claimed"
+            "GitHub did not take the release token in {}: {e}; nothing was claimed",
+            crate::publish::channel_token_pointer()
         ))
     })?;
     Ok(user["login"].as_str().map(str::to_string))

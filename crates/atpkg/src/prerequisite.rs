@@ -673,6 +673,33 @@ impl HeldSet {
             .map(|(_, tool)| tool)
     }
 
+    /// The directory that exposes this set's fixed command names: a temporary path of this
+    /// acquisition alone, different in every process that acquires the same tools.
+    #[must_use]
+    pub fn directory(&self) -> &Path {
+        self.directory.path()
+    }
+
+    /// What a child finds under [`HeldSet::directory`], without that path: each exposed
+    /// command with the signed package, build and payload root it runs. Two acquisitions of
+    /// the same signed builds have one identity.
+    #[must_use]
+    pub fn identity(&self) -> String {
+        self.tools
+            .iter()
+            .map(|(want, tool)| {
+                format!(
+                    "{}={}@{}:{}",
+                    want.executable(),
+                    tool.program(),
+                    tool.build(),
+                    tool.tree_root()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
     /// Validate every held executable and put only the fixed requested names
     /// before the child's remaining PATH. Retain this set through child exit.
     ///

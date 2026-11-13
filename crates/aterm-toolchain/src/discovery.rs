@@ -847,7 +847,12 @@ impl Toolchain {
                 }
                 (Ok(locked), Some(prefix), None) => {
                     let standing = crate::trust_lock::locked_build(prefix, locked);
-                    lock_refusal = standing.refusal(found, locked);
+                    // Discovery takes `stage2_bin` (`TRUST_STAGE2_BIN`) ahead of any lock.
+                    lock_refusal = standing.refusal(
+                        found,
+                        locked,
+                        crate::trust_lock::LOCAL_SYSROOT_OR_STAGE2_REMEDY,
+                    );
                     match standing {
                         crate::trust_lock::LockedBuild::Present { bin } => {
                             commit_of = Some(locked);

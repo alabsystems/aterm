@@ -22,6 +22,10 @@ use aterm_phase::CliHarness;
 use aterm_phase::harness_version::{declared_in_source, source_line};
 
 const MANIFEST: &str = "Cargo.toml";
+/// One local git read's wait. A read with no input is a hang detector: it ends only after this
+/// long with no output and no CPU or I/O in its process tree, so a loaded Mac can make it take as
+/// long as it must. A read fed input ([`Reads::missing`]'s batch) still ends at this wall-clock
+/// limit; no progress-bound collector writes a child's input.
 const READ_WAIT: Duration = Duration::from_secs(60);
 /// The hang detector on the one import of the blobs a partial clone lacks; a test's import is a
 /// local fixture, held to the one-minute hang detector every test wait gets.
@@ -106,23 +110,26 @@ fn call(
         git.env("GIT_DIR", &view.git_dir)
             .env("GIT_OBJECT_DIRECTORY", &view.objects);
     }
-    let ran = match input {
-        None => aterm_uds::deadline::output_within(&mut git, READ_WAIT).map_err(|e| e.to_string()),
+    let read = format!("git {}", args.join(" "));
+    match input {
+        None => aterm_uds::deadline::output_while_process_progressing(&mut git, READ_WAIT, &read)
+            .map_err(|error| match error {
+                aterm_uds::deadline::ProgressError::Run(error) => format!("{read}: {error}"),
+                stalled @ aterm_uds::deadline::ProgressError::Stalled { .. } => stalled.to_string(),
+            }),
         Some(input) => aterm_uds::deadline::output_with_input_until(
             &mut git,
             aterm_uds::secret::Secret::new(input),
             Instant::now() + READ_WAIT,
             aterm_uds::deadline::MAX_COMPLETE_STDOUT_BYTES,
         )
-        .map_err(|e| e.to_string()),
-    };
-    ran.map_err(|error| {
-        format!(
-            "git {} did not answer within {} seconds: {error}",
-            args.join(" "),
-            READ_WAIT.as_secs()
-        )
-    })
+        .map_err(|error| {
+            format!(
+                "{read} did not answer within {} seconds: {error}",
+                READ_WAIT.as_secs()
+            )
+        }),
+    }
 }
 
 fn git(root: &Path, path_env: &OsStr, args: &[&str]) -> Result<Vec<u8>, String> {
@@ -462,14 +469,15 @@ fn release_version(text: &str) -> Option<(u64, u64, u64)> {
     (parts.next().is_none() && version.2 == 0).then_some(version)
 }
 
-/// The newest fetched public release tag no newer than the workspace version and reachable from
-/// `head`. Annotated tags contribute their peeled commit; lightweight tags their object.
-pub(crate) fn public_baseline(
+/// Every fetched public release tag no newer than the workspace version and reachable from
+/// `head`, oldest first, each with its commit. Annotated tags contribute their peeled commit;
+/// lightweight tags their object.
+pub(crate) fn public_releases(
     root: &Path,
     path_env: &OsStr,
     head: &str,
     current: &str,
-) -> Result<(String, String), String> {
+) -> Result<Vec<(String, String)>, String> {
     let current = release_version(current)
         .ok_or_else(|| format!("workspace version {current:?} is not MAJOR.MINOR.0"))?;
     let merged = format!("--merged={head}");
@@ -499,7 +507,20 @@ pub(crate) fn public_baseline(
         }
     }
     releases.sort_unstable_by_key(|release| release.0);
-    let Some((_, tag, commit)) = releases.pop() else {
+    Ok(releases
+        .into_iter()
+        .map(|(_, tag, commit)| (tag.trim_start_matches('v').to_string(), commit))
+        .collect())
+}
+
+/// The newest of [`public_releases`], its commit resolved.
+pub(crate) fn public_baseline(
+    root: &Path,
+    path_env: &OsStr,
+    head: &str,
+    current: &str,
+) -> Result<(String, String), String> {
+    let Some((version, commit)) = public_releases(root, path_env, head, current)?.pop() else {
         return Err(format!(
             "no fetched public vMAJOR.MINOR.0 tag at or before the workspace version is in {head}"
         ));
@@ -511,7 +532,7 @@ pub(crate) fn public_baseline(
     )?
     .trim()
     .to_string();
-    Ok((tag.trim_start_matches('v').to_string(), commit))
+    Ok((version, commit))
 }
 
 fn matches_source(source: &str, path: &str) -> bool {
@@ -527,16 +548,8 @@ fn is_source(harness: CliHarness, path: &str) -> bool {
         .any(|source| matches_source(source, path))
 }
 
-/// The newest fetched public release in this candidate's ancestry, shared by harness
-/// debt and the generated changelog line. Missing promisor blobs use the same batched reader.
-///
-/// # Errors
-/// The candidate, workspace version, public baseline or required git object cannot be read.
-pub fn baseline(root: &Path, head: &str, path_env: &OsStr) -> Result<(String, String), String> {
-    let (_, version, commit) = candidate_baseline(&Reads { root, path_env }, head)?;
-    Ok((version, commit))
-}
-
+/// The newest fetched public release in this candidate's ancestry. Missing promisor blobs use
+/// the same batched reader.
 fn candidate_baseline(reads: &Reads<'_>, head: &str) -> Result<(String, String, String), String> {
     let root = reads.root;
     let path_env = reads.path_env;

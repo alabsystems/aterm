@@ -127,11 +127,12 @@ fn named(mode: Mode) -> Resolved {
 /// Script the settings the click reads: their default `mode` named by [`SETTINGS`], or none
 /// named anywhere, and bypass turned off by [`SETTINGS`] where `bypass_off`.
 fn settings(app: &mut App, mode: Option<Mode>, bypass_off: bool) {
-    app.permission_clicks
-        .set_defaults(Defaults::new(move |_| PermissionDefault {
+    app.permission_clicks.set_defaults(Defaults::new(move |_| {
+        Some(PermissionDefault {
             mode: mode.map_or(Resolved::Unset, named),
             bypass_disabled: bypass_off.then(|| SETTINGS.into()),
-        }));
+        })
+    }));
 }
 
 /// Script the settings' default mode the click reads, bypass allowed.
@@ -775,6 +776,60 @@ fn a_right_press_on_the_chip_opens_its_box_and_clicks_nothing() {
     );
 }
 
+/// A BOX NEVER ACTS ON A MODE THE PILL NO LONGER READS. The box opened on yolo says a click
+/// leaves it; the agent then moves the pill to plan with no click. A press on the chip before
+/// any frame brought the box's words along only closes it: it stands nothing, where the click
+/// would now turn yolo ON, the other way's restart (the defect: the press read the stale words
+/// and stood the bypass line). A frame brings an open box's words to the pill: it says plan and
+/// that a click turns yolo on, and CONTROL: a press then stands what the box said.
+#[test]
+fn a_box_whose_pill_moved_acts_only_on_what_it_says_now() {
+    let first = a_minute_ago();
+    let leaves = Told::Shown(Mode::Bypass, Some(Would::Leave(named(Mode::AcceptEdits))));
+
+    let (mut app, wid, session, _reader, _host, _script) = claude_app(120, true);
+    default_mode(&mut app, Some(Mode::AcceptEdits));
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    assert!(app.explain_permission(wid, session));
+    assert_eq!(box_told(&app), Some(leaves.clone()), "precondition");
+    draw_claude(&app, session, PLAN);
+    assert_eq!(
+        app.permission_pill(session),
+        Some(Mode::Plan),
+        "the agent moved it"
+    );
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, first);
+    assert!(box_told(&app).is_none(), "the press closed the box");
+    assert!(
+        standing(&app, session).is_none(),
+        "and stood nothing the box did not say"
+    );
+
+    let (mut app, wid, session, _reader, _host, _script) = claude_app(120, true);
+    default_mode(&mut app, Some(Mode::AcceptEdits));
+    draw_claude(&app, session, BYPASS);
+    frame(&mut app, wid);
+    assert!(app.explain_permission(wid, session));
+    lay(&mut app, wid);
+    assert_eq!(box_told(&app), Some(leaves), "precondition");
+    draw_claude(&app, session, PLAN);
+    lay(&mut app, wid);
+    assert_eq!(
+        box_told(&app),
+        Some(Told::Shown(Mode::Plan, Some(Would::TurnOn))),
+        "a frame brings the box's words to the pill"
+    );
+    hover_light(&mut app, wid);
+    press_at(&mut app, wid, first);
+    assert_eq!(
+        standing(&app, session).map(|s| s.click.to),
+        Some(PermissionTo::Bypass),
+        "CONTROL: the press stands what the box now says"
+    );
+}
+
 /// THE BOX STAYS WHILE ITS CLICK STANDS, ITS CHIP GONE WITH THE AGENT: between the signal and
 /// the relaunch Claude Code's footer is off the screen, and the box, anchored at a chip no
 /// longer drawn, stays open because its click stands. NEGATIVE CONTROL: once the restart has
@@ -957,7 +1012,61 @@ fn a_click_is_never_decided_on_half_a_frame() {
     assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
 }
 
-/// A TAB WITH NO SNAPSHOT IS CLICKED ON THE CONVERSATION ITS FOOTER READ: the host publishes no
+/// A CLICK BEFORE THE RESOLVER'S FIRST READ OF ITS AGENT STANDS NOTHING: the production default
+/// of an agent the resolver has not read yet (a hover's ask still in flight, or a relaunched
+/// agent's new pid) is not told, so the click refuses as unread and asks for the read, rather than
+/// standing a restart a read default might refuse (the defect: the unread default let a click on
+/// the off chip stand the bypass line though the settings turn bypass off). Once the read is
+/// held the next click decides on it: bypass off explains and stands nothing; a CONTROL with
+/// bypass allowed stands the ask.
+#[test]
+fn a_click_before_the_settings_are_read_stands_nothing() {
+    for bypass_off in [true, false] {
+        let (mut app, wid, session, mut reader, _host, _script) = claude_app(80, false);
+        let tab = sid_of(&app, session);
+        app.permission_clicks
+            .set_defaults(crate::permission_click::live_defaults());
+        draw_claude(&app, session, AUTO);
+        frame(&mut app, wid);
+        app.click_permission(wid, session, Light::Mode);
+        assert!(
+            standing(&app, session).is_none(),
+            "no click on a default not read yet"
+        );
+        assert!(
+            matches!(
+                app.windows[&wid].claude_lights.sessions[&session].refused,
+                Some((Light::Mode, Said::SettingsUnread, _))
+            ),
+            "refused as not read yet"
+        );
+        crate::permission_click::hold_default_for_test(
+            &tab,
+            snapshot(&tab, FIRST).pid,
+            PermissionDefault {
+                mode: Resolved::Unset,
+                bypass_disabled: bypass_off.then(|| SETTINGS.into()),
+            },
+        );
+        app.click_permission(wid, session, Light::Mode);
+        if bypass_off {
+            assert!(
+                standing(&app, session).is_none(),
+                "the read turns bypass off"
+            );
+            assert_eq!(box_told(&app), Some(Told::BypassOff(SETTINGS.into())));
+        } else {
+            assert_eq!(
+                standing(&app, session).map(|s| s.click.to),
+                Some(PermissionTo::Bypass),
+                "CONTROL: a held read lets the click stand"
+            );
+        }
+        assert!(pty(&mut reader, 0).is_empty(), "nothing typed");
+    }
+}
+
+/// A TAB WITH NO SNAPSHOT IS CLICKED ON THE CONVERSATION ITS FOOTER READ:the host publishes no
 /// snapshot of an agent that started under Off, so the click keys on the conversation Claude
 /// Code's registry names for the program in front, as its footer facts were read, and stands.
 /// Measured on a real Claude Code: under Off such a tab refused every click as unread. NEGATIVE

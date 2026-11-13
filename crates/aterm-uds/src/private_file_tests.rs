@@ -8,9 +8,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::{
-    KeptParse, OwnedRead, PrivateDir, PrivateFileError, PrivateLock, PrivateRead, check_owned_dir,
-    create_private_dir, ensure_private_dir, judge_private_dir, open_private_rw, read_owned_into,
-    read_private, read_private_into, remove_private, write_private, write_private_new,
+    KeptParse, OwnedRead, Pin, PrivateDir, PrivateFileError, PrivateLock, PrivateRead, SETTLE,
+    Stamp, check_owned_dir, create_private_dir, ensure_private_dir, judge_private_dir,
+    open_private_rw, read_owned_into, read_private, read_private_into, remove_private, settle,
+    tally, write_private, write_private_new,
 };
 
 /// The busy text the lock tests hand [`PrivateLock::take`].
@@ -1105,31 +1106,371 @@ fn a_kept_parse_of_unchanged_bytes_is_not_parsed_again() {
 }
 
 /// A kept parse is handed back only after the file was opened and judged again: once its
-/// directory is no longer private the read is refused, though the file stands as it was.
-/// A warm parse also obeys each read's byte cap before invoking the parser.
+/// directory is no longer private the read is refused, though the file stands as it was, and
+/// the file is let go. A warm parse also obeys each read's byte cap before invoking the parser.
+/// Both hold for a parse found by its bytes and for one pinned to its file, which no byte is
+/// read for. NEGATIVE CONTROL: looking a pin up before the open (by the stamp
+/// `symlink_metadata` gives) hands the kept parse back from the directory open to others;
+/// keeping the entry of a refused file leaves its descriptor open.
 #[test]
 fn a_kept_parse_is_judged_at_every_read() {
-    use std::os::unix::fs::PermissionsExt as _;
+    fn judged(pinned: usize) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = aterm_tempfile::tempdir().unwrap();
+        let dir = dir_in(root.path(), "state", 0o700);
+        write_private(&dir, "book", b"held").unwrap();
+        let kept = KeptParse::new(4);
+        assert_eq!(
+            kept.read(&dir, "book", 64, <[u8]>::to_vec).unwrap(),
+            b"held"
+        );
+        assert_eq!(kept.pinned(), pinned);
+        assert!(matches!(
+            kept.read(&dir, "book", 3, |_| panic!(
+                "an oversized file is not parsed"
+            )),
+            Err(PrivateFileError::Malformed(_))
+        ));
+        assert_eq!(kept.read(&dir, "book", 4, <[u8]>::to_vec).unwrap(), b"held");
+        assert_eq!(kept.pinned(), pinned);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(
+            kept.read(&dir, "book", 64, <[u8]>::to_vec),
+            Err(PrivateFileError::NotPrivate(_))
+        ));
+        assert_eq!(kept.pinned(), 0, "a refused file is not held open");
+    }
+    // A file written this instant is not pinned: its parse is found by its bytes.
+    settle::after(Duration::from_secs(3600), || judged(0));
+    settle::none(|| judged(1));
+}
+
+/// A parse pinned to its file is handed back without a byte of the file read, while the file
+/// opened is that very file as it stood. A write over it (a rename, as [`write_private`]
+/// makes, here of the same length) is another file: it is read and parsed (what keeps it from
+/// the first one's inode number is the descriptor
+/// [`a_kept_parse_holds_its_file_open_for_as_long_as_it_is_kept`] counts). A write into the
+/// file that changes its length is read too, and a file that is gone is let go.
+/// NEGATIVE CONTROL: finding the pin by its path alone (`self.stamp == opened` dropped from
+/// `Pin::stands`) hands "first" back for "again"; reading the bytes at every call (the pin
+/// lookup dropped) lists the 5 bytes at the second read.
+#[test]
+fn a_kept_parse_of_a_file_nothing_replaced_reads_no_bytes() {
+    use std::io::Write as _;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    write_private(&dir, "book", b"first").unwrap();
+    let kept = KeptParse::new(4);
+    let parses = std::cell::Cell::new(0);
+    let parse = |bytes: &[u8]| {
+        parses.set(parses.get() + 1);
+        bytes.to_vec()
+    };
+    let read = || tally::counted(|| kept.read(&dir, "book", 64, parse).unwrap());
+    let whole = |bytes: usize| {
+        vec![tally::Read {
+            name: "book".to_owned(),
+            reads: 1,
+            bytes,
+        }]
+    };
+    settle::none(|| {
+        assert_eq!(read(), (b"first".to_vec(), whole(5)));
+        assert_eq!(kept.pinned(), 1);
+        assert_eq!(
+            read(),
+            (b"first".to_vec(), Vec::new()),
+            "a file nothing replaced is not read"
+        );
+        assert_eq!(parses.get(), 1);
+        write_private(&dir, "book", b"again").unwrap();
+        assert_eq!(
+            read(),
+            (b"again".to_vec(), whole(5)),
+            "a rewrite is read again"
+        );
+        assert_eq!(read(), (b"again".to_vec(), Vec::new()));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("book"))
+            .unwrap()
+            .write_all(b"longer!")
+            .unwrap();
+        assert_eq!(
+            read(),
+            (b"longer!".to_vec(), whole(7)),
+            "a write into the file that moves its length is read"
+        );
+        assert_eq!((parses.get(), kept.pinned()), (3, 1));
+        std::fs::remove_file(dir.join("book")).unwrap();
+        assert!(matches!(
+            kept.read(&dir, "book", 64, parse),
+            Err(PrivateFileError::Missing)
+        ));
+        assert_eq!(kept.pinned(), 0, "a file that is gone is not held open");
+    });
+}
+
+/// The file `path` names now: its device and inode number.
+fn file_at(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::metadata(path).unwrap();
+    (meta.dev(), meta.ino())
+}
+
+/// How many descriptors of this process are open on `file` ([`file_at`]): each one `/dev/fd`
+/// lists whose `fstat` names that device and inode. One another thread closes meanwhile names
+/// nothing.
+fn open_on(file: (u64, u64)) -> usize {
+    std::fs::read_dir("/dev/fd")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse::<i32>().ok())
+        .filter(|fd| {
+            // SAFETY: `stat` is integers and arrays, so all-zero is a value.
+            let mut said: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: `fstat` writes one `stat` to this live exclusive reference, and of a
+            // number that is no open descriptor says `EBADF`.
+            let read = unsafe { libc::fstat(*fd, &raw mut said) } == 0;
+            #[allow(
+                clippy::unnecessary_cast,
+                reason = "st_dev and st_ino are narrower or signed on some systems"
+            )]
+            let named = (said.st_dev as u64, said.st_ino as u64);
+            read && named == file
+        })
+        .count()
+}
+
+/// A PINNED PARSE HOLDS ITS FILE OPEN FOR AS LONG AS IT IS KEPT, AND NO OTHER: what makes a
+/// later file with the pin's device and inode number that very file. While the descriptor is
+/// held the kernel gives the file's inode number to no other, so a replacement made meanwhile
+/// (the rename every aterm write is) is another number whatever the two files' times say;
+/// were it let go at the pin, a second replacement could land on the freed number with the
+/// first one's length and times and be taken for it unread. The file a rename unlinked stays
+/// held until the read that finds its replacement, which lets it go and holds the new one. A
+/// parse that is not pinned, one forgotten (the file gone) and one pushed out by the bound
+/// hold nothing open.
+///
+/// The reuse itself cannot be staged here: APFS never gives an inode number twice. This counts
+/// the descriptor that forbids it.
+///
+/// NEGATIVE CONTROL (2026-11-12): with `KeptParse::read` giving the pin another file to hold
+/// and letting the one it read go, no descriptor is open on the pinned file (`left: (1, 0),
+/// right: (1, 1)`).
+#[test]
+fn a_kept_parse_holds_its_file_open_for_as_long_as_it_is_kept() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    let book = dir.join("book");
+    write_private(&dir, "book", b"first").unwrap();
+    let kept = KeptParse::new(1);
+    let read = |name: &str| kept.read(&dir, name, 64, <[u8]>::to_vec).unwrap();
+    settle::after(Duration::from_secs(3600), || {
+        assert_eq!(read("book"), b"first");
+        assert_eq!(
+            (kept.pinned(), open_on(file_at(&book))),
+            (0, 0),
+            "a parse that is not pinned holds nothing open"
+        );
+    });
+    settle::none(|| {
+        assert_eq!(read("book"), b"first");
+        let first = file_at(&book);
+        assert_eq!(
+            (kept.pinned(), open_on(first)),
+            (1, 1),
+            "the pinned file is held open"
+        );
+        assert_eq!(read("book"), b"first");
+        assert_eq!(open_on(first), 1, "by one descriptor, however often read");
+
+        write_private(&dir, "book", b"again").unwrap();
+        let second = file_at(&book);
+        assert_eq!(
+            open_on(first),
+            1,
+            "the replaced file is held while its replacement is made"
+        );
+        assert_ne!(second, first, "so the replacement is another inode");
+        assert_eq!(read("book"), b"again");
+        assert_eq!(
+            (open_on(first), open_on(second)),
+            (0, 1),
+            "the read that finds the replacement lets the first go and holds the second"
+        );
+
+        write_private(&dir, "other", b"else").unwrap();
+        assert_eq!(read("other"), b"else");
+        assert_eq!(
+            (
+                kept.pinned(),
+                open_on(second),
+                open_on(file_at(&dir.join("other")))
+            ),
+            (1, 0, 1),
+            "a parse the bound pushed out holds nothing open"
+        );
+        let other = file_at(&dir.join("other"));
+        std::fs::remove_file(dir.join("other")).unwrap();
+        assert!(matches!(
+            kept.read(&dir, "other", 64, <[u8]>::to_vec),
+            Err(PrivateFileError::Missing)
+        ));
+        assert_eq!(open_on(other), 0, "a file that is gone is let go");
+    });
+}
+
+/// A parse of a file on a volume whose times another clock sets (a network, user-space or
+/// virtual machine's volume) is never pinned, however old those times are: a write there can
+/// carry any stamp, so each read takes the bytes, and a write into the file at the same length
+/// is returned at once. The volume is this thread's word (`TIMES_FROM_ELSEWHERE`), since no test
+/// can mount one; the same file on the volume as it is pins.
+///
+/// NEGATIVE CONTROL (2026-11-12): with `pins` not asking `times_are_this_kernels`, the first
+/// read pins the parse (`left: (1, 1), right: (1, 0)`).
+#[test]
+fn a_parse_of_a_file_whose_times_another_clock_sets_is_not_pinned() {
+    use std::io::Write as _;
+    /// Puts the thread's word back as the test ends, a panic's unwinding included.
+    struct Back;
+    impl Drop for Back {
+        fn drop(&mut self) {
+            super::TIMES_FROM_ELSEWHERE.set(false);
+        }
+    }
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    write_private(&dir, "book", b"first").unwrap();
+    let kept = KeptParse::new(4);
+    let parses = std::cell::Cell::new(0);
+    let parse = |bytes: &[u8]| {
+        parses.set(parses.get() + 1);
+        bytes.to_vec()
+    };
+    let read = || tally::counted(|| kept.read(&dir, "book", 64, parse).unwrap());
+    let bytes = |read: &[tally::Read]| read.iter().map(|seen| seen.bytes).sum::<usize>();
+    settle::none(|| {
+        let _back = Back;
+        super::TIMES_FROM_ELSEWHERE.set(true);
+        for _ in 0..2 {
+            let (parsed, read) = read();
+            assert_eq!((parsed.as_slice(), bytes(&read)), (&b"first"[..], 5));
+            assert_eq!((parses.get(), kept.pinned()), (1, 0));
+        }
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("book"))
+            .unwrap()
+            .write_all(b"again")
+            .unwrap();
+        assert_eq!(read().0, b"again", "a write into the file is read at once");
+        assert_eq!((parses.get(), kept.pinned()), (2, 0));
+
+        super::TIMES_FROM_ELSEWHERE.set(false);
+        assert_eq!(bytes(&read().1), 5, "read once more, and pinned");
+        assert_eq!((parses.get(), kept.pinned()), (2, 1));
+        assert_eq!(bytes(&read().1), 0, "the same file on this kernel's volume");
+    });
+}
+
+/// A parse of a file whose last change is younger than the settle time is not pinned: two
+/// writes inside one tick of the filesystem's clock can leave one stamp, so each read takes
+/// the bytes, and a write into the file at the same length is returned at once. Equal bytes
+/// still reuse their parse. NEGATIVE CONTROL: pinning every parse (`stamp.settled` dropped
+/// from `pins`) lists no bytes at the second read.
+#[test]
+fn a_parse_of_a_file_changed_just_now_is_not_pinned() {
+    use std::io::Write as _;
+    let root = aterm_tempfile::tempdir().unwrap();
+    let dir = dir_in(root.path(), "state", 0o700);
+    write_private(&dir, "book", b"fresh").unwrap();
+    let kept = KeptParse::new(4);
+    let parses = std::cell::Cell::new(0);
+    let parse = |bytes: &[u8]| {
+        parses.set(parses.get() + 1);
+        bytes.to_vec()
+    };
+    let read = || tally::counted(|| kept.read(&dir, "book", 64, parse).unwrap());
+    settle::after(Duration::from_secs(3600), || {
+        for _ in 0..2 {
+            let (parsed, read) = read();
+            assert_eq!(parsed, b"fresh");
+            assert_eq!(read.iter().map(|seen| seen.bytes).sum::<usize>(), 5);
+        }
+        assert_eq!((parses.get(), kept.pinned()), (1, 0));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("book"))
+            .unwrap()
+            .write_all(b"again")
+            .unwrap();
+        assert_eq!(read().0, b"again");
+        assert_eq!((parses.get(), kept.pinned()), (2, 0));
+    });
+}
+
+/// A stamp is settled by the later of its two times, at least the settle time before the
+/// read began: a time ahead of the clock, or before the epoch, settles nothing. A pin stands
+/// for its own stamp alone, and not under a wall clock behind the one it was made under, where
+/// a write could be stamped with the time the pin holds.
+/// NEGATIVE CONTROL: judging by the change time alone settles the stamp written a second ago;
+/// `now >= self.began` dropped lets the pin stand under the earlier clock.
+#[test]
+fn a_pin_needs_settled_times_and_a_clock_not_behind_its_own() {
+    let at = |secs: u64| std::time::UNIX_EPOCH + Duration::from_secs(secs);
+    let stamp = |mtime: i64, ctime: i64| Stamp {
+        dev: 1,
+        ino: 2,
+        len: 3,
+        mtime: (mtime, 0),
+        ctime: (ctime, 0),
+    };
+    assert!(stamp(90, 98).settled(at(100), SETTLE));
+    assert!(
+        !stamp(90, 99).settled(at(100), SETTLE),
+        "changed too lately"
+    );
+    assert!(
+        !stamp(99, 90).settled(at(100), SETTLE),
+        "written too lately"
+    );
+    assert!(!stamp(90, 101).settled(at(100), Duration::ZERO), "ahead");
+    assert!(!stamp(-1, -1).settled(at(100), Duration::ZERO));
+    assert!(stamp(90, 90).settled(at(100), Duration::ZERO));
+
     let root = aterm_tempfile::tempdir().unwrap();
     let dir = dir_in(root.path(), "state", 0o700);
     write_private(&dir, "book", b"held").unwrap();
-    let kept = KeptParse::new(4);
-    assert_eq!(
-        kept.read(&dir, "book", 64, <[u8]>::to_vec).unwrap(),
-        b"held"
+    let pin = Pin {
+        _file: std::fs::File::open(dir.join("book")).unwrap(),
+        stamp: stamp(90, 90),
+        began: at(100),
+    };
+    assert!(pin.stands(stamp(90, 90), at(100)));
+    assert!(pin.stands(stamp(90, 90), at(4000)));
+    assert!(!pin.stands(stamp(90, 90), at(99)), "the clock went back");
+    assert!(!pin.stands(stamp(90, 91), at(4000)), "changed since");
+    assert!(!pin.stands(stamp(91, 90), at(4000)), "written since");
+    assert!(
+        !pin.stands(
+            Stamp {
+                len: 4,
+                ..stamp(90, 90)
+            },
+            at(4000)
+        ),
+        "another length"
     );
-    assert!(matches!(
-        kept.read(&dir, "book", 3, |_| panic!(
-            "an oversized file is not parsed"
-        )),
-        Err(PrivateFileError::Malformed(_))
-    ));
-    assert_eq!(kept.read(&dir, "book", 4, <[u8]>::to_vec).unwrap(), b"held");
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(matches!(
-        kept.read(&dir, "book", 64, <[u8]>::to_vec),
-        Err(PrivateFileError::NotPrivate(_))
-    ));
+    assert!(
+        !pin.stands(
+            Stamp {
+                ino: 9,
+                ..stamp(90, 90)
+            },
+            at(4000)
+        ),
+        "another file"
+    );
 }
 
 /// A directory judgement's answer: its verdict, or its error by kind and raw errno.

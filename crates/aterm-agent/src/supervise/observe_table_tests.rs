@@ -273,21 +273,49 @@ fn an_observed_turn_end_withholds_its_continue_before_the_gate() {
     );
 }
 
+/// One restart path of [`RESTART_ROWS`]: its name, and the run that returns the requests it asked.
+type RestartRow = (&'static str, fn() -> Vec<String>);
+
+/// Every path of the loop's that restarts its agent: the turn end's Restart (here a usage wall
+/// with an account to move to, asked of the host), the stall remedy's `restart if-stalled` with
+/// `stall_term` on, and the memory ceiling's `restart` beside a proven self-claim, each with the
+/// restarts it asks a confirmed agent's host.
+const RESTART_ROWS: [RestartRow; 3] = [
+    ("turn-end Restart", super::turn_end::observe_row_restart),
+    ("stall remedy", super::stall_hold::observe_row_stall_restart),
+    (
+        "memory ceiling beside a self-claim",
+        super::stall_hold::observe_row_memory_restart,
+    ),
+];
+
 /// An observed agent is never restarted: a restart ends the process and the host types its
-/// relaunch line and continuation through its own connection, past the gate, so the turn end
-/// withholds the restart it decides (here a usage wall with an account to move to). CONTROL: a
-/// confirmed agent and the name-only admission each ask the host's restart. NEGATIVE CONTROL
-/// (run): with a restart left out of what an observed turn end withholds, the observed agent is
-/// restarted.
+/// relaunch line and continuation through its own connection, as the relaunch lane the server's
+/// gate exempts, so every path that restarts withholds it before it is sent, and none makes the
+/// gate refuse one. CONTROL: a confirmed agent and the name-only admission each restart on every
+/// path. NEGATIVE CONTROL (run): with a restart left out of what an observed turn end
+/// withholds, or the stall remedy's or the memory ceiling's observe check removed, that row's
+/// observed agent is restarted or the gate refuses its restart.
 #[test]
 fn an_observed_agent_is_never_restarted() {
-    for (mode, restarts) in [(Mode::Observe, 0), (Mode::On, 1), (Mode::NameOnly, 1)] {
-        TABLE.with_borrow_mut(|t| *t = Some((mode, Vec::new())));
-        let unset = Unset;
-        let asked = super::turn_end::observe_row_restart();
-        drop(unset);
-        assert_eq!(asked.len(), restarts, "{mode:?}: {asked:?}");
+    let mut wrong = Vec::new();
+    for (name, row) in RESTART_ROWS {
+        for (mode, restarts) in [(Mode::Observe, 0), (Mode::On, 1), (Mode::NameOnly, 1)] {
+            TABLE.with_borrow_mut(|t| *t = Some((mode, Vec::new())));
+            let unset = Unset;
+            super::observe::REFUSED.set(0);
+            let asked = row();
+            let refused = super::observe::REFUSED.get();
+            drop(unset);
+            if (asked.len(), refused) != (restarts, 0) {
+                wrong.push(format!(
+                    "{name} {mode:?}: asked {asked:?}, the gate refused {refused} (want {restarts} \
+                     asked, withheld before the gate)"
+                ));
+            }
+        }
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]

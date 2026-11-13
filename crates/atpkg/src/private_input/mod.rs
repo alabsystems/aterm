@@ -24,6 +24,12 @@ use std::{
 };
 
 const CONTENTS: &str = "contents";
+
+mod materialization;
+pub use materialization::MaterializationAttempt;
+mod preparation_inputs;
+pub use preparation_inputs::PreparationInputs;
+
 const LOCK: &str = ".input-owner.lock";
 const STATE: &str = ".input-owner";
 const BUILDING: &[u8] = b"aterm-private-input-v1\nmaterializing\n";

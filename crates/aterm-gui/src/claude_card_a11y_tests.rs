@@ -42,13 +42,17 @@ fn a_reader_hears_claudes_words_under_the_glass() {
     let wid = WindowId(0);
     let session = app.focused_session_id(wid).expect("the front session");
     assert!(app.apply_term_resize(wid, u16_of(c.rows), u16_of(c.cols)));
-    publish(&app, session, CAPTURED);
+    publish(&app, session, c.version);
     feed_capture(&app, session, &c, &screen);
     claude_program(&app, session);
     let host = supervise(&mut app, session);
     frame(&mut app, wid);
-    assert!(capture_banner(&app, wid, &c), "the banner is on the glass");
     let strip = strip_rows(&app, wid);
+    let line = line_texts_for(3)[0].as_str();
+    assert!(
+        glass_text(&app, wid, strip + c.line(), 0..c.cols).contains(line),
+        "the card's line is on the glass"
+    );
     let presented = AccessibleSnapshot::from_cells(
         &app.windows[&wid].input_scratch.cells[strip..],
         c.cols,
@@ -56,7 +60,7 @@ fn a_reader_hears_claudes_words_under_the_glass() {
     );
     let presented = presented.value();
     assert!(
-        presented.contains(aterm_types::identity::SITE_URL)
+        presented.contains(line)
             && !presented.contains("bypass permissions on")
             && presented.contains(LOGO),
         "NEGATIVE CONTROL: the presented frame holds the glass's words and the rule's lockup: {presented}"
@@ -72,7 +76,7 @@ fn a_reader_hears_claudes_words_under_the_glass() {
             && heard
                 .value()
                 .contains(aterm_phase::anchor!("notice.updated_details"))
-            && !heard.value().contains(aterm_types::identity::SITE)
+            && !heard.value().contains(line)
             && !heard.value().contains("yolo")
             && !heard.value().contains(LOGO),
         "{}",
@@ -117,42 +121,38 @@ fn a_reader_hears_claudes_words_under_the_glass() {
             )
         })
         .collect();
-    let link = |at| crate::a11y_tree::HarnessChip::Link(at);
+    use crate::a11y_tree::HarnessChip;
+    let mark = format!(
+        "{}, {}",
+        aterm_types::identity::COMPANY,
+        aterm_types::identity::SITE
+    );
     assert_eq!(
         links,
         vec![
+            (Some((session, HarnessChip::Mark)), Some(mark), true),
             (
-                Some((session, link(GlassLink::Line))),
-                Some(aterm_types::identity::SITE.to_owned()),
-                true
-            ),
-            (
-                Some((session, link(GlassLink::Notice))),
-                Some(aterm_types::identity::SITE_URL.to_owned()),
+                Some((session, HarnessChip::CardMark)),
+                Some(aterm_types::identity::COMPANY.to_owned()),
                 true
             ),
         ],
-        "the line's link and the banner's are links a reader can press, named by their words"
+        "the top rule's mark and the card line's are links a reader can press"
     );
-    for at in [GlassLink::Notice, GlassLink::Line] {
+    for at in [HarnessChip::Mark, HarnessChip::CardMark] {
         let _ = crate::platform::take_opened_urls();
-        app.press_claude_chip_for_reader(wid, session, link(at));
+        app.press_claude_chip_for_reader(wid, session, at);
         assert_eq!(
             crate::platform::take_opened_urls(),
             vec![aterm_types::identity::SITE_URL.to_string()],
-            "{at:?}: the reader's press opens it"
+            "{at:?}: the reader's press opens the site"
+        );
+        app.press_claude_chip_for_reader(wid, session + 1, at);
+        assert!(
+            crate::platform::take_opened_urls().is_empty(),
+            "{at:?}: CONTROL: a session with no mark on the glass opens nothing"
         );
     }
-    app.press_claude_chip_for_reader(wid, session, link(GlassLink::Announcement));
-    assert!(
-        crate::platform::take_opened_urls().is_empty(),
-        "CONTROL: no announcement on this screen, nothing opened"
-    );
-    app.press_claude_chip_for_reader(wid, session + 1, link(GlassLink::Notice));
-    assert!(
-        crate::platform::take_opened_urls().is_empty(),
-        "CONTROL: no banner, nothing opened"
-    );
     host.shutdown_and_join();
 }
 

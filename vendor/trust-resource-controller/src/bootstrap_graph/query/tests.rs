@@ -145,6 +145,25 @@ fn complete_query_binding_rejects_foreign_nonce_sequence_gnu_image_environment_a
     };
     assert_ne!(request.binding_preimage().unwrap(), different.binding_preimage().unwrap());
 }
+
+#[test]
+fn runtime_text_encoding_and_unknown_policy_keys_never_become_query_environment() {
+    for key in [b"__CF_USER_TEXT_ENCODING".as_slice(), b"RUSTC_BOOTSTRAP", b"PRIVATE_POLICY"] {
+        for value in [b"".as_slice(), b"0x1F5:0:0", b"1"] {
+            for replacing in [false, true] {
+                let mut request = request();
+                let extra = (key.to_vec(), value.to_vec());
+                if replacing {
+                    request.environment[0] = extra;
+                } else {
+                    request.environment.push(extra);
+                }
+                assert!(request.validate().is_err());
+                assert!(request.encode().is_err());
+            }
+        }
+    }
+}
 #[test]
 fn prepared_and_raw_stream_events_bind_actual_selected_image_and_full_operation() {
     let request = request();

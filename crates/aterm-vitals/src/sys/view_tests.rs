@@ -1055,10 +1055,11 @@ fn procs_rows_carry_labels_states_and_base_units() {
     assert!(all_text(&r).contains("more=2 rows"), "{}", all_text(&r));
 }
 
-/// A process's wait, peak and write rate are read only by macOS's sweep: elsewhere each unread
-/// one says `not_sampled`, never `refused` or `warming`, which no wait would end. NEGATIVE
-/// CONTROL: on macOS the same row keeps `warming` for its rates and `refused` for its peak, and
-/// a refused row `refused` for all three.
+/// A process's wait, peak and write rate say why each is unread on its OS: Windows samples no
+/// wait or disk writes (`not_sampled`), Linux keeps no peak footprint (`unsupported`) and reads
+/// wait and disk writes for this user's processes (`warming` until a second sweep, `refused` for
+/// `Services`), and macOS reads all three (`warming` for rates, `refused` for peak or a refused
+/// row). NEGATIVE CONTROL: a service row on Linux never stays `warming`.
 #[test]
 fn a_process_figure_no_sweep_reads_is_not_sampled() {
     let mut s = snapshot();
@@ -1066,6 +1067,8 @@ fn a_process_figure_no_sweep_reads_is_not_sampled() {
     (row.wait, row.peak, row.write_bps, row.refused) = (None, None, None, false);
     let mut refused = row.clone();
     refused.refused = true;
+    let mut service = row.clone();
+    service.scope = RowScope::Services;
     let row = row.clone();
     let words = |family: &'static str, r: &ProcView| {
         let mut w = world();
@@ -1076,20 +1079,25 @@ fn a_process_figure_no_sweep_reads_is_not_sampled() {
             .map(|key| j.get(key).cloned().expect("a figure or why"))
     };
     let why = |words: [&str; 3]| words.map(Jv::why);
-    for family in ["Linux", "Windows"] {
-        for r in [&row, &refused] {
-            assert_eq!(
-                words(family, r),
-                why(["not_sampled"; 3]),
-                "{family}, refused={}",
-                r.refused
-            );
-        }
+    for r in [&row, &refused, &service] {
+        assert_eq!(words("Windows", r), why(["not_sampled"; 3]));
+    }
+    assert_eq!(
+        words("Linux", &row),
+        why(["warming", "unsupported", "warming"])
+    );
+    for r in [&refused, &service] {
+        assert_eq!(
+            words("Linux", r),
+            why(["refused", "unsupported", "refused"])
+        );
     }
     assert_eq!(words("macOS", &row), why(["warming", "refused", "warming"]));
-    assert_eq!(words("macOS", &refused), why(["refused"; 3]));
+    for r in [&refused, &service] {
+        assert_eq!(words("macOS", r), why(["refused"; 3]));
+    }
     let mut w = world();
-    w.machine.family = "Linux";
+    w.machine.family = "Windows";
     let c = ctx(&w, Some(&s), true, true);
     let text = all_text(&render_text(&query(View::Procs, false), &c));
     let pid = row.pid;
@@ -1266,6 +1274,76 @@ fn unmeasured_figures_read_unavailable_never_zero() {
         "{cores}"
     );
     assert!(cores.contains("core name=P1 cpu=2 busy_pm=1000"), "{cores}");
+}
+
+/// A Linux machine's unavailable words: with zswap off the compressed class says
+/// `not_enabled:zswap` (not sampling), lifetime peak footprint is `unsupported` (never refused),
+/// and volume purgeable space off APFS is `unsupported` (not sampling). NEGATIVE CONTROL: the
+/// Mac's world keeps `not_sampled` for purgeable space and `refused`/`not_sampled` for peak.
+#[test]
+fn a_linux_machine_reads_its_own_unavailable_words() {
+    let mut w = world();
+    w.machine = Machine {
+        executable: None,
+        cpu: None,
+        os: Some("Ubuntu 24.04.5 LTS".into()),
+        family: "Linux",
+    };
+    let s = snapshot();
+    let mut off = s.clone();
+    if let Some(m) = off.mem.as_mut() {
+        m.sample.compressed = None;
+    }
+    for p in &mut off.procs {
+        p.peak = None;
+    }
+    let c = ctx(&w, Some(&off), true, true);
+    let mem = all_text(&render_text(&query(View::Mem, false), &c));
+    assert!(
+        mem.contains("compressed unavailable(not_enabled:zswap)"),
+        "{mem}"
+    );
+    assert!(mem.contains("peak_bytes=unavailable(unsupported)"), "{mem}");
+    let j = render_json(&query(View::Mem, true), &c);
+    let compressed = match j.get("classes") {
+        Some(Jv::Arr(a)) => a
+            .iter()
+            .find(|x| x.get("class") == Some(&Jv::s("compressed")))
+            .and_then(|x| x.get("bytes"))
+            .cloned(),
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(compressed, Some(Jv::why("not_enabled:zswap")));
+    // No lifetime peak on Linux: unsupported, never refused.
+    let procs = all_text(&render_text(&query(View::Procs, false), &c));
+    assert!(
+        procs.contains("peak_bytes=unavailable(unsupported)")
+            && !procs.contains("peak_bytes=unavailable(refused"),
+        "{procs}"
+    );
+    // No purgeable space off APFS: unsupported, not a sampling still to come.
+    let disk = all_text(&render_text(&query(View::Disk, false), &c));
+    assert!(
+        disk.contains("purgeable_bytes=unavailable(unsupported)"),
+        "{disk}"
+    );
+    let j = render_json(&query(View::Disk, true), &c);
+    let purgeable = j
+        .get("disk")
+        .and_then(|d| d.get("volume"))
+        .and_then(|v| v.get("purgeable_bytes"))
+        .cloned();
+    assert_eq!(purgeable, Some(Jv::why("unsupported")));
+
+    let mac = world();
+    let c = ctx(&mac, Some(&off), true, true);
+    let disk = all_text(&render_text(&query(View::Disk, false), &c));
+    assert!(
+        disk.contains("purgeable_bytes=unavailable(not_sampled)"),
+        "{disk}"
+    );
+    let mem = all_text(&render_text(&query(View::Mem, false), &c));
+    assert!(mem.contains("compressed unavailable(not_sampled)"), "{mem}");
 }
 
 #[test]

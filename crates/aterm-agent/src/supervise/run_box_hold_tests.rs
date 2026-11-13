@@ -3,14 +3,12 @@
 
 use aterm_phase::prompt::fixtures as f;
 
-/// A person's input inside every box's bound (`QUESTION_PERSON_GRACE`): they are at the keys now,
-/// so an untouched permission box is held through it as a question is, and the holds below run
-/// against the vendor's countdown.
+/// A person's gesture inside [`approval_loop::PERSON_SETTLE`]: a box nobody has touched waits on it.
+const TYPING_MS: u64 = 1_000;
+/// A person's input past [`approval_loop::PERSON_SETTLE`] and inside every box's bound
+/// (`QUESTION_PERSON_GRACE`): a Claude Code permission box nobody has touched is answered over it,
+/// and a question, or a box a person or another driver touched, is held through it.
 const TYPED_BEFORE_MS: u64 = 5_000;
-/// A person's input past that bound and inside their whole grace: it holds a permission box only
-/// once a person or another driver has touched the box
-/// (`an_untouched_box_is_held_by_older_input_no_longer_than_a_question`).
-const TYPED_LONG_BEFORE_MS: u64 = 22_000;
 const GRACE_S: u32 = 120;
 
 /// A person's input inside a question dialog's bound (`QUESTION_PERSON_GRACE`): they are answering
@@ -20,16 +18,17 @@ const QUESTION_TYPED_BEFORE_MS: u64 = 5_000;
 const QUESTION_TYPED_BEFORE: &str = "5000";
 
 #[test]
-fn the_typed_inputs_sit_inside_and_past_the_bound_and_inside_the_grace() {
-    use super::approval_loop::QUESTION_PERSON_GRACE;
+fn the_typed_inputs_sit_inside_and_past_the_settle_and_inside_the_grace() {
+    use super::approval_loop::{PERSON_SETTLE, QUESTION_PERSON_GRACE};
     assert_eq!(
         QUESTION_TYPED_BEFORE.parse::<u64>().ok(),
         Some(QUESTION_TYPED_BEFORE_MS)
     );
     assert!(Duration::from_millis(QUESTION_TYPED_BEFORE_MS) < QUESTION_PERSON_GRACE);
+    assert!(Duration::from_millis(TYPING_MS) < PERSON_SETTLE);
+    assert!(Duration::from_millis(TYPED_BEFORE_MS) > PERSON_SETTLE);
     assert!(Duration::from_millis(TYPED_BEFORE_MS) < QUESTION_PERSON_GRACE);
-    assert!(Duration::from_millis(TYPED_LONG_BEFORE_MS) > QUESTION_PERSON_GRACE);
-    assert!(Duration::from_millis(TYPED_LONG_BEFORE_MS) < Duration::from_secs(u64::from(GRACE_S)));
+    assert!(QUESTION_PERSON_GRACE < Duration::from_secs(u64::from(GRACE_S)));
 }
 
 fn swapped(rows: &[String], edits: &[(&str, &[&str])]) -> Vec<String> {
@@ -207,24 +206,28 @@ fn a_countdown_is_believed_once_seen_ticking() {
     assert_eq!(jumped.deny(), None, "another box, faster than the clock");
 }
 
-/// Which loop a test runs: as shipped, or one of the three defects the
-/// model names, each its negative control.
+/// Which loop a test runs: as shipped, or one of the defects
+/// `supervisor_box_settle_model` names, each its negative control.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Build {
     /// The loop as shipped.
     Shipped,
-    /// The hold outlasts the countdown, as before the cap
-    /// ([`Session::set_deny_cap_off`]: the model's `Outlast`).
+    /// A question's hold outlasts its countdown, as before the cap
+    /// ([`Session::set_deny_cap_off`]).
     CapOff,
     /// No box episode reads as touched ([`Session::set_touch_off`]: the
-    /// model's `Touched`).
+    /// model's `Buggy == 1`).
     TouchOff,
+    /// The touch rule and grace before the settle: any rise in the person
+    /// count since the read before the box a touch, and an untouched box held
+    /// as a question is ([`Session::set_old_grace`]: `Buggy == 2`).
+    OldGrace,
+    /// An untouched box answered with no settle ([`Session::set_settle_off`]:
+    /// `Buggy == 3`).
+    SettleOff,
     /// Every box other than the last read's starts an episode afresh
-    /// ([`Session::set_episode_per_box`]: the model's `Lost`).
+    /// ([`Session::set_episode_per_box`]: `Buggy == 4`).
     EpisodePerBox,
-    /// An untouched permission box keeps the person's whole grace, as before
-    /// its bound ([`Session::set_bound_off`]).
-    BoundOff,
 }
 
 fn held_watch(
@@ -289,8 +292,9 @@ fn built<C: Ctl>(s: &mut Session<'_, C>, build: Build) {
         Build::Shipped => {}
         Build::CapOff => s.set_deny_cap_off(),
         Build::TouchOff => s.set_touch_off(),
+        Build::OldGrace => s.set_old_grace(),
+        Build::SettleOff => s.set_settle_off(),
         Build::EpisodePerBox => s.set_episode_per_box(),
-        Build::BoundOff => s.set_bound_off(),
     }
 }
 
@@ -332,269 +336,120 @@ fn key_names(m: &Mock) -> Vec<&str> {
         .collect()
 }
 
-#[test]
-fn the_incident_box_is_pressed_before_the_vendor_denies_it() {
-    let (m, journal) = held_watch(
-        watched(ticking(104, 2, incident)),
-        Some(TYPED_BEFORE_MS),
-        Build::Shipped,
-        |_, _| {},
-    );
-    assert_eq!(ones(&m), 0, "held above the margin: {:#?}", m.requests);
-    let held = held_lines(&journal);
-    assert_eq!(held.len(), 2, "{journal:#?}");
-    assert!(
-        held[0].ends_with("(the box's answer; a countdown on it is read again to see it tick)"),
-        "{}",
-        held[0]
-    );
-    let past = |stamp: &str| {
-        aterm_types::rfc3339::parse_utc_fractional(stamp).expect("a stamp") - TEST_NOW
-    };
-    let (look, _) = held_times(held[0]);
-    assert!(past(&look) <= 2, "{}", held[0]);
-    assert!(
-        held[1].contains("a person is typing: hands off until ")
-            && held[1].contains("(the box's answer; the vendor denies it at "),
-        "{}",
-        held[1]
-    );
-    let (until, deny) = held_times(held[1]);
-    let (until, deny) = (past(&until), past(deny.as_deref().expect("the deny named")));
-    assert!((45..=103).contains(&deny), "{deny}: {}", held[1]);
-    assert!(
-        until <= 10 && deny - until > 16,
-        "the untouched box's bound ends the hold, not the deny: {until}: {}",
-        held[1]
-    );
-    assert!(!ended(&journal), "{journal:#?}");
+/// The words of a hold on a box nobody has touched ([`approval_loop::PERSON_SETTLE`]).
+const SETTLING: &str =
+    "(the box's answer; nobody has touched it, so it waits only for their keys to settle)";
 
-    let (m, journal) = held_watch(
-        watched(ticking(20, 2, incident)),
-        Some(TYPED_BEFORE_MS),
-        Build::Shipped,
-        |_, _| {},
-    );
-    assert_eq!(ones(&m), 0, "held above the margin: {:#?}", m.requests);
-    let held = held_lines(&journal);
-    assert_eq!(held.len(), 2, "{journal:#?}");
-    let (until, deny) = held_times(held[1]);
-    let (until, deny) = (past(&until), past(deny.as_deref().expect("the deny named")));
-    assert!((16..=20).contains(&deny), "{deny}: {}", held[1]);
-    assert!(
-        until < 9 && (14..=16).contains(&(deny - until)),
-        "the hold ends at the deny's margin, before the bound: {until}: {}",
-        held[1]
-    );
-    assert!(!ended(&journal), "{journal:#?}");
-
-    let at_the_margin = || watched(ticking(15, 2, incident));
-    let (m, journal) = held_watch(
-        at_the_margin(),
-        Some(TYPED_BEFORE_MS),
-        Build::Shipped,
-        |_, _| {},
-    );
-    assert_eq!(ones(&m), 1, "pressed once: {:#?}", m.requests);
-    let end = journal
-        .iter()
-        .position(|l| l.starts_with("HOLD-ENDED "))
-        .expect("the hold's end said");
-    assert!(
-        journal[end].contains(
-            "a person is typing, but nobody has touched the box and the vendor denies it at "
-        ) && journal[end].ends_with("the policy's answer goes now (the box's answer)"),
-        "{}",
-        journal[end]
-    );
-    let approved = journal
-        .iter()
-        .position(|l| l.starts_with("APPROVED "))
-        .expect("approved");
-    assert!(end < approved, "{journal:#?}");
-
-    let (m, journal) = held_watch(
-        at_the_margin(),
-        Some(TYPED_BEFORE_MS),
-        Build::CapOff,
-        |_, _| {},
-    );
-    assert_eq!(
-        ones(&m),
-        0,
-        "the hold outlasts the countdown: {:#?}",
-        m.requests
-    );
-    let held = held_lines(&journal);
-    assert_eq!(held.len(), 2, "{journal:#?}");
-    assert!(
-        held.iter()
-            .all(|l| !l.contains("the vendor denies") && !l.contains("tick")),
-        "{held:#?}"
-    );
-    assert!(!ended(&journal), "{journal:#?}");
+fn past(stamp: &str) -> i64 {
+    aterm_types::rfc3339::parse_utc_fractional(stamp).expect("a stamp") - TEST_NOW
 }
 
-/// The owner's incident (2026-10-25): a general-purpose subagent's `bash -c` rm box
-/// (`f::shell_c_rm_box`) came up 6 s after the owner's last keystroke into the tab, and full
-/// power's Yes was held for the rest of their 120 s grace (`HELD … a person is typing: hands off
-/// until …`). Input older than a permission box nobody has touched holds it no longer than a
-/// question (`QUESTION_PERSON_GRACE`), and input older than that not at all. A box a person
-/// touched, or whose touch cannot be told, keeps the whole grace, as ever.
-#[test]
-fn an_untouched_box_is_held_by_older_input_no_longer_than_a_question() {
-    use super::approval_loop::QUESTION_PERSON_GRACE;
-    let shell_c = || f::shell_c_rm_box(" │ This shell -c script runs rm and could not be checked");
-    let past = |stamp: &str| {
-        aterm_types::rfc3339::parse_utc_fractional(stamp).expect("a stamp") - TEST_NOW
-    };
-    let bound = i64::try_from(QUESTION_PERSON_GRACE.as_secs()).expect("the bound");
-    let six_s = 6_000;
-    let quiet_past_the_bound = |m: &mut Mock, _: &mut SuperviseOpts| {
-        m.status_human_from.insert(5, 16_000);
-    };
-    let (m, journal) = held_watch(
-        watched(vec![shell_c(); 6]),
-        Some(six_s),
-        Build::Shipped,
-        quiet_past_the_bound,
-    );
-    assert_eq!(
-        ones(&m),
-        1,
-        "pressed once the bound ran out: {:#?}",
-        m.requests
-    );
-    let held = held_lines(&journal);
-    assert!(!held.is_empty(), "held inside the bound: {journal:#?}");
-    let (until, deny) = held_times(held[0]);
-    assert_eq!(deny, None, "{}", held[0]);
-    assert!(
-        (bound - 7..=bound - 6).contains(&past(&until)),
-        "held to the bound, not the 120 s grace: {}",
-        held[0]
-    );
-    assert!(theirs(&journal).is_empty(), "{journal:#?}");
-
-    let (m, journal) = held_watch(
-        watched(vec![shell_c(); 6]),
-        Some(six_s),
-        Build::BoundOff,
-        quiet_past_the_bound,
-    );
-    assert_eq!(ones(&m), 0, "the whole grace: {:#?}", m.requests);
-    let held = held_lines(&journal);
-    let (until, _) = held_times(held[0]);
-    assert!(past(&until) > 100, "{}", held[0]);
-
-    let (m, journal) = held_watch(
-        watched(vec![shell_c(); 2]),
-        Some(TYPED_LONG_BEFORE_MS),
-        Build::Shipped,
-        |_, _| {},
-    );
-    assert_eq!(ones(&m), 1, "{:#?}", m.requests);
-    assert!(held_lines(&journal).is_empty(), "{journal:#?}");
-
-    let (m, journal) = held_watch(
-        watched(vec![shell_c(); 3]),
-        Some(TYPED_LONG_BEFORE_MS),
-        Build::Shipped,
-        |m, _| {
-            m.human_seq_from.insert(2, 1);
-        },
-    );
-    assert!(m.presses().is_empty(), "touched: {:#?}", m.requests);
-    let held = held_lines(&journal);
-    let (until, _) = held_times(held[0]);
-    assert!(
-        past(&until) > 90,
-        "a touched box keeps the whole grace: {}",
-        held[0]
-    );
-
-    let (m, _) = held_watch(
-        [vec![shell_c(); 2], vec![busy_screen()]].concat(),
-        Some(TYPED_LONG_BEFORE_MS),
-        Build::Shipped,
-        |_, _| {},
-    );
-    assert!(
-        m.presses().is_empty(),
-        "first read the box: {:#?}",
-        m.requests
-    );
+/// The person typing on the box's first look, and quiet ([`TYPED_BEFORE_MS`]) from the read after.
+fn typing_then_quiet(m: &mut Mock) {
+    m.status_human_from.insert(3, TYPED_BEFORE_MS);
 }
 
+/// A person's Enter queuing a message 0.8 s before Claude Code drew an rm box, counted between the
+/// read before the box and its first read: it decided nothing on the box, which waits only until
+/// their keys settle ([`approval_loop::PERSON_SETTLE`]) and is then answered by the policy, fenced
+/// on the person count it was decided on. The loop before the settle (`Build::OldGrace`) read the
+/// count as a touch and held the box for the person's whole grace (`held as ever`), so they
+/// answered it by hand; one with no settle (`Build::SettleOff`) answers it at its first look,
+/// 0.8 s after the key.
 #[test]
-fn no_countdown_the_worker_drew_or_one_standing_still_ends_a_hold() {
-    let run = |screens: Vec<Vec<String>>| {
+fn an_untouched_box_is_answered_once_the_persons_keys_settle() {
+    let run = |build: Build| {
         held_watch(
-            watched(screens),
-            Some(TYPED_BEFORE_MS),
-            Build::Shipped,
-            |_, _| {},
+            watched(ticking(104, 4, incident)),
+            Some(800),
+            build,
+            |m, _| {
+                for (screen, ms) in [(1, "800"), (2, "1800"), (3, "2800"), (4, "3800")] {
+                    m.human_on.insert(screen, ms);
+                }
+                for (read, ms) in [(3, 1_800), (4, 2_800), (5, 3_800)] {
+                    m.status_human_from.insert(read, ms);
+                }
+                m.human_seq_from.insert(2, 1);
+            },
         )
     };
-    let (m, journal) = run(vec![faked("0:14"); 3]);
-    assert_eq!(ones(&m), 0, "{:#?}", m.requests);
+    let (m, journal) = run(Build::Shipped);
+    let digits: Vec<&String> = m
+        .presses()
+        .into_iter()
+        .filter(|p| p.ends_with(" 1"))
+        .collect();
+    assert_eq!(digits.len(), 1, "{:#?}\n{journal:#?}", m.requests);
+    assert!(digits[0].starts_with("key if-human=1 "), "{digits:#?}");
     let held = held_lines(&journal);
-    assert_eq!(held.len(), 3, "{journal:#?}");
-    assert!(
-        held.iter().all(|l| l.ends_with("(the box's answer)")),
-        "{held:#?}"
-    );
+    assert_eq!(held.len(), 2, "{journal:#?}");
+    for l in &held {
+        assert!(
+            l.contains("a person is typing: hands off until ") && l.ends_with(SETTLING),
+            "{l}"
+        );
+        let (until, deny) = held_times(l);
+        assert_eq!(deny, None, "the deny is no part of the settle: {l}");
+        assert!(past(&until) <= 5, "the settle, not a grace: {l}");
+    }
+    assert!(theirs(&journal).is_empty(), "{journal:#?}");
     assert!(!ended(&journal), "{journal:#?}");
 
-    let (m, journal) = run(vec![incident("0:14"); 3]);
-    assert_eq!(ones(&m), 0, "{:#?}", m.requests);
-    let held = held_lines(&journal);
-    assert_eq!(held.len(), 3, "{journal:#?}");
+    let (m, journal) = run(Build::OldGrace);
+    assert_eq!(ones(&m), 0, "the old grace: {:#?}", m.requests);
+    let theirs = theirs(&journal);
     assert!(
-        held.iter()
-            .all(|l| l.ends_with("read again to see it tick)")),
-        "{held:#?}"
+        !theirs.is_empty()
+            && theirs.iter().all(|l| l.contains(
+                "a person's gesture was counted on the session since it appeared: held as ever"
+            )),
+        "{journal:#?}"
     );
-    assert!(!ended(&journal), "{journal:#?}");
 
-    let (m, _) = run(ticking(15, 2, incident));
-    assert_eq!(ones(&m), 1, "{:#?}", m.requests);
+    let (m, journal) = run(Build::SettleOff);
+    assert_eq!(ones(&m), 1, "no settle: {:#?}", m.requests);
+    assert!(
+        held_lines(&journal).is_empty(),
+        "answered at its first look: {journal:#?}"
+    );
 }
 
-#[test]
-fn a_stall_between_two_reads_changes_nothing() {
-    let (m, journal) = held_watch(
-        watched(ticking(15, 2, incident)),
-        Some(TYPED_BEFORE_MS),
-        Build::Shipped,
-        |m, _| {
-            m.stall_after_read.insert(2, Duration::from_millis(4_500));
-        },
-    );
-    assert_eq!(ones(&m), 1, "{:#?}", m.requests);
-    assert!(ended(&journal), "{journal:#?}");
-}
-
+/// A key that moved a box's focus off where Claude Code drew it is a person deciding the box,
+/// whether they moved it before the box's first read, while it was held, or moved it and back: the
+/// box is held for their whole grace (`held as ever`), the touch kept through the focus coming
+/// back and the transcript printed over. A gesture counted while the box is shown that moves
+/// nothing (a scroll, a letter, a message queued into the composer) is no touch, nor is a box
+/// first read mid-way: the box is answered once the keys settle, fenced on the count it was
+/// decided on; with no person count to fence that answer on inside the person's grace, the box is
+/// handed over unpressed.
 #[test]
 fn a_box_a_person_touched_is_held_as_ever() {
-    let down: Vec<Vec<String>> = watched(vec![
-        incident("0:15"),
-        moved_to_no(&incident("0:14")),
-        moved_to_no(&incident("0:13")),
-    ]);
-    let worlds = [
-        ("a Down onto No", down.clone(), Some(3), false),
+    let touched = [
         (
-            "a scroll",
-            watched(ticking(15, 3, incident)),
-            Some(3),
-            false,
+            "a Down onto No",
+            watched(vec![
+                incident("0:15"),
+                moved_to_no(&incident("0:14")),
+                moved_to_no(&incident("0:13")),
+            ]),
         ),
         (
-            "in the gap before the first read",
-            watched(ticking(15, 3, incident)),
-            Some(2),
-            false,
+            "before its first read",
+            watched(vec![
+                moved_to_no(&incident("0:15")),
+                moved_to_no(&incident("0:14")),
+                moved_to_no(&incident("0:13")),
+            ]),
+        ),
+        (
+            "Down and back",
+            watched(vec![
+                incident("0:15"),
+                moved_to_no(&incident("0:14")),
+                incident("0:13"),
+                incident("0:12"),
+            ]),
         ),
         (
             "printed over once touched",
@@ -603,340 +458,69 @@ fn a_box_a_person_touched_is_held_as_ever() {
                 printed_over(&moved_to_no(&incident("0:14"))),
                 printed_over(&moved_to_no(&incident("0:13"))),
             ]),
-            Some(3),
-            false,
-        ),
-        (
-            "attached mid-box",
-            [ticking(15, 3, incident), vec![busy_screen()]].concat(),
-            None,
-            false,
-        ),
-        (
-            "no person count",
-            watched(ticking(15, 3, incident)),
-            None,
-            true,
         ),
     ];
-    let tweak = |m: &mut Mock, counted: Option<usize>, no_count: bool| {
-        if let Some(read) = counted {
-            m.human_seq_from.insert(read, 1);
-        }
-        if no_count {
-            m.human_seq = None;
-        }
-    };
-    for (name, screens, counted, no_count) in &worlds {
-        let (m, journal) = held_watch(
-            screens.clone(),
-            Some(TYPED_BEFORE_MS),
-            Build::Shipped,
-            |m, _| tweak(m, *counted, *no_count),
-        );
+    for (name, screens) in touched {
+        let (m, journal) = held_watch(screens.clone(), Some(TYPING_MS), Build::Shipped, |m, _| {
+            typing_then_quiet(m);
+        });
         assert!(m.presses().is_empty(), "{name}: {:#?}", m.requests);
+        assert!(
+            theirs(&journal).iter().any(|l| l
+                .contains("(the box's answer; a key not aterm's moved its focus: held as ever")),
+            "{name}: {journal:#?}"
+        );
         assert!(!ended(&journal), "{name}: {journal:#?}");
-        let theirs = theirs(&journal);
-        assert!(!theirs.is_empty(), "{name}: {journal:#?}");
-        assert!(
-            theirs
-                .iter()
-                .all(|l| l.contains("a person is typing: hands off until ")),
-            "{name}: {theirs:#?}"
-        );
-        assert!(
-            theirs
-                .iter()
-                .any(|l| l.contains(": held as ever, and the vendor denies it at ")),
-            "{name}: {theirs:#?}"
-        );
-        let (m, journal) = held_watch(
-            screens.clone(),
-            Some(TYPED_BEFORE_MS),
-            Build::TouchOff,
-            |m, _| tweak(m, *counted, *no_count),
-        );
-        assert!(ended(&journal), "{name}, touch off: {journal:#?}");
-        let withheld = m
-            .requests
-            .iter()
-            .any(|r| r.contains("the digit's read carried no person count to fence on"));
-        assert_eq!(
-            (ones(&m), withheld),
-            (usize::from(!*no_count), *no_count),
-            "{name}, touch off: {:#?}",
-            m.requests
-        );
+        let (m, _) = held_watch(screens, Some(TYPING_MS), Build::TouchOff, |m, _| {
+            typing_then_quiet(m);
+        });
+        assert_eq!(ones(&m), 1, "{name}, touch off: {:#?}", m.requests);
     }
-    let (_, journal) = held_watch(
-        down.clone(),
-        Some(TYPED_BEFORE_MS),
-        Build::Shipped,
-        |m, _| tweak(m, Some(3), false),
-    );
-    assert!(
-        theirs(&journal).iter().any(|l| l.contains(
-            "(the box's answer; a person's gesture was counted on the session since it appeared: \
-             held as ever, and the vendor denies it at "
-        )),
-        "{journal:#?}"
-    );
-    let (_, journal) = held_watch(
-        [ticking(15, 3, incident), vec![busy_screen()]].concat(),
-        Some(TYPED_BEFORE_MS),
-        Build::Shipped,
-        |_, _| {},
-    );
-    assert!(
-        theirs(&journal).iter().any(|l| l.contains(
-            "whether a person touched it since it appeared cannot be told: held as ever"
-        )),
-        "{journal:#?}"
-    );
 
     let (m, journal) = held_watch(
         watched(ticking(15, 3, incident)),
-        Some(TYPED_BEFORE_MS),
+        Some(TYPING_MS),
         Build::Shipped,
-        |m, _| m.human_seq = Some(4),
+        |m, _| {
+            typing_then_quiet(m);
+            m.human_seq_from.insert(3, 1);
+        },
     );
-    assert_eq!(ones(&m), 1, "untouched: {:#?}", m.requests);
-    assert!(ended(&journal), "{journal:#?}");
-    let (m, _) = held_watch(down, Some(TYPED_BEFORE_MS), Build::Shipped, |m, _| {
-        m.human_seq_from.insert(3, 1);
-        m.status_human_from
-            .insert(3, u64::from(GRACE_S) * 1000 + 10_000);
-    });
-    assert_eq!(ones(&m), 1, "their grace over: {:#?}", m.requests);
-}
-
-/// A gesture the box's first read counted, made before the box was drawn, answered something else:
-/// the box's ticking countdown places its first frame two minutes before its deny
-/// (`approval_loop::AUTO_DENY_WINDOW`), so a keystroke 8 s before a read of a box drawn 2 s before
-/// it leaves the box untouched. Its hold ends at the deny's margin, however long the person's grace
-/// (300 s here), and the policy's answer goes before the vendor denies the box. A gesture after the
-/// box's first frame touches it, and a box with no countdown, which places nothing, is touched by
-/// any gesture its first read counts, as ever.
-#[test]
-fn a_gesture_counted_before_the_box_was_drawn_is_no_touch() {
-    let run = |typed_ms: u64, screens: Vec<Vec<String>>| {
-        held_watch(
-            watched(screens),
-            Some(typed_ms),
-            Build::Shipped,
-            |m, opts| {
-                opts.policy.human_grace_s = 300;
-                m.human_seq_from.insert(2, 1);
-            },
-        )
-    };
-    let past = |stamp: &str| {
-        aterm_types::rfc3339::parse_utc_fractional(stamp).expect("a stamp") - TEST_NOW
-    };
-    let margin = i64::try_from(approval_loop::DENY_MARGIN.as_secs()).expect("the margin");
-    let drawn_just_now = || ticking(118, 104, incident);
-    const COUNTED: &str = "a person's gesture was counted on the session since it appeared";
-
-    let (m, journal) = run(8_000, drawn_just_now());
+    let presses = m.presses();
     assert_eq!(
-        ones(&m),
+        presses.len(),
         1,
-        "pressed at the deny's margin: {:#?}",
+        "a key that moves nothing: {:#?}",
         m.requests
     );
-    assert!(ended(&journal), "{journal:#?}");
+    assert!(presses[0].starts_with("key if-human=1 "), "{presses:#?}");
+    assert!(theirs(&journal).is_empty(), "{journal:#?}");
+
+    let (m, journal) = held_watch(
+        [ticking(15, 3, incident), vec![busy_screen()]].concat(),
+        Some(TYPING_MS),
+        Build::Shipped,
+        |m, _| typing_then_quiet(m),
+    );
+    let presses = m.presses();
+    assert_eq!(presses.len(), 1, "attached mid-box: {:#?}", m.requests);
+    assert!(presses[0].starts_with("key if-human=0 "), "{presses:#?}");
+    assert!(theirs(&journal).is_empty(), "{journal:#?}");
+
+    let (m, _, rows) = held_watch_ledgered(
+        watched(ticking(15, 3, incident)),
+        Some(TYPING_MS),
+        Build::Shipped,
+        |m, _| {
+            typing_then_quiet(m);
+            m.human_seq = None;
+        },
+    );
+    assert!(m.presses().is_empty(), "no count: {:#?}", m.requests);
     assert!(
-        journal.iter().all(|l| !l.contains(COUNTED)),
-        "untouched: {journal:#?}"
-    );
-    let held = held_lines(&journal);
-    assert!(held.len() > 2, "{journal:#?}");
-    for line in &held {
-        let (until, deny) = held_times(line);
-        if let Some(deny) = deny {
-            assert!(
-                past(&until) + margin <= past(&deny),
-                "held no later than the deny's margin: {line}"
-            );
-        }
-    }
-
-    let (m, journal) = run(1_000, drawn_just_now());
-    assert!(m.presses().is_empty(), "touched: {:#?}", m.requests);
-    assert!(!ended(&journal), "{journal:#?}");
-    assert!(
-        theirs(&journal).iter().any(|l| l.contains(&format!(
-            "{COUNTED}: held as ever, and the vendor denies it at "
-        ))),
-        "a gesture after its first frame: {journal:#?}"
-    );
-
-    let shell_c = f::shell_c_rm_box(" │ This shell -c script runs rm and could not be checked");
-    let (m, journal) = run(8_000, vec![shell_c; 6]);
-    assert!(m.presses().is_empty(), "touched: {:#?}", m.requests);
-    let held = held_lines(&journal);
-    assert!(!held.is_empty(), "{journal:#?}");
-    let (until, _) = held_times(held[0]);
-    assert!(
-        past(&until) > 280,
-        "no countdown places the box: the whole grace: {}",
-        held[0]
-    );
-}
-
-/// One box world for the dating of a gesture its first read counted: a whole grace of 300 s, the
-/// count rising at the box's first read (the read after the busy one), that read's gesture
-/// `typed_ms` before its snapshot, and the person's input 22 s old from the fifth read on (past an
-/// untouched box's bound, inside the whole grace), so an untouched box is pressed there and a
-/// touched one held.
-fn dated_box_watch(
-    screens: Vec<Vec<String>>,
-    typed_ms: u64,
-    seam: impl FnOnce(&mut Session<'_, TapedCtl<'_, Mock>>),
-) -> (Mock, Vec<String>) {
-    let (m, journal, _) = held_watch_seamed(watched(screens), Some(typed_ms), seam, |m, opts| {
-        opts.policy.human_grace_s = 300;
-        m.human_seq_from.insert(2, 1);
-        m.status_human_from.insert(5, TYPED_LONG_BEFORE_MS);
-    });
-    (m, journal)
-}
-
-const BY_OWED: &str = "a person's gesture was counted between the read before it and its first \
-                       read, which its countdown, once seen ticking, places before or after it";
-
-/// The box's first read is asked for at `a` and answered 6 s later, its snapshot (the countdown
-/// at 1:58, the gesture 1 s before it) taken at the end of those 6 s: the box was drawn at `a + 4`
-/// and touched at `a + 5`. The gesture is dated no earlier than the next read was asked for less
-/// its age, so it stays a touch, held for the person's grace. Dated from the instant the read was
-/// asked for, it fell at `a - 1`, before the first frame its countdown places, and the box the
-/// person touched was pressed. A gesture 8 s before that snapshot, before the box, is no touch
-/// either way.
-#[test]
-fn a_gesture_counted_by_a_slow_first_read_is_dated_no_earlier_than_its_answer() {
-    let slow = |s: &mut Session<'_, TapedCtl<'_, Mock>>| s.set_read_lag(2, Duration::from_secs(6));
-    let (m, journal) = dated_box_watch(ticking(118, 12, incident), 1_000, slow);
-    assert!(m.presses().is_empty(), "touched: {:#?}", m.requests);
-    assert!(
-        theirs(&journal).iter().any(|l| l.contains(
-            "a person's gesture was counted on the session since it appeared: held as ever"
-        )),
-        "{journal:#?}"
-    );
-    let (m, journal) = dated_box_watch(ticking(118, 12, incident), 8_000, slow);
-    assert_eq!(
-        ones(&m),
-        1,
-        "before the box: {:#?}\n{journal:#?}",
-        m.requests
-    );
-}
-
-/// A countdown that shows more time left than the two-minute window (4:58 on its first frame)
-/// runs longer than the window says, so the window places none of its box's frames: the gesture
-/// its first read counted, 1 s before that read and after the box was drawn, is a touch, held for
-/// the person's grace. Where the window placed it, the box's first frame fell 175 s after its
-/// first read and the gesture before it, and the box was pressed.
-#[test]
-fn a_countdown_longer_than_the_window_places_no_box() {
-    let (m, journal) = dated_box_watch(ticking(298, 12, incident), 1_000, |_| {});
-    assert!(m.presses().is_empty(), "touched: {:#?}", m.requests);
-    assert!(!ended(&journal), "{journal:#?}");
-    let (m, _) = dated_box_watch(ticking(118, 12, incident), 8_000, |_| {});
-    assert_eq!(
-        ones(&m),
-        1,
-        "the window's own countdown places it: {:#?}",
-        m.requests
-    );
-}
-
-/// A box whose first frame draws its countdown row with a time the parser does not read (`about
-/// 2 minutes`) is placed by the countdown of the frames after it: the gesture its first read
-/// counted, 22 s before that read, came before the box, which is pressed once the person's bound
-/// is over. Until then the count is owed its verdict, re-read within a second. Before, that first
-/// frame took the box for one that draws no countdown, and the gesture held it for the person's
-/// whole grace.
-#[test]
-fn a_countdown_its_first_frame_leaves_unread_places_the_box_from_the_next() {
-    let screens = [
-        vec![incident("about 2 minutes")],
-        ticking(118, 11, incident),
-    ]
-    .concat();
-    let (m, journal) = dated_box_watch(screens, TYPED_LONG_BEFORE_MS, |_| {});
-    assert_eq!(
-        ones(&m),
-        1,
-        "before the box: {:#?}\n{journal:#?}",
-        m.requests
-    );
-    let held = held_lines(&journal);
-    assert!(
-        held.first().is_some_and(|l| l.contains(BY_OWED)),
-        "the unread frame's hold looks again: {held:#?}"
-    );
-}
-
-/// A box drawn in the place of one nobody touched, before a read without a box between them, is
-/// read as a box of its own: the gesture its first read counted is placed by its countdown, and
-/// one made before its first frame is no touch. A gesture after its first frame is one, and so is
-/// a count owed its verdict at a box drawn over before its countdown placed it.
-#[test]
-fn a_box_drawn_in_an_untouched_ones_place_is_placed_by_its_own_countdown() {
-    let read = |rows: Vec<String>, count: u64, ms: u64| Screen {
-        rows,
-        human: HumanInput::Ago(ms),
-        human_seq: Some(count),
-        cols: Some(144),
-        ..Screen::default()
-    };
-    let t0 = Instant::now();
-    let run = |second: u64| {
-        let mut m = Mock::new(vec![busy_screen()]);
-        let mut s = session(&mut m, None);
-        let mut last: Option<Option<u64>> = Some(Some(0));
-        let mut touched = Vec::new();
-        let mut step = |s: &mut Session<'_, Mock>, r: Screen, at_s: u64| {
-            let at = t0 + Duration::from_secs(at_s);
-            s.keep_countdown(&r.rows, at);
-            s.keep_episode(&r, last, at);
-            last = Some(r.human_seq);
-            touched.push(s.touched());
-        };
-        step(&mut s, read(incident("0:30"), 0, 60_000), 0);
-        step(&mut s, read(incident("0:29"), 0, 60_000), 1);
-        step(&mut s, read(next_request("1:58"), 1, second), 12);
-        step(&mut s, read(next_request("1:57"), 1, second + 1_000), 13);
-        (touched, s.person_fence(&read(next_request("1:56"), 1, 0)))
-    };
-    const COUNTED: &str = "a person's gesture was counted on the session since it appeared";
-    let (touched, fence) = run(9_000);
-    assert_eq!(
-        touched,
-        [None, None, Some(BY_OWED), None],
-        "before its first frame"
-    );
-    assert_eq!(fence, Some(1), "the gesture's count is the baseline");
-    let (touched, _) = run(1_000);
-    assert_eq!(
-        touched,
-        [None, None, Some(BY_OWED), Some(COUNTED)],
-        "after its first frame"
-    );
-
-    let mut m = Mock::new(vec![busy_screen()]);
-    let mut s = session(&mut m, None);
-    s.keep_countdown(&incident("1:58"), t0);
-    s.keep_episode(&read(incident("1:58"), 1, 9_000), Some(Some(0)), t0);
-    assert_eq!(s.touched(), Some(BY_OWED));
-    let over = t0 + Duration::from_secs(1);
-    s.keep_countdown(&next_request("1:57"), over);
-    s.keep_episode(&read(next_request("1:57"), 1, 10_000), Some(Some(1)), over);
-    assert_eq!(
-        s.touched(),
-        Some(COUNTED),
-        "drawn over before its countdown placed it"
+        rows.iter().any(|r| r
+            .contains("the read carried no person count to fence an answer inside their grace on")),
+        "{rows:#?}"
     );
 }
 
@@ -962,65 +546,54 @@ fn let_go_before(m: &mut Mock, opts: &mut SuperviseOpts) {
     m.status_human_from.insert(3, TYPED_BEFORE_MS);
 }
 
+/// Another driver's hand on the session holds a box as a person's key does, and touches it: once
+/// the hand lifts the box is held for the person's whole grace (`held as ever`). A hand gone
+/// before the box was drawn touches nothing, and the person alone, quiet, has the box answered.
 #[test]
 fn another_drivers_hand_on_the_session_is_a_touch() {
     let at_margin = || watched(ticking(17, 5, incident));
-    let worlds = [
-        ("lease", at_margin(), None, false),
-        (
-            "lease come and gone",
-            at_margin(),
-            Some(TYPED_BEFORE_MS),
-            true,
-        ),
-        (
-            "printed over",
-            watched(vec![
-                incident("0:16"),
-                printed_over(&incident("0:15")),
-                printed_over(&incident("0:14")),
-            ]),
-            None,
-            false,
-        ),
-    ];
-    for (name, screens, typed_ms, passing) in worlds {
-        let world = |m: &mut Mock, _: &mut SuperviseOpts| {
-            if passing {
-                m.hand_from.insert(3, "lease:operator");
-                m.hand_from.insert(5, "-");
-            } else {
-                m.hand = "lease:operator";
-            }
-        };
-        let (m, journal) = held_watch(screens.clone(), typed_ms, Build::Shipped, world);
-        assert!(
-            m.presses().is_empty(),
-            "{name}: {:#?}\n{journal:#?}",
-            m.requests
-        );
-        assert!(!ended(&journal), "{name}: {journal:#?}");
-        assert!(
-            theirs(&journal).iter().any(|l| l.contains(
-                "another driver's hand was on the session while it was up: held as ever, and \
-                 the vendor denies it at "
-            )),
-            "{name}: {journal:#?}"
-        );
-        let (m, journal) = held_watch(screens, typed_ms, Build::TouchOff, world);
-        assert_eq!(ones(&m), 1, "{name}, touch off: {:#?}", m.requests);
-        assert!(ended(&journal), "{name}, touch off: {journal:#?}");
-    }
     let (m, journal) = held_watch(at_margin(), None, Build::Shipped, |m, _| {
-        m.hand = "lease:operator"
+        m.hand = "lease:operator";
     });
+    assert_eq!(ones(&m), 0, "{:#?}", m.requests);
     assert!(
         held_lines(&journal)
             .iter()
             .all(|l| l.contains("another driver's hand is on the session: hands off until ")),
         "{journal:#?}"
     );
-    assert_eq!(ones(&m), 0, "{:#?}", m.requests);
+    assert!(
+        theirs(&journal).iter().any(|l| l.contains(
+            "another driver's hand was on the session while it was up: held as ever, and the \
+             vendor denies it at "
+        )),
+        "{journal:#?}"
+    );
+
+    let come_and_gone = |m: &mut Mock, _: &mut SuperviseOpts| {
+        typing_then_quiet(m);
+        m.hand_from.insert(3, "lease:operator");
+        m.hand_from.insert(5, "-");
+    };
+    let (m, journal) = held_watch(at_margin(), Some(TYPING_MS), Build::Shipped, come_and_gone);
+    assert_eq!(ones(&m), 0, "lease come and gone: {:#?}", m.requests);
+    assert!(
+        theirs(&journal)
+            .iter()
+            .any(|l| l.contains("a person is typing: hands off until ")
+                && l.contains(
+                    "another driver's hand was on the session while it was up: held as ever"
+                )),
+        "{journal:#?}"
+    );
+    let (m, _) = held_watch(at_margin(), Some(TYPING_MS), Build::TouchOff, come_and_gone);
+    assert_eq!(
+        ones(&m),
+        1,
+        "lease come and gone, touch off: {:#?}",
+        m.requests
+    );
+
     let (m, journal) = held_watch(
         at_margin(),
         Some(TYPED_BEFORE_MS),
@@ -1028,7 +601,7 @@ fn another_drivers_hand_on_the_session_is_a_touch() {
         |_, _| {},
     );
     assert_eq!(ones(&m), 1, "the person alone: {:#?}", m.requests);
-    assert!(ended(&journal), "{journal:#?}");
+    assert!(held_lines(&journal).is_empty(), "{journal:#?}");
     let (m, journal) = held_watch(
         lease_before(ticking(17, 5, incident)),
         Some(TYPED_BEFORE_MS),
@@ -1053,7 +626,6 @@ fn another_drivers_hand_on_the_session_is_a_touch() {
         "the lease gone before the box: {:#?}",
         m.requests
     );
-    assert!(ended(&journal), "{journal:#?}");
     assert!(theirs(&journal).is_empty(), "{journal:#?}");
 }
 
@@ -1091,6 +663,8 @@ fn rewrapped(rows: &[String]) -> Vec<String> {
     )
 }
 
+/// A box re-wrapped or redrawn at another width is the same box, untouched: it waits only for the
+/// person's keys to settle and is answered then.
 #[test]
 fn a_redraw_is_no_touch() {
     let p = aterm_phase::parse_prompt_v2(&rewrapped(&incident("0:14"))).expect("the box");
@@ -1117,7 +691,7 @@ fn a_redraw_is_no_touch() {
     assert!(footer(&subagent(72, "0:14")).ends_with("twice to stop background…"));
     assert!(footer(&subagent(76, "0:14")).ends_with("twice to stop background agen…"));
     assert!(footer(&subagent(100, "0:14")).ends_with("twice to stop background agents"));
-    for (name, screens) in [
+    for (name, screens, quiet_from) in [
         (
             "re-wrapped",
             watched(vec![
@@ -1127,6 +701,7 @@ fn a_redraw_is_no_touch() {
                 rewrapped(&incident("0:15")),
                 rewrapped(&incident("0:14")),
             ]),
+            5,
         ),
         (
             "resized",
@@ -1137,23 +712,19 @@ fn a_redraw_is_no_touch() {
                 subagent(76, "0:18"),
                 subagent(100, "0:17"),
                 subagent(100, "0:16"),
-                subagent(100, "0:15"),
-                subagent(100, "0:14"),
             ]),
+            6,
         ),
     ] {
-        let (m, journal) = held_watch(
-            screens.clone(),
-            Some(TYPED_BEFORE_MS),
-            Build::Shipped,
-            |_, _| {},
-        );
+        let (m, journal) = held_watch(screens, Some(TYPING_MS), Build::Shipped, |m, _| {
+            m.status_human_from.insert(quiet_from, TYPED_BEFORE_MS);
+        });
         assert_eq!(ones(&m), 1, "{name}: {:#?}\n{journal:#?}", m.requests);
-        assert!(ended(&journal), "{name}: {journal:#?}");
-        assert!(theirs(&journal).is_empty(), "{name}: {journal:#?}");
-        let (m, journal) = held_watch(screens, Some(TYPED_BEFORE_MS), Build::CapOff, |_, _| {});
-        assert_eq!(ones(&m), 0, "{name}, cap off: {:#?}", m.requests);
-        assert!(!ended(&journal), "{name}, cap off: {journal:#?}");
+        let held = held_lines(&journal);
+        assert!(
+            held.len() >= 3 && held.iter().all(|l| l.ends_with(SETTLING)),
+            "{name}: {journal:#?}"
+        );
     }
 }
 
@@ -1182,30 +753,61 @@ fn narrowed(rows: &[String]) -> Vec<String> {
     )
 }
 
+/// A countdown a narrow pane wraps, and one that says `block this request in` (2.1.316), whole or
+/// wrapped through its words, is read as the box's countdown and believed once seen ticking, one
+/// box through every tick; so is one on a box relabelled between its reads.
 #[test]
-fn a_countdown_a_narrow_pane_wraps_ends_the_hold_too() {
+fn a_countdown_wrapped_relabelled_or_saying_block_is_read_as_one() {
+    let t0 = Instant::now();
     let narrow = |left: &str| narrowed(&incident(left));
-    let p = aterm_phase::parse_prompt_v2(&narrow("1:44")).expect("the box");
-    assert_eq!(p.auto_deny_left(), Some(Duration::from_secs(104)), "{p:?}");
-    assert!(p.rm_breaker().is_some(), "{p:?}");
-    let run = |build: Build| {
-        held_watch(
-            watched(ticking(15, 2, narrow)),
-            Some(TYPED_BEFORE_MS),
-            build,
-            |_, _| {},
-        )
-    };
-    let (m, journal) = run(Build::Shipped);
-    assert_eq!(ones(&m), 1, "{:#?}\n{journal:#?}", m.requests);
-    assert!(ended(&journal), "{journal:#?}");
-    let (m, journal) = run(Build::CapOff);
-    assert_eq!(ones(&m), 0, "cap off: {:#?}", m.requests);
-    assert!(!ended(&journal), "{journal:#?}");
+    let block = |left: &str| blocked(left, false);
+    let block_wrapped = |left: &str| blocked(left, true);
+    for (name, at) in [
+        ("narrowed", &narrow as &dyn Fn(&str) -> Vec<String>),
+        ("block", &block),
+        ("block, wrapped", &block_wrapped),
+    ] {
+        let p = aterm_phase::parse_prompt_v2(&at("1:44")).expect(name);
+        assert_eq!(
+            p.auto_deny_left(),
+            Some(Duration::from_secs(104)),
+            "{name}: {p:?}"
+        );
+        assert!(p.rm_breaker().is_some(), "{name}: {p:?}");
+        if name != "narrowed" {
+            let one = approval_loop::box_identity(&at("1:44"));
+            assert!(one.is_some(), "{name}");
+            assert_eq!(
+                one,
+                approval_loop::box_identity(&at("1:43")),
+                "{name}: one box through the tick"
+            );
+        }
+        let first = approval_loop::countdown_of(&at("1:44"), t0).expect(name);
+        let next = approval_loop::countdown_of(&at("1:43"), t0 + Duration::from_secs(1))
+            .expect(name)
+            .after(Some(&first));
+        assert_eq!(
+            next.deny(),
+            Some(t0 + Duration::from_secs(104)),
+            "{name}: ticking"
+        );
+    }
+    let first = approval_loop::countdown_of(&incident("0:16"), t0).expect("the countdown");
+    let relabelled = approval_loop::countdown_of(
+        &stacked(&incident("0:15"), "1 of 2"),
+        t0 + Duration::from_secs(1),
+    )
+    .expect("the relabelled countdown")
+    .after(Some(&first));
+    assert_eq!(relabelled.deny(), Some(t0 + Duration::from_secs(16)));
 }
 
+/// Every key of an answer names the person count the answer was decided on (`if-human=`), however
+/// long the person has been quiet: a gesture of theirs after it skips the key, the skip is ledgered
+/// as theirs, and the box, its focus where it was, is decided again on the new count.
 #[test]
-fn a_press_past_the_hold_is_fenced_on_the_person() {
+fn a_digit_answer_is_fenced_on_the_person_count_it_was_decided_on() {
     let digits = |m: &Mock| -> Vec<String> {
         m.presses()
             .into_iter()
@@ -1213,18 +815,16 @@ fn a_press_past_the_hold_is_fenced_on_the_person() {
             .cloned()
             .collect()
     };
-    let raced = |build: Build| {
-        held_watch_ledgered(
-            watched(ticking(15, 3, incident)),
-            Some(TYPED_BEFORE_MS),
-            build,
-            |m, _| m.person_at_key = 1,
-        )
-    };
-    let (m, journal, rows) = raced(Build::Shipped);
+    let (m, _, rows) = held_watch_ledgered(
+        watched(ticking(15, 3, incident)),
+        Some(TYPED_BEFORE_MS),
+        Build::Shipped,
+        |m, _| m.person_at_key = 1,
+    );
     let presses = digits(&m);
-    assert_eq!(presses.len(), 1, "{:#?}", m.requests);
+    assert_eq!(presses.len(), 2, "{:#?}", m.requests);
     assert!(presses[0].starts_with("key if-human=0 "), "{presses:#?}");
+    assert!(presses[1].starts_with("key if-human=1 "), "{presses:#?}");
     assert_eq!(m.person_skipped.len(), 1, "{:#?}", m.requests);
     let skipped: Vec<&String> = rows
         .iter()
@@ -1239,16 +839,6 @@ fn a_press_past_the_hold_is_fenced_on_the_person() {
         "{}",
         skipped[0]
     );
-    assert!(
-        theirs(&journal)
-            .iter()
-            .any(|l| l.contains("a person's gesture was counted")),
-        "{journal:#?}"
-    );
-    let (m, _, _) = raced(Build::TouchOff);
-    let presses = digits(&m);
-    assert_eq!(presses.len(), 2, "touch off: {:#?}", m.requests);
-    assert!(presses[1].starts_with("key if-human=1 "), "{presses:#?}");
 
     let (m, _) = held_watch(
         watched(vec![incident("0:14")]),
@@ -1275,8 +865,10 @@ fn fenced_on(m: &mut Mock) {
     m.human_seq = Some(0);
 }
 
+/// [`a_digit_answer_is_fenced_on_the_person_count_it_was_decided_on`] for a box answered by its
+/// focus and Enter.
 #[test]
-fn a_focus_press_past_the_hold_is_fenced_on_the_person() {
+fn a_focus_answer_is_fenced_on_the_person_count_it_was_decided_on() {
     let yes = |left: &str| unnumbered(&incident(left));
     let p = aterm_phase::parse_prompt_v2(&yes("0:14")).expect("the box");
     assert_eq!(
@@ -1287,36 +879,28 @@ fn a_focus_press_past_the_hold_is_fenced_on_the_person() {
         ),
         "{p:?}"
     );
-    let raced = |build: Build| {
-        held_watch(
-            watched(ticking(15, 3, yes)),
-            Some(TYPED_BEFORE_MS),
-            build,
-            |m, _| {
-                fenced_on(m);
-                m.person_at_key = 1;
-            },
-        )
-    };
-    let (m, journal) = raced(Build::Shipped);
-    assert_eq!(key_names(&m), ["enter"], "{:#?}", m.requests);
-    assert!(
-        m.presses()[0].starts_with("key if-human=0 "),
-        "{:#?}",
-        m.requests
+    let (m, _) = held_watch(
+        watched(ticking(15, 3, yes)),
+        Some(TYPED_BEFORE_MS),
+        Build::Shipped,
+        |m, _| {
+            fenced_on(m);
+            m.person_at_key = 1;
+        },
     );
-    assert_eq!(m.person_skipped.len(), 1, "{:#?}", m.requests);
-    assert!(!theirs(&journal).is_empty(), "{journal:#?}");
-    let (m, _) = raced(Build::TouchOff);
+    let presses = m.presses();
     assert_eq!(key_names(&m), ["enter", "enter"], "{:#?}", m.requests);
+    assert!(presses[0].starts_with("key if-human=0 "), "{presses:#?}");
+    assert!(presses[1].starts_with("key if-human=1 "), "{presses:#?}");
+    assert_eq!(m.person_skipped.len(), 1, "{:#?}", m.requests);
 
     let (m, _) = held_watch(watched(vec![yes("0:14")]), None, Build::Shipped, |m, _| {
-        fenced_on(m)
+        fenced_on(m);
     });
     let presses = m.presses();
     assert_eq!(presses.len(), 1, "{:#?}", m.requests);
     assert!(
-        presses[0].ends_with(" enter") && !presses[0].contains("if-human="),
+        presses[0].ends_with(" enter") && presses[0].starts_with("key if-human=0 "),
         "{presses:#?}"
     );
 }
@@ -1342,6 +926,10 @@ fn default_no(left: &str, on_yes: bool) -> Vec<String> {
     }
 }
 
+/// A person's gesture that refuses one of aterm's keys (`skipped reason=person`) leaves the box's
+/// focus where aterm's keys put it as the read before showed it: a key of theirs that moves it from
+/// there, with no key of aterm's since, makes the box theirs, held for their whole grace, where the
+/// loop with no touch (`Build::TouchOff`) would answer it again over them.
 #[test]
 fn a_persons_key_after_the_loops_own_arrow_makes_the_box_theirs() {
     let run = |build: Build| {
@@ -1369,7 +957,7 @@ fn a_persons_key_after_the_loops_own_arrow_makes_the_box_theirs() {
     assert!(
         theirs(&journal)
             .iter()
-            .any(|l| l.contains("a person's gesture was counted")),
+            .any(|l| l.contains("a key not aterm's moved its focus: held as ever")),
         "{journal:#?}"
     );
     let (m, _) = run(Build::TouchOff);
@@ -1381,8 +969,11 @@ fn a_persons_key_after_the_loops_own_arrow_makes_the_box_theirs() {
     );
 }
 
+/// A focus answer's Enter is keyed on the read that saw its arrow land, fenced on the person count
+/// that read carried: a gesture counted between the arrow and that read that left the focus where
+/// the arrow put it moved nothing on the box, so the answer goes on.
 #[test]
-fn a_gesture_between_a_focus_press_arrow_and_its_enter_skips_the_enter() {
+fn a_focus_answer_s_enter_is_fenced_on_the_read_that_saw_its_arrow_land() {
     let (m, journal) = held_watch(
         watched(vec![
             default_no("0:15", false),
@@ -1401,58 +992,48 @@ fn a_gesture_between_a_focus_press_arrow_and_its_enter_skips_the_enter() {
     assert_eq!(key_names(&m), ["down", "enter"], "{:#?}", m.requests);
     let presses = m.presses();
     assert!(
-        presses.iter().all(|p| p.starts_with("key if-human=0 ")),
+        presses[0].starts_with("key if-human=0 ") && presses[1].starts_with("key if-human=1 "),
         "{presses:#?}"
     );
-    assert_eq!(m.person_skipped.len(), 1, "{:#?}", m.requests);
-    assert!(ended(&journal), "{journal:#?}");
-    assert!(
-        theirs(&journal)
-            .iter()
-            .any(|l| l.contains("a person's gesture was counted")),
-        "{journal:#?}"
-    );
+    assert!(m.person_skipped.is_empty(), "{:#?}", m.requests);
+    assert!(theirs(&journal).is_empty(), "{journal:#?}");
 }
 
+/// A read with no box ends the box's episode, so the same box asked again after it is another
+/// episode: a touch on the first is no touch on the second, and a touch on the second leaves the
+/// first answered.
 #[test]
 fn a_box_asked_again_after_a_read_without_one_is_another_episode() {
-    let screens = |moved: bool| {
-        let b = |rows: Vec<String>| if moved { moved_to_no(&rows) } else { rows };
+    let screens = |a_moved: bool, b_moved: bool| {
+        let a = |rows: Vec<String>| if a_moved { moved_to_no(&rows) } else { rows };
+        let b = |rows: Vec<String>| if b_moved { moved_to_no(&rows) } else { rows };
         watched(vec![
-            incident("0:15"),
-            incident("0:14"),
+            a(incident("0:15")),
+            a(incident("0:14")),
             busy_screen(),
-            incident("0:16"),
+            b(incident("0:16")),
             b(incident("0:15")),
             b(incident("0:14")),
-            b(incident("0:13")),
         ])
     };
-    let run = |moved: bool, build: Build| {
-        held_watch(screens(moved), Some(TYPED_BEFORE_MS), build, |m, _| {
-            if moved {
-                m.human_seq_from.insert(6, 1);
-            }
-        })
+    let run = |a_moved: bool, b_moved: bool, build: Build| {
+        held_watch(
+            screens(a_moved, b_moved),
+            Some(TYPED_BEFORE_MS),
+            build,
+            |_, _| {},
+        )
     };
-    let (m, journal) = run(true, Build::Shipped);
+    let (m, journal) = run(false, true, Build::Shipped);
     assert_eq!(ones(&m), 1, "A only: {:#?}", m.requests);
-    assert!(!theirs(&journal).is_empty(), "{journal:#?}");
-    let (m, _) = run(false, Build::Shipped);
+    assert!(!theirs(&journal).is_empty(), "B theirs: {journal:#?}");
+    let (m, _) = run(false, false, Build::Shipped);
     assert_eq!(ones(&m), 2, "A and B: {:#?}", m.requests);
-    let (m, _) = run(true, Build::TouchOff);
+    let (m, _) = run(false, true, Build::TouchOff);
     assert_eq!(ones(&m), 2, "touch off: {:#?}", m.requests);
-    let (m, journal) = held_watch(
-        screens(false),
-        Some(TYPED_BEFORE_MS),
-        Build::Shipped,
-        |m, _| {
-            m.human_seq_from.insert(3, 1);
-        },
-    );
+    let (m, journal) = run(true, false, Build::Shipped);
     assert_eq!(ones(&m), 1, "B only: {:#?}\n{journal:#?}", m.requests);
     assert!(!theirs(&journal).is_empty(), "A theirs: {journal:#?}");
-    assert!(ended(&journal), "B's hold ended: {journal:#?}");
 }
 
 fn next_request(left: &str) -> Vec<String> {
@@ -1473,6 +1054,9 @@ fn next_request(left: &str) -> Vec<String> {
     )
 }
 
+/// A box a person or another driver touched stays theirs through a relabel (`1 of 2`, `2 of 2`)
+/// and the next request drawn in its place while they hold it; a touch kept through the focus
+/// coming back is lost by a loop that starts an episode at every box (`Build::EpisodePerBox`).
 #[test]
 fn a_touched_box_relabelled_or_replaced_stays_theirs() {
     let p = aterm_phase::parse_prompt_v2(&stacked(&incident("0:14"), "1 of 2")).expect("the box");
@@ -1499,17 +1083,20 @@ fn a_touched_box_relabelled_or_replaced_stays_theirs() {
         ])
     };
     let person = |build: Build| {
-        held_watch(screens(false), Some(TYPED_BEFORE_MS), build, |m, _| {
-            m.human_seq_from.insert(3, 1);
+        held_watch(screens(true), Some(TYPING_MS), build, |m, _| {
+            typing_then_quiet(m);
         })
     };
-    let lease =
-        |build: Build| held_watch(screens(true), None, build, |m, _| m.hand = "lease:operator");
+    let lease = |build: Build| {
+        held_watch(screens(false), None, build, |m, _| {
+            m.hand = "lease:operator"
+        })
+    };
     for (name, run, why) in [
         (
             "person",
             &person as &dyn Fn(Build) -> (Mock, Vec<String>),
-            "a person's gesture was counted on the session since it appeared: held as ever",
+            "a key not aterm's moved its focus: held as ever",
         ),
         (
             "lease",
@@ -1523,189 +1110,52 @@ fn a_touched_box_relabelled_or_replaced_stays_theirs() {
             "{name}: {:#?}\n{journal:#?}",
             m.requests
         );
-        assert!(!ended(&journal), "{name}: {journal:#?}");
         let theirs = theirs(&journal);
         assert!(theirs.len() >= 6, "{name}: {journal:#?}");
         assert!(
             theirs.iter().all(|l| l.contains(why)),
             "{name}: {theirs:#?}"
         );
-        let (m, journal) = run(Build::TouchOff);
-        assert!(ones(&m) >= 1, "{name}, touch off: {:#?}", m.requests);
-        assert!(ended(&journal), "{name}, touch off: {journal:#?}");
     }
-    let (m, journal) = person(Build::EpisodePerBox);
-    let digits: Vec<&String> = m
-        .presses()
-        .into_iter()
-        .filter(|p| p.ends_with(" 1"))
-        .collect();
-    assert!(
-        !digits.is_empty(),
-        "episode per box: {:#?}\n{journal:#?}",
-        m.requests
-    );
-    assert!(digits[0].starts_with("key if-human=1 "), "{digits:#?}");
-    assert!(
-        m.person_skipped.is_empty(),
-        "pressed over the gesture: {:#?}",
-        m.requests
-    );
-    assert!(ended(&journal), "{journal:#?}");
+    let (m, _) = person(Build::TouchOff);
+    assert!(ones(&m) >= 1, "person, touch off: {:#?}", m.requests);
+
+    let back_up = |build: Build| {
+        held_watch(
+            watched(vec![
+                incident("0:17"),
+                moved_to_no(&incident("0:16")),
+                incident("0:15"),
+                stacked(&incident("0:14"), "1 of 2"),
+                stacked(&incident("0:13"), "1 of 2"),
+            ]),
+            Some(TYPING_MS),
+            build,
+            |m, _| typing_then_quiet(m),
+        )
+    };
+    let (m, journal) = back_up(Build::Shipped);
+    assert!(m.presses().is_empty(), "{:#?}\n{journal:#?}", m.requests);
+    assert!(theirs(&journal).len() >= 3, "{journal:#?}");
+    let (m, _) = back_up(Build::EpisodePerBox);
+    assert!(ones(&m) >= 1, "episode per box: {:#?}", m.requests);
 }
 
-#[test]
-fn an_episode_runs_from_the_first_box_to_the_first_read_without_one() {
-    let read = |rows: Vec<String>, count: Option<u64>, human: HumanInput| Screen {
-        rows,
-        human,
-        human_seq: count,
-        cols: Some(144),
-        ..Screen::default()
-    };
-    let seen = |rows: Vec<String>, count: u64| read(rows, Some(count), HumanInput::Ago(22_000));
-    let mut m = Mock::new(vec![busy_screen()]);
-    let mut s = session(&mut m, None);
-    let mut last: Option<Option<u64>> = None;
-    let mut step = |s: &mut Session<'_, Mock>, r: Screen| {
-        s.keep_episode(&r, last, Instant::now());
-        last = Some(r.human_seq);
-        s.touched()
-    };
-    assert_eq!(
-        step(&mut s, seen(incident("0:20"), 0)),
-        Some("whether a person touched it since it appeared cannot be told"),
-        "the session's first read"
-    );
-    assert_eq!(
-        step(&mut s, seen(busy_screen(), 0)),
-        None,
-        "no box: the episode over"
-    );
-    for (why, rows) in [
-        ("as opened", incident("0:19")),
-        ("relabelled", stacked(&incident("0:18"), "1 of 2")),
-        ("re-wrapped", rewrapped(&incident("0:17"))),
-        ("its focus moved", moved_to_no(&incident("0:16"))),
-        ("its footer re-cut", subagent(76, "0:15")),
-        ("at another width", subagent(100, "0:14")),
-    ] {
-        assert_eq!(step(&mut s, seen(rows, 0)), None, "{why}");
-    }
-    const COUNTED: &str = "a person's gesture was counted on the session since it appeared";
-    assert_eq!(step(&mut s, seen(subagent(100, "0:13"), 1)), Some(COUNTED));
-    for (why, rows) in [
-        ("relabelled", stacked(&incident("0:12"), "2 of 2")),
-        ("re-wrapped", rewrapped(&incident("0:11"))),
-        ("another drawn in its place", next_request("0:10")),
-        ("at another width", subagent(100, "0:09")),
-    ] {
-        assert_eq!(step(&mut s, seen(rows, 1)), Some(COUNTED), "{why}");
-    }
-    assert_eq!(
-        step(&mut s, seen(busy_screen(), 1)),
-        None,
-        "no box: the episode over"
-    );
-    assert_eq!(
-        step(&mut s, seen(incident("0:30"), 1)),
-        None,
-        "another episode"
-    );
-    assert_eq!(
-        s.person_fence(&seen(incident("0:30"), 1)),
-        Some(1),
-        "its baseline"
-    );
-    for (why, r, by) in [
-        (
-            "no count",
-            read(incident("0:29"), None, HumanInput::Ago(22_000)),
-            "whether a person touched it since it appeared cannot be told",
-        ),
-        (
-            "no stamp",
-            read(incident("0:29"), Some(1), HumanInput::Unknown),
-            "whether a person touched it since it appeared cannot be told",
-        ),
-        (
-            "started over",
-            seen(incident("0:29"), 0),
-            "the session's person count started over since it appeared, so whether a person \
-             touched it cannot be told",
-        ),
-    ] {
-        assert_eq!(step(&mut s, seen(busy_screen(), 1)), None, "{why}");
-        assert_eq!(step(&mut s, seen(incident("0:30"), 1)), None, "{why}");
-        assert_eq!(step(&mut s, r), Some(by), "{why}");
-        assert_eq!(
-            s.person_fence(&seen(incident("0:28"), 7)),
-            Some(7),
-            "{why}: a touched episode is fenced on the read decided on"
-        );
-    }
-    assert_eq!(step(&mut s, seen(busy_screen(), 1)), None);
-    s.driver = true;
-    assert_eq!(
-        step(&mut s, seen(incident("0:30"), 1)),
-        None,
-        "a hand the status read before the box found"
-    );
-    s.episode_driven();
-    assert_eq!(
-        s.touched(),
-        Some("another driver's hand was on the session while it was up"),
-        "a status read under way"
-    );
-
-    let mut m = Mock::new(vec![busy_screen()]);
-    let mut s = session(&mut m, None);
-    s.set_episode_per_box();
-    let mut last: Option<Option<u64>> = Some(Some(0));
-    let mut step = |s: &mut Session<'_, Mock>, r: Screen| {
-        s.keep_episode(&r, last, Instant::now());
-        last = Some(r.human_seq);
-        s.touched()
-    };
-    assert_eq!(step(&mut s, seen(incident("0:20"), 0)), None);
-    assert_eq!(step(&mut s, seen(incident("0:19"), 1)), Some(COUNTED));
-    assert_eq!(
-        step(&mut s, seen(stacked(&incident("0:18"), "1 of 2"), 1)),
-        None,
-        "episode per box: the touch lost"
-    );
-}
-
-#[test]
-fn a_person_count_that_started_over_is_a_touch() {
-    let (m, journal) = held_watch(
-        watched(ticking(17, 5, incident)),
-        Some(TYPED_BEFORE_MS),
-        Build::Shipped,
-        |m, _| {
-            m.human_seq_from.insert(1, 57);
-            m.human_seq_from.insert(3, 0);
-            m.human_seq_from.insert(4, 1);
-        },
-    );
-    assert_eq!(ones(&m), 0, "{:#?}\n{journal:#?}", m.requests);
-    assert!(
-        theirs(&journal).iter().any(|l| l.contains(
-            "the session's person count started over since it appeared, so whether a person \
-             touched it cannot be told: held as ever"
-        )),
-        "{journal:#?}"
-    );
-    assert!(!ended(&journal), "{journal:#?}");
-}
-
+/// Every tab of a question dialog, and its review, is one episode: a person's key that moved a
+/// tab's focus, or another driver's hand on it, keeps the review theirs, which a loop that starts
+/// an episode at every box (`Build::EpisodePerBox`) answers.
 #[test]
 fn a_question_dialog_s_tabs_are_one_episode() {
-    let keys = |lease: bool, counted: bool, build: Build| {
+    let keys = |lease: bool, moved: bool, build: Build| {
         let (jdir, journal) = journal_file("box-hold-tab");
         let tab = f::screen(f::QUESTION_TABS_FOURTH);
+        let second = if moved {
+            focused_on(&tab, "2. Top")
+        } else {
+            tab.clone()
+        };
         let mut m = questioned(watched(
-            [vec![tab.clone(), tab], ticking(15, 3, review_ticking)].concat(),
+            [vec![tab, second], ticking(15, 3, review_ticking)].concat(),
         ));
         if lease {
             m.hand = "lease:operator";
@@ -1714,9 +1164,6 @@ fn a_question_dialog_s_tabs_are_one_episode() {
             m.human_ms = Some(QUESTION_TYPED_BEFORE_MS);
         }
         m.human_seq = Some(0);
-        if counted {
-            m.human_seq_from.insert(3, 1);
-        }
         m.vanish_after = Some(0);
         let mut opts = SuperviseOpts {
             journal: Some(journal.clone()),
@@ -1740,12 +1187,12 @@ fn a_question_dialog_s_tabs_are_one_episode() {
             journal,
         )
     };
-    for (name, lease, counted, why) in [
+    for (name, lease, moved, why) in [
         (
             "person",
             false,
             true,
-            "a person's gesture was counted on the session since it appeared: held as ever",
+            "a key not aterm's moved its focus: held as ever",
         ),
         (
             "lease",
@@ -1754,7 +1201,7 @@ fn a_question_dialog_s_tabs_are_one_episode() {
             "another driver's hand was on the session while it was up: held as ever",
         ),
     ] {
-        let (pressed, journal) = keys(lease, counted, Build::Shipped);
+        let (pressed, journal) = keys(lease, moved, Build::Shipped);
         assert!(pressed.is_empty(), "{name}: {pressed:?}\n{journal:#?}");
         assert!(
             theirs(&journal).iter().any(|l| l.contains(why)),
@@ -1767,327 +1214,6 @@ fn a_question_dialog_s_tabs_are_one_episode() {
     let (pressed, journal) = keys(false, true, Build::EpisodePerBox);
     assert_eq!(pressed, ["enter"], "episode per box: {journal:#?}");
     assert!(ended(&journal), "{journal:#?}");
-}
-
-struct World {
-    name: &'static str,
-    screens: Vec<Vec<String>>,
-    watched: bool,
-    typed_ms: Option<u64>,
-    lease: bool,
-    lease_before: bool,
-    answers: bool,
-    counts: &'static [(usize, u64)],
-    no_count: bool,
-    grace_over_from: Option<usize>,
-    vendor_s: Option<u64>,
-    known: bool,
-    counted: bool,
-    blind: bool,
-}
-
-fn worlds() -> Vec<World> {
-    let person = Some(TYPED_BEFORE_MS);
-    let ticks = |name, from: u64, typed_ms, answers| World {
-        name,
-        screens: ticking(from, 2, incident),
-        watched: true,
-        typed_ms,
-        lease: false,
-        lease_before: false,
-        answers,
-        counts: &[],
-        no_count: false,
-        grace_over_from: None,
-        vendor_s: Some(from - 1),
-        known: true,
-        counted: false,
-        blind: false,
-    };
-    vec![
-        ticks("1:44 person", 104, person, true),
-        ticks("0:29 person", 29, person, true),
-        ticks("0:15 person", 15, person, true),
-        World {
-            screens: vec![incident("1:44")],
-            vendor_s: Some(104),
-            known: false,
-            ..ticks("1:44 nobody", 104, None, true)
-        },
-        ticks("0:15 escalated", 15, person, false),
-        World {
-            screens: vec![incident("about 2 minutes"); 2],
-            vendor_s: Some(120),
-            known: false,
-            ..ticks("unread person", 120, person, true)
-        },
-        World {
-            screens: vec![faked("0:14"); 2],
-            vendor_s: None,
-            known: false,
-            ..ticks("faked person", 14, person, true)
-        },
-        World {
-            screens: vec![incident("0:14"); 2],
-            vendor_s: None,
-            known: false,
-            ..ticks("standing person", 14, person, true)
-        },
-        World {
-            counts: &[(3, 1)],
-            counted: true,
-            ..ticks("touched person", 15, person, true)
-        },
-        World {
-            counts: &[(2, 1)],
-            counted: true,
-            ..ticks("touched in the gap", 15, person, true)
-        },
-        World {
-            screens: ticking(30, 3, incident),
-            vendor_s: Some(28),
-            counts: &[(3, 1)],
-            grace_over_from: Some(4),
-            counted: true,
-            ..ticks("touched, grace over", 30, person, true)
-        },
-        World {
-            watched: false,
-            blind: true,
-            ..ticks("first read the box", 15, person, true)
-        },
-        World {
-            screens: ticking(15, 2, |left| unnumbered(&incident(left))),
-            no_count: true,
-            blind: true,
-            ..ticks("no person count", 15, person, true)
-        },
-        World {
-            counts: &[(1, 57), (3, 0)],
-            blind: true,
-            ..ticks("count started over", 15, person, true)
-        },
-        World {
-            screens: vec![
-                incident("0:15"),
-                moved_to_no(&incident("0:14")),
-                moved_to_no(&incident("0:13")),
-            ],
-            lease: true,
-            ..ticks("lease, focus moved", 15, None, true)
-        },
-        World {
-            lease: true,
-            ..ticks("lease", 15, None, true)
-        },
-        World {
-            screens: vec![
-                incident("0:17"),
-                incident("0:16"),
-                stacked(&incident("0:15"), "1 of 2"),
-                stacked(&incident("0:14"), "1 of 2"),
-                stacked(&incident("0:13"), "1 of 2"),
-            ],
-            vendor_s: Some(14),
-            counts: &[(3, 1)],
-            counted: true,
-            ..ticks("relabelled once touched", 17, person, true)
-        },
-        World {
-            screens: vec![
-                subagent(72, "0:17"),
-                subagent(72, "0:16"),
-                subagent(76, "0:15"),
-                subagent(76, "0:14"),
-                subagent(76, "0:13"),
-            ],
-            vendor_s: Some(14),
-            ..ticks("footer re-cut", 17, person, true)
-        },
-        World {
-            lease_before: true,
-            ..ticks("lease gone before the box", 15, person, true)
-        },
-        ticks("1:44 older person", 104, Some(TYPED_LONG_BEFORE_MS), true),
-        World {
-            counts: &[(2, 1)],
-            counted: true,
-            ..ticks(
-                "touched, older person",
-                90,
-                Some(TYPED_LONG_BEFORE_MS),
-                true,
-            )
-        },
-        World {
-            counts: &[(2, 1)],
-            ..ticks(
-                "counted before the box",
-                104,
-                Some(TYPED_LONG_BEFORE_MS),
-                true,
-            )
-        },
-    ]
-}
-
-fn pressed_in(w: &World, build: Build) -> bool {
-    let screens = if w.lease_before {
-        lease_before(w.screens.clone())
-    } else if w.watched {
-        watched(w.screens.clone())
-    } else {
-        [w.screens.clone(), vec![busy_screen()]].concat()
-    };
-    let (answers, lease, lease_before, counts, no_count, grace_over_from) = (
-        w.answers,
-        w.lease,
-        w.lease_before,
-        w.counts,
-        w.no_count,
-        w.grace_over_from,
-    );
-    let (m, _) = held_watch(screens, w.typed_ms, build, |m, opts| {
-        if !answers {
-            opts.policy.approve = Approve::None;
-        }
-        if lease {
-            m.hand = "lease:operator";
-        }
-        if lease_before {
-            let_go_before(m, opts);
-        }
-        if no_count {
-            m.human_seq = None;
-        }
-        for &(from, n) in counts {
-            m.human_seq_from.insert(from, n);
-        }
-        if let Some(from) = grace_over_from {
-            m.status_human_from
-                .insert(from, u64::from(GRACE_S) * 1000 + 10_000);
-        }
-    });
-    !m.presses().is_empty()
-}
-
-fn box_hold_violations(build: Build) -> (Vec<String>, Vec<bool>) {
-    let model = aterm_models_harness::supervisor_box_hold_model();
-    let window = model
-        .consts
-        .iter()
-        .find(|(k, _)| *k == "Window")
-        .map(|(_, v)| *v)
-        .expect("the window");
-    let margin = approval_loop::DENY_MARGIN.as_secs();
-    let mut bad = Vec::new();
-    let mut presses = Vec::new();
-    for w in worlds() {
-        let pressed = pressed_in(&w, build);
-        presses.push(pressed);
-        let mut st = model.init_state();
-        let latched = w.counted || w.lease || w.blind;
-        let bound_ms = if latched {
-            u64::from(GRACE_S) * 1000
-        } else {
-            u64::try_from(approval_loop::QUESTION_PERSON_GRACE.as_millis()).unwrap_or(u64::MAX)
-        };
-        let grace = w.grace_over_from.is_none() && w.typed_ms.is_some_and(|ms| ms < bound_ms);
-        for (k, v) in [
-            ("up", 1),
-            (
-                "left",
-                w.vendor_s
-                    .map_or(window, |s| i64::try_from(s.div_ceil(margin)).unwrap_or(0)),
-            ),
-            ("known", i64::from(w.known)),
-            ("policy", i64::from(w.answers)),
-            ("grace", i64::from(grace)),
-            ("driver", i64::from(w.lease)),
-            ("counted", i64::from(w.counted)),
-            ("driven", i64::from(w.lease)),
-            ("blind", i64::from(w.blind)),
-            ("latched", i64::from(latched)),
-        ] {
-            st.insert(k, v);
-        }
-        let action = if pressed { "Press" } else { "Tick" };
-        if !model.action_enabled(action, &st) {
-            bad.push(format!("{}: {action} at {st:?}", w.name));
-        }
-    }
-    (bad, presses)
-}
-
-#[test]
-fn tier1_a_hold_goes_only_where_the_model_allows() {
-    let names = |bad: &[String]| -> Vec<String> {
-        bad.iter()
-            .map(|b| b.split_once(": ").map_or("", |(n, _)| n).to_string())
-            .collect()
-    };
-    let shipped = [
-        false, false, true, true, false, false, false, false, false, false, true, false, false,
-        false, false, false, false, true, true, true, false, true,
-    ];
-    let (bad, presses) = box_hold_violations(Build::Shipped);
-    assert_eq!(bad, Vec::<String>::new());
-    assert_eq!(presses, shipped);
-
-    let (bad, presses) = box_hold_violations(Build::BoundOff);
-    let mut want = shipped;
-    want[19] = false;
-    want[21] = false;
-    assert_eq!(presses, want);
-    assert_eq!(
-        names(&bad),
-        ["1:44 older person", "counted before the box"],
-        "{bad:#?}"
-    );
-    assert!(bad.iter().all(|b| b.contains(": Tick at ")), "{bad:#?}");
-
-    let (bad, presses) = box_hold_violations(Build::CapOff);
-    let mut want = shipped;
-    want[2] = false;
-    want[17] = false;
-    want[18] = false;
-    assert_eq!(presses, want);
-    assert_eq!(
-        names(&bad),
-        ["0:15 person", "footer re-cut", "lease gone before the box"],
-        "{bad:#?}"
-    );
-    assert!(bad.iter().all(|b| b.contains(": Tick at ")), "{bad:#?}");
-
-    let (bad, presses) = box_hold_violations(Build::TouchOff);
-    let mut want = shipped;
-    for i in [8, 9, 11, 12, 13, 14, 15, 16, 20] {
-        want[i] = true;
-    }
-    assert_eq!(presses, want);
-    assert_eq!(
-        names(&bad),
-        [
-            "touched person",
-            "touched in the gap",
-            "first read the box",
-            "no person count",
-            "count started over",
-            "lease, focus moved",
-            "lease",
-            "relabelled once touched",
-            "touched, older person"
-        ],
-        "{bad:#?}"
-    );
-    assert!(bad.iter().all(|b| b.contains(": Press at ")), "{bad:#?}");
-
-    let (bad, presses) = box_hold_violations(Build::EpisodePerBox);
-    let mut want = shipped;
-    want[16] = true;
-    assert_eq!(presses, want);
-    assert_eq!(names(&bad), ["relabelled once touched"], "{bad:#?}");
-    assert!(bad.iter().all(|b| b.contains(": Press at ")), "{bad:#?}");
 }
 
 fn review_ticking(left: &str) -> Vec<String> {
@@ -2125,15 +1251,12 @@ fn a_question_dialog_is_answered_before_its_countdown_runs_out() {
         "read whole: {p:?}"
     );
     assert_eq!(p.auto_deny_left(), Some(Duration::from_secs(14)));
-    let keys = |screens: Vec<Vec<String>>, build: Build, counted: bool| {
+    let keys = |screens: Vec<Vec<String>>, build: Build| {
         let mut m = questioned(screens);
         m.human = vec![QUESTION_TYPED_BEFORE];
         m.human_ms = Some(QUESTION_TYPED_BEFORE_MS);
         m.human_seq = Some(0);
         m.vanish_after = Some(0);
-        if counted {
-            m.human_seq_from.insert(3, 1);
-        }
         let mut opts = answering(30);
         opts.policy.human_grace_s = GRACE_S;
         let _ = watch_lines_with(&mut m, &opts, |s| {
@@ -2151,8 +1274,7 @@ fn a_question_dialog_is_answered_before_its_countdown_runs_out() {
     assert_eq!(
         enters(&keys(
             watched(ticking(15, 2, review_ticking)),
-            Build::Shipped,
-            false
+            Build::Shipped
         )),
         1,
         "answered before the deny"
@@ -2160,8 +1282,7 @@ fn a_question_dialog_is_answered_before_its_countdown_runs_out() {
     assert_eq!(
         enters(&keys(
             watched(ticking(104, 2, review_ticking)),
-            Build::Shipped,
-            false
+            Build::Shipped
         )),
         0,
         "held for the person above the margin"
@@ -2169,8 +1290,7 @@ fn a_question_dialog_is_answered_before_its_countdown_runs_out() {
     assert_eq!(
         enters(&keys(
             watched(ticking(15, 2, review_ticking)),
-            Build::CapOff,
-            false
+            Build::CapOff
         )),
         0,
         "the hold outlasts the countdown"
@@ -2187,27 +1307,27 @@ fn a_question_dialog_is_answered_before_its_countdown_runs_out() {
         )),
         "{p:?}"
     );
+    let reviewed = || {
+        watched(vec![
+            skipped_to("0:15"),
+            focused_on(&skipped_to("0:14"), "2. Cancel"),
+            skipped_to("0:13"),
+            skipped_to("0:12"),
+        ])
+    };
     assert!(
-        keys(watched(ticking(15, 3, skipped_to)), Build::Shipped, true).is_empty(),
+        keys(reviewed(), Build::Shipped).is_empty(),
         "a person's review"
     );
-    assert_eq!(
-        enters(&keys(
-            watched(ticking(15, 3, skipped_to)),
-            Build::TouchOff,
-            true
-        )),
-        1,
-        "touch off"
-    );
+    assert_eq!(enters(&keys(reviewed(), Build::TouchOff)), 1, "touch off");
     let cancel = |left: &str| focused_on(&review_ticking(left), "2. Cancel");
     let attached = || [ticking(15, 3, cancel), vec![busy_screen()]].concat();
     assert!(
-        keys(attached(), Build::Shipped, false).is_empty(),
+        keys(attached(), Build::Shipped).is_empty(),
         "attached mid-dialog"
     );
     assert_eq!(
-        keys(attached(), Build::TouchOff, false)
+        keys(attached(), Build::TouchOff)
             .first()
             .map(String::as_str),
         Some("up"),
@@ -2215,44 +1335,31 @@ fn a_question_dialog_is_answered_before_its_countdown_runs_out() {
     );
 }
 
+/// A question dialog's answer past its countdown's margin is fenced on the person count it was
+/// decided on: a gesture of theirs counted as its Enter is keyed skips the Enter, and the dialog is
+/// decided again on the new count.
 #[test]
 fn a_gesture_counted_inside_the_answer_past_the_hold_stops_it() {
-    let cancel = |left: &str| focused_on(&review_ticking(left), "2. Cancel");
-    let screens = watched(vec![
-        cancel("0:15"),
-        cancel("0:14"),
-        review_ticking("0:13"),
-        review_ticking("0:12"),
-        review_ticking("0:11"),
-    ]);
-    let (jdir, journal) = journal_file("box-hold-answer");
-    let mut m = questioned(screens);
+    let mut m = questioned(watched(ticking(15, 4, review_ticking)));
     m.human = vec![QUESTION_TYPED_BEFORE];
     m.human_ms = Some(QUESTION_TYPED_BEFORE_MS);
     m.human_seq = Some(0);
-    m.human_seq_from.insert(4, 1);
+    m.person_at_key = 1;
     m.vanish_after = Some(0);
-    let mut opts = SuperviseOpts {
-        journal: Some(journal.clone()),
-        ..answering(30)
-    };
+    let mut opts = answering(30);
     opts.policy.human_grace_s = GRACE_S;
     let _ = watch_lines_with(&mut m, &opts, |s| {
         s.set_approval_env(owner_env());
         s.set_read_clock();
         s.set_person_hold_wait(Duration::ZERO);
     });
-    let (records, _) = journal_records(&journal);
-    let _ = std::fs::remove_dir_all(&jdir);
-    let journal: Vec<String> = records.into_iter().map(|r| r.line).collect();
-    assert_eq!(key_names(&m), ["up", "enter"], "{:#?}", m.requests);
+    assert_eq!(key_names(&m), ["enter", "enter"], "{:#?}", m.requests);
+    let presses = m.presses();
     assert!(
-        m.presses()[1].starts_with("key if-human=0 "),
-        "{:#?}",
-        m.requests
+        presses[0].starts_with("key if-human=0 ") && presses[1].starts_with("key if-human=1 "),
+        "{presses:#?}"
     );
     assert_eq!(m.person_skipped.len(), 1, "{:#?}", m.requests);
-    assert!(!theirs(&journal).is_empty(), "{journal:#?}");
 }
 
 fn tall_ticking(left: &str) -> [Vec<String>; 4] {
@@ -2349,23 +1456,6 @@ fn a_persons_key_during_the_loops_decline_makes_the_box_theirs() {
     assert!(
         w[2].ends_with(" down") && w.last().is_some_and(|k| k.ends_with(" enter")),
         "touch off: {w:#?}"
-    );
-}
-
-#[test]
-fn a_gesture_counted_inside_the_decline_past_the_hold_stops_it() {
-    let states = [0usize, 0, 0, 0, 2, 2, 3, 3, 3, 3];
-    let (w, journal) = tall_decline(17, &states, Build::Shipped, &|m| {
-        m.human_seq_from.insert(6, 1);
-    });
-    assert_eq!(w.len(), 2, "{w:#?}\n{journal:#?}");
-    assert!(w[0].ends_with(" down"), "{w:#?}");
-    assert!(w[1].starts_with("send if-human=0 "), "{w:#?}");
-    assert!(!w.iter().any(|k| k.ends_with(" enter")), "{w:#?}");
-    assert!(!theirs(&journal).is_empty(), "{journal:#?}");
-    assert!(
-        !journal.iter().any(|l| l.starts_with("DECLINED ")),
-        "{journal:#?}"
     );
 }
 
@@ -2587,47 +1677,6 @@ fn the_first_key_after_a_ticking_dialogs_wait_is_fenced_on_a_read_after_it() {
         s.set_person_hold_wait(Duration::ZERO);
     });
     assert_eq!(key_names(&m), ["enter"], "{:#?}", m.requests);
-}
-
-#[test]
-fn a_countdown_ticks_on_through_its_box_s_redraws() {
-    let at_margin = watched(vec![
-        incident("0:17"),
-        incident("0:16"),
-        stacked(&incident("0:15"), "1 of 2"),
-        stacked(&incident("0:14"), "1 of 2"),
-        stacked(&incident("0:13"), "1 of 2"),
-    ]);
-    let (m, journal) = held_watch(at_margin, Some(TYPED_BEFORE_MS), Build::Shipped, |_, _| {});
-    let looks = |journal: &[String]| {
-        held_lines(journal)
-            .into_iter()
-            .filter(|l| l.contains("read again to see it tick"))
-            .count()
-    };
-    let ends = |journal: &[String]| {
-        journal
-            .iter()
-            .filter(|l| l.starts_with("HOLD-ENDED "))
-            .count()
-    };
-    assert_eq!(ones(&m), 1, "{:#?}", m.requests);
-    assert_eq!(looks(&journal), 1, "{journal:#?}");
-    assert_eq!(ends(&journal), 1, "{journal:#?}");
-
-    let skipped = watched(vec![
-        incident("0:16"),
-        incident("0:15"),
-        stacked(&incident("0:14"), "1 of 2"),
-        stacked(&incident("0:13"), "1 of 2"),
-        stacked(&incident("0:12"), "1 of 2"),
-    ]);
-    let (m, journal) = held_watch(skipped, Some(TYPED_BEFORE_MS), Build::Shipped, |m, _| {
-        m.tick_at_key = 1;
-    });
-    assert_eq!(ones(&m), 2, "{:#?}", m.requests);
-    assert_eq!(looks(&journal), 1, "{journal:#?}");
-    assert_eq!(ends(&journal), 1, "{journal:#?}");
 }
 
 #[test]
@@ -2895,85 +1944,162 @@ fn blocked(left: &str, wrapped: bool) -> Vec<String> {
     )
 }
 
-/// A box whose countdown says `block this request in` (2.1.316), whole or wrapped through its
-/// words, is held as one whose countdown says `deny`: one box through every tick, its first hold
-/// a look to see it tick and the next naming the vendor's deny, the bound of a box nobody touched
-/// ending that hold before the deny's margin, and at the margin the hold ends and the policy's
-/// answer goes before the vendor denies the box.
-#[test]
-fn a_box_whose_countdown_says_block_is_held_against_its_deny() {
-    let past = |stamp: &str| {
-        aterm_types::rfc3339::parse_utc_fractional(stamp).expect("a stamp") - TEST_NOW
+/// One world [`tier1_a_box_goes_only_where_the_settle_model_allows`] runs: its box reads, the
+/// person's last gesture on every read (`human_ms`), and what the model reads of it.
+struct World {
+    name: &'static str,
+    screens: Vec<Vec<String>>,
+    typed_ms: Option<u64>,
+    answers: bool,
+    lease: bool,
+    counted: bool,
+    touched: bool,
+}
+
+fn worlds() -> Vec<World> {
+    let quiet = Some(TYPED_BEFORE_MS);
+    let world = |name: &'static str, screens: Vec<Vec<String>>, typed_ms: Option<u64>| World {
+        name,
+        screens,
+        typed_ms,
+        answers: true,
+        lease: false,
+        counted: false,
+        touched: false,
     };
-    for wrapped in [false, true] {
-        let at = |left: &str| blocked(left, wrapped);
-        let p = aterm_phase::parse_prompt_v2(&at("1:44")).expect("the box");
-        assert_eq!(
-            p.auto_deny_left(),
-            Some(Duration::from_secs(104)),
-            "wrapped {wrapped}: {p:?}"
-        );
-        assert!(p.rm_breaker().is_some(), "wrapped {wrapped}: {p:?}");
-        let one = approval_loop::box_identity(&at("1:44"));
-        assert!(one.is_some(), "wrapped {wrapped}");
-        assert_eq!(
-            one,
-            approval_loop::box_identity(&at("1:43")),
-            "wrapped {wrapped}: one box through the tick"
-        );
+    let boxed = || ticking(104, 2, incident);
+    let moved = || ticking(104, 2, |left| moved_to_no(&incident(left)));
+    vec![
+        world("untouched, quiet", boxed(), quiet),
+        world("untouched, typing", boxed(), Some(TYPING_MS)),
+        World {
+            touched: true,
+            ..world("touched, quiet", moved(), quiet)
+        },
+        World {
+            touched: true,
+            ..world(
+                "touched, their grace over",
+                moved(),
+                Some(u64::from(GRACE_S) * 1000 + 10_000),
+            )
+        },
+        world("nobody at the keys", boxed(), None),
+        World {
+            answers: false,
+            ..world("escalated", boxed(), quiet)
+        },
+        World {
+            lease: true,
+            touched: true,
+            ..world("another driver's hand", boxed(), None)
+        },
+        World {
+            touched: true,
+            ..world(
+                "redrawn once touched",
+                vec![
+                    moved_to_no(&incident("1:44")),
+                    incident("1:43"),
+                    stacked(&incident("1:42"), "1 of 2"),
+                    stacked(&incident("1:41"), "1 of 2"),
+                ],
+                quiet,
+            )
+        },
+        World {
+            counted: true,
+            ..world("a gesture that moved nothing", boxed(), quiet)
+        },
+    ]
+}
 
-        let (m, journal) = held_watch(
-            watched(ticking(104, 2, at)),
-            Some(TYPED_BEFORE_MS),
-            Build::Shipped,
-            |_, _| {},
-        );
-        assert_eq!(ones(&m), 0, "wrapped {wrapped}: {:#?}", m.requests);
-        let held = held_lines(&journal);
-        assert_eq!(held.len(), 2, "wrapped {wrapped}: {journal:#?}");
-        assert!(
-            held[0].ends_with("(the box's answer; a countdown on it is read again to see it tick)"),
-            "wrapped {wrapped}: {}",
-            held[0]
-        );
-        assert!(
-            held[1].contains("a person is typing: hands off until ")
-                && held[1].contains("(the box's answer; the vendor denies it at "),
-            "wrapped {wrapped}: {}",
-            held[1]
-        );
-        let (until, deny) = held_times(held[1]);
-        let (until, deny) = (past(&until), past(deny.as_deref().expect("the deny named")));
-        assert!(
-            (45..=103).contains(&deny) && until <= 10,
-            "wrapped {wrapped}: {until}, {deny}: {}",
-            held[1]
-        );
-        assert!(!ended(&journal), "wrapped {wrapped}: {journal:#?}");
+fn pressed_in(w: &World, build: Build) -> bool {
+    let (answers, lease, counted) = (w.answers, w.lease, w.counted);
+    let (m, _) = held_watch(watched(w.screens.clone()), w.typed_ms, build, |m, opts| {
+        if !answers {
+            opts.policy.approve = Approve::None;
+        }
+        if lease {
+            m.hand = "lease:operator";
+        }
+        if counted {
+            m.human_seq_from.insert(2, 1);
+        }
+    });
+    !m.presses().is_empty()
+}
 
-        let (m, journal) = held_watch(
-            watched(ticking(15, 2, at)),
-            Some(TYPED_BEFORE_MS),
-            Build::Shipped,
-            |_, _| {},
-        );
-        assert_eq!(ones(&m), 1, "wrapped {wrapped}: {:#?}", m.requests);
-        let end = journal
-            .iter()
-            .position(|l| l.starts_with("HOLD-ENDED "))
-            .unwrap_or_else(|| panic!("wrapped {wrapped}: the hold's end said: {journal:#?}"));
-        assert!(
-            journal[end].contains(
-                "a person is typing, but nobody has touched the box and the vendor denies it at "
+/// Each world's run under `build`, and the worlds where it pressed or held a box the shipped
+/// `SupervisorBoxSettle` model does not let it.
+fn settle_violations(build: Build) -> (Vec<String>, Vec<bool>) {
+    let model = aterm_models_harness::supervisor_box_settle_model();
+    let settle = u64::try_from(approval_loop::PERSON_SETTLE.as_millis()).unwrap_or(u64::MAX);
+    let grace = u64::from(GRACE_S) * 1000;
+    let mut bad = Vec::new();
+    let mut presses = Vec::new();
+    for w in worlds() {
+        let pressed = pressed_in(&w, build);
+        presses.push(pressed);
+        let mut st = model.init_state();
+        for (k, v) in [
+            ("up", 1),
+            ("policy", i64::from(w.answers)),
+            (
+                "grace",
+                i64::from(w.lease || w.typed_ms.is_some_and(|ms| ms < grace)),
             ),
-            "wrapped {wrapped}: {}",
-            journal[end]
+            ("typed", i64::from(w.typed_ms.is_some_and(|ms| ms < settle))),
+            ("driver", i64::from(w.lease)),
+            ("touched", i64::from(w.touched)),
+            ("hand", i64::from(w.touched)),
+        ] {
+            st.insert(k, v);
+        }
+        let action = if pressed { "Press" } else { "Wait" };
+        if !model.action_enabled(action, &st) {
+            bad.push(format!("{}: {action} at {st:?}", w.name));
+        }
+    }
+    (bad, presses)
+}
+
+/// Binds the loop to `supervisor_box_settle_model`: in every world the shipped loop presses a box
+/// only where the model's `Press` is enabled and holds it only where its `Wait` is, and each
+/// defect the model names (`Buggy`) is a build that breaks it in the worlds that defect reaches:
+/// pressing over a touch (`Build::TouchOff`), holding an untouched box for a person's input or a
+/// count that moved nothing on it (`Build::OldGrace`), answering while the person types
+/// (`Build::SettleOff`), and losing a touch at a redraw (`Build::EpisodePerBox`).
+#[test]
+fn tier1_a_box_goes_only_where_the_settle_model_allows() {
+    let names = |bad: &[String]| -> Vec<String> {
+        bad.iter()
+            .map(|b| b.split_once(": ").map_or("", |(n, _)| n).to_string())
+            .collect()
+    };
+    let shipped = [true, false, false, true, true, false, false, false, true];
+    let (bad, presses) = settle_violations(Build::Shipped);
+    assert_eq!(bad, Vec::<String>::new());
+    assert_eq!(presses, shipped);
+    let all = worlds();
+    for (build, flipped, action) in [
+        (Build::TouchOff, &[2usize, 7][..], "Press"),
+        (Build::OldGrace, &[0, 8][..], "Wait"),
+        (Build::SettleOff, &[1][..], "Press"),
+        (Build::EpisodePerBox, &[7][..], "Press"),
+    ] {
+        let (bad, presses) = settle_violations(build);
+        let mut want = shipped;
+        for &i in flipped {
+            want[i] = !want[i];
+        }
+        assert_eq!(presses, want, "{build:?}");
+        let named: Vec<String> = flipped.iter().map(|&i| all[i].name.to_string()).collect();
+        assert_eq!(names(&bad), named, "{build:?}: {bad:#?}");
+        assert!(
+            bad.iter().all(|b| b.contains(&format!(": {action} at "))),
+            "{build:?}: {bad:#?}"
         );
-        let approved = journal
-            .iter()
-            .position(|l| l.starts_with("APPROVED "))
-            .expect("approved");
-        assert!(end < approved, "wrapped {wrapped}: {journal:#?}");
     }
 }
 

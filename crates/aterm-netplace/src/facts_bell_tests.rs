@@ -118,7 +118,7 @@ fn stop_wakes_real_condvar_and_registered_poll_without_a_network_change() {
 #[test]
 fn a_closed_bell_is_a_failed_wait_not_an_endless_notification() {
     let routes = aterm_uds::network::RouteChanges::open().expect("network event socket");
-    let (hear, ring) = std::io::pipe().unwrap();
+    let (hear, ring) = aterm_uds::pipe().unwrap();
     drop(ring);
     aterm_uds::deadline::once_released(|| {
         if poll_both(&routes, Some(hear.as_fd()), Duration::ZERO) == Woke::Failed {

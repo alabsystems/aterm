@@ -227,7 +227,7 @@ fn a_native_stage_keeps_its_inherited_pipe_descriptor() {
     use std::io::Write as _;
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     let dir = aterm_tempfile::tempdir().unwrap();
-    let (reader, mut writer) = std::io::pipe().unwrap();
+    let (reader, mut writer) = aterm_uds::pipe().unwrap();
     // SAFETY: F_DUPFD creates one owned, non-close-on-exec duplicate without replacing
     // another descriptor. The original remains live throughout the call.
     let fd = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_DUPFD, 100) };

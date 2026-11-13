@@ -958,6 +958,10 @@ fn front_door_main(
     account_claims::install(claims_observation, claims_pusher);
     #[cfg(unix)]
     alab_journal::install();
+    // The update record's publication as this Mac's `upd` row, and the lab's rows for the
+    // updater (a release build only).
+    #[cfg(unix)]
+    alab_update::install();
     // The lab registry's preferences, as the harness's roster source (a release build only).
     #[cfg(unix)]
     alab_view::install();
@@ -2165,12 +2169,32 @@ fn network_state_source_from(
     services: impl Fn() -> Option<aterm_db::service_state::ObservationHandle> + Send + Sync + 'static,
     retained: Option<aterm_types::network_state::NetworkObservation>,
 ) -> aterm_gui::NetworkSnapshotSource {
-    network_state_source_with_readers(
-        move || network().and_then(|network| network.try_publication()),
-        move || services().and_then(|services| services.try_publication()),
-        retained,
-        || (std::time::Instant::now(), aterm_time::unix_millis()),
+    offering_to_fleet(
+        network_state_source_with_readers(
+            move || network().and_then(|network| network.try_publication()),
+            move || services().and_then(|services| services.try_publication()),
+            retained,
+            || (std::time::Instant::now(), aterm_time::unix_millis()),
+        ),
+        aterm_db::fleet::folder(),
     )
+}
+
+/// `source`, with each look's snapshot offered to the fleet tables `fleet` (`aterm_db::fleet`),
+/// which fold the observer's machines and ask it nothing. The tables take it in the state it
+/// was observed in: one no observer is making (none started, its publication expired) is held,
+/// never live (`aterm_db::fleet::observe`). The offer never waits and a snapshot it already
+/// holds changes nothing, so a look costs a pointer comparison.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn offering_to_fleet(
+    source: aterm_gui::NetworkSnapshotSource,
+    fleet: &'static aterm_db::fleet::Folder,
+) -> aterm_gui::NetworkSnapshotSource {
+    std::sync::Arc::new(move |read: aterm_gui::NetworkRead| {
+        let snapshot = source(read)?;
+        fleet.offer_network(&snapshot);
+        Some(snapshot)
+    })
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -2297,6 +2321,7 @@ fn wire_window(args: &[OsString]) -> Option<fn() -> bool> {
     aterm_gui::set_launch_repairs(doctor::launch_repairs);
     #[cfg(target_os = "macos")]
     aterm_gui::set_initial_setup_handlers(aterm_gui::InitialSetupHandlers {
+        launch_history: initial_setup_launch_history,
         apply: restart_initial_setup,
         check: check_initial_setup,
         restore: restore_initial_setup,
@@ -2554,6 +2579,7 @@ struct Widened {
 #[cfg(target_os = "macos")]
 fn run_startup_setup(mut widened: Option<Widened>) {
     let running = StartupRunning::enter();
+    preload_setup_history();
     run_repaired_startups(|reserved| {
         let mut password = None;
         let (prepared, mut sent, recovered) =
@@ -6307,7 +6333,8 @@ struct SetupIo {
     /// Whether this process may never change the person's profile
     /// (`aterm_cli::macos_doctor::lasting_scope_refusal`).
     scope_refused: fn() -> bool,
-    /// Optional display-only storage, resolved on the existing reading worker.
+    /// Optional display-only storage, resolved by the reading worker or before a restored
+    /// System State page is constructed at launch, never on the running GUI loop.
     history_store: fn() -> Option<aterm_cli::macos_doctor::SetupHistoryStore>,
     /// Read rows for a plan under their current observation admission, the network's too when
     /// asked (`aterm_cli::macos_doctor::observe_initial_setup`). Plan mode alone permits no
@@ -7131,7 +7158,86 @@ fn begin_setup_history(
     choices: Option<u64>,
 ) -> Option<SetupHistoryTicket> {
     let store = (setup_io().history_store)()?;
+    begin_setup_history_in(store, plan, choices)
+}
+
+/// Refresh saved display values before startup or a cold observer publishes checking.
+/// These worker reads complement the GUI launch's display-only seed.
+#[cfg(target_os = "macos")]
+fn preload_setup_history() {
+    let choices = {
+        let Ok(rows) = OBSERVED_ROWS.lock() else {
+            return;
+        };
+        if !rows.last_known.is_empty() {
+            return;
+        }
+        rows.choices
+    };
+    let Some(store) = (setup_io().history_store)() else {
+        return;
+    };
+    let plan = observed_plan(None, choices).map(|(plan, _)| plan);
+    let _ = begin_setup_history_in(store, plan.as_ref(), Some(choices));
+}
+
+/// Any System State page gets its saved display values before the GUI loop starts.
+/// This launch-only read uses aterm's records, never a native probe or a setup admission.
+#[cfg(target_os = "macos")]
+fn initial_setup_launch_history() -> Option<aterm_gui::SetupDisplayHistory> {
+    let choices = OBSERVED_ROWS.lock().ok()?.choices;
+    let store = (setup_io().history_store)()?;
+    initial_setup_launch_history_in(store, choices)
+}
+
+#[cfg(target_os = "macos")]
+fn initial_setup_launch_history_in(
+    store: aterm_cli::macos_doctor::SetupHistoryStore,
+    choices: u64,
+) -> Option<aterm_gui::SetupDisplayHistory> {
+    let (plan, history) = store.display()?;
+    restore_setup_history(&history, Some(&plan), Some(choices))?;
+    let rows = OBSERVED_ROWS.lock().ok()?;
+    if rows.choices != choices {
+        return None;
+    }
+    let source = plan.vault_url.trim();
+    let source_matches = !source.is_empty()
+        && history.vault_source.trim() == source
+        && rows.vault_url.as_deref().map(str::trim) == Some(source);
+    let last_known = rows
+        .last_known
+        .iter()
+        .filter(|row| !row.subject.uses_vault_source() || source_matches)
+        .cloned()
+        .collect();
+    Some(aterm_gui::SetupDisplayHistory {
+        plan,
+        last_known,
+        vault_source: source_matches.then(|| rows.vault_url.clone()).flatten(),
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn begin_setup_history_in(
+    store: aterm_cli::macos_doctor::SetupHistoryStore,
+    plan: Option<&aterm_types::macos_setup::Plan>,
+    choices: Option<u64>,
+) -> Option<SetupHistoryTicket> {
     let history = store.begin()?;
+    restore_setup_history(&history, plan, choices)?;
+    Some(SetupHistoryTicket {
+        store,
+        basis: history.generation,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn restore_setup_history(
+    history: &aterm_cli::macos_doctor::DisplayHistory,
+    plan: Option<&aterm_types::macos_setup::Plan>,
+    choices: Option<u64>,
+) -> Option<()> {
     let changed = if let Ok(mut rows) = OBSERVED_ROWS.lock() {
         if choices.is_some_and(|choices| choices != rows.choices) {
             return None;
@@ -7175,10 +7281,7 @@ fn begin_setup_history(
     if changed {
         publish_setup_readings();
     }
-    Some(SetupHistoryTicket {
-        store,
-        basis: history.generation,
-    })
+    Some(())
 }
 
 #[cfg(target_os = "macos")]
@@ -7649,6 +7752,7 @@ fn dispatch_observation_publishing(
     // Keep the finite pending batch in the queue until its worker actually starts.
     // Holding this admission lock also serializes concurrent callers with spawn.
     let spawned = spawn(Box::new(|| {
+        preload_setup_history();
         loop {
             let batch = {
                 let Ok(mut queue) = OBSERVE_QUEUE.lock() else {
@@ -10496,7 +10600,10 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
             _ => {
                 // A word that is not ours (`claude --wait-lock 60`, `apply` on a Mac)
                 // says what it is, and one of ours out of place says so, whatever follows it.
-                if let Some(word) = sub.as_deref().filter(|w| !matches!(*w, "status" | "check")) {
+                if let Some(word) = sub
+                    .as_deref()
+                    .filter(|w| !matches!(*w, "status" | "check" | "retry" | "holds"))
+                {
                     let line = update_misplaced_line(word)
                         .unwrap_or_else(|| update_unknown_line(word, store_resolves));
                     eprintln!("{line}");
@@ -10507,8 +10614,39 @@ fn update_verb(rest: &[OsString]) -> ExitCode {
             }
         }
     }
-    let checking = sub.as_deref() == Some("check");
-    let st = match sub.as_deref().unwrap_or("status") {
+    if sub.as_deref() == Some("holds") {
+        return update_holds(verbose);
+    }
+    let retrying = sub.as_deref() == Some("retry");
+    if retrying {
+        let checks = !cfg!(windows);
+        let next = if checks { "; checking now" } else { "" };
+        match aterm_update::retry() {
+            Ok(Some(hold)) => {
+                let held = if hold.version.is_empty() {
+                    format!("build {}", hold.build)
+                } else {
+                    hold.version
+                };
+                println!("aterm update: {held} is no longer held{next}");
+            }
+            Ok(None) => println!("aterm update: nothing is held{next}"),
+            Err(error) => {
+                eprintln!("aterm update: {error}");
+                return ExitCode::FAILURE;
+            }
+        }
+        if !checks {
+            return ExitCode::SUCCESS;
+        }
+    }
+    let checking = retrying || sub.as_deref() == Some("check");
+    let word = if retrying {
+        "check"
+    } else {
+        sub.as_deref().unwrap_or("status")
+    };
+    let st = match word {
         "status" => aterm_update::status(build),
         "check" if cfg!(windows) => None,
         "check" => {
@@ -10575,17 +10713,20 @@ const fn no_ledger_fails(checking: bool) -> bool {
 }
 
 const UPDATE_USAGE: &str = if cfg!(target_os = "linux") {
-    "usage: aterm update [status|check] [-v] | identity | enable | apply | rollback"
+    "usage: aterm update [status|check|retry|holds] [-v] | identity | enable | apply | rollback"
 } else if cfg!(windows) {
-    "usage: aterm update [status|check] [-v] | apply [--restart] | identity"
+    "usage: aterm update [status|check|retry|holds] [-v] | apply [--restart] | identity"
 } else {
-    "usage: aterm update [status|check] [-v] | identity"
+    "usage: aterm update [status|check|retry|holds] [-v] | identity"
 };
 
 const UPDATE_HELP: &[&str] = &[
     "  status     this copy's version and where it stands, one line (the default)",
     "  check      check now (a newer release downloads), then print that line;",
     "             exits 1 when this copy cannot update or checking fails",
+    "  retry      end a hold on a newer build now and check, so it is tried again",
+    "  holds      each lab Mac's update record: what it runs, what it was offered,",
+    "             what it holds and until when (this copy's alone outside a lab)",
     "  -v         add the updater's detail: last decision, last check, failures",
     "  identity   the running binary's compiled identity, as JSON",
 ];
@@ -10941,6 +11082,10 @@ fn update_summary(
         };
         return (line, None);
     }
+    // A live hold outranks a download of the build it holds: the gates refuse it until it lapses.
+    if let Some(hold) = st.hold.as_ref().filter(|hold| hold.live) {
+        return held_update_line(version, hold, now);
+    }
     if let Some(staged) = st.staged_build.filter(|staged| *staged > build) {
         let downloaded =
             downloaded_update_line(version, build, st.staged_version.as_deref(), staged);
@@ -11040,15 +11185,25 @@ fn update_summary(
         );
     }
     let checked = aterm_update_core::pkg_check::rfc3339_to_unix(&st.updated_at);
-    let mut line = if st.linux.as_ref().is_some_and(|native| native.refused_newer) {
-        let refused = format!(
-            "aterm {version} \u{b7} a newer release was rolled back on this copy and won\u{2019}t \
-             install again"
-        );
-        match checked {
-            Some(checked) => format!("{refused} \u{b7} checked {}", ago_words(checked, now)),
-            None => refused,
-        }
+    let checked_words = checked
+        .map(|checked| format!(" \u{b7} checked {}", ago_words(checked, now)))
+        .unwrap_or_default();
+    // Never "up to date" while a newer build is held (a lapsed hold is tried again) or offered.
+    let mut line = if let Some(hold) = &st.hold {
+        let again = if hold.peer_lifted {
+            ": it started on another Mac"
+        } else {
+            ""
+        };
+        format!(
+            "aterm {version} \u{b7} trying {} again{again}{checked_words}",
+            hold.name()
+        )
+    } else if st.behind {
+        format!(
+            "aterm {version} \u{b7} a newer release is out and not installed yet; the next \
+             check downloads it{checked_words}"
+        )
     } else if let Some(checked) = checked {
         format!(
             "aterm {version} is up to date \u{b7} checked {}",
@@ -11061,6 +11216,173 @@ fn update_summary(
         line.push_str(CHECKS_OFF);
     }
     (line, None)
+}
+
+/// How long until `until`, from `now`, in plain words ([`update_record::left_words`]).
+///
+/// [`update_record::left_words`]: aterm_update_core::update_record::left_words
+fn left_words(until: u64, now: i64) -> String {
+    aterm_update_core::update_record::left_words(
+        until.saturating_sub(u64::try_from(now).unwrap_or(0)),
+    )
+}
+
+/// The line for a live hold on a newer build: what is held, for how long more, why, which try,
+/// and the verb that ends it now; the hold's recorded reason goes to stderr.
+fn held_update_line(
+    version: &str,
+    hold: &aterm_update::HoldView,
+    now: i64,
+) -> (String, Option<String>) {
+    let line = format!(
+        "aterm {version} \u{b7} {} is held for {} more ({}, try {}) \u{b7} `aterm update \
+         retry` tries it now",
+        hold.name(),
+        left_words(hold.until, now),
+        hold.cause.words(),
+        hold.tries
+    );
+    let why = hold.why.trim();
+    (line, (!why.is_empty()).then(|| why.to_string()))
+}
+
+/// `aterm update holds`: this copy's update record, then every other lab Mac's live `upd` row,
+/// one line each. Exits 1 only when this copy's record cannot be read.
+fn update_holds(verbose: bool) -> ExitCode {
+    use aterm_update_core::update_record::UpdateRecord;
+    let now = aterm_time::unix_secs().unwrap_or(0);
+    let own = match aterm_update::record_path() {
+        None => None,
+        Some(path) => match UpdateRecord::read(&path) {
+            Ok(record) => Some(record),
+            Err(error) => {
+                eprintln!(
+                    "aterm update: the update record {} cannot be read ({error}), so it holds \
+                     nothing",
+                    path.display()
+                );
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    match &own {
+        Some(Some(record)) => println!("{}", record_line("this copy", record, now, verbose)),
+        Some(None) => println!("this copy: no update record yet (it has not checked)"),
+        None => println!("this copy: keeps no update record"),
+    }
+    let Some(rows) = aterm_update::lab::rows() else {
+        println!("no lab here: other Macs' records are not read");
+        return ExitCode::SUCCESS;
+    };
+    #[cfg(unix)]
+    let name = lab_machine_names();
+    #[cfg(not(unix))]
+    let name = |uuid: &str| format!("uuid:{}", uuid.get(..8).unwrap_or(uuid));
+    for row in rows {
+        let who = if row.own {
+            format!(
+                "{} (this Mac, as the lab last heard it)",
+                name(&row.machine)
+            )
+        } else {
+            name(&row.machine)
+        };
+        println!("{}", record_line(&who, &row.record, now, verbose));
+    }
+    ExitCode::SUCCESS
+}
+
+/// How `aterm update holds` names a lab Mac by its Commons uuid: its registry label where one is
+/// bound, else `uuid:<first 8 hex>`.
+#[cfg(unix)]
+fn lab_machine_names() -> impl Fn(&str) -> String {
+    let view = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .zip(aterm_types::dirs::aterm_config_path())
+        .and_then(|(home, config)| {
+            aterm_db::alab::Registry::at(aterm_secrets::client::Paths::for_home(&home))
+                .lab(&config, None)
+                .ok()
+                .flatten()
+        })
+        .and_then(|read| match read {
+            aterm_db::alab::LabRead::Projected(view, _) => Some(*view),
+            _ => None,
+        })
+        .unwrap_or_default();
+    move |uuid| alab_seen::mac(&view, uuid)
+}
+
+/// One update record as `aterm update holds` prints it: who, what it runs, what it was offered,
+/// its hold (live or lapsed) and, with `verbose`, the trial and how the last hold ended.
+fn record_line(
+    who: &str,
+    record: &aterm_update_core::update_record::UpdateRecord,
+    now: u64,
+    verbose: bool,
+) -> String {
+    use std::fmt::Write as _;
+    let mut line = if record.running == 0 {
+        format!("{who}: no build noted yet")
+    } else {
+        format!(
+            "{who}: runs build {}{}",
+            record.running,
+            if record.proven { "" } else { " (not proven)" }
+        )
+    };
+    if let Some(offered) = record.offered.filter(|offered| *offered > record.running) {
+        let _ = write!(line, ", offered build {offered}");
+    }
+    match &record.hold {
+        Some(hold) if hold.live(now) => {
+            let held = hold.name();
+            let _ = write!(
+                line,
+                ", holds {held} for {} more ({}, try {})",
+                left_words(hold.until, i64::try_from(now).unwrap_or(i64::MAX)),
+                hold.cause.words(),
+                hold.tries
+            );
+            if verbose && !hold.why.is_empty() {
+                let _ = write!(line, ": {}", hold.why);
+            }
+        }
+        Some(hold) => {
+            let _ = write!(line, ", hold on build {} lapsed", hold.build);
+        }
+        None => line.push_str(", holds nothing"),
+    }
+    if let Some(failed) = record.live_start_failure(now) {
+        let _ = write!(
+            line,
+            "; a window here saw {} fail to start, so a background start waits {} more",
+            failed.name(),
+            left_words(failed.until, i64::try_from(now).unwrap_or(i64::MAX))
+        );
+    }
+    if verbose {
+        if let Some(trial) = &record.trial {
+            let _ = write!(
+                line,
+                "; trying build {} ({} missed)",
+                trial.build, trial.misses
+            );
+        }
+        if let Some(last) = &record.last {
+            use aterm_update_core::update_record::EndHow;
+            let how = match last.how {
+                EndHow::Started => "it started",
+                EndHow::Newer => "a newer build replaced it",
+                EndHow::Expired => "it lapsed",
+                EndHow::Peer => "it started on another Mac",
+                EndHow::Person => "it was retried",
+            };
+            let _ = write!(line, "; the last hold ended: {how}");
+        }
+    }
+    line
 }
 
 fn check_trouble_words(kind: &str) -> Option<&'static str> {
@@ -11298,6 +11620,10 @@ mod account_claims;
 /// The lab journal's sink for the harness's notes.
 #[cfg(unix)]
 mod alab_journal;
+
+/// The update record's glue to the lab journal's `upd` rows.
+#[cfg(unix)]
+mod alab_update;
 
 /// The node service's metrics publisher (one-mesh §4.14).
 #[cfg(unix)]

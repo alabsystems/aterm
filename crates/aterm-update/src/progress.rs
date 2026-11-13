@@ -35,7 +35,7 @@ pub enum Progress {
     /// A check that had begun downloading failed.
     Failed { detail: String },
     /// The release being downloaded was withheld on this machine while the download ran (signer
-    /// revoked, yanked, or quarantined after crash-looping here).
+    /// revoked, yanked, or held by the update record after it failed here).
     Withheld { detail: String },
 }
 

@@ -618,7 +618,9 @@ pub trait Ports: Sync {
         None
     }
     /// Whether `[swarm] enabled` in `aterm.toml` leaves swarm participation on: `false` makes
-    /// every sync row read `NotApplicable` before touching its subsystem.
+    /// every sync row read `NotApplicable` before touching its subsystem, but for
+    /// `sync.steward.server.standby`'s removal of aterm's own stale vault server
+    /// ([`Ports::stale_vault_server`]).
     ///
     /// # Errors
     /// `aterm.toml` cannot be read or has an invalid `[swarm]` section.
@@ -738,6 +740,27 @@ pub trait Ports: Sync {
     /// Service installation or startup did not finish, for the next pass.
     fn apply_steward_standby_server(&self) -> Result<String, String> {
         Ok("standby vault server runs".to_owned())
+    }
+
+    /// The member vault server an earlier aterm installed where nothing finds or feeds it
+    /// (`aterm_secrets::client::stale_member_server`): what the read finds, or `None`. It is
+    /// aterm's own stale install, not swarm participation, so `sync.steward.server.standby`
+    /// reads it and removes it whatever `[swarm]` says.
+    ///
+    /// # Errors
+    /// The server job's pin record cannot be read.
+    fn stale_vault_server(&self) -> Result<Option<String>, String> {
+        Ok(None)
+    }
+
+    /// Remove the job [`Ports::stale_vault_server`] finds, judged again under its decision lock
+    /// (`aterm_secrets::client::retire_stale_member_server`): what was removed, or `None` where
+    /// none is left to remove.
+    ///
+    /// # Errors
+    /// The job's decision lock or pin record cannot be read, or the job did not stop or go.
+    fn retire_stale_vault_server(&self) -> Result<Option<String>, String> {
+        Ok(None)
     }
     /// `sync.shared-data`'s read.
     ///
@@ -994,6 +1017,11 @@ struct Synced<'a> {
     /// starting a mug, so its read-back verifies their removal even when keep-awake itself is off
     /// or deferred.
     retired_awake: std::sync::atomic::AtomicBool,
+    /// Whether this pass's `sync.steward.server.standby` read planned the removal of aterm's own
+    /// stale vault server ([`Ports::stale_vault_server`]): its apply removes that, not the
+    /// standby server, and its read-back that finds none left reads right whatever `[swarm]` or
+    /// the standby read say.
+    retiring_server: std::sync::atomic::AtomicBool,
     /// The commands that put back the block `sync.github`'s read found, which the engine
     /// journals before the apply.
     revert: Mutex<Option<String>>,
@@ -1016,6 +1044,7 @@ impl<'a> Synced<'a> {
             said: Mutex::new(None),
             aside: Mutex::new(None),
             retired_awake: std::sync::atomic::AtomicBool::new(false),
+            retiring_server: std::sync::atomic::AtomicBool::new(false),
             revert: Mutex::new(None),
             replaced_github: std::sync::atomic::AtomicBool::new(false),
         }
@@ -1081,6 +1110,40 @@ impl<'a> Synced<'a> {
     /// instances start no window's pass, and a pass refuses a private state root outright.
     fn turns_fabric_on(&self) -> bool {
         self.trigger != Trigger::Subscriber && self.ports.window_runs()
+    }
+
+    /// `sync.steward.server.standby`'s first read, before `[swarm]` is read: the member vault
+    /// server an earlier aterm installed where nothing finds or feeds it
+    /// ([`Ports::stale_vault_server`]) is aterm's own stale install, not swarm participation, so
+    /// it goes with the swarm off too, held only by System State's hold on the vault. `None`
+    /// leaves the row to the swarm switch and its standby read.
+    fn stale_server(&self) -> Option<Probe> {
+        let stale = match self.ports.stale_vault_server() {
+            Ok(stale) => stale,
+            Err(why) => return Some(Probe::Unusable { why }),
+        };
+        match stale {
+            Some(from) if self.held.get_or_init(|| self.ports.vault_held()).is_none() => {
+                self.retiring_server
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                Some(Probe::Change {
+                    from,
+                    to: "removed".to_owned(),
+                })
+            }
+            // Held: the row's gates say why it stays.
+            Some(_) => None,
+            None if self
+                .retiring_server
+                .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                Some(Probe::Ok {
+                    now: "no member vault server an earlier aterm installed is left here"
+                        .to_owned(),
+                })
+            }
+            None => None,
+        }
     }
 }
 
@@ -1231,6 +1294,11 @@ impl Item for Synced<'_> {
     }
 
     fn probe(&self) -> Probe {
+        if self.kind == Kind::StewardServerStandby
+            && let Some(stale) = self.stale_server()
+        {
+            return stale;
+        }
         match self.ports.swarm_enabled() {
             Ok(true) => {}
             Ok(false) => return not_applicable(SWARM_OFF),
@@ -1620,6 +1688,20 @@ impl Item for Synced<'_> {
                 .ports
                 .apply_steward_lease()
                 .map_err(|why| format!("{why}; the next pass tries again"))?,
+            // The read planned the removal of aterm's own stale server, or the standby server.
+            Kind::StewardServerStandby
+                if self
+                    .retiring_server
+                    .load(std::sync::atomic::Ordering::Relaxed) =>
+            {
+                self.ports
+                    .retire_stale_vault_server()
+                    .map_err(|why| format!("{why}; the next pass tries again"))?
+                    .unwrap_or_else(|| {
+                        "no member vault server an earlier aterm installed was left to remove"
+                            .to_owned()
+                    })
+            }
             Kind::StewardServerStandby => self
                 .ports
                 .apply_steward_standby_server()

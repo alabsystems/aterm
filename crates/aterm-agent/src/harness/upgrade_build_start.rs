@@ -1,7 +1,7 @@
 // Copyright 2026 Andrew Yates
 // SPDX-License-Identifier: Apache-2.0
 
-//! A build that failed to start, noted against the build.
+//! Startup failures and later evidence that a build starts.
 
 use std::path::Path;
 use std::time::Duration;
@@ -12,7 +12,7 @@ use super::{
     FailedStart, Opts, Report, St, VERSION_WAIT, check_upgrade_tree, ensure_upgrade_tree, ledger,
     said,
 };
-use crate::harness::upgrade::{Candidate, Phase};
+use crate::harness::upgrade::{Agent, Candidate, Phase, SessionFile};
 
 /// The wait of a move onto a build that failed to start and is not proved since ([`crate::harness::upgrade::build_hold`]).
 pub use crate::harness::upgrade::BUILD_FAILS;
@@ -27,7 +27,7 @@ const STOPS_KEPT: usize = 16;
 /// What loads the build's program without starting a session.
 const PROBE_ARG: &str = "--help";
 
-/// What is known of one build's start: the failures noted against it, the probes run since, and whether a probe can still prove anything of it.
+/// Startup failures and the later probes or confirmed session starts covering them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Note {
     /// The build's version, as its stop's record names it.
@@ -50,7 +50,12 @@ pub struct Note {
     pub proved_for: u32,
     /// When a probe last passed (unix seconds; `0`: never).
     pub proved_at: u64,
-    /// A move onto the build failed after a probe had proved it to start: no probe proves anything of it any more.
+    /// Failure generation covered by a confirmed session's kernel start.
+    pub started_for: u32,
+    /// That process's birth (unix seconds), strictly after the latest failure.
+    pub started_at: u64,
+    /// A move failed after earlier startup evidence: a help probe cannot release this hold.
+    /// A confirmed newer session start or withdrawal of its failure can release it.
     pub blind: bool,
     /// The failure that made it [`Note::blind`] (one of [`Note::stops`]): a stop taken back takes the blindness it caused with it.
     pub blinded_by: String,
@@ -72,6 +77,8 @@ impl Note {
         o.insert("probe".into(), Value::from(self.probe.as_str()));
         o.insert("provedFor".into(), Value::from(self.proved_for));
         o.insert("provedAt".into(), Value::from(self.proved_at));
+        o.insert("startedFor".into(), Value::from(self.started_for));
+        o.insert("startedAt".into(), Value::from(self.started_at));
         o.insert("blind".into(), Value::from(self.blind));
         o.insert("blindedBy".into(), Value::from(self.blinded_by.as_str()));
         aterm_json::to_string(&Value::Object(o)).unwrap_or_default()
@@ -102,18 +109,34 @@ impl Note {
             probe: s("probe").unwrap_or_default(),
             proved_for: count("provedFor"),
             proved_at: n("provedAt"),
+            started_for: count("startedFor"),
+            started_at: n("startedAt"),
             blind: v.get("blind").and_then(Value::as_bool).unwrap_or(false),
             blinded_by: s("blindedBy").unwrap_or_default(),
         })
     }
 
-    /// Whether a probe run since the latest failure passed — with no failure noted, whether one passed at all ([`proved`]).
+    /// Whether a probe passed or a session started since the latest failure.
     pub const fn proved(&self) -> bool {
-        self.proved_at != 0 && self.proved_for == self.failures
+        self.proof_at() != 0
     }
 
-    /// Whether a probe run since a failure noted passed: a move failure
-    /// after it makes the note [`Note::blind`] ([`note_failure`]).
+    const fn proof_at(&self) -> u64 {
+        let probe = if self.proved_for == self.failures {
+            self.proved_at
+        } else {
+            0
+        };
+        let session = if self.started_for == self.failures {
+            self.started_at
+        } else {
+            0
+        };
+        if session > probe { session } else { probe }
+    }
+
+    /// Whether a probe or real session start covered a recorded failure: a move failure
+    /// after that evidence makes the note [`Note::blind`] ([`note_failure`]).
     const fn proved_since_a_failure(&self) -> bool {
         self.failures != 0 && self.proved()
     }
@@ -161,18 +184,18 @@ pub fn load(opts: &Opts, source: &str, version: &str) -> Option<Note> {
     Note::from_json(&text)
 }
 
-/// Writes `note` (a dry run writes nothing).
-fn write(opts: &Opts, note: &Note) {
+/// Writes `note`, returning whether it was persisted. A dry run writes nothing.
+fn write(opts: &Opts, note: &Note) -> bool {
     if opts.dry_run {
-        return;
+        return false;
     }
     let Some(name) = note_file_name(&note.source, &note.version) else {
-        return;
+        return false;
     };
     let Ok(dir) = ensure_upgrade_tree(&opts.state, Some("build-starts")) else {
-        return;
+        return false;
     };
-    let _ = crate::harness::atomic_write::write_atomic(&dir.join(name), &note.to_json());
+    crate::harness::atomic_write::write_atomic(&dir.join(name), &note.to_json()).is_ok()
 }
 
 /// What `session`'s record, saved at `now` over `before` (the record on disk), says of its build's start: a failure it carries ([`note_failure`]) or a stop it takes back ([`taken_back`]).
@@ -203,12 +226,20 @@ fn retract(opts: &Opts, session: &str, failed: &FailedStart, st: &St) {
     let Some(at) = note.stops.iter().position(|s| *s == stop) else {
         return;
     };
+    // A proof covers a prefix of the failure sequence. Removing an earlier failure
+    // shifts that prefix too, even when later failures were never covered by it.
+    let after = u32::try_from(note.stops.len() - at - 1).unwrap_or(u32::MAX);
+    let removed_for = note.failures.saturating_sub(after);
     note.stops.remove(at);
     let was = note.failures;
     note.failures = was.saturating_sub(1);
-    for count in [&mut note.probed_for, &mut note.proved_for] {
-        if *count >= was {
-            *count = note.failures;
+    for count in [
+        &mut note.probed_for,
+        &mut note.proved_for,
+        &mut note.started_for,
+    ] {
+        if *count >= removed_for {
+            *count = count.saturating_sub(1);
         }
     }
     let unblinded = note.blind && note.blinded_by == stop;
@@ -218,6 +249,7 @@ fn retract(opts: &Opts, session: &str, failed: &FailedStart, st: &St) {
     }
     write(opts, &note);
     let row = Report {
+        rung: None,
         pid: st.pid,
         tab: st.tab.clone(),
         session: session.to_string(),
@@ -263,11 +295,12 @@ fn note_failure(opts: &Opts, session: &str, st: &St, now: u64) {
     } else {
         st.relaunched_at
     };
-    let blinded = note.proved_since_a_failure() && moved_at >= note.proved_at;
+    let blinded = note.proved_since_a_failure() && moved_at >= note.proof_at();
     if blinded {
         note.blind = true;
         note.blinded_by.clone_from(&stop);
         let row = Report {
+            rung: None,
             pid: st.pid,
             tab: st.tab.clone(),
             session: session.to_string(),
@@ -278,9 +311,9 @@ fn note_failure(opts: &Opts, session: &str, st: &St, now: u64) {
         ledger(
             opts,
             &row,
-            "a move onto the build failed to start after its probe had passed: the probe does \
-             not see what fails, so no agent is moved onto this build again (a newer build is \
-             the next target)",
+            "a move onto the build failed after earlier startup evidence: automatic moves are \
+             held until this build is confirmed starting after that failure or a newer build \
+             is selected",
         );
     }
     note.failures = note.failures.saturating_add(1);
@@ -291,7 +324,64 @@ fn note_failure(opts: &Opts, session: &str, st: &St, now: u64) {
     write(opts, &note);
 }
 
-/// WHETHER AN AGENT MAY BE MOVED ONTO `to` AT `now`: `Ok` for a build with no failure to start noted that a probe has not found exiting — probed first where none has run on it (the module's "The upgrade's own first move"), and held only where that probe sees it exit with a failure — and for one a probe run since its latest failure proved to start; else the probe is run now (no sooner than [`PROBE_GAP_S`] after one that did not pass), its answer recorded and said once on the ledger (`build-probe:<what>`, as row `r`), and `Err(`[`BUILD_FAILS`]`)` where it did not pass — or where a move after a passing probe failed all the same ([`Note::blind`]), which no probe proves again for any agent but one whose move the owner asked for (`owner_now`, their `--now`): that move is probed once more, and taken if the probe passes.
+/// A real upgrade relaunch can disprove an older startup ban. The caller supplies fresh
+/// kernel identity, unique conversation ownership and tab ownership checks under the sweep
+/// lock; historical records and a successful help probe supply none of that evidence.
+pub(super) fn observed_start(
+    opts: &Opts,
+    r: &Report,
+    st: &St,
+    sf: &SessionFile,
+    now: u64,
+    confirm: impl FnOnce() -> bool,
+) {
+    match st.agent {
+        Agent::Claude => {}
+        Agent::Codex | Agent::Agy | Agent::Muse => return,
+    }
+    if opts.dry_run
+        || !st.is_upgrade()
+        || !matches!(st.phase, Phase::Relaunched { .. })
+        || st.exited_at == 0
+        || !matches!(st.source.as_str(), "managed" | "native")
+        || sf.version != st.to
+        || sf.pid == 0
+        || sf.session_id != r.session
+        || sf.status != "idle"
+    {
+        return;
+    }
+    let Some(started) = crate::harness::unix_time::parse_lstart(&sf.proc_start) else {
+        return;
+    };
+    let Some(mut note) = load(opts, &st.source, &st.to) else {
+        return;
+    };
+    if note.failures == 0
+        || note.failed_at == 0
+        || started <= note.failed_at
+        || started > now
+        || (note.proved() && !note.blind)
+        || !confirm()
+    {
+        return;
+    }
+    note.started_for = note.failures;
+    note.started_at = started;
+    note.blind = false;
+    note.blinded_by.clear();
+    if !write(opts, &note) {
+        return;
+    }
+    ledger(
+        opts,
+        &said(r.clone(), "build-start:observed".to_string()),
+        "the target build started after its latest recorded startup failure and now holds its \
+         conversation in its tab by kernel identity; that real start releases the older build hold",
+    );
+}
+
+/// WHETHER AN AGENT MAY BE MOVED ONTO `to` AT `now`: `Ok` for a build with no failure to start noted that a probe has not found exiting — probed first where none has run on it (the module's "The upgrade's own first move"), and held only where that probe sees it exit with a failure — and for one proved since its latest failure by a probe or confirmed session start; else the probe is run now (no sooner than [`PROBE_GAP_S`] after one that did not pass), its answer recorded and said once on the ledger (`build-probe:<what>`, as row `r`), and `Err(`[`BUILD_FAILS`]`)` where it did not pass — or while a move failed after earlier startup evidence ([`Note::blind`]). A help probe cannot release that hold for any agent but one whose move the owner asked for (`owner_now`, their `--now`): that move is probed once more, and taken if the probe passes. [`observed_start`] releases an older hold only after a new target process is confirmed.
 pub fn starts(
     opts: &Opts,
     r: &Report,

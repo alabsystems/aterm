@@ -883,14 +883,19 @@ fn the_disk_cover_never_reaches_a_child() {
     assert!(crate::CHILD_ENV_REMOVED.contains(&aterm_capacity::DISK_COVER_ENV));
 }
 
-/// A RELEASE RUN OVER THE WHOLE WORKSPACE THAT PASSED KEEPS WHAT ITS TEST COMPILE USED at the
-/// top of its build directory (`atpkg::build_cache::stale::USED`): each artifact's unit, fresh
-/// or built, by its profile; the packages it built tests of; and when it began. NEGATIVE
-/// CONTROLS: an artifact that is no test build names no package of the workspace's own; a file
-/// cargo copied into the target with no twin in the build directory names no unit; and the same
-/// run keeps nothing where it is no release's, failed, or is over less than the workspace.
+/// A RUN OF ANY SCOPE WHOSE COMPILE CALLS COMPLETED KEEPS WHAT THEY USED at the top of its build
+/// directory, as its scope's run (`atpkg::build_cache::stale::USED`, [`run_key`]): a dev run
+/// over one package keeps each artifact's unit, fresh or built, by its profile, the packages it
+/// built tests of, and when it began; a run over the whole workspace, one with `--as-release`
+/// and one with `--compile-only` each keep a run of their own beside it and leave the others as
+/// they were; and what a call into the lint lane reported ([`note_call`]) is kept at that lane's
+/// top once the lane is closed, the main lane's record as it was. NEGATIVE CONTROLS: a lint
+/// lane not yet closed keeps nothing; an artifact that is no test build names no package of the
+/// workspace's own; a file cargo copied into the target with no twin in the build directory
+/// names no unit; and a run whose closing call never passed, one a call of which failed, and one
+/// that reported no unit keep nothing, before any record and beside one, whose bytes stay.
 #[test]
-fn a_passing_release_run_keeps_the_units_it_used() {
+fn a_run_of_any_scope_keeps_the_units_it_used() {
     let dir = aterm_tempfile::Builder::new()
         .prefix("verify-disk-used-")
         .suffix(".noindex")
@@ -911,7 +916,7 @@ fn a_passing_release_run_keeps_the_units_it_used() {
         package: Some(package.to_owned()),
         test,
     };
-    let noted = |scope: crate::Scope| {
+    let made = |scope: crate::Scope| {
         let mut ctx = Ctx::new(
             dir.path().join("w"),
             scope,
@@ -920,9 +925,13 @@ fn a_passing_release_run_keeps_the_units_it_used() {
         )
         .with_checks(&[Check::Test]);
         ctx.main_build_dir = Some(format!("build.build-dir='{}'", leaf.display()));
+        ctx
+    };
+    let note = |ctx: &Ctx, ok: bool| {
         let uplifted = ctx.target_dir.join("debug/aterm");
         note_used(
-            &ctx,
+            ctx,
+            &Dir::Main,
             &[
                 artifact(vec![unit("1111111111111111")], "aterm-grid", true),
                 artifact(
@@ -932,34 +941,53 @@ fn a_passing_release_run_keeps_the_units_it_used() {
                 ),
             ],
             &[],
+            ok,
         );
-        ctx
+    };
+    let grid = || crate::Scope::packages(&["aterm-grid".to_owned()]);
+    // Each a run that keeps nothing: its closing call never passed; a call of it failed; it
+    // reported no unit.
+    let keeps_nothing = || {
+        let open = made(grid());
+        note(&open, true);
+        assert!(keep_used(&open).is_empty(), "its closing call never passed");
+        let failed = made(grid());
+        note(&failed, true);
+        note(&failed, false);
+        close(&failed, &Dir::Main);
+        assert!(keep_used(&failed).is_empty(), "a call of it failed");
+        let empty = made(grid());
+        close(&empty, &Dir::Main);
+        assert!(keep_used(&empty).is_empty(), "it reported no unit");
     };
     let record = leaf.join(atpkg::build_cache::stale::USED);
-    assert_eq!(
-        keep_used(&noted(crate::Scope::workspace()), true),
-        None,
-        "no release's run"
-    );
-    let release = |scope| noted(scope).with_checkers_in_tests(true);
-    assert_eq!(
-        keep_used(&release(crate::Scope::workspace()), false),
-        None,
-        "a run that failed"
-    );
-    assert_eq!(
-        keep_used(
-            &release(crate::Scope::packages(&["aterm-grid".to_owned()])),
-            true
-        ),
-        None,
-        "a run over less than the workspace"
-    );
+    keeps_nothing();
     assert!(!record.exists());
-    let ctx = release(crate::Scope::workspace());
-    assert!(keep_used(&ctx, true).is_some(), "kept");
-    let kept = atpkg::build_cache::stale::Used::decode(&std::fs::read(&record).expect("kept"))
-        .expect("a record");
+
+    let closed = |ctx: Ctx| {
+        note(&ctx, true);
+        close(&ctx, &Dir::Main);
+        let said = keep_used(&ctx);
+        assert_eq!(said.len(), 1, "{said:?}");
+        assert_eq!(
+            (&said[0].of, said[0].dir.as_path(), said[0].retired),
+            (&Dir::Main, leaf.as_path(), 0),
+            "{said:?}"
+        );
+        assert!(said[0].bound.is_some(), "{said:?}");
+        ctx
+    };
+    let read = || {
+        atpkg::build_cache::stale::Kept::decode(&std::fs::read(&record).expect("kept"))
+            .expect("a record")
+    };
+    let ctx = closed(made(grid()));
+    let first = read();
+    assert_eq!(
+        first.runs.keys().cloned().collect::<Vec<_>>(),
+        vec![run_key(&ctx)]
+    );
+    let kept = &first.runs[&run_key(&ctx)];
     assert_eq!(
         kept.profiles
             .get("debug")
@@ -979,5 +1007,326 @@ fn a_passing_release_run_keeps_the_units_it_used() {
             .duration_since(std::time::UNIX_EPOCH)
             .ok()
             .and_then(|d| u64::try_from(d.as_millis()).ok())
+    );
+
+    let wide = closed(made(crate::Scope::workspace()));
+    let second = read();
+    assert_eq!(second.runs.len(), 2, "{:?}", second.runs.keys());
+    assert_eq!(
+        second.runs[&run_key(&ctx)],
+        first.runs[&run_key(&ctx)],
+        "the narrower run stands as it was"
+    );
+    assert!(second.runs.contains_key(&run_key(&wide)));
+
+    let release = closed(made(crate::Scope::workspace()).with_checkers_in_tests(true));
+    let compile = closed(made(crate::Scope::workspace()).with_compile_only(true));
+    let keys: std::collections::BTreeSet<String> =
+        [&ctx, &wide, &release, &compile].map(run_key).into();
+    assert_eq!(keys.len(), 4, "each a scope of its own: {keys:?}");
+    assert_eq!(
+        read()
+            .runs
+            .keys()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>(),
+        keys
+    );
+
+    let bytes = std::fs::read(&record).expect("kept");
+    keeps_nothing();
+    assert_eq!(std::fs::read(&record).expect("kept"), bytes);
+
+    let mut lint = made(grid());
+    lint.env.side_lanes_dir = Some(PathBuf::from("lanes"));
+    let lane = crate::plan::lane_dir(&lint, crate::plan::Lane::TippyTarget).expect("a lane");
+    std::fs::create_dir_all(&lane).expect("the lint lane");
+    let checked = lane
+        .join("debug/build/aterm-grid/5555555555555555/out/libaterm_grid-5555555555555555.rmeta");
+    let wire = aterm_json::json!({
+        "reason": "compiler-artifact",
+        "package_id": "path+file:///w/aterm/crates/aterm-grid#0.155.0",
+        "target": {"kind": ["lib"], "name": "aterm_grid"},
+        "profile": {"test": true},
+        "filenames": [checked.display().to_string()],
+        "fresh": false,
+    })
+    .to_string();
+    let call = crate::exec::Cmd::new("tippy").env("CARGO_TARGET_DIR", lane.clone());
+    note_call(&lint, &call, Some(&wire), true);
+    assert!(keep_used(&lint).is_empty(), "the lint lane is not closed");
+    close(&lint, &Dir::Side(lane.clone()));
+    let said = keep_used(&lint);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(
+        (&said[0].of, said[0].dir.as_path(), said[0].retired),
+        (&Dir::Side(lane.clone()), lane.as_path(), 0),
+        "{said:?}"
+    );
+    let side = atpkg::build_cache::stale::Kept::decode(
+        &std::fs::read(lane.join(atpkg::build_cache::stale::USED)).expect("kept"),
+    )
+    .expect("a record");
+    let side = &side.runs[&run_key(&lint)];
+    assert_eq!(
+        side.profiles["debug"],
+        std::collections::BTreeSet::from(["5555555555555555".to_owned()])
+    );
+    assert_eq!(
+        side.members,
+        std::collections::BTreeSet::from(["aterm-grid".to_owned()])
+    );
+    assert_eq!(
+        std::fs::read(&record).expect("kept"),
+        bytes,
+        "the main lane's record is not the lint lane's"
+    );
+}
+
+/// THE RUN'S END TRIMS WHAT ITS RECORD RETIRED ([`trim_used`], `atpkg::build_cache::trim_run_end`):
+/// a checkout's first run keeps the two test units it used and retires nothing, so nothing is
+/// surveyed or taken (a third unit of their kind that no run used and nothing wrote for five days
+/// stands); its second, of the same scope, used that third in place of one of them, so the record
+/// retires the one and the trim takes it whole, an hour old and inside the stale window, says
+/// the bytes that went, and leaves cargo's lock, the record, no stage, and every unit the run
+/// used, each unwritten for five days, so the record alone keeps them; a third run alike retires
+/// nothing and takes nothing; and a stage a trim left in the build directory is finished by the
+/// next run to end there, though it retires nothing. NEGATIVE CONTROLS: while a build holds the
+/// profile's cargo lock the retired unit stands and the run says so; a retired unit written
+/// since the run that retired it began stands; and a build directory replaced under the run,
+/// another directory standing at its path, is not read.
+#[cfg(unix)]
+#[test]
+fn the_run_end_trim_takes_the_retired_bytes_and_leaves_every_unit_the_run_used() {
+    use atpkg::build_cache::{Trimmed, Unused};
+    const HOUR: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+    const DAY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    const OLD: &str = "1111111111111111";
+    const NEW: &str = "2222222222222222";
+    const BOTH: &str = "3333333333333333";
+    const LATER: &str = "4444444444444444";
+    let dir = aterm_tempfile::Builder::new()
+        .prefix("verify-disk-trim-")
+        .suffix(".noindex")
+        .tempdir()
+        .expect("scratch");
+    let leaf = dir.path().join("cache/w/.cargo-build");
+    let profile = leaf.join("debug");
+    std::fs::create_dir_all(&profile).expect("the profile");
+    let lock = profile.join(".cargo-build-lock");
+    std::fs::write(&lock, b"").expect("cargo's lock");
+    let folder = |hash: &str| profile.join("build/aterm-grid").join(hash);
+    let out = |hash: &str| folder(hash).join(format!("out/aterm_grid-{hash}"));
+    let dated = |hash: &str, at: std::time::SystemTime| {
+        let unit = folder(hash);
+        for path in [
+            unit.join("fingerprint/test-lib-aterm_grid"),
+            unit.join("fingerprint/test-lib-aterm_grid.json"),
+            unit.join("fingerprint"),
+            out(hash),
+            unit.join("out"),
+            unit,
+        ] {
+            std::fs::File::open(path)
+                .and_then(|f| f.set_modified(at))
+                .expect("dated");
+        }
+    };
+    let lay = |hash: &str, bytes: usize, ago: std::time::Duration| {
+        let unit = folder(hash);
+        std::fs::create_dir_all(unit.join("fingerprint")).expect("its fingerprint");
+        std::fs::create_dir_all(unit.join("out")).expect("its outputs");
+        std::fs::write(unit.join("fingerprint/test-lib-aterm_grid"), b"h").expect("hash");
+        std::fs::write(
+            unit.join("fingerprint/test-lib-aterm_grid.json"),
+            b"{\"rustc\":2,\"features\":\"[]\"}",
+        )
+        .expect("fingerprint");
+        std::fs::write(out(hash), vec![7u8; bytes]).expect("its test");
+        dated(hash, std::time::SystemTime::now() - ago);
+    };
+    lay(OLD, 64 << 10, HOUR);
+    lay(NEW, 1 << 10, 5 * DAY);
+    lay(BOTH, 1 << 10, 5 * DAY);
+    let ran = |hashes: [&str; 2]| {
+        let mut ctx = Ctx::new(
+            dir.path().join("w"),
+            crate::Scope::packages(&["aterm-grid".to_owned()]),
+            crate::EnvSnapshot::default(),
+            PathBuf::from("/tmp/x"),
+        )
+        .with_checks(&[Check::Test]);
+        ctx.main_build_dir = Some(format!("build.build-dir='{}'", leaf.display()));
+        let artifacts = hashes.map(|hash| crate::shape::Artifact {
+            filenames: vec![out(hash).display().to_string()],
+            fresh: true,
+            package: Some("aterm-grid".to_owned()),
+            test: true,
+        });
+        note_used(&ctx, &Dir::Main, &artifacts, &[], true);
+        close(&ctx, &Dir::Main);
+        let kept = keep_used(&ctx);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].dir, leaf, "{kept:?}");
+        assert!(kept[0].bound.is_some(), "{kept:?}");
+        (ctx, kept)
+    };
+    // Each call of the cache's entry and what it took; the probe is inert: no fixture reads
+    // the person's processes.
+    let calls = std::cell::RefCell::new(Vec::<Trimmed>::new());
+    let trim = |ctx: &Ctx, kept: &[KeptDir]| {
+        trim_used_with(ctx, kept, &|dir| {
+            let trimmed = atpkg::build_cache::trim_run_end_with_processes(
+                dir,
+                std::time::SystemTime::now(),
+                &|| true,
+                &|_, _| Ok(aterm_uds::holders::PathScan::default()),
+            );
+            calls.borrow_mut().push(trimmed.clone());
+            trimmed
+        })
+    };
+    let last = || calls.borrow().last().cloned().expect("the trim ran");
+    let took = |trimmed: &Trimmed| -> usize {
+        trimmed
+            .went
+            .iter()
+            .map(|(_, why)| match why {
+                Unused::Stale { superseded, .. } => *superseded,
+                _ => 0,
+            })
+            .sum()
+    };
+    let stages = || {
+        std::fs::read_dir(&leaf)
+            .expect("the build directory")
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".cargo-build.removing")
+            })
+            .count()
+    };
+
+    let (ctx, kept) = ran([OLD, BOTH]);
+    assert_eq!(kept[0].retired, 0, "{kept:?}");
+    assert_eq!(trim(&ctx, &kept), Vec::<String>::new());
+    assert_eq!(
+        last(),
+        Trimmed::default(),
+        "nothing retired and no stage left: nothing is surveyed or taken"
+    );
+    assert!(
+        out(NEW).is_file(),
+        "a unit no run used waits for a retirement"
+    );
+
+    let (ctx, kept) = ran([NEW, BOTH]);
+    assert_eq!(kept[0].retired, 1, "{kept:?}");
+    let held = aterm_toolchain::record_lock::RecordLock::lock(
+        std::fs::File::open(&lock).expect("cargo's lock"),
+        0,
+    )
+    .expect("held");
+    let said = trim(&ctx, &kept);
+    assert_eq!(said.len(), 1, "{said:?}");
+    let refused = last();
+    assert!(
+        refused.went.is_empty() && refused.freed == 0 && refused.kept.is_some(),
+        "{refused:?}"
+    );
+    assert!(
+        out(OLD).is_file() && stages() == 0,
+        "a build holds the lock"
+    );
+    drop(held);
+
+    let said = trim(&ctx, &kept);
+    assert_eq!(said.len(), 1, "{said:?}");
+    let trimmed = last();
+    assert_eq!(took(&trimmed), 1, "{trimmed:?}");
+    assert!(
+        trimmed.freed >= 64 << 10 && trimmed.kept.is_none(),
+        "{trimmed:?}"
+    );
+    assert!(
+        said[0].contains(&atpkg::admit_disk::size(trimmed.freed)),
+        "the line says the bytes that went: {said:?}"
+    );
+    assert!(!folder(OLD).exists() && stages() == 0);
+    for hash in [NEW, BOTH] {
+        assert!(
+            out(hash).is_file()
+                && folder(hash)
+                    .join("fingerprint/test-lib-aterm_grid")
+                    .is_file(),
+            "{hash}"
+        );
+    }
+    assert!(lock.is_file());
+    let read = atpkg::build_cache::stale::Kept::decode(
+        &std::fs::read(leaf.join(atpkg::build_cache::stale::USED)).expect("kept"),
+    )
+    .expect("a record");
+    assert_eq!(
+        read.runs[&run_key(&ctx)].profiles["debug"],
+        std::collections::BTreeSet::from([NEW.to_owned(), BOTH.to_owned()])
+    );
+
+    let (ctx, kept) = ran([NEW, BOTH]);
+    assert_eq!(kept[0].retired, 0, "{kept:?}");
+    assert_eq!(trim(&ctx, &kept), Vec::<String>::new());
+    assert_eq!(last(), Trimmed::default(), "an identical run takes nothing");
+
+    // A trim that was stopped once it had moved its units aside left its stage in the build
+    // directory, where no pass of the cache looks: the next run to end there finishes it.
+    let left = leaf.join(".cargo-build.removing-2");
+    std::fs::create_dir_all(left.join("0")).expect("a stage left");
+    std::fs::write(left.join("0/part"), vec![7u8; 8 << 10]).expect("what it holds");
+    let (ctx, kept) = ran([NEW, BOTH]);
+    assert_eq!(kept[0].retired, 0, "{kept:?}");
+    let said = trim(&ctx, &kept);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(last().went, vec![(left.clone(), Unused::Unfinished)]);
+    assert!(!left.exists() && stages() == 0, "{said:?}");
+
+    // NEGATIVE CONTROL: the run retires `NEW`, which something wrote after the run began.
+    lay(LATER, 1 << 10, HOUR);
+    let (ctx, kept) = ran([LATER, BOTH]);
+    assert_eq!(kept[0].retired, 1, "{kept:?}");
+    dated(NEW, std::time::SystemTime::now() + HOUR);
+    let said = trim(&ctx, &kept);
+    assert_eq!(said.len(), 1, "{said:?}");
+    let refused = last();
+    assert!(
+        refused.went.is_empty() && refused.kept.is_some(),
+        "{refused:?}"
+    );
+    assert!(out(NEW).is_file() && out(LATER).is_file() && out(BOTH).is_file() && stages() == 0);
+
+    // NEGATIVE CONTROL: the build directory the record was written in is moved away, and
+    // another stands at its path when the trim comes to it.
+    let (ctx, kept) = ran([NEW, BOTH]);
+    assert_eq!(kept[0].retired, 1, "{kept:?}");
+    let aside = dir.path().join("cache/w/aside");
+    std::fs::rename(&leaf, &aside).expect("moved away");
+    std::fs::create_dir_all(&leaf).expect("another directory at its path");
+    let before = calls.borrow().len();
+    let said = trim(&ctx, &kept);
+    assert_eq!(said.len(), 1, "{said:?}");
+    assert_eq!(
+        calls.borrow().len(),
+        before,
+        "a directory the record was not written in is not read"
+    );
+    assert!(
+        aside
+            .join("debug/build/aterm-grid")
+            .join(LATER)
+            .join("fingerprint")
+            .is_dir(),
+        "the retired unit stands where its directory went"
     );
 }

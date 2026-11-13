@@ -145,7 +145,7 @@ impl Owner {
             .as_ref()
             .ok_or_else(|| refused("output handoff precedes actual readiness"))?;
         if request.key.invocation_sha256 != ready.sha256
-            || request.output_root != ready.invocation.output_root
+            || &request.output_root != ready.invocation.header().output_root
             || state
                 .control
                 .as_ref()

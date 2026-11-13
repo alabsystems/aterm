@@ -15,7 +15,16 @@ use aterm_net::lan::{Multicast, Scope as LinkScope};
 use aterm_secrets::commons::roster::Role;
 use std::net::Ipv4Addr;
 
-fn start(paths: &Paths, observers: &Path, machine: usize, port: u16) -> (Runtime, Attachment) {
+/// A runtime on the isolated attachment at `port`. An `unpolled` one never runs its serving loop's
+/// polled checks ([`Network::unpolled`]): only an event of its own, such as the round that enrolls
+/// it, moves what it serves.
+fn start(
+    paths: &Paths,
+    observers: &Path,
+    machine: usize,
+    port: u16,
+    unpolled: bool,
+) -> (Runtime, Attachment) {
     let attachment = Attachment::new(port);
     let observer = observers.join(machine.to_string());
     aterm_secrets::fsx::ensure_private_dir(&observer).unwrap();
@@ -25,6 +34,7 @@ fn start(paths: &Paths, observers: &Path, machine: usize, port: u16) -> (Runtime
         |_| {},
         Network {
             isolated: Some(attachment.clone()),
+            unpolled,
             ..Network::default()
         },
     )
@@ -32,6 +42,13 @@ fn start(paths: &Paths, observers: &Path, machine: usize, port: u16) -> (Runtime
     (runtime, attachment)
 }
 
+/// The recipient's polled checks never come due ([`Network::unpolled`]): the round that enrolls it
+/// ends its enrolling serve at that round's tick, and it rebuilds as a member.
+///
+/// NEGATIVE CONTROL: drop `serve_selected`'s `if witness_due && witnessed(&bootstrap)?` (the
+/// check at the tick an enrolling round completes): the recipient stays an enrolling device, runs
+/// no application round, and `wait_for` reports after its silent minute that repair retained
+/// nothing.
 #[test]
 fn automatic_runtime_enrolls_a_vault_approved_device_then_discovers_its_first_table() {
     // The issuer's vault records approval of this exact recipient. Discovery
@@ -71,8 +88,8 @@ fn automatic_runtime_enrolls_a_vault_approved_device_then_discovers_its_first_ta
     )
     .unwrap();
     let port = reservation.port();
-    let (issuer, _) = start(&lab.paths[0], observers.path(), 0, port);
-    let (recipient, progress) = start(&lab.paths[1], observers.path(), 1, port);
+    let (issuer, _) = start(&lab.paths[0], observers.path(), 0, port, false);
+    let (recipient, progress) = start(&lab.paths[1], observers.path(), 1, port, true);
     // The pending transport has no listener. Runtime must obtain its witness
     // and rebuild its own transport before ordinary catalog/table repair can
     // report this inventory. The test never constructs an enrolled endpoint.
@@ -134,7 +151,7 @@ fn running_newly_enrolled_device_discovers_a_later_generic_table_and_can_write_b
     )
     .unwrap();
     let port = reservation.port();
-    let (issuer, issuer_progress) = start(&lab.paths[0], observers.path(), 0, port);
+    let (issuer, issuer_progress) = start(&lab.paths[0], observers.path(), 0, port, false);
     let recipient_progress = Attachment::new(port);
     let recipient_observer = observers.path().join("1");
     aterm_secrets::fsx::ensure_private_dir(&recipient_observer).unwrap();
@@ -246,6 +263,12 @@ fn running_newly_enrolled_device_discovers_a_later_generic_table_and_can_write_b
     }
 }
 
+/// The windowless recipient's polled checks never come due ([`Network::unpolled`]): the round that
+/// enrolls it ends its enrolling serve at that round's tick.
+///
+/// NEGATIVE CONTROL: drop `serve_selected`'s `if witness_due && witnessed(&bootstrap)?`: the
+/// recipient stays an enrolling device and `wait_for` reports after its silent minute that repair
+/// retained nothing.
 #[test]
 fn windowless_steward_background_runtime_enrolls_windowless_pending_device() {
     let lab = crate::control::enrollment::tests::Lab::new(true);
@@ -300,6 +323,7 @@ fn windowless_steward_background_runtime_enrolls_windowless_pending_device() {
         |_| {},
         Network {
             isolated: Some(progress.clone()),
+            unpolled: true,
             ..Network::default()
         },
     )

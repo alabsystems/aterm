@@ -2199,7 +2199,13 @@ fn a_slow_shutdown_just_ended_in_a_watched_tab_is_its_carrys_to_relaunch() {
     };
     save(&o, session, &record(now_s() - super::super::STALE_S - 60));
     let lock = super::super::sweep_lock(&o).expect("lock").expect("held");
-    let r = crate::harness::relaunch::carry_restart(&o, upgrade::Agent::Claude, Some(gone), false);
+    let r = crate::harness::relaunch::carry_restart(
+        &o,
+        upgrade::Agent::Claude,
+        Some(gone),
+        false,
+        crate::harness::upgrade_drive::now_s(),
+    );
     assert!(r.step.starts_with("busy:"), "{r:?}");
     assert_eq!(
         load(&o, session).expect("kept").exited_at,

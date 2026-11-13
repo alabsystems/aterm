@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use atpkg::net::MANIFEST_CAP;
 
-use super::{Log, download_retried, flag_value, host_error, probe_served};
+use super::{Log, SETTLE_READS, await_served, download_retried, flag_value, host_error};
 use crate::artifact::{package, pkgdoc, upload};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
@@ -693,11 +693,11 @@ fn one(
     };
 
     for name in &written {
-        let answer = probe_served(channel, &public, &tag, name);
+        let answer = await_served(channel, &public, &tag, name);
         if answer != Probe::Present {
             return Err(Error::refused(format!(
-                "{} answers {answer:?} after the upload — the public repo is private, or the \
-                 release is not published",
+                "{} answers {answer:?} after the upload, read {SETTLE_READS} times — the \
+                 public repo is private, or the release is not published",
                 public.download_url(&tag, name)
             )));
         }

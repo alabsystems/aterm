@@ -81,6 +81,19 @@ pub(super) fn interface_generation() -> Option<u64> {
     }
 }
 
+/// What one drain of a listener's change source heard, the most it heard standing for all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum Heard {
+    /// Nothing, or only replies to route lookups.
+    Nothing,
+    /// Changes of the route table and nothing else: no interface, address or link type moved,
+    /// so what a listener reads its attachment from stands.
+    Routes,
+    /// A message that can change an attachment, or so much queued that the kernel may have
+    /// dropped one.
+    Attachments,
+}
+
 /// One listener's route and attachment notifications. This socket never sends a query or
 /// changes a route: readiness only asks the service to recheck its existing authority.
 pub(super) struct RouteChanges {
@@ -136,11 +149,23 @@ impl RouteChanges {
         self.socket.0.as_fd()
     }
 
-    /// Consume at most 4096 datagrams. Exhaustion, closed sockets and failed reads cannot
+    /// Notifications read from `socket`, a datagram socket whose receive room is `room` bytes:
+    /// a test's stand-in for the routing socket.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) fn over(socket: std::os::fd::OwnedFd, room: usize) -> Self {
+        Self {
+            socket: Socket(socket),
+            room,
+        }
+    }
+
+    /// Consume at most 4096 datagrams and say the most they told ([`Heard`]). Half the
+    /// receive room found queued counts as an attachment change: Darwin drops a message that
+    /// finds the room full and says nothing. Exhaustion, closed sockets and failed reads cannot
     /// leave an idle service relying on a notification source that no longer works.
-    pub(super) fn drain(&self) -> io::Result<bool> {
+    pub(super) fn drain(&self) -> io::Result<Heard> {
         let mut buffer = vec![0_u8; MAX_REPLY];
-        let mut changed = false;
+        let mut heard = Heard::Nothing;
         let mut queued = 0_usize;
         for _ in 0..4096 {
             #[cfg(target_os = "linux")]
@@ -181,7 +206,11 @@ impl RouteChanges {
                     match error.kind() {
                         io::ErrorKind::WouldBlock => {
                             // Darwin may silently drop a message when this room fills.
-                            return Ok(changed || queued.saturating_mul(2) >= self.room);
+                            return Ok(if queued.saturating_mul(2) >= self.room {
+                                Heard::Attachments
+                            } else {
+                                heard
+                            });
                         }
                         io::ErrorKind::Interrupted => continue,
                         _ => return Err(error),
@@ -198,11 +227,11 @@ impl RouteChanges {
             queued = queued.saturating_add(received);
             #[cfg(target_os = "macos")]
             {
-                changed |= darwin::route_changed(&buffer[..received])?;
+                heard = heard.max(darwin::route_changed(&buffer[..received])?);
             }
             #[cfg(target_os = "linux")]
             {
-                changed |= linux::route_changed(&buffer[..received])?;
+                heard = heard.max(linux::route_changed(&buffer[..received])?);
             }
         }
         Err(refuse("route notification drain exceeded its bound"))

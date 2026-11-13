@@ -458,7 +458,7 @@ fn pipeline_history_uses_the_exact_frame_snapshot_and_retires_cursor_state() {
 }
 
 #[test]
-fn the_web_rainbow_is_v2_the_underline_and_names_no_animal() {
+fn the_web_rainbow_is_v2_draws_its_band_and_names_no_animal() {
     let mut p = EffectsPipeline::new();
     for (style, rainbow) in [
         ("rainbow", true),
@@ -494,8 +494,8 @@ fn the_web_rainbow_is_v2_the_underline_and_names_no_animal() {
     assert_eq!(p.companion.species(), PetSpecies::Cat);
     rainbow_kitty_glow(&mut p, "rainbow");
     assert!(
-        !p.glow_cfg.ribbon_tall && !p.glow_cfg.ribbon_flat,
-        "the one rainbow theme is the underline"
+        p.glow_cfg.ribbon_tall && !p.glow_cfg.ribbon_flat,
+        "the one rainbow theme draws its band behind the words"
     );
 }
 
@@ -514,14 +514,9 @@ fn rainbow_kitty_glow(p: &mut EffectsPipeline, style: &str) {
     );
 }
 
-/// The rainbow with the tall ribbon body. The one `rainbow` theme draws the underline; the tall
-/// body is a shape no built-in theme picks, kept drawing here as theme data for the tests that
-/// need a ribbon over the letters' rows.
+/// The `rainbow` theme, whose tall ribbon body lies over the letters' rows.
 fn tall_rainbow_glow(p: &mut EffectsPipeline) {
     rainbow_kitty_glow(p, "rainbow");
-    let request = p.glow_request.as_mut().expect("a glow request");
-    request.spelling.ribbon_tall = true;
-    p.resolve_glow();
     assert!(p.glow_cfg.ribbon_tall);
 }
 

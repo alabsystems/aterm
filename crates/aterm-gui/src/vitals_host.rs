@@ -181,7 +181,7 @@ pub(crate) fn newly_stranded<'a>(
         .collect()
 }
 
-/// The rows `f` names as not started for another reason than macOS's program check, each with
+/// The rows `f` names as not started but not as held at macOS's program check, each with
 /// what keeps it: translating, then not started, then stopped or traced.
 fn not_started_rows(
     f: &aterm_vitals::jobs::Findings,
@@ -878,6 +878,9 @@ pub(crate) struct VitalsHost {
     /// The dangling links a `proc.link` record told, by path
     /// ([`crate::message_reporters::newly_dangling`]).
     links_told: std::collections::VecDeque<String>,
+    /// What the `vitals.stranded` entry last handed said: the pids it named and the syspolicyd
+    /// running ([`App::note_held_episode`]).
+    stranded_said: Option<(Vec<u32>, u32)>,
 }
 
 impl Default for VitalsHost {
@@ -939,6 +942,7 @@ impl Default for VitalsHost {
             wall: Wall::System,
             left_told: std::collections::BTreeSet::new(),
             links_told: std::collections::VecDeque::new(),
+            stranded_said: None,
         }
     }
 }
@@ -5037,11 +5041,16 @@ impl crate::App {
 
     /// Records what the view just adopted says of macOS's program check: one `program-check.`
     /// record per episode edge it makes against `before` ([`held_edge`]), one naming the programs
-    /// it first says have not started for another reason ([`newly_not_started`]), one naming the
+    /// it first says have not started but does not call held ([`newly_not_started`]), one naming the
     /// programs it first says are stranded ([`newly_stranded`]) while it names the syspolicyd they
-    /// were judged against, one when it first names programs aterm started after its Developer
-    /// Tools grant took ([`after_grant_edge`]), and, once the view stands in no episode, the
-    /// verdict refresh held back ([`Self::start_devtools_refresh`]): one an episode held
+    /// were judged against, the `vitals.stranded` digest entry
+    /// ([`crate::message_reporters::stranded_entry`]) for those it names stranded at least
+    /// [`aterm_uds::deadline::FIRST_EXEC_HANG`] while it names that syspolicyd, handed only when
+    /// those programs or that syspolicyd move (a view that names no syspolicyd leaves the entry as
+    /// it stands, and one that names one and no such program ends it; a view carried into a later
+    /// snapshot says what it said), one when it first names programs aterm started after its
+    /// Developer Tools grant took ([`after_grant_edge`]), and, once the view stands in no episode,
+    /// the verdict refresh held back ([`Self::start_devtools_refresh`]): one an episode held
     /// ([`Self::refresh_devtools_verdict`]) or one that did not settle since, held first, so it is
     /// asked again at the first view that stands in none, this one included.
     fn note_held_episode(&mut self, before: Option<&aterm_vitals::jobs::JobsView>) {
@@ -5063,6 +5072,22 @@ impl crate::App {
             && !stranded.is_empty()
         {
             let _ = self.post_message(crate::message_reporters::stranded_record(&stranded, daemon));
+        }
+        if let Some(daemon) = after.findings.program_check_daemon {
+            let long: Vec<&aterm_vitals::jobs::Named> = after
+                .findings
+                .program_check_stranded
+                .iter()
+                .filter(|n| Duration::from_millis(n.for_ms) >= aterm_uds::deadline::FIRST_EXEC_HANG)
+                .collect();
+            let said = (long.iter().map(|n| n.pid).collect(), daemon);
+            if self.vitals.stranded_said.as_ref() != Some(&said) {
+                let entries: Vec<_> = crate::message_reporters::stranded_entry(&long, daemon)
+                    .into_iter()
+                    .collect();
+                self.except_replace(aterm_messages::exceptions::Family::Stranded, &entries);
+                self.vitals.stranded_said = Some(said);
+            }
         }
         if let Some(n) = after_grant_edge(before.map(|v| &v.findings), &after.findings) {
             let _ = self.post_message(crate::message_reporters::program_check_after_grant(n));

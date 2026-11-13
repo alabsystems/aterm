@@ -4,6 +4,7 @@
 //! Witness verification precedes historical classification. A crash tail never
 //! acquires the authority of bytes already acknowledged in independent custody.
 
+use super::group::Boundary;
 use super::{CONFLICT_SUBJECT, Receipt, SUBJECT, Stored, Witness};
 use crate::{
     Error, Result,
@@ -33,7 +34,11 @@ pub(super) struct Entry {
         project = "aterm_db::table::store::replay::tests::quarantine_transition"
     )
 )]
-pub(super) fn read(log: &mut Log, acknowledged: Witness, pending: bool) -> Result<Replay> {
+pub(super) fn read(
+    log: &mut Log,
+    acknowledged: impl Into<Boundary>,
+    pending: bool,
+) -> Result<Replay> {
     let mut replay = Builder::new(acknowledged, pending);
     let mut offset = Offset::ZERO;
     loop {
@@ -117,26 +122,39 @@ pub(super) fn identify_onto(
 }
 
 /// A replay's claim steps against the witness the enrollment claim acknowledges: the chain may run
-/// one record past it (the sealed append a cut-off writer can leave), must equal it where it
-/// counts as many records, and must have reached it by the end.
+/// one record past it without a group permit, or to an independently permitted exact group
+/// endpoint. It must equal the acknowledged prefix where its count matches, and reach that
+/// prefix by the end. An unfinished permitted group is never an accepted checkpoint.
 struct Claim {
     acknowledged: Witness,
+    end: Option<Witness>,
+    through: Witness,
     prefix_checked: bool,
 }
 impl Claim {
-    fn new(acknowledged: Witness) -> Self {
+    fn new(boundary: impl Into<Boundary>) -> Self {
+        let boundary = boundary.into();
+        let acknowledged = boundary.acknowledged();
+        let end = boundary.end();
         Self {
             acknowledged,
+            end,
+            through: Witness::default(),
             prefix_checked: acknowledged == Witness::default(),
         }
     }
 
     /// Admit the chain `through` the next record.
     fn admit(&mut self, through: Witness) -> Result<()> {
-        if through.count > self.acknowledged.count + 1 {
-            return Err(Error::new(
-                "table log exceeds its single unwitnessed append allowance",
-            ));
+        let limit = self
+            .end
+            .map_or(self.acknowledged.count + 1, |end| end.count);
+        if through.count > limit {
+            return Err(Error::new(if self.end.is_some() {
+                "table log exceeds its independent checkpoint group allowance"
+            } else {
+                "table log exceeds its single unwitnessed append allowance"
+            }));
         }
         if through.count == self.acknowledged.count {
             if through != self.acknowledged {
@@ -146,6 +164,7 @@ impl Claim {
             }
             self.prefix_checked = true;
         }
+        self.through = through;
         Ok(())
     }
 
@@ -153,6 +172,13 @@ impl Claim {
         if !self.prefix_checked {
             return Err(Error::new(
                 "table history lost acknowledged custody records",
+            ));
+        }
+        if self.through.count > self.acknowledged.count
+            && self.end.is_some_and(|end| self.through != end)
+        {
+            return Err(Error::new(
+                "table checkpoint differs from its exact group permission",
             ));
         }
         Ok(())
@@ -170,9 +196,11 @@ impl Claim {
 pub(super) fn witnessed(
     links: Cow<'_, [Linked]>,
     refused: Option<Error>,
-    acknowledged: Witness,
+    acknowledged: impl Into<Boundary>,
 ) -> Result<Replay> {
-    let count = witnessed_count(&links, refused, acknowledged)?;
+    let boundary = acknowledged.into();
+    let acknowledged = boundary.acknowledged();
+    let count = witnessed_count(&links, refused, boundary)?;
     let entries = match links {
         Cow::Owned(links) => links.into_iter().take(count).map(Linked::entry).collect(),
         Cow::Borrowed(links) => links
@@ -193,9 +221,9 @@ pub(super) fn witnessed(
 pub(super) fn repair_ids(
     links: &[Linked],
     refused: Option<Error>,
-    acknowledged: Witness,
+    acknowledged: impl Into<Boundary>,
 ) -> Result<std::collections::BTreeSet<astream_wire::sync::Digest>> {
-    let count = witnessed_count(links, refused, acknowledged)?;
+    let count = witnessed_count(links, refused, acknowledged.into())?;
     Ok(links[..count]
         .iter()
         .filter(|link| !link.conflict)
@@ -203,12 +231,8 @@ pub(super) fn repair_ids(
         .collect())
 }
 
-fn witnessed_count(
-    links: &[Linked],
-    refused: Option<Error>,
-    acknowledged: Witness,
-) -> Result<usize> {
-    let mut claim = Claim::new(acknowledged);
+fn witnessed_count(links: &[Linked], refused: Option<Error>, boundary: Boundary) -> Result<usize> {
+    let mut claim = Claim::new(boundary);
     for link in links {
         claim.admit(link.through)?;
     }
@@ -216,14 +240,14 @@ fn witnessed_count(
         return Err(refused);
     }
     claim.finish()?;
-    usize::try_from(acknowledged.count)
+    usize::try_from(boundary.acknowledged().count)
         .map_err(|_| Error::new("table witness count exceeds this reader"))
 }
 
 /// [`witnessed`] of `records` identified afresh.
 pub(super) fn read_observed(
     records: Vec<astream_broker::BrokerRecord>,
-    acknowledged: Witness,
+    acknowledged: impl Into<Boundary>,
 ) -> Result<Replay> {
     let mut links = Vec::with_capacity(records.len());
     let refused = identify_onto(&mut links, records).err();
@@ -231,7 +255,7 @@ pub(super) fn read_observed(
 }
 
 /// A writer's replay: each record identified ([`identify`]) and admitted against the claim
-/// ([`Claim`]) in turn, the one unwitnessed append included.
+/// ([`Claim`]) in turn, the independently allowed unwitnessed tail included.
 struct Builder {
     pending: bool,
     witness: Witness,
@@ -239,14 +263,15 @@ struct Builder {
     entries: Vec<Entry>,
 }
 impl Builder {
-    fn new(acknowledged: Witness, pending: bool) -> Self {
-        let cap = usize::try_from(acknowledged.count)
+    fn new(boundary: impl Into<Boundary>, pending: bool) -> Self {
+        let boundary = boundary.into();
+        let cap = usize::try_from(boundary.acknowledged().count)
             .unwrap_or(0)
             .min(super::JOURNAL_RECORDS);
         Self {
             pending,
             witness: Witness::default(),
-            claim: Claim::new(acknowledged),
+            claim: Claim::new(boundary),
             entries: Vec::with_capacity(cap),
         }
     }
@@ -321,28 +346,36 @@ pub(super) fn restore(
     wire: Identified,
     acknowledged: u64,
     catalog: bool,
+    read_only: bool,
 ) -> Result<Stored> {
     let scope = batch.scope;
-    // Store::open_region checks live authority around this held-source replay
+    // Store::open_claimed checks live authority around this held-source replay
     // and before finalization. Keep signed-envelope and historical validation
     // per record without repeating those filesystem checks for every entry.
     // `catalog` is whether `scope` is the catalog, which the open judged once.
     let envelope = Envelope::parse_identified(scope, &wire)?;
     super::operation_policy_in(catalog, &envelope.header, envelope.body.len() - 16)?;
-    let (header, quarantine, cut) = if aterm_db_core::quarantine_eligible(
+    let (payload, cut) = if aterm_db_core::quarantine_eligible(
         acknowledged,
         receipt.offset,
         batch.discarded_source(&envelope)?,
     ) {
         (
-            envelope.header,
-            Some((envelope.roster, envelope.epoch, envelope.authored_ms)),
+            super::PayloadState::Quarantined(envelope.roster, envelope.epoch, envelope.authored_ms),
             None,
         )
     } else {
-        let (header, cut) = batch.replay_metadata(&wire, envelope)?;
-        (header, None, cut)
+        match batch.replay_metadata(&wire, &envelope) {
+            Ok(cut) => (super::PayloadState::Ready, cut),
+            Err(error)
+                if read_only && receipt.offset < acknowledged && error.is_awaiting_membership() =>
+            {
+                (super::PayloadState::AwaitingMembership, None)
+            }
+            Err(error) => return Err(error),
+        }
     };
+    let header = envelope.header;
     if header.id != receipt.id {
         return Err(Error::new("replayed receipt differs from ciphertext"));
     }
@@ -350,7 +383,7 @@ pub(super) fn restore(
         wire: super::StoredWire::Shared(wire),
         header,
         receipt,
-        quarantine,
+        payload,
         cut,
     })
 }

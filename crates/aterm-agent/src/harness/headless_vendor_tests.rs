@@ -1808,8 +1808,8 @@ pub(in crate::harness) fn fake_cdp_serving(
     refuse_target: bool,
     mut serve: impl FnMut(&str) -> Value + Send + 'static,
 ) -> (CdpClient, std::thread::JoinHandle<()>) {
-    let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
-    let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
+    let (to_browser_r, to_browser_w) = aterm_uds::pipe().expect("pipe");
+    let (from_browser_r, mut from_browser_w) = aterm_uds::pipe().expect("pipe");
     let browser = std::thread::spawn(move || {
         let mut reader = to_browser_r;
         let mut pending = Vec::new();
@@ -2240,8 +2240,8 @@ fn counting_cdp(
     reads: Arc<AtomicUsize>,
     presses: Arc<AtomicUsize>,
 ) -> (CdpClient, std::thread::JoinHandle<()>) {
-    let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
-    let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
+    let (to_browser_r, to_browser_w) = aterm_uds::pipe().expect("pipe");
+    let (from_browser_r, mut from_browser_w) = aterm_uds::pipe().expect("pipe");
     let browser = std::thread::spawn(move || {
         let mut reader = to_browser_r;
         let mut pending = Vec::new();
@@ -3301,8 +3301,8 @@ fn cjk_punctuated_emails_readonly_inputs_and_vendor_otp_retry_work() {
 
     // 3. `drive_cdp_vendor_within` retries mailbox polling when the first OTP is rejected and
     // the page remains on the verification code screen, then completes with the second OTP.
-    let (to_browser_r, to_browser_w) = std::io::pipe().expect("pipe");
-    let (from_browser_r, mut from_browser_w) = std::io::pipe().expect("pipe");
+    let (to_browser_r, to_browser_w) = aterm_uds::pipe().expect("pipe");
+    let (from_browser_r, mut from_browser_w) = aterm_uds::pipe().expect("pipe");
     let submitted_otps = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let submitted_clone = Arc::clone(&submitted_otps);
     let browser = std::thread::spawn(move || {

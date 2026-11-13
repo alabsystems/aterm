@@ -9,6 +9,8 @@ use aterm_update_core::release_asset::{self, AssetError, Reader};
 use aterm_update_core::tag::{TagError, TagKind};
 use aterm_update_core::{HeadAnswer, HttpError};
 
+use aterm_update_core::update_record::{Ending, Hold};
+
 use crate::manifest::{Manifest, Ready};
 use crate::{Source, bundle, install, paths::Staging};
 
@@ -723,17 +725,15 @@ fn sweep_download_scratch(staging: &Staging) {
     }
 }
 
-/// An open stage-failure retry window, and what it may stop.
+/// An open retry window on the candidate, and what it may stop.
 #[derive(Debug)]
 struct StageBackoff {
     /// Seconds until the candidate named by the manifest may be downloaded again.
     retry_in_secs: u64,
-    /// Consecutive stage failures recorded for that candidate (at least 1).
+    /// Consecutive failures recorded for that candidate (at least 1).
     attempts: u32,
-    /// The candidate is quarantined (applied, crash-looped, reverted).
-    quarantined: bool,
-    /// The window is a moment's.
-    moment: bool,
+    /// The update record's hold on the candidate, when the window is one (none for a moment).
+    hold: Option<Hold>,
     /// A published local stage that is strictly newer than the running build, if one exists.
     applicable: Option<Ready>,
 }
@@ -741,27 +741,19 @@ struct StageBackoff {
 impl StageBackoff {
     /// The operator-facing line for an open window.
     fn status_line(&self, candidate_build: u64) -> String {
-        let restage = if self.quarantined {
-            format!(
-                "build {candidate_build} is quarantined: it was applied, failed to start \
-                 cleanly, and was reverted — this machine will not retry it (a newer build, \
-                 or a re-publish under a different digest, clears it)"
-            )
-        } else if self.moment {
-            format!(
+        let restage = match &self.hold {
+            Some(hold) => format!(
+                "skipping build {candidate_build} for another {}m: {}",
+                self.retry_in_secs.div_ceil(60),
+                crate::hold::refusal(hold)
+            ),
+            None => format!(
                 "skipping re-stage of build {candidate_build} for another {}m (staging could \
                  not finish {} time(s) in a row; nothing is known against the build, and it is \
                  retried automatically, or at once when you check for updates)",
                 self.retry_in_secs.div_ceil(60),
                 self.attempts
-            )
-        } else {
-            format!(
-                "skipping re-stage of build {candidate_build} for another {}m (failed to stage \
-                 {} time(s); retrying automatically, or re-publish to retry now)",
-                self.retry_in_secs.div_ceil(60),
-                self.attempts
-            )
+            ),
         };
         match &self.applicable {
             None => format!("{restage}; no verified stage to apply"),
@@ -774,7 +766,96 @@ impl StageBackoff {
     }
 }
 
-/// Read the stage-failure memo and decide what it may stop for this candidate.
+/// The in-memory retry schedule for a candidate whose staging could not finish (a moment), in
+/// seconds: nothing is known against the build, so it is no hold, and a fresh process (or a
+/// person's check) tries at once.
+pub(crate) const MOMENT_BACKOFF_SECS: [u64; 4] = [0, 15 * 60, 60 * 60, 4 * 60 * 60];
+
+/// The moment this process last booked under one staging root: the artifact, how many in a
+/// row, and the unix second before which it is not staged again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Moment {
+    root: std::path::PathBuf,
+    build: u64,
+    sha256: String,
+    attempts: u32,
+    retry_after: u64,
+}
+
+static MOMENTS: std::sync::Mutex<Vec<Moment>> = std::sync::Mutex::new(Vec::new());
+
+/// Runs `f` on the booked moments under their lock, which no caller holds across anything else.
+fn with_moments<T>(f: impl FnOnce(&mut Vec<Moment>) -> T) -> T {
+    let mut all = MOMENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    f(&mut all)
+}
+
+/// The moment booked under `staging`'s root, if any.
+fn booked_moment(staging: &Staging) -> Option<Moment> {
+    with_moments(|all| all.iter().find(|m| m.root == staging.root).cloned())
+}
+
+/// Book a moment of `(build, sha256)` under `staging` at `now`: one more in a row of the same
+/// artifact, and its next try on [`MOMENT_BACKOFF_SECS`].
+fn book_moment(staging: &Staging, build: u64, sha256: &str, now: u64) -> Moment {
+    with_moments(|all| {
+        let attempts = all
+            .iter()
+            .find(|m| m.root == staging.root)
+            .filter(|m| m.build == build && m.sha256.eq_ignore_ascii_case(sha256))
+            .map_or(1, |m| m.attempts.saturating_add(1));
+        let index = usize::try_from(attempts.saturating_sub(1))
+            .unwrap_or(usize::MAX)
+            .min(MOMENT_BACKOFF_SECS.len() - 1);
+        let moment = Moment {
+            root: staging.root.clone(),
+            build,
+            sha256: sha256.to_ascii_lowercase(),
+            attempts,
+            retry_after: now.saturating_add(MOMENT_BACKOFF_SECS[index]),
+        };
+        all.retain(|m| m.root != staging.root);
+        all.push(moment.clone());
+        moment
+    })
+}
+
+/// Forget the moment booked under `staging` (a stage published).
+fn clear_moment(staging: &Staging) {
+    with_moments(|all| all.retain(|m| m.root != staging.root));
+}
+
+/// Note in the update record what this check saw: the newest build offered, when the floors
+/// admit it (which ends a hold on an older one,
+/// [`aterm_update_core::update_record::UpdateRecord::offer`]; a release the floors withdraw is
+/// no offer, so it never reads as one this copy is behind), the build that runs when no trial of
+/// it is under way ([`aterm_update_core::update_record::UpdateRecord::observe_running`]: found
+/// running, not proven), and any lab peer's evidence that the held artifact starts
+/// ([`crate::lab::lift_by`]: once per artifact).
+fn note_offer(staging: &Staging, current_build: u64, offered: Option<u64>, now: u64) {
+    let receipt = crate::manifest::InstalledReceipt::read(&staging.installed_receipt())
+        .filter(|receipt| receipt.build_number == current_build)
+        .and_then(|receipt| crate::hold::sha(&receipt.dmg_sha256));
+    let peers = crate::lab::peers_for(&crate::hold::load(staging), now);
+    crate::hold::edit(staging, "note the offered build", |record| {
+        if let Some(offered) = offered {
+            record.offer(offered, now);
+        }
+        let on_trial = record
+            .trial
+            .as_ref()
+            .is_some_and(|trial| trial.build == current_build);
+        if !on_trial {
+            record.observe_running(current_build, receipt, now);
+        }
+        crate::lab::lift_by(record, &peers, now);
+    });
+}
+
+/// Decide what the update record's hold, or this process's booked moment, may stop for this
+/// candidate. A person's check ends the hold and passes a moment by: it tries now.
 fn stage_backoff(
     staging: &Staging,
     manifest: &Manifest,
@@ -782,31 +863,41 @@ fn stage_backoff(
     now: u64,
     asked: Asked,
 ) -> Option<StageBackoff> {
-    // The quarantine ledger first: a verdict no later stage event can overwrite
-    // — `failed.toml` holds one artifact at a time.
-    if crate::manifest::artifact_quarantined(staging, manifest.build_number, &manifest.sha256) {
+    let applicable =
+        || Ready::read_publishable(staging).filter(|ready| ready.build_number > current_build);
+    if let Some(hold) = crate::hold::held(staging, manifest.build_number, &manifest.sha256, now) {
+        if asked == Asked::Person {
+            crate::hold::edit(staging, "a person retried a held build", |record| {
+                record.end_hold(Ending::Person, now)
+            });
+            crate::log(&format!(
+                "a person checked for updates: the hold on build {} ends, and it is tried now",
+                hold.build
+            ));
+            return None;
+        }
         return Some(StageBackoff {
-            retry_in_secs: 0,
-            attempts: 1,
-            quarantined: true,
-            moment: false,
-            applicable: Ready::read_publishable(staging)
-                .filter(|ready| ready.build_number > current_build),
+            retry_in_secs: hold.left(now),
+            attempts: u32::from(hold.tries.max(1)),
+            hold: Some(hold),
+            applicable: applicable(),
         });
     }
-    let memo = crate::manifest::FailedMark::read(&staging.failed())?;
-    if !memo.suppresses(manifest.build_number, &manifest.sha256, now)
-        || (asked == Asked::Person && memo.moment && !memo.is_quarantine())
+    if asked == Asked::Person {
+        return None;
+    }
+    let moment = booked_moment(staging)?;
+    if moment.build != manifest.build_number
+        || !moment.sha256.eq_ignore_ascii_case(&manifest.sha256)
+        || moment.retry_after <= now
     {
         return None;
     }
     Some(StageBackoff {
-        retry_in_secs: memo.retry_in_secs(now),
-        attempts: memo.attempts.max(1),
-        quarantined: memo.is_quarantine(),
-        moment: memo.moment,
-        applicable: Ready::read_publishable(staging)
-            .filter(|ready| ready.build_number > current_build),
+        retry_in_secs: moment.retry_after - now,
+        attempts: moment.attempts.max(1),
+        hold: None,
+        applicable: applicable(),
     })
 }
 
@@ -985,13 +1076,9 @@ fn book_stage_failure(
     error: &str,
     now: u64,
 ) -> StageBooked {
-    if crate::manifest::artifact_quarantined(staging, manifest.build_number, &manifest.sha256) {
+    if let Some(hold) = crate::hold::held(staging, manifest.build_number, &manifest.sha256, now) {
         crate::health::Health::record_acquisition_success(&staging.health());
-        let why = format!(
-            "held: build {} is quarantined — it crash-looped on this machine and was \
-             reverted; aterm will not install it",
-            manifest.build_number
-        );
+        let why = format!("held: {}", crate::hold::refusal(&hold));
         crate::status::record(staging, current_build, &why);
         return StageBooked::Held(why);
     }
@@ -1004,13 +1091,8 @@ fn book_stage_failure(
         return StageBooked::Held(why);
     }
     if crate::is_passing_refusal(error) {
-        let memo = crate::manifest::FailedMark::record_stage_moment(
-            &staging.failed(),
-            manifest.build_number,
-            &manifest.sha256,
-            now,
-        );
-        let next = match memo.retry_in_secs(now) {
+        let memo = book_moment(staging, manifest.build_number, &manifest.sha256, now);
+        let next = match memo.retry_after.saturating_sub(now) {
             0 => "the next check tries again".to_string(),
             wait => format!(
                 "it could not finish {} times in a row, so it is tried again in {} min, or \
@@ -1036,10 +1118,12 @@ fn book_stage_failure(
         );
         return StageBooked::Moment;
     }
-    crate::manifest::FailedMark::record_stage_failure(
-        &staging.failed(),
+    crate::hold::stage_failed(
+        staging,
         manifest.build_number,
+        &manifest.version,
         &manifest.sha256,
+        error,
         now,
     );
     crate::health::Health::record_failure(&staging.health(), "stage", error);
@@ -1750,6 +1834,7 @@ fn check_and_stage_in(
         install::reap_abandoned_copy_attempts(parent);
     }
     install::sweep_left_incoming_unless_staging(&staging);
+    staging.retire();
     crate::status::clear_check_note();
     install::expire_apply_streak_moved_past(&staging, current_build);
     let floor = floor_snapshot(&staging)?;
@@ -1911,6 +1996,15 @@ fn check_and_stage_in(
         return Ok(None);
     };
 
+    let floor_held = floor_hold(manifest.build_number, effective_min_build, floor.high_water);
+    note_offer(
+        &staging,
+        current_build,
+        (manifest.build_number <= current_build || floor_held.is_none())
+            .then_some(manifest.build_number),
+        crate::install::unix_now_secs(),
+    );
+
     if manifest.build_number <= current_build {
         crate::health::Health::record_success(&staging.health());
         crate::status::set_latest_tag(&web_tag, source, current_build, manifest.build_number);
@@ -1926,7 +2020,7 @@ fn check_and_stage_in(
         return Ok(None);
     }
 
-    if let Some(held) = floor_hold(manifest.build_number, effective_min_build, floor.high_water) {
+    if let Some(held) = floor_held {
         crate::health::Health::record_success(&staging.health());
         crate::status::record(&staging, current_build, &held);
         return Ok(None);
@@ -2044,7 +2138,7 @@ fn check_and_stage_in(
         return end_failed_stage(&staging, current_build, &manifest, e);
     }
     let _ = std::fs::remove_file(&container_path);
-    crate::manifest::FailedMark::clear_backoff(&staging.failed());
+    clear_moment(&staging);
     crate::health::Health::record_success(&staging.health());
     crate::manifest::Floor::observe_and_write(
         &staging.floor(),

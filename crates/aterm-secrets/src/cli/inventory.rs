@@ -6,55 +6,7 @@
 //! ([`crate::claude_token::Standing`]); it never opens credential files or decrypts their
 //! contents.
 
-use crate::need::catalog::{GhProfile, NOTARY_ENTRY, SITE_DEPLOYER_KEY_ENTRY, Want};
-
-fn description(name: &str) -> String {
-    match name {
-        "gh_access_token" => Want::Gh(GhProfile::Dev).title(),
-        "gh_access_token_alabsystems" => Want::Gh(GhProfile::Release).title(),
-        "github-repositories.json" => {
-            "Private development account and repository inventory for automatic setup".into()
-        }
-        NOTARY_ENTRY => Want::Notary.title(),
-        SITE_DEPLOYER_KEY_ENTRY => Want::SiteDeployerKey.title(),
-        "~/.aterm/release-credentials.toml" | "~/.aterm/release-ring/release-credentials.toml" => {
-            "Release signing profile; use with --release-credentials".into()
-        }
-        "~/.aterm/machine.key" | "~/.aterm/release-ring/machine.key" => {
-            "Machine release signing key".into()
-        }
-        "~/.aterm/machine.toml" | "~/.aterm/release-ring/machine.toml" => {
-            "Machine release identity".into()
-        }
-        "ai-accounts.csv" => {
-            "AI account sheet (the lab importer's input; read directly only on a Mac the lab does \
-             not name)"
-                .into()
-        }
-        "ai-mailbox.toml" => "AI account mailbox configuration".into(),
-        "~/.config/gh/hosts.yml" => "GitHub CLI authentication".into(),
-        "~/.config/git/credentials" => "Git HTTPS credentials".into(),
-        "~/.config/git/config" => "Git configuration and credential routing".into(),
-        _ if name.ends_with(".cer") && name.starts_with("~/.aterm/apple/") => {
-            "Apple Developer ID certificate".into()
-        }
-        _ if name.ends_with(".key") && name.starts_with("~/.aterm/apple/") => {
-            "Apple Developer ID private key".into()
-        }
-        _ if name.starts_with("~/.aterm/roster/") => {
-            "Release machine roster or its signature".into()
-        }
-        _ => Want::Entry(name.to_owned()).title(),
-    }
-}
-
-fn pointer(name: &str) -> Option<String> {
-    // Reuse the materializer's eligibility rules, including reserved entries and login
-    // files it deliberately refuses. The synthetic home is never opened.
-    crate::materialize::target_path(std::path::Path::new("~"), name)
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned())
-}
+use crate::registry::{pointer, purpose as description};
 
 /// One Claude Code token entry as `ls` lists it: its name and what it is, never a value and
 /// never a file (DESIGN-claude-setup-token §5.10).

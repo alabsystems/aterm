@@ -5,6 +5,7 @@ use super::*;
 
 fn source() -> Snapshot {
     Snapshot {
+        lifetime: None,
         launch_env: None,
         auth_observed: true,
         tab: "s-selected-source".into(),
@@ -102,6 +103,15 @@ fn selection_case(case: i64) -> bool {
         }
         22 | 29 => asked = Restart::Memory,
         23 => {
+            fresh.lifetime = Some(
+                aterm_json::from_value(aterm_json::json!({
+                    "host": "darwin:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "boot": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "pid": fresh.pid,
+                    "birth": 123456,
+                }))
+                .unwrap(),
+            );
             fresh.cwd = "/new/work".into();
             fresh.session = Some("0badf00d-7777-2222-3333-444455556666".into());
             fresh.version = Some("new-version".into());

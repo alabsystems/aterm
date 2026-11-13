@@ -32,13 +32,13 @@ fn app_observing_pty() -> (App, i32) {
 /// the master a guarded control write (`if=`) needs for its immediate write.
 #[cfg(unix)]
 fn app_observing_pty_with(immediate: bool) -> (App, i32) {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, IntoRawFd};
     use std::sync::Arc;
 
     use aterm_session::sink::SinkWriter;
 
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let (reader, writer) = aterm_uds::pipe().expect("pipe");
+    let pipe = [reader.into_raw_fd(), writer.as_raw_fd()];
     let ends: &[i32] = if immediate { &pipe } else { &pipe[..1] };
     for &fd in ends {
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -48,8 +48,7 @@ fn app_observing_pty_with(immediate: bool) -> (App, i32) {
             0
         );
     }
-    let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-    let sink = Arc::new(SinkWriter::new_owned(writer));
+    let sink = Arc::new(SinkWriter::new_owned(writer.into()));
     sink.note_master_nonblocking(immediate);
     (App::headless_for_test_with_sink(sink), pipe[0])
 }
@@ -2447,7 +2446,7 @@ fn a_key_typed_before_claude_shows_insert_lights_on_the_frame_that_shows_it() {
 #[cfg(unix)]
 #[test]
 fn a_split_reads_vim_s_mode_from_the_focused_pane_s_own_terminal() {
-    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::fd::IntoRawFd;
     use std::sync::Arc;
 
     use aterm_effects::cursor_glow::AdmissionRecord;
@@ -2464,19 +2463,18 @@ fn a_split_reads_vim_s_mode_from_the_focused_pane_s_own_terminal() {
     app.config.cursor_trail = Some(true);
     app.config.cursor_trail_style = Some("rainbow".to_string());
     let left = app.front_terminal(wid).expect("terminal").clone();
-    let mut pipe = [0; 2];
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-    let flags = unsafe { libc::fcntl(pipe[0], libc::F_GETFL) };
+    let (reader, writer) = aterm_uds::pipe().expect("pipe");
+    let right_pipe = reader.into_raw_fd();
+    let flags = unsafe { libc::fcntl(right_pipe, libc::F_GETFL) };
     assert!(flags >= 0);
     assert_eq!(
-        unsafe { libc::fcntl(pipe[0], libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        unsafe { libc::fcntl(right_pipe, libc::F_SETFL, flags | libc::O_NONBLOCK) },
         0
     );
-    let writer = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
     let right = app.split_active_stub_tab_dir_with_sink(
         wid,
         crate::pane::SplitDir::Vertical,
-        Arc::new(SinkWriter::new_owned(writer)),
+        Arc::new(SinkWriter::new_owned(writer.into())),
     );
     let front = app.front_terminal(wid).expect("terminal").clone();
     assert_eq!(
@@ -2605,7 +2603,7 @@ fn a_split_reads_vim_s_mode_from_the_focused_pane_s_own_terminal() {
         "control: the focused footer in INSERT lights the echo: {verdicts:?}"
     );
     let _ = drain(left_pipe);
-    let _ = drain(pipe[0]);
+    let _ = drain(right_pipe);
 }
 
 /// The insert arm is Rainbow Kitty's alone: a bare Tab and a bare ⌃V arm

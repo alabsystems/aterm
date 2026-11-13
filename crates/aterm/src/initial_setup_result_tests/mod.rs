@@ -3867,6 +3867,7 @@ fn only_a_press_of_check_again_lifts_parks_and_wakes_the_run() {
 #[test]
 fn queued_observation_intents_keep_a_draft_check_across_a_focus_refresh() {
     use aterm_types::macos_setup::Standing;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let _globals = globals();
     let _io = TestIo::install();
@@ -3986,18 +3987,126 @@ fn queued_observation_intents_keep_a_draft_check_across_a_focus_refresh() {
         rows.caps_live = None;
         rows.generation += 1;
     }
+    let choices = OBSERVED_ROWS.lock().unwrap().choices;
+    let ledger = CLAIM_ROOT
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap()
+        .join("setup-ledger.json");
+    let before_ledger = std::fs::read(&ledger).unwrap();
+    let before_readings = setup_readings();
+    let before_reads = script().reads.len();
+    let save_display_plan = |plan: &Plan| {
+        std::fs::write(
+            ledger.with_file_name("automatic-plan.json"),
+            aterm_json::to_vec(&aterm_json::json!({
+                "profile": "macos-workstation-v1",
+                "selection": plan.selection.bits(),
+                "vault_url": plan.vault_url,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    };
+    save_display_plan(&shown);
+    let foreign = aterm_cli::macos_doctor::SetupHistoryStore::at(
+        ledger.parent().unwrap(),
+        Path::new("/another-account"),
+    );
+    assert!(initial_setup_launch_history_in(foreign, choices).is_none());
+    let mut invalid: aterm_json::Value = aterm_json::from_slice(&before_ledger).unwrap();
+    invalid
+        .as_object_mut()
+        .unwrap()
+        .get_mut("display_history")
+        .unwrap()
+        .as_object_mut()
+        .unwrap()
+        .insert("format".into(), aterm_json::Value::from(99));
+    std::fs::write(&ledger, aterm_json::to_vec(&invalid).unwrap()).unwrap();
+    assert!(initial_setup_launch_history_in(store.clone(), choices).is_none());
+    std::fs::write(&ledger, &before_ledger).unwrap();
+    assert!(initial_setup_launch_history_in(store.clone(), choices.wrapping_add(1)).is_none());
+    save_display_plan(&checked);
+    let other_source = initial_setup_launch_history_in(store.clone(), choices).unwrap();
+    assert!(
+        other_source.last_known.is_empty(),
+        "another vault's history is not shown"
+    );
+    assert_eq!(OBSERVED_ROWS.lock().unwrap().plan.as_ref(), Some(&shown));
+    save_display_plan(&shown);
+    let seeded = initial_setup_launch_history().unwrap();
+    assert_eq!(seeded.plan, shown);
+    assert!(
+        seeded
+            .last_known
+            .iter()
+            .any(|row| { row.subject == vault && row.now.as_deref() == Some("Synced") })
+    );
+    save_display_plan(&checked);
+    let other_source = initial_setup_launch_history_in(store.clone(), choices).unwrap();
+    assert!(
+        other_source
+            .last_known
+            .iter()
+            .all(|row| !row.subject.uses_vault_source()),
+        "a source swap cannot reuse another vault's cached history"
+    );
+    assert!(other_source.vault_source.is_none());
+    let after_seed = setup_readings();
+    assert_eq!(after_seed.observed, before_readings.observed);
+    assert_eq!(after_seed.caps_live, before_readings.caps_live);
+    assert_eq!(
+        script().reads.len(),
+        before_reads,
+        "launch history runs no native probe"
+    );
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        before_ledger,
+        "launch history writes no authority or display record"
+    );
+
+    // Exercise the cold worker separately from the first-frame seed.
+    {
+        let mut rows = OBSERVED_ROWS.lock().unwrap();
+        rows.last_known.clear();
+        rows.retained_reads.clear();
+        rows.history_restored.clear();
+        rows.generation += 1;
+    }
     change(|script| {
         script.reads.clear();
         script.hold = true;
         script.readings = [Vec::new()].into();
     });
-    assert!(observe_initial_setup(shown.clone()));
+    // The cold observer restores display history before even the pending-repository
+    // read, not only once the native row reader has finally begun.
+    static HISTORY_BEFORE_PENDING: AtomicBool = AtomicBool::new(false);
+    HISTORY_BEFORE_PENDING.store(false, Ordering::Release);
+    let pending_reader = setup_io().pending_repositories;
+    SETUP_IO.write().unwrap().pending_repositories = || {
+        HISTORY_BEFORE_PENDING.store(
+            setup_readings().last_known.iter().any(|row| {
+                row.subject == Subject::Setting(Setting::Secrets)
+                    && row.now.as_deref() == Some("Synced")
+            }),
+            Ordering::Release,
+        );
+        Ok(None)
+    };
+    let mut cold = shown.clone();
+    cold.selection.set(Setting::Repositories, true);
+    assert!(observe_initial_setup(cold));
     wait_until("the relaunched page's first reader starts", || {
         script().reads.len() == 1
     });
     let relaunched = setup_readings();
     release_readings();
     wait_until("the relaunched empty reader finishes", observe_idle);
+    SETUP_IO.write().unwrap().pending_repositories = pending_reader;
+    assert!(HISTORY_BEFORE_PENDING.load(Ordering::Acquire));
     assert!(
         relaunched.observed.is_empty(),
         "history supplies no current native evidence"

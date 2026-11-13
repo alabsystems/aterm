@@ -713,6 +713,99 @@ fn a_pipe_with_two_writers_counts_as_the_one_that_progresses() {
         classify(&idle_both),
         (WaitName::Pipe, Some(41), Standing::Capped)
     );
+
+    // Every reader below shares all four writers, including itself. A depth limit alone
+    // expands the same four states at every branch; none of those cycles proves progress.
+    let mut cycle = vec![reader.clone()];
+    for pid in 41..=44 {
+        cycle.push(proc_with(
+            pid,
+            "cat",
+            vec![
+                end(0, 0xC1, 0xC2, false, wait::PIPE_WANTR),
+                end(1, 0xC2, 0xC1, true, 0),
+                end(2, 0xC2, 0xC1, true, 0),
+            ],
+        ));
+    }
+    let measure = |procs: &[JobProc], consumer| {
+        let by: HashMap<_, _> = procs.iter().map(|p| (p.pid, p)).collect();
+        let d_age = HashMap::new();
+        let elsewhere = HashMap::new();
+        let scene = Scene {
+            procs: &by,
+            lanes: LanesSeen::default(),
+            d_age: &d_age,
+            elsewhere: &elsewhere,
+            program_check: true,
+        };
+        wait::measured_name_job(
+            &scene,
+            &JobFacts {
+                consumer,
+                ..JobFacts::default()
+            },
+            &[(40, "cat".into())],
+            (1, "zsh"),
+        )
+    };
+    let (w, expanded, indexed) = measure(&cycle, None);
+    assert_eq!(
+        (w.name, w.peer, w.standing),
+        (WaitName::Pipe, Some(41), Standing::Capped)
+    );
+    assert!(
+        expanded <= 4 * 8,
+        "shared cyclic peers were expanded {expanded} times"
+    );
+    assert_eq!(indexed, 13, "the same descriptors are indexed only once");
+
+    let mut clock = proc_with(45, "sleep", vec![end(1, 0xC2, 0xC1, true, 0)]);
+    clock.wchan = Some("hrtimer_nanosleep".into());
+    cycle.push(clock);
+    let (w, expanded, _) = measure(&cycle, None);
+    assert_eq!(
+        w.standing,
+        Standing::Legit,
+        "a real exit from the cycle still counts"
+    );
+    assert!(expanded <= 5 * 8);
+    assert_eq!(measure(&cycle, Some(41)).0.name, WaitName::Serves);
+
+    // One peer is reached at the depth limit through a long branch, and then directly.
+    // Its earlier capped result must not hide the shorter path to a legitimate timer.
+    let mut shared = vec![proc_with(
+        40,
+        "cat",
+        vec![end(0, 100, 101, false, wait::PIPE_WANTR)],
+    )];
+    for pid in 41..=47 {
+        let input = 100 + 2 * u64::from(pid - 40);
+        shared.push(proc_with(
+            pid,
+            "cat",
+            vec![
+                end(0, input, input + 1, false, wait::PIPE_WANTR),
+                end(1, input - 1, input - 2, true, 0),
+            ],
+        ));
+    }
+    shared.push(proc_with(
+        49,
+        "cat",
+        vec![
+            end(0, 116, 117, false, wait::PIPE_WANTR),
+            end(1, 115, 114, true, 0),
+            end(2, 101, 100, true, 0),
+        ],
+    ));
+    let mut clock = proc_with(50, "sleep", vec![end(1, 117, 116, true, 0)]);
+    clock.wchan = Some("hrtimer_nanosleep".into());
+    shared.push(clock);
+    let (w, expanded, indexed) = measure(&shared, None);
+    assert_eq!((w.peer, w.standing), (Some(49), Standing::Legit));
+    assert!(expanded <= shared.len() * 8);
+    assert_eq!(indexed, 19);
 }
 
 #[test]
@@ -897,6 +990,7 @@ fn call_tick(at_ms: u64, leader: Option<JobProc>, exits: Vec<LeaderExit>) -> Job
         session_leader: Some(true),
         has_tty: Some(true),
         exec: Some(true),
+        threads: None,
     };
     let mut sweep = vec![shell];
     let mut procs = vec![JobProc {
@@ -921,6 +1015,7 @@ fn call_tick(at_ms: u64, leader: Option<JobProc>, exits: Vec<LeaderExit>) -> Job
             session_leader: Some(true),
             has_tty: Some(false),
             exec: Some(true),
+            threads: None,
         });
         procs.push(p);
     }

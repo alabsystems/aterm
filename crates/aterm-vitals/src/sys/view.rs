@@ -1297,7 +1297,10 @@ fn global_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>)
     if let Some(m) = s.mem.as_ref() {
         lines.push(line(
             "mem",
-            format!("mem      {}", mem_class_words(m, exact_partition(ctx))),
+            format!(
+                "mem      {}",
+                mem_class_words(m, exact_partition(ctx), class_why(ctx))
+            ),
         ));
         if let Some(c) = m.sample.commit.as_ref() {
             lines.push(line("commit", format!("commit   {}", commit_words(c))));
@@ -1446,26 +1449,59 @@ fn g2(b: u64) -> String {
     format!("{:.2}", b as f64 / f64::from(1u32 << 30))
 }
 
-fn class_g2(b: Option<u64>) -> String {
-    b.map_or_else(|| unavailable("not_sampled"), g2)
+/// Why a class the OS does not say reads unavailable: on Linux only the compressed class can be
+/// missing, and only with zswap off or absent (design §9.6, "only with zswap"); elsewhere it is
+/// not read.
+pub(super) fn class_why(ctx: &Ctx<'_>) -> &'static str {
+    if ctx.machine.family == "Linux" {
+        "not_enabled:zswap"
+    } else {
+        "not_sampled"
+    }
 }
 
-fn mem_sum_words(m: &crate::model::MemView, exact: bool) -> String {
+/// Why a process's lifetime peak footprint reads unavailable ([`ProcView::peak`]): macOS reads
+/// `ri_lifetime_max_phys_footprint` (refused for another user's process) and Windows reads
+/// `PeakPagefileUsage` for every process; Linux keeps no lifetime peak footprint (`VmHWM` is a
+/// peak RSS), so it is unsupported there, never refused.
+fn peak_why(ctx: &Ctx<'_>, mac: &'static str) -> &'static str {
+    match ctx.machine.family {
+        "macOS" => mac,
+        "Windows" => "not_sampled",
+        _ => "unsupported",
+    }
+}
+
+/// Why a volume's purgeable space reads unavailable: APFS keeps such space (not sampled here yet);
+/// Linux's and Windows' file systems have none.
+fn purgeable_why(ctx: &Ctx<'_>) -> &'static str {
+    if ctx.machine.family == "macOS" {
+        "not_sampled"
+    } else {
+        "unsupported"
+    }
+}
+
+fn class_g2(b: Option<u64>, why: &str) -> String {
+    b.map_or_else(|| unavailable(why), g2)
+}
+
+fn mem_sum_words(m: &crate::model::MemView, exact: bool, why: &str) -> String {
     let c = mem_classes(m, exact);
     format!(
         "used {} = app {} + wired {} + compressed {} · cache {} · free {} · {} {} GiB",
         g2(m.sample.used()),
-        class_g2(c[0].1),
-        class_g2(c[1].1),
-        class_g2(c[2].1),
-        class_g2(c[3].1),
-        class_g2(c[4].1),
+        class_g2(c[0].1, why),
+        class_g2(c[1].1, why),
+        class_g2(c[2].1, why),
+        class_g2(c[3].1, why),
+        class_g2(c[4].1, why),
         if exact { "not in VM" } else { "no class" },
-        class_g2(c[5].1)
+        class_g2(c[5].1, why)
     )
 }
 
-fn mem_class_words(m: &crate::model::MemView, exact: bool) -> String {
+fn mem_class_words(m: &crate::model::MemView, exact: bool, why: &str) -> String {
     let mut t = format!(
         "{} · pressure {}",
         words::memory_space_line(&m.sample),
@@ -1475,7 +1511,7 @@ fn mem_class_words(m: &crate::model::MemView, exact: bool) -> String {
         t.push_str(&format!(" (memorystatus_level {k}%)"));
     }
     t.push_str(" · ");
-    t.push_str(&mem_sum_words(m, exact));
+    t.push_str(&mem_sum_words(m, exact, why));
     t
 }
 
@@ -1852,7 +1888,7 @@ fn mem_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
     lines.push(line("mem", head));
     lines.push(line(
         "classes",
-        format!("classes {}", mem_sum_words(m, exact)),
+        format!("classes {}", mem_sum_words(m, exact, class_why(ctx))),
     ));
     if let Some(c) = m.sample.commit.as_ref() {
         lines.push(line("commit", format!("commit  {}", commit_words(c))));
@@ -1917,7 +1953,7 @@ fn mem_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 r.pid,
                 exe_word(&r.name),
                 rec(r.footprint, "refused"),
-                rec(r.peak, proc_unread(ctx, r, false))
+                rec(r.peak, peak_why(ctx, "not_sampled"))
             ),
         ));
     }
@@ -2253,7 +2289,7 @@ fn disk_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) {
                 v.total,
                 v.level.as_deref().map_or_else(|| unavailable("not_sampled"), str::to_owned),
                 unavailable("not_sampled"),
-                unavailable("not_sampled")
+                unavailable(purgeable_why(ctx))
             ),
         )),
         None => lines.push(line(
@@ -2568,13 +2604,10 @@ fn procs_text(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot, lines: &mut Vec<Line>) 
             proc_label(ctx, s, r),
             r.pgid,
             proc_cpu(r),
-            rec(mc_opt(r.wait), proc_unread(ctx, r, true)),
+            rec(mc_opt(r.wait), proc_rate_why(ctx, r)),
             rec(r.footprint, "refused"),
-            rec(r.peak, proc_unread(ctx, r, false)),
-            rec(
-                r.write_bps.map(|b| b.round() as u64),
-                proc_unread(ctx, r, true)
-            ),
+            rec(r.peak, peak_why(ctx, "refused")),
+            rec(r.write_bps.map(|b| b.round() as u64), proc_rate_why(ctx, r)),
             rec(r.gpu.map(gpu_ppm), GPU_LANE_OFF),
             r.state.word(),
             scheduling_json(r.scheduling, ctx.machine.family).to_text(),
@@ -3352,16 +3385,11 @@ fn gpu_split_json(ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
 
 /// [`mem_classes`] as JSON: `[{class, bytes}]`, an unread class's bytes an
 /// unknown.
-pub(super) fn classes_json(m: &crate::model::MemView, exact: bool) -> Jv {
+pub(super) fn classes_json(m: &crate::model::MemView, exact: bool, why: &str) -> Jv {
     Jv::Arr(
         mem_classes(m, exact)
             .iter()
-            .map(|(k, b)| {
-                Jv::obj([
-                    ("class", Jv::s(*k)),
-                    ("bytes", Jv::known_or(*b, "not_sampled")),
-                ])
-            })
+            .map(|(k, b)| Jv::obj([("class", Jv::s(*k)), ("bytes", Jv::known_or(*b, why))]))
             .collect(),
     )
 }
@@ -3377,7 +3405,7 @@ fn mem_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
             "partition",
             Jv::s(if exact { "exact" } else { "remainder" }),
         ),
-        ("classes", classes_json(m, exact)),
+        ("classes", classes_json(m, exact, class_why(ctx))),
         ("used_bytes", Jv::u(m.sample.used())),
         (
             "pressure",
@@ -3510,19 +3538,13 @@ fn proc_json(ctx: &Ctx<'_>, s: &Snapshot, r: &ProcView) -> Jv {
     );
     o.set(
         "wait_mc",
-        Jv::known_or(r.wait.map(mc), proc_unread(ctx, r, true)),
+        Jv::known_or(r.wait.map(mc), proc_rate_why(ctx, r)),
     );
     o.set("footprint_bytes", Jv::known_or(r.footprint, "refused"));
-    o.set(
-        "peak_bytes",
-        Jv::known_or(r.peak, proc_unread(ctx, r, false)),
-    );
+    o.set("peak_bytes", Jv::known_or(r.peak, peak_why(ctx, "refused")));
     o.set(
         "write_bytes_per_s",
-        Jv::known_or(
-            r.write_bps.map(|b| b.round() as u64),
-            proc_unread(ctx, r, true),
-        ),
+        Jv::known_or(r.write_bps.map(|b| b.round() as u64), proc_rate_why(ctx, r)),
     );
     o.set("gpu_ppm", Jv::known_or(r.gpu.map(gpu_ppm), GPU_LANE_OFF));
     o.set("stat", Jv::s(r.state.word()));
@@ -3549,17 +3571,21 @@ fn scheduling_read<T>(read: Result<T, i32>, value: impl FnOnce(T) -> Jv) -> Jv {
     )
 }
 
-/// Why a process's time waiting for a core, peak footprint or write rate is unread
-/// ([`ProcView::wait`], [`ProcView::peak`], [`ProcView::write_bps`]; a `rate` needs a second
-/// sweep): only macOS's sweep reads them, from `proc_pid_rusage`, which it refuses for another
-/// user's process; elsewhere none is sampled, however long the sweep runs.
-fn proc_unread(ctx: &Ctx<'_>, r: &ProcView, rate: bool) -> &'static str {
-    if ctx.machine.family != "macOS" {
-        "not_sampled"
-    } else if r.refused || !rate {
-        "refused"
-    } else {
-        "warming"
+/// Why a process's time waiting for a core or write rate is unread ([`ProcView::wait`],
+/// [`ProcView::write_bps`]): macOS (`proc_pid_rusage`) and Linux (`/proc/<pid>/io` and each
+/// thread's `schedstat`) read them for this user's own processes and need a second sweep for a
+/// rate (`warming`), refusing another user's (`refused`, including [`RowScope::Services`] on
+/// Linux where `stat` still gives CPU time); elsewhere neither is sampled (`not_sampled`).
+fn proc_rate_why(ctx: &Ctx<'_>, r: &ProcView) -> &'static str {
+    match ctx.machine.family {
+        "macOS" | "Linux" => {
+            if r.refused || r.scope == RowScope::Services {
+                "refused"
+            } else {
+                "warming"
+            }
+        }
+        _ => "not_sampled",
     }
 }
 
@@ -3888,7 +3914,7 @@ fn disk_json(q: &SysQuery, ctx: &Ctx<'_>, s: &Snapshot) -> Jv {
                 ("total_bytes", Jv::u(v.total)),
                 ("slope_bytes_per_s", Jv::why("not_sampled")),
                 ("eta_full_s", Jv::why("not_sampled")),
-                ("purgeable_bytes", Jv::why("not_sampled")),
+                ("purgeable_bytes", Jv::why(purgeable_why(ctx))),
             ]);
             o.set(
                 "level",

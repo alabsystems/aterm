@@ -1707,13 +1707,23 @@ fn background_setup_status_only_reads_and_rejects_action_words_before_posting() 
 
 /// `devtools hand-over [now]` -> one status line. `now` is `permissions walk now devtools`:
 /// the walk, Developer Tools first.
-pub(crate) fn cmd_devtools(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+///
+/// `desk` is the desk door's answer for this client ([`crate::desk_door::admit`]), asked once the
+/// words parse: the page comes up only for a client whose tab is the one in front.
+pub(crate) fn cmd_devtools(
+    proxy: &EventLoopProxy<Wake>,
+    rest: &str,
+    desk: &dyn Fn() -> Result<(), String>,
+) -> String {
     let now = match parse_devtools(rest) {
         Ok(now) => now,
         Err(usage) => return usage.to_string(),
     };
     if !cfg!(target_os = "macos") {
         return "ERR unsupported: the Developer Tools list exists only on macOS\n".to_string();
+    }
+    if let Err(refusal) = desk() {
+        return refusal;
     }
     if now {
         return ask_walk(proxy, vec![crate::permission_walk::Subject::DeveloperTools]);
@@ -1742,14 +1752,23 @@ pub(crate) fn parse_permissions(
         .collect()
 }
 
-/// `permissions walk now [<subject>…]` -> one status line ([`crate::permission_walk::Started::reply`]).
-pub(crate) fn cmd_permissions(proxy: &EventLoopProxy<Wake>, rest: &str) -> String {
+/// `permissions walk now [<subject>…]` -> one status line ([`crate::permission_walk::Started::reply`]),
+/// or the desk door's refusal (`desk`, [`crate::desk_door::admit`]) for a client whose tab is not the
+/// one in front: the walk brings System Settings up over what the person is looking at.
+pub(crate) fn cmd_permissions(
+    proxy: &EventLoopProxy<Wake>,
+    rest: &str,
+    desk: &dyn Fn() -> Result<(), String>,
+) -> String {
     let subjects = match parse_permissions(rest) {
         Ok(subjects) => subjects,
         Err(usage) => return usage.to_string(),
     };
     if !cfg!(target_os = "macos") {
         return "ERR unsupported: aterm's permission walk is macOS's\n".to_string();
+    }
+    if let Err(refusal) = desk() {
+        return refusal;
     }
     ask_walk(proxy, subjects)
 }

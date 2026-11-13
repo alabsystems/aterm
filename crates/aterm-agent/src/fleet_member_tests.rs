@@ -1306,6 +1306,7 @@ fn a_survey_of_a_host_alone_dials_it_at_the_default_port() {
     let ask = aterm_ctl::FleetAsk {
         host: Some("127.0.0.1"),
         within: HANG,
+        holder: None,
     };
     let read = survey_fleet_in(&world.places, &ask).unwrap_or_else(|why| panic!("{why}"));
     let at = format!("127.0.0.1:{}", member::default_port());
@@ -1349,6 +1350,56 @@ fn a_fleet_status_read_sends_the_explicit_facts_request() {
         queries.iter().all(|query| query == "survey facts"),
         "{queries:?}"
     );
+}
+
+/// A `--host` read naming a release-line holder carries `survey holder=…` to that one peer,
+/// and the plain read still sends `survey`.
+#[test]
+fn a_host_read_naming_a_holder_sends_the_holder_request() {
+    let (issuer, code, serving) = issuing("holder-issuer");
+    let member = World::new("holder-member");
+    ok(join(
+        &member.places,
+        &Opts {
+            port: Some(closed_port()),
+            ..Opts::default()
+        },
+        &code,
+    ));
+    let node = member::read_node_identity(&issuer.places.state)
+        .unwrap()
+        .unwrap()
+        .node()
+        .to_owned();
+    let holder = aterm_ctl::release_holder::Identity {
+        pid: 4242,
+        boot: "7bd6dc21fbac480eabe228c34320639d".into(),
+        start: 9,
+    };
+    for (asked, expected) in [
+        (
+            Some(&holder),
+            "survey holder=4242.7bd6dc21fbac480eabe228c34320639d.9",
+        ),
+        (None, "survey"),
+    ] {
+        serving.queries.lock().unwrap().clear();
+        let read = survey_fleet_in(
+            &member.places,
+            &aterm_ctl::FleetAsk {
+                host: Some(&node),
+                within: HANG,
+                holder: asked,
+            },
+        )
+        .unwrap();
+        assert!(
+            read.peers.iter().any(|peer| peer.answer.is_ok()),
+            "{read:?}"
+        );
+        let queries = serving.queries.lock().unwrap();
+        assert_eq!(queries.as_slice(), [expected.to_owned()]);
+    }
 }
 
 fn said() -> String {
@@ -4095,6 +4146,7 @@ fn a_members_peers_reads_its_issuers_book_and_keeps_a_copy() {
     let whole = aterm_ctl::FleetAsk {
         host: None,
         within: HANG,
+        holder: None,
     };
     let read = survey_fleet_in(&member.places, &whole).unwrap_or_else(|why| panic!("{why}"));
     assert_eq!(read.peers.len(), 2, "{:?}", read.peers);
@@ -4218,6 +4270,7 @@ fn a_proven_mac_that_names_this_one_in_its_survey_is_refused_not_hidden() {
     let whole = aterm_ctl::FleetAsk {
         host: None,
         within: HANG,
+        holder: None,
     };
     let only = || {
         let mut read =
@@ -4355,6 +4408,7 @@ fn an_issuer_whose_book_lists_no_peer_says_so_and_not_that_none_joined() {
     let fleet = aterm_ctl::FleetAsk {
         host: None,
         within: HANG,
+        holder: None,
     };
     let book = "this machine's book lists no peer: a member is recorded when it runs `aterm fleet \
                 join`, and `aterm fleet peers add <host>` names one by hand";
@@ -4408,6 +4462,7 @@ fn a_members_rm_of_its_issuer_gives_a_members_remedy() {
     let fleet = aterm_ctl::FleetAsk {
         host: None,
         within: HANG,
+        holder: None,
     };
     let alone = survey_fleet_in(&member.places, &fleet).unwrap();
     assert!(
@@ -4499,6 +4554,7 @@ fn a_word_naming_the_issuer_and_a_copied_member_is_refused_by_every_verb_alike()
         let ask = aterm_ctl::FleetAsk {
             host: Some("127.0.0.1"),
             within: 2 * HANG,
+            holder: None,
         };
         let surveyed = survey_fleet_in(&member.places, &ask).map(|read| read.peers.len());
         assert_eq!(surveyed.map_err(|refused| refused.why), Err(named.clone()));
@@ -4549,6 +4605,7 @@ fn a_word_naming_the_issuer_and_an_entry_by_hand_elsewhere_takes_out_neither() {
             let ask = aterm_ctl::FleetAsk {
                 host: Some("127.0.0.1"),
                 within: 2 * HANG,
+                holder: None,
             };
             let surveyed = survey_fleet_in(&member.places, &ask).map(|read| read.peers.len());
             assert_eq!(
@@ -4599,6 +4656,7 @@ fn a_word_naming_the_issuer_gets_one_answer_from_every_verb_from_an_old_copy_or_
         let ask = aterm_ctl::FleetAsk {
             host: Some("127.0.0.1"),
             within: 2 * HANG,
+            holder: None,
         };
         before();
         let removed = peers(&member.places, &args(&["rm", "127.0.0.1"]));
@@ -6158,6 +6216,7 @@ fn a_member_reaches_a_member_that_joined_after_its_last_read() {
             &aterm_ctl::FleetAsk {
                 host: Some(&later),
                 within: 2 * HANG,
+                holder: None,
             },
         )
     })
@@ -6189,6 +6248,7 @@ fn a_survey_reads_its_issuers_book_again_within_its_own_deadline() {
         &aterm_ctl::FleetAsk {
             host: Some(&elsewhere),
             within: Duration::ZERO,
+            holder: None,
         },
     )
     .unwrap_or_else(|why| panic!("{why}"));
@@ -6273,6 +6333,7 @@ fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not
             &aterm_ctl::FleetAsk {
                 host: Some(word),
                 within,
+                holder: None,
             },
         )
         .unwrap_or_else(|why| panic!("{why}"))
@@ -6356,6 +6417,7 @@ fn a_member_past_a_silent_issuer_spends_one_deadline_and_says_its_issuer_did_not
                 &aterm_ctl::FleetAsk {
                     host: Some(word),
                     within: 2 * HANG,
+                    holder: None,
                 },
             )
         })
@@ -6466,6 +6528,7 @@ fn an_issuer_that_answers_with_no_book_is_told_once() {
             &aterm_ctl::FleetAsk {
                 host: Some(&elsewhere),
                 within: 2 * HANG,
+                holder: None,
             },
         )
     })
@@ -6620,6 +6683,7 @@ fn a_place_no_read_takes_as_a_peer_is_refused_at_its_add_and_skipped_when_booked
     let whole = aterm_ctl::FleetAsk {
         host: None,
         within: HANG,
+        holder: None,
     };
     let read = survey_fleet_in(&issuer.places, &whole).unwrap_or_else(|why| panic!("{why}"));
     let labels: Vec<&str> = read.peers.iter().map(|peer| peer.label.as_str()).collect();
@@ -6773,6 +6837,7 @@ fn peers_beside_a_key_it_cannot_use_refuses_saying_how_it_reads_again() {
     let whole = aterm_ctl::FleetAsk {
         host: None,
         within: HANG,
+        holder: None,
     };
     let unread = survey_fleet_in(&member.places, &whole).expect_err("no key it can use");
     assert!(unread.why.contains("remove that link"), "{unread}");
@@ -7182,6 +7247,7 @@ fn a_head_of_this_machines_id_another_peer_shares_is_ambiguous_to_every_verb() {
             &aterm_ctl::FleetAsk {
                 host: Some(word),
                 within: HANG,
+                holder: None,
             },
         )
         .expect_err("refused");
@@ -7253,6 +7319,7 @@ fn a_head_of_this_machines_id_no_book_here_settles_is_refused_alike_while_the_is
         &aterm_ctl::FleetAsk {
             host: Some(word),
             within: HANG,
+            holder: None,
         },
     )
     .expect_err("refused");
@@ -7372,6 +7439,7 @@ fn allow_drive_names_only_the_nodes_the_book_binds() {
             &aterm_ctl::FleetAsk {
                 host: Some(word),
                 within: HANG,
+                holder: None,
             },
         )
         .expect_err("its own node");
@@ -9077,6 +9145,7 @@ fn a_members_drive_grant_follows_its_issuers_book() {
     let whole = aterm_ctl::FleetAsk {
         host: None,
         within: HANG,
+        holder: None,
     };
 
     bind(Some(key));
@@ -9380,6 +9449,7 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
         let ask = aterm_ctl::FleetAsk {
             host: Some(word),
             within: Duration::from_millis(100),
+            holder: None,
         };
         let read =
             survey_fleet_in(&member.places, &ask).unwrap_or_else(|why| panic!("{word}: {why}"));
@@ -9410,6 +9480,7 @@ fn a_hand_entry_at_a_copys_place_never_hides_its_node_from_a_grant() {
     let ask = aterm_ctl::FleetAsk {
         host: Some("lab-mini"),
         within: Duration::from_millis(100),
+        holder: None,
     };
     assert_eq!(
         survey_fleet_in(&member.places, &ask)

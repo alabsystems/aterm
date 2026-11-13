@@ -79,6 +79,8 @@ pub mod reader;
 
 #[path = "build_admit_controller.rs"]
 mod controller;
+#[cfg(target_os = "macos")]
+pub use controller::{ControllerDeadline, supervise_controller_until};
 pub use controller::{ControllerOutcome, supervise_controller};
 
 /// The variable that admits a build at once (`now`) instead of waiting (`wait`, the default).
@@ -1963,7 +1965,9 @@ impl SupervisedChild {
 
 /// Preserve the actual child even when BIND fails: supervise it, return the binding
 /// error afterwards, and leave uncertain durable custody reserved. Only a genuine
-/// no-child receipt can cancel an ARM. Ordinary claims keep their existing spawn.
+/// no-child receipt can cancel an ARM. Ordinary claims observe their actual birth
+/// without changing the configured group, and retain postbirth errors for supervision.
+/// Unclaimed ordinary launches preserve the same child and failure classification.
 #[cfg(unix)]
 fn launch_held(
     held: Option<&mut Held>,
@@ -1974,9 +1978,14 @@ fn launch_held(
         limit_command(command, held.claim.cores());
     }
     let Some(held) = held.filter(|held| held.cohort) else {
-        return command
-            .spawn()
-            .map(|child| (SupervisedChild::Ordinary(child), None));
+        return match command.spawn_observed(aterm_uds::spawnfd::BirthAttempt::new()?) {
+            Ok(spawned) => Ok((SupervisedChild::Ordinary(spawned.into_child()), None)),
+            Err(aterm_uds::spawnfd::SpawnFailure::Refused(error)) => Err(error),
+            Err(aterm_uds::spawnfd::SpawnFailure::NotSpawned(proof)) => Err((*proof).into_error()),
+            Err(aterm_uds::spawnfd::SpawnFailure::Unbound { spawned, error }) => {
+                Ok((SupervisedChild::Ordinary(spawned.into_child()), Some(error)))
+            }
+        };
     };
     match held.claim.launch_cohort(command) {
         Ok(child) => Ok((SupervisedChild::Bound(Box::new(child)), None)),
@@ -2536,7 +2545,7 @@ fn hand_over(held: &Held) -> Result<(), String> {
         .claim
         .descriptor()
         .map_err(|e| format!("its claim's descriptor: {e}"))?;
-    let (armed, arming) = std::io::pipe().map_err(|e| format!("a pipe: {e}"))?;
+    let (armed, arming) = aterm_uds::pipe().map_err(|e| format!("a pipe: {e}"))?;
     let mut command = aterm_uds::spawnfd::LaneCommand::new(exe);
     command
         .arg(hold::HOLD_VERB)

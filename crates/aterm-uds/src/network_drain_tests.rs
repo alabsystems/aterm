@@ -131,3 +131,64 @@ fn eof_and_fatal_receive_errors_keep_a_change_or_report_failure() {
         }
     }
 }
+
+/// An ask without waiting ([`RouteChanges::changed_now`]) reads one bounded batch and says what
+/// it found: nothing queued and messages that name no change are no change, a change is one,
+/// and a socket at its end is a failure. A batch that stopped at its bound with the queue not
+/// yet empty is a change too, since one may wait among what it left: the owner that keeps an
+/// answer while no change came must not keep it past a queue it did not finish reading.
+///
+/// NEGATIVE CONTROL (2026-11-12): with the full batch judged by its messages alone
+/// (`Some(changed)` in `changed_now_by`), the first ask of the flooded queue says no change
+/// (`a batch that left the queue unread`).
+#[test]
+fn an_ask_without_waiting_counts_a_queue_it_did_not_empty_as_a_change() {
+    let ask = |queue: &mut VecDeque<Vec<u8>>, end: Option<i32>| {
+        RouteChanges::changed_now_by(|buffer| {
+            queue.pop_front().map_or_else(
+                || end.map_or(Ok(0), |errno| Err(io::Error::from_raw_os_error(errno))),
+                |message| deliver(buffer, &message),
+            )
+        })
+    };
+    let empty = Some(libc::EAGAIN);
+    assert_eq!(
+        ask(&mut VecDeque::new(), empty),
+        Some(false),
+        "nothing queued"
+    );
+    assert_eq!(
+        ask(&mut VecDeque::from([change_message()]), empty),
+        Some(true),
+        "a change queued"
+    );
+    assert_eq!(ask(&mut VecDeque::new(), None), None, "a socket at its end");
+    assert_eq!(
+        ask(&mut VecDeque::new(), Some(libc::ENOBUFS)),
+        Some(true),
+        "an overflow lost messages"
+    );
+    #[cfg(target_os = "macos")]
+    {
+        let mut one_short = VecDeque::from(vec![unrelated_message(); MAX_DRAIN_MESSAGES - 1]);
+        assert_eq!(
+            ask(&mut one_short, empty),
+            Some(false),
+            "unrelated messages read to the end of the queue"
+        );
+        let mut flooded = VecDeque::from(vec![unrelated_message(); MAX_DRAIN_MESSAGES]);
+        flooded.push_back(change_message());
+        assert_eq!(
+            ask(&mut flooded, empty),
+            Some(true),
+            "a batch that left the queue unread"
+        );
+        assert_eq!(flooded.len(), 1, "one batch, and no more, is read");
+        assert_eq!(ask(&mut flooded, empty), Some(true), "the change it left");
+        assert_eq!(
+            ask(&mut flooded, empty),
+            Some(false),
+            "and nothing after it"
+        );
+    }
+}

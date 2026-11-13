@@ -262,6 +262,71 @@ impl Log {
         }
         Ok(log)
     }
+    /// The log as of the causal cut `at` names: `at` and every retained operation it observed
+    /// through its signed parents and its writer's chain, and nothing else. An operation's
+    /// eligibility, refusal and duplicate judgement stay as this replica judges them now, on
+    /// everything it retains; only what the cut leaves out is gone, so a reader of the cut
+    /// ([`crate::att::View::read`]) projects the table as it stood there. The authored clock
+    /// plays no part: it is a claim, and a cut is the signed graph's.
+    ///
+    /// # Errors
+    /// This replica retains no operation `at` in this table.
+    pub(crate) fn as_of(&self, at: &Digest) -> Result<Self> {
+        if !self.records.contains_key(at) {
+            return Err(Error::new(
+                "no operation with that digest in this table here (see `aterm db table history`)",
+            ));
+        }
+        let mut cut = BTreeSet::new();
+        let mut todo = vec![*at];
+        while let Some(id) = todo.pop() {
+            let Some((operation, _)) = self.records.get(&id) else {
+                continue;
+            };
+            if !cut.insert(id) {
+                continue;
+            }
+            todo.extend(
+                operation
+                    .header
+                    .parents
+                    .iter()
+                    .chain(operation.header.previous.iter())
+                    .filter(|parent| !cut.contains(*parent)),
+            );
+        }
+        Ok(Self {
+            scope: self.scope,
+            retained: self.retained,
+            append_bound: self.append_bound,
+            local_use: self.local_use,
+            index: self.index.clone(),
+            records: self
+                .records
+                .iter()
+                .filter(|(id, _)| cut.contains(*id))
+                .map(|(id, record)| (*id, record.clone()))
+                .collect(),
+            conflicts: self.conflicts.intersection(&cut).copied().collect(),
+            opaque_authors: self.opaque_authors.clone(),
+            ordered: self
+                .ordered
+                .iter()
+                .filter(|id| cut.contains(*id))
+                .copied()
+                .collect(),
+            eligible: self.eligible.intersection(&cut).copied().collect(),
+            revert_refusals: self.revert_refusals.intersection(&cut).copied().collect(),
+        })
+    }
+    /// Whether this log (a cut of one, [`Self::as_of`]) holds the retained operation `id`.
+    pub(crate) fn holds(&self, id: &Digest) -> bool {
+        self.records.contains_key(id)
+    }
+    /// The retained operation `id`, whatever its eligibility.
+    pub(crate) fn operation(&self, id: &Digest) -> Option<&Operation> {
+        self.records.get(id).map(|(operation, _)| operation)
+    }
     fn project_cells(&self, before: Option<Digest>, skip: &BTreeSet<Digest>) -> Cells {
         let mut cells = Cells::new();
         for &id in &self.ordered {
@@ -348,6 +413,10 @@ impl Log {
     }
     pub(crate) const fn retained(&self) -> usize {
         self.retained
+    }
+    /// Authenticated ancestry, including causal-only merges that carry no cell writes.
+    pub(crate) const fn causal_index(&self) -> &Index {
+        &self.index
     }
     /// Every eligible business record with its decoded command, in record-id order.
     /// Causal-only merges remain in snapshots and dependencies, not this list. An application

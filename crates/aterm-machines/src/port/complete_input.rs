@@ -36,7 +36,7 @@ pub(super) fn run(live: &Live, cmd: &Cmd, input: &[u8]) -> Result<Ran, RunFailed
     let (program, args) = live.argv(cmd)?;
     let command = fixed_command(&program, &args, &live.child_env(cmd), cmd.cwd.as_deref());
     let (reader, writer) =
-        io::pipe().map_err(|_| RunFailed::Spawn("input pipe creation failed".into()))?;
+        aterm_uds::pipe().map_err(|_| RunFailed::Spawn("input pipe creation failed".into()))?;
     nonblocking(&writer).map_err(|_| RunFailed::Spawn("input pipe configuration failed".into()))?;
     let deadline = super::deadline_after(cmd.budget);
     let cancelled = AtomicBool::new(false);

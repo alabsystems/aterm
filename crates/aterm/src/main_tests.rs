@@ -1402,6 +1402,10 @@ fn update_status() -> aterm_update::UpdateStatus {
         failing_persistent: false,
         failing_checks_kind: String::new(),
         channel_unreadable: false,
+        hold: None,
+        last: None,
+        offered: Some(100),
+        behind: false,
     }
 }
 
@@ -1437,14 +1441,12 @@ fn the_update_line_claims_up_to_date_only_over_a_completed_check() {
         trial_phase: Some("Installed".into()),
         trial_starts: 0,
         trial_healthy: false,
-        refused_newer: false,
     });
     assert!(!up_to_date(&say(&waiting, None)), "an unfinished install");
     waiting.linux.as_mut().expect("linux").trial_healthy = true;
     assert!(up_to_date(&say(&waiting, None)), "a confirmed install");
-    let native = waiting.linux.as_mut().expect("linux");
-    native.trial_phase = None;
-    native.refused_newer = true;
+    waiting.linux.as_mut().expect("linux").trial_phase = None;
+    waiting.hold = Some(held_view(checked, now - 60, false));
     assert!(
         !up_to_date(&say(&waiting, None)),
         "a rolled-back newer build"
@@ -1466,6 +1468,93 @@ fn the_update_line_claims_up_to_date_only_over_a_completed_check() {
     );
     for lane in [tried(99, 3), tried(0, 0)] {
         assert!(!failed(&say(&staged, Some(&lane))), "{lane:?}");
+    }
+}
+
+/// A hold on build 101 (0.92.0) after it did not start cleanly, at its second try, set at `at`
+/// and lapsing an hour and a half later (live as of `now` when `now` is before that).
+fn held_view(at: i64, now: i64, peer_lifted: bool) -> aterm_update::HoldView {
+    let until = u64::try_from(at).unwrap() + 5400;
+    aterm_update::HoldView {
+        build: 101,
+        version: "0.92.0".into(),
+        cause: aterm_update_core::update_record::Cause::CrashLoop,
+        witness: aterm_update_core::update_record::Witness::Headless,
+        why: "the listener did not answer".into(),
+        tries: 2,
+        until,
+        live: u64::try_from(now).unwrap() < until,
+        peer_lifted,
+    }
+}
+
+/// The headline never says "up to date" while a newer build is held or offered, on every
+/// system: a live hold names the build, how long it holds, why, which try and the verb that ends
+/// it, outranks a download of it and puts the recorded reason on stderr; a lapsed hold says the
+/// build is tried again (and that another Mac started it, when one cut it short); an offer
+/// newer than the running build says it is not installed yet.
+/// NEGATIVE CONTROL: with the live-hold arm removed from `update_summary`, the staged download's
+/// line wins (`` held over its download ``).
+#[test]
+fn the_update_line_names_a_held_or_newer_build_and_never_says_up_to_date() {
+    let checked = aterm_update_core::pkg_check::rfc3339_to_unix("2026-09-23T12:00:00Z").unwrap();
+    let now = checked + 600;
+    let say = |st: &aterm_update::UpdateStatus| {
+        update_summary("0.91.0", 100, st, None, now, true, true, &DevCopy::No, "")
+    };
+    for linux in [false, true] {
+        let mut st = update_status();
+        if linux {
+            st.linux = Some(aterm_update::LinuxUpdateStatus {
+                installed_build: 100,
+                installed_version: "0.91.0".into(),
+                staged_build: None,
+                staged_version: None,
+                staged_commit: None,
+                trial_phase: None,
+                trial_starts: 0,
+                trial_healthy: true,
+            });
+        }
+        st.hold = Some(held_view(now, now, false));
+        let (line, trouble) = say(&st);
+        assert_eq!(
+            line,
+            "aterm 0.91.0 \u{b7} 0.92.0 is held for 90 min more (it did not start cleanly, \
+             try 2) \u{b7} `aterm update retry` tries it now"
+        );
+        assert_eq!(trouble.as_deref(), Some("the listener did not answer"));
+        st.staged_build = Some(101);
+        st.staged_version = Some("0.92.0".into());
+        assert!(say(&st).0.contains("is held for"), "held over its download");
+        st.staged_build = None;
+
+        st.hold = Some(held_view(now - 6000, now, false));
+        let (line, trouble) = say(&st);
+        assert_eq!(
+            line,
+            "aterm 0.91.0 \u{b7} trying 0.92.0 again \u{b7} checked 10 min ago"
+        );
+        assert_eq!(trouble, None);
+        st.hold = Some(held_view(now - 6000, now, true));
+        assert!(
+            say(&st)
+                .0
+                .contains("trying 0.92.0 again: it started on another Mac"),
+            "lifted by a peer"
+        );
+
+        st.hold = None;
+        st.offered = Some(101);
+        st.behind = true;
+        let line = say(&st).0;
+        assert!(
+            line.contains("a newer release is out and not installed yet"),
+            "{line}"
+        );
+        assert!(!line.contains("up to date"), "{line}");
+        st.behind = false;
+        assert!(say(&st).0.contains("is up to date"));
     }
 }
 
@@ -1555,7 +1644,6 @@ fn downloaded_update_summaries_distinguish_candidate_and_running_identity() {
                             trial_phase: None,
                             trial_starts: 0,
                             trial_healthy: true,
-                            refused_newer: false,
                         });
                     }
                     let line = update_summary(
@@ -2538,6 +2626,55 @@ fn an_absent_network_runtime_retains_history_but_never_current_reachability() {
         &read(aterm_gui::NetworkRead::WithServices).unwrap()
     ));
     assert_eq!(retained.peers[0].reachability, Reachability::Reachable);
+}
+
+/// EACH LOOK AT THE NETWORK IS OFFERED TO THE FLEET TABLES, in the state it was observed in: a
+/// window with no observer and no retained history offers nothing read (held, `no-history`),
+/// one with retained history offers that history (held, `unobserved`, dated by it), and neither
+/// is ever a live observation read at the epoch.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn each_look_at_the_network_is_offered_to_the_fleet_tables_in_the_state_it_was_observed_in() {
+    use aterm_db::fleet::{Folder, HELD_NO_HISTORY, HELD_UNOBSERVED};
+    use aterm_types::network_state::{HistoryState, NetworkObservation, Visibility};
+
+    let looked = |retained: Option<NetworkObservation>| {
+        let fleet: &'static Folder = Box::leak(Box::new(Folder::new()));
+        let read = super::offering_to_fleet(
+            super::network_state_source_with_readers(
+                || None,
+                || None,
+                retained,
+                || (std::time::Instant::now(), aterm_time::unix_millis()),
+            ),
+            fleet,
+        );
+        fleet.fold_now(0);
+        assert_eq!(
+            fleet.tables().value.sources.network.word(),
+            "never",
+            "CONTROL: nothing is offered before a look"
+        );
+        let snapshot = read(aterm_gui::NetworkRead::Network).expect("a look");
+        assert_eq!(snapshot.network.visibility, Visibility::Unavailable);
+        fleet.fold_now(0);
+        let revision = fleet.tables().revision;
+        // The same look again offers the same snapshot: nothing new to fold.
+        let _ = read(aterm_gui::NetworkRead::Network).expect("a look");
+        fleet.fold_now(0);
+        assert_eq!(fleet.tables().revision, revision);
+        let network = fleet.tables().value.sources.network;
+        (network.word(), network.why(), network.at_ms())
+    };
+    assert_eq!(looked(None), ("held", Some(HELD_NO_HISTORY), None));
+    assert_eq!(
+        looked(Some(NetworkObservation {
+            observed_at_ms: 2_000,
+            history: HistoryState::Ready,
+            ..NetworkObservation::default()
+        })),
+        ("held", Some(HELD_UNOBSERVED), Some(2_000))
+    );
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

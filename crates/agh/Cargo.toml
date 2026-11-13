@@ -67,6 +67,12 @@ aterm-durable = { workspace = true }
 # build.rs mounts its anchor_rules.rs, which picks the attributes' arm for each lane.
 aterm-spec-anchor = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+# Physical parent walks for disjoint read-only cache and mutable receiver stores.
+aterm-dirfd = { workspace = true }
+# No-follow, close-on-exec opens for the private complete-source inventory.
+libc = { workspace = true }
+
 [dev-dependencies]
 aterm-sysprobe = { workspace = true }
 # The loopback GitHub the loopback, resource and CLI tests drive.

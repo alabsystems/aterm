@@ -138,7 +138,7 @@ fn actual_pending_response_settles_before_drain_without_a_source_registry() {
         let resumed = resume_send.send(());
         let completed = done_receive.recv_timeout(aterm_spec::wait::MUST_HAPPEN);
         let automatic = completed.is_ok();
-        let automatic_resources = restore.resources_available();
+        let automatic_resources = restore.resources_released_within(aterm_spec::wait::MUST_HAPPEN);
         let foreign_resources = foreign_restore.resources_available();
         // Rescue real custody before joining even if drain orchestration regresses.
         let settled = owned.settle_custody(&owned.env);
@@ -155,7 +155,8 @@ fn actual_pending_response_settles_before_drain_without_a_source_registry() {
         };
         let joined = worker.join();
         let foreign_settled = foreign.settle_custody(&foreign.env);
-        let foreign_released_resources = foreign_restore.resources_available();
+        let foreign_released_resources =
+            foreign_restore.resources_released_within(aterm_spec::wait::MUST_HAPPEN);
         let foreign_pause = foreign_lifetime.pause().unwrap();
         let foreign_retired = foreign_pause.try_wait();
         let foreign_automatic = foreign_retired.is_ok();

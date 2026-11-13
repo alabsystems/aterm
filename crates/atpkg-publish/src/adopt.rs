@@ -980,6 +980,7 @@ fn compiler_at(
     let found = lock.map(|text| Found {
         path: PathBuf::from(format!("{rev}:{}", trust_lock::LOCK_FILE)),
         lock: trust_lock::parse(&text),
+        unpublished: None,
     });
     if let Some(Found {
         lock: Ok(locked), ..

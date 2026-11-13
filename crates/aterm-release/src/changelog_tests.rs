@@ -60,11 +60,8 @@ fn section_copies_do_not_claim_shipment_without_release_objects() {
     let doc = "## [Unreleased]\n\n- **Fix.** Same  words.\n  Continued here.\n\n## [0.2.0] - date\n\n- newer unrelated fix\n\n## [0.1.0] - date\n\n* **Fix.** Same words. Continued here.\n";
     assert!(gate_unreleased(doc).is_ok());
     assert!(roll(doc, "0.3.0", "date").is_ok());
-    assert!(release_changelog(doc, "0.3.0", "date").is_ok());
-    assert!(roll_shipped(doc, doc, "0.3.0", "date").is_ok());
     let recut = doc.replace("## [Unreleased]", "## [0.3.0] - date");
     assert!(gate_section(&recut, "0.3.0").is_ok());
-    assert!(release_changelog(&recut, "0.3.0", "date").is_ok());
 
     // Same bold lead, new description: a legitimate follow-up survives.
     let followup = doc.replacen("Same  words.", "A further fix.", 1);
@@ -117,58 +114,137 @@ fn today_in_los_angeles_is_what_date_says() {
 
 const SOURCE: &str = "# Changelog\n\n## [Unreleased]\n\n### Fixed\n\n- **One** — shipped.\n  A continuation line.\n\n- **Two** — shipped.\n\n## [0.91.0] - 2026-09-22\n\n- older.\n";
 
-/// Main that has not moved: the roll is exactly [`roll`], byte for byte.
+/// Main that has not moved lands exactly the release commit's text, byte for byte.
 #[test]
-fn roll_shipped_of_an_unmoved_main_is_the_plain_roll() {
+fn the_landing_on_an_unmoved_main_is_the_release_commits_text() {
+    let release = roll(SOURCE, "0.92.0", "2026-09-23").unwrap();
     assert_eq!(
-        roll_shipped(SOURCE, SOURCE, "0.92.0", "2026-09-23").unwrap(),
-        roll(SOURCE, "0.92.0", "2026-09-23").unwrap()
+        landing_text(SOURCE, SOURCE, &release, "0.92.0").unwrap(),
+        release
+    );
+    let scaffold = "# Changelog\n\n## [Unreleased]\n\n## [0.91.0] - 2026-09-22\n\n- older.\n";
+    let from_files = "# Changelog\n\n## [Unreleased]\n\n## [0.92.0] - 2026-09-23\n\n### Fixed\n\n\
+                      - **F.** From a file.\n\n## [0.91.0] - 2026-09-22\n\n- older.\n";
+    assert_eq!(
+        landing_text(scaffold, scaffold, from_files, "0.92.0").unwrap(),
+        from_files
     );
 }
 
-/// Main moved after the publish: what the published commit carried ships, what was
-/// added after stays unreleased, and an edited entry's new text stays while its old
+/// Main moved after the publish: the release commit's section lands as it shipped, what was
+/// added after stays unreleased, and an edited raw entry's new text stays while its old
 /// text ships.
 #[test]
-fn roll_shipped_keeps_what_peers_added_after_the_publish_unreleased() {
+fn the_landing_keeps_what_peers_added_after_the_publish_unreleased() {
     let main = SOURCE
         .replace(
             "### Fixed\n\n- **One**",
             "### Added\n\n- **New** — a peer's.\n\n### Fixed\n\n- **Peer fix** — after the publish.\n\n- **One**",
         )
         .replace("- **Two** — shipped.", "- **Two** — shipped, then reworded.");
-    let rolled = roll_shipped(&main, SOURCE, "0.92.0", "2026-09-23").unwrap();
+    let release = roll(SOURCE, "0.92.0", "2026-09-23").unwrap();
+    let landed = landing_text(&main, SOURCE, &release, "0.92.0").unwrap();
     assert_eq!(
-        rolled,
+        landed,
         "# Changelog\n\n## [Unreleased]\n\n### Added\n\n- **New** — a peer's.\n\n\
          ### Fixed\n\n- **Peer fix** — after the publish.\n\n\
          - **Two** — shipped, then reworded.\n\n\
          ## [0.92.0] - 2026-09-23\n\n### Fixed\n\n- **One** — shipped.\n  A continuation line.\n\n\
          - **Two** — shipped.\n\n## [0.91.0] - 2026-09-22\n\n- older.\n"
     );
+    assert_eq!(
+        rolled_body(&landed, "0.92.0").unwrap(),
+        rolled_body(&release, "0.92.0").unwrap()
+    );
     let plain = roll(&main, "0.92.0", "2026-09-23").unwrap();
     assert!(
         rolled_body(&plain, "0.92.0").unwrap().contains("a peer's"),
         "{plain}"
     );
+}
+
+/// THE LANDING NEVER JUDGES MAIN'S TIP: text no release would accept under main's
+/// `[Unreleased]` (an unknown heading, prose, `'''`) stays there for the dev check and the
+/// next cut, and the shipped section still lands exactly. A main with no `[Unreleased]` takes
+/// the section above its first release.
+#[test]
+fn the_landing_never_judges_mains_tip() {
+    let main = SOURCE.replace(
+        "## [Unreleased]\n\n",
+        "## [Unreleased]\n\n### Surprise\n\nProse ''' here.\n\n",
+    );
+    let release = roll(SOURCE, "0.92.0", "2026-09-23").unwrap();
+    let landed = landing_text(&main, SOURCE, &release, "0.92.0").unwrap();
     assert!(
-        !rolled_body(&rolled, "0.92.0").unwrap().contains("a peer's"),
-        "{rolled}"
+        landed.contains("### Surprise\n\nProse ''' here.\n\n## [0.92.0]"),
+        "{landed}"
+    );
+    assert_eq!(
+        rolled_body(&landed, "0.92.0").unwrap(),
+        rolled_body(&release, "0.92.0").unwrap()
+    );
+    let headless = "# Changelog\n\n## [0.91.0] - 2026-09-22\n\n- older.\n";
+    let landed = landing_text(headless, SOURCE, &release, "0.92.0").unwrap();
+    assert!(
+        landed.starts_with("# Changelog\n\n## [0.92.0] - 2026-09-23\n"),
+        "{landed}"
     );
 }
 
 #[test]
-fn claim_changelogs_takes_an_existing_section_as_it_stands() {
+fn the_landing_takes_an_existing_section_as_it_stands() {
     let rolled = roll(SOURCE, "0.92.0", "2026-09-23").unwrap();
-    let (release, landing) = claim_changelogs(SOURCE, &rolled, "0.92.0", "2026-09-24").unwrap();
-    assert_eq!(release, roll(SOURCE, "0.92.0", "2026-09-24").unwrap());
-    assert_eq!(landing, rolled, "main is never rolled twice");
-    let (release, landing) = claim_changelogs(&rolled, &rolled, "0.92.0", "2026-09-24").unwrap();
     assert_eq!(
-        (release.as_str(), landing.as_str()),
-        (rolled.as_str(), rolled.as_str())
+        landing_text(&rolled, SOURCE, &rolled, "0.92.0").unwrap(),
+        rolled,
+        "main is never rolled twice"
     );
-    claim_changelogs(&rolled, SOURCE, "0.92.0", "2026-09-24").unwrap_err();
+    landing_text(SOURCE, &rolled, &rolled, "0.92.0").unwrap_err();
+}
+
+fn shipped(path: &str, text: &str, oid: &str) -> (Fragment, String) {
+    (
+        Fragment {
+            path: path.into(),
+            text: text.into(),
+        },
+        oid.into(),
+    )
+}
+
+/// EACH SHIPPED FILE REMOVES ONE OF MAIN'S BY ITS BLOB, THE SAME PATH FIRST: one renamed or
+/// moved to another kind since the publish goes, one edited since (another blob) stays and
+/// ships next, and a peer's stays. Where main already records the section, only files whose
+/// entry it records go.
+#[test]
+fn the_landing_removes_what_shipped_by_blob_the_same_path_first() {
+    let shipped = [
+        shipped("changes/fixed/a.md", "- **A.**\n", "aaaa"),
+        shipped("changes/fixed/b.md", "- **B.**\n", "bbbb"),
+        shipped("changes/fixed/c.md", "- **C.**\n", "cccc"),
+        shipped("changes/fixed/twin.md", "- **T.**\n", "tttt"),
+    ];
+    let listing = [
+        ("changes/changed/a-moved.md".to_string(), "aaaa".to_string()),
+        ("changes/fixed/b.md".to_string(), "b2b2".to_string()),
+        ("changes/fixed/peer.md".to_string(), "pppp".to_string()),
+        ("changes/fixed/c.md".to_string(), "cccc".to_string()),
+        ("changes/fixed/copy.md".to_string(), "tttt".to_string()),
+        ("changes/fixed/twin.md".to_string(), "tttt".to_string()),
+    ];
+    let removed = landing_removals(&shipped, SOURCE, &listing, "0.92.0");
+    assert_eq!(
+        removed,
+        [listing[3].clone(), listing[5].clone(), listing[0].clone()]
+    );
+    let recorded = SOURCE.replace(
+        "## [Unreleased]\n\n",
+        "## [Unreleased]\n\n## [0.92.0] - 2026-09-23\n\n- **C.**\n\n",
+    );
+    assert_eq!(
+        landing_removals(&shipped, &recorded, &listing, "0.92.0"),
+        [listing[3].clone()]
+    );
 }
 
 /// The release body carries the changelog VERBATIM below the rule — the "used

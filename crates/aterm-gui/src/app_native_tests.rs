@@ -2877,6 +2877,93 @@ fn a_pending_boot_health_answer_rearms_a_bounded_retry_until_the_updater_settles
     assert!(app.boot_health_confirmation_retry_at.is_none());
 }
 
+/// Every park of an hour in which each ask is answered Pending: the updater holds the trial for
+/// as long as its window has not drawn, so the gate must open on a clock of its own.
+fn park_an_hour_of_pending_answers(
+    app: &mut App,
+    start: std::time::Instant,
+) -> Option<std::time::Instant> {
+    use crate::app_native::NativeUpdateWorkerRequest;
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    app.native_update_reconcile_worker = Some(sender);
+    let pending = aterm_update::BootHealthVerdict::Pending {
+        why: "build 12's update trial waits for this window's first frame".to_string(),
+        retry_after: None,
+    };
+    let mut now = start;
+    while now < start + std::time::Duration::from_secs(60 * 60) {
+        app.service_boot_health(now);
+        if app.native_boot_health_complete() {
+            return Some(now);
+        }
+        assert!(
+            now < start + crate::BOOT_HEALTH_PENDING_PATIENCE,
+            "the gate is still shut past its patience"
+        );
+        if let Ok(NativeUpdateWorkerRequest::ConfirmBootHealth { ticket, .. }) = receiver.try_recv()
+        {
+            assert_eq!(
+                app.handle_native_boot_health_confirmation_finished(ticket, pending.clone(), now),
+                BootHealthFinishDisposition::RetryArmed
+            );
+        }
+        let next = app
+            .boot_health_retry_deadline(now)
+            .expect("a shut gate always has its next look");
+        now = next.max(now + std::time::Duration::from_secs(1));
+    }
+    None
+}
+
+#[test]
+fn a_gate_the_updater_keeps_pending_opens_on_its_own_clock() {
+    let mut app = App::headless_for_test();
+    app.native_updater_service =
+        crate::native_updater_service::NativeUpdaterService::new(12, "1.0.12", true);
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    let start = std::time::Instant::now();
+    app.auto_apply_intent = Some(crate::AutoApplyIntent {
+        build: 13,
+        dmg_sha256: [0xab; 32],
+        retry_at: start + std::time::Duration::from_secs(60 * 60 * 24),
+        attempts: 0,
+        deadline_owner: crate::AutoApplyDeadlineOwner::BootHealth,
+        held: crate::native_update_lane_hold::NamedHold::default(),
+    });
+
+    let opened = park_an_hour_of_pending_answers(&mut app, start)
+        .expect("a gate held by pending answers opens within an hour");
+    let first_pending = app
+        .boot_health_pending_since
+        .expect("CONTROL: the updater's Pending answers started the gate's patience");
+    assert_eq!(
+        opened,
+        first_pending + crate::BOOT_HEALTH_PENDING_PATIENCE,
+        "the gate opens when its patience with the updater's answers ends, at that instant"
+    );
+    assert!(app.boot_health_pending_lapsed);
+    assert_eq!(
+        app.boot_health_confirmation,
+        crate::BootHealthConfirmation::Awaiting,
+        "the trial stays armed: the gate keeps asking"
+    );
+    assert_eq!(
+        app.boot_health_unanswered, 0,
+        "every ask was answered: the clock opened it, not the unanswered count"
+    );
+    let released = app
+        .auto_apply_intent
+        .expect("the lane's intent outlives the gate");
+    assert_eq!(
+        released.retry_at, opened,
+        "the gate's deferral is released at once"
+    );
+    assert_eq!(
+        released.deadline_owner,
+        crate::AutoApplyDeadlineOwner::Ordinary
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn boot_health_completion_releases_only_its_exact_preverification_wait() {
@@ -3110,6 +3197,19 @@ fn boot_health_handlers_follow_the_confirmation_model() {
             app.boot_health_confirmation_retry_at =
                 (state["state"] == 1 || state["retry"] == 1).then_some(watchdog);
             app.boot_health_unanswered = u32::try_from(state["unanswered"]).unwrap();
+            // A gate awaiting after a miss names why, as the miss's handler left it.
+            app.boot_health_hold_reason = (state["state"] == 0 && state["missed"] == 1)
+                .then(|| "the last ask missed".to_string());
+            // The gate's patience: unstarted, running since `now`, or run out.
+            if state["state"] != 2 {
+                app.boot_health_pending_since = match state["waited"] {
+                    0 => None,
+                    1 => Some(now - std::time::Duration::from_secs(1)),
+                    2 => Some(now - crate::BOOT_HEALTH_PENDING_PATIENCE),
+                    other => panic!("unexpected patience state {other}"),
+                };
+                app.boot_health_pending_lapsed = state["waited"] == 2;
+            }
             app
         };
         let mut app = app_at_state();
@@ -3192,6 +3292,18 @@ fn boot_health_handlers_follow_the_confirmation_model() {
                         app.expire_boot_health_confirmation(watchdog);
                         runs.push(app);
                     }
+                    "Lapse" => {
+                        let mut app = app_at_state();
+                        let ends = app.boot_health_pending_since.unwrap()
+                            + crate::BOOT_HEALTH_PENDING_PATIENCE;
+                        app.lapse_boot_health_pending(ends - std::time::Duration::from_millis(1));
+                        assert!(
+                            !app.boot_health_pending_lapsed,
+                            "CONTROL: the patience has not run out a moment before it ends"
+                        );
+                        app.lapse_boot_health_pending(ends);
+                        runs.push(app);
+                    }
                     "Confirm" => {
                         for answer in [
                             aterm_update::BootHealthVerdict::NO_TRIAL,
@@ -3253,6 +3365,29 @@ fn boot_health_handlers_follow_the_confirmation_model() {
                         "{} from {state:?}",
                         action.name
                     );
+                    if actual != 2 {
+                        let waited = match (
+                            app.boot_health_pending_since.is_some(),
+                            app.boot_health_pending_lapsed,
+                        ) {
+                            (false, false) => 0,
+                            (true, false) => 1,
+                            (true, true) => 2,
+                            (false, true) => panic!("a lapse with no clock behind it"),
+                        };
+                        assert_eq!(waited, next["waited"], "{} from {state:?}", action.name);
+                        if state["waited"] > 0 {
+                            assert_eq!(
+                                app.boot_health_pending_since,
+                                app_at_state().boot_health_pending_since,
+                                "{} from {state:?} restarted the gate's patience",
+                                action.name
+                            );
+                        }
+                        // `AHoldIsClocked`, as the handlers keep it: the updater's hold is
+                        // always on the gate's patience.
+                        assert!(next["held"] == 0 || app.boot_health_pending_since.is_some());
+                    }
                     // `AMissIsHeldOrCounted`, as the handlers keep it: a miss leaves the gate
                     // awaiting with the updater's own hold, or counted toward the bound.
                     if actual == 0 && next["missed"] == 1 {
@@ -3276,8 +3411,11 @@ fn boot_health_handlers_follow_the_confirmation_model() {
     }
     assert!(
         seen.iter().any(|state| state["unanswered"] == tries)
-            && seen.iter().any(|state| state["held"] == 1),
-        "the walk reaches the unanswered bound and a named hold"
+            && seen.iter().any(|state| state["held"] == 1)
+            && seen
+                .iter()
+                .any(|state| state["waited"] == 2 && state["state"] != 2),
+        "the walk reaches the unanswered bound, a named hold and a gate opened by its patience"
     );
 
     for (dial, trace, law) in [
@@ -3288,6 +3426,11 @@ fn boot_health_handlers_follow_the_confirmation_model() {
             1,
             ["Unavailable", "UnansweredForgotten"].as_slice(),
             "AMissIsHeldOrCounted",
+        ),
+        (
+            1,
+            ["Queue", "PendingUnclocked"].as_slice(),
+            "AHoldIsClocked",
         ),
     ] {
         let buggy = aterm_spec::interp::with_buggy(&model, dial);
@@ -4039,6 +4182,8 @@ fn status(staged_build: Option<u64>, failing_checks: u32) -> DurableUpdateStatus
         installable: Some(true),
         channel_unreadable: false,
         checked_at: None,
+        hold: None,
+        behind: false,
     }
 }
 
@@ -4351,7 +4496,6 @@ fn linux_status_holding(running: u64, staged: Option<u64>) -> DurableUpdateStatu
         trial_phase: None,
         trial_starts: 0,
         trial_healthy: false,
-        refused_newer: false,
     });
     durable
 }
@@ -7050,7 +7194,738 @@ fn a_refused_supersede_keeps_the_latch_and_says_only_a_refusal_of_the_disk() {
             "{kind}: only a refusal about the disk is the convergence notice; a moment \
              puts nothing on glass — the lane is not stranded"
         );
+        // The disk's refusal set the release's retry, so the lane's record names that retry, not
+        // a newer release replacing build 11 by itself (the record before the fix said so), and
+        // no re-sample of build 11 at a set time: while the refused download waits none runs. The
+        // refusal is no failure of build 11, so the record keeps the one the lane stopped on.
+        // NEGATIVE CONTROLS: the latch's deadline passed as the re-sample beside the retry fails
+        // "claims no re-sample"; the refusal's sentence passed as the failure fails "keeps the
+        // failure".
+        if settled {
+            let record = if cfg!(target_os = "macos") {
+                aterm_update::apply_lane_report(app.native_updater_service.snapshot().current_build)
+                    .and_then(|report| report.lane)
+                    .expect("the ledger has the lane's record")
+            } else {
+                app.auto_apply_stopped_lane
+                    .clone()
+                    .expect("the lane's record")
+                    .record
+            };
+            assert!(
+                !record.next_action.contains("re-samples"),
+                "the replacing record claims no re-sample at a set time: {}",
+                record.next_action
+            );
+            assert_eq!(
+                record.failure_signature, "structural/handoff proof ended AdoptionMismatch",
+                "the refusal keeps the failure the lane stopped on"
+            );
+            assert_eq!(
+                (record.lane.as_str(), record.target_build),
+                ("replacing", 11),
+                "{}",
+                record.next_action
+            );
+            assert!(
+                record
+                    .next_action
+                    .contains("tries verified build 12 in build 11's place")
+                    && !record
+                        .next_action
+                        .contains(crate::update_words::NEWER_RELEASE_REPLACES),
+                "{}",
+                record.next_action
+            );
+        }
     }
+}
+
+/// A HOLD REWRITES THE RECORD WHEN WHAT COMES NEXT CHANGES: a refused newer build's retry is
+/// recorded as `replacing`; once that download is gone, the hold for the spent trial has no retry
+/// to name, and the record says a newer release replaces the build (`awaiting-newer`) though the
+/// hold's journal line was already said for this verdict. The failure the lane stopped on stays.
+/// NEGATIVE CONTROL: `stopped_lane_follows_latch` without its rewrite (the record then changes only
+/// when the journal line is said) leaves `replacing` ("the hold rewrites the record").
+#[cfg(target_os = "macos")]
+#[test]
+fn a_hold_rewrites_the_record_when_its_next_step_changes() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let spent_trial = InstalledUpdate {
+        trial_launches: BOOT_TRIAL_LAUNCH_LIMIT - 1,
+        ..installed_update(11)
+    };
+    let mut app = App::headless_for_test();
+    let (_, job) = converge_and_start_the_retire(&mut app, &spent_trial);
+    app.finish_activation_supersede(ActivationSupersedeCompletion {
+        job,
+        outcome: Err(aterm_update::SupersedeRefusal::Settled(
+            "the installed build 11 stays in place: no boot trial is armed for it".to_string(),
+        )),
+        facts: Some(reconcile_facts_with_installed(
+            3,
+            3,
+            Some(status(Some(12), 0)),
+            Some(spent_trial.clone()),
+        )),
+    });
+    let lane = |app: &App| {
+        app.auto_apply_stopped_lane
+            .clone()
+            .expect("the lane's record")
+            .record
+    };
+    let replacing = lane(&app);
+    assert_eq!(
+        replacing.lane, "replacing",
+        "PRECONDITION: the refused build's retry: {}",
+        replacing.next_action
+    );
+    assert_eq!(
+        app.auto_apply_stranded_announced,
+        Some((11, false)),
+        "PRECONDITION: the hold's verdict is said"
+    );
+
+    let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+        4,
+        4,
+        Some(status(None, 0)),
+        Some(spent_trial.clone()),
+    ));
+    assert!(
+        app.latched_activation_trial_spent(11),
+        "PRECONDITION: held for the spent trial"
+    );
+    let held = lane(&app);
+    assert_eq!(
+        held.lane, "awaiting-newer",
+        "the hold rewrites the record: {}",
+        held.next_action
+    );
+    assert_eq!(
+        stopped_lane_record(&app).map(|record| record.lane),
+        Some("awaiting-newer".to_string()),
+        "and `update status` reads the rewrite"
+    );
+    assert_eq!(
+        held.failure_signature, "structural/handoff proof ended AdoptionMismatch",
+        "the failure the lane stopped on stays"
+    );
+}
+
+/// THE STOPPED LANE'S RECORD GOES WITH ITS LATCH: the record reports this process's latch, so
+/// once the latch on its build goes (a plain lapse back to automatic apply, a release to the
+/// re-sample) the turn's latch look withdraws it, and `update status` prints no plan the lane no
+/// longer has; a re-sample that fails again records it again. NEGATIVE CONTROL: without
+/// `stopped_lane_follows_latch` in `lapse_expired_auto_apply_manual_only` the lapsed latch's
+/// record still reads ("a lapsed latch withdraws its record").
+#[test]
+fn the_stopped_lanes_record_goes_with_its_latch() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let recorded = |app: &App| {
+        (
+            app.auto_apply_stopped_lane
+                .as_ref()
+                .map(|lane| lane.record.target_build),
+            stopped_lane_record(app).map(|record| record.target_build),
+        )
+    };
+    let on_macos = |build: u64| (Some(build), cfg!(target_os = "macos").then_some(build));
+
+    let mut app = App::headless_for_test();
+    forget_stopped_lane_record(&app);
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    let past = std::time::Instant::now() - std::time::Duration::from_secs(1);
+    app.auto_apply_manual_only = Some(crate::AutoApplyManualOnly {
+        replacement: Some(crate::ActivationReplacement::default()),
+        build,
+        dmg_sha256: [0xab; 32],
+        activation: false,
+        retry_at: Some(past),
+    });
+    app.announce_automatic_apply_stranded(
+        build,
+        PhysicalFailureShape::Transient,
+        3,
+        StrandedNext::Resample(past),
+        Some("overlap handoff failed safely: handoff proof ended TimedOut"),
+    );
+    assert_eq!(
+        recorded(&app),
+        on_macos(build),
+        "PRECONDITION: the lane's record"
+    );
+    assert!(
+        app.lapse_expired_auto_apply_manual_only(),
+        "PRECONDITION: the latch lapses"
+    );
+    assert!(app.auto_apply_manual_only.is_none(), "PRECONDITION: gone");
+    assert_eq!(
+        recorded(&app),
+        (None, None),
+        "a lapsed latch withdraws its record"
+    );
+
+    let installed = installed_update(11);
+    let mut app = App::headless_for_test();
+    let activation = converge_structurally_on_the_activation(&mut app, &installed, 1);
+    assert_eq!(
+        recorded(&app),
+        on_macos(11),
+        "PRECONDITION: the convergence's record"
+    );
+    observe_after_the_attempt(&mut app, &installed, 2);
+    let_the_day_pass(&mut app);
+    assert!(
+        app.lapse_expired_auto_apply_manual_only(),
+        "PRECONDITION: the re-sample is released"
+    );
+    assert_eq!(
+        recorded(&app),
+        (None, None),
+        "a latch released to its re-sample withdraws its record"
+    );
+    assert!(app.arm_native_auto_apply(11, &activation));
+    let outcome = fail_the_activation_structurally(&mut app, &installed, &activation);
+    app.surface_update_apply_outcome("automatic handoff", outcome, false);
+    assert_eq!(
+        recorded(&app),
+        on_macos(11),
+        "a re-sample that fails again records it again"
+    );
+}
+
+/// A PLAIN HOLD REWRITES THE RECORD TOO: the record follows what the lane does next whichever
+/// decision ran. A refused newer build's retry is recorded as `replacing`; once that download
+/// leaves the disk its retry goes with it, and with the boot trial's room measured and the
+/// re-sample not yet due the latch only holds (no hold for the trial runs, no journal line is
+/// said), so the record names the build's re-sample at the verdict's time (`resampling`), not a
+/// retry that never comes. The failure the lane stopped on stays. NEGATIVE CONTROL:
+/// `stopped_lane_follows_latch` without its rewrite (before this fix only the hold for a spent
+/// trial rewrote the record) leaves `replacing` ("the record names the re-sample").
+#[test]
+fn a_plain_hold_rewrites_the_record_when_the_refused_download_leaves() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let installed = installed_update(11);
+    let mut app = App::headless_for_test();
+    let (_, job) = converge_and_start_the_retire(&mut app, &installed);
+    app.finish_activation_supersede(ActivationSupersedeCompletion {
+        job,
+        outcome: Err(aterm_update::SupersedeRefusal::Settled(
+            "the installed build 11 stays in place: no boot trial is armed for it".to_string(),
+        )),
+        facts: Some(reconcile_facts_with_installed(
+            3,
+            3,
+            Some(status(Some(12), 0)),
+            Some(installed.clone()),
+        )),
+    });
+    let lane = |app: &App| {
+        app.auto_apply_stopped_lane
+            .clone()
+            .expect("the lane's record")
+    };
+    let replacing = lane(&app).record;
+    assert_eq!(
+        replacing.lane, "replacing",
+        "PRECONDITION: the refused build's retry: {}",
+        replacing.next_action
+    );
+
+    let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+        4,
+        4,
+        Some(status(None, 0)),
+        Some(installed.clone()),
+    ));
+    let latch = app
+        .auto_apply_manual_only
+        .expect("PRECONDITION: the latch stands");
+    assert!(
+        latch.build == 11
+            && latch
+                .replacement
+                .is_some_and(|replacement| replacement.newer_retry.is_none()),
+        "PRECONDITION: the download left, and its retry with it: {latch:?}"
+    );
+    assert!(
+        !app.latched_activation_trial_spent(11),
+        "PRECONDITION: the boot trial has room, so the decision is a plain hold"
+    );
+    let resample_at = app
+        .auto_apply_structural_verdict
+        .and_then(|verdict| verdict.resample_at)
+        .filter(|at| *at > std::time::Instant::now())
+        .expect("PRECONDITION: a re-sample stands, not yet due");
+    let held = lane(&app);
+    assert_eq!(
+        (held.record.lane.as_str(), held.record.target_build),
+        ("resampling", 11),
+        "the record names the re-sample: {}",
+        held.record.next_action
+    );
+    assert_eq!(
+        held.next,
+        StrandedNext::Resample(resample_at),
+        "at its time"
+    );
+    assert!(
+        held.record
+            .next_action
+            .contains("aterm re-samples build 11 by itself at")
+            && !held.record.next_action.contains("verified build 12"),
+        "{}",
+        held.record.next_action
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            stopped_lane_record(&app).map(|record| record.lane),
+            Some("resampling".to_string()),
+            "and `update status` reads the rewrite"
+        );
+    }
+    assert_eq!(
+        held.record.failure_signature, "structural/handoff proof ended AdoptionMismatch",
+        "the failure the lane stopped on stays"
+    );
+}
+
+/// A REFUSED SUPERSEDE NAMES THE FAILURE THAT SET THE LATCH, CONVERGED OR NOT: one failed
+/// activation with retries left latches on a retry and announces no convergence, so this process
+/// has no record of build 11 to keep a signature from. A newer verified download takes the latch's
+/// offer, the retire is refused about the disk, and the `replacing` record names the failure that
+/// set the latch, never nothing. NEGATIVE CONTROL: the signature kept only from this process's
+/// earlier record of the build (the code before this fix) leaves it empty ("the refusal names the
+/// failure that set the latch").
+#[test]
+fn a_refused_supersede_names_the_failure_that_set_the_latch_with_no_convergence() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let installed = installed_update(11);
+    let mut app = App::headless_for_test();
+    let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+        1,
+        1,
+        Some(status(None, 0)),
+        Some(installed.clone()),
+    ));
+    assert_activation_stage(&app, 11, &installed.commit);
+    let activation =
+        crate::native_updater_service::installed_activation_digest(11, &installed.commit);
+    let _ = fail_the_activation_structurally(&mut app, &installed, &activation);
+    assert!(
+        app.auto_apply_structural_verdict.is_none()
+            && app.auto_apply_stopped_lane.is_none()
+            && app
+                .auto_apply_manual_only
+                .is_some_and(|latch| latch.build == 11 && latch.replacement.is_some()),
+        "PRECONDITION: one failure latches on a retry, with no convergence announced"
+    );
+    let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+        2,
+        2,
+        Some(status(Some(12), 0)),
+        Some(installed.clone()),
+    ));
+    let job = app
+        .native_activation_supersede
+        .clone()
+        .expect("PRECONDITION: the newer download takes the latch's offer");
+    app.finish_activation_supersede(ActivationSupersedeCompletion {
+        job,
+        outcome: Err(aterm_update::SupersedeRefusal::Settled(
+            "the installed build 11 stays in place: no boot trial is armed for it".to_string(),
+        )),
+        facts: Some(reconcile_facts_with_installed(
+            3,
+            3,
+            Some(status(Some(12), 0)),
+            Some(installed.clone()),
+        )),
+    });
+    let record = app
+        .auto_apply_stopped_lane
+        .clone()
+        .expect("the lane's record")
+        .record;
+    assert_eq!(
+        (record.lane.as_str(), record.target_build),
+        ("replacing", 11),
+        "PRECONDITION: the refusal's record: {}",
+        record.next_action
+    );
+    assert_eq!(
+        record.failure_signature, "structural/handoff proof ended AdoptionMismatch",
+        "the refusal names the failure that set the latch"
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            stopped_lane_record(&app).map(|record| record.failure_signature),
+            Some(record.failure_signature),
+            "and `update status` reads it"
+        );
+    }
+}
+
+/// Refuse the running retire of build 11 for build 12 about the disk, as a read with build 12
+/// still on disk follows it: the lane's record names that refused build's retry.
+fn refuse_the_retire_about_the_disk(
+    app: &mut App,
+    installed: &InstalledUpdate,
+    job: ActivationSupersedeJob,
+) {
+    app.finish_activation_supersede(ActivationSupersedeCompletion {
+        job,
+        outcome: Err(aterm_update::SupersedeRefusal::Settled(
+            "the installed build 11 stays in place: no boot trial is armed for it".to_string(),
+        )),
+        facts: Some(reconcile_facts_with_installed(
+            3,
+            3,
+            Some(status(Some(12), 0)),
+            Some(installed.clone()),
+        )),
+    });
+    assert!(
+        matches!(
+            app.auto_apply_stopped_lane.as_ref().map(|lane| lane.next),
+            Some(StrandedNext::NewerRetry { newer: 12, .. })
+        ),
+        "PRECONDITION: the record names the refused build's retry: {:?}",
+        app.auto_apply_stopped_lane
+    );
+}
+
+/// The stopped lane's record as this process holds it, beside the ledger's (`update status`).
+fn the_stopped_lane(app: &App) -> (StoppedLane, Option<aterm_update::ApplyLaneRecord>) {
+    (
+        app.auto_apply_stopped_lane
+            .clone()
+            .expect("the lane's record"),
+        stopped_lane_record(app),
+    )
+}
+
+/// The mark no write of the stopped lane's record keeps: every write goes through
+/// `App::record_stopped_lane`, which replaces this process's copy of the record and leaves its `at`
+/// unset, so a copy still marked after a look was not written, not even with the same words.
+const UNWRITTEN: &str = "unwritten since the mark";
+
+fn plant_unwritten_mark(app: &mut App) {
+    app.auto_apply_stopped_lane
+        .as_mut()
+        .expect("the lane's record")
+        .record
+        .at = UNWRITTEN.to_string();
+}
+
+fn marked_unwritten(lane: &StoppedLane) -> StoppedLane {
+    let mut marked = lane.clone();
+    marked.record.at = UNWRITTEN.to_string();
+    marked
+}
+
+/// A RETIRE THAT CANNOT START WRITES THE RECORD ONCE, WITH NO TIME: a refused newer build's retry
+/// falls due while an apply is under way, so the retire cannot start, and the lane only looks
+/// again on its own cadence (each due look moves the retry 75 s on). The record says once that
+/// the retire waits to start, claims no try and names no time, and the looks after it write
+/// nothing. Before this fix each due look rewrote the record, the ledger and an info line, to
+/// "tries verified build 12 ... again by itself at" the moved time, though nothing was tried.
+/// NEGATIVE CONTROL: `stopped_lane_next` naming every waiting retry `NewerRetry` (the code before
+/// this fix) fails "a look that only re-checks writes nothing".
+#[test]
+fn a_retire_that_cannot_start_writes_the_stopped_lanes_record_once_and_names_no_time() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let installed = installed_update(11);
+    let mut app = App::headless_for_test();
+    let (_, job) = converge_and_start_the_retire(&mut app, &installed);
+    refuse_the_retire_about_the_disk(&mut app, &installed, job);
+    let activation =
+        crate::native_updater_service::installed_activation_digest(11, &installed.commit);
+    crate::native_updater_service::ApplyAttemptTicket::for_test(11, &installed.commit, &activation)
+        .make_current_apply_for_test(&mut app.native_updater_service);
+    let retry_at = |app: &App| {
+        app.auto_apply_manual_only
+            .and_then(|latch| latch.replacement)
+            .and_then(|replacement| replacement.newer_retry)
+            .expect("PRECONDITION: a retry waits")
+            .at
+    };
+    let mut looks = Vec::new();
+    for look in 0..3 {
+        let due = retry_at(&app);
+        assert!(!app.lapse_expired_auto_apply_manual_only_at(due));
+        assert!(
+            app.native_activation_supersede.is_none() && retry_at(&app) > due,
+            "PRECONDITION: look {look}: the retire could not start, and its retry moved to the \
+             next look"
+        );
+        looks.push(the_stopped_lane(&app));
+        if look == 0 {
+            plant_unwritten_mark(&mut app);
+        }
+    }
+    let (first, ledger) = looks[0].clone();
+    let unwritten = marked_unwritten(&first);
+    for (look, later) in looks.iter().enumerate().skip(1) {
+        assert_eq!(
+            later,
+            &(unwritten.clone(), ledger.clone()),
+            "a look that only re-checks writes nothing (look {look})"
+        );
+    }
+    assert_eq!(
+        first.next,
+        StrandedNext::NewerUnstarted { newer: 12 },
+        "the record names the retire that waits to start: {}",
+        first.record.next_action
+    );
+    assert_eq!(
+        (first.record.lane.as_str(), first.record.target_build),
+        ("replacing", 11)
+    );
+    let words = &first.record.next_action;
+    assert!(
+        words.contains("tries verified build 12 in build 11's place")
+            && words.contains("as soon as that can start")
+            && !words.contains("again by itself at")
+            && !words.contains("re-samples"),
+        "no try claimed and no time named: {words}"
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            ledger.map(|record| record.next_action),
+            Some(words.clone()),
+            "and `update status` reads it"
+        );
+    }
+}
+
+/// A RUNNING RETIRE IS WHAT THE RECORD NAMES: once a retire of build 11's activation for build 12
+/// starts (here at the read that brought build 12, as it does at a later look after one that
+/// could not start), the record names that retire, with no time, and claims neither a re-sample
+/// of build 11 nor a retire that could not start. Before this fix the record kept the step it
+/// named before the retire for the whole retire, so a retire that could not start and then did
+/// still read "it could not start at aterm's last look". NEGATIVE CONTROL: `stopped_lane_next`
+/// answering `None` while a retire runs (the code before this fix) fails "the record names the
+/// running retire".
+#[test]
+fn a_running_retire_is_what_the_stopped_lanes_record_names() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let installed = installed_update(11);
+    let mut app = App::headless_for_test();
+    let (_, job) = converge_and_start_the_retire(&mut app, &installed);
+    assert_eq!(
+        job.activation, 11,
+        "PRECONDITION: the retire is of build 11's activation"
+    );
+    let _ = app.lapse_expired_auto_apply_manual_only_at(std::time::Instant::now());
+    let (running, ledger) = the_stopped_lane(&app);
+    assert_eq!(
+        running.next,
+        StrandedNext::NewerRetiring { newer: 12 },
+        "the record names the running retire: {}",
+        running.record.next_action
+    );
+    assert_eq!(
+        (running.record.lane.as_str(), running.record.target_build),
+        ("replacing", 11)
+    );
+    let words = &running.record.next_action;
+    assert!(
+        words.contains("is retiring build 11's activation so verified build 12 installs")
+            && !words.contains("re-samples")
+            && !words.contains("could not start"),
+        "no re-sample and no unstarted retire claimed: {words}"
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            ledger.map(|record| record.next_action),
+            Some(words.clone()),
+            "and `update status` reads it"
+        );
+    }
+}
+
+/// AN ACCEPTED RETIRE'S DOWNLOAD HOLDS THE RECORD, WITH NO RE-SAMPLE: a transient convergence on
+/// the activation (no structural verdict) and an accepted retire for build 12 that no read
+/// confirmed in its asks leave build 12 on disk, spent; while it waits each due look of the latch
+/// only moves its deadline 75 s on, and no re-sample of build 11 ever runs there. The record names
+/// what the lane waits on, with no time, and the looks write nothing. Before this fix the record
+/// fell back to the latch's moving deadline and was rewritten every 75 s to "re-samples build 11
+/// by itself at" a time no re-sample comes. NEGATIVE CONTROL: `stopped_lane_next` without its arm
+/// for an accepted retire's download (the code before this fix) fails "a look that only
+/// re-checks writes nothing".
+#[test]
+fn an_accepted_retires_download_holds_the_stopped_lanes_record_with_no_resample() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let installed = installed_update(11);
+    let mut app = App::headless_for_test();
+    let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+        1,
+        1,
+        Some(status(None, 0)),
+        Some(installed.clone()),
+    ));
+    assert_activation_stage(&app, 11, &installed.commit);
+    let activation =
+        crate::native_updater_service::installed_activation_digest(11, &installed.commit);
+    for _ in 0..PHYSICAL_FAILURE_LIFETIME_ATTEMPTS {
+        let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
+            11,
+            &installed.commit,
+            &activation,
+        );
+        ticket.make_current_apply_for_test(&mut app.native_updater_service);
+        let _ = app.abort_reaped_native_apply_before_reconcile(
+            &ticket,
+            "overlap handoff failed safely: handoff proof ended TimedOut".to_string(),
+            HandoffFailureLane::Physical(PhysicalFailureShape::Transient),
+        );
+    }
+    assert!(
+        app.auto_apply_structural_verdict.is_none()
+            && matches!(
+                app.auto_apply_stopped_lane.as_ref().map(|lane| lane.next),
+                Some(StrandedNext::Resample(_))
+            )
+            && app
+                .auto_apply_manual_only
+                .is_some_and(|latch| latch.activation && latch.replacement.is_some()),
+        "PRECONDITION: a converged transient latch on the activation, with no structural verdict"
+    );
+    let _ = app.reconcile_native_update_facts(reconcile_facts_with_installed(
+        2,
+        2,
+        Some(status(Some(12), 0)),
+        Some(installed.clone()),
+    ));
+    let job = app
+        .native_activation_supersede
+        .clone()
+        .expect("PRECONDITION: build 12 takes the latch's offer");
+    app.finish_activation_supersede(ActivationSupersedeCompletion {
+        job,
+        outcome: Ok(aterm_update::SupersededActivation {
+            activation_build: 11,
+            restored_build: 10,
+            newer_build: 12,
+            trial_launches: 0,
+            trial_disarm_deferred: None,
+        }),
+        facts: None,
+    });
+    for _ in 0..=RETIRE_CONFIRM_ASKS {
+        let due = app
+            .native_activation_supersede
+            .as_ref()
+            .expect("PRECONDITION: the accepted retire holds")
+            .look_at;
+        let _ = app.lapse_expired_auto_apply_manual_only_at(due);
+    }
+    assert!(
+        app.native_activation_supersede.is_none()
+            && app.native_verified_download_on_disk == 12
+            && app
+                .auto_apply_manual_only
+                .and_then(|latch| latch.replacement)
+                .is_some_and(|replacement| {
+                    replacement.newer_spent == 12 && replacement.newer_retry.is_none()
+                }),
+        "PRECONDITION: no read confirmed the retire, and build 12 waits on disk, spent"
+    );
+    let deadline = |app: &App| {
+        app.auto_apply_manual_only
+            .and_then(|latch| latch.retry_at)
+            .expect("PRECONDITION: the latch's deadline")
+    };
+    let mut looks = Vec::new();
+    for look in 0..2 {
+        let due = deadline(&app);
+        assert!(!app.lapse_expired_auto_apply_manual_only_at(due));
+        assert_eq!(
+            deadline(&app),
+            due + std::time::Duration::from_secs(75),
+            "PRECONDITION: look {look}: the latch only re-checks on its cadence"
+        );
+        looks.push(the_stopped_lane(&app));
+        if look == 0 {
+            plant_unwritten_mark(&mut app);
+        }
+    }
+    assert_eq!(
+        looks[1],
+        (marked_unwritten(&looks[0].0), looks[0].1.clone()),
+        "a look that only re-checks writes nothing"
+    );
+    let (held, ledger) = looks[0].clone();
+    assert_eq!(
+        held.next,
+        StrandedNext::NewerRetired { newer: 12 },
+        "the record names what the lane waits on: {}",
+        held.record.next_action
+    );
+    assert_eq!(
+        (held.record.lane.as_str(), held.record.target_build),
+        ("replacing", 11)
+    );
+    let words = &held.record.next_action;
+    assert!(
+        words.contains("no automatic attempt at build 11 while verified build 12 waits on disk")
+            && !words.contains("re-samples"),
+        "no re-sample claimed: {words}"
+    );
+    assert_eq!(
+        held.record.failure_signature, "transient/handoff proof ended TimedOut",
+        "the failure the lane stopped on stays"
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            ledger.map(|record| record.next_action),
+            Some(words.clone()),
+            "and `update status` reads it"
+        );
+    }
+}
+
+/// THE RECORD FOLLOWS THE LATCH AT THE LOOK'S OWN TIME: the turn's look and the record's follow
+/// read one clock, so a refused build's retry that falls due between them is judged as the look
+/// saw it, still waiting, and the record names that retry. Here the look's time is taken a second
+/// before the retry and the real clock has passed it, which is the gap a second clock read
+/// opened. NEGATIVE CONTROL: the follow reading `Instant::now()` again (the code before this fix)
+/// drops the retry and writes the build's re-sample, which the retry outranks ("the follow judges
+/// the latch at the look's own time").
+#[test]
+fn the_stopped_lanes_record_follows_the_latch_at_the_looks_own_time() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let installed = installed_update(11);
+    let mut app = App::headless_for_test();
+    let (_, job) = converge_and_start_the_retire(&mut app, &installed);
+    refuse_the_retire_about_the_disk(&mut app, &installed, job);
+    let_the_retry_come_due(&mut app);
+    let retry = app
+        .auto_apply_manual_only
+        .and_then(|latch| latch.replacement)
+        .and_then(|replacement| replacement.newer_retry)
+        .expect("PRECONDITION: the refused build's retry");
+    let look = retry.at - std::time::Duration::from_secs(1);
+    assert!(!app.lapse_expired_auto_apply_manual_only_at(look));
+    assert!(
+        app.native_activation_supersede.is_none(),
+        "PRECONDITION: at the look's time the retry still waits, so no retire starts"
+    );
+    let (lane, _) = the_stopped_lane(&app);
+    assert_eq!(
+        lane.next,
+        StrandedNext::NewerRetry {
+            newer: 12,
+            at: retry.at
+        },
+        "the follow judges the latch at the look's own time: {}",
+        lane.record.next_action
+    );
+    assert_eq!(lane.record.lane, "replacing");
 }
 
 #[test]
@@ -7735,6 +8610,64 @@ fn a_structural_failure_inherits_the_round_trips_the_artifact_already_cost() {
          budget is {STRUCTURAL_FAILURE_LIFETIME_ATTEMPTS}; a `Retry` here would \
          mean the structural verdict RESET the artifact's history — it \
          converges, onto its re-sample a day out: {converged:?}"
+    );
+}
+
+/// A successor that stalled before its proof spends its image's unexplained budget: the bytes
+/// converge (and a newer verified download can replace them) after six such failures, not after
+/// the twelve a hang detector's plain timeout or an outgoing-side end is allowed.
+#[cfg(unix)]
+#[test]
+fn a_stalled_successor_converges_its_image_sooner_than_a_timeout_or_an_outgoing_revocation() {
+    use crate::native_updater_service::ApplyMode;
+    let spends_to_converge = |outcome: crate::UpdateHandoffOutcome| {
+        let shape = match HandoffFailureLane::classify(
+            ApplyMode::Automatic,
+            outcome,
+            crate::ChildDeathEvidence::Unobserved,
+            false,
+        ) {
+            HandoffFailureLane::Physical(shape) => shape,
+            other => return Err(other),
+        };
+        let mut app = App::headless_for_test();
+        let build = app.native_updater_service.snapshot().current_build + 1;
+        Ok((1..=PHYSICAL_FAILURE_LIFETIME_ATTEMPTS).find(|_| {
+            matches!(
+                app.spend_physical_failure_budget(build, [0xab; 32], false, shape),
+                PhysicalFailureSchedule::Converged { .. }
+            )
+        }))
+    };
+    assert_eq!(
+        PhysicalFailureShape::of_outcome(
+            crate::UpdateHandoffOutcome::Stalled,
+            crate::ChildDeathEvidence::Unobserved
+        ),
+        PhysicalFailureShape::Unexplained
+    );
+    assert_eq!(
+        spends_to_converge(crate::UpdateHandoffOutcome::Stalled),
+        Ok(Some(UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS)),
+        "a stalled successor is evidence against its image"
+    );
+    assert_eq!(
+        spends_to_converge(crate::UpdateHandoffOutcome::TimedOut),
+        Ok(Some(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS)),
+        "one that launched and kept reporting to the hang detector is not"
+    );
+    assert_eq!(
+        spends_to_converge(crate::UpdateHandoffOutcome::ActivityRevoked),
+        Err(HandoffFailureLane::ActivityRevoked),
+        "an outgoing-side end never spends the image's physical budget"
+    );
+    assert_eq!(
+        PhysicalFailureShape::of_outcome(
+            crate::UpdateHandoffOutcome::ActivityRevoked,
+            crate::ChildDeathEvidence::Unobserved
+        ),
+        PhysicalFailureShape::Transient,
+        "and read as a physical shape it stays transient"
     );
 }
 
@@ -8499,6 +9432,91 @@ fn a_person_s_install_held_for_boot_health_runs_in_the_park_whose_count_opens_th
     );
 }
 
+/// A press held for boot health while the updater keeps answering that the trial waits: it runs
+/// on a clock, never only when an answer opens the gate. The event loop's looks at it (the
+/// gate's wake and the press's own) both reach the gate's lapse, so it runs at that instant,
+/// not at the next ask after it.
+#[cfg(unix)]
+#[test]
+fn a_person_s_install_held_for_a_pending_boot_health_runs_on_a_clock() {
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let build = app.native_updater_service.snapshot().current_build + 1;
+    stage_one_build_for_test(&mut app, build);
+    app.config.update = Some(crate::app_config::UpdateConfig {
+        auto_apply: Some(false),
+        ..Default::default()
+    });
+    app.auto_apply_intent = None;
+    app.boot_health_confirmation = crate::BootHealthConfirmation::Awaiting;
+    app.clear_messages_for_test();
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    app.native_update_reconcile_worker = Some(sender);
+    let start = std::time::Instant::now();
+
+    assert_eq!(
+        app.apply_native_update(ApplyMode::Immediate),
+        UpdateOutcome::Accepted
+    );
+    assert!(
+        app.person_apply_is_held(),
+        "CONTROL: the shut gate holds the press"
+    );
+
+    let pending = aterm_update::BootHealthVerdict::Pending {
+        why: "a window reached its health checkpoint, but the installed build is not proven to \
+              be the running one; the trial stays armed for the launch count"
+            .to_string(),
+        retry_after: None,
+    };
+    let mut now = start;
+    let mut ran_at = None;
+    while now < start + std::time::Duration::from_secs(60 * 60) {
+        app.run_held_person_apply(now);
+        app.service_boot_health(now);
+        if !app.person_apply_is_held() {
+            ran_at = Some(now);
+            break;
+        }
+        if let Ok(crate::app_native::NativeUpdateWorkerRequest::ConfirmBootHealth {
+            ticket, ..
+        }) = receiver.try_recv()
+        {
+            let _ =
+                app.handle_native_boot_health_confirmation_finished(ticket, pending.clone(), now);
+        }
+        // The two looks `about_to_wait` folds for this press: the gate's own wake and the
+        // press's.
+        let gate = app.boot_health_retry_deadline(now);
+        let press = app
+            .held_person_apply_deadline(now)
+            .expect("a held press always has its next look");
+        let next = gate.map_or(press, |gate| gate.min(press));
+        now = next.max(now + std::time::Duration::from_secs(1));
+    }
+    let first_pending = app
+        .boot_health_pending_since
+        .expect("the updater's Pending answers started the gate's patience");
+    assert!(
+        first_pending >= start && first_pending < start + std::time::Duration::from_secs(60),
+        "CONTROL: the first ask was answered Pending at once"
+    );
+    assert_eq!(
+        ran_at,
+        Some(first_pending + crate::BOOT_HEALTH_PENDING_PATIENCE),
+        "a press held behind pending boot-health answers runs when the gate's patience ends"
+    );
+    assert!(
+        app.native_updater_service.snapshot().error.is_some(),
+        "the press went through the apply admission, which said how it ended"
+    );
+    assert!(
+        !app.update_row_text()
+            .is_some_and(|row| row.to_lowercase().contains("installing")),
+        "its installing row is down"
+    );
+}
+
 /// A held press belongs to the exact bytes the person pressed Install for. Replacing a stage
 /// under the same build cannot transfer that authority, whether boot health or the candidate's
 /// own pre-park read held it.
@@ -9149,6 +10167,8 @@ fn durable_download_status(app: &App, build: u64) -> DurableUpdateStatus {
         installable: Some(true),
         channel_unreadable: false,
         checked_at: None,
+        hold: None,
+        behind: false,
     }
 }
 
@@ -9407,6 +10427,143 @@ fn force_auto_apply_attempt_now(app: &mut App) {
         announced: crate::native_update_auto_intent::ApplyPhase::Land,
         restored_hold_said: false,
     });
+}
+
+/// A pre-park read the durable admission refused for this build's own unconfirmed trial holds
+/// the lane as boot-health, in the admission's words, and is read again on
+/// [`crate::app_native::BOOT_HEALTH_TRIAL_REREAD`], not every few seconds: the trial's own end
+/// releases it at once, through the deadline owner it keeps.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_read_refused_for_this_builds_own_trial_holds_as_boot_health_and_reads_again_slowly() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, OnceLock};
+    use std::time::Instant;
+
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    let current = app.native_updater_service.snapshot().current_build;
+    let build = current + 1;
+    stage_one_build_for_test(&mut app, build);
+    *app.handoff_preverified.lock().unwrap() = None;
+    let reason = format!(
+        "staged update failed pre-park verification: update trial for build {current} is still \
+         unconfirmed ({})",
+        aterm_update::PASSING_REFUSAL_KEY
+    );
+    assert!(aterm_update::is_boot_health_confirmation_wait(
+        &reason, current
+    ));
+    let ended = Instant::now();
+    let passing = Arc::new(OnceLock::new());
+    passing
+        .set(crate::PassingPreverification {
+            reason: reason.clone(),
+            ended,
+        })
+        .unwrap();
+    app.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
+        build,
+        commit: PREFLIGHT_TEST_COMMIT.into(),
+        artifact: "ab".repeat(32),
+        deadline: ended + crate::HANDOFF_PREVERIFY_READ_CEILING,
+        done: Arc::new(AtomicBool::new(true)),
+        passing,
+    });
+    force_auto_apply_attempt_now(&mut app);
+    app.try_pending_native_auto_apply(false);
+    let intent = app
+        .auto_apply_intent
+        .expect("the automatic intent remains armed");
+    assert_eq!(
+        intent.retry_at,
+        ended + crate::app_native::BOOT_HEALTH_TRIAL_REREAD,
+        "this build's own trial is read again on its own spacing"
+    );
+    assert_eq!(
+        intent.held.current().map(|held| held.hold),
+        Some(crate::native_update_lane_hold::LaneHold::BootHealth),
+        "the hold is named for what holds it: this build's trial"
+    );
+    assert_eq!(
+        intent.deadline_owner,
+        crate::AutoApplyDeadlineOwner::Preverification { ended_at: ended },
+        "the trial's settle can release exactly this wait"
+    );
+    assert_eq!(intent.attempts, 0);
+    assert!(app.auto_apply_physical_retry.is_none());
+    assert!(app.auto_apply_manual_only.is_none());
+}
+
+/// A READ RUNNING AFTER THE TRIAL WAIT IS BOOT-HEALTH ONLY WHILE THE GATE'S PATIENCE OPENED IT:
+/// then it reads this build's own trial wait again. Once an answer opened the gate (the trial
+/// confirmed or settled), the read that follows is the candidate's pre-park read, named as one.
+#[cfg(target_os = "macos")]
+#[test]
+fn a_read_running_after_the_trial_wait_is_boot_health_only_while_the_gate_lapsed() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, OnceLock};
+    use std::time::Instant;
+
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    for lapsed in [true, false] {
+        let mut app = App::headless_for_test();
+        let current = app.native_updater_service.snapshot().current_build;
+        let build = current + 1;
+        stage_one_build_for_test(&mut app, build);
+        *app.handoff_preverified.lock().unwrap() = None;
+        let ended = Instant::now();
+        let passing = Arc::new(OnceLock::new());
+        passing
+            .set(crate::PassingPreverification {
+                reason: format!(
+                    "staged update failed pre-park verification: update trial for build \
+                     {current} is still unconfirmed ({})",
+                    aterm_update::PASSING_REFUSAL_KEY
+                ),
+                ended,
+            })
+            .unwrap();
+        app.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
+            build,
+            commit: PREFLIGHT_TEST_COMMIT.into(),
+            artifact: "ab".repeat(32),
+            deadline: ended + crate::HANDOFF_PREVERIFY_READ_CEILING,
+            done: Arc::new(AtomicBool::new(true)),
+            passing,
+        });
+        force_auto_apply_attempt_now(&mut app);
+        app.try_pending_native_auto_apply(false);
+        assert_eq!(
+            app.auto_apply_intent
+                .and_then(|intent| intent.held.current().map(|held| held.hold)),
+            Some(crate::native_update_lane_hold::LaneHold::BootHealth),
+            "CONTROL: the trial wait holds as boot-health"
+        );
+        app.boot_health_pending_lapsed = lapsed;
+        let now = Instant::now();
+        app.handoff_preverify_in_flight = Some(crate::PreverifyInFlight {
+            build,
+            commit: PREFLIGHT_TEST_COMMIT.into(),
+            artifact: "ab".repeat(32),
+            deadline: now + crate::HANDOFF_PREVERIFY_READ_CEILING,
+            done: Arc::new(AtomicBool::new(false)),
+            passing: Arc::new(OnceLock::new()),
+        });
+        force_auto_apply_attempt_now(&mut app);
+        app.try_pending_native_auto_apply(false);
+        let expected = if lapsed {
+            crate::native_update_lane_hold::LaneHold::BootHealth
+        } else {
+            crate::native_update_lane_hold::LaneHold::PreparkRead
+        };
+        assert_eq!(
+            app.auto_apply_intent
+                .and_then(|intent| intent.held.current().map(|held| held.hold)),
+            Some(expected),
+            "lapsed={lapsed}"
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -10742,18 +11899,18 @@ fn the_async_physical_lane_converges_and_stops_nagging() {
         )
     };
 
-    assert_eq!(
-        pills.iter().filter(|pill| pill.is_some()).count(),
-        1,
-        "a whole lifetime of failures may cost at most one row, got {pills:?}"
-    );
     assert!(
-        pills[..usize::from(PHYSICAL_FAILURE_LIFETIME_ATTEMPTS) - 1]
-            .iter()
-            .all(Option::is_none),
-        "every failure before the last must pass in silence — the user has \
-         nothing to do and the lane is already coming back, got {pills:?}"
+        pills.iter().all(Option::is_none),
+        "every failure passes in silence, the converging one included: the user has nothing to \
+         do, the lane is already coming back, and its stop is a journal record, got {pills:?}"
     );
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            stopped_lane_record(&app).map(|record| (record.lane, record.target_build)),
+            Some(("resampling".to_string(), build)),
+            "the converged lane's journal record"
+        );
+    }
 
     assert!(!app.lapse_expired_auto_apply_manual_only());
     assert!(
@@ -10781,10 +11938,31 @@ fn health_row(app: &App) -> Option<(String, String, Vec<aterm_messages::Intent>)
     })
 }
 
+/// The lane's journal record as `update status` reads it (macOS: the only apply lane).
+fn stopped_lane_record(app: &App) -> Option<aterm_update::ApplyLaneRecord> {
+    aterm_update::apply_lane_report(app.native_updater_service.snapshot().current_build)
+        .and_then(|report| report.lane)
+}
+
+/// Clear the shared test ledger's lane record: an empty record reads as none.
+fn forget_stopped_lane_record(app: &App) {
+    aterm_update::record_apply_lane(
+        app.native_updater_service.snapshot().current_build,
+        &aterm_update::ApplyLaneRecord::default(),
+    );
+    assert_eq!(stopped_lane_record(app), None);
+}
+
+/// A STRUCTURAL CONVERGENCE IS A JOURNAL RECORD, NOT A ROW: the lane that stops retrying says so
+/// in aterm.log and the update ledger (`apply_lane=resampling`, its `failure_signature=` and the
+/// re-sample in `next_action=`), with no warning row, no Software Update action and nothing owed
+/// to a person. NEGATIVE CONTROL: the previous `note_update_health` call in
+/// `announce_automatic_apply_stranded` fails "no row".
 #[test]
-fn a_structural_convergence_posts_the_health_notice_at_once() {
+fn a_structural_convergence_is_a_journal_record_with_no_row() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
+    forget_stopped_lane_record(&app);
     let build = app.native_updater_service.snapshot().current_build + 1;
     let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
         build,
@@ -10803,8 +11981,8 @@ fn a_structural_convergence_posts_the_health_notice_at_once() {
 
     fail(&mut app);
     assert!(
-        health_row(&app).is_none(),
-        "one structural failure buys a confirming retry, not an alarm"
+        health_row(&app).is_none() && stopped_lane_record(&app).is_none(),
+        "one structural failure buys a confirming retry: the lane has not stopped"
     );
     assert!(
         app.auto_apply_manual_only
@@ -10812,23 +11990,44 @@ fn a_structural_convergence_posts_the_health_notice_at_once() {
             && app.auto_apply_structural_verdict.is_none(),
         "the one confirming retry"
     );
+    let owed = app.rows_owed.len();
     fail(&mut app);
-    let (_, _, actions) =
-        health_row(&app).expect("the converged lane is announced the moment it converges");
-    assert!(
-        !actions
-            .iter()
-            .any(|a| matches!(a, aterm_messages::Intent::ApplyUpdate { .. })),
-        "one decision per stopped lane (rulings 119/143): the press is never the \
-         warning's: {actions:?}"
+    assert_eq!(
+        health_row(&app),
+        None,
+        "no row: the converged lane is a journal record"
     );
+    assert_eq!(app.rows_owed.len(), owed, "and nothing is owed to a person");
     assert!(
         app.messages
             .live_by_key(crate::update_words::KEY_OUTCOME)
             .is_none(),
         "a lane with its re-sample still to come has not stopped, so no decision \
-         row stands beside the warning (ruling 143)"
+         row stands (ruling 143)"
     );
+    if cfg!(target_os = "macos") {
+        let record = stopped_lane_record(&app).expect("the ledger has the lane's record");
+        assert_eq!(
+            (
+                record.lane.as_str(),
+                record.target_build,
+                record.failure_signature.as_str()
+            ),
+            (
+                "resampling",
+                build,
+                "structural/handoff proof ended AdoptionMismatch"
+            )
+        );
+        assert!(
+            record.next_action.contains("re-samples build")
+                && !record
+                    .next_action
+                    .contains(crate::update_words::INSTALL_FROM_MENU),
+            "what aterm does next by itself, no step for a person: {}",
+            record.next_action
+        );
+    }
     let deadline = app
         .auto_apply_manual_only
         .and_then(|manual| manual.retry_at)
@@ -10842,7 +12041,7 @@ fn a_structural_convergence_posts_the_health_notice_at_once() {
     fail(&mut app);
     assert!(
         health_row(&app).is_none(),
-        "the row was said once; a later failure of the same build is quiet"
+        "a later failure of the same build is quiet too"
     );
     assert_eq!(
         app.auto_apply_manual_only
@@ -10852,11 +12051,14 @@ fn a_structural_convergence_posts_the_health_notice_at_once() {
     );
 }
 
+/// An unexplained convergence re-samples one cooldown later, recorded in the ledger at the
+/// convergence and never put up as a row.
 #[cfg(unix)]
 #[test]
-fn a_spent_unexplained_budget_resamples_after_the_cooldown_and_announces_once() {
+fn a_spent_unexplained_budget_resamples_after_the_cooldown_and_records_it() {
     let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
     let mut app = App::headless_for_test();
+    forget_stopped_lane_record(&app);
     let build = app.native_updater_service.snapshot().current_build + 1;
     let ticket = crate::native_updater_service::ApplyAttemptTicket::for_test(
         build,
@@ -10872,17 +12074,21 @@ fn a_spent_unexplained_budget_resamples_after_the_cooldown_and_announces_once() 
             HandoffFailureLane::Physical(PhysicalFailureShape::Unexplained),
         );
         app.surface_update_apply_outcome("automatic handoff", outcome, false);
-        health_row(app)
+        (
+            health_row(app),
+            stopped_lane_record(app).map(|record| record.lane),
+        )
     };
-    let mut announced = Vec::new();
+    let mut seen = Vec::new();
     for _ in 0..UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS {
-        announced.push(fail(&mut app).is_some());
+        seen.push(fail(&mut app));
     }
-    let mut expected = vec![false; usize::from(UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS)];
-    *expected.last_mut().unwrap() = true;
+    let recorded = cfg!(target_os = "macos").then(|| "resampling".to_string());
+    let mut expected = vec![(None, None); usize::from(UNEXPLAINED_FAILURE_LIFETIME_ATTEMPTS)];
+    *expected.last_mut().unwrap() = (None, recorded.clone());
     assert_eq!(
-        announced, expected,
-        "silent while the schedule runs, loud exactly once at convergence"
+        seen, expected,
+        "no row ever; the lane's record is written at convergence"
     );
     let latch = app
         .auto_apply_manual_only
@@ -10901,9 +12107,10 @@ fn a_spent_unexplained_budget_resamples_after_the_cooldown_and_announces_once() 
         "the lapsed re-sample re-arms the automatic lane"
     );
 
-    assert!(
-        fail(&mut app).is_none(),
-        "a failed re-sample does not announce again"
+    assert_eq!(
+        fail(&mut app),
+        (None, recorded),
+        "a failed re-sample puts up no row and keeps the record"
     );
     assert!(
         app.auto_apply_manual_only
@@ -13001,7 +14208,7 @@ fn palette_choice_keeps_a_follow_system_pair() {
 #[test]
 fn palette_choice_from_an_unset_theme_is_its_plain_name() {
     use aterm_types::Appearance::{Dark, Light};
-    for (os, chosen) in [(Dark, "Aterm Night"), (Light, "Aterm Day")] {
+    for (os, chosen) in [(Dark, "aterm Night"), (Light, "aterm Day")] {
         let mut app = theme_choice_app("", os);
         app.enqueue_theme_choice(chosen);
         let snapshot = complete_theme_choice(&mut app);
@@ -14559,4 +15766,282 @@ fn the_packages_page_reads_the_store_again_when_it_comes_to_the_front() {
     let away = asked(&app);
     app.switch_tab_in(wid, 1);
     assert_eq!(asked(&app), away, "another Settings page asks for no read");
+}
+
+/// A PERSON'S REMEDY STAYS IN SETTINGS, ON DEMAND: the stopped lane is a journal record with no
+/// row now, and an environment block only a person can clear (an install folder this user cannot
+/// write) is still said where a person looks, the Software Update page, with its remedy. CONTROL
+/// for the journal-record change: the row went, the remedy did not. NEGATIVE CONTROL, in the test:
+/// with the block gone the page names no remedy.
+#[cfg(unix)]
+#[test]
+fn an_environment_blocks_remedy_stays_in_settings_while_the_stopped_lane_puts_up_no_row() {
+    use crate::update_apply_trouble::PersonRemedy;
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    app.native_updater_service = NativeUpdaterService::new(10, "test", true);
+    stage_one_build_for_test(&mut app, 11);
+    let reason = "install location not writable: /Applications/aterm.app; this install cannot \
+                  update itself";
+    app.block_native_auto_apply_environment(11, [0xab; 32], EnvironmentBlockCause::InstallLocation);
+    app.native_updater_service
+        .note_apply_failure(&aterm_update::RecordedApplyFailure {
+            apply_failures: 1,
+            failures_for_target: 1,
+            target_build: 11,
+            reason: reason.to_string(),
+            persistent: false,
+        });
+    app.clear_messages_for_test();
+    app.announce_automatic_apply_stranded(
+        11,
+        PhysicalFailureShape::Structural,
+        2,
+        StrandedNext::AwaitNewer,
+        Some(reason),
+    );
+    assert_eq!(health_row(&app), None, "the stopped lane puts up no row");
+
+    let page = |app: &App| {
+        let projection = app.update_snapshot(false).projection();
+        let trouble = projection
+            .apply_trouble
+            .as_ref()
+            .map(crate::update_apply_trouble::ApplyTrouble::sentence)
+            .unwrap_or_default();
+        (
+            trouble,
+            crate::native_settings::compact_update_detail(&projection),
+        )
+    };
+    let (sentence, compact) = page(&app);
+    let remedy = PersonRemedy::MoveOrAskAdmin;
+    assert!(
+        sentence.contains(remedy.sentence()),
+        "the page's detail says what a person does: {sentence}"
+    );
+    assert!(
+        compact.contains(remedy.row_tail()),
+        "and its phone-width rung: {compact}"
+    );
+
+    app.auto_apply_environment_block = None;
+    let (sentence, compact) = page(&app);
+    assert!(
+        !sentence.contains(remedy.sentence()) && !compact.contains(remedy.row_tail()),
+        "with no block standing the page names no remedy: {sentence} / {compact}"
+    );
+}
+
+/// THE STOPPED LANE'S RECORD SAYS WHAT ATERM DOES BY ITSELF: a re-sampling lane names its next
+/// re-sample and no cadence (what follows a re-sample that fails is that failure's own schedule,
+/// by its shape), a lane whose trial is spent names the newer release that replaces the build, none names a step for a person, and the failure's signature is the same for the same
+/// failure of another build or version. A HOLD KEEPS THE FAILURE IT STOPPED ON: the trial-spent
+/// hold's own words (`trial_spent_refusal`) name no failure, so its record keeps the signature
+/// of the failure the lane stopped on. NEGATIVE CONTROL: `say_structural_hold` passing its hold
+/// sentence as the failure (the code before this fix) fails "the signature survives the hold".
+#[test]
+fn the_stopped_lanes_record_names_what_aterm_does_next_and_a_stable_signature() {
+    let soon = std::time::Instant::now() + STRUCTURAL_RESAMPLE_AFTER;
+    let stopped_on = "overlap handoff failed safely: handoff proof ended ChildDied";
+    let resampling = automatic_apply_stranded_record(
+        901,
+        StrandedNext::Resample(soon),
+        failure_signature(PhysicalFailureShape::Structural, stopped_on),
+    );
+    assert_eq!(
+        (
+            resampling.lane.as_str(),
+            resampling.target_build,
+            resampling.failure_signature.as_str()
+        ),
+        (
+            "resampling",
+            901,
+            "structural/handoff proof ended ChildDied"
+        )
+    );
+    assert!(
+        resampling
+            .next_action
+            .contains("re-samples build 901 by itself at ")
+            && !resampling.next_action.contains("every"),
+        "{}",
+        resampling.next_action
+    );
+    let transient = automatic_apply_stranded_record(
+        901,
+        StrandedNext::Resample(soon),
+        failure_signature(
+            PhysicalFailureShape::Transient,
+            "handoff proof ended TimedOut",
+        ),
+    );
+    assert_eq!(
+        transient.next_action, resampling.next_action,
+        "the shape it stopped on promises no cadence"
+    );
+
+    let _ledger = crate::app_update_screen::hold_update_ledger_for_test();
+    let mut app = App::headless_for_test();
+    app.announce_automatic_apply_stranded(
+        901,
+        PhysicalFailureShape::Structural,
+        2,
+        StrandedNext::Resample(soon),
+        Some(stopped_on),
+    );
+    let hold = crate::update_words::trial_spent_refusal(&crate::update_words::staged_build_name(
+        901, "0.187.0",
+    ));
+    app.say_structural_hold(901, &hold, StrandedNext::AwaitNewer);
+    let held = app
+        .auto_apply_stopped_lane
+        .clone()
+        .expect("the hold's record")
+        .record;
+    assert_eq!(
+        (held.lane.as_str(), held.target_build),
+        ("awaiting-newer", 901)
+    );
+    assert!(
+        held.next_action
+            .contains(crate::update_words::NEWER_RELEASE_REPLACES),
+        "{}",
+        held.next_action
+    );
+    assert_eq!(
+        held.failure_signature, resampling.failure_signature,
+        "the signature survives the hold, never the hold's own words ({hold})"
+    );
+    if cfg!(target_os = "macos") {
+        assert_eq!(
+            stopped_lane_record(&app).map(|record| (record.lane, record.failure_signature)),
+            Some((held.lane.clone(), held.failure_signature.clone())),
+            "the ledger has the same record"
+        );
+    }
+    for record in [&resampling, &transient, &held] {
+        assert!(
+            !record
+                .next_action
+                .contains(crate::update_words::INSTALL_FROM_MENU)
+                && !record.next_action.contains("Version menu"),
+            "no step for a person: {}",
+            record.next_action
+        );
+    }
+    let unnamed = failure_signature(
+        PhysicalFailureShape::Structural,
+        "aterm v0.187.0 (build 1790120495) left no trace",
+    );
+    assert_eq!(
+        unnamed,
+        failure_signature(
+            PhysicalFailureShape::Structural,
+            "aterm v0.188.0 (build 1790200001) left no trace\nsecond line"
+        ),
+        "an unnamed failure's signature masks its numbers and keeps its first line"
+    );
+    assert_eq!(unnamed, "structural/aterm v#.#.# (build #) left no trace");
+}
+
+/// A REFUSED NEWER BUILD'S RECORD SAYS ONLY WHAT IS TRUE: after a newer verified build was refused
+/// at the install path (a refusal not for now), the record names that build's retry where the
+/// lane set one, and then nothing else (while that download waits no re-sample of the build
+/// runs), the build's own re-sample where no retry was set and one stands, and otherwise that the
+/// lane holds with the remedy in Settings; it never promises that a newer release replaces the
+/// build by itself, and it names no step for a person. NEGATIVE CONTROL: the record before this
+/// fix (`awaiting-newer`, "a newer release replaces it by itself", for every case without a
+/// re-sample) fails "no promise of a replacement" and "the next step is named".
+#[test]
+fn a_refused_newer_builds_record_names_its_retry_or_the_hold_and_promises_no_replacement() {
+    let now = std::time::Instant::now();
+    let retry = now + std::time::Duration::from_secs(30 * 60);
+    let resample = now + STRUCTURAL_RESAMPLE_AFTER;
+    let record = |next| {
+        automatic_apply_stranded_record(
+            901,
+            next,
+            failure_signature(
+                PhysicalFailureShape::Structural,
+                "overlap handoff failed safely: handoff proof ended ChildDied",
+            ),
+        )
+    };
+    let retried = StrandedNext::NewerRetry {
+        newer: 902,
+        at: retry,
+    };
+    let resampled = StrandedNext::NewerRefused {
+        newer: 902,
+        resample_at: Some(resample),
+    };
+    let held = StrandedNext::NewerRefused {
+        newer: 902,
+        resample_at: None,
+    };
+    let cases = [
+        (
+            retried,
+            "replacing",
+            "tries verified build 902 in build 901's place",
+        ),
+        (
+            resampled,
+            "resampling",
+            "re-samples build 901 by itself at ",
+        ),
+        (held, "held", "the lane holds"),
+    ];
+    for (next, lane, says) in cases {
+        let got = record(next);
+        let case = format!("{next:?}: {}", got.next_action);
+        assert_eq!(got.lane, lane, "{case}");
+        assert!(
+            got.next_action.contains(says),
+            "the next step is named: {case}"
+        );
+        assert_eq!(
+            got.next_action
+                .contains("tries verified build 902 in build 901's place at the install path"),
+            matches!(next, StrandedNext::NewerRetry { .. }),
+            "the retry is named exactly where the lane set one: {case}"
+        );
+        assert_eq!(
+            got.next_action.contains("re-samples"),
+            matches!(
+                next,
+                StrandedNext::NewerRefused {
+                    resample_at: Some(_),
+                    ..
+                }
+            ),
+            "a re-sample is named only where no retry was set and one stands: {case}"
+        );
+        assert!(
+            !got.next_action
+                .contains(crate::update_words::NEWER_RELEASE_REPLACES)
+                && !got.next_action.contains("replaces it sooner"),
+            "no promise of a replacement: {case}"
+        );
+        assert!(
+            !got.next_action
+                .contains(crate::update_words::INSTALL_FROM_MENU)
+                && !got.next_action.contains("Version menu"),
+            "no step for a person: {case}"
+        );
+    }
+    assert!(
+        record(held)
+            .next_action
+            .contains("the Software Update page in Settings has the remedy"),
+        "where it holds, the remedy is on demand"
+    );
+    assert!(
+        record(resampled)
+            .next_action
+            .contains("refused at the install path, is not tried there again by itself"),
+        "a re-sampling lane says the refused build is not retried"
+    );
 }

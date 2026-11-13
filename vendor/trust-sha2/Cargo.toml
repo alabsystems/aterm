@@ -13,7 +13,11 @@ std = []
 
 [package.metadata.aterm-origin]
 project = "Trust"
-commit = "21a4afd96990dac728b69cd3e6c25e1ea72e180e"
+commit = "b27fbd29fd181a19d806fa8c8b9c57a0bc160b76"
 path = "crates/trust-sha2"
 
 [workspace]
+
+[dev-dependencies]
+# Independent test-only incumbent; never a runtime dependency.
+sha2 = "0.10"

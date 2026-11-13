@@ -294,7 +294,9 @@ impl App {
 
     /// What this window tells the node job of its update lane (§4.13), with the staged build it
     /// speaks of: a person's setting holds updates here, or the posture of the staged build says
-    /// whether the window's automatic lane may land it.
+    /// whether the window's automatic lane may land it. Bytes a handoff of this window saw fail to
+    /// start are no hold of the window's: the job's own lanes leave them for a window
+    /// (`aterm_update`'s window-start failure record).
     #[cfg(unix)]
     pub(crate) fn window_update_lane(
         &self,

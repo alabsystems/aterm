@@ -6,12 +6,14 @@
 //!
 //! - [`View`]: one read of a typed table, the per-Mac quota applied: past-quota automatic
 //!   records never project, owned rows count only at their signer's own key.
-//! - [`Handle`]: read, apply a grid save with compare-before-write, revert one operation, and
+//! - [`Handle`]: read (at the head or as of a past point, [`Point`]), compare two points
+//!   ([`Handle::diff`]), apply a grid save with compare-before-write, revert one operation, and
 //!   list history, for any table in [`TABLES`].
-//! - [`command`]: `aterm db table ls|schema|get|scan|history|check|revert|export|apply|edit`,
+//! - [`command`]: `aterm db table ls|schema|get|scan|history|diff|check|revert|export|apply|edit`,
 //!   addresses masked unless `--show-addresses` is given, and the amacs grid round trip.
 
 pub mod command;
+mod diff;
 mod edit;
 
 use crate::{
@@ -23,9 +25,9 @@ use crate::{
     table::Session,
     typed::{
         self, Collection, Table,
-        cell::{self, Cells, Projection},
+        cell::{self, Cells},
         grid::{self, Plan, Stale},
-        owned::{self, Op, OwnedRead, Quota, SchemaState},
+        owned::{self, Op, SchemaState},
     },
 };
 use astream_wire::sync::{Actor, Digest};
@@ -34,6 +36,7 @@ use aterm_secrets::{client::Paths, commons::bootstrap::Bootstrap};
 use std::collections::BTreeMap;
 
 pub use crate::documents::log::Hlc;
+pub use diff::{CellDiff, Delta, Diff, Maker, Point};
 pub(crate) use edit::edit as edit_grid;
 pub(crate) use edit::show as show_grid;
 pub use edit::{Edited, GridSecrets, Opener, amacs, in_editor_tab, open_secrets};
@@ -45,7 +48,8 @@ pub type Birth = fn(&Collection, &BTreeMap<String, Value>, &Cells) -> Result<Str
 /// A table's rules on what the owner writes, over each row's changes (one record each) and the
 /// table's cells as they are under the writer: it answers the first write the rules stop
 /// ([`Refused`]), and may add to a row's record the cells its rules derive from one the write
-/// changes. It runs on a grid save ([`Handle::apply`]), an owner verb's write
+/// changes. It runs through [`Compiled::rules`], before the missing-row rule every table keeps,
+/// on a grid save ([`Handle::apply`]), an owner verb's write
 /// ([`Handle::commit_owner`], [`Handle::commit_owner_sealed`]) and a revert ([`Handle::revert`],
 /// which writes the exact compensation and none of the additions); a plan written through
 /// [`Handle::commit_derived`] or [`Handle::commit_sealed_until`] (the importer's, `adopt`'s,
@@ -246,6 +250,10 @@ pub struct Compiled {
     pub birth: Birth,
     /// Its rules on the owner's writes.
     pub guard: Guard,
+    /// Whether every build of the table compiles a row keyed `pk` in `collection` (the
+    /// registry's seeds): the table holds it by construction, so a write may name it before a
+    /// seed pass has written it here ([`Self::rules`]).
+    pub seeded: fn(&str, &str) -> bool,
     /// Which generation of its table family this is (`registry` 1, `registry.2` 2, design §3.8).
     pub generation: u32,
     /// The next generation a roll restates this one into, when this build compiles one.
@@ -264,6 +272,26 @@ impl Compiled {
     /// This generation and every later one this build compiles, oldest first.
     pub fn chain(&'static self) -> Vec<&'static Compiled> {
         std::iter::successors(Some(self), |compiled| compiled.successor).collect()
+    }
+
+    /// Its rules on an owner write's `rows` (one record each) over `cells`, the table as the
+    /// writer reads it: the table's own ([`Self::guard`]), which may add derived cells, then the
+    /// rule every table keeps, that a reference the write makes names a row the table holds once
+    /// the write lands or compiles ([`Self::seeded`], [`typed::check::missing_row`]). Answers the
+    /// first refusal.
+    ///
+    /// # Errors
+    /// A change is not a typed cell of its collection.
+    pub fn rules(&self, rows: &mut [Vec<Change>], cells: &Cells) -> Result<Option<Refused>> {
+        if let Some(refused) = (self.guard)(rows, cells)? {
+            return Ok(Some(refused));
+        }
+        Ok(typed::check::missing_row(
+            self.table,
+            rows,
+            cells,
+            self.seeded,
+        ))
     }
 
     /// The key a new grid row in `collection` is born under ([`Birth`]), refused when the
@@ -316,6 +344,7 @@ pub const REGISTRY: Compiled = Compiled {
     version: registry::VERSION,
     birth: registry::birth,
     guard: registry::guard,
+    seeded: crate::alab::seeds::compiled,
     generation: 1,
     successor: Some(&REGISTRY_2),
 };
@@ -326,6 +355,7 @@ pub const REGISTRY_2: Compiled = Compiled {
     version: registry::VERSION,
     birth: registry::birth,
     guard: registry::guard,
+    seeded: crate::alab::seeds::compiled,
     generation: 2,
     successor: None,
 };
@@ -444,29 +474,7 @@ pub(crate) fn decode(payload: &[u8]) -> Result<Command> {
     }
 }
 
-/// One read of a typed table, the quota applied.
-#[derive(Clone, Debug)]
-pub struct View {
-    /// Every eligible operation, past-quota ones included (the schema reader and history read
-    /// them).
-    pub ops: Vec<Op>,
-    /// Each writer's automatic records, and the ones past the table's `self_quota`, which never
-    /// project.
-    pub quota: Quota,
-    /// The projected cells without the past-quota records.
-    pub cells: Cells,
-    /// The owned collections' rows, past-quota records left out, each at its signer's own key.
-    pub owned: BTreeMap<&'static str, OwnedRead>,
-    /// No retained operation could still become visible here (`Log::awaited`: none waits on a
-    /// causal parent that has not arrived, and this Mac's own writer has nothing withheld), so
-    /// a comparison against these cells misses nothing a later projection would add.
-    pub complete: bool,
-    /// Retained operations this build never projects and that cannot become visible: refused
-    /// payloads (a newer build's encoding, a reused request id), cut-off or forked writers'
-    /// records and quarantined payloads. They never hold a grid save or an import back;
-    /// `check` lists them.
-    pub refused: Vec<Digest>,
-}
+pub use crate::typed::View;
 
 impl View {
     pub(crate) fn read(table: &Table, session: &Session<'_>, log: &Log) -> Self {
@@ -489,7 +497,22 @@ impl View {
         };
         let resolve = owned::commons::historical(session);
         let awaited = log.awaited(session.actor());
-        let (cells, refused) = log.cells_and_refused(&quota.over, &awaited);
+        let (mut cells, refused) = log.cells_and_refused(&quota.over, &awaited);
+        for collection in table.collections {
+            if collection
+                .columns
+                .iter()
+                .any(|column| column.claim.is_some())
+                && let std::borrow::Cow::Owned(restored) = typed::claim::interpreted_cells(
+                    collection,
+                    &cells,
+                    within.iter(),
+                    log.causal_index(),
+                )
+            {
+                cells = restored;
+            }
+        }
         let archived = archived_ops(table, session, within);
         let owned = table
             .collections
@@ -513,6 +536,7 @@ impl View {
                 .keys()
                 .any(|(collection, _)| collection == registry::ROLL.name);
         Self {
+            causal: log.causal_index().clone(),
             cells,
             complete: awaited.is_empty() && restated,
             refused,
@@ -520,16 +544,6 @@ impl View {
             quota,
             owned,
         }
-    }
-
-    /// One cells collection's rows.
-    pub fn project(&self, collection: &Collection) -> Projection {
-        cell::project(collection, &self.cells)
-    }
-
-    /// The stored schema row of `collection`: the highest version any eligible operation wrote.
-    pub fn schema(&self, collection: &str) -> SchemaState {
-        owned::schema_state(&self.ops, collection)
     }
 }
 
@@ -704,7 +718,7 @@ pub struct Applied {
     pub retired: Vec<String>,
     /// The operations appended.
     pub operations: Vec<Digest>,
-    /// The table's rules refused the save ([`Compiled::guard`]): nothing of it was written.
+    /// The table's rules refused the save ([`Compiled::rules`]): nothing of it was written.
     pub refused: Option<Refused>,
 }
 
@@ -978,14 +992,64 @@ impl Handle {
     /// # Errors
     /// No Commons, the table is not declared or not subscribed here, or its storage is damaged.
     pub fn view(&self) -> Result<View> {
+        self.view_at(Point::Head)
+    }
+
+    /// [`Self::view`] as of `point`: the table as the causal cut an operation names projects it,
+    /// through the same read, quota and claims included, with eligibility judged on everything
+    /// this Mac retains now.
+    ///
+    /// # Errors
+    /// As [`Self::view`], or this Mac retains no operation `point` names in this table.
+    pub fn view_at(&self, point: Point) -> Result<View> {
         let table = self.compiled.table;
         reopened(crate::admission::deadline(), || {
             application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
-                Ok(View::read(
-                    table,
-                    session,
-                    &Log::read_with(session, store, scope, decode)?,
-                ))
+                let log = Log::read_with(session, store, scope, decode)?;
+                Ok(match point {
+                    Point::Head => View::read(table, session, &log),
+                    Point::At(at) => View::read(table, session, &log.as_of(&at)?),
+                })
+            })
+        })
+    }
+
+    /// What changed from the cut `from` names to `to`'s: each cell added, retired, changed or
+    /// conflict-changed, and each owned row, with the operations of `to` that made it, their
+    /// writers and machines. Both sides are read in one observation through [`Self::view_at`]'s
+    /// projection. A comparison runs forward: `to` must have observed `from` (the head holds
+    /// every operation this Mac retains); two concurrent points are each compared with the head.
+    ///
+    /// # Errors
+    /// As [`Self::view_at`] for either point, or `to` did not observe `from`.
+    pub fn diff(&self, from: Digest, to: Point) -> Result<Diff> {
+        let table = self.compiled.table;
+        reopened(crate::admission::deadline(), || {
+            application::observe_store(&self.paths, self.descriptor(), |session, store, scope| {
+                let log = Log::read_with(session, store, scope, decode)?;
+                let past = log.as_of(&from)?;
+                let later = match to {
+                    Point::Head => None,
+                    Point::At(at) => Some(log.as_of(&at)?),
+                };
+                let later = later.as_ref().unwrap_or(&log);
+                if !later.holds(&from) {
+                    return Err(Error::new(
+                        "the later point did not observe the first: compare each with head",
+                    ));
+                }
+                let before = View::read(table, session, &past);
+                let after = View::read(table, session, later);
+                let resolve = owned::commons::historical(session);
+                let cells = diff::between(table, &before, &after, |id| {
+                    let operation = log.operation(id)?;
+                    Some(Maker {
+                        operation: *id,
+                        actor: operation.header.actor,
+                        machine: resolve(&operation.roster, &operation.header.actor),
+                    })
+                });
+                Ok(Diff { from, to, cells })
             })
         })
     }
@@ -1075,7 +1139,7 @@ impl Handle {
     /// Write a grid save (design §8): under the store's writer, re-read the table and settle
     /// `plan` against it ([`grid::settle`]): each changed register is written only while its
     /// candidates are still the exported ones, a cell that changed meanwhile is left alone and
-    /// returned as stale, what is left passes the table's rules ([`Compiled::guard`]), and one
+    /// returned as stale, what is left passes the table's rules ([`Compiled::rules`]), and one
     /// row's changes go in one owner record (at most 64 changes, a fresh random request id each).
     /// A save the rules refuse writes nothing and comes back with [`Applied::refused`] set, for
     /// the grid to show at that row as it shows a problem.
@@ -1118,7 +1182,7 @@ impl Handle {
                     plan
                 };
                 let mut settled = grid::settle(collection, plan, &view.cells);
-                if let Some(refused) = (self.compiled.guard)(&mut settled.rows, &view.cells)? {
+                if let Some(refused) = self.compiled.rules(&mut settled.rows, &view.cells)? {
                     return Ok(Applied {
                         refused: Some(refused),
                         ..Applied::default()
@@ -1226,7 +1290,7 @@ impl Handle {
     /// after saying another (a relabel back and forth, a retire undone and redone) is written,
     /// never taken for a retry of the first record. A repeat of a value the table holds writes
     /// nothing anyway: the verbs write only the cells that change. The rows pass the table's
-    /// rules first ([`Compiled::guard`]), as a grid save's do.
+    /// rules first ([`Compiled::rules`]), as a grid save's do.
     ///
     /// # Errors
     /// As [`Self::commit_derived`], or the table's rules refuse the rows.
@@ -1301,7 +1365,7 @@ impl Handle {
     }
 
     /// The plan `derive` makes, written: `owner` is the owner's own word, whose records take
-    /// random request ids and whose rows pass the table's rules ([`Compiled::guard`]); otherwise
+    /// random request ids and whose rows pass the table's rules ([`Compiled::rules`]); otherwise
     /// each record's request id derives from its content, so a retry returns its first receipt.
     fn commit_planned<T>(
         &self,
@@ -1328,7 +1392,7 @@ impl Handle {
                     ));
                 }
                 let (planned, mut rows) = derive(&view, &sealer(&name, session, scope)?)?;
-                if owner && let Some(refused) = (self.compiled.guard)(&mut rows, &view.cells)? {
+                if owner && let Some(refused) = self.compiled.rules(&mut rows, &view.cells)? {
                     return Err(refused.into());
                 }
                 let mut applied = Applied::default();
@@ -1396,7 +1460,7 @@ impl Handle {
     /// Append the exact compensation of `operation` while every key it wrote still holds it as
     /// the sole candidate (`Log::compensate`); a later edit stays. The target, current value and
     /// preimage use the same quota-filtered history as [`Self::view`]. The compensation passes
-    /// the table's rules as any owner write does ([`Compiled::guard`]), and is written exactly:
+    /// the table's rules as any owner write does ([`Compiled::rules`]), and is written exactly:
     /// a cell the rules would add is not. An exact retry of `request` returns the first operation.
     ///
     /// # Errors
@@ -1419,7 +1483,7 @@ impl Handle {
                 let command = log.compensate(request, operation, &view.quota.over)?;
                 if let Some(changes) = command.changes()
                     && let Some(refused) =
-                        (self.compiled.guard)(&mut [changes.to_vec()], &view.cells)?
+                        self.compiled.rules(&mut [changes.to_vec()], &view.cells)?
                 {
                     return Err(refused.into());
                 }

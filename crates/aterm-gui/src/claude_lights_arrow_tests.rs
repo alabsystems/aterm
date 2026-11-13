@@ -68,7 +68,7 @@ fn text(app: &App, wid: WindowId, row: usize, cols: std::ops::Range<usize>) -> S
 /// The words in the label's cells.
 fn slot(app: &App, wid: WindowId) -> String {
     let b = switch(app, wid);
-    let cols = b.label.clone().expect("a label");
+    let cols = b.mark.clone().expect("a label");
     text(app, wid, b.frame_row, cols).trim_start().to_string()
 }
 
@@ -97,7 +97,7 @@ fn click_at(app: &mut App, wid: WindowId, cell: (usize, usize)) {
 /// waits on is no wait of a press's); a press writes the one-shot press of that build; a refused
 /// word says why in the slot until the refusal's few seconds pass; an accepted one turns the
 /// arrow to `◌`, the label as it was, and a second press asks nothing. The refusal takes the
-/// label's own cells (`alab v0.5 (v<build>)`), which hold its reason alone, not its preamble.
+/// label's own cells (`ALab v0.5 (v<build>)`), which hold its reason alone, not its preamble.
 /// CONTROL: a skipped build shows no arrow.
 #[test]
 fn the_arrow_asks_for_the_move_and_says_why_it_was_refused() {
@@ -115,7 +115,7 @@ fn the_arrow_asks_for_the_move_and_says_why_it_was_refused() {
         "an emoji-presented ⬆️"
     );
     let label = slot(&app, wid);
-    assert!(label.starts_with("alab v"), "at rest, the label: {label:?}");
+    assert!(label.starts_with("ALab v"), "at rest, the label: {label:?}");
     let words = "update to v2.1.310 \u{b7} now";
     let on = (b.frame_row, arrow.start + 1);
     let (x, y) = px_of(&app, wid, on);
@@ -483,21 +483,25 @@ fn a_held_press_says_why_at_every_width() {
             "{cols}: why and the target build: {said}"
         );
         if cols == 30 {
-            assert!(b.label.is_none(), "30: no label to say it in");
+            assert!(
+                b.mark.as_ref().is_none_or(|m| m.len() <= 4),
+                "30: no more label than the mark, so no room to say it in"
+            );
         }
     }
 }
 
-/// EVERY BUTTON ON THE LABEL GOES NOWHERE: a right, middle or left press on the harness label
-/// opens nothing and reaches no program (no mouse report, no paste), only the glass. CONTROL:
-/// the same right press on Claude's own rows reports to the program that asked for the mouse.
+/// NO BUTTON ON THE MARK REACHES THE PROGRAM: a right, middle or left press on the harness's
+/// mark reaches no program (no mouse report, no paste), only the glass, and only the left one
+/// opens the site. CONTROL: the same right press on Claude's own rows reports to the program
+/// that asked for the mouse.
 #[test]
-fn every_button_on_the_label_goes_nowhere() {
+fn no_button_on_the_mark_reaches_the_program() {
     let (mut app, wid, session, mut reader, _host) = claude_pane(158);
     feed(&app, session, b"\x1b[?1000h\x1b[?1006h");
     frame(&mut app, wid);
     let b = switch(&app, wid);
-    let label = b.label.clone().expect("a label");
+    let label = b.mark.clone().expect("a label");
     let press = |app: &mut App, cell: (usize, usize), button: MouseButton| {
         let (x, y) = px_of(app, wid, cell);
         app.on_cursor_moved(wid, x, y);
@@ -505,11 +509,21 @@ fn every_button_on_the_label_goes_nowhere() {
         app.on_mouse_input_at(wid, ElementState::Pressed, button, at);
         app.on_mouse_input_at(wid, ElementState::Released, button, at);
     };
+    let _ = crate::platform::take_opened_urls();
     for button in [MouseButton::Right, MouseButton::Middle, MouseButton::Left] {
         press(&mut app, (b.frame_row, label.end - 2), button);
         assert!(
             pty(&mut reader, 0).is_empty(),
             "{button:?}: nothing reaches the program"
+        );
+        assert_eq!(
+            crate::platform::take_opened_urls(),
+            if button == MouseButton::Left {
+                vec![aterm_types::identity::SITE_URL.to_string()]
+            } else {
+                Vec::new()
+            },
+            "{button:?}: the left press alone opens the site"
         );
     }
     press(&mut app, (b.frame_row - 3, 4), MouseButton::Right);
@@ -519,17 +533,18 @@ fn every_button_on_the_label_goes_nowhere() {
     );
 }
 
-/// THE LABEL IS GLASS TO THE POINTER TOO: with the program tracking every motion (1003), the
-/// pointer moving over the harness label reports nothing to it and shows the arrow cursor, not
-/// the pane's I-beam, while the label's hover is on, as its presses go nowhere
-/// ([`every_button_on_the_label_goes_nowhere`]). CONTROL: motion over Claude's own rows reports.
+/// THE MARK IS GLASS TO THE POINTER TOO: with the program tracking every motion (1003), the
+/// pointer moving over the harness's mark reports nothing to it and shows the hand a link wears,
+/// not the pane's I-beam, while the label's hover is on, as its presses reach no program
+/// ([`no_button_on_the_mark_reaches_the_program`]). CONTROL: motion over Claude's own rows
+/// reports.
 #[test]
-fn the_label_is_glass_to_the_pointer_too() {
+fn the_mark_is_glass_to_the_pointer_too() {
     let (mut app, wid, session, mut reader, _host) = claude_pane(158);
     feed(&app, session, b"\x1b[?1003h\x1b[?1006h");
     frame(&mut app, wid);
     let b = switch(&app, wid);
-    let label = b.label.clone().expect("a label");
+    let label = b.mark.clone().expect("a label");
     for col in [label.end - 2, label.end - 4] {
         let (x, y) = px_of(&app, wid, (b.frame_row, col));
         app.on_cursor_moved(wid, x, y);
@@ -537,10 +552,11 @@ fn the_label_is_glass_to_the_pointer_too() {
             pty(&mut reader, 0).is_empty(),
             "{col}: no motion reaches the program"
         );
+        app.update_hover_cursor(wid);
         let ws = &app.windows[&wid];
         assert!(
-            !ws.native_text_cursor && !ws.hover_pointer,
-            "{col}: the arrow cursor"
+            !ws.native_text_cursor && ws.hover_pointer,
+            "{col}: the hand, not the I-beam"
         );
         assert_eq!(
             ws.claude_lights.part_hover,
@@ -613,7 +629,7 @@ fn a_pointer_move_after_the_rule_moved_hovers_the_arrow() {
     let b = switch(&app, wid);
     let off = (0..140)
         .find(|c| {
-            ![Some(b.cols.clone()), b.label.clone(), b.arrow.clone()]
+            ![Some(b.cols.clone()), b.mark.clone(), b.arrow.clone()]
                 .iter()
                 .flatten()
                 .any(|r| r.contains(c))

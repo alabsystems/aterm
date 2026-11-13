@@ -2178,14 +2178,14 @@ fn instances_fact() -> Result<aterm_ctl::census::Census, String> {
 fn offered_token_live(pid: u32) -> Option<String> {
     use aterm_uds::runs::Kernel as _;
     let dir = aterm_uds::control_socket_dir();
+    let boot = aterm_uds::process::boot_id();
     let records = dir
         .as_deref()
         .map(|dir| {
             aterm_uds::runs::records_dir(dir, aterm_uds::process::pid_namespace().as_deref())
         })
-        .and_then(|records| aterm_uds::runs::read_records(&records).ok())
+        .and_then(|records| aterm_uds::runs::read_records(&records, boot.as_deref()).ok())
         .unwrap_or_default();
-    let boot = aterm_uds::process::boot_id();
     let me = std::process::id();
     let known = aterm_uds::left::Known {
         self_pid: me,
@@ -2626,6 +2626,10 @@ fn devtools_hand_over_after(facts: &atpkg::devtools::Facts, reach: &DevtoolsReac
     (reach.say)(&format!("aterm doctor: {did}"));
 }
 
+/// What doctor did when the window's desk door refused its ask
+/// ([`aterm_types::macos_setup::desk_refused`]): nothing, here or in the window.
+const DESK_REFUSED_DID: &str = "did nothing: this tab is not the one in front of you, so the                                 aterm window brings no page up over what you are looking at;                                 run aterm doctor from the tab in front, or use System State's                                 Permissions rows";
+
 /// Hand every grant doctor found missing to the running aterm window's permission walk
 /// (`permissions walk now <subjects>`): one panel beside System Settings takes the person from
 /// page to page, each turning to the next once its switch reads on, so doctor opens nothing
@@ -2749,6 +2753,9 @@ fn permissions_hand_over(missing: &Missing, reach: &DevtoolsReach<'_>) -> Vec<St
         return vec![
             "did nothing: the aterm window walked these pages within the last minute".to_string(),
         ];
+    }
+    if aterm_types::macos_setup::desk_refused(reply) {
+        return vec![DESK_REFUSED_DID.to_string()];
     }
     vec![format!("did nothing: the aterm window answered `{reply}`")]
 }
@@ -3164,6 +3171,7 @@ fn devtools_hand_over(facts: &atpkg::devtools::Facts, reach: &DevtoolsReach<'_>)
             "did nothing: the aterm instance doctor reached is headless, so no page opens"
                 .to_string()
         }
+        _ if aterm_types::macos_setup::desk_refused(&reply) => DESK_REFUSED_DID.to_string(),
         _ => format!("did nothing: the aterm window answered `{reply}`"),
     };
     (did, false)

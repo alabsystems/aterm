@@ -18,6 +18,29 @@ impl EarlyHostStore {
     pub fn is_present(&self) -> bool {
         self.0.is_some()
     }
+    /// Prefer actual inherited control originals. A selected pin never falls
+    /// back to opening a book/store if any native check fails. The independent
+    /// original Store locator must identify the SAME retained root.
+    pub fn discover_with_control(
+        self,
+        control: super::control_pin::EarlyHostControl,
+        deadline: Instant,
+    ) -> io::Result<crate::client::Client> {
+        let Some(pin) = control.into_pin(deadline)? else {
+            return self.discover(deadline);
+        };
+        let Some((original, before)) = self.0 else {
+            return Err(refused());
+        };
+        use std::os::fd::AsFd as _;
+        if directory(original.as_raw_fd())? != before
+            || !pin.same_original_store_directory(original.as_fd())?
+        {
+            return Err(refused());
+        }
+        pin.validate(deadline)?;
+        Ok(crate::client::Client::from_helper(Arc::new(pin)))
+    }
     /// No retry or fallback after a selected locator fails. The original
     /// independently configured host selects this directory, never Invocation40.
     pub fn discover(self, deadline: Instant) -> io::Result<crate::client::Client> {
@@ -110,7 +133,9 @@ pub unsafe fn capture_host_store(pending: PendingHostStore) -> io::Result<EarlyH
     unsafe { take(pending) }
 }
 unsafe fn take(pending: PendingHostStore) -> io::Result<EarlyHostStore> {
-    let Some((fd, before)) = pending.0 else { return Ok(EarlyHostStore(None)) };
+    let Some((fd, before)) = pending.0 else {
+        return Ok(EarlyHostStore(None));
+    };
     let owned = unsafe { OwnedFd::from_raw_fd(fd) };
     if directory(owned.as_raw_fd())? != before {
         return Err(refused());

@@ -6,7 +6,8 @@
 //! [`crate::overlay::card_raster`], for the Overview on v5's closing scene
 //! ([`crate::overview::closing_scene`]) and for the palette, on one window at 1× and at 2×, and at
 //! 2× with the width cap read as device pixels (`px_per_pt` 1, as before `fix/card-cap-in-points`)
-//! to compare: a measurement for a person, never a gate.
+//! to compare; and a footer card's frame rastered afresh ([`footer_card_frames`]): a measurement
+//! for a person, never a gate.
 
 use std::time::Instant;
 
@@ -67,7 +68,48 @@ pub(crate) fn overlay_card_cost(frames: usize) -> Vec<CardCost> {
             });
         }
     }
+    out.extend(footer_card_frames(frames));
     out
+}
+
+/// A footer card's frame rastered afresh ([`crate::footer_card_plate::plate_frame`]), what a
+/// frame that opens or resizes the card pays once: a 44 by 12 cell card at 1× and at 2×, and
+/// the widest and tallest one, 62 by 40, at 2×, under Cruise's arc with its shadow. The size
+/// is the frame's extent; its strips' texels are fewer.
+fn footer_card_frames(frames: usize) -> Vec<CardCost> {
+    use crate::footer_card_plate::{PlateKey, PlateLine, plate_frame};
+    let theme = aterm_render::Theme::default();
+    let inks = aterm_effects::glass_inks::GlassInks::of(
+        Some(aterm_effects::harness_card::CardPalette::Cruise),
+        theme.bg,
+        theme.fg,
+        0x005A_5A5A,
+    );
+    [
+        ("1x", (44, 12), 1.0),
+        ("2x", (44, 12), 2.0),
+        ("2x, 62 by 40", (62, 40), 2.0),
+    ]
+    .into_iter()
+    .map(|(case, cells, scale): (&str, (usize, usize), f64)| {
+        let cell = ((7.0 * scale) as usize, (16.0 * scale) as usize);
+        let key = PlateKey::new(cells, cell, scale, theme.bg, PlateLine::Arc(inks), true);
+        let extent = key.extent();
+        let (p50_us, p90_us, p99_us) = timed(frames, &mut || {
+            std::hint::black_box(plate_frame(&key));
+        });
+        CardCost {
+            what: format!("footer card frame {case}"),
+            px: (
+                (extent.x1 - extent.x0).unsigned_abs(),
+                (extent.y1 - extent.y0).unsigned_abs(),
+            ),
+            p50_us,
+            p90_us,
+            p99_us,
+        }
+    })
+    .collect()
 }
 
 /// `run`'s µs per call at p50, p90 and p99 over `frames` calls, after 16 unmeasured ones.

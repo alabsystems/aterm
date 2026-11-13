@@ -178,7 +178,7 @@ pub(crate) fn refusal(
 /// `pointer` or `pointer status` (`control_input::parse_pointer`'s
 /// `PointerAction::Status`): a read of where the pointer is, which stays
 /// answerable as every read does.
-fn reads_the_pointer(verb: &str, rest: &str) -> bool {
+pub(crate) fn reads_the_pointer(verb: &str, rest: &str) -> bool {
     verb == "pointer" && matches!(rest.split_whitespace().next(), None | Some("status"))
 }
 

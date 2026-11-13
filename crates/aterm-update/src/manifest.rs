@@ -226,8 +226,13 @@ impl Ready {
     /// [`Self::is_publishable`] without the floor.
     pub(crate) fn is_published_bundle(&self, staging: &crate::paths::Staging) -> bool {
         self.names_published_bundle(staging)
-            && artifact_quarantined_for_gate(staging, self.build_number, &self.dmg_sha256)
-                == Ok(false)
+            && crate::hold::held(
+                staging,
+                self.build_number,
+                &self.dmg_sha256,
+                crate::install::unix_now_secs(),
+            )
+            .is_none()
     }
 
     /// [`Self::is_published_bundle`] without the records.
@@ -443,7 +448,7 @@ pub struct FloorObservation<'a> {
     pub revoked: &'a [String],
 }
 
-fn records_unreadable(error: String) -> String {
+pub(crate) fn records_unreadable(error: String) -> String {
     crate::verify::mark_passing(format!(
         "aterm can't read its update records ({error}), so no update installs until it \
          can — if this lasts, make that file readable again (it should be yours) or \
@@ -608,246 +613,36 @@ impl Floor {
     }
 }
 
-/// A memo of the last candidate build that was downloaded but failed to stage.
+/// The boot trial's artifact (`trial.toml`): which `(build_number, sha256)` the armed trial
+/// swapped in, and the install root (`…/aterm.app`) it belongs to. Transaction state of one
+/// trial, empty outside it; the verdict a trial ends in goes to the update record.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct FailedMark {
+pub struct Trial {
     #[serde(default)]
     pub build_number: u64,
     #[serde(default)]
     pub sha256: String,
-    /// How many times this exact `(build_number, sha256)` has failed.
-    #[serde(default)]
-    pub attempts: u32,
-    /// Unix seconds before which this candidate is skipped.
-    #[serde(default)]
-    pub retry_after: u64,
-    /// Quarantine: this artifact was swapped in, failed to confirm boot health
-    /// `MAX_BOOT_ATTEMPTS` times, and was reverted.
-    #[serde(default)]
-    pub quarantined: bool,
-    /// Trial markers only: the install root (`…/aterm.app`) the armed trial belongs to.
+    /// The install root (`…/aterm.app`) the armed trial belongs to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install_root: Option<String>,
-    /// The latest failure booked here was a moment.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub moment: bool,
 }
 
-/// The widening retry schedule for a candidate that failed to stage, in seconds.
-pub const RETRY_BACKOFF_SECS: [u64; 4] = [15 * 60, 60 * 60, 4 * 60 * 60, 24 * 60 * 60];
-
-/// The retry schedule for a candidate whose staging could not finish (a moment).
-pub const MOMENT_BACKOFF_SECS: [u64; 4] = [0, 15 * 60, 60 * 60, 4 * 60 * 60];
-
-/// The furthest ahead a memo's `retry_after` is ever written. One further ahead was stamped under
-/// a clock that has since been corrected, and says nothing of how long this candidate should wait.
-const LONGEST_BACKOFF_SECS: u64 = RETRY_BACKOFF_SECS[RETRY_BACKOFF_SECS.len() - 1];
-const _: () = assert!(MOMENT_BACKOFF_SECS[MOMENT_BACKOFF_SECS.len() - 1] <= LONGEST_BACKOFF_SECS);
-
-impl FailedMark {
-    /// Read the memo, or `None` if absent/unparseable.
+impl Trial {
+    /// Read the marker, or `None` if absent/unparseable.
     pub fn read(path: &Path) -> Option<Self> {
-        Self::parse(&crate::read_ledger_text(path)?)
-    }
-
-    fn read_for_replace(path: &Path) -> Result<Option<Self>, String> {
-        let text = crate::read_ledger_text_checked(path)
-            .map_err(|error| format!("read {}: {error}", path.display()))?;
-        Ok(text.and_then(|text| Self::parse(&text)))
-    }
-
-    fn parse(text: &str) -> Option<Self> {
-        let parsed: Self = aterm_toml::from_str(text).ok()?;
+        let parsed: Self = aterm_toml::from_str(&crate::read_ledger_text(path)?).ok()?;
         (parsed.build_number != 0 || !parsed.sha256.is_empty()).then_some(parsed)
     }
 
-    /// Whether this memo matches the given candidate (same build and same DMG hash).
+    /// Whether this marker names the given artifact (same build and same DMG hash).
     pub fn matches(&self, build_number: u64, sha256: &str) -> bool {
         self.build_number == build_number && self.sha256.eq_ignore_ascii_case(sha256)
-    }
-
-    /// Whether this memo should skip the given candidate right now.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "NativeUpdateFailedMarkSuppression",
-            action = "ProbeSuppresses",
-            project = "aterm_update::failed_mark_suppression_projection"
-        )
-    )]
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::spec_unmodeled(
-            machine = "NativeUpdateFailedMarkSuppression",
-            action = "PickSuppressionInputs",
-            reason = "Bounded nondeterministic environment selection, not a shipping updater transition; Tier-1 exhaustively enumerates every projected input class before driving the record/probe pair."
-        )
-    )]
-    #[must_use]
-    pub fn suppresses(&self, build_number: u64, sha256: &str, now: u64) -> bool {
-        self.matches(build_number, sha256) && (self.quarantined || self.retry_in_secs(now) > 0)
-    }
-
-    /// Whether this memo is the never-lapsing crash-loop quarantine rather than a timed backoff.
-    #[must_use]
-    pub const fn is_quarantine(&self) -> bool {
-        self.quarantined
-    }
-
-    /// Seconds until this memo stops suppressing, or 0 if it already has, or if its stamp lies
-    /// further ahead than any schedule writes ([`LONGEST_BACKOFF_SECS`]).
-    #[must_use]
-    pub const fn retry_in_secs(&self, now: u64) -> u64 {
-        let left = self.retry_after.saturating_sub(now);
-        if left > LONGEST_BACKOFF_SECS { 0 } else { left }
-    }
-
-    /// The attempt count a fresh failure of `(build_number, sha256)` should be recorded with, given
-    /// this memo as the prior state.
-    #[must_use]
-    pub fn next_attempt(&self, build_number: u64, sha256: &str) -> u32 {
-        if self.matches(build_number, sha256) {
-            self.attempts.saturating_add(1).max(2)
-        } else {
-            1
-        }
-    }
-
-    /// The backoff for the `n`-th consecutive failure (1-based).
-    #[must_use]
-    pub fn backoff_secs(attempts: u32) -> u64 {
-        let idx = (attempts.max(1) as usize - 1).min(RETRY_BACKOFF_SECS.len() - 1);
-        RETRY_BACKOFF_SECS[idx]
-    }
-
-    /// The backoff for the `n`-th consecutive failure (1-based) when it is a moment.
-    #[must_use]
-    pub fn moment_backoff_secs(attempts: u32) -> u64 {
-        let idx = (attempts.max(1) as usize - 1).min(MOMENT_BACKOFF_SECS.len() - 1);
-        MOMENT_BACKOFF_SECS[idx]
     }
 
     /// Record `(build_number, sha256)` as the in-flight trial artifact.
     #[cfg(test)]
     pub fn record(path: &Path, build_number: u64, sha256: &str) {
         let _ = Self::record_required(path, build_number, sha256, None);
-    }
-
-    /// Quarantine `(build_number, sha256)`.
-    pub fn record_quarantine(path: &Path, build_number: u64, sha256: &str, flush: Flush) {
-        let m = Self::quarantine_mark(build_number, sha256);
-        let Ok(text) = aterm_toml::to_string(&m) else {
-            return;
-        };
-        let _ = write_durable(path, &text, "artifact quarantine", flush);
-    }
-
-    /// The in-memory quarantine verdict [`Self::record_quarantine`] persists.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "NativeUpdateFailedMarkSuppression",
-            action = "RecordQuarantine",
-            project = "aterm_update::failed_mark_suppression_projection"
-        )
-    )]
-    #[must_use]
-    pub(crate) fn quarantine_mark(build_number: u64, sha256: &str) -> Self {
-        FailedMark {
-            build_number,
-            sha256: sha256.to_ascii_lowercase(),
-            attempts: 0,
-            retry_after: 0,
-            quarantined: true,
-            install_root: None,
-            moment: false,
-        }
-    }
-
-    /// Record a download/stage failure of `(build_number, sha256)` at `now` (unix seconds).
-    pub fn record_stage_failure(path: &Path, build_number: u64, sha256: &str, now: u64) {
-        Self::record_timed(path, build_number, sha256, now, false);
-    }
-
-    /// Record a staging moment of `(build_number, sha256)`.
-    pub fn record_stage_moment(path: &Path, build_number: u64, sha256: &str, now: u64) -> Self {
-        Self::record_timed(path, build_number, sha256, now, true)
-    }
-
-    fn record_timed(path: &Path, build_number: u64, sha256: &str, now: u64, moment: bool) -> Self {
-        let prior = match Self::read_for_replace(path) {
-            Ok(prior) => prior.unwrap_or_default(),
-            Err(error) => {
-                crate::warn(&format!(
-                    "did not write the backoff memo of build {build_number} over a memo this \
-                     could not read: {error}"
-                ));
-                return Self::default().stage_failure_mark(build_number, sha256, now, moment);
-            }
-        };
-        let m = prior.stage_failure_mark(build_number, sha256, now, moment);
-        if prior.is_quarantine() {
-            let ledger = path.with_file_name("quarantine.toml");
-            if let Err(error) =
-                Quarantine::record(&ledger, prior.build_number, &prior.sha256, Flush::Ordered)
-            {
-                crate::warn(&format!(
-                    "kept the quarantine of build {} in place of a backoff memo: {error}",
-                    prior.build_number
-                ));
-                return m;
-            }
-        }
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let Ok(text) = aterm_toml::to_string(&m) else {
-            return m;
-        };
-        let tmp = path.with_extension(format!(
-            "toml.{}-{}.tmp",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        if crate::install::write_private_file(&tmp, text.as_bytes()).is_err()
-            || std::fs::rename(&tmp, path).is_err()
-        {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        m
-    }
-
-    /// The in-memory backoff memo [`Self::record_stage_failure`] persists.
-    #[cfg_attr(
-        any(test, debug_assertions),
-        aterm_spec_anchor::refines(
-            machine = "NativeUpdateFailedMarkSuppression",
-            action = "RecordStageFailure",
-            project = "aterm_update::failed_mark_suppression_projection"
-        )
-    )]
-    #[must_use]
-    pub(crate) fn stage_failure_mark(
-        &self,
-        build_number: u64,
-        sha256: &str,
-        now: u64,
-        moment: bool,
-    ) -> Self {
-        let attempts = self.next_attempt(build_number, sha256);
-        let backoff = if moment {
-            Self::moment_backoff_secs(attempts)
-        } else {
-            Self::backoff_secs(attempts)
-        };
-        FailedMark {
-            build_number,
-            sha256: sha256.to_ascii_lowercase(),
-            attempts,
-            retry_after: now.saturating_add(backoff),
-            quarantined: false,
-            install_root: None,
-            moment,
-        }
     }
 
     /// Atomically record `(build_number, sha256)`, reporting persistence failure.
@@ -857,14 +652,10 @@ impl FailedMark {
         sha256: &str,
         install_root: Option<&Path>,
     ) -> Result<(), String> {
-        let m = FailedMark {
+        let m = Self {
             build_number,
             sha256: sha256.to_ascii_lowercase(),
-            attempts: 0,
-            retry_after: 0,
-            quarantined: false,
             install_root: install_root.map(|root| root.to_string_lossy().into_owned()),
-            moment: false,
         };
         let text = aterm_toml::to_string(&m)
             .map_err(|error| format!("serialize artifact marker: {error}"))?;
@@ -875,165 +666,10 @@ impl FailedMark {
         write_durable(path, &text, "artifact marker", flush)
     }
 
-    /// Clear the memo (called once a stage finally succeeds).
+    /// Clear the marker (the trial ended).
     pub fn clear(path: &Path) {
         let _ = std::fs::remove_file(path);
     }
-
-    /// Clear the download/stage backoff memo once a stage succeeds.
-    pub fn clear_backoff(path: &Path) {
-        match Self::read_for_replace(path) {
-            Ok(Some(mark)) if mark.is_quarantine() => {}
-            Ok(_) => Self::clear(path),
-            Err(_) => {}
-        }
-    }
-}
-
-/// The crash-loop quarantine ledger (`quarantine.toml`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct Quarantine {
-    /// `"<build_number>:<sha256>"`, lowercase digest, oldest first.
-    #[serde(default)]
-    pub artifacts: Vec<String>,
-}
-
-impl Quarantine {
-    /// How many verdicts the ledger keeps.
-    pub const KEEP: usize = 64;
-
-    fn entry(build_number: u64, sha256: &str) -> String {
-        format!("{build_number}:{}", sha256.to_ascii_lowercase())
-    }
-
-    /// The ledger, or an empty one when it is absent or unreadable.
-    #[must_use]
-    pub fn read(path: &Path) -> Self {
-        crate::read_ledger_text(path)
-            .and_then(|text| aterm_toml::from_str(&text).ok())
-            .unwrap_or_default()
-    }
-
-    fn read_for_replace(path: &Path) -> Result<Self, String> {
-        let text = crate::read_ledger_text_checked(path)
-            .map_err(|error| format!("read {}: {error}", path.display()))?;
-        Ok(text
-            .and_then(|text| aterm_toml::from_str(&text).ok())
-            .unwrap_or_default())
-    }
-
-    /// Whether `(build_number, sha256)` is quarantined here.
-    #[must_use]
-    pub fn holds(&self, build_number: u64, sha256: &str) -> bool {
-        let entry = Self::entry(build_number, sha256);
-        self.artifacts.contains(&entry)
-    }
-
-    /// Whether any artifact of `build_number` is quarantined here.
-    #[must_use]
-    pub fn holds_build(&self, build_number: u64) -> bool {
-        let prefix = format!("{build_number}:");
-        self.artifacts.iter().any(|held| held.starts_with(&prefix))
-    }
-
-    /// Add `(build_number, sha256)`, durably.
-    pub fn record(
-        path: &Path,
-        build_number: u64,
-        sha256: &str,
-        flush: Flush,
-    ) -> Result<(), String> {
-        let mut ledger = Self::read_for_replace(path)?;
-        if ledger.holds(build_number, sha256) {
-            return Ok(());
-        }
-        ledger.artifacts.push(Self::entry(build_number, sha256));
-        let excess = ledger.artifacts.len().saturating_sub(Self::KEEP);
-        ledger.artifacts.drain(..excess);
-        let text = aterm_toml::to_string(&ledger)
-            .map_err(|error| format!("serialize artifact quarantine: {error}"))?;
-        write_durable(path, &text, "artifact quarantine ledger", flush)
-    }
-}
-
-/// Quarantine `(build_number, sha256)` on this machine (the crash-loop revert's verdict).
-pub fn quarantine_artifact(
-    staging: &crate::paths::Staging,
-    build_number: u64,
-    sha256: &str,
-    flush: Flush,
-) {
-    if let Err(error) = Quarantine::record(&staging.quarantine(), build_number, sha256, flush) {
-        crate::warn(&format!(
-            "could not record the quarantine of build {build_number}: {error}"
-        ));
-    }
-    FailedMark::record_quarantine(&staging.failed(), build_number, sha256, flush);
-}
-
-/// Whether `(build_number, sha256)` is quarantined on this machine.
-#[must_use]
-pub fn artifact_quarantined(
-    staging: &crate::paths::Staging,
-    build_number: u64,
-    sha256: &str,
-) -> bool {
-    Quarantine::read(&staging.quarantine()).holds(build_number, sha256)
-        || FailedMark::read(&staging.failed())
-            .is_some_and(|mark| mark.is_quarantine() && mark.matches(build_number, sha256))
-}
-
-/// [`artifact_quarantined`] for a gate that admits a build.
-pub(crate) fn artifact_quarantined_for_gate(
-    staging: &crate::paths::Staging,
-    build_number: u64,
-    sha256: &str,
-) -> Result<bool, String> {
-    if Quarantine::read_for_replace(&staging.quarantine())
-        .map_err(records_unreadable)?
-        .holds(build_number, sha256)
-    {
-        return Ok(true);
-    }
-    Ok(FailedMark::read_for_replace(&staging.failed())
-        .map_err(records_unreadable)?
-        .is_some_and(|mark| mark.is_quarantine() && mark.matches(build_number, sha256)))
-}
-
-/// One bounded machine state as both spec tiers exchange it — variable name to bounded value.
-#[cfg(any(test, debug_assertions))]
-type SpecState = std::collections::BTreeMap<&'static str, i64>;
-
-/// Project one observed writer→reader round trip of [`FailedMark`] onto the bounded
-/// `NativeUpdateFailedMarkSuppression` machine.
-#[cfg(any(test, debug_assertions))]
-#[doc(hidden)]
-#[must_use]
-pub fn failed_mark_suppression_projection(
-    quarantine_writer: bool,
-    probe_now_class: i64,
-    candidate_matches: bool,
-    recorded_quarantined: bool,
-    recorded_deadline_class: i64,
-    suppressed: bool,
-) -> (SpecState, SpecState, SpecState) {
-    let picked = std::collections::BTreeMap::from([
-        ("phase", 1),
-        ("writer_kind", if quarantine_writer { 1 } else { 2 }),
-        ("probe_now", probe_now_class),
-        ("candidate_matches", i64::from(candidate_matches)),
-        ("quarantined", 0),
-        ("deadline", 0),
-        ("suppressed", 0),
-    ]);
-    let mut recorded = picked.clone();
-    recorded.insert("phase", 2);
-    recorded.insert("quarantined", i64::from(recorded_quarantined));
-    recorded.insert("deadline", recorded_deadline_class);
-    let mut probed = recorded.clone();
-    probed.insert("phase", 3);
-    probed.insert("suppressed", i64::from(suppressed));
-    (picked, recorded, probed)
 }
 
 #[cfg(test)]

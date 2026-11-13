@@ -600,6 +600,41 @@ fn a_process_that_ends_in_order_writes_the_times_it_holds() {
     assert!(text.contains(&line(2_000)), "{text}");
 }
 
+/// One state directory's pace is its own: a time noted of another directory at an instant far
+/// later, as a test that holds its own clock gives one, leaves this directory's last write
+/// standing as what its next time is paced by.
+/// NEGATIVE CONTROL (2026-11-12): have `seen::note` drop every other directory whose last write
+/// is [`SEEN_FLUSH_EVERY`] before the instant it is given: the second time is on disk at once
+/// (three tests of this file failed that way when another's later instant fell between their
+/// two notes).
+#[test]
+fn another_directorys_later_instant_leaves_this_ones_pace_standing() {
+    let (state, other) = (State::new("seen-own-pace"), State::new("seen-other-pace"));
+    for dir in [state.dir(), other.dir()] {
+        update_peers(dir, |book| {
+            record(book, joined(0xa1, "a.local", [10, 0, 0, 1], 7100)).map(|_| ())
+        })
+        .unwrap();
+    }
+    let dir = state.dir();
+    let began = Instant::now();
+    hear(dir, 0xa1, T0 + 1_000, seen::Pace::Within(began));
+    let beside = on_disk(dir, SEEN_FILE);
+    hear(
+        other.dir(),
+        0xa1,
+        T0 + 1_000,
+        seen::Pace::Within(began + 2 * SEEN_FLUSH_EVERY),
+    );
+    hear(dir, 0xa1, T0 + 2_000, seen::Pace::Within(began));
+    assert_eq!(
+        on_disk(dir, SEEN_FILE),
+        beside,
+        "the second time waits for this directory's own pace"
+    );
+    assert_eq!(seen_of(dir, 0xa1), Some(T0 + 2_000));
+}
+
 /// The copy of the issuer's book is written when the issuer's book changed: a read that brings
 /// the copies the file holds writes nothing, and one that brings only later times writes them
 /// beside it.

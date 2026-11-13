@@ -120,6 +120,8 @@ struct SignInHost {
     terminal: bool,
     /// Whether this runs over SSH.
     ssh: bool,
+    /// Why no window opens at this desk ([`AccountsHost::no_window_desk`]), if one does not.
+    no_desk: Option<&'static str>,
     /// The window browser installed, if any.
     window: Option<PathBuf>,
     /// What fetching the pinned window browser gives where none is installed, and how many
@@ -155,6 +157,7 @@ impl SignInHost {
             handed: RefCell::new(Vec::new()),
             terminal: false,
             ssh: false,
+            no_desk: None,
             window: None,
             fetched: (
                 Err(
@@ -178,7 +181,7 @@ impl SignInHost {
         }
     }
 
-    /// A desk: a terminal on stdin, no SSH, Chrome for Testing installed.
+    /// A desk: one that opens a window, a terminal on stdin, no SSH, Chrome for Testing installed.
     fn desk(home: &Path) -> SignInHost {
         SignInHost {
             terminal: true,
@@ -222,6 +225,10 @@ impl AccountsHost for SignInHost {
 
     fn under_ssh(&self) -> bool {
         self.ssh
+    }
+
+    fn no_window_desk(&self) -> Option<&'static str> {
+        self.no_desk
     }
 
     fn window_browser(&self) -> Option<PathBuf> {
@@ -1064,8 +1071,10 @@ fn a_pools_stats_list_each_row_alike_as_text_and_json() {
 /// ended. CONTROL: a mainland row opens kimi.com, and a window closed with nothing signed in
 /// exits 1.
 ///
-/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
-/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
+/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
+/// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
 #[test]
 fn accounts_browser_opens_the_rows_own_profile_at_its_regions_page_and_records_no_secret() {
@@ -1139,8 +1148,10 @@ fn accounts_browser_opens_the_rows_own_profile_at_its_regions_page_and_records_n
 /// what else works. CONTROL: with a window browser installed nothing is fetched; a row refused
 /// for its own reasons (no email) fetches nothing either.
 ///
-/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
-/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
+/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
+/// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
 #[test]
 fn accounts_browser_fetches_its_own_window_browser_where_none_is_installed() {
@@ -1232,8 +1243,10 @@ fn accounts_browser_fetches_its_own_window_browser_where_none_is_installed() {
 /// fetch giving the build opens the window in it
 /// (`accounts_browser_fetches_its_own_window_browser_where_none_is_installed`).
 ///
-/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
-/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
+/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
+/// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
 #[test]
 fn accounts_browser_stopped_as_its_fetch_placed_the_build_opens_nothing() {
@@ -1276,8 +1289,10 @@ fn accounts_browser_stopped_as_its_fetch_placed_the_build_opens_nothing() {
 /// and put back once the window is recorded; a pass that ran removes the mark. CONTROL: a pass
 /// that failed leaves the mark, for the next headless launch on the profile to make up.
 ///
-/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
-/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
+/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
+/// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
 #[test]
 fn accounts_browser_holds_its_ends_through_the_pass_after_the_window_and_marks_it_until_then() {
@@ -1407,25 +1422,41 @@ fn a_window_hold_keeps_this_process_through_a_hangup_a_stop_and_a_quit() {
     assert_eq!(line, None, "CONTROL");
 }
 
-/// `ACCOUNTS BROWSER` opens nothing without a terminal, over SSH, under another sign-in's lock or
-/// on a profile another browser holds. CONTROL: with all of that clear it opens one window. Unix
-/// alone: the held profile is planted as Chromium's `SingletonLock` link, which only unix reads.
+/// `ACCOUNTS BROWSER` opens nothing where its host's desk opens no window (a Linux session with no
+/// display, [`AccountsHost::no_window_desk`]), without a terminal, over SSH, under another
+/// sign-in's lock or on a profile another browser holds. The desk is refused first, before a
+/// terminal or SSH is asked after, and none of the first three refusals fetches a browser where
+/// none is installed. CONTROL: with all of that clear it opens one window, whatever display the
+/// session running the test has. Unix alone: the held profile is planted as Chromium's
+/// `SingletonLock` link, which only unix reads.
 #[cfg(unix)]
 #[test]
-fn accounts_browser_refuses_without_a_terminal_over_ssh_under_a_held_lock_or_an_open_profile() {
+fn accounts_browser_refuses_off_a_desk_without_a_terminal_over_ssh_under_a_held_lock_or_an_open_profile()
+ {
     let (tmp, env) = kimi_env("browser-refusals");
     let home = tmp.path().join("home");
     let store = env.accounts_store_for(Cli::Kimi).expect("kimi's store");
     let line = "accounts browser kimi-one --cli kimi";
+    // No browser installed, so a refusal that came after the fetch would count one.
+    let no_desk = SignInHost {
+        no_desk: crate::harness::browser_window::no_window_desk_in(true, true, &|_| None),
+        terminal: false,
+        ssh: true,
+        window: None,
+        ..SignInHost::desk(&home)
+    };
     let no_terminal = SignInHost {
         terminal: false,
+        window: None,
         ..SignInHost::desk(&home)
     };
     let over_ssh = SignInHost {
         ssh: true,
+        window: None,
         ..SignInHost::desk(&home)
     };
     for (host, said) in [
+        (&no_desk, "this session has no display"),
         (&no_terminal, "stdin is not a terminal"),
         (&over_ssh, "over SSH"),
     ] {
@@ -1436,6 +1467,7 @@ fn accounts_browser_refuses_without_a_terminal_over_ssh_under_a_held_lock_or_an_
             "{err}"
         );
         assert!(host.opened.borrow().is_empty());
+        assert_eq!(host.fetched.1.get(), 0, "{said}: nothing was fetched");
     }
     let held_by = SignInHost {
         cancel_on_queue: true,
@@ -1484,12 +1516,102 @@ fn accounts_browser_refuses_without_a_terminal_over_ssh_under_a_held_lock_or_an_
     assert_eq!(clear.opened.borrow().len(), 1);
 }
 
+/// The file [`live_desk_stand_in`] writes its run's exit and standard error to.
+#[cfg(target_os = "linux")]
+const LIVE_DESK_ENV: &str = "ATERM_TEST_LIVE_DESK";
+
+/// The live host's desk is this process's: a Linux session with no display opens nothing,
+/// whatever display the machine running the test has. This test binary, run again with
+/// `DISPLAY` and `WAYLAND_DISPLAY` removed ([`live_desk_stand_in`]), runs `accounts browser` on
+/// [`LiveAccounts`] and is refused for having no display. CONTROL: with a `DISPLAY` named (one
+/// nothing connects to) it passes the desk and is refused at the next step, its stdin, which is
+/// no terminal.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_live_host_refuses_a_linux_session_with_no_display() {
+    let tmp = tmp_dir("browser-live-desk");
+    let exe = std::env::current_exe().expect("test exe");
+    // The run gets a scratch home and an empty PATH, so a step past the desk (a window
+    // browser found or fetched, the machine's sign-in lock) reads none of the person's.
+    let home = tmp.path().join("home");
+    let no_path = tmp.path().join("no-path");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&no_path).expect("no-path");
+    let run = |name: &str, display: Option<&str>| {
+        let said = tmp.path().join(name);
+        let mut cmd = aterm_uds::spawnfd::command(&exe);
+        cmd.args([
+            "harness::cli::tests::signin::live_desk_stand_in",
+            "--exact",
+            "--nocapture",
+        ])
+        .env(LIVE_DESK_ENV, &said)
+        .env("HOME", &home)
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("PATH", &no_path)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+        if let Some(display) = display {
+            cmd.env("DISPLAY", display);
+        }
+        let ran = aterm_uds::deadline::output_within(&mut cmd, aterm_spec::wait::MUST_HAPPEN)
+            .expect("the stand-in ran");
+        assert!(ran.status.success(), "{ran:?}");
+        let said = read(&said);
+        let (code, err) = said.split_once('\n').unwrap_or((said.as_str(), ""));
+        (code.to_owned(), err.to_owned())
+    };
+    let headless = crate::harness::browser_window::no_window_desk_in(true, true, &|_| None)
+        .expect("a Linux session with no display opens no window");
+    let (code, err) = run("headless", None);
+    assert_eq!(code, exit(1), "{err}");
+    assert!(err.contains(headless), "{err}");
+    let (code, err) = run("display", Some(":aterm-test-unconnected"));
+    assert_eq!(code, exit(1), "CONTROL: {err}");
+    assert!(
+        !err.contains(headless) && err.contains("stdin is not a terminal"),
+        "CONTROL: {err}"
+    );
+}
+
+/// [`the_live_host_refuses_a_linux_session_with_no_display`]'s run: with [`LIVE_DESK_ENV`] set,
+/// `accounts browser` of a scratch Kimi row on [`LiveAccounts`], its exit and standard error
+/// written there. Anywhere else it is an empty test.
+#[cfg(target_os = "linux")]
+#[test]
+fn live_desk_stand_in() {
+    let Some(said) = std::env::var_os(LIVE_DESK_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let (_tmp, env) = kimi_env("browser-live-desk-run");
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let code = run_accounts_browser(
+        Cli::Kimi,
+        &env,
+        &LiveAccounts::default(),
+        "kimi-one",
+        &mut out,
+        &mut err,
+    );
+    std::fs::write(
+        &said,
+        format!("{code:?}\n{}", String::from_utf8_lossy(&err)),
+    )
+    .expect("its run's words");
+}
+
 /// `ACCOUNTS BROWSER` opens nothing for a row with no email, an unknown label, a Kimi row with no
 /// region (whose roster is refused whole) or a machine with no window browser.
 ///
-/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`): off Unix
-/// every row is refused for that first, as `a_grok_rows_next_steps_name_its_login_never_a_renewal`
-/// holds.
+/// Each of these refusals comes before `accounts browser` asks its host's desk
+/// ([`AccountsHost::no_window_desk`]), and off Unix a run's own desk refuses the row with none of
+/// them before its window browser is looked for (`browser_window::no_window_desk_in`, which
+/// `headless_fetch`'s `the_window_route_reads_the_desk_and_the_downloader` holds). Unix only, as
+/// its rows' `accounts add` queues for the machine's sign-in, which only Unix does (this file's
+/// head).
 #[cfg(unix)]
 #[test]
 fn accounts_browser_refuses_no_email_no_region_no_window_browser_and_an_unknown_label() {
@@ -1674,26 +1796,15 @@ fn a_grok_rows_next_steps_name_its_login_never_a_renewal() {
 
     let desk = SignInHost::desk(&home);
     let (code, out, err) = renew("accounts browser grok-one --cli grok", &env, &desk);
-    if cfg!(unix) {
-        assert_eq!(code, exit(0), "{out}{err}");
-        assert_eq!(desk.opened.borrow().len(), 1, "one window");
-        assert!(
-            out.contains("next: aterm harness accounts login grok-one --cli grok")
-                && !out.contains("accounts renew")
-                && !out.contains("the renewal checks it")
-                && !out.contains("headlessly"),
-            "{out}"
-        );
-    } else {
-        // Off Unix aterm opens no sign-in window, and says so.
-        assert_eq!(code, exit(1), "{out}{err}");
-        assert!(
-            err.contains("not run: a sign-in window opens on macOS and Linux only")
-                && err.contains("nothing was opened"),
-            "{err}"
-        );
-        assert!(desk.opened.borrow().is_empty(), "no window");
-    }
+    assert_eq!(code, exit(0), "{out}{err}");
+    assert_eq!(desk.opened.borrow().len(), 1, "one window");
+    assert!(
+        out.contains("next: aterm harness accounts login grok-one --cli grok")
+            && !out.contains("accounts renew")
+            && !out.contains("the renewal checks it")
+            && !out.contains("headlessly"),
+        "{out}"
+    );
 
     let store = env.accounts_store_for(Cli::Grok).expect("grok's store");
     let signed_out = SignInHost::new(
@@ -1934,8 +2045,10 @@ fn an_unrecorded_bot_check_still_ends_as_a_bot_check() {
 /// `ACCOUNTS BROWSER` with no `--cli` serves Claude Code's pool: claude.ai's sign-in page, in the
 /// profile its headless opener keys on. CONTROL: the record lands in Claude Code's own ledger.
 ///
-/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
-/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
+/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
+/// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
 #[test]
 fn accounts_browser_serves_claude_codes_pool() {
@@ -2016,8 +2129,10 @@ fn accounts_browser_takes_one_label() {
 /// and names `renew`; a pass that could not run exits 1 and says the identity provider's sign-in
 /// may be left.
 ///
-/// Unix only, where aterm opens a sign-in window (`browser_window::no_window_desk_in`); off Unix,
-/// `a_grok_rows_next_steps_name_its_login_never_a_renewal` holds the refusal.
+/// Unix only, as its row's `accounts add` queues for the machine's sign-in, which only Unix does
+/// (this file's head); off Unix a run's own desk refuses `accounts browser` before its window
+/// (`browser_window::no_window_desk_in`, which `headless_fetch`'s
+/// `the_window_route_reads_the_desk_and_the_downloader` holds).
 #[cfg(unix)]
 #[test]
 fn accounts_browser_judges_the_sign_in_by_the_vendors_session_never_a_cookie_store() {
@@ -2133,8 +2248,7 @@ fn accounts_browser_opens_nothing_on_a_profile_a_headless_sign_in_holds() {
 /// failed is a plain failure.
 ///
 /// Unix only, as the overlay staging home its Kimi row signs in to is; off Unix,
-/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal
-/// and `a_grok_rows_next_steps_name_its_login_never_a_renewal` a stop for a person.
+/// `a_sign_in_that_needs_an_overlay_runs_nothing_where_aterm_makes_no_links` holds the refusal.
 #[cfg(unix)]
 #[test]
 fn a_renewal_that_stopped_for_a_person_says_so() {

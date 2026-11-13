@@ -24,6 +24,13 @@ const ACQUIRED_MAX: usize = 4096;
 const WALK_MAX: usize = 1_000_000;
 const WALK_BYTES_MAX: usize = 256 * 1024 * 1024;
 
+fn local_children<'gh>(children: &Children<'gh>) -> Children<'gh> {
+    let mut local = children.clone();
+    local.env.retain(|(key, _)| key != "GIT_NO_LAZY_FETCH");
+    local.env.push((os("GIT_NO_LAZY_FETCH"), os("1")));
+    local
+}
+
 struct Reader<'a, 'gh> {
     children: &'a Children<'gh>,
     run: &'a GitRun,
@@ -44,8 +51,7 @@ impl Reader<'_, '_> {
         source: bool,
         input: Option<&[u8]>,
     ) -> Result<ChildOut> {
-        let mut children = self.children.clone();
-        children.env.push((os("GIT_NO_LAZY_FETCH"), os("1")));
+        let children = local_children(self.children);
         self.serial += 1;
         let key = [
             crate::fx::canon::git_request(self.run),
@@ -305,11 +311,15 @@ pub(super) fn read(
     // This operation is bounded by exact object, byte and walk counts below. An anonymous
     // reader's local Git children therefore use an inactivity window, just like its network
     // children, rather than turning a long but progressing original-parent walk into a timeout.
-    let mut children = children.clone();
+    // The shared object-directory inventory is also a local child of this
+    // operation. Its source may be filtered, so cover setup as well as Reader.
+    let mut children = local_children(children);
     if anonymous && children.progress_window.is_none() {
         children.progress_window = Some(ANONYMOUS_READ_PROGRESS_WINDOW);
     }
     let children = &children;
+    // Only this immutable commit reader admits the exact filtered-clone metadata.
+    // Every Reader Git child still disables lazy fetch, including source writes.
     let source = screened(children, run, dir)?;
     let mut reader = Reader {
         children,
@@ -365,13 +375,7 @@ pub(super) fn read(
     reader.view = view;
     // Only immutable objects are shared. Source shallow, grafts, replacements,
     // refs, commit-graph accelerators and configuration never enter this view.
-    if let Some(view) = &reader.view {
-        std::fs::write(
-            view.join("objects/info/alternates"),
-            format!("{common}/objects\n"),
-        )
-        .map_err(|error| Error::local(format!("commit-only object view: {error}")))?;
-    }
+    super::lend_objects(children, run, reader.view.as_deref(), common, false)?;
     reader.read(request.commits())?;
     let mut queries = Vec::<Value>::new();
     for query in request.queries() {

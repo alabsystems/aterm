@@ -40,6 +40,19 @@ impl BuildPhase {
     }
 }
 
+impl State {
+    fn can_exchange_compiler_tokens(&self) -> bool {
+        !self.initial_reserved
+            && !self.ended[0]
+            && !self.ended[1]
+            && self.build_phase == BuildPhase::Compilers
+    }
+
+    fn serial_tree_waiting(&self) -> bool {
+        self.serial_build && self.can_exchange_compiler_tokens() && self.allocated[1] == 0
+    }
+}
+
 /// One tree token lent to the fixture producer's build FIFO. Drop only after every producer
 /// child has been reaped, including a fallback compiler. The returned token belongs to tree.
 #[derive(Debug)]
@@ -231,6 +244,103 @@ impl BranchShares {
             self.pools[0].path().display(),
             self.pools[1].path().display()
         );
+    }
+
+    /// Whether the serial escape still withholds a live tree's CPU allocation.
+    #[must_use]
+    pub fn serial_tree_waiting(&self) -> bool {
+        self.qualify_allocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .serial_tree_waiting()
+    }
+
+    /// Restore one tree token after the caller proves its queued memory claim is held.
+    /// Only a currently free build token moves: live compiler clients retain every token they
+    /// hold, and build keeps at least one allocation for its remaining work. A one-slot build
+    /// or an empty build FIFO waits for its existing completion handoff. Repeated resumption
+    /// is inert. Memory admission belongs to the caller and never changes here.
+    /// # Errors
+    /// Reading the build FIFO fails.
+    pub fn resume_admitted_tree(&self) -> io::Result<bool> {
+        let mut state = self
+            .qualify_allocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.serial_tree_waiting() || state.allocated[0] <= 1 {
+            return Ok(false);
+        }
+        let Some(token) = self.pools[0].try_acquire()? else {
+            return Ok(false);
+        };
+        std::mem::forget(token);
+        state.allocated[0] -= 1;
+        state.allocated[1] += 1;
+        state.serial_build = false;
+        self.describe(&state);
+        self.pools[1].remint(1);
+        eprintln!(
+            "qualify-pool resumed_admitted_tree transferred=1 shares={:?}",
+            state.allocated
+        );
+        Ok(true)
+    }
+
+    /// Whether both compiler branches can still exchange free CPU tokens.
+    /// Memory eligibility is established separately by the caller.
+    #[must_use]
+    pub fn compiler_branches_active(&self) -> bool {
+        self.qualify_allocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .can_exchange_compiler_tokens()
+    }
+
+    /// Lend currently free build tokens to an admitted shared-memory tree, retaining at least
+    /// half the non-export allocation for build, rounded up. The caller must first establish
+    /// that the same non-ALONE tree memory claim is held. No live client loses a token, and the
+    /// existing completion handoffs recover the allocations after either branch drains.
+    /// # Errors
+    /// Reading the build FIFO fails; tokens already read are returned before any state changes.
+    pub fn lend_free_build_to_admitted_tree(&self) -> io::Result<u32> {
+        let mut held = Vec::new();
+        let mut state = self
+            .qualify_allocations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.can_exchange_compiler_tokens() {
+            return Ok(0);
+        }
+        let build_floor = (state.allocated[0] + state.allocated[1]).div_ceil(2).max(1);
+        let limit = state.allocated[0].saturating_sub(build_floor);
+        while held.len() < limit as usize {
+            match self.pools[0].try_acquire() {
+                Ok(Some(token)) => held.push(token),
+                Ok(None) => break,
+                Err(error) => {
+                    // Return the bytes before unlocking permits a completion handoff.
+                    drop(held);
+                    return Err(error);
+                }
+            }
+        }
+        let moved = u32::try_from(held.len()).expect("held tokens fit the compiler allocation");
+        if moved == 0 {
+            return Ok(0);
+        }
+        for token in held {
+            std::mem::forget(token);
+        }
+        state.allocated[0] -= moved;
+        state.allocated[1] += moved;
+        state.serial_build = false;
+        self.describe(&state);
+        self.pools[1].remint(moved);
+        eprintln!(
+            "qualify-pool lent_free_build transferred={moved} build_floor={build_floor} shares={:?}",
+            state.allocated
+        );
+        Ok(moved)
     }
 
     /// Give a waiting tree its compiler share when the serial bundle's clients have drained.

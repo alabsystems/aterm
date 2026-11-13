@@ -45,14 +45,15 @@ fn this_mac_s_first_count_is_read_past_its_lead() {
 
 #[test]
 fn the_pad_is_the_row_over_the_last_prompt() {
-    let text = format!("> hello\n\n  {OWN}  \n\u{203a} Ask Codex\n\n  ? for shortcuts\n");
+    let text = format!("> hello\n\n  {OWN}  \n» Ask Codex\n\n  ? for shortcuts\n");
     assert_eq!(pad_of(&text).as_deref(), Some(OWN));
     assert_eq!(
-        pad_of("> hello\n\n\u{203a} Ask Codex\n").as_deref(),
+        pad_of("> hello\n\n» Ask Codex\n").as_deref(),
         Some(""),
         "a blank pad"
     );
     assert_eq!(pad_of("no prompt here\n"), None, "CONTROL: no prompt row");
+    assert_eq!(pad_of(&text.replace('»', "›")).as_deref(), Some(OWN));
 }
 
 #[test]

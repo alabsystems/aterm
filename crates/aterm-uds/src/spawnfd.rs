@@ -1366,7 +1366,6 @@ mod platform {
             argv: *const *const c_char,
             envp: *const *const c_char,
         ) -> i32;
-        fn pipe2(fds: *mut RawFd, flags: i32) -> i32;
         fn open(path: *const c_char, flags: i32, ...) -> RawFd;
         fn read(fd: RawFd, buf: *mut c_void, count: usize) -> isize;
         fn write(fd: RawFd, buf: *const c_void, count: usize) -> isize;
@@ -1512,14 +1511,8 @@ mod platform {
         }
         // SAFETY: just opened here, owned by nothing else.
         let null = off_the_targets(unsafe { OwnedFd::from_raw_fd(null) })?;
-        let mut ends: [RawFd; 2] = [-1, -1];
-        // SAFETY: `pipe2` fills the two-element array it is handed.
-        if unsafe { pipe2(ends.as_mut_ptr(), O_CLOEXEC) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: both ends were just created here and nothing else owns them.
-        let (status_rd, status_wr) =
-            unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
+        let (status_rd, status_wr) = crate::pipe()?;
+        let (status_rd, status_wr) = (OwnedFd::from(status_rd), OwnedFd::from(status_wr));
         let status_wr = off_the_targets(status_wr)?;
         let stdio_fds = stdio.iter().map(|slot| match *slot {
             Source::Null => null.as_raw_fd(),
@@ -2443,3 +2436,11 @@ mod transparent_tests;
 #[cfg(test)]
 #[path = "spawnfd_test_support.rs"]
 pub(crate) mod test_support;
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[doc(hidden)]
+pub use no_fork::exec_status_observation_control;
+
+#[cfg(all(target_os = "macos", debug_assertions))]
+#[doc(hidden)]
+pub use no_fork::with_exec_status_observation_fault_for_tests;

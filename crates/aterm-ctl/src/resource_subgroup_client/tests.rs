@@ -318,7 +318,7 @@ fn delegated_cpu_gnu_and_fences_keep_original_open_descriptions() {
     cpu.seek(SeekFrom::Start(0)).unwrap();
     fence.write_all(b"fence").unwrap();
     fence.seek(SeekFrom::Start(0)).unwrap();
-    let (read, write) = aterm_uds::kept_out(io::pipe).unwrap();
+    let (read, write) = aterm_uds::pipe().unwrap();
     let delegated = Delegations {
         cpu: Some(aterm_uds::kept_out(|| cpu.as_fd().try_clone_to_owned()).unwrap()),
         gnu: vec![read.into(), write.into()],
@@ -401,7 +401,7 @@ fn exact_134_right_bundle_preserves_all_original_fences_without_launch_claim() {
     source.write_all(&[b'+'; 128]).unwrap();
     source.seek(SeekFrom::Start(0)).unwrap();
     let duplicate = || aterm_uds::kept_out(|| source.as_fd().try_clone_to_owned()).unwrap();
-    let (read, write) = aterm_uds::kept_out(io::pipe).unwrap();
+    let (read, write) = aterm_uds::pipe().unwrap();
     let delegated = Delegations {
         cpu: Some(duplicate()),
         gnu: vec![read.into(), write.into()],

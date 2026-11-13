@@ -5,6 +5,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use sha2::Sha256;
+
 use super::*;
 
 static SERIAL: Mutex<()> = Mutex::new(());
@@ -264,22 +266,35 @@ impl Drop for OwnedChild {
     }
 }
 fn actor(fixture: &mut Fixture) -> OwnedChild {
+    actor_for(fixture, ACTOR, &[("NATIVE_PROGRAM_ACTOR", "1")])
+}
+fn actor_for(fixture: &mut Fixture, test: &str, environment: &[(&str, &str)]) -> OwnedChild {
     fixture.execution_attempted = true;
+    let current_code = test == "program::tests::native_current_code_actor";
+    let stderr = if current_code {
+        Stdio::from(File::create(fixture.directory.path().join("current-code-stderr")).unwrap())
+    } else {
+        Stdio::inherit()
+    };
     let mut child = OwnedChild(
         Command::new(&fixture.program)
-            .args(["--exact", ACTOR, "--nocapture"])
+            .args(["--exact", test, "--nocapture"])
             .env_clear()
-            .env("NATIVE_PROGRAM_ACTOR", "1")
+            .envs(environment.iter().copied())
+            .stderr(stderr)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
             .unwrap(),
         None,
     );
+    let evidence = current_code.then(|| fixture.directory.path().join("current-code-stdout"));
     let output = child.0.stdout.take().unwrap();
     let (send, receive) = std::sync::mpsc::sync_channel(1);
     let reader = std::thread::spawn(move || {
-        let mut read = std::io::BufReader::new(output);
+        // Bound even a single unterminated line before allocation.
+        let mut read = std::io::BufReader::new(output).take(4097);
+        let mut transcript = String::new();
         let mut line = String::new();
         let mut total = 0;
         let mut send = Some(send);
@@ -289,6 +304,10 @@ fn actor(fixture: &mut Fixture) -> OwnedChild {
                 break;
             }
             total += line.len();
+            transcript.push_str(&line);
+            if let Some(path) = &evidence {
+                fs::write(path, &transcript).unwrap();
+            }
             assert!(total <= 4096);
             if line.contains("held-native-program-running")
                 && let Some(send) = send.take()
@@ -296,17 +315,29 @@ fn actor(fixture: &mut Fixture) -> OwnedChild {
                 send.send(()).unwrap();
             }
         }
+        if current_code {
+            assert!(transcript.contains("running 1 test"));
+            assert!(transcript.contains("CURRENT_CODE_ASSERTIONS_PASSED"));
+            assert!(transcript.contains("1 passed; 0 failed; 0 ignored"));
+        }
     });
-    receive.recv_timeout(Duration::from_secs(60)).unwrap();
     child.1 = Some(reader);
-    fixture.execution_proved = true;
+    receive.recv_timeout(Duration::from_secs(60)).unwrap();
+    // This stronger actor keeps its failed source/output until all assertions
+    // and the exact one-test harness result have actually completed.
+    fixture.execution_proved = !current_code;
     child
 }
-fn finish(mut child: OwnedChild) {
+fn finish(child: OwnedChild) {
+    finish_before(child, deadline());
+}
+fn finish_before(mut child: OwnedChild, end: Instant) {
     child.0.stdin.take().unwrap().write_all(b"x").unwrap();
-    let end = deadline();
     loop {
         if let Some(status) = child.0.try_wait().unwrap() {
+            if let Some(reader) = child.1.take() {
+                reader.join().unwrap();
+            }
             assert!(status.success());
             break;
         }
@@ -750,4 +781,159 @@ fn produced_inputs_refuse_direct_absolute_loader_overrides() {
 #[test]
 fn produced_inputs_refuse_direct_relative_loader_overrides() {
     direct_load_override_is_refused(true);
+}
+
+#[test]
+fn native_current_code_actor() {
+    if std::env::var_os("NATIVE_CURRENT_CODE_ACTOR").is_none() {
+        return;
+    }
+    // Actual execution proof precedes any pin of first-run OS image metadata.
+    println!("held-native-program-running");
+    std::io::stdout().flush().unwrap();
+    let mut byte = [0];
+    std::io::stdin().read_exact(&mut byte).unwrap();
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    let root = executable.parent().unwrap().parent().unwrap();
+    let foreign_root = root.parent().unwrap().join("other-sdk");
+    fs::create_dir_all(foreign_root.join("bin")).unwrap();
+    let foreign = foreign_root.join("bin/program");
+    fs::copy(&executable, &foreign).unwrap();
+    fs::set_permissions(&foreign, fs::Permissions::from_mode(0o555)).unwrap();
+    let expected: [u8; 32] = Sha256::digest(fs::read(&executable).unwrap()).into();
+    let program = Arc::new(HeldProgram::open(root, &executable, &expected, deadline()).unwrap());
+    assert!(std::env::var_os("DYLD_LIBRARY_PATH").is_none());
+    let anchors = [native_current_code_actor as *const ()];
+    let owner = program.bind_current_code(&anchors, deadline()).unwrap();
+    owner.validate(deadline()).unwrap();
+    let identity = *owner.content_identity();
+    let wrong =
+        Arc::new(HeldProgram::open(&foreign_root, &foreign, &expected, deadline()).unwrap());
+    assert!(
+        wrong.bind_current_code(&anchors, deadline()).is_err(),
+        "equal bytes cannot replace the actual original mapped vnode"
+    );
+    assert!(program.bind_current_code(&[], deadline()).is_err());
+    assert!(program.bind_current_code(&[std::ptr::null()], deadline()).is_err());
+    assert!(
+        program.bind_current_code(&[libc::getpid as *const ()], deadline()).is_err(),
+        "system code is outside the owned main/driver closure"
+    );
+    let data = 19usize;
+    assert!(
+        program.bind_current_code(&[(&data as *const usize).cast()], deadline()).is_err(),
+        "a data address cannot stand for builtin executable code"
+    );
+    // A new Darwin vnode does not acquire a validated code-signature cache
+    // merely by copying signed bytes. Actually execute/reap this exact foreign
+    // image through the maintained one-test actor before asking the kernel for
+    // an executable mapping. No signing mutation, MAP_JIT or policy bypass.
+    let evidence = root.parent().unwrap();
+    let stdout = evidence.join("foreign-execution-stdout");
+    let stderr = evidence.join("foreign-execution-stderr");
+    let foreign_child = OwnedChild(
+        Command::new(&foreign)
+            .args(["--exact", ACTOR, "--nocapture"])
+            .env_clear()
+            .env("NATIVE_PROGRAM_ACTOR", "1")
+            .stdin(Stdio::piped())
+            .stdout(File::create(&stdout).unwrap())
+            .stderr(File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap(),
+        None,
+    );
+    // Finish this owned child well inside the parent's sixty-second watchdog.
+    finish_before(foreign_child, Instant::now() + Duration::from_secs(15));
+    assert!(fs::metadata(&stdout).unwrap().len() <= 4096);
+    let transcript = fs::read_to_string(stdout).unwrap();
+    assert!(transcript.contains("running 1 test"));
+    assert!(transcript.contains("held-native-program-running"));
+    assert!(transcript.contains("1 passed; 0 failed; 0 ignored"));
+    let foreign_digest: [u8; 32] = Sha256::digest(fs::read(&foreign).unwrap()).into();
+    assert_eq!(foreign_digest, expected);
+    let file = File::open(&foreign).unwrap();
+    let size = usize::try_from(file.metadata().unwrap().len()).unwrap();
+    // Real equal-byte foreign executable mapping. The main-only image check
+    // still passes while the closed current-code profile must refuse.
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            size,
+            libc::PROT_READ | libc::PROT_EXEC,
+            libc::MAP_PRIVATE,
+            file.as_raw_fd(),
+            0,
+        )
+    };
+    let mapping_error = io::Error::last_os_error();
+    assert_ne!(
+        mapping,
+        libc::MAP_FAILED,
+        "native executable shadow control must actually map: {mapping_error}"
+    );
+    struct Mapping(*mut libc::c_void, usize);
+    impl Drop for Mapping {
+        fn drop(&mut self) {
+            unsafe { libc::munmap(self.0, self.1) };
+        }
+    }
+    let mapping = Mapping(mapping, size);
+    program
+        .validate_loaded(process::read_identity(std::process::id()).unwrap(), deadline())
+        .unwrap();
+    assert!(
+        owner.validate(deadline()).is_err(),
+        "unexpected actual executable vnode is not covered by main-image equality"
+    );
+    drop(mapping);
+    assert!(
+        owner.validate(deadline()).is_err(),
+        "later equal content cannot clear an observed failure"
+    );
+    let current = program.bind_current_code(&anchors, deadline()).unwrap();
+    assert_eq!(current.content_identity(), &identity);
+    assert!(current.validate(Instant::now()).is_err());
+    assert!(current.validate(deadline()).is_err());
+    let current = program.bind_current_code(&anchors, deadline()).unwrap();
+    fs::create_dir(root.join("unexpected-input")).unwrap();
+    assert!(current.validate(deadline()).is_err());
+    fs::write(root.parent().unwrap().join("current-code-identity"), crate::schema::hex(&identity))
+        .unwrap();
+    println!("CURRENT_CODE_ASSERTIONS_PASSED");
+    std::io::stdout().flush().unwrap();
+}
+
+#[test]
+fn actual_current_code_binds_original_vnode_and_identity_survives_real_prefix_relocation() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut keys = Vec::new();
+    let mut files = Vec::new();
+    let mut fixtures = Vec::new();
+    for _ in 0..2 {
+        let mut fixture = Fixture::new(&[]);
+        fs::set_permissions(&fixture.program, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::copy(std::env::current_exe().unwrap(), &fixture.program).unwrap();
+        let before = fs::metadata(&fixture.program).unwrap();
+        files.push((before.dev(), before.ino()));
+        let child = actor_for(
+            &mut fixture,
+            "program::tests::native_current_code_actor",
+            &[("NATIVE_CURRENT_CODE_ACTOR", "1")],
+        );
+        finish(child);
+        let key = fs::read(fixture.directory.path().join("current-code-identity")).unwrap();
+        assert_eq!(key.len(), 64);
+        assert!(key.iter().all(u8::is_ascii_hexdigit));
+        keys.push(key);
+        fixtures.push(fixture);
+    }
+    assert_ne!(files[0], files[1]);
+    assert_eq!(
+        keys[0], keys[1],
+        "actual original content key excludes physical prefix/vnode/address instance"
+    );
+    for fixture in &mut fixtures {
+        fixture.execution_proved = true;
+    }
 }

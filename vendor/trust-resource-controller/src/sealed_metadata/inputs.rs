@@ -53,7 +53,11 @@ pub enum MetadataEvent {
 }
 
 fn attempts(root: [u8; 16], member: [u8; 16]) -> io::Result<()> {
-    if root == [0; 16] || member == [0; 16] || root == member { Err(invalid()) } else { Ok(()) }
+    if root == [0; 16] || member == [0; 16] || root == member {
+        Err(invalid())
+    } else {
+        Ok(())
+    }
 }
 fn field(text: &str, maximum: usize) -> bool {
     !text.is_empty() && text.len() <= maximum && !text.chars().any(char::is_control)
@@ -200,6 +204,24 @@ impl MetadataPrepared {
         }
         Ok(())
     }
+    /// Native107 query retains a distinct whole-job binding. This validates
+    /// preparation DATA only; native owner/member/Root checks remain separate.
+    pub fn validate_for_native_job_query(
+        &self,
+        request: &crate::native_job::query::CompilerQuery,
+    ) -> io::Result<()> {
+        self.validate()?;
+        request.validate()?;
+        if self.root_attempt != request.member.binding.root_attempt
+            || self.member_attempt != request.member.member_attempt
+            || self.root != request.sdk_root
+            || self.executable.path != request.compiler.path
+            || self.executable.sha256 != request.compiler.sha256
+        {
+            return Err(invalid());
+        }
+        Ok(())
+    }
     pub fn encode(&self) -> io::Result<Vec<u8>> {
         self.validate()?;
         let mut e = Encoder::new(13);
@@ -299,7 +321,10 @@ impl MetadataCompletion {
             _ => return Err(invalid()),
         };
         d.done()?;
-        let value = Self { finished, inputs_unchanged };
+        let value = Self {
+            finished,
+            inputs_unchanged,
+        };
         value.encode()?;
         Ok(value)
     }

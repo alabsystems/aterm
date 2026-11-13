@@ -6,23 +6,15 @@
 
 use crate::ledger::{Error, GitRunner, Result, git_read_ok};
 
-/// The selected version's published source, once it is an ancestor of the
-/// candidate. Its entries are judged on this lineage, not main's later changes.
-pub(crate) struct Publication {
-    pub(crate) source: String,
-    pub(crate) text: String,
-    pub(crate) section: String,
-    pub(crate) entries: std::collections::BTreeSet<String>,
-}
-
+/// Refuse an entry of `text`'s `section` that an earlier release (a tag in `catalog` older than
+/// `version`) shipped, judged by that release's own `CHANGELOG.md` object.
 pub(crate) fn gate(
     git: &dyn GitRunner,
-    commit: &str,
     version: &str,
     text: &str,
     section: &str,
     catalog: &str,
-) -> Result<Option<Publication>> {
+) -> Result<()> {
     let current = crate::gates::version_triple(version)
         .ok_or_else(|| Error::new("changelog shipment audit: invalid candidate version"))?;
     let tags = crate::gates::tag_commits(catalog);
@@ -31,8 +23,7 @@ pub(crate) fn gate(
         .filter_map(|(tag, oid)| {
             let name = tag.strip_prefix('v')?;
             let found = crate::gates::version_triple(name)?;
-            (found < current || (section == version && name == version))
-                .then_some((oid.as_str(), name))
+            (found < current).then_some((oid.as_str(), name))
         })
         .collect();
     if releases.len() > 4096 {
@@ -44,9 +35,8 @@ pub(crate) fn gate(
         .iter()
         .map(|(tag, _)| format!("{tag}^{{commit}}:{}\n", super::CHANGELOG_FILE))
         .collect();
-    let mut publication = None;
     if input.is_empty() {
-        return Ok(publication);
+        return Ok(());
     }
     let out = git.git_input(
         &[
@@ -110,40 +100,12 @@ pub(crate) fn gate(
         };
         let entries: std::collections::BTreeSet<_> =
             super::note_keys(old, old_section).into_iter().collect();
-        if release == version {
-            let source = format!("{tag}^{{commit}}");
-            let ancestry = git.git_read(&[
-                "--no-lazy-fetch",
-                "--no-replace-objects",
-                "merge-base",
-                "--is-ancestor",
-                &source,
-                commit,
-            ])?;
-            match ancestry.status {
-                0 => {
-                    publication = Some(Publication {
-                        source,
-                        text: old.to_owned(),
-                        section: old_section.to_owned(),
-                        entries,
-                    })
-                }
-                1 => {}
-                _ => {
-                    return Err(Error::new(
-                        "changelog shipment audit: cannot establish published source ancestry",
-                    ));
-                }
-            }
-        } else {
-            for key in entries {
-                if keys.contains(&key) {
-                    return Err(Error::new(format!(
-                        "{}: [{section}] repeats an entry shipped by v{release}: {key}\nfix: remove this already-shipped copy from [{section}]",
-                        super::CHANGELOG_FILE
-                    )));
-                }
+        for key in entries {
+            if keys.contains(&key) {
+                return Err(Error::new(format!(
+                    "{}: [{section}] repeats an entry shipped by v{release}: {key}\nfix: remove this already-shipped copy from [{section}]",
+                    super::CHANGELOG_FILE
+                )));
             }
         }
         rest = rest
@@ -154,5 +116,5 @@ pub(crate) fn gate(
     if !rest.is_empty() {
         return Err(Error::new("changelog shipment audit: extra batch data"));
     }
-    Ok(publication)
+    Ok(())
 }

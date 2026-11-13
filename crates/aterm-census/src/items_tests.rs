@@ -316,8 +316,9 @@ fn code_drops_comments_and_keeps_every_place() {
     );
 }
 
-/// Each comment says how many code tokens come before it; those of test-only items are not
-/// listed.
+/// Each comment says how many code tokens come before it and whether it is a doc comment; those
+/// of test-only items are not listed. CONTROL: `////` beside `/** block */` at the same gap
+/// differs only in `doc`.
 #[test]
 fn comments_say_where_they_sit_among_the_code() {
     let src = "//! File.\n/// Doc.\npub fn f() {} // after\n//// plain\n/** block */\nfn g() {}\n#[cfg(test)]\nmod tests {\n    // hidden\n}\n";
@@ -325,18 +326,72 @@ fn comments_say_where_they_sit_among_the_code() {
     let got: Vec<_> = source
         .comments()
         .iter()
-        .map(|c| (c.at.text, c.at.line, c.gap))
+        .map(|c| (c.at.text, c.at.line, c.gap, c.doc))
         .collect();
     assert_eq!(
         got,
         [
-            ("//! File.", 1, 0),
-            ("/// Doc.", 2, 0),
-            ("// after", 3, 7),
-            ("//// plain", 4, 7),
-            ("/** block */", 5, 7),
+            ("//! File.", 1, 0, true),
+            ("/// Doc.", 2, 0, true),
+            ("// after", 3, 7, false),
+            ("//// plain", 4, 7, false),
+            ("/** block */", 5, 7, true),
         ]
     );
+}
+
+/// `comment_at` names the comment whose text holds a byte, as `comments` lists it: its text,
+/// whether it is a doc comment and whether a macro may read it. A byte in code, in a string
+/// literal or in a test-only item is in no comment. CONTROL: `////`, `/**/` and `/***/` are
+/// plain; the same comment inside a macro's arguments is carried where its copy outside is not;
+/// and the bytes on either side of a comment are outside it.
+#[test]
+fn a_comment_at_says_which_comment_holds_a_byte() {
+    let src = "//! inner\n/*! bang */\n// plain\n/// outer\n/** block */\n//// four\n/**/\n/***/\nfn g() {}\nm!(/* in */);\n/* out */\nconst S: &str = \"// no\";\n#[cfg(test)]\nmod t {\n    // gated\n}\nfn f() {}\n";
+    let source = read(src);
+    let at = |needle: &str| {
+        assert_eq!(src.matches(needle).count(), 1, "{needle} is unique");
+        src.find(needle).expect(needle)
+    };
+    let comment = |at: usize| {
+        source
+            .comment_at(at)
+            .map(|comment| (comment.at.text, comment.doc, comment.carried))
+    };
+    for (needle, want) in [
+        ("inner", Some(("//! inner", true, false))),
+        ("bang", Some(("/*! bang */", true, false))),
+        ("plain", Some(("// plain", false, false))),
+        ("outer", Some(("/// outer", true, false))),
+        ("block", Some(("/** block */", true, false))),
+        ("four", Some(("//// four", false, false))),
+        ("/**/", Some(("/**/", false, false))),
+        ("/***/", Some(("/***/", false, false))),
+        ("in */", Some(("/* in */", false, true))),
+        ("out */", Some(("/* out */", false, false))),
+        ("// no", None),
+        ("gated", None),
+        ("fn f", None),
+        ("fn g", None),
+    ] {
+        assert_eq!(comment(at(needle)), want, "{needle}");
+    }
+    // A comment's first and last bytes are in it; the newline after a line comment is not.
+    let plain = at("// plain");
+    assert_eq!(comment(plain).map(|c| c.0), Some("// plain"));
+    assert_eq!(
+        comment(plain + "// plain".len() - 1).map(|c| c.0),
+        Some("// plain")
+    );
+    assert_eq!(comment(plain + "// plain".len()), None);
+    assert_eq!(comment(plain - 1), None, "the newline before it");
+    // What `comment_at` returns is the comment `comments` lists, gap included.
+    let listed = source
+        .comments()
+        .into_iter()
+        .find(|c| c.at.text == "/* out */")
+        .expect("listed");
+    assert_eq!(source.comment_at(at("out */")), Some(listed));
 }
 
 /// Whether the comment holding `needle` in `src` is one a macro may read.

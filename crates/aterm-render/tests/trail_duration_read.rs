@@ -14,11 +14,11 @@ use aterm_effects::cursor_glow::{GlowStyle, KnobContext, TrailKnob};
 /// Every trail style the Settings picker offers, and the rainbow's other bodies and pets
 /// ([`Spec`]).
 const STYLES: [&str; 14] = [
-    "tall rainbow + cat",
     "rainbow + cat",
-    "tall rainbow + dog",
+    "underline rainbow + cat",
+    "rainbow + dog",
     "flat rainbow + cat",
-    "tall rainbow",
+    "rainbow",
     "phaser",
     "fire",
     "water",
@@ -59,9 +59,7 @@ fn trail_light(style: &str, look: Look, duration_ms: u64, scaled: bool) -> u64 {
         true,
         look.cursor,
     );
-    if spec.tall {
-        r.fx.set_ribbon_shape(true, spec.flat);
-    }
+    r.fx.set_ribbon_shape(spec.tall, spec.flat);
     r.fx.set_typed_life_scaled(scaled);
     let last = 1_000 + 60 * (TYPING_TEXT.len() as u64 - 1);
     r.keep = (1_008..last + 1_200).step_by(48).collect();

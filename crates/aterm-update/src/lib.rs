@@ -112,9 +112,14 @@ mod github;
 pub use github::local_stage::{LocalStageOptions, stage_local};
 #[cfg(target_os = "macos")]
 mod health;
+/// This copy's update record as the macOS updater reads and writes it.
+#[cfg(target_os = "macos")]
+mod hold;
 #[cfg(target_os = "macos")]
 mod install;
 mod install_posture;
+/// The lab's update records, read through the hook the executable installs.
+pub mod lab;
 /// Signed single-executable Linux update transactions and explicit enrollment.
 #[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -171,13 +176,14 @@ mod unreadable;
 #[cfg(target_os = "macos")]
 mod verify;
 pub mod which_copy;
+/// The one artifact a window here saw fail to start, which no windowless lane installs.
+mod window_start_failure;
+pub use window_start_failure::{FailedStartBytes, WindowStartFailure};
 /// Windows: the locally staged build's pointer, its standing against the running copy, and the
 /// staged install.
 pub mod windows;
 
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
-pub use manifest::failed_mark_suppression_projection;
-
 #[cfg(all(target_os = "macos", any(test, debug_assertions)))]
 pub use github::roster_freshness_projection;
 
@@ -230,8 +236,20 @@ fn read_ledger_text_checked(path: &std::path::Path) -> std::io::Result<Option<St
     Ok(String::from_utf8(bytes).ok())
 }
 
+/// The update record: one per copy, its one hold expiring on its schedule.
+pub use aterm_update_core::update_record;
 /// The resolved GitHub release source and the compiled-in default owner/repo.
 pub use aterm_update_core::{DEFAULT_OWNER, DEFAULT_REPO, Source};
+
+/// The update record's file name under a copy's updater folder (`Updates/` on macOS, the
+/// executable's `.aterm-update/` on Linux).
+pub const RECORD: &str = aterm_update_core::update_record::FILE;
+
+/// The wall clock, in unix seconds (0 where it reads before the epoch).
+#[must_use]
+pub(crate) fn unix_now() -> u64 {
+    aterm_time::unix_secs().unwrap_or(0)
+}
 
 pub use progress::{Progress, ProgressNotify, ProgressReport, set_progress_observer};
 
@@ -368,12 +386,14 @@ pub enum TrialWitness {
 /// The bound: a proof that ran under the apply lock and was refused is retried, and after
 /// [`TRIAL_SETTLE_AFTER_REFUSALS`] refusals that lasted [`TRIAL_SETTLE_REFUSAL_SPAN`] of
 /// awake time in one process the trial is settled without the proof
-/// ([`Self::SettledUnproven`]), never reverted: the launch count alone reverts. Four holds
-/// stay unbounded here and are named, not settled ([`Self::Pending`]): a trial whose window
-/// never draws a frame (it is never asked at a checkpoint); a sentinel the filesystem will
-/// not remove; a refusal that says the installed bundle is not the running build while its
-/// predecessor verifies, which the launch count reverts; and a process with no awake clock,
-/// whose refusals span nothing.
+/// ([`Self::SettledUnproven`]), never reverted: the launch count alone reverts. Four holds stay
+/// unbounded here and are named, not settled ([`Self::Pending`]): a window that never draws a
+/// frame, which reaches no window checkpoint, so its trial waits for a window of it to draw or
+/// for the launch count; a sentinel the filesystem will not remove; a refusal that says the
+/// installed bundle is not the running build while its predecessor verifies, which the launch
+/// count reverts; and a process with no awake clock, whose refusals span nothing. The GUI's
+/// startup gate does not wait on them past its own patience: the apply lane's admission, under
+/// the apply lock, then refuses in these words while the trial stays armed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BootHealthVerdict {
     /// Nothing is owed: no trial of this build is armed, another installed copy owns it, or
@@ -550,6 +570,44 @@ pub fn recover_boot_trial_exact(
     install::recover_boot_trial(current_build, Some(current_commit), witness)
 }
 
+/// How long `build` has waited on this machine, by the pending clock each update check keeps for
+/// the newest build it sees waiting ([`PENDING_UPDATE_OVERDUE_SECS`]). The node service bounds by
+/// it how long a window that does not answer holds a waiting build, across its own restarts. Where
+/// that clock follows no build, or one older than `build`, this starts it for `build` now: only a
+/// check with a health hook (a window's) keeps the clock, and a frozen window checks nothing, so
+/// an asker that waited for a check to start it would wait for good. Where it follows a newer
+/// build, that clock's wait is the answer, which is no longer than `build`'s. `None` only where
+/// `build` is withdrawn (below the floor) or the update root does not resolve.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn pending_update_waited(current_build: u64, build: u64) -> Option<std::time::Duration> {
+    let staging = paths::Staging::resolve()?;
+    pending_update_waited_at(&staging, current_build, build)
+}
+
+/// [`pending_update_waited`] in `staging`.
+#[cfg(target_os = "macos")]
+fn pending_update_waited_at(
+    staging: &paths::Staging,
+    current_build: u64,
+    build: u64,
+) -> Option<std::time::Duration> {
+    if withdrawn(staging, build) {
+        return None;
+    }
+    let read = health::Health::read(&staging.health());
+    let h = if read.pending_build >= build && !read.pending_since.is_empty() {
+        read
+    } else {
+        note_pending_update(staging, current_build, Some(build), None)
+    };
+    if h.pending_build < build || h.pending_since.is_empty() {
+        return None;
+    }
+    install::rfc3339_delta_secs(&h.pending_since, &install::now_rfc3339())
+        .map(std::time::Duration::from_secs)
+}
+
 /// Whether this installed image owns an unconfirmed trial which a headless service must
 /// still prove. A live window's trial remains that window's responsibility while its wait lasts.
 #[cfg(target_os = "macos")]
@@ -559,10 +617,11 @@ pub fn headless_boot_trial_pending(current_build: u64) -> bool {
 }
 
 /// The build newer than `current_build` that a fresh start of this installed copy would run: one
-/// staged and ready for a boot apply ([`apply_staged_if_ready_preserving_fds_exact`]), or one
-/// another process already installed in this image's place. `None` where neither stands, and
-/// for a copy outside an installed bundle (a dev build), whose start applies nothing. The node
-/// service asks it to decide whether to end its run so launchd starts it again
+/// staged and ready for a boot apply ([`apply_staged_if_ready_preserving_fds_exact`]) whose exact
+/// bytes no window here saw fail to start ([`staged_for_a_start`]), or one another process already
+/// installed in this image's place. `None` where neither stands, and for a copy outside an
+/// installed bundle (a dev build), whose start applies nothing. The node service asks it to
+/// decide whether to end its run so launchd starts it again
 /// (`docs/DESIGN-alab-one-mesh-2026-11-05.md` §4.13). An installed build the operator floor
 /// yanks, or one whose floor cannot be read, is none: a window refuses to activate it
 /// ([`preverify_installed_for_handoff`]), and a start would run it. It reads the stage's marker,
@@ -571,15 +630,37 @@ pub fn headless_boot_trial_pending(current_build: u64) -> bool {
 #[must_use]
 pub fn newer_build_for_a_start(current_build: u64) -> Option<u64> {
     let installed = bundle::resolve()?;
-    let staging = paths::Staging::resolve();
-    let staged = staging
-        .as_ref()
-        .and_then(manifest::Ready::read_publishable)
-        .map(|ready| ready.build_number);
-    let replaced = installed_build_observed(&installed.app_root).ok();
-    newer_for_a_start(current_build, staged, replaced, |build| {
-        installed_build_yanked(staging.as_ref(), build)
+    newer_build_for_a_start_in(paths::Staging::resolve().as_ref(), current_build, || {
+        installed_build_observed(&installed.app_root)
     })
+}
+
+/// [`newer_build_for_a_start`] over `staging` and the reader of the build installed in this
+/// image's place (`installed`). Only the staged arm reads the window-start failure record.
+#[cfg(target_os = "macos")]
+fn newer_build_for_a_start_in(
+    staging: Option<&paths::Staging>,
+    current_build: u64,
+    installed: impl FnOnce() -> Result<u64, String>,
+) -> Option<u64> {
+    let staged = staging.and_then(staged_for_a_start);
+    newer_for_a_start(current_build, staged, installed().ok(), |build| {
+        installed_build_yanked(staging, build)
+    })
+}
+
+/// The staged build a fresh start would install: a publishable stage, unless its exact bytes are
+/// ones a window here saw fail to start or that record cannot be read, which a windowless start
+/// leaves for a window ([`window_start_failure::headless_refusal`]). The installed build is not
+/// filtered this way on purpose: a trial of installed bytes needs its headless settle, which
+/// keeps their window re-trial, or it would block every update.
+#[cfg(target_os = "macos")]
+pub(crate) fn staged_for_a_start(staging: &paths::Staging) -> Option<u64> {
+    manifest::Ready::read_publishable(staging)
+        .filter(|ready| {
+            window_start_failure::holds(staging, ready.build_number, &ready.dmg_sha256) == Ok(false)
+        })
+        .map(|ready| ready.build_number)
 }
 
 /// [`newer_build_for_a_start`]'s choice: the newest of `staged` and `installed` above
@@ -994,6 +1075,85 @@ pub fn record_apply_refusal_with_detail(current_build: u64, reason: &str, detail
     status::record(&staging, current_build, &outcome);
 }
 
+/// Books that a window running `current_build` launched a successor from `bytes` and saw it fail
+/// to start (`signature` says how, in diagnostic words), replacing any earlier such record: the
+/// node job's and every headless boot's lanes then leave those exact bytes for a window, and a
+/// headless settle of a trial of them keeps their window re-trial at the count it carried. Call
+/// it where the failure is judged, before any later withdraw of the same bytes.
+///
+/// # Errors
+/// No private staging root, `bytes` names no artifact (an installed build the receipt does not
+/// name), or the write failed: nothing was recorded.
+#[cfg(target_os = "macos")]
+pub fn record_window_start_failure(
+    current_build: u64,
+    bytes: FailedStartBytes<'_>,
+    signature: &str,
+) -> Result<(), String> {
+    let staging = paths::Staging::resolve()
+        .ok_or_else(|| "no private staging root is available".to_string())?;
+    window_start_failure::record(
+        &staging,
+        current_build,
+        bytes,
+        signature,
+        install::unix_now_secs(),
+    )
+}
+
+/// Withdraws the record of a window-start failure if it names exactly `bytes`, because a window
+/// of those bytes presented (or proved its adoption): `true` when a record was removed.
+#[cfg(target_os = "macos")]
+pub fn withdraw_window_start_failure(bytes: FailedStartBytes<'_>) -> bool {
+    let Some(staging) = paths::Staging::resolve() else {
+        return false;
+    };
+    match window_start_failure::withdraw(&staging, bytes) {
+        Ok(removed) => removed,
+        Err(error) => {
+            warn(&format!(
+                "could not withdraw the record of a window-start failure: {error}"
+            ));
+            false
+        }
+    }
+}
+
+/// The window-start failure on record, or `None` when there is none or it cannot be read.
+#[cfg(target_os = "macos")]
+#[must_use]
+pub fn window_start_failure() -> Option<WindowStartFailure> {
+    window_start_failure::read(&paths::Staging::resolve()?)
+        .ok()
+        .flatten()
+}
+
+/// Non-macOS: no window here hands off to a successor this way, so there is nothing to record.
+///
+/// # Errors
+/// Never.
+#[cfg(not(target_os = "macos"))]
+pub fn record_window_start_failure(
+    _current_build: u64,
+    _bytes: FailedStartBytes<'_>,
+    _signature: &str,
+) -> Result<(), String> {
+    Ok(())
+}
+
+/// Non-macOS counterpart to [`withdraw_window_start_failure`].
+#[cfg(not(target_os = "macos"))]
+pub fn withdraw_window_start_failure(_bytes: FailedStartBytes<'_>) -> bool {
+    false
+}
+
+/// Non-macOS counterpart to [`window_start_failure`].
+#[cfg(not(target_os = "macos"))]
+#[must_use]
+pub const fn window_start_failure() -> Option<WindowStartFailure> {
+    None
+}
+
 /// Non-macOS: no apply lane exists, so there is nothing to record.
 #[cfg(not(target_os = "macos"))]
 pub fn record_apply_failure(
@@ -1011,6 +1171,99 @@ pub fn record_apply_refusal(_current_build: u64, _reason: &str) {}
 /// Non-macOS counterpart to [`record_apply_refusal_with_detail`].
 #[cfg(not(target_os = "macos"))]
 pub fn record_apply_refusal_with_detail(_current_build: u64, _reason: &str, _detail: &str) {}
+
+/// Where the automatic apply lane stands after it stopped retrying an artifact: a journal record
+/// `aterm ctl update status` reads (`apply_lane=`, `failure_signature=`, `next_action=`), never a
+/// request of a person.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ApplyLaneRecord {
+    /// A word for where the lane stands (`resampling`, `awaiting-newer`, `replacing`, `held`).
+    pub lane: String,
+    /// The build the lane stopped retrying.
+    pub target_build: u64,
+    /// The failure it stopped on, as a stable signature (`<shape>/<cause key>`).
+    pub failure_signature: String,
+    /// What aterm does next by itself about [`Self::target_build`].
+    pub next_action: String,
+    /// RFC3339 UTC of the record, as read back (ignored when recording).
+    pub at: String,
+}
+
+/// The process that wrote an [`ApplyLaneRecord`]: its pid and kernel birth. The record is that
+/// process's account of its own in-memory latch, so it reads as current only there; one an
+/// earlier process left (before a restart, a swap or a crash) reads as none.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaneWriter {
+    /// The writer's pid.
+    pub pid: u32,
+    /// The writer's kernel birth ([`aterm_uds::process::read_birth`]), 0 where it was unreadable.
+    pub birth: u64,
+}
+
+impl LaneWriter {
+    /// This process, read on each call (never cached, so a forked child is not its parent).
+    #[must_use]
+    pub fn this_process() -> Self {
+        let pid = std::process::id();
+        let birth = i32::try_from(pid)
+            .ok()
+            .and_then(aterm_uds::process::read_birth)
+            .map_or(0, |birth| birth.0);
+        Self { pid, birth }
+    }
+
+    /// Whether this writer still runs: a process of its pid lives and, where the writer's birth
+    /// was read, was born then (a pid reused by a later process is not it, nor is one whose birth
+    /// cannot be read now, as the writer's could). A writer whose birth was unreadable is taken
+    /// to run while its pid lives.
+    #[must_use]
+    pub fn runs(self) -> bool {
+        let Some(pid) = i32::try_from(self.pid).ok().filter(|pid| *pid > 0) else {
+            return false;
+        };
+        if self.birth == 0 {
+            return aterm_uds::process::pid_alive(self.pid);
+        }
+        aterm_uds::process::read_birth(pid).is_some_and(|birth| birth.0 == self.birth)
+    }
+}
+
+/// Records where this process's automatic apply lane stands ([`ApplyLaneRecord`]) under
+/// `current_build`.
+#[cfg(target_os = "macos")]
+pub fn record_apply_lane(current_build: u64, record: &ApplyLaneRecord) {
+    let Some(staging) = paths::Staging::resolve() else {
+        return;
+    };
+    health::Health::record_apply_lane(
+        &staging.health(),
+        current_build,
+        LaneWriter::this_process(),
+        record,
+    );
+}
+
+/// Non-macOS: no apply lane exists, so there is nothing to record.
+#[cfg(not(target_os = "macos"))]
+pub fn record_apply_lane(_current_build: u64, _record: &ApplyLaneRecord) {}
+
+/// Withdraws this process's [`ApplyLaneRecord`] about `target_build`, once the latch it reported
+/// is gone.
+#[cfg(target_os = "macos")]
+pub fn withdraw_apply_lane(target_build: u64) {
+    let Some(staging) = paths::Staging::resolve() else {
+        return;
+    };
+    health::Health::withdraw_apply_lane(
+        &staging.health(),
+        LaneWriter::this_process(),
+        target_build,
+    );
+}
+
+/// Non-macOS: no apply lane exists, so there is nothing to withdraw.
+#[cfg(not(target_os = "macos"))]
+pub fn withdraw_apply_lane(_target_build: u64) {}
 
 /// What the ledger knows about the seamless handoff's freeze.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1117,6 +1370,12 @@ pub struct ApplyLaneReport {
     pub trial_wait: String,
     /// The last timed handoff capture, the first freeze rung it seeded and the last landed park.
     pub handoff_capture: Option<HandoffCaptureRecord>,
+    /// Where the automatic apply lane stands, recorded by this process under the running build.
+    pub lane: Option<ApplyLaneRecord>,
+    /// The bytes a window here saw fail to start, which the windowless lanes leave for a window:
+    /// only where they are a build newer than the running one, its armed trial's, or its
+    /// headless-settled bytes awaiting a window.
+    pub window_start_failure: Option<WindowStartFailure>,
 }
 
 /// Reads the apply lane's durable record as it applies to `current_build`.
@@ -1130,9 +1389,12 @@ pub fn apply_lane_report(current_build: u64) -> Option<ApplyLaneReport> {
     let trial_wait =
         install::window_trial_wait_at(&staging, current_build, install::unix_now_secs())
             .unwrap_or_default();
+    let window_start_failure = install::window_start_failure_for_report(&staging, current_build);
     Some(ApplyLaneReport {
         trial_wait,
         handoff_capture,
+        window_start_failure,
+        lane: ledger.apply_lane_for(current_build, LaneWriter::this_process()),
         last_failure: ledger.last_apply_error,
         last_failure_target_build: ledger.last_apply_failure_target_build,
         failures_for_target: ledger.apply_failures_for_target,
@@ -1746,7 +2008,7 @@ pub fn failed_activation_waiting() -> Option<(u64, u64)> {
 /// the window here could not switch to, and installs the strictly newer verified stage over the
 /// build retained for its rollback, which stays retained. It moves nothing while the activation's
 /// trial is confirmed, a window launch of it runs or came after the window's last failure, or the
-/// stage is not admitted (quarantined, withdrawn, unverified). It verifies the bundles before it
+/// stage is not admitted (held, withdrawn, unverified). It verifies the bundles before it
 /// takes the apply lock, so the lock is held for the exchanges, the start probe and cheap
 /// re-reads.
 #[cfg(target_os = "macos")]
@@ -1897,6 +2159,7 @@ impl HealthAnnouncer {
     fn tick_overdue(
         &mut self,
         h: &health::Health,
+        hold: Option<&update_record::Hold>,
         now: &str,
         current_build: u64,
         automatic: bool,
@@ -1916,7 +2179,7 @@ impl HealthAnnouncer {
             return None;
         }
         self.overdue_announced = Some(h.pending_build);
-        Some(pending_update_overdue_notice(h, current_build))
+        Some(pending_update_overdue_notice(h, hold, current_build))
     }
 
     fn tick(
@@ -2125,7 +2388,21 @@ fn passing_step(reason: &str) -> String {
 
 /// The loud notice for a newer build that has waited on this machine.
 #[cfg(target_os = "macos")]
-fn pending_update_overdue_notice(h: &health::Health, current_build: u64) -> (String, String) {
+fn pending_update_overdue_notice(
+    h: &health::Health,
+    hold: Option<&update_record::Hold>,
+    current_build: u64,
+) -> (String, String) {
+    let held = hold
+        .filter(|hold| hold.build == h.pending_build)
+        .map(|hold| {
+            format!(
+                "it is held until {} ({}, try {})",
+                hold::until_words(hold),
+                hold.why,
+                hold.tries
+            )
+        });
     let failed = (h.last_apply_failure_target_build == h.pending_build
         && h.apply_failures_for_target > 0)
         .then(|| format!("installing it failed {}×", h.apply_failures_for_target));
@@ -2137,6 +2414,10 @@ fn pending_update_overdue_notice(h: &health::Health, current_build: u64) -> (Str
         (Some(failed), None) => failed,
         (None, Some(standing)) => format!("it is held back: {standing}"),
         (None, None) => "no apply attempt has been recorded for it".to_string(),
+    };
+    let cause = match held {
+        Some(held) => format!("{held}; {cause}"),
+        None => cause,
     };
     (
         health_failing_title("apply").to_string(),
@@ -2166,15 +2447,18 @@ fn note_pending_update(
     if observed.is_some_and(|build| build > current_build) || h.pending_build <= current_build {
         return h;
     }
-    let withdrawn = manifest::Quarantine::read(&staging.quarantine()).holds_build(h.pending_build)
-        || manifest::FailedMark::read(&staging.failed())
-            .is_some_and(|mark| mark.is_quarantine() && mark.build_number == h.pending_build)
-        || h.pending_build < floor;
-    if withdrawn {
+    if withdrawn(staging, h.pending_build) {
         health::Health::forget_pending_update(&staging.health(), h.pending_build)
     } else {
         h
     }
+}
+
+/// Whether `build` is withdrawn in `staging`: below the operator floor. A hold does not withdraw
+/// a build: it still waits, and its pending clock keeps running until the hold ends.
+#[cfg(target_os = "macos")]
+fn withdrawn(staging: &paths::Staging, build: u64) -> bool {
+    build < manifest::Floor::read(&staging.floor()).min_build
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -2222,7 +2506,8 @@ pub fn check_now_with_settings(
 
 /// Start this process's background checker once [`automatic_at_launch`] answers
 /// ([`once_automatic_known`]): the platform's start reads [`automatic`] and runs no scheduled
-/// check where it is off.
+/// check where it is off. The files earlier updaters kept a verdict in are retired first
+/// ([`retire_old_records`]), whether or not checks are on.
 pub fn spawn_background_check_with_settings(
     current_build: u64,
     provider: CheckSettingsProvider,
@@ -2230,6 +2515,7 @@ pub fn spawn_background_check_with_settings(
     on_staged: Option<StagedNotify>,
     on_checked: Option<CheckedNotify>,
 ) {
+    retire_old_records();
     once_automatic_known("automatic update checks", move || {
         start_background_check(current_build, provider, notify, on_staged, on_checked);
     });
@@ -2474,8 +2760,6 @@ pub struct LinuxUpdateStatus {
     pub trial_phase: Option<String>,
     pub trial_starts: u32,
     pub trial_healthy: bool,
-    /// This copy rolled back a build newer than the one it runs, and won't install it again.
-    pub refused_newer: bool,
 }
 
 /// Starts the process's one background checker, sampling its source before each cycle so a
@@ -3225,8 +3509,10 @@ fn run_checker(
             {
                 args.send_health(title, body);
             }
+            let record = hold::load(&staging);
+            let held = record.live_hold(install::unix_now_secs());
             if let Some((title, body)) =
-                announcer.tick_overdue(&h, &now, current_build, automatic_apply_on())
+                announcer.tick_overdue(&h, held, &now, current_build, automatic_apply_on())
             {
                 args.send_health(title, body);
             }
@@ -3959,6 +4245,192 @@ pub struct UpdateStatus {
     /// Whether the last completed check found this machine unable to read its release channel.
     /// It records no ledger failure, so [`Self::failing_persistent`] never says it.
     pub channel_unreadable: bool,
+    /// The update record's hold on a build newer than the running one: live, or lapsed and kept
+    /// as history until a start, a newer build or a person ends it.
+    pub hold: Option<HoldView>,
+    /// How the last hold ended.
+    pub last: Option<update_record::Ended>,
+    /// The newest build the check lane saw.
+    pub offered: Option<u64>,
+    /// Whether a build newer than the running one was offered and is not running yet.
+    pub behind: bool,
+}
+
+/// The update record's hold, as status reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HoldView {
+    pub build: u64,
+    pub version: String,
+    pub cause: update_record::Cause,
+    pub witness: update_record::Witness,
+    pub why: String,
+    /// How many failures of this artifact in a row (1 for the first).
+    pub tries: u8,
+    /// When it lapses (unix seconds).
+    pub until: u64,
+    /// Whether it holds now; a lapsed hold means the build is tried again.
+    pub live: bool,
+    /// Whether another Mac's proven start of it cut it short.
+    pub peer_lifted: bool,
+}
+
+impl HoldView {
+    /// The held build as a person names it: its version, or "build N" where none was recorded.
+    #[must_use]
+    pub fn name(&self) -> String {
+        if self.version.is_empty() {
+            format!("build {}", self.build)
+        } else {
+            self.version.clone()
+        }
+    }
+
+    /// `record`'s hold on a build newer than `running`, as of `now`.
+    #[must_use]
+    pub fn of(record: &update_record::UpdateRecord, running: u64, now: u64) -> Option<Self> {
+        let hold = record.hold.as_ref().filter(|hold| hold.build > running)?;
+        Some(Self {
+            build: hold.build,
+            version: hold.version.clone(),
+            cause: hold.cause,
+            witness: hold.witness,
+            why: hold.why.clone(),
+            tries: hold.tries,
+            until: hold.until,
+            live: hold.live(now),
+            peer_lifted: hold.peer_lifted,
+        })
+    }
+}
+
+/// This copy's update record file, where the platform keeps one.
+#[must_use]
+pub fn record_path() -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        paths::Staging::resolve().map(|staging| staging.record())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        linux::record_path()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// Delete, once per process, the files earlier updaters kept a verdict in (the quarantine
+/// ledger, the failed-candidate memo and the window-start failure record, `paths::RETIRED`),
+/// best effort. Nothing reads them and nothing is imported from them: a build they held is
+/// tried again on the next check. Every start of the background checker (the node's, a
+/// window's, a terminal session's) calls it, and every check retires them from its own
+/// staging root.
+pub fn retire_old_records() {
+    #[cfg(target_os = "macos")]
+    {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            if let Some(staging) = paths::Staging::resolve() {
+                staging.retire();
+            }
+        });
+    }
+}
+
+/// The node service ends its run because the running `build`'s boot trial could not prove its
+/// listener, for `why`: record the miss and its reason in the update record before the run ends,
+/// so a revert the next launches make holds the build with that reason. Returns whether it was
+/// noted (no trial of `build` armed, or a record that could not be written, notes nothing).
+#[cfg(target_os = "macos")]
+pub fn note_trial_miss(build: u64, why: &str) -> bool {
+    paths::Staging::resolve().is_some_and(|staging| install::note_trial_miss(&staging, build, why))
+}
+
+/// A person or an agent asks to try again (`aterm update retry`, Settings' Try Now): the hold
+/// and the window-start failure end ([`update_record::EndHow::Person`]), so the next check
+/// stages the held build at once and a headless start may install bytes a window saw fail.
+/// Returns the hold it ended (the hold where both held), or `None` when nothing was held.
+///
+/// # Errors
+/// The record could not be written.
+pub fn retry() -> Result<Option<update_record::Hold>, String> {
+    let Some(path) = record_path() else {
+        return Ok(None);
+    };
+    let now = unix_now();
+    update_record::UpdateRecord::edit(&path, |record| {
+        let hold = record
+            .live_hold(now)
+            .or_else(|| record.live_start_failure(now))
+            .cloned();
+        record
+            .end_hold(update_record::Ending::Person, now)
+            .then_some(hold)
+            .flatten()
+    })
+    .map(|(_, ended)| ended)
+    .map_err(|error| {
+        format!(
+            "could not write the update record {}: {error}",
+            path.display()
+        )
+    })
+}
+
+/// Whether a status `outcome` says this copy is up to date: the one claim [`held_outcome`] never
+/// lets stand while a newer build is held or offered, and the only words that speak for the
+/// channel on a surface.
+#[must_use]
+pub fn says_up_to_date(outcome: &str) -> bool {
+    outcome
+        .trim_start()
+        .get(..10)
+        .is_some_and(|head| head.eq_ignore_ascii_case("up to date"))
+}
+
+/// What the update record adds to a status report of `running` at `now`: its hold on a newer
+/// build, whether the copy is behind the newest offer, and `outcome` as [`held_outcome`] lets
+/// it stand.
+#[must_use]
+pub fn hold_report(
+    record: &update_record::UpdateRecord,
+    running: u64,
+    outcome: String,
+    now: u64,
+) -> (Option<HoldView>, bool, String) {
+    let hold = HoldView::of(record, running, now);
+    let behind = record.offered.is_some_and(|offered| offered > running);
+    let outcome = held_outcome(outcome, hold.as_ref(), behind, now);
+    (hold, behind, outcome)
+}
+
+/// `outcome` as status reports it at `now`: never "up to date" while a newer build is held or
+/// the copy is behind the newest offer the floors admit.
+#[must_use]
+pub fn held_outcome(outcome: String, hold: Option<&HoldView>, behind: bool, now: u64) -> String {
+    if !says_up_to_date(&outcome) {
+        return outcome;
+    }
+    match hold {
+        Some(hold) if hold.live => format!(
+            "held: aterm {} is held until {} ({}, try {}); `aterm update retry` tries it now",
+            hold.name(),
+            update_record::clock_words(hold.until, now),
+            hold.why,
+            hold.tries
+        ),
+        Some(hold) => format!(
+            "behind: aterm {} was held ({}) and is tried again on the next check",
+            hold.name(),
+            hold.why
+        ),
+        None if behind => {
+            "behind: a newer release is out and not installed yet; an update check stages it"
+                .to_string()
+        }
+        None => outcome,
+    }
 }
 
 impl UpdateStatus {
@@ -4021,6 +4493,10 @@ impl UpdateStatus {
             failing_persistent: false,
             failing_checks_kind: String::new(),
             channel_unreadable: false,
+            hold: None,
+            last: None,
+            offered: None,
+            behind: false,
         }
     }
 }
@@ -4438,7 +4914,14 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
         ready = None;
     }
     let current_build = reconciliation.current_build;
-    outcome = reconciliation.outcome.into_string();
+    let record = hold::load(&staging);
+    let (hold, behind, held) = hold_report(
+        &record,
+        current_build,
+        reconciliation.outcome.into_string(),
+        install::unix_now_secs(),
+    );
+    outcome = held;
     let h = health::Health::read(&staging.health());
     Some(UpdateStatus {
         linux: None,
@@ -4462,6 +4945,10 @@ pub fn status(current_build: u64) -> Option<UpdateStatus> {
         failing_applies: h.apply_failures,
         failing_since: h.failing_since,
         channel_unreadable: unreadable::is_stranded(),
+        hold,
+        last: record.last,
+        offered: record.offered,
+        behind,
     })
 }
 

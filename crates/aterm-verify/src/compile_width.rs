@@ -664,8 +664,19 @@ fn wrapper(
                 .ends_when_stuck(crate::STUCK_ENDS),
             &machine.read(None),
         );
-        let alone = need.alone;
+        if unit.is_none() {
+            // Nothing keeps a peak for a call no unit names, so each one claims the unmeasured
+            // envelope again: say what it was, so the log can tell which calls those are.
+            let words: Vec<String> = args
+                .iter()
+                .skip(1)
+                .take(12)
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
+            eprintln!("{label}unidentified compiler call: {}", words.join(" "));
+        }
         let held = admit_unit(ledger, machine, need)?;
+        let alone = held.alone().is_some();
         let width = ledger
             .list()
             .map_err(|e| e.to_string())?
@@ -675,11 +686,7 @@ fn wrapper(
         eprintln!(
             "compiler width now {width}: admitted {name} with {}{} (ceiling {})",
             aterm_capacity::size(bytes),
-            if alone {
-                " alone (more than this machine can have beside the driver)"
-            } else {
-                ""
-            },
+            if alone { " alone" } else { "" },
             std::env::var("CARGO_BUILD_JOBS").unwrap_or_else(|_| "pool".to_owned())
         );
         command.env(aterm_capacity::COVER_ENV, held.record().cover_marker());
@@ -800,10 +807,22 @@ fn keep_unit(units: &Units, unit: &crate::unitgraph::UnitName, peak: u64) -> Res
 /// A queued heavy unit must not reserve memory against a ready smaller unit. Each look
 /// uses the ordinary ledger atomically, then gives up its queue place while it cannot fit.
 /// The separate wait mark keeps the compiler's ceiling and stall accounting informed.
+///
+/// UNCLAIMED MEMORY. A unit short only of memory no claim holds or reserves (a person's apps,
+/// another session's plain build) waits for nothing the ledger can bring back: no claim's end
+/// frees it. The ledger admits such a need alone at once only where it asks for no margin
+/// (its ALONE rule), and a unit's margin is its own driver's envelope, which the ledger leaves
+/// out of a child's admission. So the unit asks to run alone from that look on: it starts once
+/// no other claim holds memory, and every other unit waits while it runs. A unit its own look
+/// names STUCK (`Short::Memory`'s `stuck`: no claim's end it can wait for brings what it lacks)
+/// asks so too, though claims that went first past it, or a stuck waiter ahead, hold or wait for
+/// memory beside it. Without this a
+/// measured unit (aterm-gui's tests: 25.3 GiB and 2 GiB beside it, 2026-11-12) waited three
+/// hours on a 32 GiB Mac whose available memory stayed between 14 and 22 GiB.
 fn admit_unit(
     ledger: &aterm_capacity::Ledger,
     machine: &dyn aterm_capacity::Machine,
-    need: aterm_capacity::Need,
+    mut need: aterm_capacity::Need,
 ) -> Result<aterm_capacity::Claim, String> {
     let mut observation = crate::resource_waits::UnitTrace::new(&need.what, ledger.dir());
     if let Some(why) = aterm_capacity::never(&need, &machine.read(None)) {
@@ -852,12 +871,33 @@ fn admit_unit(
                 if stuck.is_some() {
                     return Err(format!("unit holders made no progress: {text}"));
                 }
+                if !need.alone && unclaimed_memory(&short) {
+                    eprintln!(
+                        "{}: no claim holds the memory it is short of, so no wait brings it: \
+                         it asks to run alone",
+                        need.what
+                    );
+                    need = need.alone();
+                }
             }
             aterm_capacity::Polled::Gone(error) => return Err(error.to_string()),
             aterm_capacity::Polled::Unqualified(issue) => return Err(format!("{issue:?}")),
         }
         interrupt.nap(std::time::Duration::from_millis(250), &|| false);
     }
+}
+
+/// Whether a wait is for memory alone, and for memory no claim holds or reserves ahead of it
+/// ([`admit_unit`], UNCLAIMED MEMORY): none holds or reserves any, or the unit's own look names
+/// it STUCK (no claim's end it can wait for brings what it lacks,
+/// `aterm_capacity::Spared::Stuck`), whatever claims hold or wait for memory beside it.
+fn unclaimed_memory(short: &aterm_capacity::Shortfall) -> bool {
+    !short.shorts.is_empty()
+        && short.shorts.iter().all(|s| match s {
+            aterm_capacity::Short::Memory { stuck: true, .. } => true,
+            aterm_capacity::Short::Memory { reserved: 0, .. } => short.holders.is_empty(),
+            _ => false,
+        })
 }
 
 #[cfg(test)]

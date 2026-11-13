@@ -293,7 +293,7 @@ fn items_current(
             }
             captured
                 .snapshot
-                .is_current_now(&paths)
+                .is_current(&paths)
                 .map_err(|error| error.to_string())
         },
     )

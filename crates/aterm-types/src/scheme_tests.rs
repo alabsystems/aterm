@@ -496,7 +496,7 @@ fn signature_themes_meet_their_bars() {
 }
 
 #[test]
-fn signature_themes_list_right_after_default() {
+fn builtin_theme_names_preserve_signature_order_and_resolve_stored_case() {
     let list = builtin_theme_list();
     assert_eq!(list[0].name, "Default");
     let first_other = list[1..]
@@ -510,8 +510,18 @@ fn signature_themes_list_right_after_default() {
     );
     assert_eq!(
         builtin_names()[1..5],
-        ["Aterm Night", "Aterm Day", "Hearth", "Linen"]
+        ["aterm Night", "aterm Day", "Hearth", "Linen"]
     );
+    for (stored, canonical, partner) in [
+        ("Aterm Night", "aterm Night", "aterm Day"),
+        ("Aterm Day", "aterm Day", "aterm Night"),
+    ] {
+        let theme = builtin_theme(stored).expect("stored casing resolves");
+        assert_eq!(theme.name, canonical);
+        assert_eq!(builtin_pair(stored), Some(partner));
+        assert_eq!(builtin_theme(partner).and_then(|t| t.pair), Some(canonical));
+        assert!(builtin(stored).is_some(), "stored theme still loads");
+    }
 }
 
 #[test]

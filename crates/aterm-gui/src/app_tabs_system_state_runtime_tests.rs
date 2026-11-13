@@ -230,8 +230,17 @@ fn the_system_state_menu_row_opens_the_one_system_state_tab() {
 
 #[test]
 fn system_state_restore_mints_a_view_and_shares_the_existing_controller() {
+    use aterm_types::macos_setup::{Observation, Plan, Standing, Subject};
+
     let mut app = App::headless_for_test();
     let wid = WindowId(0);
+    let skipped = crate::system_state_host::Host::for_launch_with_history(true, || {
+        panic!("a headless launch does not read setup history")
+    });
+    assert!(skipped.latest_status().last_known.is_empty());
+    let missing = crate::system_state_host::Host::for_launch_with_history(false, || None);
+    assert!(missing.latest_status().last_known.is_empty());
+    assert!(missing.latest_status().observed.is_empty());
     assert!(app.open_system_state_tab());
     let existing = app.active_native_view(wid).unwrap();
     let descriptor = crate::restore::NativeTabRestore::SystemState;
@@ -252,6 +261,79 @@ fn system_state_restore_mints_a_view_and_shares_the_existing_controller() {
     assert_ne!(existing.1, reopened.1, "restore must never alias a view");
     assert!(app.view_store.get(existing.1).is_some());
     assert!(app.structural_invariants_ok());
+
+    // An immediate manual open, quit/crash restoration and an update handoff take the same
+    // seed before their first native frame. No setup worker has started in this fixture.
+    let history = crate::SetupDisplayHistory {
+        plan: Plan::default(),
+        last_known: vec![Observation {
+            standing: Standing::InPlace,
+            now: Some("Dock saved at the bottom".into()),
+            ..Observation::unknown(Subject::Setting(aterm_types::macos_setup::Setting::Dock))
+        }],
+        vault_source: None,
+    };
+    let layouts =
+        std::iter::once(None).chain(std::iter::once(Some(app.capture_restore_manifest())));
+    #[cfg(unix)]
+    let layouts = layouts.chain(std::iter::once(Some(app.capture_handoff_layout())));
+    for layout in layouts {
+        let mut cold = App::headless_for_test();
+        cold.system_state_host =
+            crate::system_state_host::Host::for_launch_with_history(false, || {
+                Some(history.clone())
+            });
+        let status = cold.system_state_host.latest_status();
+        assert_eq!(status.last_known, history.last_known);
+        assert!(status.observed.is_empty() && status.rows.is_empty());
+        assert!(status.permissions.is_none() && status.run.is_none() && status.check.is_none());
+        assert!(!status.finished && !status.busy && status.caps_live.is_none());
+        if let Some(layout) = layout {
+            cold.restore_into_window(wid, layout.windows.into_iter().next().unwrap());
+        } else {
+            assert!(cold.open_system_state_tab());
+        }
+        let (instance, view) = cold.active_native_view(wid).expect("opened System State");
+        // Prepare this fixture's disclosure before any frame, so the first actual
+        // native presentation must contain this seed's value, not a generic stale label.
+        let Some(crate::native_app::AppViewState::SystemState(state)) =
+            cold.native_runtime.view_state_mut(view)
+        else {
+            panic!("the opened view is System State")
+        };
+        **state = crate::system_state::SystemStateViewState::with_line_open(Some(
+            crate::system_state::lines::Line::Mac,
+        ));
+        assert!(cold.commit_glassless_native_frame(wid));
+        let ui = &cold.windows[&wid].leaf_render_cache[&view]
+            .native
+            .as_ref()
+            .expect("the first native frame")
+            .compiled;
+        assert!(
+            ui.semantics
+                .iter()
+                .any(|node| node.label.contains("as last read"))
+        );
+        assert!(
+            ui.semantics
+                .iter()
+                .any(|node| node.label.contains("Dock saved at the bottom")),
+            "the opened page's first frame contains this seed's actual value"
+        );
+        let Some(crate::native_app::NativeApp::SystemState(page)) =
+            cold.native_runtime.app(instance)
+        else {
+            panic!("the opened controller is System State")
+        };
+        assert!(
+            !page.starts_by_itself(),
+            "display history admits no setup run"
+        );
+        cold.native_runtime.tick_system_state();
+        assert!(cold.native_runtime.take_system_state_action().is_none());
+        assert!(cold.structural_invariants_ok());
+    }
 }
 
 #[test]

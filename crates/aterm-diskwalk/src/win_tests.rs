@@ -398,9 +398,9 @@ fn a_walk_sums_the_tree_follows_no_junction_and_shares_a_hard_link_out() {
 
     let links = walk.links().expect("links_out");
     assert_eq!(links.linked_inodes, 2);
-    assert_eq!(links.alloc_first_seen, singles + four + shared);
+    assert_eq!(links.alloc_first_seen, singles + folders + four + shared);
     assert_eq!(links.shared_out, shared);
-    assert_eq!(links.frees_at_most, singles + four);
+    assert_eq!(links.frees_at_most, singles + folders + four);
 }
 
 #[test]

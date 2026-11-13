@@ -217,6 +217,7 @@ fn fact(detail: Option<&str>, end: crate::session_log::BlockEnd) -> crate::sessi
         end,
         detail: detail.map(str::to_owned),
         detail_final: true,
+        shape: crate::session_status::LineShape::ONE,
     }
 }
 

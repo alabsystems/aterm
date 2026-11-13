@@ -6,8 +6,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
-use crate::host::rest::STAGED;
-use crate::host::{HostError, HostRole, Release, ReleaseHost, Replace, Slug, gh_serves};
+use crate::host::{HostError, HostRole, Release, ReleaseHost, Replace, STAGED, Slug, gh_serves};
 
 #[path = "upload_version.rs"]
 mod version;

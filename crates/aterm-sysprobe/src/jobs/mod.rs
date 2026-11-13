@@ -10,6 +10,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 pub mod darwin;
+#[cfg(any(target_os = "macos", test))]
+mod event_queues;
 pub mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -188,7 +190,9 @@ pub struct Counters {
     pub disk_written: Option<u64>,
     /// Bytes written through any descriptor, before the page cache (`ri_logical_writes`, Linux `wchar`).
     pub logical_writes: Option<u64>,
-    /// Time runnable, waiting for a core included, ns (`ri_runnable_time`, Linux `schedstat`'s run time plus its wait).
+    /// Time runnable, waiting for a core included, ns (`ri_runnable_time`;
+    /// Linux the CPU time plus every live thread's `schedstat` wait,
+    /// [`linux::threads_wait_ns`]).
     pub runnable_ns: Option<u64>,
     /// Page-ins (`ri_pageins`, Linux major faults).
     pub pageins: Option<u64>,
@@ -642,7 +646,7 @@ pub enum AtStart {
     /// User execution was measured, its thread set its handle, or its fork is
     /// younger than the unresolved-start threshold [`PROGRAM_CHECK_AGE_MS`].
     Started,
-    /// Affirmative per-process program-check evidence, with no measured user execution,
+    /// Affirmative per-process program-check evidence, with user execution measured at zero,
     /// neither stopped nor traced, native, and a local executable.
     Held,
     /// One thread that never ran, past [`PROGRAM_CHECK_AGE_MS`], that reads stopped or traced: a start-suspended spawn, a debugger's launch, or a program the check holds that reads either way, which nothing has measured (the leftover-processes design's U3). Never counted as held; `sys jobs` names it with what it read.
@@ -691,8 +695,8 @@ pub struct StartFacts {
 /// Where a process with `f` stands at its start: [`AtStart::Started`] unless its one thread never
 /// ran, past [`PROGRAM_CHECK_AGE_MS`]; then [`AtStart::StoppedUnstarted`] when it reads stopped or
 /// traced, else [`AtStart::Translating`] for an x86_64 process on an arm64 Mac, else
-/// [`AtStart::Unstarted`] unless its executable's volume reads local, no user execution
-/// was measured, and affirmative per-process request evidence establishes [`AtStart::Held`].
+/// [`AtStart::Unstarted`] unless its executable's volume reads local, its user execution was
+/// measured at zero, and affirmative per-process request evidence establishes [`AtStart::Held`].
 /// Positive user execution always gives [`AtStart::Started`].
 #[must_use]
 pub fn judge_start(f: &StartFacts) -> AtStart {
@@ -763,7 +767,7 @@ pub fn stranded(
         && held_since_daemon == Some(0)
 }
 
-/// The [`StartFacts`] of `pid` at `now_us` (µs since the epoch, [`now_us`]): one two-slot thread list, and for a lone `0` only its BSD record, its arch and its executable's mount. `None` when the list or a record the judgment needs cannot be read (gone, another user's), and off macOS. Nothing of its arguments or environment is read: such a read of a program held mid-start can hang (M29).
+/// The [`StartFacts`] of `pid` at `now_us` (µs since the epoch, [`now_us`]): one two-slot thread list, and for a lone `0` only its BSD record, that thread's user time, its arch and its executable's mount. `None` when the list or a record the judgment needs cannot be read (gone, another user's), and off macOS. Nothing of its arguments or environment is read: such a read of a program held mid-start can hang (M29).
 #[must_use]
 pub fn read_start(pid: u32, now_us: u64) -> Option<StartFacts> {
     read_start_in(pid, now_us, &std::cell::OnceCell::new())
@@ -956,6 +960,25 @@ impl JobsReader {
     /// The optional lanes, self-checked on the first call and remembered (a failed lane is not retried in this process).
     pub fn lanes(&mut self) -> Lanes {
         *self.lanes.get_or_insert_with(check_lanes)
+    }
+
+    /// Read only `pid`'s event queues, independently of the ordinary descriptor-detail budget.
+    /// A successful result contains every listed queue with its complete known knote list.
+    /// At most [`MAX_FDS`] descriptors are listed, [`MAX_FD_DETAILS`] queues are read, and fewer
+    /// than [`MAX_KNOTES`] notes are admitted per queue. Unsupported platforms, unread facts,
+    /// cuts or saturation return `None`, never a complete empty set. These bounded observations
+    /// confer no process-control authority and do not freeze a process's descriptor table.
+    #[must_use]
+    pub fn event_queues(&mut self, pid: u32) -> Option<Vec<FdReading>> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::event_queues(pid, self.lanes())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = pid;
+            None
+        }
     }
 
     /// Read every process `reqs` names, in order; a process gone or refused meanwhile is left out.

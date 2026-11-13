@@ -948,7 +948,8 @@ fn a_newer_ledger_of_an_old_run_still_breaks_crash_loops() {
     }
 
     let display_root = aterm_tempfile::tempdir().unwrap();
-    let store = SetupHistoryStore::at(display_root.path(), Path::new("/fixture"));
+    let display_home = aterm_tempfile::tempdir().unwrap();
+    let store = SetupHistoryStore::at(display_root.path(), display_home.path());
     let mut authority = ledger::Ledger::of(revision).record();
     authority
         .as_object_mut()
@@ -956,6 +957,7 @@ fn a_newer_ledger_of_an_old_run_still_breaks_crash_loops() {
         .insert("future_stage_field".into(), Value::from("kept"));
     write_json(&display_root.path().join(ledger::LEDGER), &authority).unwrap();
     let basis = store.begin().unwrap();
+    assert!(store.display().is_none(), "an empty history reads no plan");
     let read = LastRead::capture(
         &aterm_types::macos_setup::Observation {
             standing: aterm_types::macos_setup::Standing::AtLogin,
@@ -984,6 +986,92 @@ fn a_newer_ledger_of_an_old_run_still_breaks_crash_loops() {
         "AtLogin keeps the original displayed value"
     );
     assert!(past.note.is_none() && past.detail.is_none());
+    let plan = Plan::default();
+    let plan_path = display_root.path().join("automatic-plan.json");
+    write_json(&plan_path, &plan_record(&plan, false)).unwrap();
+    let vault_read = LastRead::capture(
+        &aterm_types::macos_setup::Observation {
+            standing: aterm_types::macos_setup::Standing::InPlace,
+            now: Some("Synced".into()),
+            ..aterm_types::macos_setup::Observation::unknown(Subject::Setting(Setting::Secrets))
+        },
+        1234,
+    )
+    .unwrap();
+    assert!(store.save(
+        saved.generation,
+        &plan.vault_url,
+        &[saved.rows[0].clone(), vault_read],
+        || true,
+    ));
+    let before_display = std::fs::read(display_root.path().join(ledger::LEDGER)).unwrap();
+    let paths = aterm_secrets::client::Paths::locate_for_home(display_home.path());
+    assert!(!paths.dir.exists());
+    let (shown, history) = store.display().unwrap();
+    assert_eq!(shown, plan);
+    assert_eq!(history.rows.len(), 2);
+    assert!(
+        !paths.dir.exists(),
+        "display must not initialize a vault identity"
+    );
+    assert_eq!(
+        std::fs::read(display_root.path().join(ledger::LEDGER)).unwrap(),
+        before_display,
+        "display does not rewrite the setup ledger"
+    );
+    let decision = display_root.path().join("first-run.json");
+    write_json(
+        &decision,
+        &stamped(json!({"profile": PROFILE, "state": "cancelled", "reviewed": plan_record(&plan, false)})),
+    )
+    .unwrap();
+    assert_eq!(store.display().unwrap().0.selection, Selection::none());
+    let mut restored = Selection::none();
+    restored.set(Setting::CapsLock, true);
+    write_json(
+        &decision,
+        &stamped(json!({"profile": PROFILE, "state": "restored", "selection": restored.bits()})),
+    )
+    .unwrap();
+    assert_eq!(store.display().unwrap().0.selection, restored);
+    std::fs::remove_file(&decision).unwrap();
+    let mut interrupted = plan_record(&plan, false);
+    interrupted
+        .as_object_mut()
+        .unwrap()
+        .insert("upgrade".into(), json!({}));
+    write_json(&plan_path, &interrupted).unwrap();
+    assert!(
+        store.display().is_none(),
+        "an unresolved recovery is not a display plan"
+    );
+    write_json(&plan_path, &plan_record(&plan, false)).unwrap();
+    aterm_secrets::fsx::ensure_private_dir(&paths.dir).unwrap();
+    aterm_secrets::fsx::write_atomic(&paths.dir.join("source.toml"), b"invalid = [", 0o600)
+        .unwrap();
+    assert!(
+        aterm_secrets::fsx::read_private(&paths.dir.join("source.toml"), 4 << 20)
+            .unwrap()
+            .is_some()
+    );
+    assert!(aterm_secrets::client::config(&paths).is_err());
+    let (_, history) = store.display().unwrap();
+    assert_eq!(history.rows, [saved.rows[0].clone()]);
+    assert!(
+        history.vault_source.is_empty(),
+        "unreadable source gives no historical vault evidence"
+    );
+    aterm_secrets::fsx::write_atomic(
+        &paths.dir.join("source.toml"),
+        b"url = 'https://example.invalid/other'\nname = 'other'\n",
+        0o600,
+    )
+    .unwrap();
+    assert!(aterm_secrets::client::config(&paths).unwrap().is_some());
+    let (shown, history) = store.display().unwrap();
+    assert_eq!(shown.vault_url, "https://example.invalid/other");
+    assert_eq!(history.rows, [saved.rows[0].clone()]);
+    assert!(history.vault_source.is_empty());
     assert!(!store.save(basis.generation, "", &saved.rows, || panic!(
         "a stale file generation is rejected before cache admission"
     )));

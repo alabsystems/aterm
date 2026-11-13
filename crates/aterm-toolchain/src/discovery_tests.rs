@@ -765,6 +765,22 @@ fn a_locked_tree_resolves_its_build_and_nothing_else() {
         }
     }
 
+    // Where the store's signed manifests say no published install serves the lock's build here,
+    // the refusal names the local builds discovery itself takes in the lock's place, the
+    // TRUST_STAGE2_BIN and the dev link below. NEGATIVE CONTROL (2026-11-12): with discovery
+    // passing `LOCAL_SYSROOT_REMEDY`, the store readers' wording, it named no TRUST_STAGE2_BIN.
+    let unpublished = crate::trust_lock::Found {
+        unpublished: Some("unavailable on x: no build".to_string()),
+        ..lock(16999, &root, commit)
+    };
+    let why = found(None, Some(&unpublished))
+        .lock_refusal
+        .expect("an unpublished build is refused");
+    assert!(
+        why.contains("TRUST_STAGE2_BIN") && !why.contains("pkg install"),
+        "{why}"
+    );
+
     let named = lock(16387, &root, commit);
     let t = found(Some(&on_path), Some(&named));
     assert_eq!(t.stage2_dir, on_path);

@@ -3,14 +3,13 @@
 
 //! The cross-version guard: the bytes a shipped producer really wrote, adopted by this build's consumer.
 
+use std::os::fd::IntoRawFd as _;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use aterm_core::scrollback::Line;
 use aterm_core::terminal::Terminal;
 
-use super::tests::{
-    ScratchEnv, child_proof_from, env_alone_with_ptys as env_alone, pipe_pair, restore_env,
-};
+use super::tests::{ScratchEnv, child_proof_from, env_alone_with_ptys as env_alone, restore_env};
 use super::*;
 
 /// The recorded handoff fixtures, a folder per release.
@@ -1929,6 +1928,26 @@ const PINNED_DESKS: &[(&str, &str)] = &[
     ("v0.198.0", "stalled-sequence"),
     ("v0.198.0", "twelve-panes"),
     ("v0.198.0", "variants"),
+    ("v0.199.0", "carried-state"),
+    ("v0.199.0", "claude-code-1049"),
+    ("v0.199.0", "colour-and-shell"),
+    ("v0.199.0", "engine-state"),
+    ("v0.199.0", "fold"),
+    ("v0.199.0", "held-failed"),
+    ("v0.199.0", "held-pane"),
+    ("v0.199.0", "held-withheld"),
+    ("v0.199.0", "history"),
+    ("v0.199.0", "history-carry"),
+    ("v0.199.0", "incident-55x149"),
+    ("v0.199.0", "link-dense"),
+    ("v0.199.0", "link-dense-history"),
+    ("v0.199.0", "lone-workers-list"),
+    ("v0.199.0", "policy-repaint"),
+    ("v0.199.0", "policy-visible"),
+    ("v0.199.0", "shell-integration"),
+    ("v0.199.0", "stalled-sequence"),
+    ("v0.199.0", "twelve-panes"),
+    ("v0.199.0", "variants"),
 ];
 
 const REQUIRED_DESKS: &[(&str, &str)] = &[
@@ -2631,8 +2650,10 @@ fn stage_with(
         slaves.push(slave);
     }
     let manifest_path = dir.join(&desk.parent.manifest);
-    let (ready_read, ready_write) = pipe_pair("ready");
-    let (commit_read, commit_write) = pipe_pair("commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     // SAFETY: `getppid` is a side-effect-free libc getter.
     let parent_pid = unsafe { libc::getppid() };
     aterm_log::env::set(ENV_MANIFEST, &manifest_path);
@@ -3409,9 +3430,8 @@ fn every_shipped_producers_desk_adopts_exactly_and_proves() {
         for (index, desks) in batches.iter().enumerate() {
             let value = std::ffi::OsString::from(index.to_string());
             let stdout = {
-                let _lease =
-                    aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease");
-                crate::test_alone::spawn_alone_with(&[(BATCH, &value)])
+                let lease = aterm_pty::test_budget::Lease::take().expect("dense PTY fixture lease");
+                crate::test_alone::spawn_alone_with_lease(&[(BATCH, &value)], &lease)
                     .passed()
                     .stdout
             };
@@ -4341,8 +4361,10 @@ pub(super) fn capture_transport(scratch: &std::path::Path) -> TransportCapture {
         .iter()
         .map(|_| open_pty_pair())
         .collect::<Vec<_>>();
-    let (ready_read, ready_write) = pipe_pair("rz ready");
-    let (commit_read, commit_write) = pipe_pair("rz commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("rz ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("rz commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     // SAFETY: fresh pipe descriptors, owned from here.
     let (ready_write, commit_read) = unsafe {
         (
@@ -4526,8 +4548,10 @@ fn replay_grant_to_this_successor(
         .iter()
         .map(|_| open_pty_pair())
         .collect::<Vec<_>>();
-    let (ready_read, ready_write) = pipe_pair("replay ready");
-    let (commit_read, commit_write) = pipe_pair("replay commit");
+    let (ready_read, ready_write) = aterm_uds::pipe().expect("replay ready pipe");
+    let (ready_read, ready_write) = (ready_read.into_raw_fd(), ready_write.into_raw_fd());
+    let (commit_read, commit_write) = aterm_uds::pipe().expect("replay commit pipe");
+    let (commit_read, commit_write) = (commit_read.into_raw_fd(), commit_write.into_raw_fd());
     let sent = record
         .descriptor_order
         .iter()

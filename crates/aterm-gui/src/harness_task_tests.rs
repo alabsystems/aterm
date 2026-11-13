@@ -691,6 +691,7 @@ fn reading(said: &str, worked: Option<Duration>, person: Option<Duration>) -> Tu
         credits: None,
         repo: aterm_agent::harness::repo_work::RepoRead::Clean,
         leftover: aterm_agent::harness::leftover::LeftRead::NotAsked,
+        credentials: aterm_agent::supervise::policy::credential_need::CredentialRead::NotAsked,
         login_screen: None,
         login_interrupted: false,
         login_at_wall: None,
@@ -1085,6 +1086,7 @@ fn a_proven_self_claims_landing_marks_its_workers_task_done_with_its_rollout_rep
             &sid,
             Some(aterm_agent::harness::self_claimed::Copy {
                 pid: proven.pid,
+                lifetime: None,
                 start: proven.start.clone(),
                 home: home.clone(),
                 seen: aterm_agent::harness::self_claimed::Seen::Present(

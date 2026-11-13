@@ -1277,13 +1277,38 @@ pub(crate) fn mark_session_task_with_timeline(
     fence_wait: std::time::Duration,
     when: impl FnOnce(&crate::session_timeline::SessionTimeline, Option<&str>) -> bool,
 ) -> Result<Option<MarkedWith>, MarkFenced> {
+    mark_session_task_with_context(
+        ctx,
+        local_id,
+        mark,
+        edit,
+        fence_wait,
+        |_, _, timeline, standing| when(timeline, standing),
+    )
+}
+
+/// One task mark's hold observation, metadata and timeline predicate, under the existing
+/// fabric, metadata and timeline locks. The predicate must not acquire those locks again.
+pub(crate) fn mark_session_task_with_context(
+    ctx: &SessionCtx,
+    local_id: u64,
+    mark: Option<&TaskMark>,
+    edit: AttentionEdit<'_>,
+    fence_wait: std::time::Duration,
+    when: impl FnOnce(
+        aterm_gui_fabric::HoldObservation,
+        &crate::session_timeline::SessionMeta,
+        &crate::session_timeline::SessionTimeline,
+        Option<&str>,
+    ) -> bool,
+) -> Result<Option<MarkedWith>, MarkFenced> {
     let outcome = ctx
         .fabric
-        .run_unfenced(fence_wait, || {
+        .run_unfenced(fence_wait, |hold| {
             let mut meta = ctx.meta.lock().unwrap_or_else(|p| p.into_inner());
             let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
             let owner = crate::harness_host::ATTENTION_OWNER;
-            if !when(&timeline, meta.attention_owners.get(owner)) {
+            if !when(hold, &meta, &timeline, meta.attention_owners.get(owner)) {
                 return None;
             }
             let attention_moved = match edit {
@@ -1375,7 +1400,7 @@ pub(crate) fn mark_session_task_fact_if(
     fence_wait: std::time::Duration,
     when: impl FnOnce() -> bool,
 ) -> NoteOutcome {
-    let edited = ctx.fabric.run_unfenced(fence_wait, || {
+    let edited = ctx.fabric.run_unfenced(fence_wait, |_| {
         let mut timeline = ctx.timeline.lock().unwrap_or_else(|p| p.into_inner());
         if !when() {
             return (NoteOutcome::Fenced, false);
@@ -1780,7 +1805,7 @@ pub(crate) fn note_program_block(
     fence_wait: std::time::Duration,
 ) -> bool {
     ctx.fabric
-        .run_unfenced(fence_wait, || {
+        .run_unfenced(fence_wait, |_| {
             ctx.timeline
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())

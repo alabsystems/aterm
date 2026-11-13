@@ -1780,12 +1780,17 @@ fn table_inventory_reads_beside_held_control_and_catalog_writers() {
     assert!(held.inventory(&session).unwrap().next().is_some());
 }
 
+/// A read whose wait has already run out tries each lock once and waits on none, so the
+/// custody held past its wait is met at once. The held custody, not the spent deadline, makes
+/// it busy: the same read is ready once custody is let go.
 #[test]
 fn commons_status_beside_a_custody_observation_held_past_its_wait_is_busy() {
     use aterm_secrets::commons::roster::Role;
     let lab = crate::table::tests::Lab::new(&[Role::Writer]);
     lab.bootstrap(0);
     let paths = &lab.paths[0];
+    let config = paths.home.join("config");
+    let past_its_wait = || commons_status_until(paths, &config, std::time::Instant::now()).unwrap();
     let custody = aterm_uds::private_file::PrivateLock::take(
         &paths.dir,
         "commons.lock",
@@ -1793,13 +1798,14 @@ fn commons_status_beside_a_custody_observation_held_past_its_wait_is_busy() {
         "held",
     )
     .unwrap();
-    let busy = status(paths);
+    let busy = past_its_wait();
     assert_eq!(busy["state"].as_str(), Some("control-busy"), "{busy}");
     assert_eq!(busy["membership_checked"].as_bool(), Some(false));
     assert_eq!(busy["ready"].as_bool(), Some(false));
     assert!(busy.get("role").is_none());
     assert!(busy.get("network_id").is_none());
     drop(custody);
+    assert_eq!(past_its_wait()["state"].as_str(), Some("ready"));
     assert_eq!(status(paths)["state"].as_str(), Some("ready"));
 }
 

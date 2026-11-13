@@ -1545,11 +1545,11 @@ fn harness_verdict(text: &str) -> Verdict {
 #[test]
 fn need_words_takes_the_frame_off_a_harness_entry() {
     use aterm_phase::Program;
-    let whole = harness_entry("claude", "the release credential to sign 0.48.0", 0);
+    let whole = harness_entry("claude", "the release permission to sign 0.48.0", 0);
     assert_eq!(
         need_words(&whole),
         Some(NeedWords {
-            first: "the release credential to sign 0.48.0",
+            first: "the release permission to sign 0.48.0",
             more: 0,
             program: Program::Claude,
             tail: NeedTail::CarryingOn,

@@ -6,7 +6,6 @@
 pub mod agents_panel;
 pub mod agy;
 pub mod anchors;
-pub mod announcement;
 pub mod answered;
 pub mod auto_mode;
 pub mod autocompact;
@@ -20,7 +19,6 @@ pub mod harness_version;
 pub mod kimi;
 pub mod login;
 pub mod muse;
-pub mod notice;
 pub mod panel;
 pub mod phase;
 pub mod prompt;
@@ -42,10 +40,6 @@ mod vendor_drift;
 mod vendor_files;
 
 pub use anchors::{ANCHORS, anchor, anchor_text};
-pub use announcement::{
-    AnnouncementPlace, AnnouncementScan, BAR as ANNOUNCEMENT_BAR, announcement_scan,
-    announcement_scrolled, announcement_unmoved,
-};
 pub use autocompact::{Offer, OfferFocus};
 pub use command::{CLAUDE_EXIT_WORDS, DraftCommand, draft_command};
 pub use credits::{ModelWeek, UsageSighting, WeekModel, usage_sighting};
@@ -57,7 +51,6 @@ pub use login::{
     LoginAtWall, LoginMethod, LoginScreen, Picker as LoginPicker, login_at_wall, login_interrupted,
     login_over_limit, login_screen,
 };
-pub use notice::{NoticePlace, NoticeScan, update_notice_scan, update_notice_unmoved};
 pub use panel::{
     PanelRenderer, SettingsPanel, panel_tail, settings_panel, usage_tab_mark, usage_unsettled,
 };

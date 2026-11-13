@@ -17,5 +17,5 @@ fn sweeps_name_both_crates_and_their_subject() {
         "assert_eq!(a.si_pid() as i128, b.si_pid() as i128, \"siginfo_t::si_pid differs"
     ));
     assert!(!si.contains('@'));
-    assert_eq!(siginfo_projection("si_band"), None);
+    assert_eq!(siginfo_projection("unknown_accessor"), None);
 }

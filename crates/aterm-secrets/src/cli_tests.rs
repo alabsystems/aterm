@@ -2981,6 +2981,61 @@ fn status_says_what_the_node_service_last_did_with_the_vault() {
     );
 }
 
+/// `status` says what the server job's store holds, read from the store its unit names: a server
+/// that runs and holds no vault says so (a Linux member's ran that way for its whole life while
+/// `status` said only "running").
+#[cfg(unix)]
+#[test]
+fn status_says_when_the_server_holds_no_vault() {
+    use crate::service::{Job, State};
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let paths = crate::client::Paths::for_home(&root.path().join("home"));
+    let program = root.path().join("aterm");
+    std::fs::write(&program, b"").expect("a program file");
+    let args: Vec<String> = ["secrets", "serve", "--no-keep-awake"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    if cfg!(target_os = "macos") {
+        crate::service::write_plist(&paths.home, Job::Server, &program, &args)
+    } else {
+        crate::service::write_unit(&paths.home, Job::Server, &program, &args)
+    }
+    .expect("the server's unit");
+    let running = Ok(State::Installed {
+        pid: Some(7),
+        unit: crate::service::unit_file(&paths.home, Job::Server),
+    });
+    let words = |state: &crate::Result<State>| unix::server_words(&paths, state);
+    assert_eq!(words(&running), "running (pid 7), holds no vault");
+    assert_eq!(words(&Ok(State::Absent)), "not installed");
+
+    std::fs::create_dir_all(paths.served()).expect("the store");
+    let vault = |name: &str| {
+        crate::envelope::sign(
+            &crate::envelope::Unsigned {
+                name: name.to_owned(),
+                seq: 3,
+                time: 1_792_530_003,
+                handoff: Vec::new(),
+                parents: Vec::new(),
+                lockers: vec![crate::envelope::Locker {
+                    label: "admin".to_owned(),
+                    armored: crate::envelope::test_armor(&[3; 40]),
+                }],
+            },
+            &[5; 32],
+        )
+        .expect("a signed vault")
+    };
+    // A file that names another vault than its own is not held.
+    std::fs::write(paths.served().join("team.vault"), vault("alab")).unwrap();
+    assert_eq!(words(&running), "running (pid 7), holds no vault");
+    std::fs::write(paths.served().join("alab.vault"), vault("alab")).unwrap();
+    std::fs::write(paths.served().join("team.vault"), vault("team")).unwrap();
+    assert_eq!(words(&running), "running (pid 7), holds alab, team");
+}
+
 /// `status` of a machine of a signed vault names it by its code: the name it asked for
 /// may be another machine's in the vault.
 #[cfg(unix)]
@@ -3646,18 +3701,34 @@ fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
     let rel_path = secrets.join("gh_access_token_alabsystems");
     crate::fsx::write_atomic(&dev_path, b"ghp_dev_token_1\n", 0o600).expect("dev token");
     crate::fsx::write_atomic(&rel_path, b"ghp_rel_token_2\n", 0o600).expect("rel token");
+    // The applied registry names both GitHub entries: the one path the helper resolves them by.
+    let paths = crate::client::Paths::locate_for_home(&home);
+    crate::fsx::ensure_private_dir(&paths.dir).expect("vault dir");
+    let registry = |text: &str| {
+        crate::fsx::write_atomic(&paths.dir.join("state.toml"), text.as_bytes(), 0o600)
+            .expect("state.toml");
+    };
+    registry("[manifest]\ngh_access_token = 'a'\ngh_access_token_alabsystems = 'b'\n");
 
+    let answer = |dev: &unix::DevToken<'_>,
+                  dev_user: Option<&str>,
+                  op: Option<&str>,
+                  term: bool,
+                  stdin: &[u8]|
+     -> (String, Option<crate::need::GhProfile>) {
+        let mut cursor = std::io::Cursor::new(stdin);
+        let answer = unix::git_credential_reply(Some(&paths), dev_user, dev, op, term, &mut cursor);
+        (
+            String::from_utf8(answer.reply.as_slice().to_vec()).expect("utf8"),
+            answer.missing,
+        )
+    };
     let ask_from = |dev: &unix::DevToken<'_>,
                     dev_user: Option<&str>,
                     op: Option<&str>,
                     term: bool,
                     stdin: &[u8]|
-     -> String {
-        let mut cursor = std::io::Cursor::new(stdin);
-        let reply =
-            unix::git_credential_reply(Some(&home), None, dev_user, dev, op, term, &mut cursor);
-        String::from_utf8(reply.as_slice().to_vec()).expect("utf8")
-    };
+     -> String { answer(dev, dev_user, op, term, stdin).0 };
     let ask = |dev_user: Option<&str>, op: Option<&str>, term: bool, stdin: &[u8]| -> String {
         ask_from(&unix::DevToken::Vault, dev_user, op, term, stdin)
     };
@@ -3756,38 +3827,37 @@ fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
         "username=alabsystems\npassword=ghp_rel_token_2\n"
     );
 
-    // agh's vault.toml record names the dev login when its fingerprint matches the loaded token.
-    let fp = String::from_utf8(unix::agh_fingerprint(b"ghp_dev_token_1").to_vec()).unwrap();
-    let agh_dir = home.join(".config").join("aterm").join("agh");
-    std::fs::create_dir_all(&agh_dir).unwrap();
-    crate::fsx::write_atomic(
-        &agh_dir.join("vault.toml"),
-        format!("[dev]\nfingerprint = \"{fp}\"\nlogin = \"octocat\"\n").as_bytes(),
-        0o600,
-    )
-    .unwrap();
+    // NEGATIVE CONTROL: a token file the registry does not name is no token. git's request
+    // fails and the helper names gh:dev to file in the need ledger; the same with no registry.
+    let unnamed = b"protocol=https\nhost=github.com\n\n";
+    registry("[manifest]\ngh_access_token_alabsystems = 'b'\n");
     assert_eq!(
-        ask(
+        answer(&unix::DevToken::Vault, None, Some("get"), false, unnamed),
+        ("quit=1\n".to_owned(), Some(crate::need::GhProfile::Dev))
+    );
+    std::fs::remove_file(paths.dir.join("state.toml")).unwrap();
+    assert_eq!(
+        answer(&unix::DevToken::Vault, None, Some("get"), false, unnamed),
+        ("quit=1\n".to_owned(), Some(crate::need::GhProfile::Dev))
+    );
+    // A --token-file is no registry token: its absence files nothing.
+    assert_eq!(
+        answer(
+            &unix::DevToken::File {
+                file: &root.path().join("absent"),
+                key: None
+            },
             None,
             Some("get"),
             false,
-            b"protocol=https\nhost=github.com\n\n"
+            unnamed
         ),
-        "username=octocat\npassword=ghp_dev_token_1\n"
+        ("quit=1\n".to_owned(), None)
     );
-    assert_eq!(
-        ask(
-            None,
-            Some("get"),
-            false,
-            b"protocol=https\nhost=github.com\nusername=OctoCat\n\n"
-        ),
-        "username=OctoCat\npassword=ghp_dev_token_1\n"
-    );
+    registry("[manifest]\ngh_access_token = 'a'\ngh_access_token_alabsystems = 'b'\n");
 
-    // Negative controls: rotated token with stale vault.toml fingerprint does not answer for
-    // the old login unless init.toml or --dev-user names it; stranger usernames, non-get ops,
-    // other hosts and plain HTTP get no answer.
+    // A named login answers only where --dev-user or init.toml's [github] account names it;
+    // stranger usernames, non-get ops, other hosts and plain HTTP get no answer.
     crate::fsx::write_atomic(&dev_path, b"ghp_rotated_token\n", 0o600).unwrap();
     assert_eq!(
         ask(
@@ -3933,12 +4003,46 @@ fn git_credential_routes_vault_tokens_and_quits_when_unusable() {
     );
     std::fs::remove_file(&rel_path).unwrap();
     assert_eq!(
-        ask(
+        answer(
+            &unix::DevToken::Vault,
             None,
             Some("get"),
             false,
             b"protocol=https\nhost=github.com\nusername=alabsystems\n\n"
         ),
-        "quit=1\n"
+        ("quit=1\n".to_owned(), Some(crate::need::GhProfile::Release))
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn git_credential_files_a_missing_token_once_under_its_agh_purpose() {
+    use crate::need::{GhProfile, Purpose, Want};
+
+    let root = aterm_tempfile::tempdir().expect("tempdir");
+    let paths = crate::client::Paths::locate_for_home(&root.path().join("home"));
+    let file = |profile: GhProfile| -> String {
+        let mut err = Vec::new();
+        unix::file_missing(&paths, profile, &mut err);
+        String::from_utf8(err).expect("utf8")
+    };
+    for (profile, purpose) in [
+        (GhProfile::Dev, Purpose::AghDev),
+        (GhProfile::Release, Purpose::AghRelease),
+    ] {
+        let want = Want::Gh(profile);
+        let first = file(profile);
+        let again = file(profile);
+        let rows: Vec<_> = crate::need::list(&paths)
+            .expect("ledger")
+            .into_iter()
+            .filter(|need| need.want == want)
+            .collect();
+        assert_eq!(rows.len(), 1, "one row per want: {rows:?}");
+        assert_eq!(rows[0].purpose, purpose);
+        let id = aterm_codec::hex::encode_lower(&rows[0].id);
+        for line in [&first, &again] {
+            assert!(line.contains(&want.key()) && line.contains(&id), "{line}");
+        }
+    }
 }

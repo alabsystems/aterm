@@ -710,7 +710,7 @@ impl LineSizeSpan {
 }
 
 /// A host chrome row drawn at pixel resolution.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct ChromeRaster {
     /// The frame row (counted from the top of the composed input, like [`RenderInput::cells`]).
     pub row: u16,
@@ -730,6 +730,34 @@ pub struct ChromeRaster {
     pub rings: Vec<ChromeRing>,
     /// Cells whose glyph is drawn as a band icon instead of from a font.
     pub icons: Vec<ChromeIcon>,
+}
+
+impl Clone for ChromeRaster {
+    fn clone(&self) -> Self {
+        Self {
+            row: self.row,
+            ground: std::sync::Arc::clone(&self.ground),
+            rail: std::sync::Arc::clone(&self.rail),
+            rail_h: self.rail_h,
+            clear_rail: self.clear_rail,
+            own: self.own.clone(),
+            split: self.split,
+            rings: self.rings.clone(),
+            icons: self.icons.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.row = source.row;
+        self.ground.clone_from(&source.ground);
+        self.rail.clone_from(&source.rail);
+        self.rail_h = source.rail_h;
+        self.clear_rail = source.clear_rail;
+        self.own.clone_from(&source.own);
+        self.split = source.split;
+        self.rings.clone_from(&source.rings);
+        self.icons.clone_from(&source.icons);
+    }
 }
 
 impl ChromeRaster {

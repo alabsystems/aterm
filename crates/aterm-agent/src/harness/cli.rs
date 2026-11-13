@@ -542,7 +542,10 @@ VAULT TOKENS (Claude Code's pool, macOS):
   a session here is on has no token in use (or its token ends within 30 days, or a removed Mac
   was handed it), an `offer:` line names the one step that makes one; it is noted once per
   change of its state and of its stored login's (`ok`, `ending` within 7 days, `ended`), and
-  never while a token made here is not yet in vault. Off macOS the block still says each
+  never while a token made here is not yet in vault. A row with no login on this Mac (no
+  session here is logged into its account and its own login directory holds none) says `no
+  login here`, `none` in `--json`; an account this Mac only keeps a token record of says
+  nothing of a login, `unread` in `--json`. Off macOS the block still says each
   token's state, and no `offer:` line comes, since the step makes a token only on macOS.
   `--json` carries the same under `tokens`, each account's `offer{state, login, pair, since,
   step}`, and each session's `route`.
@@ -852,10 +855,18 @@ OTHER CLIS (`--cli codex|grok|kimi`; `--cli claude`, or none, is the above):
     it is refused, `next:` says until when, and a worker holds up to the startup deadline, which
     stalls it naming when the wall ends (a launch after that runs; `accounts use` clears the
     record at once). `next:` is what a new launch takes. A running codex-alab session
-    moves only at its weekly limit, by the handoff it proves itself, to the row an `at a weekly
+    moves at its weekly limit, by the handoff it proves itself, to the row an `at a weekly
     limit:` line names for the row it runs on (`next.wall_moves`, one for each row a session can
     run on and a limit moves off); while the owner's pin stands, only a session on the pinned row
-    moves, whose limit ends the pin. No other running session of these pools is moved. A Codex
+    moves so, whose limit ends the pin. It also moves when it is asked to:
+    `aterm ctl @<sid> restart account=<label>` (or `account-auto`, the row a new launch would
+    get) ends it and relaunches it on that row, once the row proves it serves there (signed in on
+    this Mac, not at a limit, a usage read answered then), else it resumes as a relaunch with no
+    account asked would: on the row it ran on, or on the serving row if that one no longer
+    serves (`aterm ctl help restart`). That move is the one session's: it writes no pin, no active
+    row and no rotation, `accounts use` stays the pool's pin for launches, and a session moved off
+    the pinned row does not move at its limit while the pin holds. No other running session of
+    these pools is moved. A Codex
     tab a cold restore relaunches, and a self-claimed codex-alab aterm relaunches after it
     crashed or was restarted, leaves a row now limited, signed out or not signed in here for the
     serving one, the row it ran on read first where the records say it serves and its reading is
@@ -931,6 +942,11 @@ FLEET ACCOUNTS (fetched where a source is named, signed in wherever a roster sta
     needs no source.
 ";
 
+// The help's `30m` login wall is `upgrade::LOGIN_WALL_S`, its `1h` usage limit
+// `upgrade::LIMIT_WALL_S`.
+const _: () = assert!(crate::harness::upgrade::LOGIN_WALL_S == 30 * 60);
+const _: () = assert!(crate::harness::upgrade::LIMIT_WALL_S == 60 * 60);
+const _: () = assert!(crate::harness::upgrade::SILENT_HOLD_S == 70 * 60);
 const HELP_UPGRADE: &str = "\
 `upgrade` moves live supervised sessions onto a newer build in place,
 keeping the conversation and running work.
@@ -963,7 +979,11 @@ MODES:
     and where the move can be planned; where the tab offers it and the build is proved
     to start it also names `aterm ctl @self restart`). A box, a draft, a person's typing
     or a held tab still hold that restart, and with Autopilot off nothing is typed and
-    the work holds the move as before.
+    the work holds the move as before. A session whose task finished or landed is told
+    nothing: what it left that only follows (a `tail -f` of files, a development server
+    such as `npm run dev`) holds the move 70m with nobody at the tab, then the session
+    restarts at its next break or idle point and the line after the resume names what
+    ended; any other work it left holds the move until it ends.
   - Cooperative mode (`[harness] upgrade_ask = true`): types a readiness notice asking the
     agent to finish background work and confirm. It repeats every 30m, up to 4 notices,
     then rests 2h (then 4h, 8h, and 24h from the fourth unanswered round in a row) and
@@ -974,8 +994,11 @@ THE LADDER (activity delays, never disables):
   - >=20m (`settled`): two idle reads 20 s apart with the same last words.
   - >=1h (`keys-only`): human grace narrows to a keystroke in the last 20 s.
   - >=2h or `--now` (`land`): first idle pause with no keystroke in the last 20 s.
-  Never moves over a draft, approval box, keystroke in the last 20 s, hold, usage/login
-  wall, or running child process.
+  Never moves over a draft, approval box, keystroke in the last 20 s or hold, nor over a
+  running child process but as MODES says. A Claude Code login wall holds the move 30m from its first answer, and a
+  usage limit 1h from its first (a key of the person's starts either again); past that,
+  with nobody at the tab, it restarts with nothing typed, leaving signing in to
+  `[harness] logins` and the carry past the limit's reset to the supervisor.
 
 SCOPE & EXIT CODES:
   - Moves only foreground jobs on an aterm tab's own PTY (tmux/screen/ssh panes wait as
@@ -1004,8 +1027,8 @@ const HELP_UPGRADE_STATUS: &str = "\
     look), or `overdue` (>6h behind, >1h past a usage-limit reset, or a notice refused for 90m).
   - `held_by=`: child processes (`<pid>(<name>:<age>),...` or `-`).
   - `release=`: release line owed after an abandoned notice (`gave-up`, `void`, `skipped`,
-    `deferred`, `retargeted`, `no-target`, the reason a round stopped after its notice,
-    or `-`).
+    `deferred`, `retargeted`, `no-target`, `switched-off`, the reason a round stopped after
+    its notice, or `-`).
   - `rung=`: ladder rung (`prefer`, `settled`, `keys-only`, `land`, or `-`).
   - `looked=`, `by=`, `point=`, `guard=`, `watch_at=`: last host look, build, idle point,
     the supervisor's withholding guard word (such as `wall`, `settle`, `no-background-wait`,
@@ -7202,6 +7225,7 @@ fn upgrade_pass(
             out,
             json,
             &super::upgrade_drive::Report {
+                rung: None,
                 pid: 0,
                 tab: "-".to_string(),
                 session: "-".to_string(),
@@ -7557,6 +7581,11 @@ pub trait AccountsHost {
     /// The peer's own unattended due pass, using its authenticated native fleet Drive.
     fn renew_remote(&self, _host: &str) -> Result<super::remote_renew::Output, String> {
         Err("this host runs no native fleet renewal".to_string())
+    }
+
+    /// Why no sign-in window can open at this machine's desk ([`super::browser_window::no_window_desk`]: a host that is not Unix, or a Linux session with no display), which `accounts browser` refuses on before anything else about the window ([`run_accounts_browser`]); `None` where one can. The process's desk in a run ([`LiveAccounts`]); a desk on any other host, so a test's `accounts browser` reads its stand-in host alone, never the display of the session the test runs in.
+    fn no_window_desk(&self) -> Option<&'static str> {
+        None
     }
 
     /// Whether this command runs over SSH (`SSH_CONNECTION` set): the browser is on the machine the owner is at, so nothing is opened here and Claude Code's own paste-code flow is used ([`RenewBrowser::Remote`]).
@@ -8098,6 +8127,7 @@ impl AccountsHost for LiveAccounts {
         crate::fleet_member::survey_fleet(&aterm_ctl::FleetAsk {
             host: None,
             within: aterm_ctl::FLEET_WITHIN,
+            holder: None,
         })
         .ok()
     }
@@ -8190,6 +8220,10 @@ impl AccountsHost for LiveAccounts {
 
     fn renew_remote(&self, host: &str) -> Result<super::remote_renew::Output, String> {
         super::remote_renew::request(host)
+    }
+
+    fn no_window_desk(&self) -> Option<&'static str> {
+        super::browser_window::no_window_desk()
     }
 
     fn under_ssh(&self) -> bool {
@@ -10884,6 +10918,14 @@ fn use_recorded(
 ) -> (UseTakes, String) {
     let product = cli.connector().product;
     let walls_move = walls_move_sessions((cli, launch), rotation, roster, state, enrolled, now);
+    // A codex-alab also moves when it is asked to, pin or no pin: said where a session of this
+    // pool can run on another row at all. The verb is named, not spelled as a command: nothing
+    // these words read names the session or the row, and every command a surface prints is one
+    // that can be run as printed.
+    let asked = match cli {
+        Cli::Codex => "its tab's `restart account=<label>` control verb",
+        Cli::Claude | Cli::Grok | Cli::Kimi | Cli::Agy => "",
+    };
     let stay = match pinned {
         Some(label)
             if wall_moves((cli, launch), rotation, roster, state, enrolled, now)
@@ -10893,12 +10935,25 @@ fn use_recorded(
             format!(
                 "while the pin holds, a running {product} session stays where it is, but for one \
                  on `{label}` at its weekly limit, which ends the pin (the report's `at a weekly \
-                 limit:` line)"
+                 limit:` line){}",
+                if asked.is_empty() {
+                    String::new()
+                } else {
+                    format!(", and for one asked to move with {asked}")
+                }
             )
         }
+        Some(_) if walls_move && !asked.is_empty() => format!(
+            "while the pin holds, a running {product} session stays where it is unless it is \
+             asked to move with {asked}"
+        ),
         Some(_) if walls_move => {
             format!("while the pin holds, a running {product} session stays where it is")
         }
+        None if walls_move && !asked.is_empty() => format!(
+            "a running {product} session moves at its weekly limit, where the report's `at a \
+             weekly limit:` line says so, or when it is asked to with {asked}"
+        ),
         None if walls_move => format!(
             "a running {product} session moves only at its weekly limit, where the report's `at \
              a weekly limit:` line says so"
@@ -18407,26 +18462,7 @@ fn run_accounts_login_for(
     }
 }
 
-/// `accounts browser <label> [--cli <id>]` (design §6): the row's own browser profile ([`super::headless_oauth::row_browser_profile`], the one its headless sign-ins run in) opened in a window at the vendor's sign-in page ([`crate::ai::connector::Accounts::sign_in_page`]) for a person to sign in to the vendor's site once, under the machine's sign-in lock ([`AccountsHost::open_window`]). It runs only at this machine's desk: a terminal on stdin, no SSH, a window browser ([`AccountsHost::window_browser`], else the pinned Chrome for Testing fetched first, before the sign-in lock is taken: [`AccountsHost::fetch_window_browser`]) and no other browser holding the profile. The profile is claimed for the window ([`super::browser_window::ProfileLock`]), its password manager turned off first, and after the window opened headlessly once more ([`AccountsHost::tidy_profile`]) to drop every identity provider's cookies and ask whether the vendor's web session is kept there ([`crate::ai::connector::Accounts::web_session_key`]). From before the window until its record is written, the signals that would end this process only end the window ([`AccountsHost::hold_window_ends`]), and the profile carries [`super::browser_window::UNTIDIED_MARK`] until that pass has run, so a window whose pass never ran is made up by the next headless launch on the profile ([`super::browser_window::make_up_tidy`]). The ledger keeps the page's host, how the window ended and that answer, never a URL, code or email; nothing else is written but the profile. Exit 0 where the vendor keeps its session there, or, for a vendor whose session aterm cannot see, once the person was done (or quit the browser); exit 1 where the identity providers' cookies could not be removed.
-fn run_accounts_browser(
-    cli: Cli,
-    env: &Env,
-    host: &dyn AccountsHost,
-    label: &str,
-    out: &mut dyn Write,
-    err: &mut dyn Write,
-) -> ExitCode {
-    run_accounts_browser_with(
-        cli,
-        env,
-        host,
-        label,
-        out,
-        err,
-        super::browser_window::no_window_desk(),
-    )
-}
-
+/// `accounts browser <label> [--cli <id>]` (design §6): the row's own browser profile ([`super::headless_oauth::row_browser_profile`], the one its headless sign-ins run in) opened in a window at the vendor's sign-in page ([`crate::ai::connector::Accounts::sign_in_page`]) for a person to sign in to the vendor's site once, under the machine's sign-in lock ([`AccountsHost::open_window`]). It runs only at this machine's desk: one that opens a window ([`AccountsHost::no_window_desk`]), a terminal on stdin, no SSH, a window browser ([`AccountsHost::window_browser`], else the pinned Chrome for Testing fetched first, before the sign-in lock is taken: [`AccountsHost::fetch_window_browser`]) and no other browser holding the profile. The profile is claimed for the window ([`super::browser_window::ProfileLock`]), its password manager turned off first, and after the window opened headlessly once more ([`AccountsHost::tidy_profile`]) to drop every identity provider's cookies and ask whether the vendor's web session is kept there ([`crate::ai::connector::Accounts::web_session_key`]). From before the window until its record is written, the signals that would end this process only end the window ([`AccountsHost::hold_window_ends`]), and the profile carries [`super::browser_window::UNTIDIED_MARK`] until that pass has run, so a window whose pass never ran is made up by the next headless launch on the profile ([`super::browser_window::make_up_tidy`]). The ledger keeps the page's host, how the window ended and that answer, never a URL, code or email; nothing else is written but the profile. Exit 0 where the vendor keeps its session there, or, for a vendor whose session aterm cannot see, once the person was done (or quit the browser); exit 1 where the identity providers' cookies could not be removed.
 #[cfg_attr(
     any(test, debug_assertions),
     aterm_spec_anchor::refines(
@@ -18435,14 +18471,13 @@ fn run_accounts_browser(
         project = "aterm_agent::harness::cli::tests::signin_epoch::epoch_transition"
     )
 )]
-fn run_accounts_browser_with(
+fn run_accounts_browser(
     cli: Cli,
     env: &Env,
     host: &dyn AccountsHost,
     label: &str,
     out: &mut dyn Write,
     err: &mut dyn Write,
-    desk_refusal: Option<&str>,
 ) -> ExitCode {
     use super::browser_window::WindowEnd;
     let refuse = |err: &mut dyn Write, what: &str| {
@@ -18497,7 +18532,7 @@ fn run_accounts_browser_with(
     if accounts::bound(&file_roster, &logins).row(label).is_none() {
         return refuse(err, "the browser account is no longer listed");
     }
-    if let Some(why) = desk_refusal {
+    if let Some(why) = host.no_window_desk() {
         return refuse(err, why);
     }
     if !host.stdin_is_terminal() {

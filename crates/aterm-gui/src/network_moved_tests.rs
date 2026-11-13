@@ -120,6 +120,106 @@ fn the_browse_stops_and_starts_with_the_sharing_switch() {
         ],
         "each change said once"
     );
+
+    // The actual retry loop hears a newly installed or replaced broker on an unchanged LAN.
+    // Its ordinary retry is beyond this test's hang detector, so only the socket event can
+    // resume the second attempt. The stand-in speaks the normal checked hello, not Bonjour.
+    fn answer(path: &std::path::Path) -> std::thread::JoinHandle<()> {
+        use aterm_uds::lan::wire::{Frame, Reader};
+        let listener = aterm_uds::CtlListener::bind(path).unwrap();
+        std::thread::spawn(move || {
+            let until = Instant::now() + HANG;
+            let (stream, _) = aterm_uds::accept(
+                &listener,
+                aterm_uds::AcceptWait::Until(until),
+                aterm_uds::AcceptedMode::Blocking,
+            )
+            .unwrap();
+            aterm_uds::lan::wire::send(
+                &stream,
+                &Frame::Hello {
+                    protocol: aterm_uds::lan::PROTOCOL,
+                    build: "browse-wake-fixture".into(),
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                Reader::new(0).frame(&stream, Some(until)).unwrap(),
+                Some(Frame::Hello { .. })
+            ));
+        })
+    }
+    for (replace, turn_off) in [(false, false), (true, false), (false, true)] {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        std::fs::create_dir_all("/tmp/.ubd").unwrap();
+        let root = aterm_tempfile::Builder::new()
+            .tempdir_in("/tmp/.ubd")
+            .unwrap();
+        let folder = root.path().join("broker");
+        let socket = folder.join("socket");
+        let prior = if replace {
+            std::fs::create_dir(&folder).unwrap();
+            Some(answer(&socket))
+        } else {
+            None
+        };
+        let mut arrivals = aterm_uds::lan::seam_here(
+            aterm_uds::lan::Seam {
+                socket: Some(socket.clone()),
+                ..Default::default()
+            },
+            aterm_uds::lan::Arrivals::new,
+        );
+        let on = Arc::new(AtomicBool::new(true));
+        let running = Arc::clone(&on);
+        let (sent, received) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut prior = prior;
+            let mut serving = None;
+            let mut attempts = 0;
+            browse_until_off_with(
+                &mut || running.load(Ordering::Acquire),
+                &mut arrivals,
+                BROWSE_AGAIN + HANG,
+                |_| {
+                    attempts += 1;
+                    if attempts == 1 {
+                        if let Some(old) = prior.take() {
+                            old.join().unwrap();
+                            std::fs::remove_file(&socket).unwrap();
+                        }
+                        if !turn_off {
+                            std::fs::create_dir_all(&folder).unwrap();
+                            serving = Some(answer(&socket));
+                        }
+                        sent.send(None).unwrap();
+                        Err(aterm_uds::lan::LanError::Io(std::io::Error::other(
+                            "browse ended",
+                        )))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            if let Some(serving) = serving {
+                serving.join().unwrap();
+            }
+            sent.send(Some(attempts)).unwrap();
+        });
+        let first = received.recv_timeout(HANG);
+        let began = matches!(first.as_ref(), Ok(None));
+        if turn_off || !began {
+            on.store(false, Ordering::Release);
+        }
+        let completed = began.then(|| received.recv_timeout(HANG));
+        on.store(false, Ordering::Release);
+        worker.join().unwrap();
+        assert_eq!(first.unwrap(), None);
+        assert_eq!(
+            completed.unwrap().unwrap(),
+            Some(if turn_off { 1 } else { 2 })
+        );
+    }
 }
 
 /// A move told wakes every watch once, with its source; a watch made after it was not told

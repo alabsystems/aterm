@@ -811,7 +811,7 @@ pub static VERBS: &[Verb] = &[
     Verb {
         path: &["repo", "fetch"],
         class: Class::Git,
-        usage: "agh repo fetch REPO DIR (--ref REF --into REF [--checkout-closure [--checkout-cache DIR]] | --input FILE | --objects FILE) [--anonymous]",
+        usage: "agh repo fetch REPO DIR (--ref REF --into REF [--source-object-cache DIR | --checkout-closure [--checkout-cache DIR]] | --input FILE | --objects FILE) [--anonymous]",
         summary: "fetch exact sources into agh's private namespace without moving other refs",
         example: "agh repo fetch alabsystems/aterm . --input refs.json --anonymous",
         noun: Noun::Repo,
@@ -820,13 +820,17 @@ pub static VERBS: &[Verb] = &[
         flags: &[
             value("--ref", "full ref or forty-digit object id"),
             value("--into", "destination beneath refs/agh/"),
+            value(
+                "--source-object-cache",
+                "read-only object DATA for a complete exact source fetch",
+            ),
             on(
                 "--checkout-closure",
-                "exact commit ancestry and selected checkout blobs only",
+                "retain ancestry metadata and the selected checkout blobs",
             ),
             value(
                 "--checkout-cache",
-                "read-only immutable object cache for checkout closure",
+                "read-only selected-checkout object DATA",
             ),
             value(
                 "--input",

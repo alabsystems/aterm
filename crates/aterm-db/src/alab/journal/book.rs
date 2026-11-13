@@ -13,6 +13,7 @@ use super::{
     place::{Holding, Why},
     relay::{Entry, Heard, Rk},
     spool::{KEEP_S, MAX_SPOOL},
+    upd,
 };
 use crate::{
     Error, Result,
@@ -21,6 +22,7 @@ use crate::{
     typed::owned::{caps, fit},
 };
 use aterm_json::{Map, Value, json};
+use aterm_update_core::update_record::UpdateRecord;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// One week, the journal ring's period.
@@ -437,6 +439,11 @@ pub(crate) struct Book {
     /// relays and a bucket another Mac covered that falls to it after that Mac went away (design
     /// §11 step 12).
     pub known: BTreeMap<(Pk, Rk), Entry>,
+    /// This Mac's update record as this pass read it ([`upd::record`]); never saved, so a pass
+    /// that reads none writes no `upd` row.
+    pub upd: Option<UpdateRecord>,
+    /// What the last `upd` row said ([`upd::content`]) and when.
+    pub upd_stated: Option<Stated>,
 }
 
 /// One planned flush record (design §4.17 "Record packing").
@@ -449,6 +456,8 @@ pub(crate) struct Planned {
     pub uses: Vec<(Pk, Value)>,
     pub places: Vec<(Pk, Value)>,
     pub relays: Vec<(u8, Value)>,
+    /// The `upd` row it carries.
+    pub upd: Option<Value>,
     /// Planned with the journal off: its `sum` says so.
     pub off: bool,
 }
@@ -573,7 +582,8 @@ impl Book {
 
     /// Whether a flush is due at `now` in week `period` (design §3.9): the week's first record
     /// (its `sum`, even idle); otherwise, while under the pace line, a `sum` that must say the
-    /// journal was turned off or on, and with the journal on a sharp event, 128 waiting events,
+    /// journal was turned off or on, and with the journal on a sharp event, an update record the
+    /// last `upd` row did not say ([`Self::upd_waiting`]), 128 waiting events,
     /// or six hours since the last flush with events or rows waiting. With the journal off
     /// (`off`, `[alab] journal = false`) nothing but the `sum` is ever due.
     pub(crate) fn due(
@@ -598,6 +608,7 @@ impl Book {
             return false;
         }
         outbox.iter().any(Event::sharp)
+            || self.upd_waiting()
             || outbox.len() >= BATCH_EVENTS
             || ((owed || !outbox.is_empty()) && now >= self.flushed_at.saturating_add(ROUTINE_S))
     }
@@ -621,6 +632,32 @@ impl Book {
             }
         }
         Ok(due)
+    }
+
+    /// Whether the update record this pass read says something the last `upd` row did not: due
+    /// as promptly as a sharp event.
+    pub(crate) fn upd_waiting(&self) -> bool {
+        self.upd
+            .as_ref()
+            .and_then(|record| upd::row(record, 0, 0))
+            .is_some_and(|row| {
+                self.upd_stated
+                    .as_ref()
+                    .is_none_or(|said| said.value != upd::content(&row))
+            })
+    }
+
+    /// The `upd` row due now at counter `n` in week `period`: the record says something the last
+    /// row did not, or it is the first record of a week while a hold or a trial stands (the
+    /// weekly carry; an idle, proven Mac's row lapses with its weeks).
+    pub(crate) fn upd_due(&self, n: u64, period: u64) -> Option<Value> {
+        let record = self.upd.as_ref()?;
+        let row = upd::row(record, n, period)?;
+        let said = self.upd_stated.as_ref();
+        let changed = said.is_none_or(|said| said.value != upd::content(&row));
+        let carry = said.is_some_and(|said| said.period < period)
+            && (record.hold.is_some() || record.trial.is_some());
+        (changed || carry).then_some(row)
     }
 
     /// Whether this Mac's journal saw `account` run or sign in here: a session start or a sign-in
@@ -786,10 +823,11 @@ impl Book {
     }
 
     /// One flush record from `outbox`, the rows due and `heard`'s relays, at counter `n` (design
-    /// §4.17 "Record packing"): the `ev` batch first, then `sum`, then the changed `use` rows,
-    /// then the `place` rows, then the `relay` rows, while the record stays within 64 changes and 60 KiB; what does
-    /// not fit goes in the next flush. With the journal off (`off`) the record holds the `sum`
-    /// row alone, saying so: no event, `use`, `place` or `relay` row is published.
+    /// §4.17 "Record packing"): the `ev` batch first, then `sum`, then the `upd` row, then the
+    /// changed `use` rows, then the `place` rows, then the `relay` rows, while the record stays
+    /// within 64 changes and 60 KiB; what does not fit goes in the next flush. With the journal
+    /// off (`off`) the record holds the `sum` row alone, saying so: no event, `upd`, `use`,
+    /// `place` or `relay` row is published.
     ///
     /// # Errors
     /// A row cannot be built within its cap.
@@ -863,6 +901,16 @@ impl Book {
         if off {
             return Ok(planned);
         }
+        if let Some(row) = self.upd_due(n, period) {
+            let change = Change {
+                collection: super::UPD.name.into(),
+                key: uuid.clone(),
+                value: Some(row.clone()),
+            };
+            if offer(&mut planned, &mut payload_len, change) {
+                planned.upd = Some(row);
+            }
+        }
         for (pk, row) in self.uses_due(n, period, now)? {
             let change = Change {
                 collection: super::USE.name.into(),
@@ -926,6 +974,13 @@ impl Book {
             if ended {
                 self.places.remove(pk);
             }
+        }
+        if let Some(row) = &planned.upd {
+            self.upd_stated = Some(Stated {
+                value: upd::content(row),
+                at: now,
+                period,
+            });
         }
         for (bucket, row) in &planned.relays {
             self.relays.insert(
@@ -1013,6 +1068,7 @@ impl Book {
             "relays": self.relays.iter()
                 .map(|(b, s)| (b.to_string(), stated(s)))
                 .collect::<Map>(),
+            "upd": self.upd_stated.as_ref().map(stated),
             "heard": self.heard.iter()
                 .map(|(m, ns)| (m.clone(), json!(ns.iter().copied().collect::<Vec<u64>>())))
                 .collect::<Map>(),
@@ -1044,6 +1100,7 @@ impl Book {
             checked_at: u(v.get("checked_at")),
             held_until: u(v.get("held_until")),
             kept: v.get("kept").and_then(Value::as_str).map(str::to_owned),
+            upd_stated: stated(v.get("upd")),
             ..Self::default()
         };
         for (pk, f) in v

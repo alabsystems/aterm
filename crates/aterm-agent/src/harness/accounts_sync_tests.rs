@@ -7279,9 +7279,6 @@ fn its_arrival_meets_the_need(
          (browser {browser}, routed {routed}): {}",
         met.line
     );
-    if meets {
-        assert!(need::exceptions(&need::peek(&paths).unwrap()).is_empty());
-    }
 }
 #[test]
 fn app_scope_cancellation_during_fetch_does_not_publish_the_fetched_roster() {

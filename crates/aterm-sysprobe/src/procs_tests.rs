@@ -310,9 +310,10 @@ fn the_tick_rate_sysctl_answers_a_frequency() {
     );
 }
 
-/// The sweep's CPU time is the kernel's, in nanoseconds, natively or under Rosetta: a stopped
-/// spinning child reads within 2x of what `wait4` reports for it.
-#[cfg(target_os = "macos")]
+/// The sweep's CPU time is the kernel's, in nanoseconds, natively or under Rosetta (and on
+/// Linux, where `stat`'s clock ticks are scaled by `_SC_CLK_TCK`): a stopped spinning child
+/// reads within 2x of what `wait4` reports for it.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn the_sweep_reads_a_stopped_childs_cpu_time_as_wait4_counts_it() {
     use super::stopped_spinner::{read, within_2x};
@@ -326,8 +327,8 @@ fn the_sweep_reads_a_stopped_childs_cpu_time_as_wait4_counts_it() {
     assert!(
         within_2x(swept_ns, kernel),
         "the sweep read {swept_ns} ns; the reap's rusage for the same stopped child is \
-         {kernel} ns (timebase {:?})",
-        kernel_timebase()
+         {kernel} ns ({})",
+        super::stopped_spinner::scale()
     );
 }
 
@@ -1046,7 +1047,7 @@ fn the_sweep_finds_this_process_and_its_parent() {
     assert!(mine.ppid > 0, "{mine:?}");
     assert!(mine.cpu_ns.is_some_and(|ns| ns > 0), "{mine:?}");
     assert!(mine.footprint.is_some_and(|b| b > 0), "{mine:?}");
-    if cfg!(target_os = "macos") {
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
         assert!(
             mine.disk_read.is_some() && mine.disk_written.is_some(),
             "{mine:?}"
@@ -1063,10 +1064,21 @@ fn the_sweep_finds_this_process_and_its_parent() {
         assert_eq!(mine.name, file);
     }
     assert!(mine.read_at.is_some(), "{mine:?}");
+    if cfg!(any(target_os = "macos", target_os = "linux")) {
+        // Running, so runnable: never less than its CPU time.
+        assert!(
+            mine.runnable_ns
+                .is_some_and(|r| r > 0 && mine.cpu_ns.is_some_and(|c| r >= c)),
+            "{mine:?}"
+        );
+    }
     if cfg!(target_os = "macos") {
-        assert!(mine.runnable_ns.is_some_and(|r| r > 0), "{mine:?}");
         assert!(mine.peak_footprint.is_some_and(|p| p > 0), "{mine:?}");
         assert!(mine.disk_written.is_some(), "{mine:?}");
+    }
+    if cfg!(target_os = "linux") {
+        // The test harness runs tests on threads of its own.
+        assert!(mine.threads.is_some_and(|t| t >= 2), "{mine:?}");
     }
     assert!(sweep.procs.iter().any(|p| p.pid == mine.ppid));
 }

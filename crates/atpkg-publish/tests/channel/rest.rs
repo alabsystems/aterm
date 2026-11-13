@@ -19,8 +19,8 @@ use agh_fake::{
 use aterm_types::http_retry::Policy;
 use aterm_uds::spawnfd::Command;
 use aterm_update_core::github_rest::{Direct, Origins, Spawn};
-use atpkg_publish::host::rest::{RestHost, STAGED, probe_of};
-use atpkg_publish::host::{HostError, Probe, ReleaseHost, Replace, Slug};
+use atpkg_publish::host::rest::{RestHost, probe_of};
+use atpkg_publish::host::{HostError, Probe, ReleaseHost, Replace, STAGED, Slug};
 
 use super::scratch;
 

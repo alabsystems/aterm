@@ -20,7 +20,7 @@ use crate::session_store::{SessionHandle, new_store, test_handle};
 use crate::task_record::{TaskMark, mark_session_task_within};
 
 const NEED_A: &str = "approve the 0.48.0 release notes";
-const NEED_B: &str = "the release credential to sign 0.48.0";
+const NEED_B: &str = "the release permission to sign 0.48.0";
 const ENTRY_A: &str = "claude needs you: approve the 0.48.0 release notes \u{2014} carrying on";
 const ENTRY_AB: &str =
     "claude needs you: approve the 0.48.0 release notes (+1 more) \u{2014} carrying on";

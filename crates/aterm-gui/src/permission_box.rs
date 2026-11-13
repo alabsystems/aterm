@@ -385,6 +385,8 @@ impl App {
             generation: 0,
             rest: PointerRest::at_open(px),
             told: Some((told.clone(), room)),
+            plate: Default::default(),
+            wash: Default::default(),
         });
         self.request_menu_frame(wid);
         true
@@ -430,9 +432,11 @@ impl App {
         else {
             return;
         };
-        let standing = self
-            .session_sid(session)
-            .and_then(|tab| self.permission_clicks.clicks.get(&tab));
+        let tab = self.session_sid(session);
+        let standing = tab
+            .as_ref()
+            .and_then(|tab| self.permission_clicks.clicks.get(tab));
+        let pill = self.permission_pill(session);
         let now = match (&told, &standing) {
             (
                 Told::TurningOn
@@ -445,6 +449,17 @@ impl App {
             }
             (Told::Shown(mode, Some(Would::TakeBack)), Some(standing)) if standing.signalled => {
                 Told::Shown(*mode, Some(Would::Signalled))
+            }
+            // The pill moved under a box that said what a click on the old one would do (the
+            // agent's own step to plan, say): it says the mode the pill reads now, and what a
+            // click would do from there, so its words never promise the other way's restart.
+            (Told::Shown(mode, would), None) if pill.is_some_and(|pill| pill != *mode) => {
+                let pill = pill.unwrap_or(*mode);
+                let would = would
+                    .as_ref()
+                    .and(tab.as_ref())
+                    .map(|tab| self::would(pill, self.permission_default(tab)));
+                Told::Shown(pill, would)
             }
             _ => told.clone(),
         };
@@ -461,17 +476,29 @@ impl App {
     }
 
     /// [`Self::refresh_permission_box`] for the box open in `wid`, before a frame lays it: a
-    /// pane resized since its words were wrapped has them wrapped again.
+    /// pane resized since its words were wrapped has them wrapped again, and a box that says a
+    /// mode the pill no longer reads says the one it does.
     pub(crate) fn fit_permission_box(&mut self, wid: WindowId) {
-        let Some((session, room)) = self
+        let Some((session, room, shown)) = self
             .autopilot_menu
             .as_ref()
             .filter(|menu| menu.wid == wid && menu.owner == MenuOwner::Permission)
-            .and_then(|menu| Some((menu.session, menu.told.as_ref()?.1)))
+            .and_then(|menu| {
+                let (told, room) = menu.told.as_ref()?;
+                let shown = match told {
+                    Told::Shown(mode, _) => Some(*mode),
+                    _ => None,
+                };
+                Some((menu.session, *room, shown))
+            })
         else {
             return;
         };
-        if self.permission_box_room(wid, session) != room {
+        let moved = shown.is_some_and(|mode| {
+            self.permission_pill(session)
+                .is_some_and(|pill| pill != mode)
+        });
+        if moved || self.permission_box_room(wid, session) != room {
             self.refresh_permission_box(session);
         }
     }
@@ -492,7 +519,9 @@ impl App {
     /// gesture's and leaves the box open; any other closes the box and, where a click acts (it
     /// takes a standing restart back, or stands one), is the chip's click too. Where a click
     /// would only open this box again, the press just closes it, so the chip dismisses its own
-    /// box. Whether the press was the chip's.
+    /// box. A box that said what a click on a mode the pill no longer reads would do acts on
+    /// nothing: its press only closes it, since the click would now do something else.
+    /// Whether the press was the chip's.
     pub(crate) fn permission_box_chip_press(
         &mut self,
         wid: WindowId,
@@ -506,8 +535,11 @@ impl App {
             .map(|menu| {
                 let acts = match menu.told.as_ref().map(|(told, _)| told) {
                     Some(Told::TurningOn | Told::Leaving(_)) => true,
-                    Some(Told::Shown(_, Some(would))) => {
-                        would.stands() || *would == Would::TakeBack
+                    // A take-back is decided before the pill is read; a restart the box offered
+                    // stands only from the mode the box said.
+                    Some(Told::Shown(_, Some(Would::TakeBack))) => true,
+                    Some(Told::Shown(mode, Some(would))) => {
+                        would.stands() && self.permission_pill(menu.session) == Some(*mode)
                     }
                     Some(Told::DefaultIsYolo(_) | Told::BypassOff(_) | Told::Shown(_, None))
                     | None => false,

@@ -59,3 +59,25 @@ fn a_sessions_shell_runs_jobs_by_what_aterm_launched() {
         "an adopted shell is read from its process"
     );
 }
+
+/// M2 land (audit 4 review): an adopted shell is the one its image's path names, else, its
+/// file gone since its exec (a PowerShell upgrade under a running pwsh, where macOS's
+/// `proc_pidpath` names no path), the one a name the kernel keeps for its exec names, so
+/// that pwsh still runs every command in its own group after a seamless update and a
+/// restore reads its children. A path decides over the kernel's names; none that names a
+/// shell is `Unknown`, which runs jobs. NEGATIVE CONTROL (scratch): no fallback to the
+/// kernel's names fails the first assertion with `Unknown`.
+#[test]
+fn an_adopted_shell_whose_file_is_gone_is_read_by_its_kernel_name() {
+    let pwsh = || vec!["pwsh".to_owned()];
+    assert_eq!(super::adopted_shell(None, pwsh), ShellType::PowerShell);
+    assert!(!super::shell_runs_jobs(super::adopted_shell(None, pwsh)));
+    assert_eq!(
+        [
+            super::adopted_shell(Some("/bin/zsh".into()), pwsh),
+            super::adopted_shell(None, || vec!["QZP7M2C".to_owned()]),
+            super::adopted_shell(None, Vec::new),
+        ],
+        [ShellType::Zsh, ShellType::Unknown, ShellType::Unknown]
+    );
+}

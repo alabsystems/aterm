@@ -7,6 +7,8 @@
 use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::path::Path;
+#[cfg(unix)]
+use std::time::Duration;
 
 use aterm_toml::edit::{
     Array, ArrayOfTables, DocumentMut, InlineTable, Item, Table, TableLike, Value,
@@ -753,21 +755,29 @@ impl AuthEdit {
     /// Refused while another edit holds it or when the directory or lock is not private;
     /// could_not_run on I/O.
     pub(crate) fn take(dirs: &Dirs) -> Result<Self> {
-        Self::take_named(dirs, AUTH_EDIT_LOCK, "the auth edit lock", || {
-            Error::refused("another agh auth edit is in progress")
-                .with_next("run the auth command again after that edit finishes")
-        })
+        Self::take_named(
+            dirs,
+            AUTH_EDIT_LOCK,
+            "the auth edit lock",
+            Duration::ZERO,
+            || {
+                Error::refused("another agh auth edit is in progress")
+                    .with_next("run the auth command again after that edit finishes")
+            },
+        )
     }
 
-    /// The lock in `dirs.config/{file}` taken, `what` naming it in each refusal and `busy`
-    /// the refusal while another holder has it.
+    /// The lock in `dirs.config/{file}` taken, waiting up to `wait` while another holder has
+    /// it (`Duration::ZERO`: one attempt), `what` naming it in each refusal and `busy` the
+    /// refusal when another holder kept it past `wait`.
     /// # Errors
-    /// `busy()` while another holder has it; Refused when the directory or lock is not private
-    /// or the lock file is not empty; could_not_run on I/O.
+    /// `busy()` when another holder kept it past `wait`; Refused when the directory or lock is
+    /// not private or the lock file is not empty; could_not_run on I/O.
     pub(crate) fn take_named(
         dirs: &Dirs,
         file: &str,
         what: &str,
+        wait: Duration,
         busy: impl FnOnce() -> Error,
     ) -> Result<Self> {
         use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
@@ -796,17 +806,12 @@ impl AuthEdit {
                 ),
             );
         }
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the auth transaction guard releases by LOCK_UN before closing"
-        )]
-        let taken = file.try_lock();
-        match taken {
+        // The guard releases by LOCK_UN before closing (`Drop`).
+        let deadline = crate::fx::lock_deadline(wait);
+        match aterm_uds::file_lock::lock_exclusive_until(&file, deadline, what) {
             Ok(()) => {}
-            Err(std::fs::TryLockError::WouldBlock) => return Err(busy()),
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(Error::could_not_run(format!("{what}: {e}")));
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Err(busy()),
+            Err(e) => return Err(Error::could_not_run(format!("{what}: {e}"))),
         }
         let held = Self(file);
         let same = std::fs::symlink_metadata(&path).is_ok_and(|named| {

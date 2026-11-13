@@ -114,7 +114,7 @@ pub(super) fn run(
         {
             return Err("the selected package source changed".into());
         }
-        let mut wanted = wanted_programs(&index, &now, current_triple());
+        let mut wanted = wanted_listed(&index, &now, current_triple());
         for removed in layout.removed_programs().map_err(|why| why.to_string())? {
             wanted.remove(&removed);
         }

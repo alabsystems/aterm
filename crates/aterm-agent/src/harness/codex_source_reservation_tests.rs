@@ -862,6 +862,42 @@ fn dedicated_cleanup_does_not_reopen_ready_or_fabricate_unknown_retired_use_rece
 }
 
 #[test]
+fn proof_census_keeps_pending_retirement_but_excludes_settled_end_records() {
+    // Synthetic source/peer, actual native Scope capture and retirement.
+    let fixture = Fixture::new();
+    let capability = fixture.begin(1);
+    let key = member_key(&fixture.peer.caller, &fixture.member).unwrap();
+    let capture = {
+        let state = fixture.registry.state.lock().unwrap();
+        assert_eq!(ProofUses::counts(&state, &fixture.peer.caller), (1, 0, 0));
+        state.uses[&key].active[&1]._scope.clone()
+    };
+    let end = || {
+        fixture.registry.end_use(
+            &fixture.peer,
+            &fixture.connection,
+            &fixture.member,
+            fixture.request(1).nonce,
+            &capability,
+        )
+    };
+    assert!(matches!(end(), Err(Error::Busy)));
+    {
+        let state = fixture.registry.state.lock().unwrap();
+        assert_eq!(ProofUses::counts(&state, &fixture.peer.caller), (0, 0, 1));
+    }
+    drop(capture);
+    end().unwrap();
+    let state = fixture.registry.state.lock().unwrap();
+    assert_eq!(
+        state.uses[&key].ending.len(),
+        1,
+        "retain exact End replay metadata"
+    );
+    assert_eq!(ProofUses::counts(&state, &fixture.peer.caller), (0, 0, 0));
+}
+
+#[test]
 fn metadata_inspection_releases_registry_and_rechecks_retired_use() {
     let fixture = Fixture::new();
     let capability = fixture.begin(1);
@@ -4726,6 +4762,70 @@ fn rebound_manager_fixture() -> (Fixture, PreloadSequence, FixtureConnection) {
         )
         .unwrap();
     (f, sequence, replacement)
+}
+
+#[test]
+fn ordinary_ready_replay_after_eof_keeps_member_unknown_until_rebound() {
+    // Synthetic source metadata and accepted report; actual process, native
+    // connection records, EOF/rebind and registry checks. Replay must not read a Slot
+    // or turn metadata into a new source/readiness permission.
+    let (f, sequence, replacement) = rebound_manager_fixture();
+    let env = Env {
+        state: f._home.path().join("state"),
+        aterm_state: None,
+        cwd: f._home.path().into(),
+        home: None,
+        claude_dir: None,
+        claude_config_unusable: None,
+        claude_profile: None,
+        claude_custom_oauth: false,
+        claude_session: None,
+        claude_pid: None,
+        codex_thread: None,
+        codex_home: None,
+        xdg_config_home: None,
+        codex_login: None,
+        agy_conversation: None,
+        now: 0,
+        sid: f.peer.caller.sid.clone(),
+        sock: None,
+        config: None,
+        claude_tmp: None,
+        claude_running: None,
+        tz_s: 0,
+    };
+    let key = member_key(&f.peer.caller, &f.member).unwrap();
+    let source = f.registry.state.lock().unwrap().members[&key]
+        .source
+        .clone();
+    let replay = |auth| {
+        f.registry.ready(
+            &env,
+            peer(&f.peer),
+            &f.member,
+            &f.operation,
+            &f.registration,
+            &replacement,
+            Ready::Loaded {
+                credential_generation: source.credential_generation(),
+                digest: source.digest().into(),
+                account: source.account().into(),
+                user: source.user().into(),
+                auth,
+            },
+            sequence,
+        )
+    };
+    assert!(f.registry.state.lock().unwrap().members[&key].unknown);
+    assert!(f.registry.ready_source(&f.peer.caller, &f.member).is_err());
+    replay(auth()).unwrap();
+    assert!(f.registry.state.lock().unwrap().members[&key].unknown);
+    assert!(f.registry.ready_source(&f.peer.caller, &f.member).is_err());
+    assert!(f.registry.state.lock().unwrap().preloads.is_empty());
+    let mut changed = auth();
+    changed.generation += 1;
+    assert!(replay(changed).is_err(), "the accepted report is immutable");
+    assert!(f.registry.state.lock().unwrap().members[&key].unknown);
 }
 
 #[test]

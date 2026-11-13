@@ -267,6 +267,8 @@ fn package_cancellation_is_nonwaiting_and_full_readiness_still_guards_each_pass(
             other => Ok(other),
         });
         let calls = Arc::clone(&choices);
+        let pass = Arc::new(std::sync::Mutex::new(None));
+        let held = Arc::clone(&pass);
         item.toolset = Toolset::new(
             Box::new(|| Found::Missing("Git is missing".into())),
             Box::new(move |args, _, stopped| {
@@ -289,19 +291,12 @@ fn package_cancellation_is_nonwaiting_and_full_readiness_still_guards_each_pass(
                         assert!(!stopped(), "continuation does not grant file integrity");
                     }
                     "writer" => {
+                        // A vault pass (the subscriber's over each long-poll answer) says
+                        // nothing of the source: the child goes on, the check not waiting for
+                        // the pass, which still holds the lock as the child ends.
                         let writer = client::test_hold_state_lock(&paths).unwrap();
-                        assert!(
-                            stopped(),
-                            "a busy writer cancels without waiting for release"
-                        );
-                        drop(writer);
-                        assert!(
-                            !stopped(),
-                            "the unchanged source is observable after release"
-                        );
-                        return Err(aterm_machines::port::RunFailed::TimedOut(
-                            std::time::Duration::ZERO,
-                        ));
+                        assert!(!stopped(), "a busy writer is no change of source");
+                        *held.lock().unwrap() = Some(writer);
                     }
                     "stop" => {
                         calls.holds.lock().unwrap().stopped = Some("setup stopped".into());
@@ -319,16 +314,24 @@ fn package_cancellation_is_nonwaiting_and_full_readiness_still_guards_each_pass(
         ).default_selected("git");
         let probe = item.probe();
         assert!(matches!(probe, Probe::Change { .. }), "{change}: {probe:?}");
-        let result = item.apply();
+        let (result, waited) = client::test_while_state_lock_held(
+            move || drop(pass.lock().unwrap().take()),
+            || item.apply(),
+        );
         assert_eq!(
             *choices.calls.lock().unwrap(),
             ["update --default-selected git"],
             "{change}"
         );
+        assert_eq!(waited > 0, change == "writer", "{change}: {waited} waits");
         if change == "writer" {
+            // The full admission after the child waits the pass out and reads the vault as it
+            // is, where one that took the busy lock as its answer would leave the owned update
+            // standing aside as a vault still syncing.
+            result.unwrap();
             assert!(
-                result.is_err(),
-                "cancelled package attempt remains unfinished"
+                item.stood_aside().is_none(),
+                "a writer that changed nothing leaves the owned update admitted"
             );
             assert!(matches!(item.probe(), Probe::Change { .. }));
         } else {
@@ -514,7 +517,7 @@ fn active_toolset_without_the_git_ready_marker_still_gets_a_package_attempt() {
     );
 
     // A native Git can be installed yet incapable of the read-only object
-    // operations required by this private inventory: one before 2.44, which refuses
+    // operations required by this private inventory: one before 2.45, which refuses
     // `--no-lazy-fetch` and, before the 2.39.4 security release, fetches lazily whatever
     // GIT_NO_LAZY_FETCH says. Presence is not readiness.
     for path in [

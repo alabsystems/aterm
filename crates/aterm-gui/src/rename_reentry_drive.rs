@@ -233,6 +233,7 @@ impl ApplicationHandler<Wake> for Driver {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        eprintln!("rename-reentry child: LoopExiting");
         if !self.ordering_armed {
             return;
         }
@@ -343,6 +344,7 @@ fn rename_cancel_round(windowed: Windowed) -> Result<(), String> {
         None,
     );
     sheet::end(press);
+    eprintln!("rename-reentry child: rename alert returned; waiting for the Cancel helper");
     done.store(true, Ordering::Release);
     let helper_hang = Instant::now() + ALERT_HANG;
     while !helper.is_finished() {
@@ -381,6 +383,7 @@ struct AlertLook {
 /// Wait for the exact production panel, including its active first field editor, then click its
 /// Cancel button. All AppKit reads and the click execute on the main queue served by `runModal`.
 fn cancel_real_rename_alert(done: &AtomicBool, windowed: Windowed) -> Result<bool, String> {
+    eprintln!("rename-reentry child: Cancel helper waiting for the field editor");
     let deadline = Instant::now() + ALERT_HANG;
     loop {
         if done.load(Ordering::Acquire) {
@@ -426,6 +429,7 @@ fn inspect_and_cancel(_windowed: Windowed) -> Result<bool, String> {
         if editor.is_null() || appkit::send_id(window, sel!(firstResponder)) != editor {
             return Ok(false);
         }
+        eprintln!("rename-reentry child: field editor ready; clicking Cancel");
         appkit::send_v_id(cancel, sel!(performClick:), Id::NIL);
         Ok(true)
     }

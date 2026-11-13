@@ -160,7 +160,7 @@ fn an_install_waiting_for_a_start_is_said_at_its_deadline_and_the_start_answers_
 #[test]
 fn a_crash_loops_end_is_said_from_the_record_and_a_newer_started_install_answers_it() {
     let rolled = "aterm 0.11.0 didn\u{2019}t start properly in 3 launches, so aterm 0.10.0 \
-                  is back and aterm 0.11.0 won\u{2019}t install again";
+                  is back and aterm 0.11.0 is held a while before it is tried again";
     let crash = crate::INSTALL_CRASH_LOOP_TITLE;
     let words = rollback_body("0.11.0", "aterm 0.10.0");
     let mut watch = InstallWatch::default();
@@ -645,7 +645,7 @@ fn reported<'a>(
 #[test]
 fn the_install_halfs_recovery_waits_for_the_check_half() {
     let rolled = "aterm 0.11.0 didn\u{2019}t start properly in 3 launches, so aterm 0.10.0 \
-                  is back and aterm 0.11.0 won\u{2019}t install again";
+                  is back and aterm 0.11.0 is held a while before it is tried again";
     let words = rollback_body("0.11.0", "aterm 0.10.0");
     let failed_at = "2026-09-28T11:00:00Z";
     let checked_at = "2026-09-28T12:00:00Z";

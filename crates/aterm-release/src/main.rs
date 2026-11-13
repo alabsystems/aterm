@@ -44,6 +44,7 @@ mod github;
 mod github_remote;
 
 mod hook;
+mod host_fit;
 
 mod interrupt;
 mod ledger;
@@ -65,6 +66,7 @@ mod cutter_inputs;
 mod release;
 mod release_disk;
 mod release_keychain;
+mod release_pump;
 mod release_status;
 mod release_steps;
 mod release_target;

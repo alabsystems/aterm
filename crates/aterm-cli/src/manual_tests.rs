@@ -237,6 +237,7 @@ fn trust_lock_rows_name_the_lock_and_a_shim_that_runs_another_build() {
             receipt: "SEED-MINT sha256:00".to_string(),
             stock_toolchain: "1.99.1".to_string(),
         }),
+        unpublished: None,
     };
     let laid = |build: u64| {
         std::fs::create_dir_all(prefix.join("bin")).expect("bin");
@@ -272,7 +273,8 @@ fn trust_lock_rows_name_the_lock_and_a_shim_that_runs_another_build() {
     let resolved = atpkg::trust_lock::build_dir(&prefix, 83).join("bin");
     let refused = atpkg::toolchain::Toolchain {
         lock_refusal: Some(
-            "/c/trust.lock names Trust build 83, which this Mac's store does not hold".to_string(),
+            "/c/trust.lock names Trust build 83, which this machine's store does not hold"
+                .to_string(),
         ),
         ..tools(resolved.clone(), None)
     };

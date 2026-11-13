@@ -521,11 +521,16 @@ fn usable(usage: &IdentifiedUsage, now: i64) -> bool {
         && !usage.usage.sample.low(now)
 }
 
-/// Whether `why`, what [`prepare`] refused a session for, stands however often it is asked: this
-/// session's login is no row of the pool, a login the pool does not manage, one that names
-/// another account than its row's, or one whose fresh read shows no limit a handoff leaves
-/// ([`walled_window`]). A wait would change nothing, so its control answers that no handoff is
-/// coming rather than to wait.
+/// Whether `why`, what [`prepare`] refused a session for, ends its asking, and as which kind
+/// ([`NoHandoff`]): this session's login is no row of the pool, a login the pool does not manage,
+/// one that names another account than its row's, or one whose fresh read shows no limit a
+/// handoff leaves ([`walled_window`]). Its control answers that no handoff is coming rather than
+/// to wait. How long that answer stands is its kind's. No row of the pool and a login that names
+/// another account are nothing a wait changes, and stand for the control's job. No limit to
+/// leave is a reading at one time: the TUI's control keeps it for its job, which is one wall's (a
+/// TUI turn ends at each wall), and the exec control, whose job is a whole run, reads the login
+/// again once the reset that reading waited out has passed with its grace, then less often while
+/// it keeps reading so (`codex_exec_handoff_control`).
 #[must_use]
 pub fn prepare_refusal_stands(why: &str) -> Option<NoHandoff> {
     match why {
@@ -539,12 +544,16 @@ pub fn prepare_refusal_stands(why: &str) -> Option<NoHandoff> {
 /// [`prepare`]'s refusal of a session whose row's login names another account than the row's.
 const SOURCE_NAMES_ANOTHER: &str = "source-names-another";
 
-/// Why no handoff is coming to a session, however often it asks.
+/// Why no handoff is coming to a session that asked for one: what ends its asking, for its
+/// control's job or, for [`Self::NoWallToLeave`], until its control reads the login again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NoHandoff {
     /// A fresh read of the session's login shows no limit a handoff leaves: its week is not
     /// spent, and its five-hour window is not spent, resets within [`accounts::RESET_SOON_S`] or
-    /// names no reset.
+    /// names no reset. It is a reading at one time, of one wall: a session that asks again under
+    /// the same request at a later wall (a headless exec run, one root turn) is read again once
+    /// that reset and its grace ([`accounts::RESET_GRACE_S`]) have passed, and by longer rungs
+    /// while it keeps reading so ([`accounts::NO_RESET_WALL_S`]).
     NoWallToLeave,
     /// The session's login is no row the pool hands off.
     NoRowOfThePool,

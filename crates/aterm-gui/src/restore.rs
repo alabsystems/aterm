@@ -189,6 +189,8 @@ pub(crate) fn carried_sid(sid: &str) -> bool {
 pub(crate) struct AgentRestore {
     pub pid: u32,
     pub start: String,
+    /// The exact lifetime captured with the agent, absent when the saved image has no evidence.
+    pub lifetime: Option<aterm_agent::harness::relaunch::ProcessLifetime>,
     pub program: String,
     pub argv: Vec<String>,
     pub session: Option<String>,
@@ -218,6 +220,8 @@ mod leaf {
     pub(super) struct AgentRestore {
         pub(super) pid: u32,
         pub(super) start: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(super) lifetime: Option<aterm_agent::harness::relaunch::ProcessLifetime>,
         pub(super) program: String,
         pub(super) argv: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -261,6 +265,7 @@ impl From<leaf::AgentRestore> for AgentRestore {
         Self {
             pid: leaf.pid,
             start: leaf.start,
+            lifetime: leaf.lifetime,
             program: leaf.program,
             argv: leaf.argv,
             session: leaf.session,
@@ -297,6 +302,7 @@ impl From<AgentRestore> for leaf::AgentRestore {
         Self {
             pid: agent.pid,
             start: agent.start,
+            lifetime: agent.lifetime,
             program: agent.program,
             argv: agent.argv,
             session: agent.session,
@@ -337,6 +343,15 @@ impl<'de> Deserialize<'de> for AgentRestore {
             ));
         }
         let agent = Self::from(leaf);
+        if agent
+            .lifetime
+            .as_ref()
+            .is_some_and(|lifetime| lifetime.pid() != agent.pid)
+        {
+            return Err(serde::de::Error::custom(
+                "an agent restore's lifetime belongs to another process",
+            ));
+        }
         let claude = match agent.agent() {
             Some(aterm_agent::harness::upgrade::Agent::Claude) => true,
             Some(
@@ -498,6 +513,7 @@ impl AgentRestore {
             tab: Some(snap.tab).filter(|t| !t.is_empty()),
             pid: snap.pid,
             start: snap.start,
+            lifetime: snap.lifetime,
             program: snap.program.to_string_lossy().into_owned(),
             argv: snap.argv,
             session,
@@ -614,6 +630,7 @@ impl AgentRestore {
             tab,
             pid: self.pid,
             start: self.start,
+            lifetime: self.lifetime,
             shell,
             program: std::path::PathBuf::from(self.program),
             argv: self.argv,
@@ -4274,3 +4291,7 @@ mod cold_resume_environment_tests;
 #[cfg(test)]
 #[path = "restore_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "restore_lifetime_tests.rs"]
+mod lifetime_tests;

@@ -7,6 +7,17 @@ use super::{ApplyRetry, ApplyTrouble, GENERIC, PersonRemedy, clauses};
 const REAL_LEDGER_REASONS: &[&str] = &[
     "overlap handoff failed safely: handoff proof ended ChildDied",
     "overlap handoff failed safely: handoff proof ended TimedOut",
+    "overlap handoff failed safely: handoff proof ended TimedOut (12 progress report(s), the \
+     last `first_present` 41000 ms before the end; native launch finished)",
+    "overlap handoff failed safely: handoff proof ended Stalled (3 progress report(s), the last \
+     `first_present` 3001 ms before the end; native launch finished; the last silence judged: \
+     2 ms CPU and 0 page-in(s) in 2990 ms)",
+    "overlap handoff failed safely: handoff proof ended Stalled (no progress report in 60000 ms \
+     (a successor that does not report progress, or one silent since its grant))",
+    "overlap handoff failed safely: the launched successor never claimed the handoff: timed \
+     out; it was still running past the dial bound and the self-exit grace, so it was stopped",
+    "overlap handoff failed safely: no rendezvous dialer was admitted before the dial deadline: \
+     timed out",
     "overlap handoff failed safely: handoff proof ended AdoptionMismatch",
     "overlap handoff failed safely: handoff proof ended ActivityRevoked",
     "overlap handoff failed safely: handoff proof ended Rejected",
@@ -89,8 +100,6 @@ const REAL_LEDGER_REASONS: &[&str] = &[
      condition, not a verdict on the update); the terminal was left untouched",
     "update trial for build 1787699398 was unrecoverable across 3 launches of build \
      1787690000; disarmed the boot sentinel to keep updates possible",
-    "trial recovery proof failed 3x (trial receipt is missing); disarmed the boot \
-     sentinel to keep updates possible",
 ];
 
 /// No reason this program writes survives into any rendering, nor its most alarming words
@@ -116,6 +125,9 @@ fn no_reason_this_program_writes_can_reach_a_surface_verbatim() {
                 "Commit",
                 "ChildDied",
                 "TimedOut",
+                "Stalled",
+                "progress report",
+                "page-in",
                 "AdoptionMismatch",
                 "ActivityRevoked",
                 "Rejected",
@@ -159,6 +171,30 @@ fn apply_lane_reasons_this_program_can_actually_write_map_to_the_right_cause() {
         ),
         "the new version did not finish starting in time"
     );
+    for stalled in [
+        "overlap handoff failed safely: handoff proof ended Stalled (3 progress report(s), the \
+         last `first_present` 3001 ms before the end; native launch finished)",
+        "overlap handoff failed safely: handoff proof ended Stalled (no progress report in \
+         60000 ms (a successor that does not report progress, or one silent since its grant))",
+    ] {
+        assert_eq!(
+            full(stalled),
+            "the new version stopped partway through starting",
+            "{stalled}"
+        );
+        assert_eq!(short(stalled), "stopped starting", "{stalled}");
+    }
+    let pre_dial = format!(
+        "overlap handoff failed safely: the launched successor never claimed the handoff: timed \
+         out; {}",
+        super::PRE_DIAL_STALL
+    );
+    assert_eq!(
+        full(&pre_dial),
+        "the new version stopped partway through starting",
+        "a successor hung before its dial stalled like one hung after its grant"
+    );
+    assert_eq!(short(&pre_dial), "stopped starting");
     assert_eq!(
         full("overlap handoff failed safely: handoff proof ended AdoptionMismatch"),
         "the new version did not take over the open sessions"
@@ -194,12 +230,14 @@ fn apply_lane_reasons_this_program_can_actually_write_map_to_the_right_cause() {
             "{prepared}"
         );
     }
+    // A rollback is the update record's hold (`Cause::CrashLoop`), which the page says from
+    // the record; the one boot-trial reason the ledger still holds is a wedged trial cleared.
     assert_eq!(
         full(
-            "trial recovery proof failed 3x (receipt missing); disarmed the boot sentinel \
-             to keep updates possible"
+            "update trial for build 1787699398 was unrecoverable across 3 launches of build \
+             1787690000; disarmed the boot sentinel to keep updates possible"
         ),
-        "the new version would not run and aterm went back to this one"
+        "an earlier update\u{2019}s start check never finished, so aterm cleared it"
     );
     for producer in [
         "overlap handoff failed safely: could not write the authenticated handoff manifest \

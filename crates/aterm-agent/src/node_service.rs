@@ -10,7 +10,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 pub use crate::fleet_member::prove_discovery_address;
@@ -516,23 +516,122 @@ pub fn current_route_tokens() -> Vec<String> {
         .collect()
 }
 
+/// How long a route this Mac was read to have stands for the node's advert and its LAN responder
+/// while the kernel names no change of network ([`RouteStanding`]).
+const ROUTE_STANDS: Duration = Duration::from_secs(10);
+
+/// How long after a change of network was heard no read of the routes is kept
+/// ([`RouteStanding`]): the kernel names a change of address or link, and nothing shows the
+/// routes have followed it by then, so a route read that soon can be the one the change takes
+/// away. For this long the node reads at every ask, as it did before a route stood at all.
+const ROUTE_SETTLES: Duration = Duration::from_secs(1);
+
+/// Whether this Mac has a route, as the node's advert and its LAN responder ask many times a
+/// minute ([`AlabTcpAdvertiser::tick`], [`lan_responder_allowed`]). A read of the routes
+/// ([`current_route_tokens`]) asks the kernel's routing table, so the two share one answer
+/// rather than each read at every ask: a route it read stands until the kernel names a change of
+/// network (`changes`, asked without waiting before every answer) or [`ROUTE_STANDS`] passes,
+/// whichever is first, since nothing shows that every change of route alone is named there. That
+/// it has no route is never kept, so a Mac that comes online is seen at the next ask. Nor is a
+/// read made at the ask that hears a change or less than [`ROUTE_SETTLES`] after it, which can
+/// come before the routes have followed the change: every ask in that time reads. With no
+/// change socket nothing is kept at all.
+struct RouteStanding {
+    /// The kernel's network-change events from before the read `seen` dates. `None` where it
+    /// could not be opened or has failed since.
+    #[cfg(unix)]
+    changes: Option<aterm_uds::network::RouteChanges>,
+    /// The latest ask that heard a change of network, by its own clock.
+    changed: Option<Instant>,
+    /// When a read made [`ROUTE_SETTLES`] or more after `changed` last found a route, with no
+    /// change heard since.
+    seen: Option<Instant>,
+}
+
+impl RouteStanding {
+    /// A standing that hears the kernel's network changes from now on, and has read nothing.
+    fn open() -> Self {
+        Self {
+            #[cfg(unix)]
+            changes: aterm_uds::network::RouteChanges::open().ok(),
+            changed: None,
+            seen: None,
+        }
+    }
+
+    /// Whether a change of network came since the last ask; `None` with no socket to tell, which
+    /// a socket that fails here is from now on.
+    fn change_heard(&mut self) -> Option<bool> {
+        #[cfg(unix)]
+        {
+            let heard = self.changes.as_ref()?.changed_now();
+            if heard.is_none() {
+                self.changes = None;
+            }
+            heard
+        }
+        #[cfg(not(unix))]
+        None
+    }
+
+    /// Whether this Mac has a route at `now`, by `read` only where no read of the last
+    /// [`ROUTE_STANDS`] found one with no change of network heard since. A read made at the ask
+    /// that heard a change, or less than [`ROUTE_SETTLES`] after it, answers its own ask alone:
+    /// it can come before the routes have followed the change, so it is not kept.
+    fn has_route(&mut self, now: Instant, read: impl FnOnce() -> bool) -> bool {
+        match self.change_heard() {
+            Some(false) => {}
+            Some(true) => {
+                self.seen = None;
+                self.changed = self.changed.max(Some(now));
+            }
+            None => {
+                self.seen = None;
+                return read();
+            }
+        }
+        if self
+            .seen
+            .and_then(|seen| now.checked_duration_since(seen))
+            .is_some_and(|age| age < ROUTE_STANDS)
+        {
+            return true;
+        }
+        let routed = read();
+        let settled = self.changed.is_none_or(|changed| {
+            now.checked_duration_since(changed)
+                .is_some_and(|since| since >= ROUTE_SETTLES)
+        });
+        self.seen = (routed && settled).then_some(now);
+        routed
+    }
+}
+
+/// One [`RouteStanding`] for an advertiser and the responder it starts, opened at its first ask:
+/// a Mac that is no member asks nothing of its routes and opens no socket.
+type SharedRouteStanding = Arc<LazyLock<Mutex<RouteStanding>>>;
+
+/// Whether this Mac has a route now, by `standing` ([`RouteStanding::has_route`] over
+/// [`current_route_tokens`]).
+fn has_route_now(standing: &SharedRouteStanding) -> bool {
+    standing
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .has_route(Instant::now(), || !current_route_tokens().is_empty())
+}
+
 /// Whether `_alab._tcp` is advertised (§3.3, C23; on every network since F17,
 /// `docs/DESIGN-fluid-swarm-2026-10-28.md` §4.1): `[swarm] enabled` is not `false` (`enabled`),
-/// this Mac has a route (`routes`), and it is an ALab vault member whose vault answered within
+/// this Mac has a route (`routed`), and it is an ALab vault member whose vault answered within
 /// [`ALAB_MEMBER_TTL_SECS`] before `now_secs` (`heard`, unix seconds). A clock that could not be
 /// read (`now_secs` `None`) or an answer dated after it (the clock stepped back since) gives no
 /// age, so nothing is advertised until the vault answers again. No network is special: a café's
 /// routes advertise as an office's do, since the advert carries no identity and a dial of it is
 /// judged by its handshake's proof.
 #[must_use]
-pub fn advertises(
-    enabled: bool,
-    routes: &[String],
-    heard: Option<u64>,
-    now_secs: Option<u64>,
-) -> bool {
+pub fn advertises(enabled: bool, routed: bool, heard: Option<u64>, now_secs: Option<u64>) -> bool {
     enabled
-        && !routes.is_empty()
+        && routed
         && heard
             .zip(now_secs)
             .and_then(|(heard, now)| now.checked_sub(heard))
@@ -540,16 +639,18 @@ pub fn advertises(
 }
 
 /// [`advertises`] as `aterm_config`'s `[swarm]` and the vault at `vault_paths` stand at
-/// `now_secs` on `routes`: the vault's word that this Mac is an ALab member no evidence denies,
+/// `now_secs`, on a Mac that has a route when `routed` says so: the vault's word that this Mac
+/// is an ALab member no evidence denies,
 /// and when it last heard it, is read again only when one of the vault's files it was read from
 /// moved ([`aterm_secrets::client::swarm_member_heard_now`]), and judged against `now_secs` at
 /// every call. A read that judged nothing (a vault writer mid-apply, a file it cannot read) is no
-/// member's.
+/// member's. `routed` is asked last, and only where every other term holds, so a Mac with the
+/// swarm off, or no member's, asks nothing of its routes.
 #[must_use]
 pub fn should_advertise_alab_tcp_with(
     vault_paths: &aterm_secrets::client::Paths,
     aterm_config: Option<&Path>,
-    routes: &[String],
+    routed: impl FnOnce() -> bool,
     now_secs: Option<u64>,
 ) -> bool {
     let enabled = aterm_config
@@ -557,21 +658,23 @@ pub fn should_advertise_alab_tcp_with(
     let heard = aterm_secrets::client::swarm_member_heard_now(vault_paths)
         .ok()
         .flatten();
-    advertises(enabled, routes, heard, now_secs)
+    advertises(enabled, true, heard, now_secs) && routed()
 }
 
 /// Whether this Mac's LAN responder answers now ([`crate::lan_members::Responder`]), which asks at
-/// each of its refreshes and before each answer it sends: the node `state` holds is still the one
+/// each look at its sources and before each answer it sends: the node `state` holds is still the one
 /// keyed `key`, neither turned off ([`node_turned_off`]) nor gone from its fleet
-/// ([`left_the_fleet`]), each read afresh, and this Mac advertises on `routes` at `now_secs`
+/// ([`left_the_fleet`]), each read afresh, and this Mac advertises at `now_secs` where `routed`
+/// says it has a route
 /// ([`should_advertise_alab_tcp_with`] of the vault and `aterm.toml` in `vault`), so a removal, a
-/// turn-off or a day unheard ends its answers at the next ask.
+/// turn-off or a day unheard ends its answers at the next ask. `routed` is asked last, and only
+/// where every other term holds: a Mac that left its fleet asks nothing of its routes.
 #[cfg(unix)]
 fn lan_responder_allowed(
     state: Option<&Path>,
     key: aterm_net::fleet::NodeKey,
     (vault_paths, aterm_config): (&aterm_secrets::client::Paths, Option<&Path>),
-    routes: &[String],
+    routed: impl FnOnce() -> bool,
     now_secs: Option<u64>,
 ) -> bool {
     state.is_some_and(|state| {
@@ -581,7 +684,7 @@ fn lan_responder_allowed(
                 .ok()
                 .flatten()
                 .is_some_and(|node| node.key() == key)
-    }) && should_advertise_alab_tcp_with(vault_paths, aterm_config, routes, now_secs)
+    }) && should_advertise_alab_tcp_with(vault_paths, aterm_config, routed, now_secs)
 }
 
 /// The role `_alab._tcp`'s TXT names ([`AlabTcpTxt`]): steward on a vault admin, which opens the
@@ -603,6 +706,8 @@ pub struct AlabTcpAdvertiser {
     instance: String,
     mesh: bool,
     state: Option<PathBuf>,
+    /// Whether this Mac has a route, for [`Self::tick`] and the responder it starts.
+    routes: SharedRouteStanding,
     inner: Mutex<AdvertiserInner>,
 }
 
@@ -698,6 +803,7 @@ impl AlabTcpAdvertiser {
             instance,
             mesh: DiscoveryPolicy::process_discovery().mesh,
             state: aterm_types::dirs::state_dir(),
+            routes: Arc::new(LazyLock::new(|| Mutex::new(RouteStanding::open()))),
             inner: Mutex::new(AdvertiserInner {
                 held: None,
                 #[cfg(unix)]
@@ -730,10 +836,14 @@ impl AlabTcpAdvertiser {
         fleet_port: u16,
         window_open: bool,
     ) {
-        let routes = current_route_tokens();
         let now_secs = aterm_time::unix_secs();
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
-        let eligible = should_advertise_alab_tcp_with(vault_paths, aterm_config, &routes, now_secs);
+        let eligible = should_advertise_alab_tcp_with(
+            vault_paths,
+            aterm_config,
+            || has_route_now(&self.routes),
+            now_secs,
+        );
         let identity = (cfg!(unix) || cfg!(target_os = "macos"))
             .then_some(eligible)
             .filter(|&eligible| eligible)
@@ -762,12 +872,13 @@ impl AlabTcpAdvertiser {
                     let paths = vault_paths.clone();
                     let config = aterm_config.map(Path::to_owned);
                     let state = self.state.clone();
+                    let routes = Arc::clone(&self.routes);
                     guard.lan = crate::lan_members::Responder::start(port, key, move || {
                         lan_responder_allowed(
                             state.as_deref(),
                             key,
                             (&paths, config.as_deref()),
-                            &current_route_tokens(),
+                            || has_route_now(&routes),
                             aterm_time::unix_secs(),
                         )
                     })
@@ -1154,6 +1265,12 @@ pub trait ServiceSupervisor {
         let _ = (pid, program);
         false
     }
+    /// Positive evidence that `pid` has loaded `program`, or that it loaded another image.
+    /// `None` is unreadable, never evidence that a replacement finished.
+    fn running_image_matches(&self, pid: u32, program: &Path) -> Option<bool> {
+        let _ = (pid, program);
+        None
+    }
     /// Restart the loaded job on the program its unit names now (`launchctl kickstart -k`),
     /// never a bootout followed at once by a bootstrap.
     ///
@@ -1167,6 +1284,14 @@ pub trait ServiceSupervisor {
     fn leaves_unit_alone(&self, home: &Path) -> Option<String> {
         let _ = home;
         None
+    }
+    /// Whether a person switched the job off in the supervisor (`launchctl disable`, or its
+    /// switch in Login Items turned off): a sync pass leaves that job as their choice.
+    ///
+    /// # Errors
+    /// The supervisor could not be asked, so whether it is switched off is not known.
+    fn switched_off(&self) -> Result<bool, String> {
+        Ok(false)
     }
 }
 
@@ -1335,6 +1460,22 @@ impl Launchd<'_> {
                 (domain, pid)
             })
             .collect())
+    }
+
+    /// Whether `launchctl print-disabled gui/<uid>` names the job disabled ([`disabled_in`]).
+    ///
+    /// # Errors
+    /// `print-disabled` could not run or failed.
+    pub fn switched_off(&self) -> Result<bool, String> {
+        let domain = self.gui();
+        let (ok, said) = self.launchctl.run(&["print-disabled", &domain])?;
+        if !ok {
+            return Err(format!(
+                "{LAUNCHCTL} print-disabled {domain}: {}",
+                said.trim()
+            ));
+        }
+        Ok(disabled_in(&said, NODE_LABEL))
     }
 
     /// The running job's pid, in whichever domain holds it.
@@ -1517,6 +1658,17 @@ impl LiveSupervisor {
 }
 
 impl ServiceSupervisor for LiveSupervisor {
+    fn switched_off(&self) -> Result<bool, String> {
+        #[cfg(target_os = "macos")]
+        {
+            live_launchd(&RealLaunchctl).switched_off()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(false)
+        }
+    }
+
     fn program_release(&self, program: &Path) -> Result<(u64, u64, u64), String> {
         #[cfg(unix)]
         {
@@ -1651,6 +1803,10 @@ impl ServiceSupervisor for LiveSupervisor {
         image_replaced(pid, program)
     }
 
+    fn running_image_matches(&self, pid: u32, program: &Path) -> Option<bool> {
+        aterm_uds::process::image_matches_file(i32::try_from(pid).ok()?, program)
+    }
+
     fn renew(&self) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
@@ -1678,6 +1834,18 @@ impl ServiceSupervisor for LiveSupervisor {
             Ok(())
         }
     }
+}
+
+/// Whether `print-disabled`'s `text` names `label` disabled: its rows read
+/// `"<label>" => disabled` (`=> true` before macOS 13).
+fn disabled_in(text: &str, label: &str) -> bool {
+    let quoted = format!("\"{label}\"");
+    text.lines().any(|line| {
+        line.trim()
+            .strip_prefix(&quoted)
+            .and_then(|rest| rest.trim().strip_prefix("=>"))
+            .is_some_and(|state| matches!(state.trim(), "disabled" | "true"))
+    })
 }
 
 /// This user's launchd, as the live supervisor reaches it.
@@ -2160,6 +2328,16 @@ pub fn read_for_sync_with(
         ));
     };
     let state = state_with(home, supervisor)?;
+    // A job that does not run because a person switched it off stays off: putting it back is
+    // theirs to do. Where launchd cannot say, the pass goes on as before.
+    if !matches!(state, NodeJobState::Installed { pid: Some(_), .. })
+        && supervisor.switched_off().unwrap_or(false)
+    {
+        return Ok(SyncNodeState::NotApplicable(format!(
+            "{NODE_LABEL} is switched off in launchd (Login Items or `launchctl disable`), \
+             which a sync pass leaves as the person's choice"
+        )));
+    }
     let program = sync_program(program, &state, supervisor)?;
     let target = format!("{NODE_LABEL} running {}", program.display());
     match state {
@@ -2265,6 +2443,14 @@ pub fn ensure_for_sync_with(
         SyncNodeState::Due { .. } => {
             #[cfg(unix)]
             let _guard = node_admin_lock(state_dir)?;
+            // Another window or the subscriber may have repaired it while this pass waited.
+            // A stale Due must not reload the now-current job.
+            match read_for_sync_with(home, state_dir, aterm_config, program, under_ci, supervisor)?
+            {
+                SyncNodeState::NotApplicable(why) => return Ok(format!("left as it is: {why}")),
+                SyncNodeState::Current(now) => return Ok(format!("nothing changed: {now}")),
+                SyncNodeState::Due { .. } => {}
+            }
             // Off or fleet leave may have finished while version probes were running.
             // The same lock keeps either from completing between this check and mutation.
             if let Some(why) = sync_gate(state_dir, aterm_config, under_ci)? {
@@ -2296,6 +2482,113 @@ pub fn ensure_for_sync_with(
                 "installed and started {NODE_LABEL} ({})",
                 unit.display()
             ))
+        }
+    }
+}
+
+/// A committed installed window's relationship to its already-installed node job.
+/// This is image readiness for that launch, not a network-health or access verdict.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowNode {
+    /// Another program, an absent job, or an explicit off is left to ordinary upkeep.
+    Unmanaged,
+    /// The job has positively loaded this window's installed program.
+    Ready,
+    /// The job's loaded image is unreadable, or its replacement has not started yet.
+    Waiting,
+    /// The same installed path now names a different image than the job loaded.
+    Replaced,
+}
+
+/// Read readiness without changing the job. Different installed paths are not compared by
+/// release number: two private builds can have the same version and different protocols.
+///
+/// # Errors
+/// The job, its policy, or its unit cannot be read.
+pub fn window_node_with(
+    home: &Path,
+    state_dir: &Path,
+    aterm_config: Option<&Path>,
+    program: &Path,
+    under_ci: bool,
+    supervisor: &dyn ServiceSupervisor,
+) -> Result<WindowNode, String> {
+    if sync_gate(state_dir, aterm_config, under_ci)?.is_some() || supervisor.switched_off()? {
+        return Ok(WindowNode::Unmanaged);
+    }
+    if let Some(why) = supervisor.leaves_unit_alone(home) {
+        return Err(why);
+    }
+    let NodeJobState::Installed {
+        pid,
+        program: Some(kept),
+        ..
+    } = state_with(home, supervisor)?
+    else {
+        return Ok(WindowNode::Unmanaged);
+    };
+    if kept != program {
+        return Ok(WindowNode::Unmanaged);
+    }
+    let Some(pid) = pid else {
+        return Ok(WindowNode::Waiting);
+    };
+    Ok(match supervisor.running_image_matches(pid, program) {
+        Some(true) => WindowNode::Ready,
+        Some(false) => WindowNode::Replaced,
+        None => WindowNode::Waiting,
+    })
+}
+
+/// Renew only a positively replaced job at this installed window's own path, then wait for its
+/// loaded image. One call makes at most one renewal; later upkeep owns retries. The existing
+/// administration lock keeps concurrent windows from repeating a successful renewal.
+/// `wait` sleeps off the GUI thread and returns false when the window is shutting down.
+///
+/// # Errors
+/// A policy or job read fails, renewal is refused, or the image remains unconfirmed after a
+/// thirty-second polling budget. Lock acquisition and supervisor calls retain their own bounds.
+/// The caller keeps its pending presence and may continue read-only observation.
+pub fn renew_for_window_with(
+    home: &Path,
+    state_dir: &Path,
+    aterm_config: Option<&Path>,
+    program: &Path,
+    under_ci: bool,
+    supervisor: &dyn ServiceSupervisor,
+    mut wait: impl FnMut(Duration) -> bool,
+) -> Result<WindowNode, String> {
+    let read = || window_node_with(home, state_dir, aterm_config, program, under_ci, supervisor);
+    if !wait(Duration::ZERO) {
+        return Err("the window ended before its node renewal".to_owned());
+    }
+    let first = read()?;
+    if matches!(first, WindowNode::Unmanaged | WindowNode::Ready) {
+        return Ok(first);
+    }
+    #[cfg(unix)]
+    let _guard = node_admin_lock(state_dir)?;
+    if !wait(Duration::ZERO) {
+        return Err("the window ended before its node renewal".to_owned());
+    }
+    // A prior window may have finished while this one waited for the administration lock.
+    match read()? {
+        WindowNode::Unmanaged => return Ok(WindowNode::Unmanaged),
+        WindowNode::Ready => return Ok(WindowNode::Ready),
+        WindowNode::Replaced => supervisor.renew()?,
+        WindowNode::Waiting => {}
+    }
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        let state = read()?;
+        if matches!(state, WindowNode::Unmanaged | WindowNode::Ready) {
+            return Ok(state);
+        }
+        let left = until.saturating_duration_since(Instant::now());
+        if left.is_zero() || !wait(left.min(Duration::from_secs(1))) {
+            return Err(
+                "the node's loaded image has not confirmed this installed window".to_owned(),
+            );
         }
     }
 }

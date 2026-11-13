@@ -28,6 +28,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod announce;
+pub(crate) mod census;
 mod custody;
 mod discovery;
 #[cfg(any(test, debug_assertions))]
@@ -37,12 +39,15 @@ mod place;
 mod report;
 mod transport;
 mod vault;
+pub use census::{Cadence, cadence};
 pub(crate) use discovery::MAX_UNVERIFIED_ENDPOINTS;
 #[cfg(test)]
 pub(crate) use discovery::Outcome;
 pub use report::{AuthenticatedConnection, RepairRound};
 #[cfg(test)]
 pub(crate) use transport::test_worker;
+#[cfg(test)]
+pub use vault::Passes;
 
 /// Unforgeable outside this runtime: workers retain the owner lock until they finish,
 /// and recheck its identity before a credential read or publication. Detached endpoints
@@ -114,8 +119,8 @@ pub use discovery::db_discovery_replacement_environment;
 /// owner or a contended one waits between tries.
 const POLL: Duration = Duration::from_secs(2);
 /// The least time between two ticks of a serving loop ([`serve_paced`]): work a tick leaves (a
-/// beacon flood past its per-tick bound, a deadline that comes again at once) waits this long, so
-/// a loop never ticks more often than ten times a second, and only when something it waits on
+/// second connection queued at a listener, a deadline that comes again at once) waits this long,
+/// so a loop never ticks more often than ten times a second, and only when something it waits on
 /// happened.
 const TICK: Duration = Duration::from_millis(100);
 
@@ -132,14 +137,17 @@ enum Flow {
 
 /// A serving loop: `tick(state, now, round)` until `stopped`, ending at the first tick that ends
 /// it ([`Flow::End`]) or fails. Between ticks it waits (`wait(state, floor, until)`) for what its
-/// state waits on to happen ([`rest`]: a beacon, a connection, a round's end, a push), for its
-/// stop, or for `until`: the earlier of the deadline the tick returned ([`Flow::Serve`]) and the
-/// next round; never sooner than `floor`, one [`TICK`] after the tick began. An idle loop so wakes
-/// once a [`POLL`], not ten times a second.
+/// state waits on to happen ([`rest`]: a connection, a round's end, a push, an append this
+/// process made to a table of the custody it serves), for its stop, or for
+/// `until`: the earlier of the deadline the tick returned ([`Flow::Serve`]) and the next round;
+/// never sooner than `floor`, one [`TICK`] after the tick began. An idle loop so wakes once a
+/// [`POLL`], not ten times a second. A peer's beacon wakes nothing: the transport reads the
+/// beacons that came since at each round ([`transport::Transport::turn`]).
 ///
 /// `round` says that the loop's polled checks (the generation, lease, custody, configuration and
-/// vault rechecks, the address refresh) are due in this tick: the first [`POLL`] after the loop
-/// starts, then [`POLL`] after the last tick that ran them returned, by `clock`, not after it
+/// vault rechecks, the address refresh, the transport's read of its peers' beacons) are due in
+/// this tick: the first [`POLL`] after the loop starts, then [`POLL`] after the last tick that
+/// ran them returned, by `clock`, not after it
 /// started. A round slower than the interval (a busy vault waited for, a slow interface read) so
 /// still leaves the loop that long at rest before the next, instead of running round after round
 /// with no rest between. The rest belongs to the loop, not to the round: no path through a tick
@@ -158,6 +166,7 @@ fn serve_paced<S, E>(
     while !stopped() {
         let now = clock();
         let round = now >= due;
+        census::count(census::Event::OwnerTick);
         let flow = tick(state, now, round);
         if round {
             due = clock() + POLL;
@@ -168,6 +177,18 @@ fn serve_paced<S, E>(
         wait(state, now + TICK, next.map_or(due, |next| next.min(due)));
     }
     Ok(())
+}
+
+/// A serving loop's transport step, which both loops' ticks run ([`serve_selected`],
+/// [`serve_presence`]): the transport's turn at `now`, which reads the beacons its peers sent
+/// where this tick is the loop's polled round (`round`, [`serve_paced`]). No beacon wakes the
+/// loop, so a beacon is read at the next round's tick, and no later.
+fn serve_turn(
+    transport: &mut transport::Transport,
+    now: Instant,
+    round: bool,
+) -> std::result::Result<(), Status> {
+    transport.turn(now, round).map_err(|_| Status::Offline)
 }
 
 /// A serving loop's wait between ticks ([`serve_paced`]) on its transport: until a descriptor it
@@ -238,6 +259,9 @@ struct Network {
     /// Which peers speak `Bus` ([`Runtime::speaks_bus`]): every transport this network opens
     /// holds their seats out of its dials and pushes. Shared with the runtime's handle.
     bus: transport::Bus,
+    /// When the selected vault's reader passes ([`vault::Pace`]): on its timer, or each time a
+    /// test asks (tests).
+    vault: vault::Pace,
     #[cfg(test)]
     isolated: Option<auto_sync_tests::Attachment>,
     /// Counts each transport this network opened (tests).
@@ -258,6 +282,11 @@ struct Network {
     /// hello, the broker answering where there is none.
     #[cfg(test)]
     broker: Option<Arc<dyn Fn() -> std::result::Result<(), &'static str> + Send + Sync>>,
+    /// Its Commons serving loop's polled checks never come due (tests): `round` in
+    /// [`serve_selected`]'s tick never holds, so what it serves moves under it only by an event of
+    /// its own, such as the round that enrolls it ([`witnessed`]).
+    #[cfg(test)]
+    unpolled: bool,
     /// The LAN broker answered this runtime once ([`Self::may_use`]).
     brokered: std::cell::Cell<bool>,
     /// What the runtime's first LAN use last waited for ([`Self::may_use`]).
@@ -271,6 +300,7 @@ impl Network {
             place: place::Publisher::live(),
             mesh: aterm_types::mesh_switch::MESH,
             bus: transport::Bus::default(),
+            vault: vault::Pace::Interval,
             #[cfg(test)]
             isolated: None,
             #[cfg(test)]
@@ -283,6 +313,8 @@ impl Network {
             retries: None,
             #[cfg(test)]
             broker: None,
+            #[cfg(test)]
+            unpolled: false,
             brokered: std::cell::Cell::new(false),
             waits: std::cell::Cell::new(""),
         }
@@ -864,6 +896,10 @@ pub struct Runtime {
 pub struct Diagnostic {
     pub observer_config: PathBuf,
     pub recover_writer: bool,
+    /// The passes of the runtime's vault reader: each one these ask for, and none on its timer
+    /// (tests).
+    #[cfg(test)]
+    pub vault: Arc<Passes>,
 }
 
 impl Runtime {
@@ -907,12 +943,18 @@ impl Runtime {
         observe: impl Fn(Status) + Send + 'static,
         reports: impl Fn(RepairRound) + Send + 'static,
     ) -> Result<Self> {
+        let network = Network::live();
+        #[cfg(test)]
+        let network = Network {
+            vault: vault::Pace::Asked(diagnostic.vault),
+            ..network
+        };
         Self::start_mode_with_sources(
             paths,
             config,
             (diagnostic.observer_config, diagnostic.recover_writer),
             observe,
-            Network::live(),
+            network,
             false,
             reports,
         )
@@ -1465,7 +1507,8 @@ fn serve_selected(
     let vault_reader = if pending {
         None
     } else {
-        vault::Reader::start(paths, config, &lease, &custody).map_err(refusal("vault reader"))?
+        vault::Reader::start(paths, config, &lease, &custody, network.vault.clone())
+            .map_err(refusal("vault reader"))?
     };
     let mut hearing = (!pending).then(|| Hearing::open(&bootstrap));
     let mut clocks = if pending {
@@ -1477,6 +1520,14 @@ fn serve_selected(
     // publish anything with.
     let mut lab = (!pending).then(|| crate::alab::upkeep::Upkeep::new(Instant::now()));
     let mut refresh = Instant::now() + Duration::from_secs(30);
+    // While it serves, each append this process makes to a table of this custody rings the owner,
+    // which dials every established peer for that table rather than leaving the record to each
+    // pair's turn. An enrolling owner has no tables. Where no listener can be had, and for what
+    // another process appends, the record goes at each pair's turn, as it did.
+    let _announcing = (!pending)
+        .then(|| crate::table::store::claim_dir_of(&bootstrap).ok())
+        .flatten()
+        .and_then(|claims| crate::table::store::listen(claims, transport.announcer()));
     let result = {
         let _serving = board.serving(transport.doorbell());
         let mut pushing: Option<Ask> = None;
@@ -1489,6 +1540,8 @@ fn serve_selected(
                 if window_config.is_some_and(owner::window_claimed) {
                     return Err(Status::Waiting);
                 }
+                #[cfg(test)]
+                let round = round && !network.unpolled;
                 if round {
                     crate::generation::guard(paths, false).map_err(refusal("generation guard"))?;
                     if now >= refresh {
@@ -1519,26 +1572,8 @@ fn serve_selected(
                         commons::Observation::Unavailable(commons::Unavailable::Busy) => {}
                         commons::Observation::Unavailable(_) => return Err(Status::Dormant),
                     }
-                    if pending {
-                        if bootstrap
-                            .log_witness()
-                            .map_err(refusal("log witness"))?
-                            .is_some()
-                        {
-                            return Ok(Flow::End);
-                        }
-                        let journal = aterm_secrets::commons::journal::Journal::read_existing(
-                            bootstrap.journal_dir(),
-                            bootstrap.trust(),
-                        )
-                        .map_err(refusal("control journal"))?;
-                        if bootstrap
-                            .witness_in(&journal)
-                            .map_err(refusal("control witness"))?
-                            .is_some()
-                        {
-                            return Ok(Flow::End);
-                        }
+                    if pending && witnessed(&bootstrap)? {
+                        return Ok(Flow::End);
                     }
                     let candidates = network.addresses()?;
                     network.may_use(&candidates)?;
@@ -1552,7 +1587,7 @@ fn serve_selected(
                         board.settle(ask.id, Pushed::NoPeers);
                     }
                 }
-                transport.tick(now).map_err(|_| Status::Offline)?;
+                serve_turn(transport, now, round)?;
                 if let Some(ask) = pushing {
                     let settled = if transport.reached() {
                         Some(Pushed::Reached)
@@ -1566,6 +1601,10 @@ fn serve_selected(
                     }
                 }
                 let completed: Vec<_> = transport.reports().collect();
+                // The round that enrolls this device brings its witness into view: an enrolling
+                // owner asks for it at the tick one of its rounds completes its control exchange,
+                // not only at its next polled round.
+                let witness_due = pending && completed.iter().any(|round| round.control.is_ok());
                 if let Some(lab) = &mut lab {
                     lab.tick(paths, now);
                 }
@@ -1615,6 +1654,9 @@ fn serve_selected(
                         hints: transport.peers(),
                     }
                 });
+                if witness_due && witnessed(&bootstrap)? {
+                    return Ok(Flow::End);
+                }
                 let due = transport.next_due(now);
                 Ok(Flow::Serve(Some(
                     pushing.map_or(due, |ask| ask.deadline.min(due)),
@@ -1631,6 +1673,29 @@ fn serve_selected(
     }
     drop(owner_relay);
     result
+}
+
+/// Whether an enrolling owner's custody now holds its membership witness, in the membership log or
+/// the control journal: what it serves moved under it, and it rebuilds as a member. Asked at each
+/// polled round, and at the tick one of its rounds completes its control exchange, which is what
+/// brings the witness into view.
+fn witnessed(bootstrap: &Bootstrap) -> std::result::Result<bool, Status> {
+    if bootstrap
+        .log_witness()
+        .map_err(refusal("log witness"))?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    let journal = aterm_secrets::commons::journal::Journal::read_existing(
+        bootstrap.journal_dir(),
+        bootstrap.trust(),
+    )
+    .map_err(refusal("control journal"))?;
+    Ok(bootstrap
+        .witness_in(&journal)
+        .map_err(refusal("control witness"))?
+        .is_some())
 }
 
 /// This device's contact ledger ([`Ledger`]): every authenticated peer and the version it
@@ -2008,7 +2073,7 @@ fn serve_presence(
                 network.may_use(&candidates)?;
                 network.refresh(transport, &candidates);
             }
-            transport.tick(now).map_err(|_| Status::Offline)?;
+            serve_turn(transport, now, round)?;
             observe_transport(history, transport, ObservationMode::Discovery);
             Ok(Flow::Serve(Some(transport.next_due(now))))
         },

@@ -13,7 +13,7 @@ use super::checkpoint_holder::HolderRepr;
 use super::checkpoint_output::OutputStateRepr;
 use super::checkpoint_state::{ColorRepr, ShellRepr, TitleRepr};
 use super::types::{CurrentStyle, TerminalModes};
-use crate::grid::{CellFlags, Cursor, Grid, PackedColor, SavedCursorState};
+use crate::grid::{CellFlags, Cursor, Grid, PackedColor, SavedCursorState, VisibleCells};
 use crate::scrollback::{Scrollback, deserialize_lines, serialize_line_views};
 
 /// Per-grid cursor + region + wrap + tab-stop projection, captured for the main grid and (when present) the alt grid.
@@ -298,6 +298,10 @@ pub struct TerminalCheckpoint {
     pub alt_grid: Option<Vec<u8>>,
     /// Alt-grid cursor/region/wrap/tab projection, if an alt grid exists.
     pub alt_cursor: Option<GridCursorRepr>,
+    /// What `grid`'s visible rows hold that their line records leave out ([`VisibleCells`]): each row's DEC line size and its DECSCA-protected columns. Empty from a producer that carried none.
+    pub visible_cells: VisibleCells,
+    /// The same for `alt_grid`'s visible rows (empty when there is none).
+    pub alt_visible_cells: VisibleCells,
     /// DECSC/DECRC save slot for the main screen.
     pub saved_cursor_main: Option<SavedCursorRepr>,
     /// DECSC/DECRC save slot for the alternate screen.
@@ -2156,7 +2160,7 @@ impl Terminal {
         (carry, self.partial_sequence_uncarried())
     }
 
-    /// The scalar half of [`Self::checkpoint_carry_abandoning_partial`]`(0)` (exactly that carry's [`CheckpointMeta`]) without projecting either grid.
+    /// The scalar half of [`Self::checkpoint_carry_abandoning_partial`]`(0)` without projecting either grid: that carry's [`CheckpointMeta`] with `visible_cells` and `alt_visible_cells`, which describe the grids, left empty.
     #[cfg(feature = "serde")]
     #[must_use]
     pub fn carry_meta_abandoning_partial(&self) -> CheckpointMeta {
@@ -2339,7 +2343,7 @@ impl Terminal {
         let rows = self.grid.rows();
         let cols = self.grid.cols();
         let parser = self.carried_parser();
-        let (grid_bytes, history_lines) = if grids {
+        let (grid_bytes, history_lines, visible_cells) = if grids {
             let grid_lines = self.grid.checkpoint_line_views_bounded(max_history);
             let history_lines = u32::try_from(
                 grid_lines
@@ -2347,9 +2351,13 @@ impl Terminal {
                     .saturating_sub(usize::from(self.grid.rows())),
             )
             .unwrap_or(u32::MAX);
-            (serialize_line_views(&grid_lines), history_lines)
+            (
+                serialize_line_views(&grid_lines),
+                history_lines,
+                self.grid.checkpoint_visible_cells(),
+            )
         } else {
-            (Vec::new(), 0)
+            (Vec::new(), 0, VisibleCells::default())
         };
         let cursor = GridCursorRepr::capture(&self.grid);
 
@@ -2368,18 +2376,21 @@ impl Terminal {
             }
         });
 
-        let (alt_grid, alt_cursor) = match &self.alt_grid {
-            Some(inactive) => (
-                Some(if grids {
-                    serialize_line_views(
-                        &inactive.checkpoint_line_views_bounded(inactive_max_history),
+        let (alt_grid, alt_cursor, alt_visible_cells) = match &self.alt_grid {
+            Some(inactive) => {
+                let (blob, cells) = if grids {
+                    (
+                        serialize_line_views(
+                            &inactive.checkpoint_line_views_bounded(inactive_max_history),
+                        ),
+                        inactive.checkpoint_visible_cells(),
                     )
                 } else {
-                    Vec::new()
-                }),
-                Some(GridCursorRepr::capture(inactive)),
-            ),
-            None => (None, None),
+                    (Vec::new(), VisibleCells::default())
+                };
+                (Some(blob), Some(GridCursorRepr::capture(inactive)), cells)
+            }
+            None => (None, None, VisibleCells::default()),
         };
 
         TerminalCheckpoint {
@@ -2390,6 +2401,8 @@ impl Terminal {
             cursor,
             alt_grid,
             alt_cursor,
+            visible_cells,
+            alt_visible_cells,
             saved_cursor_main: self.cursor_save.main.map(SavedCursorRepr::capture),
             saved_cursor_alt: self.cursor_save.alt.map(SavedCursorRepr::capture),
             modes: self.modes,
@@ -2423,12 +2436,27 @@ impl Terminal {
     /// [`Self::from_checkpoint`] with the main grid's tiered store unbounded (`store_lines` `None`) or kept to `store_lines` lines.
     fn from_checkpoint_onto(c: &TerminalCheckpoint, store_lines: Option<usize>) -> Terminal {
         let on_alt = c.modes.alternate_screen;
-        let mut active_grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt, store_lines);
+        let mut active_grid = restore_grid(
+            c.rows,
+            c.cols,
+            &c.grid,
+            &c.visible_cells,
+            &c.cursor,
+            on_alt,
+            store_lines,
+        );
         active_grid.continue_absolute_numbering(c.absolute_row_counter);
         let saved_grid = match (&c.alt_grid, &c.alt_cursor) {
             (Some(alt_bytes), Some(alt_cursor)) => {
-                let mut saved =
-                    restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt, store_lines);
+                let mut saved = restore_grid(
+                    c.rows,
+                    c.cols,
+                    alt_bytes,
+                    &c.alt_visible_cells,
+                    alt_cursor,
+                    !on_alt,
+                    store_lines,
+                );
                 saved.continue_absolute_numbering(c.alt_absolute_row_counter);
                 Some(saved)
             }
@@ -2942,12 +2970,28 @@ impl Terminal {
         let prior_pullback = self.deep_history_pullback_ordinal();
         self.release_search_index();
         let on_alt = c.modes.alternate_screen;
-        self.grid = restore_grid(c.rows, c.cols, &c.grid, &c.cursor, on_alt, None);
+        self.grid = restore_grid(
+            c.rows,
+            c.cols,
+            &c.grid,
+            &c.visible_cells,
+            &c.cursor,
+            on_alt,
+            None,
+        );
         self.grid
             .continue_absolute_numbering(c.absolute_row_counter);
         self.alt_grid = match (&c.alt_grid, &c.alt_cursor) {
             (Some(alt_bytes), Some(alt_cursor)) => {
-                let mut saved = restore_grid(c.rows, c.cols, alt_bytes, alt_cursor, !on_alt, None);
+                let mut saved = restore_grid(
+                    c.rows,
+                    c.cols,
+                    alt_bytes,
+                    &c.alt_visible_cells,
+                    alt_cursor,
+                    !on_alt,
+                    None,
+                );
                 saved.continue_absolute_numbering(c.alt_absolute_row_counter);
                 Some(saved)
             }
@@ -3130,6 +3174,20 @@ pub struct CheckpointMeta {
         deserialize_with = "lenient_holder"
     )]
     pub holder: HolderRepr,
+    /// [`TerminalCheckpoint::visible_cells`]: additive, absent when empty, and a value that does not read costs only itself.
+    #[serde(
+        default,
+        skip_serializing_if = "super::checkpoint_cells::VisibleCellsRepr::is_empty",
+        deserialize_with = "super::checkpoint_cells::lenient_visible_cells"
+    )]
+    pub visible_cells: super::checkpoint_cells::VisibleCellsRepr,
+    /// [`TerminalCheckpoint::alt_visible_cells`], dropped with the inactive grid whenever [`Self::into_checkpoint`] drops the grid.
+    #[serde(
+        default,
+        skip_serializing_if = "super::checkpoint_cells::VisibleCellsRepr::is_empty",
+        deserialize_with = "super::checkpoint_cells::lenient_visible_cells"
+    )]
+    pub alt_visible_cells: super::checkpoint_cells::VisibleCellsRepr,
 }
 
 #[cfg(feature = "serde")]
@@ -3222,6 +3280,8 @@ impl CheckpointMeta {
             alt_grid: _, // sidecar blob, not meta
             cursor,
             alt_cursor,
+            visible_cells,
+            alt_visible_cells,
             saved_cursor_main,
             saved_cursor_alt,
             modes,
@@ -3275,6 +3335,10 @@ impl CheckpointMeta {
                 .map(super::checkpoint_parser::ParserRepr::from_carry),
             output_state: output_state.clone(),
             holder: holder.clone(),
+            visible_cells: super::checkpoint_cells::VisibleCellsRepr::from_cells(visible_cells),
+            alt_visible_cells: super::checkpoint_cells::VisibleCellsRepr::from_cells(
+                alt_visible_cells,
+            ),
         }
     }
 
@@ -3286,9 +3350,9 @@ impl CheckpointMeta {
             .as_ref()
             .and_then(super::checkpoint_parser::ParserRepr::to_carry)
             .filter(|carry| !carry.is_ground());
-        let (alt_grid, alt_cursor) = match (alt_grid, self.alt_cursor) {
-            (Some(g), Some(c)) => (Some(g), Some(c)),
-            _ => (None, None),
+        let (alt_grid, alt_cursor, alt_visible_cells) = match (alt_grid, self.alt_cursor) {
+            (Some(g), Some(c)) => (Some(g), Some(c), self.alt_visible_cells.into_cells()),
+            _ => (None, None, VisibleCells::default()),
         };
         TerminalCheckpoint {
             rows: self.rows,
@@ -3298,6 +3362,8 @@ impl CheckpointMeta {
             cursor: self.cursor,
             alt_grid,
             alt_cursor,
+            visible_cells: self.visible_cells.into_cells(),
+            alt_visible_cells,
             saved_cursor_main: self.saved_cursor_main,
             saved_cursor_alt: self.saved_cursor_alt,
             modes: self.modes,
@@ -3347,6 +3413,7 @@ fn restore_grid(
     rows: u16,
     cols: u16,
     bytes: &[u8],
+    cells: &VisibleCells,
     cursor: &GridCursorRepr,
     is_alt: bool,
     store_lines: Option<usize>,
@@ -3376,6 +3443,8 @@ fn restore_grid(
         grid
     };
     grid.restore_visible_from_lines(&lines[visible_start..]);
+    // Before the cursor, which a row's line size bounds.
+    grid.restore_visible_cells(cells);
     grid.damage_mut().mark_full();
     cursor.apply(&mut grid);
     grid

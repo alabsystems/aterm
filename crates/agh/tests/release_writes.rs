@@ -187,6 +187,64 @@ fn guard_what(error: &Error) -> String {
 }
 
 #[test]
+fn recovery_only_lookup_never_creates_an_absent_release_or_an_intent() {
+    let world = world("recover-absent");
+    let mark = world.mark();
+    assert!(
+        world
+            .releases()
+            .recover_created(&world.permit(), &notes("A"), &world.journal())
+            .unwrap()
+            .is_none()
+    );
+    assert!(world.writes_since(mark).is_empty());
+    assert!(world.records().is_empty());
+}
+
+#[test]
+fn recovery_only_lookup_returns_the_journals_existing_draft_without_posting() {
+    let world = world("recover-owned");
+    let request = notes("A");
+    let original = done(world.create(&request).unwrap(), Effect::Created);
+    let mark = world.mark();
+    let recovered = world
+        .releases()
+        .recover_created(&world.permit(), &request, &world.journal())
+        .unwrap()
+        .unwrap();
+    assert_eq!(recovered.object.id, original.id);
+    assert_eq!(recovered.effect, Effect::Converged);
+    assert!(world.writes_since(mark).is_empty());
+}
+
+#[test]
+fn recovery_only_lookup_refuses_a_foreign_draft_and_another_body_without_writes() {
+    let world = world("recover-foreign");
+    world
+        .fake
+        .add_release(APP, ReleaseSpec::draft("v1", "2026-10-01T00:00:00Z"));
+    let mark = world.mark();
+    assert!(
+        world
+            .releases()
+            .recover_created(&world.permit(), &notes("A"), &world.journal())
+            .is_err()
+    );
+    assert!(world.writes_since(mark).is_empty());
+
+    let owned = self::world("recover-other-body");
+    done(owned.create(&notes("A")).unwrap(), Effect::Created);
+    let mark = owned.mark();
+    assert!(
+        owned
+            .releases()
+            .recover_created(&owned.permit(), &notes("B"), &owned.journal())
+            .is_err()
+    );
+    assert!(owned.writes_since(mark).is_empty());
+}
+
+#[test]
 fn create_posts_one_draft_with_the_exact_body() {
     let world = world("rw-create");
     let made = done(

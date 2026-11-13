@@ -32,7 +32,7 @@ fn an_activation_consumed_by_a_continued_carry_is_revisited_without_another_idle
             }),
             step: Arc::new(move |_, _, _| {
                 s.fetch_add(1, Ordering::SeqCst);
-                "wait:settling".into()
+                UpgradeStep::unknown("wait:settling")
             }),
             ..Acts::inert()
         };
@@ -89,7 +89,7 @@ fn an_ordinary_upgrade_continued_step_still_waits_for_the_next_idle_event() {
             n.fetch_add(1, Ordering::SeqCst);
             Due::Yes
         }),
-        step: Arc::new(|_, _, _| "continued".into()),
+        step: Arc::new(|_, _, _| UpgradeStep::unknown("continued")),
         ..Acts::inert()
     };
     let idle = idle_host("s-ordinary-continued", Program::Claude, switched(&on()), h);

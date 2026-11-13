@@ -171,6 +171,8 @@ pub struct Machine<'a> {
     pub env: &'a dyn Fn(&str) -> Option<OsString>,
     /// A config file's text.
     pub read: &'a dyn Fn(&Path) -> Result<Option<String>, ()>,
+    /// Initial manifest text: only a missing path is absent; existing non-files refuse.
+    pub read_manifest: &'a dyn Fn(&Path) -> Result<Option<String>, ()>,
     /// Whether this process may write the directory (`access(2)`).
     pub writable: &'a dyn Fn(&Path) -> Option<bool>,
 }
@@ -1332,7 +1334,8 @@ pub enum BuildDir {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplicitCache {
     pub target: PathBuf,
-    pub manifest: PathBuf,
+    /// All supported initial manifest readings; custody requires owner agreement.
+    pub manifests: Vec<PathBuf>,
     /// A separately selected intermediate directory; both outputs require custody.
     pub intermediates: Option<PathBuf>,
 }
@@ -1351,37 +1354,64 @@ pub fn explicit_cache(
 ) -> Option<ExplicitCache> {
     let (line, target, intermediates) = cache_line(args, tool, m, alias)?;
     let cwd = m.cwd?;
-    let target = target.or_else(|| configured_target(cwd, tool, m))?;
+    let target = if line.trust || tool == Tool::Cargo {
+        target.or_else(|| configured_target(cwd, tool, m))
+    } else {
+        target
+    }?;
     if target.as_os_str().is_empty() {
         return None;
     }
     Some(ExplicitCache {
         target: absolute(target, cwd)?,
-        manifest: cache_manifest(&line, m)?,
+        manifests: cache_manifests(&line, tool, m)?,
         intermediates,
     })
 }
 
-/// Manifest for the exact producer-selected local fallback. The registrar resolves its
-/// workspace root before preparing `target`; caller-selected layouts grant no such choice.
+/// Manifest for the exact producer-selected local fallback: `selected`, the placement this call
+/// was handed, never a fresh [`decide`], which can name the cache once admission has made its
+/// parents ([`still_selected`] holds the plan itself). The registrar resolves its workspace root
+/// before preparing `target`; caller-selected layouts grant no such choice.
 #[must_use]
-pub fn local_fallback_manifest(
+pub fn local_fallback_manifests(
     args: &[String],
     tool: Tool,
     m: &Machine<'_>,
+    selected: &BuildDir,
     alias: &dyn Fn(&str) -> UserAlias,
-) -> Option<PathBuf> {
+) -> Option<Vec<PathBuf>> {
     let expected = target_build_path(Path::new("{workspace-root}/target"));
     let expected = expected.to_str()?;
-    let selected = match decide(args, tool, m)? {
-        BuildDir::Target(value) => directory_from_config(&value) == Some(expected),
+    let fallback = match selected {
+        BuildDir::Target(value) => directory_from_config(value) == Some(expected),
         BuildDir::TrustEnv(value) => value == expected,
         BuildDir::Cache(_) => false,
     };
-    if !selected {
+    if !fallback {
         return None;
     }
-    cache_manifest(&cache_line(args, tool, m, alias)?.0, m)
+    cache_manifests(&cache_line(args, tool, m, alias)?.0, tool, m)
+}
+
+/// Whether [`decide`] still places this call in `selected`, the placement chosen before its
+/// admission. A changed argument, environment or config shows; the cache's writability, the one
+/// answer admission itself changes (it makes the cache's parents), is held to the answer that
+/// chose `selected`: a placement other than the cache either never reads it (a target the call
+/// names, the trust lane) or was chosen because the cache could not be written. [`decide`] reads
+/// [`Machine::writable`] for that answer alone.
+#[must_use]
+pub fn still_selected(args: &[String], tool: Tool, m: &Machine<'_>, selected: &BuildDir) -> bool {
+    let held = Machine {
+        writable: &|_| Some(false),
+        ..*m
+    };
+    let m = if matches!(selected, BuildDir::Cache(_)) {
+        m
+    } else {
+        &held
+    };
+    decide(args, tool, m).as_ref() == Some(selected)
 }
 
 fn cache_line(
@@ -1446,6 +1476,11 @@ fn cache_line(
         .or_else(|| cargo_var("CARGO_BUILD_TARGET_DIR", tool, m).map(PathBuf::from));
     let intermediates =
         intermediates.or_else(|| cargo_var(BUILD_DIR_ENV, tool, m).map(PathBuf::from));
+    let (target, intermediates) = if line.trust || tool == Tool::Cargo {
+        (target, intermediates)
+    } else {
+        resolve_discovered_outputs(cwd, tool, m, target, intermediates).ok()?
+    };
     let intermediates = match intermediates {
         Some(path) => {
             // The proof frontend's separate output grammar, an unknown upstream
@@ -1461,17 +1496,122 @@ fn cache_line(
         }
         None => None,
     };
-    // Discovered build-directory graphs remain unresolved here; they need their own
-    // definition provenance before either output can grant custody.
-    if cwd
-        .ancestors()
-        .map(|p| p.join(".cargo"))
-        .chain(package_homes(tool, m))
-        .any(|dir| config_dirs(&dir, m).build)
+    // These frontends keep their existing conservative discovery boundary. Their
+    // output grammar or include-version capability is not established by this reader.
+    if (line.trust || tool == Tool::Cargo)
+        && cwd
+            .ancestors()
+            .map(|p| p.join(".cargo"))
+            .chain(package_homes(tool, m))
+            .any(|dir| config_dirs(&dir, m).build)
     {
         return None;
     }
     Some((line, target, intermediates))
+}
+
+/// Merge discovered outputs below command, CLI and environment selections. Each supported
+/// package home is an alternative driver behavior; only identical effective outputs agree.
+fn resolve_discovered_outputs(
+    cwd: &Path,
+    tool: Tool,
+    m: &Machine<'_>,
+    target: Option<PathBuf>,
+    intermediates: Option<PathBuf>,
+) -> Result<(Option<PathBuf>, Option<PathBuf>), ()> {
+    let homes = package_homes(tool, m);
+    let homes = if homes.is_empty() {
+        vec![None]
+    } else {
+        homes.iter().map(|p| Some(p.as_path())).collect()
+    };
+    let mut resolved = None;
+    for home in homes {
+        let outputs = discovered_config_outputs(cwd, home, m, target.is_some())?;
+        let selected = (
+            target
+                .clone()
+                .or_else(|| outputs.target.map(|p| p.base.join(p.value))),
+            intermediates
+                .clone()
+                .or_else(|| outputs.intermediates.map(|p| p.base.join(p.value))),
+        );
+        if resolved.as_ref().is_some_and(|prior| prior != &selected) {
+            return Err(());
+        }
+        resolved = Some(selected);
+    }
+    resolved.ok_or(())
+}
+
+/// Targo visits nearest configuration first and merges farther roots without overwriting
+/// selected fields. Each root has a fresh include cycle set. Legacy `config` wins, and a
+/// package home already visited through its canonical ancestor name is not loaded twice.
+fn discovered_config_outputs(
+    cwd: &Path,
+    home: Option<&Path>,
+    m: &Machine<'_>,
+    target_known: bool,
+) -> Result<ConfigOutputs, ()> {
+    let mut dirs: Vec<_> = cwd.ancestors().map(|p| p.join(".cargo")).collect();
+    if let Some(home) = home
+        && !dirs.iter().any(|dir| dir == home)
+    {
+        let canonical = |p: &Path| p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+        let home_canonical = canonical(home);
+        if !dirs.iter().any(|p| canonical(p) == home_canonical) {
+            dirs.push(home.to_path_buf());
+        }
+    }
+    let mut selected = ConfigOutputs::default();
+    for dir in dirs {
+        let legacy = dir.join("config");
+        let (file, text) = match config_file(&legacy, m)? {
+            Some(text) => (legacy, text),
+            None => {
+                let file = dir.join("config.toml");
+                let Some(text) = config_file(&file, m)? else {
+                    continue;
+                };
+                (file, text)
+            }
+        };
+        if text.len() > CONFIG_GRAPH_MAX_BYTES {
+            return Err(());
+        }
+        // A literal with none of the output/include words or escapes cannot select an
+        // output. Keep neutral configuration independent of unsupported TOML syntax.
+        if !names_a_dir(&text) {
+            continue;
+        }
+        let literal = config_text_dirs(&text);
+        // An already selected target makes lower target-only text irrelevant. As in
+        // the conservative scan, only include/output words or key escapes can hide
+        // intermediate selection; malformed unused target syntax grants no new path.
+        if (target_known || selected.target.is_some())
+            && !literal.build
+            && !literal.include
+            && !spells_by_escape(&text)
+        {
+            continue;
+        }
+        let outputs = config_graph_outputs(
+            text,
+            Some(file),
+            cwd,
+            m,
+            true,
+            true,
+            &mut std::collections::BTreeSet::new(),
+        )?;
+        if selected.target.is_none() {
+            selected.target = outputs.target;
+        }
+        if selected.intermediates.is_none() {
+            selected.intermediates = outputs.intermediates;
+        }
+    }
+    Ok(selected)
 }
 
 /// Read CLI config outputs with their definition's path bases. Cargo asks whether the path
@@ -1502,6 +1642,36 @@ fn cache_config_outputs(
     )
 }
 
+const CONFIG_GRAPH_MAX_READS: usize = 1024;
+const CONFIG_GRAPH_MAX_BYTES: usize = 16 * 1024 * 1024;
+const CONFIG_GRAPH_MAX_PENDING: usize = 2 * CONFIG_GRAPH_MAX_READS;
+
+/// One graph's resource policy, shared by CLI output resolution and discovered-output scans.
+/// Missing optional files consume attempts; text counts cumulatively before another layer runs.
+#[derive(Default)]
+struct ConfigGraphBudget {
+    reads: usize,
+    text_bytes: usize,
+}
+
+impl ConfigGraphBudget {
+    fn attempt_read(&mut self) -> Result<(), ()> {
+        if self.reads >= CONFIG_GRAPH_MAX_READS {
+            return Err(());
+        }
+        self.reads += 1;
+        Ok(())
+    }
+
+    fn retain_text(&mut self, text: &str) -> Result<(), ()> {
+        self.text_bytes = self.text_bytes.checked_add(text.len()).ok_or(())?;
+        if self.text_bytes > CONFIG_GRAPH_MAX_BYTES {
+            return Err(());
+        }
+        Ok(())
+    }
+}
+
 enum ConfigStep {
     Load(PathBuf, bool),
     Layer(String, Option<PathBuf>),
@@ -1528,19 +1698,16 @@ fn config_graph_outputs(
 ) -> Result<ConfigOutputs, ()> {
     // Bound adversarial acyclic graphs as well as cycles. Optional missing files consume
     // attempts, and aggregate text is checked before retaining another layer.
-    const MAX_READS: usize = 1024;
-    const MAX_BYTES: usize = 16 * 1024 * 1024;
-    const MAX_PENDING: usize = 2 * MAX_READS;
-    let mut text_bytes = text.len();
-    if text_bytes > MAX_BYTES {
-        return Err(());
+    let mut budget = ConfigGraphBudget::default();
+    budget.retain_text(&text)?;
+    if file.is_some() {
+        budget.attempt_read()?;
     }
-    let mut reads = usize::from(file.is_some());
     let mut inline_seen = std::collections::BTreeSet::new();
     // CLI file arguments share Targo's seen set; inline graphs each get a fresh one.
     // Supplied root paths retain their spelling, while included paths are normalized.
     let seen = if let Some(file) = &file {
-        if file_seen.len() >= MAX_READS || !file_seen.insert(file.clone()) {
+        if file_seen.len() >= CONFIG_GRAPH_MAX_READS || !file_seen.insert(file.clone()) {
             return Err(());
         }
         file_seen
@@ -1560,17 +1727,16 @@ fn config_graph_outputs(
                 }
             }
             ConfigStep::Load(file, optional) => {
-                if reads >= MAX_READS || seen.contains(&file) {
+                if seen.contains(&file) {
                     return Err(());
                 }
-                reads += 1;
+                budget.attempt_read()?;
                 match config_file(&file, m)? {
                     None if optional => {}
-                    Some(text) if seen.len() < MAX_READS && seen.insert(file.clone()) => {
-                        text_bytes = text_bytes.checked_add(text.len()).ok_or(())?;
-                        if text_bytes > MAX_BYTES {
-                            return Err(());
-                        }
+                    Some(text)
+                        if seen.len() < CONFIG_GRAPH_MAX_READS && seen.insert(file.clone()) =>
+                    {
+                        budget.retain_text(&text)?;
                         pending.push(ConfigStep::Layer(text, Some(file)))
                     }
                     _ => return Err(()),
@@ -1604,12 +1770,17 @@ fn config_graph_outputs(
                 if !follow_includes && !includes.is_empty() {
                     return Err(());
                 }
+                // Refuse an oversized layer before allocating its joined paths. The output
+                // selection, if any, already counts toward the pending bound.
+                if pending.len().saturating_add(includes.len()) > CONFIG_GRAPH_MAX_PENDING {
+                    return Err(());
+                }
                 for (path, optional) in includes.into_iter().rev() {
                     pending.push(ConfigStep::Load(lexical(&base.join(path)), optional));
                 }
             }
         }
-        if pending.len() > MAX_PENDING {
+        if pending.len() > CONFIG_GRAPH_MAX_PENDING {
             return Err(());
         }
     }
@@ -1684,17 +1855,84 @@ fn absolute(path: PathBuf, cwd: &Path) -> Option<PathBuf> {
     .then(|| path.components().collect::<PathBuf>())
 }
 
-fn cache_manifest(line: &Line, m: &Machine<'_>) -> Option<PathBuf> {
-    let (home, cwd) = (m.home?, m.cwd?);
-    Some(match line.manifest_path.as_deref() {
-        Some(path) => absolute(PathBuf::from(path), cwd)?,
-        None => cwd
-            .ancestors()
-            .take_while(|p| p.starts_with(home) && *p != home)
-            .take(32)
-            .map(|p| p.join("Cargo.toml"))
-            .find(|p| (m.read)(p).is_ok_and(|text| text.is_some()))?,
-    })
+/// An initial manifest observation. Only absence allows searching a parent directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitialManifest {
+    Absent,
+    Readable(PathBuf),
+    Unreadable(PathBuf),
+}
+
+/// Initial package discovery within managed ancestry. Native Targo prefers its filename
+/// within each directory; compatibility drivers may read Cargo.toml alone. Workspace
+/// ancestor and package.workspace lookup are separate operations with their own grammar.
+#[must_use]
+pub fn initial_manifest(m: &Machine<'_>, native: bool) -> InitialManifest {
+    let (Some(home), Some(cwd)) = (m.home, m.cwd) else {
+        return InitialManifest::Absent;
+    };
+    let names: &[&str] = if native {
+        &["Targo.toml", "Cargo.toml"]
+    } else {
+        &["Cargo.toml"]
+    };
+    for directory in cwd
+        .ancestors()
+        .take_while(|p| p.starts_with(home) && *p != home)
+    {
+        for name in names {
+            let path = directory.join(name);
+            match (m.read_manifest)(&path) {
+                Ok(None) => {}
+                Ok(Some(_)) => return InitialManifest::Readable(path),
+                Err(_) => return InitialManifest::Unreadable(path),
+            }
+        }
+    }
+    InitialManifest::Absent
+}
+
+fn manifest_modes(tool: Tool, line: Option<&Line>) -> &'static [bool] {
+    match tool {
+        Tool::Cargo => &[false],
+        Tool::Targo if line.is_some_and(|line| !line.trust && line.alias.is_none()) => &[true],
+        _ => &[true, false],
+    }
+}
+
+/// Initial discovery observations for custody, on an already expanded command line.
+/// Unknown command/proof dispatch retains both supported grammars. The same policy
+/// selects manifest readings before an output may acquire an owner.
+#[must_use]
+pub fn initial_manifest_readings(
+    args: &[String],
+    tool: Tool,
+    m: &Machine<'_>,
+) -> Vec<InitialManifest> {
+    let line = m.home.and_then(|home| {
+        let root = m.root.map_or_else(|| cache_root(home), Path::to_path_buf);
+        Line::parse(args, tool, home, &root, consents(args))
+    });
+    manifest_modes(tool, line.as_ref())
+        .iter()
+        .map(|&native| initial_manifest(m, native))
+        .collect()
+}
+
+fn cache_manifests(line: &Line, tool: Tool, m: &Machine<'_>) -> Option<Vec<PathBuf>> {
+    if let Some(path) = line.manifest_path.as_deref() {
+        return Some(vec![absolute(PathBuf::from(path), m.cwd?)?]);
+    }
+    let mut manifests = Vec::new();
+    for &native in manifest_modes(tool, Some(line)) {
+        let InitialManifest::Readable(path) = initial_manifest(m, native) else {
+            return None;
+        };
+        if !manifests.contains(&path) {
+            manifests.push(path);
+        }
+    }
+    Some(manifests)
 }
 
 /// Cargo resolves a configured path against the directory containing `.cargo`, with the
@@ -1745,6 +1983,7 @@ fn target_hint_at(cwd: &Path, tool: Tool) -> Result<Option<PathBuf>, String> {
         cwd: Some(cwd),
         env: &|name| std::env::var_os(name),
         read: &read_config,
+        read_manifest: &read_manifest,
         writable: &|_| None,
     };
     target_hint(&machine, tool)
@@ -2169,7 +2408,12 @@ pub fn placed_build_dir(
 fn cache_writable(home: &Path, root: &Path, m: &Machine<'_>) -> bool {
     (m.writable)(root)
         .or_else(|| root.parent().and_then(|p| (m.writable)(p)))
-        .or_else(|| (m.writable)(&home.join("Library/Caches")))
+        .or_else(|| {
+            home.join("Library/Caches")
+                .ancestors()
+                .take_while(|path| path.starts_with(home))
+                .find_map(m.writable)
+        })
         .unwrap_or(false)
 }
 
@@ -2401,6 +2645,21 @@ struct Named {
     include: bool,
 }
 
+/// Literal output/include markers on non-comment lines. Escaped keys still need TOML
+/// decoding; these markers alone grant no selected directory or graph validity.
+fn config_text_dirs(text: &str) -> Named {
+    let mut named = Named::default();
+    for line in text.lines() {
+        if line.trim_start_matches([' ', '\t']).starts_with('#') {
+            continue;
+        }
+        named.build |= line.contains("build-dir");
+        named.target |= line.contains("target-dir");
+        named.include |= line.contains("include");
+    }
+    named
+}
+
 /// [`Named`] for the config files in `dir`, `alias` the verb to look up.
 fn config_scan(dir: &Path, alias: Option<&str>, m: &Machine<'_>) -> Named {
     let mut named = Named::default();
@@ -2454,74 +2713,71 @@ fn config_scan(dir: &Path, alias: Option<&str>, m: &Machine<'_>) -> Named {
 /// entry of another type, a path that is no `.toml` or holds a glob or a brace, one that names
 /// nothing though not optional, or a file the walk loads twice (Targo's cycle check spans it,
 /// so a file two includes name is one). Targo refuses all but the first, and builds nothing
-/// then. The cycle check bounds the walk as it bounds Targo's: each file loads once, and a path
-/// that loops through a link stops at the kernel's link limit, a read this reader cannot make.
+/// then. A bounded iterative walk shares the CLI graph's read-attempt, aggregate-text and
+/// pending-work limits. Exceeding a limit leaves both outputs unresolved.
 fn config_dirs(dir: &Path, m: &Machine<'_>) -> Named {
     let mut named = Named::default();
     for name in ["config.toml", "config"] {
-        let _ = included_dirs(&dir.join(name), m, &mut Vec::new(), &mut named);
+        scan_config_graph_dirs(&dir.join(name), m, &mut named);
     }
     named
 }
 
-/// [`config_dirs`] for the one file `file`, its findings added to `named`; `None` where nothing
-/// stands at `file`.
-fn included_dirs(
-    file: &Path,
-    m: &Machine<'_>,
-    seen: &mut Vec<PathBuf>,
-    named: &mut Named,
-) -> Option<()> {
+/// Add one discovered configuration graph's output markers without recursive traversal.
+/// Each root gets a fresh cycle set and resource budget; a missing root names nothing.
+/// Any incomplete graph conservatively names both outputs and needs no further reads.
+fn scan_config_graph_dirs(file: &Path, m: &Machine<'_>, named: &mut Named) {
     let both = |named: &mut Named| {
         named.build = true;
         named.target = true;
     };
-    let text = match config_file(file, m) {
-        Err(()) => {
+    let mut budget = ConfigGraphBudget::default();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pending = vec![(file.to_path_buf(), true)];
+    while let Some((file, optional)) = pending.pop() {
+        if budget.attempt_read().is_err() {
             both(named);
-            return Some(());
+            return;
         }
-        Ok(None) => return None,
-        Ok(Some(text)) => text,
-    };
-    // Every file a walk loads is one it has seen, as Targo's `_load_file` records it before
-    // reading what it includes.
-    if seen.iter().any(|loaded| loaded == file) {
-        both(named);
-        return Some(());
-    }
-    seen.push(file.to_path_buf());
-    let escaped = spells_by_escape(&text);
-    let mut includes = false;
-    for line in text.lines() {
-        if line.trim_start_matches([' ', '\t']).starts_with('#') {
+        let text = match config_file(&file, m) {
+            Ok(Some(text)) => text,
+            Ok(None) if optional => continue,
+            _ => {
+                both(named);
+                return;
+            }
+        };
+        if !seen.insert(file.clone()) || budget.retain_text(&text).is_err() {
+            both(named);
+            return;
+        }
+        let escaped = spells_by_escape(&text);
+        let literal = config_text_dirs(&text);
+        named.build |= literal.build;
+        named.target |= literal.target;
+        if !literal.include && !escaped {
             continue;
         }
-        named.build |= line.contains("build-dir");
-        named.target |= line.contains("target-dir");
-        includes |= line.contains("include");
-    }
-    if !includes && !escaped {
-        return Some(());
-    }
-    let Ok(config) = aterm_toml::from_str::<aterm_toml::Value>(&text) else {
-        both(named);
-        return Some(());
-    };
-    let build = config.get("build");
-    named.build |= build.and_then(|build| build.get("build-dir")).is_some();
-    named.target |= build.and_then(|build| build.get("target-dir")).is_some();
-    let Ok(includes) = config_includes(&config) else {
-        both(named);
-        return Some(());
-    };
-    for (path, optional) in includes {
-        let full = lexical(&file.parent().unwrap_or(Path::new("/")).join(path));
-        if included_dirs(&full, m, seen, named).is_none() && !optional {
+        let Ok(config) = aterm_toml::from_str::<aterm_toml::Value>(&text) else {
             both(named);
+            return;
+        };
+        let build = config.get("build");
+        named.build |= build.and_then(|build| build.get("build-dir")).is_some();
+        named.target |= build.and_then(|build| build.get("target-dir")).is_some();
+        let Ok(includes) = config_includes(&config) else {
+            both(named);
+            return;
+        };
+        if pending.len().saturating_add(includes.len()) > CONFIG_GRAPH_MAX_PENDING {
+            both(named);
+            return;
+        }
+        let base = file.parent().unwrap_or(Path::new("/"));
+        for (path, optional) in includes.into_iter().rev() {
+            pending.push((lexical(&base.join(path)), optional));
         }
     }
-    Some(())
 }
 
 /// Whether TOML text holds an escape that can spell any character, and so a key no line spells
@@ -2674,6 +2930,23 @@ pub fn target_build_config(target: &Path) -> Option<String> {
     reason = "Machine::read's shape: a file that cannot be read is a choice, whatever the error"
 )]
 pub fn read_config(path: &Path) -> Result<Option<String>, ()> {
+    read_input(path, false)
+}
+
+/// Read the initial manifest selected by the driver, which tests existence before reading.
+/// Unlike configuration discovery, an existing non-regular file cannot be skipped.
+///
+/// # Errors
+/// An existing path is not a readable, bounded, regular UTF-8 manifest.
+#[expect(
+    clippy::result_unit_err,
+    reason = "Machine's input observation distinguishes absence from refusal"
+)]
+pub fn read_manifest(path: &Path) -> Result<Option<String>, ()> {
+    read_input(path, true)
+}
+
+fn read_input(path: &Path, manifest: bool) -> Result<Option<String>, ()> {
     use std::io::Read as _;
     const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
     let mut options = std::fs::OpenOptions::new();
@@ -2687,13 +2960,13 @@ pub fn read_config(path: &Path) -> Result<Option<String>, ()> {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         #[cfg(unix)]
-        Err(e) if e.raw_os_error() == Some(libc::ENXIO) => return Ok(None),
+        Err(e) if !manifest && e.raw_os_error() == Some(libc::ENXIO) => return Ok(None),
         Err(_) => return Err(()),
     };
     let meta = match file.metadata() {
         Ok(meta) if meta.is_file() => meta,
-        Ok(_) => return Ok(None),
-        Err(_) => return Err(()),
+        Ok(_) if !manifest => return Ok(None),
+        Ok(_) | Err(_) => return Err(()),
     };
     if meta.len() > MAX_CONFIG_BYTES {
         return Err(());
@@ -2705,7 +2978,11 @@ pub fn read_config(path: &Path) -> Result<Option<String>, ()> {
     if (buf.len() as u64) > MAX_CONFIG_BYTES {
         return Err(());
     }
-    Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    if manifest {
+        String::from_utf8(buf).map(Some).map_err(|_| ())
+    } else {
+        Ok(Some(String::from_utf8_lossy(&buf).into_owned()))
+    }
 }
 
 #[cfg(test)]

@@ -11,8 +11,8 @@ use astream_effects::EffectRecord;
 use astream_wire::frame::{FrameError, HEADER_SIZE, decode_frame_header_bytes};
 use astream_wire::hash::crc32_ieee;
 use astream_wire::steps::{
-    STEP_HEADER, StepEnd, StepFault, StepScan, decode_step_header, end_at_corrupt_frame,
-    end_without_frame,
+    STEP_HEADER, StepEnd, StepFault, StepScan, decode_step_header, encode_step,
+    end_at_corrupt_frame, end_without_frame,
 };
 use aterm_models_harness::{
     supervise_replay_cursor_model, supervise_tape_recovery_model, supervisor_raised_latch_model,
@@ -22,13 +22,16 @@ use aterm_spec::interp::{self, State};
 use aterm_spec::rng::XorShift;
 use aterm_spec::xref::StepEvidence;
 
+use super::codec::Item;
 use super::codec::{ctl_reply, ctl_request};
 use super::ctl::is_act;
 use super::doors;
 use super::frame::{Hint, MAGIC, TapeWriter};
-use super::frame_tests::{HEADER, Memory, Said, arranged, fault_as_torn, mono, noise, screen_read};
+use super::frame_tests::{
+    HEADER, Memory, Said, arranged, fault_as_torn, frames_of, mono, noise, screen_read,
+};
 use super::header::VERBATIM;
-use super::recover::{HELD_MAX, Keep, Recovered, Tail, read, recover, steps};
+use super::recover::{HELD_MAX, Keep, Recovered, Tail, read, recover, salvage, steps};
 use super::replay::ReplayCore;
 use crate::supervise::fx::Fx;
 use crate::supervise::{Ctl, CtlReply};
@@ -65,7 +68,29 @@ fn walk(model: &Model, schedule: &[&str]) -> State {
 struct Tape {
     bytes: Vec<u8>,
     ends: Vec<usize>,
-    records: Vec<Vec<crate::supervise::tape::codec::Item>>,
+    records: Vec<Vec<Item>>,
+    /// The cuts a crash can leave past a whole astream frame nested in a frame
+    /// stored raw: from the nested frame's end to that frame's.
+    nested: Option<std::ops::Range<usize>>,
+    /// The nested frame's own bytes, where the frame that holds it is the
+    /// tape's last: damage at rest to that frame outside them leaves a whole
+    /// astream frame after the damage, so it is `Rot`, not `RotLast`.
+    last_nests: Option<std::ops::Range<usize>>,
+}
+
+/// A file read whose bytes hold a whole astream step record, as a read of an
+/// astream log or a draft journal does: the items of a frame stored raw carry
+/// it intact.
+fn nesting_read(rng: &mut XorShift) -> (Item, Vec<u8>) {
+    let nested = encode_step(0, b"a step record read back from a file").expect("a step record");
+    let mut bytes: Vec<u8> = (0..24).map(|_| (rng.next_u64() & 0xff) as u8).collect();
+    bytes.extend_from_slice(&nested);
+    bytes.extend((0..24).map(|_| (rng.next_u64() & 0xff) as u8));
+    let item = Item::effect(EffectRecord::File {
+        path: "/l/steps.bin".to_string(),
+        bytes,
+    });
+    (item, nested)
 }
 
 fn write_tape(model: &Model, ev: &mut StepEvidence, frames: u64) -> Tape {
@@ -88,12 +113,21 @@ fn write_tape(model: &Model, ev: &mut StepEvidence, frames: u64) -> Tape {
     assert_eq!(written_now(&sink), state["written"], "the header frame");
     let mut rng = XorShift::new(29);
     let mut records = Vec::new();
+    let mut nested = None;
     for frame in 0..frames - 1 {
-        let items = vec![
-            mono(frame * 9),
-            screen_read(frame as usize),
-            noise(&mut rng, 24),
-        ];
+        // The first records frame of each tape that has one nests a frame: the
+        // two-frame tape's last, the three-frame tape's one before the last.
+        let items = if frame == 0 {
+            let (read, bytes) = nesting_read(&mut rng);
+            nested = Some(bytes);
+            vec![mono(frame * 9), read, noise(&mut rng, 24)]
+        } else {
+            vec![
+                mono(frame * 9),
+                screen_read(frame as usize),
+                noise(&mut rng, 24),
+            ]
+        };
         for item in &items {
             w.append(item);
         }
@@ -120,10 +154,33 @@ fn write_tape(model: &Model, ev: &mut StepEvidence, frames: u64) -> Tape {
             Some(*end)
         })
         .collect();
+    let bytes = sink.bytes();
+    let mut last_nests = None;
+    let nested = nested.map(|inner| {
+        let frame = frames_of(&bytes)[1];
+        assert!(
+            !frame.packed,
+            "stored raw, so the nested frame stands whole"
+        );
+        let at = bytes
+            .windows(inner.len())
+            .position(|w| w == inner.as_slice())
+            .expect("the nested frame in the tape's bytes");
+        assert!(
+            frame.start < at && at + inner.len() < frame.end,
+            "inside its frame"
+        );
+        if frame.end == bytes.len() {
+            last_nests = Some(at..at + inner.len());
+        }
+        at + inner.len()..frame.end
+    });
     Tape {
-        bytes: sink.bytes(),
+        bytes,
         ends,
         records,
+        nested,
+        last_nests,
     }
 }
 
@@ -140,6 +197,8 @@ fn cases(tape: &Tape) -> Vec<Case> {
         let mut schedule = vec!["Write"; whole];
         schedule.push(if cut == 0 || tape.ends.contains(&cut) {
             "Crash"
+        } else if tape.nested.as_ref().is_some_and(|past| past.contains(&cut)) {
+            "TearNested"
         } else {
             "Tear"
         });
@@ -186,7 +245,12 @@ fn cases(tape: &Tape) -> Vec<Case> {
             bytes[at] ^= mask;
             let damage = if at < MAGIC.len() {
                 "RotMagic"
-            } else if at < last_start {
+            } else if at < last_start
+                || tape
+                    .last_nests
+                    .as_ref()
+                    .is_some_and(|own| !own.contains(&at))
+            {
                 "Rot"
             } else {
                 "RotLast"
@@ -225,8 +289,25 @@ fn bind(
     model: &Model,
     tape: &Tape,
     reader: &dyn Fn(&[u8]) -> Recovered,
+    ev: Option<&mut StepEvidence>,
+) -> Vec<Disagreement> {
+    bind_salvage(model, tape, reader, &salvage, ev)
+}
+
+/// [`bind`], reading what a salvage keeps with `salvager`. The model decides
+/// `kept` only of a tape no byte of which rotted at rest and whose frames stand
+/// in place; of another the real state takes the model's.
+fn bind_salvage(
+    model: &Model,
+    tape: &Tape,
+    reader: &dyn Fn(&[u8]) -> Recovered,
+    salvager: &dyn Fn(&[u8]) -> Recovered,
     mut ev: Option<&mut StepEvidence>,
 ) -> Vec<Disagreement> {
+    let prefix_of = |read: &Recovered| -> Vec<Item> {
+        let frames = read.frames.saturating_sub(1).min(tape.records.len());
+        tape.records[..frames].iter().flatten().cloned().collect()
+    };
     let mut out = Vec::new();
     for case in cases(tape) {
         let expected = walk(model, &case.schedule);
@@ -236,15 +317,26 @@ fn bind(
         };
         let mut real = expected.clone();
         real.extend(project(&reading));
+        let mut kept_whole = true;
+        if ["rot", "magic_rot", "misplaced"]
+            .iter()
+            .all(|v| expected[*v] == 0)
+        {
+            let kept = salvager(&case.bytes);
+            real.insert("kept", i64::try_from(kept.frames).unwrap_or(i64::MAX));
+            kept_whole = kept.items == prefix_of(&kept);
+        }
         let broken: Vec<&'static str> = model
             .invariants
             .iter()
             .map(|inv| inv.name)
             .filter(|name| !model.check_invariant(name, &real))
             .collect();
-        let frames = reading.frames.saturating_sub(1).min(tape.records.len());
-        let prefix: Vec<_> = tape.records[..frames].iter().flatten().cloned().collect();
-        if real != expected || !broken.is_empty() || reading.items != prefix {
+        if real != expected
+            || !broken.is_empty()
+            || reading.items != prefix_of(&reading)
+            || !kept_whole
+        {
             out.push(Disagreement {
                 what: case.what,
                 schedule: case.schedule,
@@ -273,6 +365,36 @@ fn the_real_writer_and_reader_conform_to_the_model() {
             [1, 12, 117][tape.ends.len() - 1],
             "{frames}-frame tape"
         );
+        let nested = cases(&tape)
+            .iter()
+            .filter(|c| c.schedule.contains(&"TearNested"))
+            .count();
+        assert_eq!(
+            nested,
+            tape.nested.as_ref().map_or(0, std::ops::Range::len),
+            "{frames}-frame tape"
+        );
+        assert_eq!(
+            nested > 0,
+            frames > 1,
+            "each tape with a records frame nests a frame"
+        );
+        assert_eq!(
+            tape.last_nests.is_some(),
+            frames == 2,
+            "the two-frame tape nests one in its last"
+        );
+        if let Some(own) = &tape.last_nests {
+            let rot = cases(&tape)
+                .iter()
+                .filter(|c| c.schedule.contains(&"Rot"))
+                .count();
+            assert_eq!(
+                rot,
+                3 * (tape.bytes.len() - MAGIC.len() - own.len()),
+                "damage to a last frame that nests one, outside the nested frame, is Rot"
+            );
+        }
         let wrong = bind(&model, &tape, &recover, Some(&mut ev));
         assert!(
             wrong.is_empty(),
@@ -421,7 +543,7 @@ fn a_reader_that_reads_a_fault_as_torn_is_rejected() {
     let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
     let tape = write_tape(&model, &mut StepEvidence::new(MACHINE), 3);
     let wrong = bind(&model, &tape, &fault_as_torn, None);
-    for law in ["RotRefused", "MisplacedRefused"] {
+    for law in ["RotRefused", "MisplacedRefused", "NestedRefused"] {
         assert!(
             wrong.iter().any(|d| d.broken.contains(&law)),
             "NEGATIVE CONTROL: {law} holds of a reader that reads a fault as torn: {:?}",
@@ -437,6 +559,50 @@ fn a_reader_that_reads_a_fault_as_torn_is_rejected() {
             .iter()
             .find(|d| d.schedule.contains(&"Tear") || d.schedule.contains(&"RotLast"))
     );
+    let as_torn = interp::with_buggy(&supervise_tape_recovery_model(), 7);
+    let cut_past: Vec<&Disagreement> = wrong
+        .iter()
+        .filter(|d| d.schedule.contains(&"TearNested"))
+        .collect();
+    assert_eq!(
+        cut_past.len(),
+        tape.nested.as_ref().map_or(0, std::ops::Range::len),
+        "every cut past the nested frame is read as torn"
+    );
+    for d in cut_past {
+        assert_eq!(d.broken, ["NestedRefused"], "{d:?}");
+        let predicted = walk(&as_torn, &d.schedule);
+        assert!(
+            ["recovered", "refused", "said_torn", "kept"]
+                .iter()
+                .all(|v| predicted[v] == d.real[v]),
+            "the Buggy = 7 machine predicts the reading: {d:?}"
+        );
+    }
+}
+
+#[test]
+fn a_salvage_that_keeps_nothing_of_a_cut_past_a_nested_frame_is_rejected() {
+    let model = interp::with_buggy(&supervise_tape_recovery_model(), 0);
+    let dropping = interp::with_buggy(&supervise_tape_recovery_model(), 8);
+    let tape = write_tape(&model, &mut StepEvidence::new(MACHINE), 3);
+    let wrong = bind_salvage(&model, &tape, &recover, &recover, None);
+    assert!(
+        !wrong.is_empty(),
+        "NEGATIVE CONTROL: the bind admits a salvage that refuses whole"
+    );
+    for d in &wrong {
+        assert!(
+            d.schedule.contains(&"TearNested"),
+            "only cuts past it: {d:?}"
+        );
+        assert_eq!(d.broken, ["NestedKept"], "{d:?}");
+        let predicted = walk(&dropping, &d.schedule);
+        assert_eq!(
+            predicted["kept"], d.real["kept"],
+            "Buggy = 8 predicts it: {d:?}"
+        );
+    }
 }
 
 const CURSOR: &str = "SuperviseReplayCursor";

@@ -991,6 +991,8 @@ fn idle_facts() -> Facts {
         taskless: false,
         limited: false,
         login: false,
+        login_s: 0,
+        limit_s: 0,
         undelivered: false,
         queued: false,
         ready_s: 0,
@@ -1007,6 +1009,7 @@ fn idle_facts() -> Facts {
         own_hold_s: 0,
         tells: 0,
         waits_only: false,
+        follows_only: false,
         deadline_set: false,
         work_due: false,
         may_tell: false,
@@ -1749,6 +1752,271 @@ fn a_finished_session_is_told_nothing_and_still_moves_over_what_yields() {
     );
 }
 
+/// A finished or landed session's own follows hold its quiet round no longer than a working
+/// session's work could be held: nothing is typed into it, and once its follows have held the
+/// round the tell's bound and the deadline after it ([`SILENT_HOLD_S`]) with nobody seen and no
+/// deadline standing, the round moves at its next break or idle point over them, a status its
+/// in-process work keeps busy (`status-stale`) included ([`Yield::Outlasted`]). Real work, which
+/// nothing warns there and whose end would lose it, a person, a wall, a running turn, a told
+/// deadline not yet passed, the tab's Autopilot off and a shorter hold keep it. NEGATIVE CONTROL:
+/// the same session still at work is told its deadline instead.
+#[test]
+fn a_finished_sessions_follows_hold_its_round_no_longer_than_a_told_deadline() {
+    let bound = SILENT_HOLD_S;
+    assert_eq!(
+        bound,
+        WORK_TELL_S + WORK_DEADLINE_S,
+        "a told deadline's earliest move"
+    );
+    let brk = Facts {
+        quiet: true,
+        may_tell: true,
+        silent: true,
+        rung: Rung::Land,
+        background: vec!["zsh".into()],
+        follows_only: true,
+        status: "shell".into(),
+        background_point: true,
+        own_hold_s: bound,
+        ..idle_facts()
+    };
+    let step = |f: &Facts| break_step(next_step(&Phase::Pending, f, false, 0), f);
+    assert_eq!(step(&brk), Step::Terminate, "at a break, past the bound");
+    assert_eq!(own_yields(&brk), Some(Yield::Outlasted), "its own arm");
+    let stale = Facts {
+        background: Vec::new(),
+        background_point: false,
+        status: "busy".into(),
+        status_age_s: 3_600,
+        quiet_s: 3_600,
+        still_s: 3_600,
+        idle_looks: IDLE_LOOKS,
+        ..brk.clone()
+    };
+    assert!(status_lags(&stale), "{stale:?}");
+    assert_eq!(
+        next_step(&Phase::Pending, &stale, false, 0),
+        Step::Terminate,
+        "status-stale: in-process work over an idle screen"
+    );
+    assert_eq!(own_yields(&stale), Some(Yield::Outlasted));
+    let idle = Facts {
+        background: Vec::new(),
+        background_point: false,
+        status: "idle".into(),
+        ..brk.clone()
+    };
+    assert_eq!(
+        own_yields(&idle),
+        None,
+        "nothing of its own runs: the idle move ends nothing"
+    );
+    assert_eq!(next_step(&Phase::Pending, &idle, false, 0), Step::Terminate);
+    for (why, f) in [
+        (
+            "real work, which would be lost",
+            Facts {
+                follows_only: false,
+                ..brk.clone()
+            },
+        ),
+        (
+            "below the bound",
+            Facts {
+                own_hold_s: bound - 1,
+                ..brk.clone()
+            },
+        ),
+        (
+            "a key of theirs within grace",
+            Facts {
+                attended: true,
+                ..brk.clone()
+            },
+        ),
+        (
+            "their keys",
+            Facts {
+                typing: true,
+                ..brk.clone()
+            },
+        ),
+        (
+            "their box",
+            Facts {
+                approval_box: true,
+                ..brk.clone()
+            },
+        ),
+        (
+            "their draft",
+            Facts {
+                composer_empty: false,
+                ..brk.clone()
+            },
+        ),
+        (
+            "a held session",
+            Facts {
+                held: true,
+                ..brk.clone()
+            },
+        ),
+        (
+            "a usage limit",
+            Facts {
+                limited: true,
+                ..brk.clone()
+            },
+        ),
+        (
+            "the login wall",
+            Facts {
+                login: true,
+                ..brk.clone()
+            },
+        ),
+        (
+            "a running turn",
+            Facts {
+                busy_footer: true,
+                ..brk.clone()
+            },
+        ),
+        (
+            "a deadline told, not passed",
+            Facts {
+                deadline_set: true,
+                tells: 1,
+                ..brk.clone()
+            },
+        ),
+        (
+            "the tab's Autopilot off",
+            Facts {
+                may_tell: false,
+                silent: false,
+                ..brk.clone()
+            },
+        ),
+        (
+            "the ask flow",
+            Facts {
+                quiet: false,
+                ..brk.clone()
+            },
+        ),
+    ] {
+        assert_ne!(step(&f), Step::Terminate, "{why}");
+        // A running turn holds the move, not the yield: the gate waits on it as at a deadline.
+        if !f.busy_footer {
+            assert_eq!(own_yields(&f), None, "{why}");
+        }
+    }
+    assert_eq!(
+        step(&Facts {
+            silent: false,
+            ..brk.clone()
+        }),
+        Step::Tell("background"),
+        "the control: a session still at work is told its deadline first"
+    );
+}
+
+/// A follow is a `tail` that follows files or a development server, after at most one `cd`, and
+/// nothing else: a pipe, a redirect into a file, a second command, a variable, a glob, a build or
+/// a test is work ([`follow_command`]). What runs under an agent is follows only where every
+/// top-level shell is exact and a follow or a proved wait, at least one a follow
+/// ([`follows_only`]). NEGATIVE CONTROL: each refused line differs from an accepted one by the
+/// one thing that makes it work.
+#[test]
+fn a_follow_is_a_tail_that_follows_files_or_a_development_server() {
+    for line in [
+        "tail -f /tmp/build.log",
+        "tail -F a.log b.log",
+        "tail -n 50 -f build.log",
+        "tail -fn 20 build.log",
+        "tail -n100 -f build.log",
+        "tail --follow=name build.log 2>&1",
+        "npm run dev",
+        "pnpm dev",
+        "yarn run serve",
+        "bun dev -- --port 3000",
+        "cd site && npm run dev",
+        "npx vite",
+        "vite --host 0.0.0.0 --port 5173",
+        "next dev -p 3000",
+        "python3 -m http.server 8000",
+        "python3 -m http.server --bind 127.0.0.1 8000",
+    ] {
+        assert!(follow_command(line), "{line}");
+    }
+    for line in [
+        "",
+        "tail build.log",
+        "tail -f",
+        "tail -fn 20",
+        "tail -f build.log | grep error",
+        "tail -f build.log > seen.log",
+        "tail -f $LOG",
+        "tail -f *.log",
+        "npm run build",
+        "npm test",
+        "npm run dev && rm -rf dist",
+        "cd a && cd b && npm run dev",
+        "npm run dev &",
+        "nohup npm run dev",
+        "vite build",
+        "next build",
+        "python3 -m http.server; rm x",
+        "python3 server.py",
+        "cargo watch",
+        "sh -c 'npm run dev'",
+    ] {
+        assert!(!follow_command(line), "{line}");
+    }
+    let top = |command: &str, under: &str, exact: bool| Held {
+        command: command.to_string(),
+        seat: Seat::Top,
+        under: vec![under.to_string()],
+        exact,
+        ..Held::default()
+    };
+    let follow = top("tail -f build.log", "tail", true);
+    let wait = top("aterm ctl await task @s-1 since=0", "sleep", true);
+    let work = top("targo --unverified test", "targo", true);
+    assert!(follows_only(std::slice::from_ref(&follow), false, false));
+    assert!(follows_only(&[follow.clone(), wait.clone()], false, false));
+    assert!(
+        !follows_only(&[wait], false, false),
+        "no follow: waits alone"
+    );
+    assert!(
+        !follows_only(&[follow.clone(), work], false, false),
+        "work beside it"
+    );
+    assert!(
+        !follows_only(&[top("tail -f build.log", "tail", false)], false, false),
+        "a command not read exactly"
+    );
+    assert!(
+        !follows_only(std::slice::from_ref(&follow), true, false),
+        "work the screen names"
+    );
+    assert!(
+        !follows_only(std::slice::from_ref(&follow), false, true),
+        "a table unread"
+    );
+    let loose = Held {
+        seat: Seat::Loose,
+        ..follow.clone()
+    };
+    assert!(
+        !follows_only(&[follow, loose], false, false),
+        "a process nothing names"
+    );
+}
+
 /// The continuation after a restart that ended the agent's waits carries each command verbatim
 /// to start again, and one at the deadline names what ended; both keep the carry-on's close, so
 /// the done check still replaces it ([`checking`]).
@@ -1824,7 +2092,28 @@ fn a_continuation_carries_each_ended_wait_verbatim_and_names_work_ended_at_its_d
         unnamed.contains("ended what still ran inside your own process."),
         "{unnamed}"
     );
-    for text in [&text, &work] {
+    // A finished session's work, ended once it had held the round past its bound: no deadline
+    // was told, so none is named.
+    let outlasted = continue_prompt(
+        &from,
+        &to,
+        None,
+        Ended::Outlasted {
+            held_s: SILENT_HOLD_S,
+            list,
+        },
+    );
+    for part in [
+        "Your task had finished, so aterm typed nothing before this restart",
+        "had held the upgrade 1h10m",
+        "ended what still ran under you: pid 7 (zsh, 2h): targo --unverified test.",
+        RELAUNCH_RESTORES,
+    ] {
+        assert!(outlasted.contains(part), "{part}: {outlasted}");
+    }
+    assert!(!outlasted.contains("deadline"), "{outlasted}");
+    assert!(outlasted.ends_with(CARRY_ON), "{outlasted}");
+    for text in [&text, &work, &outlasted] {
         let checked = checking(text, false, false);
         assert!(
             !checked.ends_with(CARRY_ON) && checked != **text,
@@ -3381,7 +3670,7 @@ fn a_restarts_cruise_prompt_lands_nothing_in_the_record() {
     let carry_on = resumed_prompt("2.1.282", CAUSE_HOST);
     let report = [
         typed_row("Fix the lexer and land it."),
-        model_row("All tasks are complete and verified; nothing is left to do."),
+        model_row("All tasks are complete and verified; nothing is left to do.\n\nATERM-TASK-DONE"),
     ];
     let answered = |asked: &str, answer: &str| {
         report
@@ -3402,9 +3691,8 @@ fn a_restarts_cruise_prompt_lands_nothing_in_the_record() {
     for check in &checks {
         assert!(check.starts_with(HARNESS_MARK), "{check}");
         for answer in [
-            "All done.",
+            "All tasks are complete and verified.\n\nATERM-TASK-DONE",
             "DONE",
-            "All tasks are complete and verified.",
             DEFENSE,
         ] {
             let s = scan(&answered(check, answer));
@@ -3591,11 +3879,11 @@ fn a_walls_retry_delivers_the_land_act_it_cut_again_to_the_record() {
         !s.finished() && s.said_done(),
         "CONTROL: the Cruise prompt's retry answered with a defense: a done report"
     );
-    let idle = model_row("No lander is running, so I'm not re-arming that watch.");
-    let s = scan(&[land(), wall.clone(), retried, idle], &ours);
+    let claim = model_row("No lander is running; all queued work has landed.\n\nATERM-TASK-DONE");
+    let s = scan(&[land(), wall.clone(), retried, claim], &ours);
     assert!(
-        !s.finished(),
-        "CONTROL: an idle report answering the retried land check"
+        !s.finished() && s.said_done(),
+        "CONTROL: the retired token answering the retried land check: a claim that lands nothing"
     );
 }
 
@@ -3803,12 +4091,15 @@ fn lands_answer_after_the_instruction_is_a_land_act_to_the_record() {
         assert!(!s.finished(), "CONTROL, {what}");
         assert!(s.said_done(), "CONTROL, {what}: a done report");
     }
-    let idle = model_row("No lander is running, so I'm not re-arming that watch.");
+    let claim = model_row("No lander is running; all queued work has landed.\n\nATERM-TASK-DONE");
     let s = scan(
-        &[land(), question(), answer(), idle],
+        &[land(), question(), answer(), claim],
         turn_end::RULE_LAND_ANSWER,
     );
-    assert!(!s.finished(), "CONTROL: an idle report answering it");
+    assert!(
+        !s.finished() && s.said_done(),
+        "CONTROL: the retired token answering it: a claim that lands nothing"
+    );
 }
 
 const FINISHED_REPORT: &str = "Landed the fix and verified it on main.\n\nATERM-TASK-DONE";
@@ -4133,7 +4424,7 @@ fn the_retired_challenges_are_checks_to_the_record() {
         "the token over open work lands nothing"
     );
     let work = model_row("Ran the e2e suite: two tests fail. Investigating the timeout now.");
-    let words = model_row("All done; nothing left to do.");
+    let words = model_row("DONE");
     let earlier = "Your report ends with ATERM-TASK-DONE but still names open work (still open). \
                    Do each of those items you can still do yourself now, and verify it. End your \
                    reply with ATERM-TASK-DONE on a line by itself only when every item left needs \
@@ -4167,7 +4458,7 @@ fn the_retired_challenges_are_checks_to_the_record() {
         assert!(!scan_rows(&reopened).finished(), "opens a landing: {asked}");
         for (what, answer) in [
             ("work goes on", &work),
-            ("done in words", &words),
+            ("a bare DONE", &words),
             ("the token", &model_row(FINISHED_REPORT)),
             ("the clean defense", &model_row(DEFENSE)),
         ] {
@@ -4175,7 +4466,7 @@ fn the_retired_challenges_are_checks_to_the_record() {
             assert!(!s.finished(), "{what}: {asked}");
         }
         let s = scan(&[asked.clone(), words.clone()]);
-        assert!(s.said_done(), "done in words is a claim: {asked}");
+        assert!(s.said_done(), "a bare DONE is a claim: {asked}");
     }
     let mut kept = landing_rows();
     kept.extend([at(typed_row("keep going")), work.clone()]);
@@ -4293,7 +4584,8 @@ fn only_the_land_checks_landed_lands_the_task_in_the_record() {
     .into_iter()
     .chain(turn_end::RETIRED_LANDS)
     .chain(turn_end::RETIRED_LAND_NUDGES);
-    let needs = format!("{DEFENSE}\nNEEDS YOU: the release credential.");
+    let needs =
+        format!("{DEFENSE}\nNEEDS YOU: decide whether to publish 1.5.0 to the public tier.");
     let open_work = "Pushed the lexer fix.\nNothing left: the parser's follow-up is still open.";
     let checked = |act: &str, said: &str, answer: &str| {
         [
@@ -4320,7 +4612,7 @@ fn only_the_land_checks_landed_lands_the_task_in_the_record() {
         assert!(!finished(&answered(act, open_work)), "open work: {act}");
         for answer in [
             "LANDED, except the docs PR",
-            "NEEDS YOU: the release credential.",
+            "NEEDS YOU: decide whether to publish 1.5.0 to the public tier.",
             DEFENSE,
             open_work,
         ] {

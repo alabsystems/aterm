@@ -174,6 +174,9 @@ pub(crate) struct SessionMeta {
     pub(crate) attention_owners: AttentionOwners,
     pub(crate) supervisor: Option<SupervisorClaim>,
     pub(crate) supervisor_revision: u64,
+    /// The actual host runner carrying this session's task across a process replacement.
+    /// A claim's release or a new claim does not end the runner's responsibility.
+    pub(crate) task_exit_owner: crate::harness_host::task_exit::Slot,
     /// Exhaustion is permanent for this session; an absent epoch cannot prove continuity.
     pub(crate) builtin_relaunch_epoch: RelaunchEpoch,
     /// Authored only by the authenticated claim setter; never inferred from holder text.
@@ -232,6 +235,7 @@ impl PartialEq for SessionMeta {
             attention_owners: _,
             supervisor: _,
             supervisor_revision: _,
+            task_exit_owner: _,
             builtin_relaunch_epoch: _,
             supervisor_builtin: _,
             claimant_conn: _,
@@ -365,6 +369,7 @@ impl SessionMeta {
             attention_owners: AttentionOwners::default(),
             supervisor: None,
             supervisor_revision: 0,
+            task_exit_owner: Default::default(),
             builtin_relaunch_epoch: RelaunchEpoch::default(),
             supervisor_builtin: false,
             claimant_conn: Vec::new(),

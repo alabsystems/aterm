@@ -9,7 +9,7 @@ use super::{
     checks::Finding,
     discover::{self, Listing},
     observe::{self, Sighting},
-    register::{self, Input, Me, Outcome, Probe, Registered},
+    register::{self, Former, Input, Me, Outcome, Probe, Registered},
     registry::{ACCOUNT_OBS, APPLICATION, MACHINE_FACTS, MAILBOX_OBS, REGISTRY},
     seeds,
     view::LabView,
@@ -154,12 +154,44 @@ pub(super) fn roster_identity(
     )
 }
 
-/// Who this enrollment is: its uuid from its binding, its label ([`chosen_label`]), and when the
-/// roster says it was admitted. Never `machine.toml`.
+/// The earlier writers of this enrollment's verified writer lineage, oldest first
+/// ([`crate::generation::lineage_in`], what `aterm db commons-lineage` prints). A writer
+/// succession gives a Mac a new binding, and with it a new machine uuid, actor, recipient and
+/// roster seat; the lineage is the proof that one home held them all. `origin` is the Mac's
+/// original home ([`origin`]), where the lineage starts: a session on that home itself has no
+/// earlier writer, and nothing more is read to say so.
+///
+/// # Errors
+/// A successor's lineage cannot be verified now: a pass that cannot say which earlier writers
+/// were this Mac must not bind it for good.
+fn former(
+    origin: &Paths,
+    session: &Session<'_>,
+) -> Result<Vec<aterm_secrets::commons::binding::Binding>> {
+    if session.paths() == origin {
+        return Ok(Vec::new());
+    }
+    let mut lineage = crate::generation::lineage_in(origin, session, crate::admission::deadline())?;
+    // The last is the current writer, which `me` reads from the session.
+    lineage.pop();
+    Ok(lineage)
+}
+
+/// The Mac's original home, whichever of its writer generations `paths` names: read before a
+/// session opens, since it observes every generation's custody.
+fn origin(paths: &Paths) -> Result<Paths> {
+    crate::generation::observed_logical_paths_until(paths, crate::admission::deadline())
+}
+
+/// Who this enrollment is: its uuid from its binding, its own seat's label ([`chosen_label`],
+/// or the number it signed), when the roster says it was admitted, and the earlier writers of
+/// its lineage, each with its seat's label. `former` reads those writers, given this
+/// enrollment's uuid. Never `machine.toml`.
 fn me(
     session: &Session<'_>,
     trust: aterm_secrets::commons::journal::Trust,
     probe: &Probe,
+    former: impl FnOnce(&str) -> Result<Vec<aterm_secrets::commons::binding::Binding>>,
 ) -> Result<Me> {
     let members = session.members()?;
     let actor = session.actor();
@@ -172,9 +204,6 @@ fn me(
         .ok()
         .flatten()
         .map(|(log, _)| log);
-    let logged = log
-        .as_ref()
-        .and_then(|log| log.membership_ref().label(&actor).map(str::to_owned));
     let chosen = log.as_ref().and_then(|log| {
         log.membership_ref()
             .label_after_choice(&actor)
@@ -183,13 +212,31 @@ fn me(
     let recipient = binding.recipient().to_bech32();
     let roster = aterm_secrets::client::swarm_roster_until(paths, crate::admission::deadline())
         .map_err(crate::table::failure)?;
-    let (rostered, enrolled_ms) = roster_identity(roster.as_ref(), &recipient);
+    let (_, enrolled_ms) = roster_identity(roster.as_ref(), &recipient);
+    let seat = |writer: &aterm_secrets::commons::binding::Binding| {
+        let logged = log.as_ref().and_then(|log| {
+            log.membership_ref()
+                .label(&writer.actor())
+                .map(str::to_owned)
+        });
+        let (rostered, _) = roster_identity(roster.as_ref(), &writer.recipient().to_bech32());
+        chosen_label(logged, rostered)
+    };
+    let uuid = keys::uuid32(binding.machine());
+    let former = former(&uuid)?
+        .iter()
+        .map(|writer| Former {
+            uuid: keys::uuid32(writer.machine()),
+            label: seat(writer),
+        })
+        .collect();
     Ok(Me {
-        uuid: keys::uuid32(binding.machine()),
-        label: chosen.clone().or_else(|| chosen_label(logged, rostered)),
+        uuid,
+        label: chosen.clone().or_else(|| seat(binding)),
         chosen,
         hw_hint: keys::hw_hint(&trust.network, &probe.platform_uuid),
         enrolled_ms,
+        former,
     })
 }
 
@@ -247,10 +294,10 @@ fn roster_migration(
         vendors: &LabelsOnly,
         sealer: &sealer,
         now_ms,
-        births: true,
+        births: import::Births::Listed,
         unread: &[],
     };
-    let plan = import::plan(&input, &view.cells)?;
+    let plan = import::plan(&input, view)?;
     // The importer leaves owner corrections intact and records source disagreements. A
     // disputed label never grants membership and must not stop unrelated Macs registering.
     let mut rows = plan.rows;
@@ -302,10 +349,24 @@ fn planned(
     trust: aterm_secrets::commons::journal::Trust,
     view: &View,
     probe: &Probe,
+    former: impl FnOnce() -> Result<Vec<aterm_secrets::commons::binding::Binding>>,
     heard: bool,
     now_ms: u64,
 ) -> Result<register::Plan> {
-    let me = me(session, trust, probe)?;
+    // An enrollment with a facts row is bound, and its lineage decides nothing more: a refresh
+    // of that row reads none, so it cannot fail on one.
+    let bound = |uuid: &str| {
+        view.owned
+            .get(MACHINE_FACTS.name)
+            .is_some_and(|facts| facts.rows.contains_key(uuid))
+    };
+    let me = me(session, trust, probe, |uuid| {
+        if bound(uuid) {
+            Ok(Vec::new())
+        } else {
+            former()
+        }
+    })?;
     let live = live_uuids(session)?;
     let input = Input {
         me: &me,
@@ -314,9 +375,7 @@ fn planned(
         heard,
         now_ms,
     };
-    let empty = crate::typed::owned::OwnedRead::default();
-    let facts = view.owned.get(MACHINE_FACTS.name).unwrap_or(&empty);
-    register::plan(&input, &view.cells, facts)
+    register::plan(&input, view)
 }
 
 /// What one account-observation pass decided and wrote
@@ -548,7 +607,9 @@ impl Registry {
     ///
     /// # Errors
     /// `config` is not a valid file; this Mac holds no catalog yet or is no Writer; the registry
-    /// cannot be read or written; or a reading breaks its column's rules.
+    /// cannot be read or written; a reading breaks its column's rules; or this enrollment has no
+    /// row yet and the writer lineage that says which earlier enrollments were this Mac cannot
+    /// be verified now.
     pub fn register(
         &self,
         config: &Path,
@@ -561,6 +622,7 @@ impl Registry {
             Ok(trust) => trust,
             Err(outcome) => return Ok(quiet(outcome)),
         };
+        let origin = origin(&self.paths)?;
         application::with_store(
             &self.paths,
             false,
@@ -595,7 +657,8 @@ impl Registry {
                         }
                     }
                 }
-                let plan = planned(session, trust, &view, probe, heard, now_ms)?;
+                let lineage = || former(&origin, session);
+                let plan = planned(session, trust, &view, probe, lineage, heard, now_ms)?;
                 if plan.changes.is_empty() {
                     return Ok(Registered {
                         outcome: plan.outcome,
@@ -819,13 +882,16 @@ impl Registry {
     /// in its log line.
     ///
     /// # Errors
-    /// As [`Self::register`], but for being no Writer.
+    /// As [`Self::register`], but for being no Writer where this enrollment has a row or was
+    /// never succeeded: a successor with no row yet reads its lineage as the pass does, and
+    /// that read refuses a Mac that is no Writer.
     pub fn preview(&self, config: &Path, probe: &Probe, now_ms: u64) -> Result<Registered> {
         let compiled = self.generation();
         let trust = match self.admitted_policy(config)? {
             Ok(trust) => trust,
             Err(outcome) => return Ok(quiet(outcome)),
         };
+        let origin = origin(&self.paths)?;
         let seen = application::observe_store_if_declared(
             &self.paths,
             descriptor(compiled),
@@ -835,7 +901,8 @@ impl Registry {
                 if !view.complete {
                     return Ok(quiet(Outcome::Incomplete));
                 }
-                let plan = planned(session, trust, &view, probe, true, now_ms)?;
+                let lineage = || former(&origin, session);
+                let plan = planned(session, trust, &view, probe, lineage, true, now_ms)?;
                 Ok(Registered {
                     outcome: plan.outcome,
                     findings: plan.findings,
@@ -880,8 +947,8 @@ impl Registry {
                         .map(|binding| keys::uuid32(binding.machine()));
                     let empty = crate::typed::owned::OwnedRead::default();
                     let owned = |name: &str| view.owned.get(name).unwrap_or(&empty);
-                    Ok(LabView::read(
-                        &view.cells,
+                    Ok(LabView::read_view(
+                        &view,
                         owned(MACHINE_FACTS.name),
                         owned(MAILBOX_OBS.name),
                         uuid.as_deref(),

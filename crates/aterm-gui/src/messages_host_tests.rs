@@ -3822,6 +3822,7 @@ fn an_unchanged_managed_current_is_recorded_once_and_news_again() {
         task: None,
         autopilot_end: None,
         wakes: None,
+        agent_act: None,
     }];
     assert!(
         app.post_managed_current(
@@ -4274,7 +4275,7 @@ fn a_linux_install_waiting_for_a_start_is_a_notice_and_its_end_takes_it_down() {
     );
 
     let rollback = "aterm 0.11.0 didn\u{2019}t start properly, so aterm 0.10.0 is back and \
-                    aterm 0.11.0 won\u{2019}t install again.";
+                    aterm 0.11.0 is held a while before it is tried again.";
     assert!(app.note_update_health(aterm_update::INSTALL_CRASH_LOOP_TITLE, rollback));
     let install = app.live_update_health(|k| k == update_words::HealthKind::Install);
     assert_eq!(

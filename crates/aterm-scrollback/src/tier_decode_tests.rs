@@ -52,6 +52,7 @@ fn warm_block_decompress_rejects_truncated_serialized_payload() {
     let block = WarmBlock {
         compressed: crate::lz4::compress_prepend_size(&serialized).expect("test data fits in u32"),
         line_count: 2,
+        encoded_line_count: 0,
         decompress_failures: Cell::new(0),
     };
 
@@ -85,6 +86,7 @@ fn cold_transfer_reuses_a_valid_noncanonical_lz4_page() {
     let mut block = WarmBlock {
         compressed: compressed.clone(),
         line_count: lines.len(),
+        encoded_line_count: 0,
         decompress_failures: Cell::new(2),
     };
 
@@ -124,6 +126,7 @@ fn cold_transfer_validates_framing_before_reusing_compressed_bytes() {
     let mut block = WarmBlock {
         compressed: crate::lz4::compress_prepend_size(&serialized).unwrap(),
         line_count: lines.len(),
+        encoded_line_count: 0,
         decompress_failures: Cell::new(0),
     };
     for expected in 1..=QUARANTINE_THRESHOLD {

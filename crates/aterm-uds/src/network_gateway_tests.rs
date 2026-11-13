@@ -295,7 +295,7 @@ fn a_gateway_the_arp_dump_leaves_out_is_looked_up_on_its_own_interface() {
 fn a_neighbour_lookup_reads_only_its_own_interfaces_entry() {
     let gw = Ipv4Addr::new(192, 168, 1, 1);
     let mac = [0x90, 0x41, 0xb2, 0x78, 0x5a, 0x9e];
-    let request = route_get_request(gw, 9, Some(8));
+    let request = route_get_request(gw.into(), 9, Some(8), RTM_GET_SILENT);
     let field = |message: &[u8], offset: usize| {
         i32::from_ne_bytes(message[offset..offset + 4].try_into().unwrap())
     };
@@ -305,7 +305,7 @@ fn a_neighbour_lookup_reads_only_its_own_interfaces_entry() {
     assert_eq!(u16::from_ne_bytes([request[at], request[at + 1]]), 8);
     assert_eq!(
         field(
-            &route_get_request(gw, 9, None),
+            &route_get_request(gw.into(), 9, None, RTM_GET_SILENT),
             std::mem::offset_of!(RtMsghdr, rtm_flags)
         ) & RTF_IFSCOPE,
         0,
@@ -332,6 +332,7 @@ fn a_neighbour_lookup_reads_only_its_own_interfaces_entry() {
     let neighbour = RTF_UP | RTF_HOST | RTF_LLINFO | RTF_IFSCOPE;
     assert_eq!(
         route_get_link(&answer(41, 9, 0, neighbour, 8, &mac), 41, 9, 8)
+            .and_then(Result::ok)
             .flatten()
             .as_deref(),
         Some(mac.as_slice()),
@@ -339,22 +340,22 @@ fn a_neighbour_lookup_reads_only_its_own_interfaces_entry() {
     );
     assert_eq!(
         route_get_link(&answer(41, 9, 0, neighbour, 15, &mac), 41, 9, 8),
-        Some(None),
+        Some(Ok(None)),
         "another interface's entry"
     );
     assert_eq!(
         route_get_link(&answer(41, 9, 0, RTF_UP | RTF_IFSCOPE, 8, &[]), 41, 9, 8),
-        Some(None),
+        Some(Ok(None)),
         "the interface's own route, before ARP resolves the gateway"
     );
     assert_eq!(
         route_get_link(&answer(41, 9, 0, neighbour, 8, &[]), 41, 9, 8),
-        Some(None),
+        Some(Ok(None)),
         "an incomplete entry"
     );
     assert_eq!(
         route_get_link(&answer(41, 9, libc::ESRCH, neighbour, 8, &mac), 41, 9, 8),
-        Some(None),
+        Some(Err(libc::ESRCH)),
         "a refused lookup"
     );
     assert_eq!(
@@ -374,7 +375,7 @@ fn a_neighbour_lookup_reads_only_its_own_interfaces_entry() {
 #[test]
 fn a_route_lookup_asks_for_the_interface_and_reads_only_its_own_answer() {
     let to = Ipv4Addr::new(224, 0, 0, 251);
-    let request = route_get_request(to, 7, None);
+    let request = route_get_request(to.into(), 7, None, RTM_GET_SILENT);
     let field = |message: &[u8], offset: usize| {
         i32::from_ne_bytes(message[offset..offset + 4].try_into().unwrap())
     };
@@ -384,7 +385,18 @@ fn a_route_lookup_asks_for_the_interface_and_reads_only_its_own_answer() {
         request.len()
     );
     assert_eq!(request[std::mem::offset_of!(RtMsghdr, rtm_version)], 5);
-    assert_eq!(request[std::mem::offset_of!(RtMsghdr, rtm_type)], RTM_GET);
+    assert_eq!(
+        request[std::mem::offset_of!(RtMsghdr, rtm_type)],
+        RTM_GET_SILENT
+    );
+    let plain = route_get_request(to.into(), 7, None, RTM_GET);
+    assert_eq!(plain[std::mem::offset_of!(RtMsghdr, rtm_type)], RTM_GET);
+    let kind = std::mem::offset_of!(RtMsghdr, rtm_type);
+    assert_eq!(
+        (&plain[..kind], &plain[kind + 1..]),
+        (&request[..kind], &request[kind + 1..]),
+        "the two lookups differ in their type alone"
+    );
     let addrs = field(&request, std::mem::offset_of!(RtMsghdr, rtm_addrs));
     assert_eq!(
         addrs,
@@ -431,7 +443,7 @@ fn a_route_lookup_asks_for_the_interface_and_reads_only_its_own_answer() {
     };
     assert_eq!(
         route_get_answer(&answer(RTM_GET, 41, 7, 0, Some(address)), 41, 7),
-        Some(Some(address)),
+        Some(Ok(Some(address))),
         "its own answer names the route's address"
     );
     // Negative controls: another process's lookup, another of its own, and a route added
@@ -453,27 +465,34 @@ fn a_route_lookup_asks_for_the_interface_and_reads_only_its_own_answer() {
         None,
         "too short"
     );
-    // Its own answer with no source in it.
+    // Its own answer with no source in it: the kernel's refusal keeps its errno, which tells
+    // "no route" from a lookup that could not be made.
     assert_eq!(
         route_get_answer(&answer(RTM_GET, 41, 7, libc::ESRCH, Some(address)), 41, 7),
-        Some(None),
+        Some(Err(libc::ESRCH)),
         "no route"
     );
     assert_eq!(
         route_get_answer(&answer(RTM_GET, 41, 7, 0, None), 41, 7),
-        Some(None)
+        Some(Ok(None))
     );
     assert_eq!(
         route_get_answer(&answer(RTM_GET, 41, 7, 0, Some(Ipv4Addr::LOCALHOST)), 41, 7),
-        Some(None)
+        Some(Ok(None))
+    );
+    // The silent type is a request's alone: the kernel answers either lookup as RTM_GET.
+    assert_eq!(
+        route_get_answer(&answer(RTM_GET_SILENT, 41, 7, 0, Some(address)), 41, 7),
+        None
     );
 }
 
 /// The kernel's own answer: the routing table gives the address a UDP socket connected to the
-/// same destination takes. The destination is TEST-NET-1 (`192.0.2.1`), which the default
-/// route carries off this Mac's network, so the connect asks macOS nothing; both read `None`
-/// on a Mac with no default route. Loopback's route is the exception: its connected socket
-/// takes `127.0.0.1`, and the lookup reads that address as none.
+/// same destination takes, asked as either type of lookup. The destination is TEST-NET-1
+/// (`192.0.2.1`), which the default route carries off this Mac's network, so the connect asks
+/// macOS nothing; both read `None` on a Mac with no default route, where the table's none is
+/// still its word (`Some(None)`), never a failed ask. Loopback's route is the exception: its
+/// connected socket takes `127.0.0.1`, and the lookup reads that address as none.
 #[test]
 fn the_route_lookup_gives_the_address_a_connected_socket_takes() {
     let connected = |to: Ipv4Addr| {
@@ -487,14 +506,36 @@ fn the_route_lookup_gives_the_address_a_connected_socket_takes() {
             })
     };
     let to = Ipv4Addr::new(192, 0, 2, 1);
+    let usable = connected(to).filter(|ip| !ip.is_unspecified() && !ip.is_loopback());
+    assert_eq!(route_source_ipv4(to), usable);
     assert_eq!(
-        route_source_ipv4(to),
-        connected(to).filter(|ip| !ip.is_unspecified() && !ip.is_loopback())
+        route_source_ipv4_asked(to),
+        Some(usable),
+        "the table was read, so its none is the connected socket's none"
     );
+    for kind in [RTM_GET_SILENT, RTM_GET] {
+        let asked = route_get_as(
+            to.into(),
+            None,
+            route_get_sequence(),
+            |write| write(kind),
+            route_get_answer,
+        );
+        assert_eq!(
+            table_word(asked).map(Option::flatten),
+            Some(usable),
+            "asked as {kind:#x}"
+        );
+    }
     assert_eq!(connected(Ipv4Addr::LOCALHOST), Some(Ipv4Addr::LOCALHOST));
     assert_eq!(
         route_source_ipv4(Ipv4Addr::LOCALHOST),
         None,
         "loopback's route has no address but loopback's"
+    );
+    assert_eq!(
+        route_source_ipv4_asked(Ipv4Addr::LOCALHOST),
+        Some(None),
+        "which the table said, read"
     );
 }

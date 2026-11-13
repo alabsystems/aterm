@@ -10,14 +10,14 @@ version = "0.2.0"
 name = "aterm-dirfd"
 version = "0.0.0"
 dependencies = [
- "libc 0.2.191",
+ "libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
 name = "aterm-dl"
 version = "0.0.0"
 dependencies = [
- "libc 0.2.191",
+ "libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -53,7 +53,7 @@ dependencies = [
  "aterm-dl",
  "aterm-json",
  "aterm-objc",
- "libc 0.2.191",
+ "libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)",
 ]
 
 [[package]]
@@ -69,8 +69,10 @@ dependencies = [
  "aterm-durable",
  "aterm-stamp",
  "aterm-sysprobe",
+ "aterm-tempfile",
  "aterm-vitals",
- "libc 0.2.191",
+ "libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)",
+ "trust-exec-policy",
 ]
 
 [[package]]
@@ -79,13 +81,20 @@ version = "0.0.0"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.191"
 
 [[package]]
 name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "trust-exec-policy"
+version = "0.13.0"
+dependencies = [
+ "libc 0.2.191 (registry+https://github.com/rust-lang/crates.io-index)",
+]
 
 [[package]]
 name = "trust-resource-provenance"
@@ -95,7 +104,7 @@ dependencies = [
  "aterm-serde",
  "aterm-tempfile",
  "aterm-uds",
- "libc 0.2.186",
+ "libc 0.2.191",
  "trust-sha2",
 ]
 

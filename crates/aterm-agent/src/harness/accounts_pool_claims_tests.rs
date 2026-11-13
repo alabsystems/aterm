@@ -359,3 +359,186 @@ fn cold_relaunch_claims_kept_row_and_moves_off_a_row_another_mac_holds() {
         [&work]
     );
 }
+
+/// A row another Mac's live claim holds is not taken on a session's asking: the relaunch keeps
+/// the row it ran on. CONTROL: the same ask on the Mac that holds the claim moves its session.
+#[test]
+fn a_relaunch_that_asked_for_a_row_another_mac_holds_keeps_its_own() {
+    use super::usage_policy::{Reads, plain_usage};
+    use crate::harness::restart_stamp::Wanted;
+    if cfg!(not(unix)) {
+        // Off Unix no claim activity is kept; the claims tests above say what a launch does there.
+        return;
+    }
+    let (m1, m2) = (World::new("claims-asked-m1"), World::new("claims-asked-m2"));
+    for world in [&m1, &m2] {
+        world.claimed_two(Cli::Codex);
+        world.on_main(Cli::Codex, &[]);
+    }
+    let (t1, t2) = (
+        Arc::new(Replica::new("aa01")),
+        Arc::new(Replica::new("bb02")),
+    );
+    let answer = |_: &Path| plain_usage();
+    let ask = |world: &World, table: &Arc<Replica>| {
+        let reads = Reads {
+            user_home: &world.home,
+            homes: std::sync::Mutex::default(),
+            answer: &answer,
+        };
+        claims::with_table(table.clone(), || {
+            super::super::cold_launch_env_asked(
+                &world.seat(),
+                Cli::Codex,
+                &[],
+                &reads,
+                Some(&world.exe),
+                Some(&Wanted::Row("work".to_owned())),
+            )
+        })
+        .expect("its own row serves")
+    };
+    let moved = ask(&m1, &t1);
+    assert_eq!(moved.kept, None);
+    assert_eq!(moved.pick.map(|pick| pick.label).as_deref(), Some("work"));
+    t2.merge(&t1);
+    let kept = ask(&m2, &t2);
+    assert_eq!(kept.pick, None, "m1 holds work");
+    assert_eq!(kept.kept.as_deref(), Some(super::super::MOVE_HELD));
+}
+
+/// A replica that takes `peer`'s rows from its `after`-th read on (counting from 0): a Commons
+/// exchange that lands between two reads of one admission.
+struct LandsAfter {
+    inner: Arc<Replica>,
+    peer: Arc<Replica>,
+    after: usize,
+    reads: std::sync::atomic::AtomicUsize,
+}
+
+impl claims::Table for LandsAfter {
+    fn read(&self, home: &Path) -> Result<claims::Tabled, String> {
+        if self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == self.after {
+            self.inner.merge(&self.peer);
+        }
+        self.inner.read(home)
+    }
+
+    fn write(&self, home: &Path, row: &claims::Row) -> Result<(), String> {
+        self.inner.write(home, row)
+    }
+}
+
+/// A row another Mac claims after the relaunch's look read the table, and before its own claim,
+/// is not taken either: the claim the asked row's admission makes is refused, and the relaunch
+/// keeps the row it ran on. CONTROL: the look alone saw no holder, so the records the ask is
+/// judged on refuse nothing.
+#[test]
+fn a_relaunch_whose_claim_on_the_asked_row_is_refused_keeps_its_own() {
+    use super::usage_policy::{Reads, plain_usage};
+    use crate::harness::restart_stamp::Wanted;
+    if cfg!(not(unix)) {
+        return;
+    }
+    let (m1, m2) = (
+        World::new("claims-asked-late-m1"),
+        World::new("claims-asked-late-m2"),
+    );
+    for world in [&m1, &m2] {
+        world.claimed_two(Cli::Codex);
+        world.on_main(Cli::Codex, &[]);
+    }
+    let (t1, t2) = (
+        Arc::new(Replica::new("aa01")),
+        Arc::new(Replica::new("bb02")),
+    );
+    let answer = |_: &Path| plain_usage();
+    let ask = |world: &World, table: Arc<dyn claims::Table>| {
+        let reads = Reads {
+            user_home: &world.home,
+            homes: std::sync::Mutex::default(),
+            answer: &answer,
+        };
+        claims::with_table(table, || {
+            super::super::cold_launch_env_asked(
+                &world.seat(),
+                Cli::Codex,
+                &[],
+                &reads,
+                Some(&world.exe),
+                Some(&Wanted::Row("work".to_owned())),
+            )
+        })
+        .expect("its own row serves")
+    };
+    let moved = ask(&m1, t1.clone());
+    assert_eq!(moved.pick.map(|pick| pick.label).as_deref(), Some("work"));
+    let late = Arc::new(LandsAfter {
+        inner: t2.clone(),
+        peer: t1.clone(),
+        after: 1,
+        reads: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let kept = ask(&m2, late.clone());
+    assert!(
+        late.reads.load(std::sync::atomic::Ordering::SeqCst) > 1,
+        "CONTROL: the table was read again after the look"
+    );
+    assert_eq!(kept.pick, None, "m1 holds work");
+    assert_eq!(kept.kept.as_deref(), Some(super::super::MOVE_HELD));
+}
+
+/// An asked row whose admission fails under the writer leaves this Mac no claim on it: other
+/// Macs would read a row no session here starts on as held until its claim lapsed. The policy
+/// turned off while the asked row was read changes the routing the relaunch was judged on, so
+/// its admission, and the relaunch, wait for another observation.
+#[test]
+fn an_asked_row_whose_admission_fails_is_left_unclaimed() {
+    use super::usage_policy::{Reads, plain_usage};
+    use crate::harness::restart_stamp::Wanted;
+    if cfg!(not(unix)) {
+        return;
+    }
+    let world = World::new("claims-asked-unadmitted");
+    world.claimed_two(Cli::Codex);
+    world.on_main(Cli::Codex, &[]);
+    let work = world.work_dir(Cli::Codex);
+    let table = Arc::new(Replica::new("aa01"));
+    let answer = |home: &Path| {
+        if home == work {
+            aterm_uds::atomic_file::write(
+                &world.cfg.join("aterm.toml"),
+                b"[harness]\naccounts='off'\n",
+                0o600,
+            )
+            .expect("the policy");
+        }
+        plain_usage()
+    };
+    let reads = Reads {
+        user_home: &world.home,
+        homes: std::sync::Mutex::default(),
+        answer: &answer,
+    };
+    let admitted = claims::with_table(table.clone(), || {
+        super::super::cold_launch_env_asked(
+            &world.seat(),
+            Cli::Codex,
+            &[],
+            &reads,
+            Some(&world.exe),
+            Some(&Wanted::Row("work".to_owned())),
+        )
+    });
+    assert!(admitted.is_err(), "the routing changed: {admitted:?}");
+    assert!(
+        reads.homes.lock().unwrap().contains(&work),
+        "CONTROL: the asked row was read"
+    );
+    let work_key = LeaseKey::new("codex", "work@example.test").expect("a key");
+    let claimed = table
+        .row("aa01")
+        .map(|row| row.claims.iter().any(|claim| claim.key == work_key))
+        .unwrap_or(false);
+    assert!(!claimed, "no claim on the row nothing started on");
+}

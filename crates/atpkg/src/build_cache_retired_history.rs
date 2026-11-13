@@ -178,6 +178,16 @@ impl Read<'_> {
         input: &[u8],
         objects: Option<&Path>,
     ) -> Result<String, String> {
+        completed(self.answer(store, args, input, objects)?)
+    }
+
+    fn answer(
+        &self,
+        store: &Path,
+        args: &[&str],
+        input: &[u8],
+        objects: Option<&Path>,
+    ) -> Result<super::Answer, String> {
         if Instant::now() >= self.deadline {
             return Err("private Git history reached its time bound".to_owned());
         }
@@ -191,16 +201,59 @@ impl Read<'_> {
         // redirect these reads back into that missing or partly removed source tree.
         let mut all = vec!["--git-dir", store, "--work-tree", worktree];
         all.extend_from_slice(args);
-        let answer = self
+        Ok(self
             .git
-            .read_history(self.checkout, &all, input, objects, self.deadline);
-        if answer.code != Some(0) || !answer.err.is_empty() {
-            return Err(format!(
-                "original Git history read refused: {}",
-                answer.err.trim()
-            ));
+            .read_history(self.checkout, &all, input, objects, self.deadline))
+    }
+
+    /// Each ref of `store` and its object, one `<name>NUL<object>` row each, as
+    /// `for-each-ref --include-root-refs` lists them: HEAD and the other root refs beside
+    /// `refs/`. A git without the option (Ubuntu 24.04's 2.43.0, say) refuses it as a usage
+    /// error (129). In the files backend, the one ref storage [`Read::format`] admits, each root
+    /// ref is a regular top-level file of the store, so for such a git those rows come from
+    /// `snapshot`'s files by git's rule ([`root_ref`]) beside its `refs/` listing: an object name
+    /// as written, or a symbolic ref's target as listed, a dangling one naming no object, as git
+    /// omits it.
+    fn refs(
+        &self,
+        store: &Path,
+        snapshot: &Snapshot,
+        objects: Option<&Path>,
+    ) -> Result<String, String> {
+        let rooted = self.answer(
+            store,
+            &["for-each-ref", "--include-root-refs", REF_ROWS],
+            &[],
+            objects,
+        )?;
+        if rooted.code != Some(129) {
+            return completed(rooted);
         }
-        Ok(answer.out)
+        let mut listed = self.git(store, &["for-each-ref", REF_ROWS], &[], objects)?;
+        let named: BTreeMap<String, String> = listed
+            .lines()
+            .filter_map(|row| row.split_once('\0'))
+            .map(|(name, oid)| (name.to_owned(), oid.to_owned()))
+            .collect();
+        for (path, bytes) in &snapshot.files {
+            let Some(name) = path.to_str().filter(|name| root_ref(name)) else {
+                continue;
+            };
+            let value = std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|text| text.strip_suffix('\n'))
+                .ok_or("private Git root ref is malformed")?;
+            let oid = match value.strip_prefix("ref: ") {
+                Some(target) if target.starts_with("refs/") => match named.get(target) {
+                    Some(oid) => oid.as_str(),
+                    None => continue,
+                },
+                Some(_) => return Err("private Git root ref names no ref".to_owned()),
+                None => value,
+            };
+            listed.push_str(&format!("{name}\0{oid}\n"));
+        }
+        Ok(listed)
     }
 
     fn format(&self, snapshot: &Snapshot, witness: bool) -> Result<usize, String> {
@@ -290,16 +343,7 @@ impl Read<'_> {
         reflogs: bool,
         objects: Option<&Path>,
     ) -> Result<BTreeSet<String>, String> {
-        let listed = self.git(
-            store,
-            &[
-                "for-each-ref",
-                "--include-root-refs",
-                "--format=%(refname)%00%(objectname)",
-            ],
-            &[],
-            objects,
-        )?;
+        let listed = self.refs(store, snapshot, objects)?;
         let mut roots = BTreeSet::new();
         let mut head = false;
         let mut names = BTreeSet::new();
@@ -386,7 +430,9 @@ impl Read<'_> {
                     let old = fields.next().ok_or("private Git reflog is malformed")?;
                     let new = fields.next().ok_or("private Git reflog is malformed")?;
                     let rest = fields.next().ok_or("private Git reflog is malformed")?;
-                    if !rest.contains(&b'\t') {
+                    // Git omits TAB when the message is empty; a committer tail remains.
+                    // Both OID fields carry retained history, and the tail stays opaque.
+                    if rest.is_empty() {
                         return Err("private Git reflog is malformed".to_owned());
                     }
                     for oid in [old, new] {
@@ -414,6 +460,42 @@ impl Read<'_> {
         }
         Ok(roots)
     }
+}
+
+/// `for-each-ref`'s row for each ref: its name and object.
+const REF_ROWS: &str = "--format=%(refname)%00%(objectname)";
+
+/// A history read's output, where git exited 0 and said nothing on standard error.
+fn completed(answer: super::Answer) -> Result<String, String> {
+    if answer.code != Some(0) || !answer.err.is_empty() {
+        return Err(format!(
+            "original Git history read refused: {}",
+            answer.err.trim()
+        ));
+    }
+    Ok(answer.out)
+}
+
+/// Whether `name` is a root ref as `for-each-ref --include-root-refs` lists one (git 2.56.0,
+/// measured): its name only capitals, `-` and `_`; `HEAD`, a name ending in `_HEAD`, or one of
+/// the irregular root refs; never the pseudorefs `FETCH_HEAD` and `MERGE_HEAD`, which can hold
+/// several objects.
+fn root_ref(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || matches!(byte, b'-' | b'_'))
+        && !matches!(name, "FETCH_HEAD" | "MERGE_HEAD")
+        && (name.ends_with("_HEAD")
+            || matches!(
+                name,
+                "HEAD"
+                    | "AUTO_MERGE"
+                    | "BISECT_EXPECTED_REV"
+                    | "NOTES_MERGE_PARTIAL"
+                    | "NOTES_MERGE_REF"
+                    | "MERGE_AUTOSTASH"
+            ))
 }
 
 fn oid_valid(oid: &str, width: usize) -> bool {

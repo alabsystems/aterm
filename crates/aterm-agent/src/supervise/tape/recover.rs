@@ -135,6 +135,14 @@ impl std::fmt::Display for Why {
     any(test, debug_assertions),
     aterm_spec_anchor::spec_unmodeled(
         machine = "SuperviseTapeRecovery",
+        action = "TearNested",
+        reason = "The writer dying inside the one write(2) of a frame stored raw whose items hold a whole astream frame runs no tape code: what it leaves is a prefix of that frame, cut past the nested frame. The Tier-1 bind's two- and three-frame tapes nest one in a File read and read every such cut."
+    )
+)]
+#[cfg_attr(
+    any(test, debug_assertions),
+    aterm_spec_anchor::spec_unmodeled(
+        machine = "SuperviseTapeRecovery",
         action = "Crash",
         reason = "The writer dying, or its run ending, between two frames runs no tape code. The Tier-1 bind reads each truncation at a frame boundary."
     )
@@ -144,7 +152,7 @@ impl std::fmt::Display for Why {
     aterm_spec_anchor::spec_unmodeled(
         machine = "SuperviseTapeRecovery",
         action = "Rot",
-        reason = "A byte damaged at rest runs no tape code. The Tier-1 bind flips every byte of every frame that has a whole frame after it, under three masks (0x01, 0x80, 0xff)."
+        reason = "A byte damaged at rest runs no tape code. The Tier-1 bind flips every byte of every frame that has a whole frame after it, and every byte outside the nested frame of a last frame that nests one, under three masks (0x01, 0x80, 0xff)."
     )
 )]
 #[cfg_attr(
@@ -152,7 +160,7 @@ impl std::fmt::Display for Why {
     aterm_spec_anchor::spec_unmodeled(
         machine = "SuperviseTapeRecovery",
         action = "RotLast",
-        reason = "A byte of the last whole frame damaged at rest runs no tape code. The Tier-1 bind flips every byte of the last frame, under three masks (0x01, 0x80, 0xff)."
+        reason = "A byte of the last whole frame damaged at rest runs no tape code. The Tier-1 bind flips every byte of the last frame that leaves no whole astream frame after it (all of it, or the nested frame of one that nests one), under three masks (0x01, 0x80, 0xff)."
     )
 )]
 #[cfg_attr(

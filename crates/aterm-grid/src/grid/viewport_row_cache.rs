@@ -16,10 +16,16 @@ const MAX_SLOTS: usize = 512;
 /// The identity of the history a set of memo slots was filled from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::grid) struct HistoryEpoch {
-    /// `GridStorage::content_gen` — the authority on "content changed".
-    pub(in crate::grid) content_gen: u64,
+    /// `GridStorage::history_content_gen` — bumped when history rows change in place or wholesale.
+    pub(in crate::grid) history_content_gen: u64,
+    /// `GridStorage::scrollback_clear_gen` — bumped when off-screen scrollback is cleared.
+    pub(in crate::grid) clear_gen: u64,
+    /// `GridStorage::history_reveal_gen` — bumped when rows-grow pulls history onto screen.
+    pub(in crate::grid) reveal_gen: u64,
     /// `GridStorage::history_renumber_epoch` — absolute keys shifted wholesale.
     pub(in crate::grid) renumber: u64,
+    /// Tiered-store image rows dropped when hot lines promote to compressed blocks.
+    pub(in crate::grid) images_dropped: u64,
     /// Width the rows were materialized at.
     pub(in crate::grid) cols: u16,
     /// Viewport height, which sizes the slot table.

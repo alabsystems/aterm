@@ -6,9 +6,9 @@
 
 use super::Repair;
 use crate::{Error, Result};
-use astream_wire::sync::Actor;
+use astream_wire::sync::{Actor, Digest};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     ops::{Deref, DerefMut},
     sync::{Condvar, Mutex},
     time::Instant,
@@ -25,6 +25,9 @@ pub(super) const CAPACITY: usize = aterm_secrets::commons::roster::MAX_MEMBERS +
 struct Pool {
     active: BTreeMap<Actor, bool>,
     idle: VecDeque<(Actor, Repair)>,
+    /// What [`Cache::announce`] named while each active peer's round ran: its hint takes it as
+    /// the round releases it. One entry at most for each active peer.
+    told: BTreeMap<Actor, (BTreeSet<Digest>, bool)>,
 }
 
 /// One local writer in one pinned trust context. Oldest idle hints are evicted
@@ -35,6 +38,31 @@ pub(super) struct Cache(Mutex<Pool>, Condvar);
 impl Cache {
     pub(super) fn acquire<'a>(&'a self, actor: Actor, repair: &'a mut Repair) -> Result<Lease<'a>> {
         self.acquire_on(actor, repair, false, Instant::now())
+    }
+
+    /// This side appended to `tables` (and, where `unnamed`, to one more it could not name):
+    /// every peer's hint takes them ([`Repair::announce`]), so the next round this side
+    /// initiates with each visits them first. An idle hint takes them now. A leased one takes
+    /// them as its round releases it: that round may have read the table before the record,
+    /// and its hint replaces the idle one. A peer with no hint here starts its next round with
+    /// none, which asks which tables differ.
+    pub(super) fn announce(&self, tables: &BTreeSet<Digest>, unnamed: bool) {
+        let mut pool = self.0.lock().unwrap_or_else(|poison| poison.into_inner());
+        let Pool { active, idle, told } = &mut *pool;
+        for (_, hint) in idle.iter_mut() {
+            hint.announce(tables, unnamed);
+        }
+        for actor in active.keys() {
+            let (kept, kept_unnamed) = told.entry(*actor).or_default();
+            // More tables than a round's list holds are kept as one unnamed.
+            if kept.len() + tables.len() > crate::replica::MAX_TABLES {
+                kept.clear();
+                *kept_unnamed = true;
+            } else {
+                kept.extend(tables);
+            }
+            *kept_unnamed |= unnamed;
+        }
     }
 
     /// Only competing authenticated channels use the preference. A lone
@@ -184,6 +212,9 @@ impl Lease<'_> {
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         pool.active.remove(&self.actor);
+        if let Some((tables, unnamed)) = pool.told.remove(&self.actor) {
+            saved.announce(&tables, unnamed);
+        }
         pool.idle.push_back((self.actor, saved));
         drop(pool);
         self.cache.1.notify_all();

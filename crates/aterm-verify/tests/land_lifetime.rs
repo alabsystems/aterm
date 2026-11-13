@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright 2026 Andrew Yates
 
-//! Real parent deaths through land's command builder, with private capacity custody, and the
-//! living parent's interrupt and supervision of a judgment main's tip doomed.
+//! Real parent deaths through land's command builder, with private capacity custody, the
+//! living parent's interrupt and supervision of a judgment main's tip doomed, and the landing's
+//! real in-place handoff to another image of itself (`land --resume`).
 
 #[cfg(any(target_vendor = "apple", target_os = "linux"))]
 fn main() {
@@ -30,12 +31,96 @@ fn main() {
         });
     }
     let exe = std::env::current_exe().unwrap();
-    let mut raw: Vec<_> = std::env::args_os().skip(1).collect();
+    let raw: Vec<_> = std::env::args_os().skip(1).collect();
+    if raw.first().is_some_and(|word| word == "land") {
+        // The image a landing handed itself to, still holding the landing's role.
+        let [_, flag, file] = raw.as_slice() else {
+            panic!("a handoff's words: {raw:?}");
+        };
+        assert_eq!(flag, aterm_verify::land::handoff::RESUME);
+        let file = Path::new(file);
+        println!(
+            "resumed image={} topology={} cwd={}",
+            exe.canonicalize().unwrap().display(),
+            handoff::topology(),
+            handoff::cwd()
+        );
+        let taken = aterm_verify::land::Handoff::take(file);
+        println!(
+            "handoff-equal={} file-left={}",
+            taken == Ok(handoff::sample(&dir.unwrap())),
+            file.exists()
+        );
+        std::process::exit(0);
+    }
+    if role == "handoff-landing" || role == "handoff-unflushed" {
+        // A landing about to hand itself over, from a subdirectory of its checkout: an unended
+        // line, then the handoff.
+        let dir = dir.unwrap();
+        print!(
+            "pre-exec topology={} cwd={};",
+            handoff::topology(),
+            handoff::cwd()
+        );
+        let file = dir.join("handoff.json");
+        aterm_verify::land::handoff::write(&file, &handoff::sample(&dir)).unwrap();
+        let next = std::path::PathBuf::from(std::env::var_os("LAND_LIFETIME_NEXT").unwrap());
+        if role == "handoff-unflushed" {
+            // NEGATIVE CONTROL: the same exec, without the handoff's flush first.
+            let error = aterm_uds::spawnfd::transparent(&next)
+                .arg("land")
+                .arg(aterm_verify::land::handoff::RESUME)
+                .arg(&file)
+                .exec();
+            panic!("the exec failed: {error}");
+        }
+        // The merge removed the directory the landing was started in.
+        std::fs::remove_dir(dir.join(handoff::START)).unwrap();
+        let code = aterm_verify::land::handoff::hand_over(
+            &aterm_verify::land::Image {
+                path: next,
+                digest: "ab".repeat(32),
+            },
+            &file,
+            &dir,
+        );
+        println!("returned {code}");
+        std::process::exit(code);
+    }
+    if role == "handoff-schema" {
+        // Through the real CLI, in a checkout: a person's file that holds a handoff, outside the
+        // git directory, then a handoff in another schema in the git directory's own file.
+        let dir = dir.unwrap();
+        let mut init = aterm_uds::fixture_git::git();
+        init.current_dir(&dir).args(["init", "-q"]);
+        let out = aterm_uds::deadline::output_within(&mut init, MUST_HAPPEN).unwrap();
+        assert!(out.status.success(), "{out:?}");
+        let bytes = String::from_utf8(handoff::sample(&dir).encode().unwrap()).unwrap();
+        let resume = |file: &Path| {
+            aterm_verify::run_cli(
+                &[
+                    "land".into(),
+                    aterm_verify::land::handoff::RESUME.into(),
+                    file.to_string_lossy().into_owned(),
+                ],
+                &dir,
+            )
+        };
+        let notes = dir.join("notes.txt");
+        publish(&notes, &bytes);
+        let code = resume(&notes);
+        let kept = std::fs::read_to_string(&notes).is_ok_and(|text| text == bytes);
+        println!("notes-code={code} notes-kept={kept}");
+        let file = dir.join(".git").join(aterm_verify::land::handoff::FILE);
+        publish(&file, &bytes.replace(r#""schema":1"#, r#""schema":2"#));
+        let code = resume(&file);
+        println!("file-left={}", file.exists());
+        std::process::exit(code);
+    }
     if role == "parent" {
         let dir = dir.unwrap();
-        let escaped = std::env::var_os("LAND_LIFETIME_ESCAPED").is_some();
         let compiler = std::env::var_os("LAND_LIFETIME_COMPILER").is_some();
-        let mut child = if !escaped && std::env::var_os("LAND_LIFETIME_CONTROL").is_some() {
+        let mut child = if std::env::var_os("LAND_LIFETIME_CONTROL").is_some() {
             command(&exe)
         } else if compiler {
             let home = dir.join("bootstrap-home");
@@ -60,19 +145,16 @@ fn main() {
                 "fake-base",
                 checks,
                 &dir.join("events"),
-                Admit::Wait,
+                &aterm_verify::land::LandResources {
+                    admit: Admit::Wait,
+                    timeout: None,
+                    test_cores: None,
+                },
                 &aterm_verify::EnvSnapshot::capture(),
-                None,
             )
             .unwrap()
         };
-        let mut child = child
-            .env(
-                "LAND_LIFETIME_ROLE",
-                if escaped { "bootstrap" } else { "verify" },
-            )
-            .spawn()
-            .unwrap();
+        let mut child = child.env("LAND_LIFETIME_ROLE", "verify").spawn().unwrap();
         if let Some(how) = std::env::var_os("LAND_LIFETIME_INTERRUPT") {
             // The landing's poll found main doomed the judgment: interrupt it and live on. The
             // negative control only says it did.
@@ -117,27 +199,7 @@ fn main() {
         child.wait().unwrap();
         unreachable!();
     }
-    if role == "bootstrap" {
-        // Targo's run boundary can give the verifier a group outside the bootstrap's group.
-        let mut child = command(&exe);
-        child.process_group(0).env("LAND_LIFETIME_ROLE", "verify");
-        assert!(
-            raw.iter()
-                .any(|arg| arg == aterm_verify::land::PARENT_LIFETIME)
-        );
-        child.arg(aterm_verify::land::PARENT_LIFETIME);
-        child.spawn().unwrap().wait().unwrap();
-        unreachable!();
-    }
     if role == "verify" {
-        // A compiler stand-in carries no verifier flag. Direct and detached verifier
-        // roles arm the same early watch before starting any other thread.
-        if !(std::env::var_os("LAND_LIFETIME_ESCAPED").is_some()
-            && std::env::var_os("LAND_LIFETIME_CONTROL").is_some())
-        {
-            // SAFETY: this fresh executable has started no other thread.
-            unsafe { aterm_verify::land::own_judgment(&mut raw) }.unwrap();
-        }
         if std::env::var_os("LAND_LIFETIME_RECHECK").is_some() {
             let words: Vec<_> = raw.iter().map(|arg| arg.to_string_lossy()).collect();
             publish(&dir.as_ref().unwrap().join("args"), &words.join(" "));
@@ -210,6 +272,7 @@ fn main() {
             std::thread::park();
         }
     }
+    handoff::exec(&exe);
     bootstrap_placement();
 
     fn pid(dir: &Path, name: &str) -> i32 {
@@ -240,8 +303,7 @@ fn main() {
             }
         }
     }
-    for phase in ["direct", "detached", "compiler"] {
-        let escaped = phase == "detached";
+    for phase in ["direct", "compiler"] {
         for control in [true, false] {
             for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGKILL] {
                 let scratch = aterm_tempfile::tempdir().unwrap();
@@ -253,9 +315,6 @@ fn main() {
                 parent
                     .env("LAND_LIFETIME_ROLE", "parent")
                     .env("LAND_LIFETIME_DIR", dir);
-                if escaped {
-                    parent.env("LAND_LIFETIME_ESCAPED", "1");
-                }
                 if phase == "compiler" {
                     parent.env("LAND_LIFETIME_COMPILER", "1");
                 }
@@ -368,20 +427,14 @@ fn main() {
         drop(started.cleanup);
     };
     // An interrupt from the living parent, as `verify land` gives a judgment main doomed: the
-    // judgment's group, a verifier Targo's run left in a group of its own, the stage beneath it
-    // and its capacity claim have all ended once the interrupt returns, while the parent, which
-    // goes on to the re-judge, and a bystander live on. So they do for a verifier that handles
-    // the signal as the real one does, and one that outlasts it until the grace runs out, in its
-    // judgment's group or (its own watch's grace) in its own, there with a stage that outlasts
-    // it too (its watch's grace after that), which only a wait for the verifier's descendants,
-    // not its children alone, sees end. NEGATIVE CONTROL: a parent that only says it interrupted
-    // leaves all three running.
+    // judgment's group, the stage beneath it and its capacity claim have all ended once the
+    // interrupt returns, while the parent, which goes on to the re-judge, and a bystander live
+    // on. So they do for a verifier that handles the signal as the real one does, and one that
+    // outlasts it until the grace runs out, with a stage that outlasts it too: the stage's own
+    // watch ends its group once its verifier is gone. NEGATIVE CONTROL: a parent that only
+    // says it interrupted leaves all three running.
     for env in [
         &[("LAND_LIFETIME_INTERRUPT", "1")][..],
-        &[
-            ("LAND_LIFETIME_INTERRUPT", "1"),
-            ("LAND_LIFETIME_ESCAPED", "1"),
-        ],
         &[
             ("LAND_LIFETIME_INTERRUPT", "1"),
             ("LAND_LIFETIME_HANDLER", "1"),
@@ -392,7 +445,6 @@ fn main() {
         ],
         &[
             ("LAND_LIFETIME_INTERRUPT", "1"),
-            ("LAND_LIFETIME_ESCAPED", "1"),
             ("LAND_LIFETIME_DEAF", "1"),
             ("LAND_LIFETIME_DEAF_STAGE", "1"),
         ],
@@ -497,8 +549,180 @@ fn main() {
         finish(started);
     }
     println!(
-        "land lifetime: compiler, direct and detached groups, INT/TERM/HUP/KILL; descendants, capacity, bystander and negative controls passed; an interrupt from the living parent ended both group shapes, a handling and an outlasting verifier, an outlasting stage beneath a detached one, their stages and claims before it returned; supervision polled a reported boundary and interrupted, and its control and a recheck's child exited"
+        "land lifetime: compiler and direct groups, INT/TERM/HUP/KILL; descendants, capacity, bystander and negative controls passed; an interrupt from the living parent ended a handling and an outlasting verifier, an outlasting stage, their stages and claims before it returned; supervision polled a reported boundary and interrupted, and its control and a recheck's child exited; a landing handed itself to another image in place, in its checkout's root, its last line flushed, and refused a missing image, a file not its handoff and another schema"
     );
+}
+
+/// The landing's real in-place handoff ([`aterm_verify::land::handoff::hand_over`]).
+#[cfg(any(target_vendor = "apple", target_os = "linux"))]
+mod handoff {
+    use aterm_spec::wait::MUST_HAPPEN;
+    use aterm_verify::land::Handoff;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+
+    /// This process's `pid:pgid:sid`.
+    pub fn topology() -> String {
+        // SAFETY: getpgrp and getsid(0) only read this process's own ids.
+        let (group, session) = unsafe { (libc::getpgrp(), libc::getsid(0)) };
+        format!("{}:{group}:{session}", std::process::id())
+    }
+
+    /// This process's working directory, physical.
+    pub fn cwd() -> String {
+        std::env::current_dir()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .display()
+            .to_string()
+    }
+
+    /// The handoff the landing role writes in `dir` and the image it hands to takes.
+    pub fn sample(dir: &Path) -> Handoff {
+        Handoff {
+            root: dir.to_owned(),
+            image: "ab".repeat(32),
+            words: vec!["--test-cores".into(), "4".into()],
+            step: aterm_land::Step::Qualify,
+            hop: 1,
+            at: "1".repeat(40),
+            base: "2".repeat(40),
+            rejudges: 0,
+            composes: 0,
+            cone: "2".repeat(40),
+            branch: None,
+            stated: aterm_types::land_trailer::Stated::default(),
+        }
+    }
+
+    /// The subdirectory of its checkout a landing role starts in.
+    pub const START: &str = "sub";
+
+    /// Run this binary as `role`, handing to `next`, in [`START`] of the fresh checkout
+    /// directory `name` of `scratch`: its exit, its output and that directory.
+    fn landing(
+        exe: &Path,
+        (scratch, name): (&Path, &str),
+        role: &str,
+        next: &Path,
+        hang: Duration,
+    ) -> (Option<i32>, String, PathBuf) {
+        let dir = scratch.join(name);
+        std::fs::create_dir_all(dir.join(START)).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let mut command = aterm_uds::spawnfd::command(exe);
+        command
+            .env("LAND_LIFETIME_ROLE", role)
+            .env("LAND_LIFETIME_DIR", &dir)
+            .env("LAND_LIFETIME_NEXT", next)
+            .current_dir(dir.join(START));
+        let out = aterm_uds::deadline::output_until(&mut command, Instant::now() + hang)
+            .expect("the landing ends before the hang detector");
+        let text = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.code(), text, dir)
+    }
+
+    /// A landing hands itself to a copy of this binary in place: the copy runs as `land --resume
+    /// <file>` with the same pid, process group and session, in the checkout's root though the
+    /// subdirectory the landing started in is gone, the landing's unended last line reached the
+    /// output first, and the copy took the handoff whole, leaving no file. NEGATIVE CONTROLS: the
+    /// same exec without the handoff's flush loses that line and keeps the directory it started
+    /// in; a missing image is a COULD NOT RUN the landing says and exits with; through the real
+    /// CLI, a person's file outside the git directory is refused and left as it was, and a
+    /// handoff in another schema is refused by name and removed.
+    pub fn exec(exe: &Path) {
+        let mut scratch =
+            aterm_uds::deadline::KeptUntilRan::new(aterm_tempfile::tempdir().unwrap().keep());
+        let next = scratch.path().join("next").join(exe.file_name().unwrap());
+        std::fs::create_dir_all(next.parent().unwrap()).unwrap();
+        aterm_uds::deadline::ad_hoc_copy(exe, &next);
+        let image = next.canonicalize().unwrap();
+        let root = scratch.path().to_owned();
+        let at = |name| (root.as_path(), name);
+        // The copy's first exec waits on macOS's program check: its own hang detector.
+        let first = aterm_uds::deadline::FIRST_EXEC_HANG;
+        let (code, text, dir) = landing(exe, at("landing"), "handoff-landing", &next, first);
+        let resumed = format!("resumed image={} topology=", image.display());
+        assert!(
+            text.contains(&resumed),
+            "the copy ran from its file: {text}"
+        );
+        let plain = MUST_HAPPEN;
+        let (unflushed, control, control_dir) =
+            landing(exe, at("unflushed"), "handoff-unflushed", &next, plain);
+        assert!(
+            control.contains(&resumed),
+            "the control's copy ran from its file: {control}"
+        );
+        // Each child started from the copy has shown it ran: it may go.
+        scratch.ran();
+        assert_eq!(code, Some(0), "{text}");
+        let before = text
+            .split("pre-exec topology=")
+            .nth(1)
+            .and_then(|rest| rest.split(';').next())
+            .expect("the landing's unended line was flushed before the exec");
+        let after = text
+            .split(&resumed)
+            .nth(1)
+            .and_then(|rest| rest.lines().next())
+            .expect("the copy's line");
+        let (before, started) = before.split_once(" cwd=").expect("the landing's directory");
+        let (after, resumed_in) = after.split_once(" cwd=").expect("the copy's directory");
+        assert_eq!(before, after, "pid, group and session kept: {text}");
+        assert_eq!(
+            started,
+            dir.join(START).display().to_string(),
+            "the landing started in its subdirectory: {text}"
+        );
+        assert_eq!(
+            resumed_in,
+            dir.display().to_string(),
+            "the copy runs in the checkout's root: {text}"
+        );
+        assert!(
+            text.contains("handoff-equal=true file-left=false"),
+            "{text}"
+        );
+        assert!(!text.contains("returned "), "{text}");
+        assert_eq!(unflushed, Some(0), "{control}");
+        assert!(
+            !control.contains("pre-exec topology="),
+            "without the flush the line is lost: {control}"
+        );
+        assert!(
+            control.contains(&format!(" cwd={}\n", control_dir.join(START).display())),
+            "a bare exec keeps the directory it started in: {control}"
+        );
+        let missing = scratch.path().join("missing").join("aterm-verify");
+        let (code, text, _) = landing(exe, at("missing"), "handoff-landing", &missing, plain);
+        assert_eq!(code, Some(3), "{text}");
+        let refused = format!(
+            "verify land: COULD NOT RUN — the landing could not hand itself to {}",
+            missing.display()
+        );
+        assert!(
+            text.contains(&refused) && text.contains("returned 3"),
+            "{text}"
+        );
+        let (code, text, _) = landing(exe, at("schema"), "handoff-schema", &missing, plain);
+        assert_eq!(code, Some(3), "{text}");
+        assert!(text.contains("notes-code=3 notes-kept=true"), "{text}");
+        assert!(
+            text.contains("notes.txt is not this checkout's handoff"),
+            "{text}"
+        );
+        assert!(
+            text.contains("it was handed over in schema 2; this tree's verify land reads schema 1"),
+            "{text}"
+        );
+        assert!(text.contains("file-left=false"), "{text}");
+    }
 }
 
 #[cfg(not(any(target_vendor = "apple", target_os = "linux")))]
@@ -623,9 +847,12 @@ fn main() {
         "main",
         &[],
         &root.join("events"),
-        aterm_capacity::Admit::Wait,
+        &verify::land::LandResources {
+            admit: aterm_capacity::Admit::Wait,
+            timeout: None,
+            test_cores: None,
+        },
         &snapshot,
-        None,
     )
     .unwrap();
     for name in verify::CARGO_LAYOUT_VARS {

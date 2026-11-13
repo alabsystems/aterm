@@ -142,25 +142,53 @@ pub const fn field(col: usize, cols: usize) -> f32 {
 /// cell is about twice as tall as it is wide, as the launch card's pixels measure it.
 pub const CELL_ASPECT: f32 = 2.0;
 
+/// An edge of a card's border, in the order the arc runs round it ([`perimeter_at`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edge {
+    /// The top edge, read left to right.
+    Top,
+    /// The right side, read down.
+    Right,
+    /// The bottom edge, read right to left.
+    Bottom,
+    /// The left side, read up.
+    Left,
+}
+
+/// The perimeter fraction `s` of the point `at` along `edge` of a box `w` wide and `h` tall (one
+/// unit for all three; `at` from the box's left on the top and the bottom edge, from its top on
+/// a side): clockwise from the top-left corner, as the launch card maps its border (top `x`,
+/// right `w + y`, bottom `w + h + (w − x)`, left `2w + h + (h − y)`, over `2(w + h)`). The one
+/// mapping a card's border takes, by cell ([`perimeter`]) or by pixel.
+#[must_use]
+#[inline]
+pub fn perimeter_at(edge: Edge, at: f32, w: f32, h: f32) -> f32 {
+    let along = match edge {
+        Edge::Top => at,
+        Edge::Right => w + at,
+        Edge::Bottom => w + h + (w - at),
+        Edge::Left => 2.0 * w + h + (h - at),
+    };
+    along / (2.0 * (w + h))
+}
+
 /// The perimeter fraction `s` of the border cell at `row`, `col` of a card `rows` by `cols`
-/// cells, at the cell's centre: clockwise from the top-left corner, as the launch card maps its
-/// border (the top edge left to right, the right side down, the bottom edge right to left, the
-/// left side up), a row counted [`CELL_ASPECT`] cell widths tall. A cell off the border reads as
-/// the left side's.
+/// cells, at the cell's centre ([`perimeter_at`]), a row counted [`CELL_ASPECT`] cell widths
+/// tall. A cell off the border reads as the left side's.
 #[must_use]
 pub fn perimeter(row: usize, col: usize, rows: usize, cols: usize) -> f32 {
     let (w, h) = (cols.max(1) as f32, rows.max(1) as f32 * CELL_ASPECT);
     let (x, y) = (col as f32 + 0.5, (row as f32 + 0.5) * CELL_ASPECT);
-    let along = if row == 0 {
-        x
+    let (edge, at) = if row == 0 {
+        (Edge::Top, x)
     } else if col + 1 >= cols {
-        w + y
+        (Edge::Right, y)
     } else if row + 1 >= rows {
-        w + h + (w - x)
+        (Edge::Bottom, x)
     } else {
-        2.0 * w + h + (h - y)
+        (Edge::Left, y)
     };
-    (along / (2.0 * (w + h))).rem_euclid(1.0)
+    perimeter_at(edge, at, w, h).rem_euclid(1.0)
 }
 
 /// What a [`GlassInks`] is made from: the palette, the pane's ground and ink, and the grey
@@ -338,16 +366,15 @@ impl GlassInks {
         if fg == rule { fg ^ 0x0001_0000 } else { fg }
     }
 
-    /// A card border's cell at `row`, `col` of a card `rows` by `cols` cells: the static arc,
-    /// [`Self::rule`] at `tri(2s)`, `s` its [`perimeter`] fraction (the launch card's border at
-    /// φ = 0, `docs/DESIGN-harness-glass-rainbow-2026-11-05.md` §1.4), worn by every fact card the
-    /// glass opens; Claude's rule grey with no palette.
+    /// A card border's ink at perimeter fraction `s` (`0.0..1.0`, clockwise from the top-left
+    /// corner, [`perimeter_at`] of a point on the border): the static arc, [`Self::rule`] at `tri(2s)`
+    /// (the launch card's border at φ = 0, `docs/DESIGN-harness-glass-rainbow-2026-11-05.md`
+    /// §1.4), worn by every fact card the glass opens; Claude's rule grey with no palette. The
+    /// arc closes on itself: `s` and `s + 1` are one ink.
     #[must_use]
     #[inline]
-    pub fn border(&self, row: usize, col: usize, rows: usize, cols: usize) -> u32 {
-        self.rule(crate::rainbow_kitty::meteor::tri(
-            2.0 * perimeter(row, col, rows, cols),
-        ))
+    pub fn border_at(&self, s: f32) -> u32 {
+        self.rule(crate::rainbow_kitty::meteor::tri(2.0 * s))
     }
 
     /// The hero word's letter at `k` across it (`0.0..=1.0`): the launch card's settled hero

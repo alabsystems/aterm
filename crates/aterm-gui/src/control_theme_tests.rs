@@ -217,10 +217,12 @@ fn a_catalog_reload_redraws_a_preview_and_ends_one_whose_file_left() {
 #[cfg(unix)]
 #[test]
 fn a_config_reload_keeps_a_settings_trial_without_a_bounce() {
+    use std::os::fd::IntoRawFd;
     let dir = std::env::temp_dir().join(format!("aterm-trial-reload-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");
-    let mut fds = [0; 2];
-    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0, "pipe");
+    let fds = aterm_uds::pipe()
+        .map(|(r, w)| [r.into_raw_fd(), w.into_raw_fd()])
+        .expect("pipe");
     assert_eq!(
         unsafe { libc::fcntl(fds[0], libc::F_SETFL, libc::O_NONBLOCK) },
         0

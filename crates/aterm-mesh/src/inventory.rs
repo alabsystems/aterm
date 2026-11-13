@@ -74,7 +74,7 @@ use crate::egress::Egress;
 use crate::logs::Mesh;
 use crate::presence::Held;
 use crate::relay::{self, Event};
-use crate::stores::{Digest, Kind, Stores, Verdict};
+use crate::stores::{Digest, Kind, ProofKey, Stores, Verdict};
 use aterm_mesh_core::relay_digest::Trigger;
 use aterm_mesh_core::relay_live;
 use aterm_net::fleet::FleetOp;
@@ -823,6 +823,24 @@ enum Unit {
     Table(Digest),
 }
 
+/// Missing identities survive the receive turn; payloads and their eligibility do not.
+enum Offer {
+    Members(Vec<Digest>),
+    Proofs(Digest, Vec<ProofKey>),
+    Table(Digest, Vec<Digest>),
+}
+
+impl Offer {
+    fn wires(&self, stores: &dyn Stores) -> io::Result<Vec<Vec<u8>>> {
+        match self {
+            Self::Members(ids) if !ids.is_empty() => stores.members_wires(ids),
+            Self::Proofs(table, keys) if !keys.is_empty() => stores.table_proof_wires(*table, keys),
+            Self::Table(table, ids) if !ids.is_empty() => stores.table_wires(*table, ids),
+            _ => Ok(Vec::new()),
+        }
+    }
+}
+
 /// This Mac's summary: the SHA-256 over the membership log's complete records' ids, then each
 /// table's digest, its operations' ids and its proofs' keys, all sorted.
 fn summary(stores: &dyn Stores) -> io::Result<Digest> {
@@ -851,7 +869,7 @@ fn io_of(error: &aterm_db::Error) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.0.clone())
 }
 
-fn write_frame(mut stream: &LinkStream, bytes: &[u8]) -> io::Result<()> {
+fn write_frame(stream: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
     let len = u32::try_from(bytes.len())
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a frame past 4 GiB"))?;
     if let Some(total) = bytes.len().checked_add(4).filter(|&n| n <= 1024) {
@@ -864,13 +882,13 @@ fn write_frame(mut stream: &LinkStream, bytes: &[u8]) -> io::Result<()> {
     stream.write_all(bytes)
 }
 
-fn read_u32(mut stream: &LinkStream) -> io::Result<u32> {
+fn read_u32(stream: &mut impl Read) -> io::Result<u32> {
     let mut len = [0u8; 4];
     stream.read_exact(&mut len)?;
     Ok(u32::from_le_bytes(len))
 }
 
-fn read_greeting(mut stream: &LinkStream) -> io::Result<Digest> {
+fn read_greeting(stream: &mut impl Read) -> io::Result<Digest> {
     let max = HEAD.len() + 32;
     let len = read_u32(stream)? as usize;
     if len > max {
@@ -898,7 +916,7 @@ fn read_greeting(mut stream: &LinkStream) -> io::Result<Digest> {
     Ok(digest)
 }
 
-fn read_frame(stream: &LinkStream, max: usize) -> io::Result<Vec<u8>> {
+fn read_frame(stream: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
     let len = read_u32(stream)? as usize;
     if len > max {
         return Err(io::Error::new(
@@ -907,8 +925,7 @@ fn read_frame(stream: &LinkStream, max: usize) -> io::Result<Vec<u8>> {
         ));
     }
     let mut bytes = vec![0u8; len];
-    let mut reader = stream;
-    reader.read_exact(&mut bytes)?;
+    stream.read_exact(&mut bytes)?;
     Ok(bytes)
 }
 
@@ -916,7 +933,7 @@ fn read_frame(stream: &LinkStream, max: usize) -> io::Result<Vec<u8>> {
 /// where this side sends no list (a table its stores do not take), and the neighbour's list, or
 /// `None` where it sent none.
 fn exchange_ids<const N: usize>(
-    stream: &LinkStream,
+    stream: &mut (impl Read + Write),
     initiator: bool,
     local: Option<&BTreeSet<[u8; N]>>,
     maximum: usize,
@@ -926,8 +943,7 @@ fn exchange_ids<const N: usize>(
     } else {
         aterm_db::replica::Side::Responder
     };
-    let mut io = stream;
-    aterm_db::replica::exchange_inventory::<N>(&mut io, side, local, maximum, || Ok(()))
+    aterm_db::replica::exchange_inventory::<N>(stream, side, local, maximum, || Ok(()))
         .map_err(|e| io_of(&e))
 }
 
@@ -965,15 +981,29 @@ fn exchange(
     initiator: bool,
     both_hold_only: bool,
 ) -> io::Result<Moved> {
+    let mut io = stream;
+    exchange_stream(stores, egress, &mut io, summary, initiator, both_hold_only)
+}
+
+fn exchange_stream(
+    stores: &dyn Stores,
+    egress: &Egress,
+    stream: &mut (impl Read + Write),
+    summary: Digest,
+    initiator: bool,
+    both_hold_only: bool,
+) -> io::Result<Moved> {
     let mut greeting = [0u8; HEAD.len() + 32];
     greeting[..HEAD.len()].copy_from_slice(HEAD);
     greeting[HEAD.len()..].copy_from_slice(&summary);
     let theirs = if initiator {
         write_frame(stream, &greeting)?;
+        stream.flush()?;
         read_greeting(stream)?
     } else {
         let theirs = read_greeting(stream)?;
         write_frame(stream, &greeting)?;
+        stream.flush()?;
         theirs
     };
     let mut moved = Moved::default();
@@ -996,18 +1026,14 @@ fn exchange(
         units.extend([Unit::Proofs(table), Unit::Table(table)]);
     }
     for unit in units {
-        let wires = match unit {
+        let offer = match unit {
             Unit::Members => {
                 let local = stores.members_inventory()?;
                 let remote = exchange_ids(stream, initiator, Some(&local), MEMBERS_MAX)?;
                 let give = lacking(Some(&local), remote.as_ref(), |remote, id| {
                     !remote.contains(id)
                 });
-                if give.is_empty() {
-                    Vec::new()
-                } else {
-                    stores.members_wires(&give)?
-                }
+                Offer::Members(give)
             }
             Unit::Proofs(table) => {
                 let local = if opens(stores, &mine, table)? {
@@ -1022,11 +1048,7 @@ fn exchange(
                     fork[48] = 1;
                     !remote.contains(key) && !remote.contains(&fork)
                 });
-                if give.is_empty() {
-                    Vec::new()
-                } else {
-                    stores.table_proof_wires(table, &give)?
-                }
+                Offer::Proofs(table, give)
             }
             Unit::Table(table) => {
                 let local = if opens(stores, &mine, table)? {
@@ -1038,27 +1060,22 @@ fn exchange(
                 let give = lacking(local.as_ref(), remote.as_ref(), |remote, id| {
                     !remote.contains(id)
                 });
-                if give.is_empty() {
-                    Vec::new()
-                } else {
-                    stores.table_wires(table, &give)?
-                }
+                Offer::Table(table, give)
             }
         };
         if initiator {
-            moved.sent += send(stream, &wires)?;
+            moved.sent += send(stream, &offer.wires(stores)?)?;
             moved.add(receive(stores, egress, stream, unit)?);
         } else {
             moved.add(receive(stores, egress, stream, unit)?);
-            moved.sent += send(stream, &wires)?;
+            moved.sent += send(stream, &offer.wires(stores)?)?;
         }
     }
     Ok(moved)
 }
 
 /// Send `wires` in batches, then an empty batch: how many went.
-fn send(stream: &LinkStream, wires: &[Vec<u8>]) -> io::Result<usize> {
-    let mut writer = stream;
+fn send(writer: &mut impl Write, wires: &[Vec<u8>]) -> io::Result<usize> {
     if wires.is_empty() {
         writer.write_all(&0u32.to_le_bytes())?;
         writer.flush()?;
@@ -1111,7 +1128,7 @@ fn send(stream: &LinkStream, wires: &[Vec<u8>]) -> io::Result<usize> {
 fn receive(
     stores: &dyn Stores,
     egress: &Egress,
-    stream: &LinkStream,
+    stream: &mut impl Read,
     unit: Unit,
 ) -> io::Result<Moved> {
     let mut moved = Moved::default();
@@ -1149,3 +1166,7 @@ fn receive(
         }
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "inventory_boundary_tests.rs"]
+mod boundary_tests;

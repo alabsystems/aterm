@@ -26,10 +26,13 @@ fn root() -> PathBuf {
     // Darwin's per-user TMPDIR can already consume most of sockaddr_un.
     // Create a fresh private fixture directory under the short native base;
     // never truncate a production path or change the native socket bound.
+    // Parallel tests can read one clock microsecond; the sequence keeps each fixture its own.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = Path::new("/tmp").join(format!(
-        "retained-inputs-{}-{}",
+        "retained-inputs-{}-{}-{}",
         std::process::id(),
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
     fs::canonicalize(path).unwrap()

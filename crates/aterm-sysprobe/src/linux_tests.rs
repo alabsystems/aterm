@@ -294,6 +294,80 @@ fn psi_gives_its_averages_and_the_pressure_level() {
     assert_eq!(Root::new(empty.path()).psi(), Err(Why::NotEnabled("psi")));
 }
 
+/// The machine's level asks for both PSI's stall and the machine's shortage, held to the live
+/// reading that found the gap: one 64 MiB `MemoryHigh` scope on a 16 GiB guest read
+/// `some avg10=74.01`, `full avg10=73.81` with `MemAvailable` at 8,626,676 KiB of 16,341,464 KiB,
+/// and PSI alone called the machine critical. NEGATIVE CONTROLS: one KiB under a tenth available
+/// is the machine's shortage again (PSI decides), and an unread or zero total leaves PSI alone
+/// deciding.
+#[test]
+fn the_machines_level_asks_for_both_the_stall_and_the_shortage() {
+    let stalled = linux::Psi {
+        some_avg10: 74.01,
+        full_avg10: 73.81,
+    };
+    assert_eq!(linux::psi_level(&stalled), MemoryLevel::Critical);
+    assert_eq!(
+        linux::machine_pressure(&stalled, Some((16_341_464, 8_626_676))),
+        MemoryLevel::Normal,
+        "the live guest: a cgroup's limit, 53 % available"
+    );
+    assert_eq!(
+        linux::machine_pressure(&stalled, Some((10_000_000, 1_000_000))),
+        MemoryLevel::Normal,
+        "exactly a tenth is room"
+    );
+    assert_eq!(
+        linux::machine_pressure(&stalled, Some((10_000_000, 999_999))),
+        MemoryLevel::Critical
+    );
+    let warn = linux::Psi {
+        some_avg10: 12.5,
+        full_avg10: 2.0,
+    };
+    assert_eq!(
+        linux::machine_pressure(&warn, Some((10_000_000, 500_000))),
+        MemoryLevel::Warn
+    );
+    assert_eq!(
+        linux::machine_pressure(&stalled, None),
+        MemoryLevel::Critical
+    );
+    assert_eq!(
+        linux::machine_pressure(&stalled, Some((0, 0))),
+        MemoryLevel::Critical
+    );
+    assert_eq!(
+        linux::machine_pressure(&stalled, Some((u64::MAX, u64::MAX))),
+        MemoryLevel::Normal,
+        "no overflow"
+    );
+    let live = tree(&[
+        (
+            "proc/pressure/memory",
+            "some avg10=74.01 avg60=40.00 avg300=9.00 total=1\nfull avg10=73.81 avg60=39.00 avg300=8.00 total=1\n",
+        ),
+        (
+            "proc/meminfo",
+            "MemTotal:       16341464 kB\nMemFree:         8000000 kB\nMemAvailable:    8626676 kB\n",
+        ),
+    ]);
+    let r = Root::new(live.path());
+    assert_eq!(r.pressure(), Ok(MemoryLevel::Normal));
+    write(
+        live.path(),
+        "proc/meminfo",
+        "MemTotal:       16341464 kB\nMemAvailable:     800000 kB\n",
+    );
+    assert_eq!(r.pressure(), Ok(MemoryLevel::Critical), "4.9 % available");
+    std::fs::remove_file(live.path().join("proc/meminfo")).expect("remove");
+    assert_eq!(r.pressure(), Ok(MemoryLevel::Critical), "PSI alone");
+    assert_eq!(
+        Root::new(tree(&[]).path()).pressure(),
+        Err(Why::NotEnabled("psi"))
+    );
+}
+
 const MEMINFO_ZSWAP: &str = "\
 MemTotal:       32768000 kB
 MemFree:         2048000 kB
@@ -327,10 +401,20 @@ fn memory_reads_psi_and_drops_a_disabled_zswap() {
     ]);
     let r = Root::new(root.path());
     let m = r.memory_detail().expect("a reading");
-    assert_eq!(m.pressure, Some(MemoryLevel::Warn));
+    assert_eq!(
+        m.pressure,
+        Some(MemoryLevel::Normal),
+        "a stall with 62.5 % available is a cgroup's, not the machine's"
+    );
     assert_eq!(m.available, 20_480_000 * 1024, "MemAvailable");
     assert_eq!((m.compressed, m.stored), (None, None));
     assert_eq!(m.shared, Some(1_024_000 * 1024));
+    let short = MEMINFO_ZSWAP.replace("MemAvailable:   20480000 kB", "MemAvailable:    2048000 kB");
+    write(root.path(), "proc/meminfo", &short);
+    let m = r.memory_detail().expect("a reading");
+    assert_eq!(m.pressure, Some(MemoryLevel::Warn), "6.25 % available");
+    assert_eq!(r.pressure(), Ok(MemoryLevel::Warn));
+    write(root.path(), "proc/meminfo", MEMINFO_ZSWAP);
     write(root.path(), "sys/module/zswap/parameters/enabled", "Y\n");
     let m = r.memory_detail().expect("a reading");
     assert_eq!(
@@ -342,6 +426,57 @@ fn memory_reads_psi_and_drops_a_disabled_zswap() {
     let m = Root::new(no_psi.path()).memory_detail().expect("a reading");
     assert_eq!(m.pressure, None, "no PSI is no level, never normal");
     assert_eq!(Root::new(tree(&[]).path()).memory_detail(), None);
+}
+
+const VMSTAT_ZSWAP: &str = "\
+nr_free_pages 3000000
+pgpgin 629812
+pswpin 12
+pswpout 30
+pgmajfault 3271
+workingset_refault_file 41446
+zswpin 5
+zswpout 9
+";
+
+/// `/proc/vmstat` read as macOS's VM counters: swap pages scaled by the page size, zswap's loads
+/// and stores as the compressor's, major faults as page-ins. NEGATIVE CONTROLS: a kernel without
+/// zswap reads 0 compressions, a text without the fault counter is no reading, `page_bytes == 0`
+/// is no reading, and a `vmstat` past [`linux::VMSTAT_CAP`] is no reading rather than the counters
+/// before its cut.
+#[test]
+fn vmstat_gives_the_vm_counters() {
+    let c = linux::vm_counters(VMSTAT_ZSWAP, 16_384).expect("counters");
+    assert_eq!(
+        (c.swapin_bytes, c.swapout_bytes, c.page_bytes),
+        (12 * 16_384, 30 * 16_384, 16_384)
+    );
+    assert_eq!((c.decompressions, c.compressions, c.pageins), (5, 9, 3271));
+    let no_zswap = VMSTAT_ZSWAP.replace("zswpin 5\nzswpout 9\n", "");
+    let c = linux::vm_counters(&no_zswap, 4096).expect("counters");
+    assert_eq!((c.decompressions, c.compressions), (0, 0));
+    assert_eq!(
+        linux::vm_counters(&VMSTAT_ZSWAP.replace("pgmajfault 3271\n", ""), 4096),
+        None
+    );
+    assert_eq!(linux::vm_counters(VMSTAT_ZSWAP, 0), None);
+
+    let root = tree(&[
+        ("proc/meminfo", MEMINFO_ZSWAP),
+        ("proc/vmstat", VMSTAT_ZSWAP),
+    ]);
+    let r = Root::new(root.path());
+    assert_eq!(r.page_bytes(), 4096, "no auxv in a fixture: the default");
+    let m = r.memory_detail().expect("a reading");
+    assert_eq!(
+        m.counters
+            .map(|c| (c.swapin_bytes, c.pageins, c.page_bytes)),
+        Some((12 * 4096, 3271, 4096))
+    );
+    let long: String = (0..2000).map(|i| format!("nr_pad_{i:05} 0\n")).collect();
+    write(root.path(), "proc/vmstat", &format!("{long}{VMSTAT_ZSWAP}"));
+    assert_eq!(r.vm_counters(), None, "cut at {} bytes", linux::VMSTAT_CAP);
+    assert_eq!(r.memory_detail().map(|m| m.counters), Some(None));
 }
 
 #[test]
@@ -1030,6 +1165,15 @@ fn the_sweep_reads_a_fixture_proc() {
             "Name:\ttmux: server\nUid:\t1000\t1000\t1000\t1000\nRssAnon:\t    2048 kB\nVmSwap:\t    1024 kB\n",
         ),
         (
+            "proc/4242/io",
+            "rchar: 9000\nwchar: 5000\nsyscr: 30\nsyscw: 20\nread_bytes: 8192\nwrite_bytes: 4096\ncancelled_write_bytes: 0\n",
+        ),
+        // tmux's two threads waited 0.2 s and 0.05 s for a core; its own
+        // `schedstat` is the leader's alone and is not read.
+        ("proc/4242/schedstat", "400000000 200000000 9\n"),
+        ("proc/4242/task/4242/schedstat", "400000000 200000000 9\n"),
+        ("proc/4242/task/4243/schedstat", "90000000 50000000 2\n"),
+        (
             "proc/4300/stat",
             "4300 (zsh) R 4242 4300 4242 34816 4300 4194304 100 0 0 0 5 5 0 0 20 0 1 0 900 0 0\n",
         ),
@@ -1147,6 +1291,64 @@ fn the_sweep_reads_a_fixture_proc() {
             (4400, None),
         ],
         "each uid is status's real Uid (0 for a kernel thread); CONTROL: 4400 has no Uid line and is None even on a Unix file system"
+    );
+    // `stat`'s thread count, the unit the per-user limit counts here.
+    assert!(
+        sweep.procs.iter().all(|p| p.threads == Some(1)),
+        "{sweep:?}"
+    );
+    // Storage bytes come from `io`; a process without one reads none, never zero.
+    let disk: Vec<(u32, Option<u64>, Option<u64>)> = sweep
+        .procs
+        .iter()
+        .map(|p| (p.pid, p.disk_read, p.disk_written))
+        .collect();
+    assert_eq!(
+        disk,
+        [
+            (1, None, None),
+            (2, None, None),
+            (4242, Some(8192), Some(4096)),
+            (4300, None, None),
+            (4400, None, None),
+        ]
+    );
+    // The runnable time is the CPU time plus every thread's wait; one without `task/*/schedstat` reads none.
+    let runnable: Vec<(u32, Option<u64>)> =
+        sweep.procs.iter().map(|p| (p.pid, p.runnable_ns)).collect();
+    assert_eq!(
+        runnable,
+        [
+            (1, None),
+            (2, None),
+            (4242, Some(490_000_000 + 250_000_000)),
+            (4300, None),
+            (4400, None),
+        ]
+    );
+    // Per-user gating: uid 1000 reads 4242's `io` and `runnable_ns`; uid 1001 skips another user's.
+    let own = Root::new(root.path())
+        .with_euid(Some(1000))
+        .processes(100, 4096)
+        .expect("a sweep");
+    let p4242 = own.procs.iter().find(|p| p.pid == 4242).expect("4242");
+    assert_eq!(
+        (p4242.disk_read, p4242.disk_written, p4242.runnable_ns),
+        (Some(8192), Some(4096), Some(490_000_000 + 250_000_000))
+    );
+    let other = Root::new(root.path())
+        .with_euid(Some(1001))
+        .processes(100, 4096)
+        .expect("a sweep");
+    let p4242_other = other.procs.iter().find(|p| p.pid == 4242).expect("4242");
+    assert_eq!(
+        (
+            p4242_other.disk_read,
+            p4242_other.disk_written,
+            p4242_other.runnable_ns
+        ),
+        (None, None, None),
+        "NEGATIVE CONTROL: another user's process is not asked"
     );
     assert!(!sweep.truncated);
     assert_eq!(Root::new(tree(&[]).path()).processes(100, 4096), None);
@@ -1344,6 +1546,77 @@ fn a_long_groups_line_never_cuts_the_footprint() {
             text.len()
         );
     }
+}
+
+/// An agent's process group on a fixture `/proc` (the memory ceiling's measure,
+/// [`crate::group_memory`]): a Claude Code (group leader, 600 MiB anonymous plus 40 MiB swapped)
+/// and a helper it forked into its group (100 MiB) are summed; a Bash tool's shell that leads a
+/// group of its own, and the 2 GiB build under it, are not the agent's; a zombie member (no
+/// `RssAnon`) is skipped, not counted as zero. NEGATIVE CONTROLS: a kernel thread (group 0), a pid
+/// that is gone, another user's group, and a group whose one member's `status` is unreadable read
+/// `None`.
+#[test]
+fn a_groups_memory_sums_its_own_members_on_a_fixture_proc() {
+    let stat = |pid: u32, name: &str, ppid: u32, pgrp: u32| {
+        format!(
+            "{pid} ({name}) S {ppid} {pgrp} {pgrp} 34816 {pgrp} 4194560 0 0 0 0 1 1 0 0 20 0 1 0 5 0 0\n"
+        )
+    };
+    let status = |uid: u32, anon_kib: u64, swap_kib: u64| {
+        format!(
+            "Name:\tx\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\nRssAnon:\t{anon_kib} kB\nVmSwap:\t{swap_kib} kB\n"
+        )
+    };
+    let rows = [
+        ("proc/7000/stat", stat(7000, "claude", 4300, 7000)),
+        ("proc/7000/status", status(1000, 600 * 1024, 40 * 1024)),
+        ("proc/7001/stat", stat(7001, "claude helper", 7000, 7000)),
+        ("proc/7001/status", status(1000, 100 * 1024, 0)),
+        ("proc/7002/stat", stat(7002, "defunct", 7000, 7000)),
+        (
+            "proc/7002/status",
+            "Name:\tdefunct\nUid:\t1000\t1000\t1000\t1000\nState:\tZ (zombie)\n".to_owned(),
+        ),
+        ("proc/7100/stat", stat(7100, "zsh", 7000, 7100)),
+        ("proc/7100/status", status(1000, 5 * 1024, 0)),
+        ("proc/7101/stat", stat(7101, "cargo", 7100, 7100)),
+        ("proc/7101/status", status(1000, 2048 * 1024, 0)),
+        (
+            "proc/2/stat",
+            "2 (kthreadd) S 0 0 0 0 -1 2129984 0 0 0 0 0 7 0 0 20 0 1 0 5 0 0\n".to_owned(),
+        ),
+        ("proc/2/status", "Name:\tkthreadd\nPPid:\t0\n".to_owned()),
+        ("proc/8000/stat", stat(8000, "lone", 1, 8000)),
+    ];
+    let files: Vec<(&str, &str)> = rows.iter().map(|(p, t)| (*p, t.as_str())).collect();
+    let root = tree(&files);
+    let proc = Root::new(root.path()).with_euid(Some(1000));
+    let agent = crate::GroupMemory {
+        pgid: 7000,
+        footprint_mib: 600 + 40 + 100,
+        measured: 2,
+    };
+    assert_eq!(proc.group_memory(7000), Some(agent), "asked by its leader");
+    assert_eq!(proc.group_memory(7001), Some(agent), "asked by a member");
+    assert_eq!(
+        proc.group_memory(7101),
+        Some(crate::GroupMemory {
+            pgid: 7100,
+            footprint_mib: 5 + 2048,
+            measured: 2,
+        }),
+        "the tool's own group"
+    );
+    assert_eq!(
+        Root::new(root.path())
+            .with_euid(Some(1001))
+            .group_memory(7000),
+        None,
+        "NEGATIVE CONTROL: another user's group"
+    );
+    assert_eq!(proc.group_memory(2), None, "a kernel thread's group 0");
+    assert_eq!(proc.group_memory(9999), None, "gone");
+    assert_eq!(proc.group_memory(8000), None, "nothing measured");
 }
 
 #[test]

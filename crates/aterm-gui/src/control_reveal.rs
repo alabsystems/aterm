@@ -14,6 +14,13 @@
 //! agent marker, as outside aterm), `spawned`, `carried`, `held`, `driven`, `agent`, else
 //! `allowed`.
 //!
+//! Beside the verdict the answer says `fleet=yes` where another Mac is behind the question: the
+//! bridge or a fleet driver asked, or a fleet driver was admitted to type into the session the
+//! asking process descends from (a local driver's typing is `driven` and `fleet=no`). A sign-in
+//! reads it before it opens anything on this Mac's desk (`aterm harness accounts renew`,
+//! `accounts token`): a session another Mac started carries that in its environment instead
+//! (`crate::tab_spawn`), since a tab's first command can ask before any answer marks it.
+//!
 //! `driven` is any typing by a control client other than aterm's own since the session started,
 //! counted from its admission, before its bytes are written: what a driver once typed can still
 //! be running and asking, and what it is typing now can ask before the write returns.
@@ -104,6 +111,10 @@ pub(crate) struct SessionFacts {
     pub(crate) driven: bool,
     /// An agent runs in its process tree.
     pub(crate) agent: bool,
+    /// Another Mac's fleet drive was admitted to type into it
+    /// ([`crate::typed_by::TypedStamp::fleet_admitted`]). It decides no verdict: `driven`
+    /// already withholds a secret from it.
+    pub(crate) fleet: bool,
 }
 
 /// What a `reveal` is decided from.
@@ -266,8 +277,9 @@ fn session_facts(store: &Store, peer: i32, procs: &dyn Procs) -> Option<(String,
 }
 
 /// What aterm records of session `ctx` but whether an agent runs in it (`agent` is `false`): who
-/// started it, whether an update carried it, whether the remote hold is on it and whether a
-/// control client other than aterm's own was ever admitted to type into it.
+/// started it, whether an update carried it, whether the remote hold is on it, whether a
+/// control client other than aterm's own was ever admitted to type into it, and whether another
+/// Mac's fleet drive was.
 pub(crate) fn marks_of(ctx: &crate::SessionCtx) -> SessionFacts {
     let mark = ctx.spawn_mark.read();
     SessionFacts {
@@ -276,6 +288,7 @@ pub(crate) fn marks_of(ctx: &crate::SessionCtx) -> SessionFacts {
         held: ctx.fabric.holds().remote().is_some(),
         driven: ctx.typed.driver_admitted(),
         agent: false,
+        fleet: ctx.typed.fleet_admitted(),
     }
 }
 
@@ -290,7 +303,12 @@ fn answer(store: &Store, remote: bool, peer: Option<i32>, procs: &dyn Procs) -> 
         session: found.as_ref().map(|(_, facts)| *facts),
     });
     let sid = found.as_ref().map_or("-", |(sid, _)| sid.as_str());
-    format!("OK 1\nverdict={} session={sid}\n", verdict.word())
+    let fleet = remote || found.as_ref().is_some_and(|(_, facts)| facts.fleet);
+    format!(
+        "OK 1\nverdict={} session={sid} fleet={}\n",
+        verdict.word(),
+        if fleet { "yes" } else { "no" }
+    )
 }
 
 /// `reveal` on the control thread: the connection's kernel peer, read now, asked through the

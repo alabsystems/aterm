@@ -4910,7 +4910,7 @@ fn real_save_latch_and_close_completion_refine_the_derived_model() {
 }
 
 #[test]
-fn a_close_waiting_on_its_save_says_so() {
+fn an_emacs_buffer_close_waits_for_its_inflight_save_then_finishes_once() {
     let dir = fresh_dir("aterm-editor-close-waits");
     let path = dir.join("waits.txt");
     fs::write(&path, "base\n").unwrap();
@@ -4934,16 +4934,13 @@ fn a_close_waiting_on_its_save_says_so() {
     };
     close(&mut app);
     assert_eq!(tabs(&app), opened);
-    let Some(AppViewState::Editor(state)) = app.native_runtime.view_state(view) else {
-        panic!("editor view");
-    };
-    assert_eq!(
-        state.status.as_deref(),
-        Some("Saving this buffer first; close it again once the save lands")
-    );
+    assert_eq!(app.document_store.view_count(document), Some(1));
+    assert!(app.document_close_pending_for_test(document));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "base\n");
     finish_inflight_save_for_test(&mut app, document, view, save);
-    close(&mut app);
-    assert_eq!(tabs(&app), opened - 1);
+    assert_eq!(tabs(&app), opened - 1, "the original key request finishes");
+    assert_eq!(app.document_store.view_count(document), Some(0));
+    assert!(!app.document_close_pending_for_test(document));
     assert_eq!(fs::read_to_string(&path).unwrap(), "edit base\n");
     let _ = fs::remove_dir_all(dir);
 }
@@ -6882,10 +6879,105 @@ fn a_dirty_document_tab_closed_from_behind_leaves_the_front_while_it_saves() {
     app.land_held_document_save_for_test(document, view, held)
         .unwrap();
     assert_eq!(fs::read_to_string(&path).unwrap(), "held before\n");
-    assert!(!app.close_tab_at(wid, 1));
-    assert_eq!(app.windows[&wid].tab_set.len(), 1, "the saved tab closes");
+    assert_eq!(
+        app.windows[&wid].tab_set.len(),
+        1,
+        "the saved tab closes without a second request"
+    );
+    assert!(!app.document_close_pending_for_test(document));
     assert_eq!(app.focused_session_id(wid), Some(0));
     assert_eq!(app.structural_invariant_violation(), None);
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_whole_tab_close_waits_for_every_async_document_and_forgets_its_intents() {
+    let dir = fresh_dir("aterm-tab-close-atomic-saves");
+    let a = dir.join("a.md");
+    let b = dir.join("b.md");
+    fs::write(&a, "a\n").unwrap();
+    fs::write(&b, "b\n").unwrap();
+    let mut app = App::headless_for_test();
+    let wid = WindowId(0);
+    let mut layout = app.capture_restore_manifest().windows.remove(0);
+    layout.tabs.clear();
+    layout.native_tabs.clear();
+    layout.tab_order.clear();
+    layout.active_item = Some(0);
+    layout.restored_tabs =
+        vec![crate::restore::RestoredTab {
+            root: crate::restore::RestoredSplitTree::Split {
+                axis: crate::restore::SplitKind::Horizontal,
+                ratio: 0.5,
+                first: Box::new(crate::restore::RestoredSplitTree::leaf(
+                    crate::restore::RestoredView::Native(
+                        crate::restore::NativeLeafRestore::document("editor", file_uri(&a)),
+                    ),
+                )),
+                second: Box::new(crate::restore::RestoredSplitTree::leaf(
+                    crate::restore::RestoredView::Native(
+                        crate::restore::NativeLeafRestore::document("editor", file_uri(&b)),
+                    ),
+                )),
+            },
+            focused_path: vec![crate::restore::RestoreBranch::First],
+            zoomed: false,
+            parked: false,
+            ephemeral: false,
+            fleet: false,
+        }];
+    app.restore_into_window(wid, layout);
+    let tab = app.windows[&wid].tab_set.active().unwrap();
+    let tab_id = tab.id;
+    let views = tab.root.leaves();
+    let documents = views
+        .iter()
+        .map(|view| {
+            let crate::tab_model::View::Native(native) =
+                app.view_store.get(*view).copied().unwrap()
+            else {
+                panic!("native document")
+            };
+            app.native_runtime.document_id(native.instance).unwrap()
+        })
+        .collect::<Vec<_>>();
+    commit(&mut app, wid, "one ");
+    app.windows
+        .get_mut(&wid)
+        .unwrap()
+        .tab_set
+        .active_mut()
+        .unwrap()
+        .set_focus(views[1]);
+    app.sync_active_session();
+    commit(&mut app, wid, "two ");
+    let first = app.hold_document_save_for_test(documents[0]);
+    let second = app.hold_document_save_for_test(documents[1]);
+    assert!(app.close_active_native_tab(wid).is_err());
+    app.land_held_document_save_for_test(documents[0], views[0], first)
+        .unwrap();
+    assert!(
+        app.windows[&wid].tab_set.get(tab_id).is_some(),
+        "one saved member cannot detach the other"
+    );
+    assert_eq!(app.document_store.view_count(documents[0]), Some(1));
+    assert_eq!(app.document_store.view_count(documents[1]), Some(1));
+    assert_eq!(fs::read_to_string(&b).unwrap(), "b\n");
+    assert!(
+        app.native_documents
+            .persistence
+            .grant(documents[1])
+            .is_some()
+    );
+    app.land_held_document_save_for_test(documents[1], views[1], second)
+        .unwrap();
+    assert!(app.windows[&wid].tab_set.get(tab_id).is_none());
+    for document in documents {
+        assert_eq!(app.document_store.view_count(document), Some(0));
+        assert!(!app.document_close_pending_for_test(document));
+    }
+    assert_eq!(fs::read_to_string(&a).unwrap(), "one a\n");
+    assert_eq!(fs::read_to_string(&b).unwrap(), "two b\n");
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -7281,9 +7373,14 @@ fn a_closed_document_leaves_memory_once_no_reopen_can_bring_it_back() {
     );
     assert!(!app.editor_workspace.can_undo(document));
     assert!(!app.editor_workspace.buffers.contains(&document));
+    app.native_documents
+        .journals
+        .as_ref()
+        .unwrap()
+        .await_worker_for_test();
     assert!(
         !journal.exists(),
-        "its clean journal, which no other process holds, went with it"
+        "the worker retired its clean journal, which no other process holds"
     );
 
     fs::write(&path, "changed on disk\n").unwrap();
@@ -8605,6 +8702,7 @@ fn a_window_close_a_quit_replaced_behind_an_update_handoff_is_disarmed() {
         detail: "stood down".to_string(),
         input_drain_spins: 0,
         child_death: crate::ChildDeathEvidence::Unobserved,
+        successor_start: crate::app_update_handoff::SuccessorStart::Unlaunched,
     });
     assert_eq!(
         teardown,

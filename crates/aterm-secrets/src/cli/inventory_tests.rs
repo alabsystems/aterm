@@ -2,6 +2,7 @@
 // Copyright 2026 Andrew Yates
 
 use super::*;
+use crate::need::catalog::SITE_DEPLOYER_KEY_ENTRY;
 
 #[test]
 fn registry_listing_does_not_require_a_readable_credential_identity() {

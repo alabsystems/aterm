@@ -107,11 +107,27 @@ pub fn sign_ad_hoc(path: &std::path::Path) {
 }
 
 /// The kept stand-in of the Apple binary `from`, signed ad hoc ([`sign_ad_hoc`]), for a test to exec IN PLACE: it runs off the system volume under its own identity (the kernel kills a copy that keeps Apple's signature, and hides a platform binary's environment from other processes).
+/// On Apple hosts, interpreter scripts stay at their absolute source path so sibling-relative
+/// helpers remain available when the caller changes its working directory.
 #[must_use]
 #[track_caller]
 pub fn stand_in(from: &std::path::Path) -> std::path::PathBuf {
     #[cfg(target_vendor = "apple")]
     {
+        use std::io::Read as _;
+
+        let (mut file, _) = crate::regular_file::open(from)
+            .unwrap_or_else(|e| panic!("read {}: {e}", from.display()));
+        let mut prefix = [0; 2];
+        let script = match file.read_exact(&mut prefix) {
+            Ok(()) => prefix == *b"#!",
+            Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => false,
+            Err(error) => panic!("read {} header: {error}", from.display()),
+        };
+        if script {
+            return std::path::absolute(from)
+                .unwrap_or_else(|e| panic!("resolve {}: {e}", from.display()));
+        }
         signed_stand_in(&stand_in_cache(), from, &mut |fresh| {
             require_trust_service();
             sign_ad_hoc(fresh);
@@ -581,31 +597,82 @@ fn stand_in_cache() -> std::path::PathBuf {
 }
 
 /// Where the stand-in of this version of `from` is kept in `cache`: a directory holds
-/// `from`'s size, modification time and inode, while its executable name stays intact.
-/// Programs such as Git choose their behavior from that executable name.
+/// `from`'s size, modification time and inode ([`version_key`]), while its executable name stays
+/// intact. Programs such as Git choose their behavior from that executable name.
 #[cfg(all(unix, any(target_vendor = "apple", test)))]
 #[track_caller]
 fn kept_at(cache: &std::path::Path, from: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::fs::MetadataExt as _;
     let meta = std::fs::metadata(from).unwrap_or_else(|e| panic!("read {}: {e}", from.display()));
-    let name = from
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("stand-in");
+    let name = stand_in_name(from);
     cache
         .join("named")
-        .join(format!(
-            "{name}-{}-{}.{}-{}",
-            meta.len(),
-            meta.mtime(),
-            meta.mtime_nsec(),
-            meta.ino()
-        ))
+        .join(format!("{name}-{}", version_key(&meta)))
         .join(name)
+}
+
+/// The file name a stand-in of `from` runs under.
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+fn stand_in_name(from: &std::path::Path) -> &str {
+    from.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("stand-in")
+}
+
+/// The version of a source [`kept_at`] names its directory by: `<size>-<mtime>.<nsec>-<inode>`.
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+fn version_key(meta: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    format!(
+        "{}-{}.{}-{}",
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ino()
+    )
+}
+
+/// Whether `key` has [`version_key`]'s shape.
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+fn is_version_key(key: &str) -> bool {
+    let digits = |part: &str| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = key.split('-');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(len), Some(mtime), Some(ino), None) => {
+            digits(len)
+                && digits(ino)
+                && mtime
+                    .split_once('.')
+                    .is_some_and(|(secs, nsec)| digits(secs) && digits(nsec))
+        }
+        _ => false,
+    }
+}
+
+/// How long a superseded stand-in no lookup asked for is kept at the least: a process that
+/// looked one up execs it at once, and its first exec's assessment by macOS's program check ends
+/// within its test's one-minute hang detector.
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+const STAND_IN_IDLE: Duration = Duration::from_secs(60 * 60);
+
+/// The file beside a stand-in's version directory that records the source it was copied from.
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+fn source_record(version: &std::path::Path) -> std::path::PathBuf {
+    let mut name = version.as_os_str().to_owned();
+    name.push(".source");
+    std::path::PathBuf::from(name)
 }
 
 /// The copy of `from` in `cache` that `sign` signed ([`kept_at`]), made the first time this
 /// version of `from` is asked for.
+///
+/// The cache keeps one stand-in per source name: placing a new version removes the other
+/// versions of the same name that [`superseded`] says no process may still exec. Each lookup
+/// holds its version directory's shared lock ([`VersionLock`]) while it stamps the directory's
+/// modification time, reads `from`'s version a second time and sees the stand-in still there,
+/// and returns the stand-in only when all three hold; the removal ([`evict`]) holds the exclusive
+/// lock while it reads the stamp a last time and removes the directory. So a lookup that returns
+/// a stand-in stamped it before that last read, and the removal keeps it, whichever name of the
+/// source (a hard link included) the lookup found it through.
 #[cfg(all(unix, any(target_vendor = "apple", test)))]
 #[track_caller]
 fn signed_stand_in(
@@ -613,40 +680,258 @@ fn signed_stand_in(
     from: &std::path::Path,
     sign: &mut dyn FnMut(&std::path::Path),
 ) -> std::path::PathBuf {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static FRESH: AtomicU64 = AtomicU64::new(0);
-    let signed = kept_at(cache, from);
-    if signed.is_file() {
+    loop {
+        let signed = kept_at(cache, from);
+        let placed = !signed.is_file();
+        if placed {
+            place_stand_in(cache, from, &signed, sign);
+        }
+        let version = signed.parent().expect("stand-in has a version directory");
+        let stamped = std::fs::File::open(version).and_then(|dir| {
+            let held = VersionLock::shared(dir)?;
+            held.0.set_modified(std::time::SystemTime::now())?;
+            Ok(held)
+        });
+        let held = match stamped {
+            Ok(held) => held,
+            // Removed since: `from` changed after its version was read.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => panic!("stamp {}: {e}", version.display()),
+        };
+        // Removed while this lookup waited for the lock, or `from` changed since.
+        if kept_at(cache, from) != signed || !signed.is_file() {
+            continue;
+        }
+        drop(held);
+        if placed {
+            remove_superseded(version, stand_in_name(from), STAND_IN_IDLE, &in_use);
+        }
         return signed;
     }
+}
+
+/// Copy `from` to `signed`, `sign`ed, and record `from` beside its version directory
+/// ([`source_record`]); a stand-in another process placed there first is kept.
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+#[track_caller]
+fn place_stand_in(
+    cache: &std::path::Path,
+    from: &std::path::Path,
+    signed: &std::path::Path,
+    sign: &mut dyn FnMut(&std::path::Path),
+) {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FRESH: AtomicU64 = AtomicU64::new(0);
     std::fs::create_dir_all(cache).unwrap_or_else(|e| panic!("create {}: {e}", cache.display()));
-    let name = from
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("stand-in");
-    let fresh = cache.join(format!(
-        ".{name}.{}.{}",
-        std::process::id(),
-        FRESH.fetch_add(1, Ordering::Relaxed)
-    ));
+    let name = stand_in_name(from);
+    let fresh_at = |what: &str| {
+        cache.join(format!(
+            ".{name}.{what}.{}.{}",
+            std::process::id(),
+            FRESH.fetch_add(1, Ordering::Relaxed)
+        ))
+    };
+    let fresh = fresh_at("copy");
+    let record = fresh_at("source");
     struct Fresh<'a>(&'a std::path::Path);
     impl Drop for Fresh<'_> {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(self.0);
         }
     }
-    let _fresh = Fresh(&fresh);
+    let _fresh = (Fresh(&fresh), Fresh(&record));
     copy_regular_fresh(from, &fresh)
         .unwrap_or_else(|e| panic!("copy {} to {}: {e}", from.display(), fresh.display()));
     sign(&fresh);
-    let parent = signed.parent().expect("stand-in has a version directory");
-    std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("create {}: {e}", parent.display()));
-    match std::fs::hard_link(&fresh, &signed) {
+    let version = signed.parent().expect("stand-in has a version directory");
+    std::fs::create_dir_all(version)
+        .unwrap_or_else(|e| panic!("create {}: {e}", version.display()));
+    let source =
+        std::path::absolute(from).unwrap_or_else(|e| panic!("resolve {}: {e}", from.display()));
+    std::fs::write(&record, source.as_os_str().as_bytes())
+        .unwrap_or_else(|e| panic!("write {}: {e}", record.display()));
+    std::fs::rename(&record, source_record(version))
+        .unwrap_or_else(|e| panic!("place {}: {e}", record.display()));
+    match std::fs::hard_link(&fresh, signed) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(e) => panic!("place {} at {}: {e}", fresh.display(), signed.display()),
     }
-    signed
+}
+
+/// Remove each other version directory of the stand-in `name` beside `kept` that [`superseded`]
+/// says no process may still exec and no lookup stamped since ([`evict`]), its source record last.
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+fn remove_superseded(
+    kept: &std::path::Path,
+    name: &str,
+    idle: Duration,
+    in_use: &dyn Fn(&std::path::Path) -> bool,
+) {
+    let (Some(named), Some(kept)) = (kept.parent(), kept.file_name()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(named) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let dir_name = entry.file_name();
+        let Some(key) = dir_name
+            .to_str()
+            .and_then(|dir_name| dir_name.strip_prefix(name))
+            .and_then(|rest| rest.strip_prefix('-'))
+        else {
+            continue;
+        };
+        if dir_name == kept || !is_version_key(key) {
+            continue;
+        }
+        let version = entry.path();
+        if superseded(&version, name, key, idle, in_use) && evict(&version, idle) {
+            let _ = std::fs::remove_file(source_record(&version));
+        }
+    }
+}
+
+/// An advisory lock held on a stand-in's version directory, released by `LOCK_UN` before its
+/// close: shared by a lookup from its stamp to its last check, exclusive by [`evict`].
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+struct VersionLock(std::fs::File);
+
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+impl VersionLock {
+    /// Take `dir`'s shared lock, waiting while an eviction holds it.
+    fn shared(dir: std::fs::File) -> std::io::Result<Self> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
+        dir.lock_shared()?;
+        Ok(Self(dir))
+    }
+
+    /// Take `dir`'s exclusive lock, or `None` when a lookup holds it or the lock fails.
+    fn exclusive(dir: std::fs::File) -> Option<Self> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "the guard's own take: its Drop releases by LOCK_UN"
+        )]
+        dir.try_lock().ok()?;
+        Some(Self(dir))
+    }
+}
+
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+impl Drop for VersionLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+/// Whether `meta`'s modification time (a lookup's stamp) is at least `idle` old.
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+fn stamped_before(meta: std::io::Result<std::fs::Metadata>, idle: Duration) -> bool {
+    meta.and_then(|meta| meta.modified())
+        .is_ok_and(|at| at.elapsed().is_ok_and(|since| since >= idle))
+}
+
+/// Remove the version directory `version` [`superseded`] judged, unless a lookup stamped it
+/// since: under the directory's exclusive lock ([`VersionLock`]), held on the directory `version`
+/// still names, its stamp is read again. A lookup holding the shared lock is still deciding, so
+/// the directory is kept; one after the removal finds no stand-in there and places it afresh.
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+fn evict(version: &std::path::Path, idle: Duration) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let Some(held) = std::fs::File::open(version)
+        .ok()
+        .and_then(VersionLock::exclusive)
+    else {
+        return false;
+    };
+    let (Ok(locked), Ok(named)) = (held.0.metadata(), std::fs::metadata(version)) else {
+        return false;
+    };
+    if (locked.dev(), locked.ino()) != (named.dev(), named.ino()) {
+        return false;
+    }
+    stamped_before(Ok(locked), idle) && std::fs::remove_dir_all(version).is_ok()
+}
+
+/// Whether the stand-in `name` in the directory `version`, for the source version `key`, may be
+/// removed: never one whose execution, or a first exec's assessment by macOS's program check,
+/// may still be under way. It must hold, read in this order:
+/// 1. its source is recorded ([`source_record`]) and no longer has `key`'s version (gone or
+///    rebuilt), so no lookup of that source finds it again;
+/// 2. no lookup stamped it within `idle` ([`STAND_IN_IDLE`]), so whoever found it last has long
+///    since exec'd it and seen its assessment end;
+/// 3. no process of this user holds it open, maps it or runs it (`in_use`).
+#[cfg(all(unix, any(target_vendor = "apple", test)))]
+fn superseded(
+    version: &std::path::Path,
+    name: &str,
+    key: &str,
+    idle: Duration,
+    in_use: &dyn Fn(&std::path::Path) -> bool,
+) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(source) = std::fs::read(source_record(version)) else {
+        return false;
+    };
+    let source = std::path::Path::new(std::ffi::OsStr::from_bytes(&source));
+    match std::fs::metadata(source) {
+        Ok(meta) if version_key(&meta) == key => return false,
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return false,
+    }
+    if !stamped_before(std::fs::metadata(version), idle) {
+        return false;
+    }
+    let stand_in = version.join(name);
+    !(stand_in.exists() && in_use(&stand_in))
+}
+
+/// Whether a process of this user has `file` open, mapped or running as its program, as
+/// libproc's `proc_listpidspath` reads every process's descriptors, mapped regions and working
+/// directory; a listing that fails says it may be.
+#[cfg(target_vendor = "apple")]
+#[cfg_attr(trust_verify, trust::skip)]
+fn in_use(file: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    unsafe extern "C" {
+        fn proc_listpidspath(
+            kind: u32,
+            typeinfo: u32,
+            path: *const core::ffi::c_char,
+            pathflags: u32,
+            buffer: *mut core::ffi::c_void,
+            buffersize: i32,
+        ) -> i32;
+    }
+    const PROC_ALL_PIDS: u32 = 1;
+    let Ok(path) = std::ffi::CString::new(file.as_os_str().as_bytes()) else {
+        return true;
+    };
+    let mut pids = [0_i32; 64];
+    // SAFETY: `path` is a live NUL-terminated string; `pids` has `buffersize` writable bytes.
+    let found = unsafe {
+        proc_listpidspath(
+            PROC_ALL_PIDS,
+            0,
+            path.as_ptr(),
+            0,
+            pids.as_mut_ptr().cast(),
+            i32::try_from(std::mem::size_of_val(&pids)).unwrap_or(i32::MAX),
+        )
+    };
+    found != 0
+}
+
+/// No reader of other processes off Apple, where stand-ins are only tests': every stand-in may be in use.
+#[cfg(all(unix, test, not(target_vendor = "apple")))]
+fn in_use(_file: &std::path::Path) -> bool {
+    true
 }
 
 /// One certificate-chained code check; its verdict is discarded.

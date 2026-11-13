@@ -539,6 +539,10 @@ fn spec_for_prefers_the_listed_sub_form_row() {
     assert!(r("update", "check").owner_only && r("update", "apply").owner_only);
     assert_eq!(r("update", "check").lane, Wait);
     assert!(!r("update", "status").owner_only && !r("update", "").owner_only);
+    // Ending a hold changes what this Mac installs, so only an owner asks it; reading the
+    // holds is anyone's.
+    assert!(r("update", "retry").owner_only && !r("update", "holds").owner_only);
+    assert_eq!(r("update", "retry").lane, Wait);
     assert!(r("family", "s-1").owner_only && !r("family", "").owner_only);
     assert!(r("pointer", "click").owner_only && !r("pointer", "move 3 4").owner_only);
     assert!(r("pointer", "mods link").owner_only);

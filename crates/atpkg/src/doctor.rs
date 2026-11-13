@@ -46,9 +46,9 @@ const fn problem_listing_start(
 }
 
 /// What the toolset row weighs: the default set this machine keeps
-/// ([`crate::cli::wanted_programs`], the index's programs and the vendor rows that serve here)
-/// against what is installed.
-#[derive(Debug, Default, PartialEq, Eq)]
+/// ([`crate::cli::wanted_programs`], the index's programs less those no build serves here, and
+/// the vendor rows that serve here) against what is installed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Missing {
     /// How many wanted programs are installed or dev-linked.
     present: usize,
@@ -58,12 +58,18 @@ struct Missing {
     on_purpose: Vec<String>,
     /// In the default set here and not installed because `[packages].exclude` leaves it out.
     excluded: Vec<String>,
+    /// Listed by the index, not here, and with no build for this target, as the store's signed
+    /// manifests say ([`crate::serving::Targets`]): outside the set here, and named only in the
+    /// toolset's platform note off macOS ([`toolset_unserved_here`]).
+    unserved: Vec<String>,
 }
 
-/// [`Missing`] against the cached signed index and this machine's triple. With no index read
-/// yet it weighs the default set's vendor half alone ([`crate::cli::vendor_set_here`]) once
-/// this machine has taken the set on (the adoption marker `seed` and `install --default-set`
-/// write), since the vendor lane completes that half without an index; before then, nothing.
+/// [`Missing`] against the cached signed index and this machine's triple, each listed program
+/// judged by the signed manifests the store holds ([`crate::serving::Targets::read`]). With no
+/// index read yet it weighs the default set's vendor half alone
+/// ([`crate::cli::vendor_set_here`]) once this machine has taken the set on (the adoption marker
+/// `seed` and `install --default-set` write), since the vendor lane completes that half without
+/// an index; before then, nothing.
 fn missing_against_index(
     layout: &Layout,
     installed: &std::collections::BTreeMap<String, u64>,
@@ -74,48 +80,61 @@ fn missing_against_index(
         return Ok(Missing::default());
     }
     let removed = layout.removed_programs()?;
+    let triple = crate::cli::current_triple();
+    let here = index.as_ref().map_or_else(
+        || crate::serving::Targets::unread(triple),
+        |index| crate::serving::Targets::read(layout, index, triple),
+    );
     Ok(missing_from_set(
         index.as_deref(),
         crate::config::cached(),
-        crate::cli::current_triple(),
+        &here,
         installed,
         &removed,
         dev_linked,
     ))
 }
 
-/// [`Missing`] for `index` (or, with none, the vendor half alone) and `cfg` on `triple`.
+/// [`Missing`] for `index` (or, with none, the vendor half alone) and `cfg` on `here`'s target.
 fn missing_from_set(
     index: Option<&crate::manifest::Index>,
     cfg: &crate::config::PackagesConfig,
-    triple: &str,
+    here: &crate::serving::Targets,
     installed: &std::collections::BTreeMap<String, u64>,
     removed: &std::collections::BTreeSet<String>,
     dev_linked: &std::collections::BTreeSet<String>,
 ) -> Missing {
     let none = std::collections::BTreeSet::new();
-    let (default_set, wanted) = match index {
+    let triple = here.triple();
+    let present =
+        |program: &String| installed.contains_key(program) || dev_linked.contains(program);
+    let (default_set, wanted, unserved) = match index {
         Some(index) => (
-            crate::cli::default_set_here(index, triple),
-            crate::cli::wanted_programs(index, cfg, triple),
+            crate::cli::default_set_here(index, here),
+            crate::cli::wanted_programs(index, cfg, here),
+            crate::cli::default_set_listed(index, triple)
+                .into_iter()
+                .filter(|program| here.unserved(program).is_some() && !present(program))
+                .collect(),
         ),
         None => (
             crate::cli::vendor_set_here(triple, &crate::config::PackagesConfig::default(), &none),
             crate::cli::vendor_set_here(triple, cfg, &none),
+            Vec::new(),
         ),
     };
-    let here = |program: &String| installed.contains_key(program) || dev_linked.contains(program);
     let (unexplained, on_purpose, _) = split_missing(&wanted, installed, removed, dev_linked);
     let excluded = default_set
         .difference(&wanted)
-        .filter(|program| !here(program))
+        .filter(|program| !present(program))
         .cloned()
         .collect();
     Missing {
-        present: wanted.iter().filter(|program| here(program)).count(),
+        present: wanted.iter().filter(|program| present(program)).count(),
         unexplained,
         on_purpose,
         excluded,
+        unserved,
     }
 }
 
@@ -176,42 +195,23 @@ pub(crate) fn recorded_problems(status: Option<&crate::Status>) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn toolset_unserved_here(status: Option<&crate::Status>) -> Option<Vec<String>> {
+/// The listed programs with no build for this platform that the toolset's platform note names
+/// ([`Missing::unserved`]), or `None` when it says nothing: on macOS, and where no program is
+/// unserved and no pass recorded an unserved toolset.
+fn toolset_unserved_here(
+    unserved: &[String],
+    status: Option<&crate::Status>,
+) -> Option<Vec<String>> {
     if cfg!(target_os = "macos") {
         return None;
     }
-    let s = status?;
-    let names: Vec<String> = s
-        .programs
-        .iter()
-        .filter(|(name, p)| {
-            !name.starts_with('*') && p.state.starts_with(crate::state::UNAVAILABLE_PREFIX)
-        })
-        .map(|(name, _)| name.clone())
-        .collect();
-    let toolset_row_says = s
-        .programs
-        .get("*toolset*")
+    let toolset_row_says = status
+        .and_then(|s| s.programs.get("*toolset*"))
         .is_some_and(|row| crate::state::is_unserved_toolset(&row.state));
-    if names.is_empty() && !toolset_row_says {
+    if unserved.is_empty() && !toolset_row_says {
         return None;
     }
-    Some(names)
-}
-
-fn trust_unserved_here(layout: &Layout) -> bool {
-    toolset_unserved_here(crate::status::read(layout).as_ref())
-        .is_some_and(|unserved| unserved.iter().any(|name| name == "trust"))
-}
-
-fn drop_unserved(missing: Vec<String>, unserved: Option<&[String]>) -> Vec<String> {
-    match unserved {
-        Some(unserved) => missing
-            .into_iter()
-            .filter(|p| !unserved.contains(p))
-            .collect(),
-        None => missing,
-    }
+    Some(unserved.to_vec())
 }
 
 fn is_unserved_toolset_problem(why: &str) -> bool {
@@ -294,6 +294,9 @@ pub struct LocalSealProbe {
     pub trustc: String,
     /// Set when it is gone or older than the store's build ([`crate::seam::stale_against_store`]).
     pub stale: Option<crate::seam::Stale>,
+    /// Whether the store's signed manifests say no Trust build serves this target
+    /// ([`crate::serving::here`]), so a local toolchain is the one there is.
+    pub trust_unserved: bool,
 }
 
 /// The environment-dependent probes: [`rows`] takes them, [`run_with`] is handed them.
@@ -860,7 +863,10 @@ pub const RETIRED_OPT_OUTS: &[(&str, &str)] = &[
         "font_px (Settings ▸ Text & Fonts), or aterm --window --font-px",
     ),
     ("ATERM_FONT_HINTING", "font_hinting in aterm.toml"),
-    ("ATERM_FONT_SUBPIXEL", "font_subpixel in aterm.toml"),
+    (
+        "ATERM_FONT_SUBPIXEL",
+        "the default (Linux subpixel-RGB text is removed)",
+    ),
     (
         "ATERM_FALLBACK_FONT",
         "fallback_fonts (Settings ▸ Text & Fonts)",
@@ -1075,6 +1081,10 @@ pub(crate) fn probe_local_seal_at(layout: &Layout, rustup_home: &Path) -> Option
         link,
         link_target: target,
         trustc: commit,
+        trust_unserved: matches!(
+            crate::serving::here(layout, crate::trust_lock::PROGRAM),
+            crate::serving::Serving::Unserved(_)
+        ),
     })
 }
 
@@ -1364,7 +1374,10 @@ fn line_of(row: &ItemReport, p: &str) -> String {
 }
 
 fn said_by_default(row: &ItemReport) -> bool {
-    mark(row).is_none_or(Mark::flagged) || (row.id == c::TOOLSET && row.outcome != Outcome::Ok)
+    mark(row).is_none_or(Mark::flagged)
+        || (row.id == c::TOOLSET && row.outcome != Outcome::Ok)
+        || c::is(&row.id, c::DEV_LINK)
+        || c::is(&row.id, c::PIN)
 }
 
 fn remedy_words(remedy: &Remedy) -> Option<String> {
@@ -2263,7 +2276,7 @@ pub(crate) fn read(
             None => {
                 let managed = layout.program_current("trust").join("bin").is_dir();
                 let exists = seal.link_target.exists();
-                if exists && !managed && trust_unserved_here(layout) {
+                if exists && !managed && seal.trust_unserved {
                     Finding::note(
                         c::RUSTUP_LOCAL,
                         Class::Person,
@@ -2949,6 +2962,13 @@ pub(crate) fn read(
                 PROBE_TIMEOUT.as_secs()
             ),
         ));
+    } else if let Some(bin) = rustup.as_deref().filter(|_| rustup_by_name(home).is_none()) {
+        f.push(Finding::note(
+            c::RUSTUP,
+            Class::Person,
+            "rustup",
+            provisioned_rustup_note(bin),
+        ));
     }
     let local_said = probes.local_seal.is_some();
     let seam_title = "rustup's trust entry";
@@ -3440,17 +3460,21 @@ fn toolset_findings(
     installed: &std::collections::BTreeMap<String, u64>,
     status: Option<&crate::Status>,
 ) -> (Vec<Finding>, usize) {
-    let mut f: Vec<Finding> = Vec::new();
+    toolset_findings_with(layout, installed, status, &|dev_linked| {
+        missing_against_index(layout, installed, dev_linked)
+    })
+}
+
+/// [`toolset_findings`] with the default set weighed by `missing` ([`missing_against_index`]
+/// in a report), handed the programs dev-linked here.
+fn toolset_findings_with(
+    layout: &Layout,
+    installed: &std::collections::BTreeMap<String, u64>,
+    status: Option<&crate::Status>,
+    missing: &dyn Fn(&std::collections::BTreeSet<String>) -> std::io::Result<Missing>,
+) -> (Vec<Finding>, usize) {
+    let mut f = pin_findings(layout);
     let recorded_problems = recorded_problems(status);
-    let toolset_unserved = toolset_unserved_here(status);
-    let recorded_problems: Vec<String> = if toolset_unserved.is_some() {
-        recorded_problems
-            .into_iter()
-            .filter(|why| !is_unserved_toolset_problem(why))
-            .collect()
-    } else {
-        recorded_problems
-    };
     let declined = layout.declined().is_file();
     let (dev_linked, link_problems) = live_dev_links(layout);
     for why in link_problems {
@@ -3476,7 +3500,8 @@ fn toolset_findings(
         unexplained: missing_unexplained,
         on_purpose: missing_on_purpose,
         excluded,
-    } = match missing_against_index(layout, installed, &dev_linked) {
+        unserved,
+    } = match missing(&dev_linked) {
         Ok(missing) => missing,
         Err(error) => {
             f.push(
@@ -3493,42 +3518,39 @@ fn toolset_findings(
             return (f, active_count);
         }
     };
-    let missing_unexplained = drop_unserved(missing_unexplained, toolset_unserved.as_deref());
+    let toolset_unserved = toolset_unserved_here(&unserved, status);
+    let recorded_problems: Vec<String> = if toolset_unserved.is_some() {
+        recorded_problems
+            .into_iter()
+            .filter(|why| !is_unserved_toolset_problem(why))
+            .collect()
+    } else {
+        recorded_problems
+    };
     if let Some(unserved) = &toolset_unserved {
-        let (vendors, alab): (Vec<&String>, Vec<&String>) = unserved
-            .iter()
-            .partition(|name| crate::vendor_direct::is_vendor(name));
-        let named = |names: &[&String]| {
-            names
-                .iter()
-                .map(|n| n.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
+        let remedy = if cfg!(target_os = "linux") {
+            "a local build links in with `aterm pkg link <program> <checkout>` \
+             (docs/LINUX-LOCAL-TOOLCHAIN.md)"
+        } else {
+            "nothing on this machine changes that"
         };
         f.push(Finding::note(
             c::TOOLSET_PLATFORM,
             Class::Install,
             "the ALab toolset on this platform",
-            format!(
-                "the ALab toolset is unavailable on this platform: no build is published for \
-                 this target{}{}; {}",
-                if alab.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", named(&alab))
-                },
-                if vendors.is_empty() {
-                    String::new()
-                } else {
-                    format!(", and {} publishes none for it either", named(&vendors))
-                },
-                if cfg!(target_os = "linux") {
-                    "a local build links in with `aterm pkg link <program> <checkout>` \
-                     (docs/LINUX-LOCAL-TOOLCHAIN.md)"
-                } else {
-                    "nothing on this machine changes that"
-                }
-            ),
+            if unserved.is_empty() {
+                format!(
+                    "the ALab toolset is unavailable on this platform: no build is published \
+                     for this target; {remedy}"
+                )
+            } else {
+                format!(
+                    "no build is published for this target of {} program(s) the index lists \
+                     ({}): the toolset here leaves them out; {remedy}",
+                    unserved.len(),
+                    unserved.join(", ")
+                )
+            },
         ));
     }
     let toolset = "the ALab toolset";
@@ -3619,8 +3641,8 @@ fn toolset_findings(
             Class::Person,
             format!("{program}'s dev link"),
             format!(
-                "{program}: dev-linked from {from}; automatic updates skip this program. \
-                 `aterm pkg unlink {program}` returns it to the index"
+                "{program}: dev-linked; automatic updates skip it. \
+                 `aterm pkg unlink {program}` returns it to the index; checkout {from}"
             ),
         ));
     }
@@ -3650,6 +3672,36 @@ fn toolset_findings(
         }
     }
     (f, active_count)
+}
+
+fn pin_findings(layout: &Layout) -> Vec<Finding> {
+    match crate::pin::pinned_set(layout) {
+        Ok(pins) => pins
+            .into_iter()
+            .map(|program| {
+                Finding::ok(
+                    c::of(c::PIN, &program),
+                    Class::Person,
+                    format!("{program}'s update pin"),
+                    format!(
+                        "{program}: pinned; ordinary upgrades are held. \
+                         `aterm pkg unpin {program}` releases the hold"
+                    ),
+                )
+            })
+            .collect(),
+        Err(error) => vec![
+            Finding::change(
+                c::PIN,
+                Class::Person,
+                "local package pins",
+                format!("local pins cannot be read: {error}; ordinary upgrades are held"),
+                "readable local pins",
+                Remedy::None,
+            )
+            .essential(),
+        ],
+    }
 }
 
 /// The toolset row ([`c::TOOLSET`]) as `aterm pkg doctor` reports it, read without the rest of
@@ -4494,7 +4546,33 @@ fn replaced_seam_line(layout: &Layout, rustup_home: &Path) -> Option<String> {
     crate::seam::replaced_note(layout, rustup_home, crate::seam::DEFAULT_SEAM)
 }
 
+/// rustup as a tool that runs it by name finds it ([`rustup_by_name`]), else the pinned copy
+/// `verify provision` placed in aterm's tooling cache ([`provisioned_rustup`]), which no PATH
+/// names.
 fn rustup_binary(home: Option<&Path>) -> Option<std::path::PathBuf> {
+    rustup_by_name(home).or_else(|| provisioned_rustup(aterm_uds::host::tooling_dir().as_deref()))
+}
+
+/// The pinned rustup `targo --unverified verify provision` placed (stamped) under `tooling`.
+fn provisioned_rustup(tooling: Option<&Path>) -> Option<std::path::PathBuf> {
+    aterm_uds::host::tool("rustup").placed_in(tooling?)
+}
+
+/// The note for a rustup only aterm's tooling cache holds: what runs `rustup` by name misses it.
+fn provisioned_rustup_note(bin: &Path) -> String {
+    let dir = bin.parent().unwrap_or(bin);
+    format!(
+        "rustup is only aterm's provisioned copy at {} — not on PATH, in $CARGO_HOME/bin or in \
+         ~/.cargo/bin, so a tool that runs `rustup` by name (the publication engine's `rustup \
+         run trust targo`, NY's scripts/gate.sh) refuses; put {} on that tool's PATH",
+        bin.display(),
+        dir.display()
+    )
+}
+
+/// rustup on `PATH`, in `$CARGO_HOME/bin` or in `~/.cargo/bin`: where a tool that runs it by
+/// name looks.
+fn rustup_by_name(home: Option<&Path>) -> Option<std::path::PathBuf> {
     let file = rustup_file_name();
     let on_path = std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
@@ -4653,7 +4731,40 @@ fn report_aterm_posture(
         bundle_build,
         &versions,
         installs_by_itself,
+        aterm_time::unix_secs().unwrap_or(0),
     )
+}
+
+/// The update record's live hold on a build newer than the one running, as doctor says it:
+/// what is held, for how long more, why, and the verb that tries it now. The record is read
+/// through its own codec (`aterm_update_core::update_record`); an unreadable one holds nothing.
+fn held_update_note(updates: &Path, running: Option<u64>, now: u64) -> Option<String> {
+    use aterm_update_core::update_record::{FILE, UpdateRecord};
+    let record = UpdateRecord::load(&updates.join(FILE));
+    let running = running.unwrap_or(0).max(record.running);
+    let hold = record
+        .hold
+        .as_ref()
+        .filter(|hold| hold.live(now) && hold.build > running)?;
+    let name = if hold.version.is_empty() {
+        format!("build {}", hold.build)
+    } else {
+        hold.version.clone()
+    };
+    let left = hold.until.saturating_sub(now);
+    let left = if left < 60 {
+        "under a minute".to_string()
+    } else if left < 2 * 3600 {
+        format!("{} min", left.div_ceil(60))
+    } else {
+        format!("{} h", left.div_ceil(3600))
+    };
+    Some(format!(
+        "aterm {name} is held for {left} more ({}, try {}) and is tried again by itself then \
+         \u{2014} `aterm update retry` tries it now",
+        hold.cause.words(),
+        hold.tries
+    ))
 }
 
 fn report_aterm_posture_at(
@@ -4661,6 +4772,7 @@ fn report_aterm_posture_at(
     bundle_build: Option<u64>,
     versions: &[(u64, String)],
     installs_by_itself: bool,
+    now: u64,
 ) -> Option<Row> {
     let field = |file: &str, key: &str| -> Option<String> {
         let text =
@@ -4687,6 +4799,13 @@ fn report_aterm_posture_at(
         _ => receipt,
     };
     let current = field("status.toml", "current_build");
+    if let Some(held) = held_update_note(
+        updates,
+        current.as_deref().and_then(parse_u64).or(bundle_build),
+        now,
+    ) {
+        return note(held);
+    }
     let newer_on_disk = match (current.as_deref(), parse_u64(&installed)) {
         (Some(c), Some(i)) => parse_u64(c).is_some_and(|c| i > c),
         _ => false,

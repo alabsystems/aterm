@@ -19,6 +19,8 @@ fn pending_child(child: Process) -> (Registry, RestartReservation, aterm_tempfil
         child: child.clone(),
         granted: AtomicBool::new(false),
         revoked: AtomicBool::new(false),
+        #[cfg(target_os = "macos")]
+        entry_generation: std::sync::OnceLock::new(),
     });
     let command = RestartCommand {
         settles: None,
@@ -176,7 +178,8 @@ fn actual_unrelated_ready_releases_constructor_without_claiming_child_death() {
         .launches
         .get_mut(&token)
         .unwrap()
-        .bind(process);
+        .bind(process)
+        .unwrap();
     let connection = registry.fixture_connection();
     let operation = "b".repeat(32);
     let member = registry
@@ -378,7 +381,7 @@ fn same_process_exec_requires_fresh_go_and_explicit_old_member_retirement() {
         // Inject only front-door metadata: /bin/cat is not a managed SDK
         // consumer. The real source-token/consumer-image front door is not
         // qualified by this registry test.
-        registry
+        let bound = registry
             .state
             .lock()
             .unwrap()
@@ -386,6 +389,16 @@ fn same_process_exec_requires_fresh_go_and_explicit_old_member_retirement() {
             .get_mut(&token)
             .unwrap()
             .bind(current.clone());
+        if case == 2 {
+            assert_eq!(bound, Err(Error::Denied));
+        } else {
+            bound.unwrap();
+        }
+        let constructor = SourceExecReservation {
+            restart: reservation,
+            caller: caller.clone(),
+        };
+        assert_eq!(constructor.entered(&current), Ok(false));
         let target = Peer {
             caller: caller.clone(),
             process: current.clone(),
@@ -403,6 +416,7 @@ fn same_process_exec_requires_fresh_go_and_explicit_old_member_retirement() {
                 );
             } else {
                 let new = result.unwrap();
+                assert_eq!(constructor.entered(&current), Ok(true));
                 assert_ne!(&new.member[..16], &old.member[..16]);
                 assert_eq!(
                     registry
@@ -436,4 +450,84 @@ fn same_process_exec_requires_fresh_go_and_explicit_old_member_retirement() {
         }
         registry.reap_gone();
     }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn a_second_exec_of_the_same_image_cannot_reuse_the_bound_constructor() {
+    use std::io::Write as _;
+    // Inject constructor metadata only. Both executions and idversion changes
+    // are real kernel events; this does not qualify a signed SDK front door.
+    let mut child = aterm_uds::spawnfd::command("/bin/bash")
+        .args(["-c", "read first; exec /bin/bash -c 'read second; exit 0'"])
+        .stdin(aterm_uds::spawnfd::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let image = Image::at(std::path::Path::new("/bin/bash")).unwrap();
+    let deadline = std::time::Instant::now() + aterm_spec::wait::MUST_HAPPEN;
+    let before = loop {
+        if let Some(process) = Process::observe(child.id()).filter(|process| process.image == image)
+        {
+            break process;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "bash enters its actual image"
+        );
+        aterm_uds::deadline::poll_yield();
+    };
+    let first = kernel_generation(child.id()).unwrap();
+    let (registry, reservation, _home) = pending_child(before.clone());
+    reservation.grant(&before).unwrap();
+    let token = reservation._launch.token.clone();
+    registry
+        .state
+        .lock()
+        .unwrap()
+        .launches
+        .get_mut(&token)
+        .unwrap()
+        .bind(before.clone())
+        .unwrap();
+    assert!(reservation.native.admits(&before));
+    child.stdin.as_mut().unwrap().write_all(b"again\n").unwrap();
+    child.stdin.as_mut().unwrap().flush().unwrap();
+    let current = loop {
+        if let Some(process) = Process::observe(child.id()).filter(|process| process.image == image)
+            && kernel_generation(child.id()).is_some_and(|generation| generation != first)
+        {
+            break process;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "same-image exec changes kernel generation"
+        );
+        aterm_uds::deadline::poll_yield();
+    };
+    assert_eq!(current, before, "PID, birth and image alone miss this exec");
+    assert!(!reservation.native.admits(&current));
+    assert_eq!(
+        registry
+            .state
+            .lock()
+            .unwrap()
+            .launches
+            .get_mut(&token)
+            .unwrap()
+            .bind(current),
+        Err(Error::Denied)
+    );
+    assert_eq!(reservation.native.entry_generation.get(), Some(&first));
+    drop(child.stdin.take());
+    let mut exit = aterm_uds::deadline::ExitWait::new(&child);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        assert!(!left.is_zero(), "second bash exits after input closes");
+        exit.wait(left);
+    }
+    registry.reap_gone();
 }

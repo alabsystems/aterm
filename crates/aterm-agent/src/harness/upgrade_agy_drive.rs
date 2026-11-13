@@ -12,17 +12,18 @@ use super::super::relaunch::{
     exit_clock, exit_wait, first_idle, hand_waits_out,
 };
 use super::super::upgrade_agy::{self as ag, ExitKind};
+use super::agent_image::Lane;
 #[cfg(all(test, unix))]
 use super::state_dir;
 use super::upgrade::{Agent, Dialect, Phase};
 use super::{
     Client, Hand, Kernel, Live, LiveTab, NoPlan, NoSocket, Opts, Plan, PromptLook,
     RelaunchLineError, Report, STALE_S, St, TURN_WAIT, TabLife, Typed, alive, connect, cwd_of,
-    descendants_in, exe_of, exit_status, file_holders, ids, is_generation, ledger, line_status,
-    load_record, managed_agent_twin, now_s, open_files, pause, read_upgrade_dir, registry_graph,
-    registry_life, roster, running_block, said, save, screen, shell_dialect_of, squash, started_ms,
-    store_version, table, turn_takes_gen, turn_verdict, twin_version, type_relaunch_line_with,
-    under_hand, unheld_hour, upgrade, wait_now, wait_until,
+    descendants_in, exe_of, exit_status, file_holders, ids, is_generation, lane_words, ledger,
+    line_status, load_record, managed_agent_twin, now_s, open_files, pause, read_upgrade_dir,
+    registry_graph, registry_life, roster, running_block, said, save, screen, shell_dialect_of,
+    squash, started_ms, store_version, table, turn_takes_gen, turn_verdict, twin_version,
+    type_relaunch_line_with, under_hand, unheld_hour, upgrade, wait_now, wait_until,
 };
 
 /// The process facts the agy lane rests on, each read when asked: the Claude lane's [`Kernel`] plus agy's needs.
@@ -353,6 +354,7 @@ pub(super) fn snapshot(
     let cwd = k.cwd(pid).unwrap_or_default();
     let started_ms = k.started_ms(pid).unwrap_or(0);
     Ok(super::super::relaunch::Snapshot {
+        lifetime: None,
         auth_observed: false,
         launch_env: None,
         tab: tab.to_string(),
@@ -465,6 +467,7 @@ pub(super) fn after_exit_onto(
     let session_key = key(&tab);
     let from = snap.version.clone().unwrap_or_else(|| "-".to_string());
     let mut r = Report {
+        rung: None,
         pid: snap.pid,
         tab: tab.clone(),
         session: session_key.clone(),
@@ -884,6 +887,7 @@ fn relaunch_held(
         PromptLook::of(st),
         || free(k),
         |c, pid, tab| k.in_tab(c, pid, tab),
+        Lane::Agy,
     );
     let unanswered = typed == Err(RelaunchLineError::Unanswered);
     match typed {
@@ -1180,6 +1184,7 @@ fn carry_in_flight_with(
     k: &dyn AgyKernel,
 ) -> Report {
     let r = Report {
+        rung: None,
         pid: st.pid,
         tab: st.tab.clone(),
         session: session.to_string(),
@@ -1253,7 +1258,13 @@ fn typing_fence(c: &mut Client, tab: &str) -> Result<Option<String>, &'static st
 }
 
 /// Type `text` into agy's composer as one turn, fenced on `generation`.
-fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) -> Result<(), Typed> {
+pub(super) fn type_text(
+    c: &mut Client,
+    tab: &str,
+    text: &str,
+    generation: Option<&str>,
+) -> Result<(), Typed> {
+    let lane = lane_words(c, "turn", Lane::Agy);
     let fence = generation
         .filter(|g| is_generation(g))
         .filter(|_| turn_takes_gen(c))
@@ -1262,7 +1273,7 @@ fn type_text(c: &mut Client, tab: &str, text: &str, generation: Option<&str>) ->
     let guard = super::composer_guard('>', text);
     let (head, _) = c
         .request_counted(&format!(
-            "@{tab} turn {fence}submit=guarded:{guard} idle=600 {TURN_WAIT} {text}"
+            "@{tab} turn {lane}{fence}submit=guarded:{guard} idle=600 {TURN_WAIT} {text}"
         ))
         .map_err(|e| Typed::of_io(&e))?;
     turn_verdict(&head)

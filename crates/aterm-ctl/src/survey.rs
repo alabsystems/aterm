@@ -62,11 +62,14 @@ pub(crate) struct Args {
     pub(crate) within: Duration,
     /// Local brief mode (`--brief`, [`brief`]).
     pub(crate) brief: bool,
+    /// A release-line holder identity the `--host` peer's kernel judges (`--holder`).
+    pub(crate) holder: Option<crate::release_holder::Identity>,
 }
 
 const USAGE: &str = "ERR usage: survey [--fleet] [--budget <chars>] | survey [--json] \
-                     [--sid <s-…>] [--fleet | --host <h>] | survey --brief [--budget <chars>] \
-                     (--fleet and --host take --timeout <seconds, at most 10>)";
+                     [--sid <s-…>] [--fleet | --host <h> [--holder <pid>.<boot>.<start>]] | \
+                     survey --brief [--budget <chars>] (--fleet and --host take --timeout \
+                     <seconds, at most 10>)";
 
 /// Parameters for a fleet survey query ([`FleetSurveyFn`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,6 +78,9 @@ pub struct FleetAsk<'a> {
     pub host: Option<&'a str>,
     /// Each peer's one wall-clock deadline.
     pub within: Duration,
+    /// A release-line holder identity each peer's own kernel judges in its answer
+    /// (`--holder`, [`crate::release_holder`]), or `None` for the plain survey.
+    pub holder: Option<&'a crate::release_holder::Identity>,
 }
 
 /// One fleet peer's answer to a [`FleetAsk`].
@@ -188,6 +194,7 @@ pub(crate) fn parse_args(parts: &[String]) -> Result<Args, String> {
         host: None,
         within: FLEET_WITHIN,
         brief: false,
+        holder: None,
     };
     let (mut timeout, mut budget) = (false, false);
     let mut rest = parts.iter().skip(1);
@@ -220,6 +227,13 @@ pub(crate) fn parse_args(parts: &[String]) -> Result<Args, String> {
                     .ok_or_else(|| USAGE.to_string())?;
                 budget = true;
             }
+            "--holder" => {
+                let holder = rest
+                    .next()
+                    .and_then(|word| crate::release_holder::Identity::parse(word))
+                    .ok_or_else(|| USAGE.to_string())?;
+                args.holder = Some(holder);
+            }
             "--sid" => {
                 let sid = rest
                     .next()
@@ -238,6 +252,11 @@ pub(crate) fn parse_args(parts: &[String]) -> Result<Args, String> {
     }
     if args.brief && !budget {
         args.budget = brief::BRIEF_BUDGET;
+    }
+    if args.holder.is_some() && args.host.is_none() {
+        return Err(format!(
+            "{USAGE}: --holder asks one Mac's kernel about one process (--host)"
+        ));
     }
     if args.fleet && args.host.is_some() {
         return Err(format!("{USAGE}: --fleet asks every peer, --host one"));
@@ -298,6 +317,14 @@ pub(crate) struct Survey {
     /// Observed native release rows, not a complete inventory: old or capped replies have no
     /// count or support marker. No usable row leaves this unknown, never an empty proof.
     pub(crate) release_lines: Option<Vec<release::ReleaseLine>>,
+    /// The `release_holder` rows the reply carried, unread until a `--holder` names the identity
+    /// they must echo.
+    pub(crate) holder_rows: Vec<String>,
+    /// What the peer's kernel said of the `--holder` identity: `None` with no row about it (an
+    /// aterm too old to judge one), else whether it runs, `None` within where unknown.
+    pub(crate) release_holder: Option<Option<bool>>,
+    /// The node a fleet peer proved in its handshake, `None` where it proved none.
+    pub(crate) proven: Option<String>,
 }
 
 /// A record's `key=value` fields in wire order, values decoded.
@@ -347,6 +374,8 @@ pub(crate) fn parse_reply(lines: &[String]) -> Result<Survey, String> {
             repos.push(Fields::of(line));
         } else if line.starts_with("github_rate ") {
             survey.github_rate.push(Fields::of(line));
+        } else if line.starts_with(crate::release_holder::ROW) {
+            survey.holder_rows.push(line.clone());
         } else if let Some(release) = release::ReleaseLine::parse(line) {
             survey.release_lines.get_or_insert_default().push(release);
         }
@@ -1712,6 +1741,31 @@ fn blocks_of(replies: &[HostReply], own: Option<&str>) -> Blocks {
     }
 }
 
+/// A fleet peer's `"proven_node"` (the node its handshake proved, `null` for none) and
+/// `"release_holder"`: `--holder`'s answer, `null` where no row about it came or where the peer
+/// did not prove the node it was asked as (no other Mac's kernel speaks of that Mac's
+/// processes), else `{"alive":true|false|null}`. A local reply has neither.
+fn proof_json(reply: &HostReply, survey: &Survey) -> String {
+    if !reply.remote {
+        return String::new();
+    }
+    let proven = !reply.unproven && survey.proven.is_some() && survey.proven == reply.node;
+    let holder = match survey.release_holder.filter(|_| proven) {
+        None => "null".to_owned(),
+        Some(alive) => format!(
+            "{{\"alive\":{}}}",
+            alive.map_or("null", |alive| if alive { "true" } else { "false" })
+        ),
+    };
+    format!(
+        ",\"proven_node\":{},\"release_holder\":{holder}",
+        survey.proven.as_deref().map_or_else(
+            || "null".to_owned(),
+            |node| format!("\"{}\"", aterm_codec::json::escape(node))
+        )
+    )
+}
+
 fn release_observer_node<'a>(reply: &'a HostReply, survey: &'a Survey) -> Option<&'a str> {
     if reply.remote {
         reply.node.as_deref()
@@ -1995,7 +2049,8 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
             );
             match &reply.answer {
                 Ok(survey) => format!(
-                    "{{{head},\"instance\":{},\"accounts\":{},\"repos\":{},\"github_rate\":[{}],\"release_lines\":{},\"sessions\":[{}]}}",
+                    "{{{head}{},\"instance\":{},\"accounts\":{},\"repos\":{},\"github_rate\":[{}],\"release_lines\":{},\"sessions\":[{}]}}",
+                    proof_json(reply, survey),
                     object(&survey.header),
                     survey.accounts.as_ref().map_or_else(
                         || "null".to_owned(),
@@ -2056,13 +2111,20 @@ pub(crate) fn render_json(replies: &[HostReply]) -> String {
 /// The reply row of a fleet peer's read: its survey parsed, or why there is none and, for a
 /// failed read, the kind of failure (an answer carries none).
 pub(crate) fn peer_reply(peer: PeerSurvey) -> HostReply {
+    let proven = peer.authenticated.map(|proof| proof.node);
     HostReply {
         label: peer.label,
         remote: true,
         unproven: peer.unproven,
         node: peer.node,
         reason: peer.reason.filter(|_| peer.answer.is_err()),
-        answer: peer.answer.and_then(|lines| parse_reply(&lines)),
+        answer: peer
+            .answer
+            .and_then(|lines| parse_reply(&lines))
+            .map(|mut survey| {
+                survey.proven = proven;
+                survey
+            }),
     }
 }
 
@@ -2157,6 +2219,7 @@ pub(crate) fn read_survey(
     let ask = FleetAsk {
         host: args.host.as_deref(),
         within: args.within,
+        holder: args.holder.as_ref(),
     };
     let (here, peers) = std::thread::scope(|scope| {
         let peers = fleet_client.map(|client| scope.spawn(move || client(&ask)));
@@ -2222,6 +2285,14 @@ pub(crate) fn read_survey(
             && !peers.is_empty()
             && peers.iter().all(|peer| peer.fault == PeerFault::Unserved);
         replies.extend(peers.into_iter().map(peer_reply));
+        if let Some(holder) = &args.holder {
+            for reply in &mut replies {
+                if let Ok(survey) = &mut reply.answer {
+                    survey.release_holder =
+                        survey.holder_rows.iter().find_map(|row| holder.read(row));
+                }
+            }
+        }
     }
     notes.extend(facts_note(&replies));
     let answered = !remote || replies.iter().any(|reply| reply.answer.is_ok());

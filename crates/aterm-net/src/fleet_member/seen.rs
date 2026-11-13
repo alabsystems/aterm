@@ -117,26 +117,35 @@ impl Settled {
     }
 }
 
+/// What this process holds of each state directory it noted or settled a time of, until a leave
+/// ([`forget`]): one directory outside a test. Each is paced by the instants its own callers
+/// give ([`Pace::Within`]) and by no other directory's.
 static KEPT: Mutex<BTreeMap<PathBuf, Kept>> = Mutex::new(BTreeMap::new());
 
 /// The lines of [`SEEN_FILE`] in `dir`: empty where it is missing or refused; a line that is no
 /// time is passed over.
 fn read_file(dir: &Path) -> Stamps {
-    static SEEN: KeptParse<Stamps> = KeptParse::new(KEPT_BOOKS);
-    SEEN.read(dir, SEEN_FILE, PEERS_FILE_MAX, |bytes| {
-        let mut stamps = Stamps::new();
-        for line in String::from_utf8_lossy(bytes).lines() {
-            for of in [Of::Book, Of::Copy] {
-                if let Some((key, ms)) = stamp_line(of.word(), line) {
-                    let at = stamps.entry((of, key.to_owned())).or_insert(ms);
-                    *at = (*at).max(ms);
+    kept_seen(|kept| {
+        kept.read(dir, SEEN_FILE, PEERS_FILE_MAX, |bytes| {
+            let mut stamps = Stamps::new();
+            for line in String::from_utf8_lossy(bytes).lines() {
+                for of in [Of::Book, Of::Copy] {
+                    if let Some((key, ms)) = stamp_line(of.word(), line) {
+                        let at = stamps.entry((of, key.to_owned())).or_insert(ms);
+                        *at = (*at).max(ms);
+                    }
                 }
             }
-        }
-        stamps
+            stamps
+        })
     })
     .unwrap_or_default()
 }
+
+kept_parse!(
+    /// `read` of the kept parses of [`SEEN_FILE`].
+    kept_seen: Stamps
+);
 
 /// The times noted beside the books of one state directory, as one instant held them.
 pub(super) struct Times(Stamps);
@@ -243,19 +252,6 @@ pub(super) fn advances(before: &[Peer], after: &[Peer]) -> Option<Vec<(String, u
 pub(super) fn note(dir: &Path, of: Of, stamps: Vec<(String, u64)>, pace: Pace) {
     let due = {
         let mut kept = KEPT.lock_or_recover();
-        // A directory with nothing noted, nothing owed to its file and no write within the
-        // pace is as one never seen.
-        if let Pace::Within(now) = pace {
-            kept.retain(|_, kept| {
-                kept.timer
-                    || !kept.pending.is_empty()
-                    || kept.due.is_some()
-                    || kept.settled.any()
-                    || kept
-                        .tried
-                        .is_some_and(|at| now.saturating_duration_since(at) < SEEN_FLUSH_EVERY)
-            });
-        }
         let kept = kept.entry(dir.to_owned()).or_default();
         for (key, ms) in stamps {
             let at = kept.pending.entry((of, key)).or_insert(ms);

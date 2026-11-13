@@ -321,7 +321,7 @@ fn host() {
                                 // Exercise the actual GO boundary with an owned
                                 // nonempty source descriptor. The typed client
                                 // ordinarily sends /dev/null; a direct peer need not.
-                                let (reader, mut writer) = io::pipe().unwrap();
+                                let (reader, mut writer) = aterm_uds::pipe().unwrap();
                                 writer
                                     .write_all(b"caller source must never be consumed\n")
                                     .unwrap();
@@ -578,14 +578,18 @@ fn client() {
     let result = execute(&live, live_io);
     assert!(result.completion.inputs_unchanged.is_ok());
     assert_eq!(result.prepared.root, request.root);
-    assert!(matches!(
-        result.completion.finished.status,
-        control::Status::Finished {
-            outcome: control::Outcome::Exit(0),
-            cause: control::CompletionCause::Exited,
-            ..
-        }
-    ));
+    assert!(
+        matches!(
+            result.completion.finished.status,
+            control::Status::Finished {
+                outcome: control::Outcome::Exit(0),
+                cause: control::CompletionCause::Exited,
+                ..
+            }
+        ),
+        "resolver query completion: {:?}",
+        result.completion.finished.status
+    );
     assert_eq!(result.stdout, b"actual native metadata output\n");
     let (replay, replay_io) = duplicated();
     assert!(

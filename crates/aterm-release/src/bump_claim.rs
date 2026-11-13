@@ -56,10 +56,14 @@ pub(crate) fn push(
             ));
         }
         if attempt == MAX_ATTEMPTS {
+            // A lost race is no verdict on the bump: nothing is red, and the same run again
+            // may win. It ends COULD NOT RUN (exit 3), which a session and the pump both try
+            // again without waiting for main to change.
             return Err(Refusal::new(
                 "main moved under the bump three times (each push lost the race); the owned bump is undone",
-                format!("{RELEASE_COMMAND} --bump again"),
-            ));
+                format!("run it again: {RELEASE_COMMAND} --bump (or --open-next, where that wrote it)"),
+            )
+            .could_not_run());
         }
     }
     unreachable!("the nonzero attempt bound always returns a verdict")
@@ -118,9 +122,9 @@ pub(crate) fn record(
     let actual = paths(git, &parent, &commit)?;
     declared.sort();
     declared.dedup();
-    // The declared set is every path the bump may write; one of them (the changelog, whose
-    // announcement is reconciled on every bump) can come out as it was. Custody is that the
-    // commit changed something and nothing undeclared.
+    // The declared set is every path the bump may write; one of them (a nested lockfile the
+    // version left as it was) can come out as it was.
+    // Custody is that the commit changed something and nothing undeclared.
     if actual.is_empty()
         || actual
             .iter()

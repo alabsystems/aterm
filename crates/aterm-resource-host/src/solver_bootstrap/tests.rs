@@ -56,6 +56,15 @@ pub(crate) fn entry() {
         {
             return Err(invalid());
         }
+        if mode == "handoff" {
+            // This is the first action after the receiver's one-shot channel
+            // transfer, before kernel probes, journal reads or payload work.
+            drop(accepted);
+            let marker = std::env::var_os("ATERM_TEST_SOLVER_WORK").ok_or_else(invalid)?;
+            std::fs::write(marker, b"original lane handed off")?;
+            std::thread::sleep(Duration::from_secs(120));
+            return Ok(());
+        }
         // Ready is sent only after the combined seal; exercise its actual kernel
         // behavior as well as the Host's read-only fork observation.
         // SAFETY: an unexpected fork child only calls _exit, and its original
@@ -416,37 +425,77 @@ fn losing_the_original_host_endpoint_stops_the_sealed_running_child() {
     ) {
         return;
     }
-    let root = aterm_tempfile::tempdir().unwrap();
-    let (mut owner, mut child) = spawn(root.path(), 512, "linger");
-    ready(&mut owner, &mut child);
-    assert!(!root.path().join("work").exists());
-    while !owner
-        .poll_run(
-            &mut child.0,
-            validate_image,
-            || false,
-            |intent| persist(root.path(), intent),
-        )
-        .unwrap()
-    {
-        std::thread::sleep(Duration::from_millis(2));
+    enum LossStage {
+        Ready,
+        RunDelivered,
+        Handoff,
+        Running,
     }
-    let deadline = crate::fixture_deadline(Instant::now());
-    while !root.path().join("work").exists() {
+    for stage in [
+        LossStage::Ready,
+        LossStage::RunDelivered,
+        LossStage::Handoff,
+        LossStage::Running,
+    ] {
+        let root = aterm_tempfile::tempdir().unwrap();
+        let mode = if matches!(stage, LossStage::Handoff) {
+            "handoff"
+        } else {
+            "linger"
+        };
+        let (mut owner, mut child) = spawn(root.path(), 512, mode);
+        ready(&mut owner, &mut child);
+        assert!(!root.path().join("work").exists());
+        if matches!(stage, LossStage::Ready) {
+            // Sealing and Ready have completed, but no Run was committed or sent.
+            drop(owner);
+            assert_eq!(wait(&mut child).code(), Some(75));
+            assert!(!root.path().join("work").exists());
+            continue;
+        }
+        while !owner
+            .poll_run(
+                &mut child.0,
+                validate_image,
+                || false,
+                |intent| persist(root.path(), intent),
+            )
+            .unwrap()
+        {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if matches!(stage, LossStage::RunDelivered) {
+            // Do not wait for payload work or watcher scheduling: the original
+            // endpoint closes immediately after the complete Run write. Work
+            // may race a valid Run; loss must still stop this same child.
+            drop(owner);
+            assert_eq!(wait(&mut child).code(), Some(75));
+            continue;
+        }
+        let deadline = crate::fixture_deadline(Instant::now());
+        while !root.path().join("work").exists() {
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "payload exited before post-Run work"
+            );
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        if matches!(stage, LossStage::Handoff) {
+            // No grace sleep: close as soon as the child reports that the
+            // original endpoint entered the watcher handoff.
+            drop(owner);
+            assert_eq!(wait(&mut child).code(), Some(75));
+            continue;
+        }
+        std::thread::sleep(Duration::from_millis(20));
         assert!(
             child.0.try_wait().unwrap().is_none(),
-            "payload exited before post-Run work"
+            "a live Host must not stop its payload"
         );
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(2));
+        drop(owner);
+        assert_eq!(wait(&mut child).code(), Some(75));
     }
-    std::thread::sleep(Duration::from_millis(20));
-    assert!(
-        child.0.try_wait().unwrap().is_none(),
-        "a live Host must not stop its payload"
-    );
-    drop(owner);
-    assert_eq!(wait(&mut child).code(), Some(75));
 }
 
 #[test]

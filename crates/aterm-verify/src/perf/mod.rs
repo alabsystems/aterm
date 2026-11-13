@@ -23,8 +23,9 @@
 //! ([`fabric`], [`restore_e2e`], [`aos`], [`commons`], [`journal`]) are headless but just as unjudgeable —
 //! their numbers are a disk's fsync, or a shared desk's scheduler, before they
 //! are aterm's — so they too run only when named and report MEASURED (fabric
-//! writing a ledger entry under `docs/measured/fabric/`, restore-e2e one under
-//! `docs/measured/restore/`, aos, commons-quiet and journal-note a summary, and JSON with `--json-out`).
+//! writing a ledger entry into the verify state directory ([`ledger_dir`] `fabric`),
+//! restore-e2e one into `restore`, aos, commons-quiet and journal-note a summary, and JSON with
+//! `--json-out`).
 //!
 //! `--no-windows` (the house switch for an agent sharing the owner's desktop)
 //! turns every lane that opens a window into a named skip and runs the rest.
@@ -37,6 +38,9 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 use aterm_capacity::Machine as _;
+
+#[cfg(target_os = "macos")]
+mod admission_wait;
 
 #[cfg(unix)]
 mod aos;
@@ -86,6 +90,13 @@ pub fn arena_inner(args: &[String]) -> i32 {
 /// `verify perf [LANE…] [--record LANE…] [--list]`, answering its exit code.
 #[must_use]
 pub fn run(args: &[String]) -> i32 {
+    #[cfg(target_os = "macos")]
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--admission-wait-child")
+    {
+        return admission_wait::child(&args[1..]);
+    }
     exit_code(main(args))
 }
 
@@ -112,6 +123,26 @@ pub(crate) fn workspace_root() -> PathBuf {
         .parent()
         .and_then(Path::parent)
         .map_or_else(|| manifest.clone(), Path::to_path_buf)
+}
+
+/// Where a ledger lane writes its entries: `ledger` is `arena` (the arena's `cat`, `scroll` and
+/// `vte`), `fabric` or `restore`. It is `<target>/verify/.ubd/perf.noindex/<ledger>/`, in the
+/// verify state directory of [`workspace_root`]'s target ([`crate::Ctx::state_dir`]), beside a
+/// check run's logs and out of fseventsd and Spotlight as they are. An entry is local state, not
+/// part of the checkout: a number a claim rests on goes in the lab tracker with the command that
+/// produced it (`goals.py measure`).
+pub(crate) fn ledger_dir(ledger: &str) -> PathBuf {
+    let root = crate::physical(&workspace_root());
+    // The target `Ctx::new` gives the run, so this stays inside its `Ctx::state_dir`.
+    crate::NativeBuildPlan::capture(&crate::EnvSnapshot::capture(), &root)
+        .map_or_else(
+            |_| root.join(aterm_toolchain::build_cache::DEFAULT_TARGET),
+            |plan| plan.target().to_path_buf(),
+        )
+        .join("verify")
+        .join(aterm_tempfile::QUIET)
+        .join("perf.noindex")
+        .join(ledger)
 }
 
 /// Every lane, in the order a run executes them.
@@ -144,6 +175,7 @@ pub(crate) enum Lane {
     Aos,
     CommonsQuiet,
     JournalNote,
+    AdmissionWait,
 }
 
 /// Which kind of lane, and so whether a bare run includes it.
@@ -159,7 +191,7 @@ pub(crate) enum Kind {
 }
 
 impl Lane {
-    pub(crate) const ALL: [Lane; 27] = [
+    pub(crate) const ALL: [Lane; 28] = [
         Lane::Throughput,
         Lane::Pathological,
         Lane::ScrollScrub,
@@ -187,6 +219,7 @@ impl Lane {
         Lane::Aos,
         Lane::CommonsQuiet,
         Lane::JournalNote,
+        Lane::AdmissionWait,
     ];
 
     pub(crate) const fn name(self) -> &'static str {
@@ -218,6 +251,7 @@ impl Lane {
             Lane::Aos => "aos",
             Lane::CommonsQuiet => "commons-quiet",
             Lane::JournalNote => "journal-note",
+            Lane::AdmissionWait => "admission-wait",
         }
     }
 
@@ -245,7 +279,8 @@ impl Lane {
             | Lane::RestoreE2e
             | Lane::Aos
             | Lane::CommonsQuiet
-            | Lane::JournalNote => Kind::Measured,
+            | Lane::JournalNote
+            | Lane::AdmissionWait => Kind::Measured,
         }
     }
 
@@ -263,7 +298,11 @@ impl Lane {
     fn takes_quiet_claim(self) -> bool {
         !matches!(
             self,
-            Lane::VteEngine | Lane::VteMarks | Lane::CliStart | Lane::FabricCounts
+            Lane::VteEngine
+                | Lane::VteMarks
+                | Lane::CliStart
+                | Lane::FabricCounts
+                | Lane::AdmissionWait
         )
     }
 
@@ -355,6 +394,9 @@ impl Lane {
             Lane::JournalNote => {
                 "one journal note's latency, the spool's single append: p50, p95 and p99"
             }
+            Lane::AdmissionWait => {
+                "paired waiting-dispatch CPU and real observation/write counters for 32 rejected candidates and two workers"
+            }
         }
     }
 
@@ -427,6 +469,9 @@ impl Lane {
             Lane::CommonsQuiet => "unix, targo (opt-test build of aterm-db's isolated repair test)",
             Lane::JournalNote => {
                 "unix, targo (opt-test build of aterm-db's ignored journal_note measurement)"
+            }
+            Lane::AdmissionWait => {
+                "macOS, dedicated aterm-verify CLI, sampled Timing admission per fresh child"
             }
         }
     }
@@ -566,6 +611,7 @@ const JSON_LANES: &[Lane] = &[
     Lane::Aos,
     Lane::CommonsQuiet,
     Lane::JournalNote,
+    Lane::AdmissionWait,
 ];
 const BUILT_LANES: &[Lane] = &[Lane::Fabric, Lane::RestoreE2e];
 const GHOSTTY_LANES: &[Lane] = &[Lane::Cat, Lane::Vte];
@@ -1123,13 +1169,14 @@ fn list() -> String {
             }
             Kind::Arena => {
                 "ARENA lanes (only when named; real windows, minutes; measured, never judged: \
-                 cat, scroll and vte write a docs/measured/arena entry, start and compare print \
-                 a summary, and JSON with --json-out)\n"
+                 cat, scroll and vte write an entry into <target>/verify/.ubd/perf.noindex/arena, \
+                 start and compare print a summary, and JSON with --json-out)\n"
             }
             Kind::Measured => {
                 "MEASURED lanes (only when named; headless, real processes, minutes; measured, \
-                 not judged: fabric writes a docs/measured/fabric entry, restore-e2e a \
-                 docs/measured/restore entry, aos, commons-quiet and journal-note print a summary, and JSON with --json-out)\n"
+                 not judged: fabric writes an entry into <target>/verify/.ubd/perf.noindex/fabric, \
+                 restore-e2e one into .../restore, aos, commons-quiet and journal-note print a \
+                 summary, and JSON with --json-out)\n"
             }
         });
         for lane in Lane::ALL.into_iter().filter(|l| l.kind() == kind) {
@@ -1387,6 +1434,15 @@ fn main(args: &[String]) -> ExitCode {
             Lane::JournalNote => LaneRun::skip(
                 "the journal measurement runs through the unix build helpers",
                 "run it on macOS or Linux",
+            ),
+            #[cfg(target_os = "macos")]
+            Lane::AdmissionWait => {
+                admission_wait::run(cli.options.get("--json-out").map(Path::new))
+            }
+            #[cfg(not(target_os = "macos"))]
+            Lane::AdmissionWait => LaneRun::skip(
+                "the paired admission workload requires macOS process write counters",
+                "run it on macOS",
             ),
         };
         if quiet.is_some() {

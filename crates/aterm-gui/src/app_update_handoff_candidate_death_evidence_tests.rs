@@ -65,9 +65,15 @@ fn the_pre_kill_probe_separates_a_running_candidate_from_a_dead_one() {
 fn only_a_bare_sigkill_needs_proof_that_the_candidate_died_first() {
     assert_eq!(
         handoff_child_death(false, Some(signalled(libc::SIGKILL))),
-        Death::Unobserved,
+        Death::EndedHere,
         "the candidate was still alive when the channel closed, so this \
          SIGKILL can only be ours"
+    );
+    assert_eq!(
+        handoff_child_death(false, None),
+        Death::EndedHere,
+        "a candidate seen running when we moved to end it ended by our hand, \
+         though no status came back"
     );
     assert_eq!(
         handoff_child_death(true, Some(signalled(libc::SIGKILL))),
@@ -200,7 +206,11 @@ fn a_candidate_the_machine_killed_is_read_as_the_machine_s_kill() {
     );
 }
 
-/// A live candidate killed by the reject path is classified as `Death::Unobserved`.
+/// A live candidate killed by the reject path is classified as `Death::EndedHere`, which is no
+/// evidence about its bytes (`PhysicalFailureShape::successor_failed_to_start`): a successor whose
+/// boot swap deferred closes its readiness channel and runs on, and is ended so. NEGATIVE CONTROL:
+/// with `handoff_child_death` reading our kill as `Unobserved`, the kill reads as a death nobody
+/// saw ("is ours").
 #[test]
 fn a_kill_this_process_sends_is_never_read_as_the_candidate_s_own_death() {
     let child = std::process::Command::new("/bin/sleep")
@@ -217,7 +227,7 @@ fn a_kill_this_process_sends_is_never_read_as_the_candidate_s_own_death() {
     );
     assert_eq!(
         death,
-        Death::Unobserved,
+        Death::EndedHere,
         "it was alive when we looked, so the SIGKILL we then sent is ours and \
          claims nothing"
     );

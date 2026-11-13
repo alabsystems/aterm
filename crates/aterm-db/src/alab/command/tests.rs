@@ -1254,9 +1254,9 @@ fn retired_keys_cannot_gain_new_preferences_and_strict_flags_or_open_keys_refuse
 }
 
 /// Denied swarm-roster members are excluded from `known_macs`, so neither `import` nor `adopt`
-/// births or adopts a retired Mac's roster entry.
+/// matches or adopts a retired Mac's roster entry.
 /// NEGATIVE CONTROL: with `known_macs` omitting `.filter(|member| !roster.is_member_denied(member))`,
-/// `report["known_macs"]` is `2` and `m2` is born active in `MACHINE`.
+/// `report["known_macs"]` is `2`.
 #[test]
 fn denied_roster_macs_are_excluded_from_import_and_adopt() {
     let lab = Lab::new(&[Role::Writer, Role::Writer]);
@@ -1279,15 +1279,6 @@ fn denied_roster_macs_are_excluded_from_import_and_adopt() {
     let mut opened = Vec::new();
     let report = import(paths, &["--apply"], &vault, &logins, &mut opened);
     assert_eq!(report["known_macs"], json!(1), "{report}");
-    let view = Registry::at(paths.clone()).view().unwrap();
-    assert!(
-        !view
-            .project(&MACHINE)
-            .rows
-            .values()
-            .any(|row| row.get("label") == Some(&json!("m2"))),
-        "denied roster member m2 must not birth a machine row"
-    );
 
     let mut no_review = |_: &Path| Ok(());
     let adopted = run(
@@ -1299,6 +1290,35 @@ fn denied_roster_macs_are_excluded_from_import_and_adopt() {
     )
     .unwrap();
     assert_eq!(adopted["known_macs"], json!(1), "{adopted}");
+}
+
+/// The whole verb: an import reads every standing roster seat (`known_macs`) and births a row
+/// for none of them the sheets do not name. Here the two seats are `m1` and `m2` and the sheets
+/// name `m3` to `m6`: the sheets' Macs get their rows, the seats none.
+/// NEGATIVE CONTROL: with `Sources::input` passing `Births::Listed`, rows labelled `m1` and `m2`
+/// are born and the `seats` assertion lists them.
+#[test]
+fn an_import_plans_no_row_for_a_seat_no_sheet_names() {
+    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let paths = &lab.paths[0];
+    aterm_secrets::client::admin_seed_swarm_roster(paths, &[]).unwrap();
+    aterm_secrets::client::sync(paths, None).unwrap();
+    let scratch = aterm_tempfile::tempdir().unwrap();
+    let (vault, logins) = sheets(scratch.path());
+    let mut opened = Vec::new();
+    let report = import(paths, &["--apply"], &vault, &logins, &mut opened);
+    assert_eq!(report["known_macs"], json!(2), "{report}");
+    let view = Registry::at(paths.clone()).view().unwrap();
+    let machines = view.project(&MACHINE);
+    let labelled = |label: &str| {
+        machines
+            .rows
+            .values()
+            .any(|row| row.get("label") == Some(&json!(label)))
+    };
+    let seats: Vec<&str> = ["m1", "m2"].into_iter().filter(|l| labelled(l)).collect();
+    assert!(seats.is_empty(), "{seats:?}");
+    assert!(labelled("m3"), "a Mac the sheets name has its row");
 }
 
 /// A harness stand-in that renders two exports from the view: each lists the accounts the lab
@@ -1672,7 +1692,10 @@ fn an_account_is_added_from_stdin_and_its_address_never_printed() {
 /// NEGATIVE CONTROL: with `add_account` keying the login by `keys::address_pk` again (born where
 /// that key has no row), the new address's add births a row beside the one saying it, which the
 /// registry's rules refuse: `` called `Result::unwrap()` on an `Err` value: Error("address.addr:
-/// row ad-…: email row ad-… holds that address; name that row, or rename it first") ``.
+/// row ad-…: email row ad-… holds that address; name that row, or rename it first") ``. With
+/// `Compiled::seeded` answering false, on this registry no seed pass wrote, the account's
+/// compiled provider row reads as missing: `` Error("account.provider: row ac-…: no such provider
+/// row") ``.
 #[test]
 fn an_account_signs_in_with_the_row_its_address_names_now() {
     let lab = Lab::new(&[Role::Writer]);
@@ -1920,6 +1943,10 @@ fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
                 label: Some(label.into()),
                 nickname: crate::alab::view::MachineNickname::Unset,
                 aliases: Vec::new(),
+                status: None,
+                os: None,
+                chip: None,
+                ram_gb: None,
                 live: true,
             },
         );
@@ -1938,12 +1965,14 @@ fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
             pk.into(),
             Account {
                 pk: pk.into(),
+                provider: None,
                 realm: Some("claude".into()),
                 label: Some(label.into()),
                 legacy_label: None,
                 login: Some(format!("{pk}@example.test")),
                 identity: None,
                 status: Some("active".into()),
+                plan: None,
                 region: None,
                 flow: None,
                 browser: None,
@@ -2046,12 +2075,11 @@ fn what_runs_on_a_machine_is_its_preferences_places_facts_and_sum() {
     assert!(!text.contains('@'), "{text}");
 }
 
-/// A label a retired row and its live replacement share (the importer births the replacement
-/// for a retired m40 as `m40/2`, also labelled m40) names the live row, as the importer's
-/// `rows_named` reads it; a label only a retired row holds still names that row, for its
-/// history; two live rows under one label name neither.
-/// NEGATIVE CONTROL: with `machine_named` counting every row alike (`found` in place of `live`),
-/// m40 names no row: `left: None right: Some("mc-new")`.
+/// Name matching prefers live rows to retired history. Within that group, canonical labels
+/// precede aliases; equal best matches remain ambiguous. A name held only by one retired
+/// row still selects that row for history. Exact row keys always select their row.
+/// NEGATIVE CONTROL: treating canonical labels and aliases alike makes m40 ambiguous:
+/// `left: None right: Some("mc-new")`.
 #[test]
 fn a_label_a_retired_row_shares_names_the_live_replacement() {
     use crate::alab::view::{LabView, Machine};
@@ -2062,6 +2090,7 @@ fn a_label_a_retired_row_shares_names_the_live_replacement() {
         ("mc-gone", "m41", false),
         ("mc-a", "m42", true),
         ("mc-b", "m42", true),
+        ("mc-alias", "m43", true),
     ] {
         lab.machines.insert(
             pk.into(),
@@ -2070,16 +2099,34 @@ fn a_label_a_retired_row_shares_names_the_live_replacement() {
                 label: Some(label.into()),
                 nickname: crate::alab::view::MachineNickname::Unset,
                 aliases: Vec::new(),
+                status: None,
+                os: None,
+                chip: None,
+                ram_gb: None,
                 live,
             },
         );
     }
+    lab.machines.get_mut("mc-alias").unwrap().aliases = vec!["m40".into(), "m99".into()];
     assert_eq!(verbs::machine_named(&lab, "m40").as_deref(), Some("mc-new"));
     assert_eq!(
         verbs::machine_named(&lab, "m41").as_deref(),
         Some("mc-gone")
     );
     assert_eq!(verbs::machine_named(&lab, "m42"), None);
+    assert_eq!(
+        verbs::machine_named(&lab, "m99").as_deref(),
+        Some("mc-alias")
+    );
+    lab.machines
+        .get_mut("mc-alias")
+        .unwrap()
+        .aliases
+        .push("m41".into());
+    assert_eq!(
+        verbs::machine_named(&lab, "m41").as_deref(),
+        Some("mc-alias")
+    );
     assert_eq!(
         verbs::machine_named(&lab, "mc-old").as_deref(),
         Some("mc-old")

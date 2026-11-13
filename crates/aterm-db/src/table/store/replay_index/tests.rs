@@ -34,7 +34,7 @@ enum Kind {
 /// An open's first refusal: its message, and the index's refusal where the index refused.
 type Refused = (&'static str, Option<Refusal>);
 
-/// The replay loop of `Store::open_region` as it was with an index built as it replayed: each
+/// The replay loop of `Store::open_claimed` as it was with an index built as it replayed: each
 /// source and each operation inserted into the index, then an operation held unless its id is.
 fn indexed(
     index: &mut Index,
@@ -62,7 +62,7 @@ fn indexed(
     Ok(())
 }
 
-/// The same loop through [`ReplayIndex`], as `Store::open_region` drives it: `kept` gathers the
+/// The same loop through [`ReplayIndex`], as `Store::open_claimed` drives it: `kept` gathers the
 /// sources the store's certificates keep, `held` its operations.
 fn admitted(
     causal: &mut ReplayIndex,
@@ -74,7 +74,7 @@ fn admitted(
         match kind {
             Kind::Source => {
                 causal
-                    .source(held, |held| held, header)
+                    .source(held, |held| Some(held), header)
                     .map_err(|refusal| ("invalid discarded-source header", Some(refusal)))?;
                 kept.push((*header).clone());
             }

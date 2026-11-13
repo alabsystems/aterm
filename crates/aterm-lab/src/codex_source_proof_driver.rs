@@ -190,7 +190,20 @@ fn await_native(guardian: &mut Guardian, generation: u64) -> Result<(), Fail> {
             return Ok(());
         }
         if Instant::now() >= until {
-            return Err(Fail::die("native Source readiness was not observed"));
+            // Keep the actual failing census without exporting identifiers,
+            // source documents or reply payloads. Missing counters stay missing.
+            let census = &observed["observation"];
+            return Err(Fail::die(format!(
+                "native Source readiness was not observed: native_ok={} issued={:?} members={:?} managers_ready={:?} readers_ready={:?} unresolved={:?} unsettled_custody={:?} maximum_credential_generation={:?}",
+                observed["outcome"].as_str() == Some("ok"),
+                census["issued"].as_u64(),
+                census["members"].as_u64(),
+                census["managers_ready"].as_u64(),
+                census["readers_ready"].as_u64(),
+                census["unresolved"].as_u64(),
+                census["unsettled_custody"].as_u64(),
+                census["maximum_credential_generation"].as_u64(),
+            )));
         }
         std::thread::sleep(Duration::from_millis(200));
     }

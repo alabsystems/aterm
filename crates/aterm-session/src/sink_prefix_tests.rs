@@ -231,7 +231,7 @@ fn kernel_prefix_cancelled_native_write_conforms_and_rejects_early_retirement() 
 }
 
 fn pipe() -> (Arc<SinkWriter>, std::fs::File) {
-    let (reader, writer) = std::io::pipe().unwrap();
+    let (reader, writer) = aterm_uds::pipe().unwrap();
     let (reader, writer): (OwnedFd, OwnedFd) = (reader.into(), writer.into());
     aterm_pty::set_nonblocking(writer.as_raw_fd(), true).unwrap();
     let sink = Arc::new(SinkWriter::new_owned(writer));

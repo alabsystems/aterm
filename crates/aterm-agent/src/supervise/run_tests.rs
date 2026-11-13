@@ -4393,7 +4393,7 @@ fn an_idle_read_torn_mid_repaint_is_read_again_after_the_settle() {
         let mut r = if first == 1 {
             rows(&[
                 "⏺ Here is the landing report.",
-                "  NEEDS YOU: rotate the deploy key",
+                "  NEEDS YOU: rotate the deploy nod",
                 "",
             ])
         } else {

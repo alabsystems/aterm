@@ -162,8 +162,6 @@ pub struct FrameGlyphInk {
     epoch: GlyphInkEpoch,
     cell: (usize, usize),
     cols: usize,
-    wallpaper: bool,
-    lcd: bool,
     cursor: (usize, usize, bool),
     selection: TextSelection,
     selection_clip: Option<SelectionClip>,
@@ -206,7 +204,6 @@ impl FrameGlyphInk {
         self.epoch.owner.load(Ordering::Relaxed)
             && self.cell == cell
             && self.cols == input.cols
-            && self.wallpaper == input.wallpaper.is_some()
             && self.rows.len() == input.rows
             && self.cursor == (input.cursor_row, input.cursor_col, input.cursor_visible)
             && self.selection == input.selection
@@ -233,7 +230,7 @@ impl GlyphInk {
 
 impl Renderer {
     /// Revoke retained carriers as well as this renderer's row memo. Replacing the token
-    /// avoids reviving an old carrier after a route or raster setting roundtrip.
+    /// avoids reviving an old carrier after a raster, shaping or blending setting roundtrip.
     pub(crate) fn invalidate_glyph_frame_ink(&mut self) {
         self.glyph_ink_identity.store(false, Ordering::Relaxed);
         self.glyph_ink_identity = Arc::new(AtomicBool::new(true));
@@ -268,13 +265,11 @@ impl Renderer {
             return base;
         }
         let epoch = self.glyph_ink_epoch();
-        let lcd = self.input_uses_lcd_text(input);
         let old = self.glyph_frame_ink_memo.take();
         let previous = old
             .as_ref()
             .filter(|(key, _)| *key == epoch)
-            .and_then(|(_, ink)| ink.frame.as_ref())
-            .filter(|frame| frame.lcd == lcd);
+            .and_then(|(_, ink)| ink.frame.as_ref());
         let mut rows = Vec::with_capacity(input.rows);
         let (mut breaks, mut plan) = (Vec::new(), Vec::new());
         for row in 0..input.rows {
@@ -335,14 +330,6 @@ impl Renderer {
                 // A wide glyph is read only where its raster is fitted to its two cells (the
                 // key's span), the box its evidence is read in.
                 if notdef || (span == 2 && key.cell_span != 2) {
-                    glyphs.push(None);
-                    continue;
-                }
-                // Linux's LCD route draws a separate three-channel raster. A mono
-                // histogram cannot certify it. Keys which actually fall back to mono
-                // (including fallback faces) retain their measured mono evidence.
-                #[cfg(all(unix, not(target_os = "macos")))]
-                if lcd && self.subpx_image(key).is_some() {
                     glyphs.push(None);
                     continue;
                 }
@@ -414,8 +401,6 @@ impl Renderer {
             epoch: epoch.clone(),
             cell: self.cell_size(),
             cols: input.cols,
-            wallpaper: input.wallpaper.is_some(),
-            lcd,
             cursor: (input.cursor_row, input.cursor_col, input.cursor_visible),
             selection: input.selection.clone(),
             selection_clip: input.selection_clip,

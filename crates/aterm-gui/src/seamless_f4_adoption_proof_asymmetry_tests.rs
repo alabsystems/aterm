@@ -667,6 +667,168 @@ fn the_in_flight_output_state_crosses_the_meta_wire_inside_the_digest() {
     }
 }
 
+/// The visible rows' line sizes and protected runs cross the wire in both directions of version skew.
+///
+/// A screen whose rows the grid blob cannot rebuild by itself (a DECDWL row and DECSCA-protected cells, on the screen and on the saved primary behind a 1049 alternate screen) is carried at the Full rung with those facts in the meta's two additive keys.
+/// The child parser reads them, the screen digest is a fixed point over them and covers them, and the adopted engine is the live one through a selective erase and a cursor move.
+/// A producer before the keys writes none and a consumer before them ignores them: both adopt the grid blobs alone, onto the screen every build before restored.
+#[test]
+fn the_visible_cells_cross_the_meta_wire_and_skew_both_ways() {
+    use aterm_core::terminal::Terminal;
+    let carry = |meta: String| ScreenCarry {
+        schema: ScreenCarry::SCHEMA,
+        meta,
+        grid_file: "unused".to_string(),
+        alt_grid_file: None,
+        repaint: false,
+    };
+    let screen = |t: &mut Terminal| {
+        let sizes: Vec<_> = (0..6)
+            .map(|r| t.grid().row(r).map(aterm_core::grid::row::Row::line_size))
+            .collect();
+        (t.cell_frame(6, 30).cells, sizes, t.cursor())
+    };
+    let started = |setup: &str, leave: &[u8]| {
+        let mut live = Terminal::new(6, 30);
+        live.process(setup.as_bytes());
+        live.process(leave);
+        live
+    };
+    let head = "\x1b#6WIDE\x1b[3;1H\x1b[1\"qKEEP\x1b[0\"q gone";
+    let tail = b"\x1b[?2J\x1b[1;25HW\x1b[3;8HZ";
+    for (label, setup) in [
+        ("the screen", head.to_string()),
+        ("the saved primary", format!("{head}\x1b[?1049halt")),
+    ] {
+        let mut outgoing = Terminal::new(6, 30);
+        outgoing.process(setup.as_bytes());
+        let (cp, rung, cause) = carry_for_wire(&outgoing, 0, 0, &mut 0, WireCaps::current());
+        assert_eq!(rung, CarryRung::Full, "{label}: {cause:?}");
+        let facts = if outgoing.is_alternate_screen() {
+            &cp.alt_visible_cells
+        } else {
+            &cp.visible_cells
+        };
+        assert!(
+            !facts.line_sizes.is_empty() && !facts.protected.is_empty(),
+            "PRECONDITION ({label}): a line size and protection: {facts:?}"
+        );
+        let meta = aterm_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta");
+        let rebuilt = parse_checkpoint_meta(&carry(meta.clone()))
+            .expect("child parses meta")
+            .into_checkpoint(cp.grid.clone(), cp.alt_grid.clone());
+        assert_eq!(
+            rebuilt.visible_cells, cp.visible_cells,
+            "{label}: crosses intact"
+        );
+        assert_eq!(rebuilt.alt_visible_cells, cp.alt_visible_cells, "{label}");
+        let parent = screen_digest(&[(0, cp.clone())]).expect("parent digest");
+        assert_eq!(
+            parent,
+            screen_digest_refs(vec![(0, &rebuilt)]).expect("child digest"),
+            "{label}: the screen digest is a fixed point over the facts"
+        );
+        let mut other = cp.clone();
+        other.visible_cells = aterm_core::grid::VisibleCells::default();
+        other.alt_visible_cells = aterm_core::grid::VisibleCells::default();
+        assert_ne!(
+            screen_digest(&[(0, other)]).expect("digest"),
+            parent,
+            "{label}: the facts are inside the screen digest"
+        );
+
+        let leave = if outgoing.is_alternate_screen() {
+            &b"\x1b[?1049l"[..]
+        } else {
+            b""
+        };
+        let mut adopted = Terminal::new(6, 30);
+        adopted.restore_checkpoint(&rebuilt);
+        adopted.process(leave);
+        let mut live = started(&setup, leave);
+        assert_eq!(
+            screen(&mut adopted),
+            screen(&mut live),
+            "{label}: the live cells"
+        );
+        adopted.process(tail);
+        live.process(tail);
+        assert_eq!(
+            screen(&mut adopted),
+            screen(&mut live),
+            "{label}: a selective erase and the program's next writes land as they do live"
+        );
+
+        // A producer before the keys, and this meta as a consumer before them reads it (the keys unknown, so ignored): the same checkpoint.
+        let mut value: aterm_json::Value = aterm_json::from_str(&meta).expect("json");
+        let object = value.as_object_mut().expect("an object");
+        let mut unknown = object.clone();
+        for key in ["visible_cells", "alt_visible_cells"] {
+            if let Some(facts) = object.remove(key) {
+                unknown.remove(key);
+                unknown.insert(format!("{key}_of_a_newer_build"), facts);
+            }
+        }
+        let old = parse_checkpoint_meta(&carry(aterm_json::to_string(&value).expect("json")))
+            .expect("an older producer's meta parses")
+            .into_checkpoint(cp.grid.clone(), cp.alt_grid.clone());
+        let unaware = parse_checkpoint_meta(&carry(
+            aterm_json::to_string(&aterm_json::Value::Object(unknown)).expect("json"),
+        ))
+        .expect("a meta with keys this reader does not know parses")
+        .into_checkpoint(cp.grid.clone(), cp.alt_grid.clone());
+        assert_eq!(
+            unaware, old,
+            "{label}: an unaware reader sees an older producer's carry"
+        );
+        let mut expected = rebuilt.clone();
+        expected.visible_cells = aterm_core::grid::VisibleCells::default();
+        expected.alt_visible_cells = aterm_core::grid::VisibleCells::default();
+        assert_eq!(
+            old, expected,
+            "{label}: every scalar and both blobs as carried, and no facts"
+        );
+        assert!(screen_digest_refs(vec![(0, &old)]).is_ok(), "{label}");
+        let mut before = Terminal::new(6, 30);
+        before.restore_checkpoint(&old);
+        before.process(leave);
+        assert_ne!(
+            screen(&mut before),
+            screen(&mut started(&setup, leave)),
+            "{label}: NEGATIVE CONTROL: without the keys the rows restore as before"
+        );
+    }
+}
+
+/// Line sizes and protected runs this build cannot read cost themselves and nothing else: the meta still parses, and the session is adopted with its screen from the grid blob, as from a producer that wrote no key.
+#[test]
+fn unreadable_visible_cells_cost_only_themselves() {
+    let mut t = aterm_core::terminal::Terminal::new(4, 20);
+    t.process(b"\x1b#6WIDE\r\n\x1b[1\"qKEEP\x1b[0\"q gone");
+    let cp = t.checkpoint_visible().expect("parser is Ground");
+    let meta = aterm_json::to_string(&CheckpointMeta::from_checkpoint(&cp)).expect("meta");
+    assert!(meta.contains("\"visible_cells\":{"), "PRECONDITION: {meta}");
+    for unreadable in ["7", "{\"line_sizes\":\"6\"}", "{\"protected\":[[0,1]]}"] {
+        let mut value: aterm_json::Value = aterm_json::from_str(&meta).expect("json");
+        value.as_object_mut().expect("an object").insert(
+            "visible_cells".to_string(),
+            aterm_json::from_str(unreadable).expect("json"),
+        );
+        let carry = ScreenCarry {
+            schema: ScreenCarry::SCHEMA,
+            meta: aterm_json::to_string(&value).expect("json"),
+            grid_file: "unused".to_string(),
+            alt_grid_file: None,
+            repaint: false,
+        };
+        let parsed = parse_checkpoint_meta(&carry).expect("the meta still parses");
+        assert!(parsed.visible_cells.is_empty(), "{unreadable}");
+        let rebuilt = parsed.into_checkpoint(cp.grid.clone(), None);
+        assert_eq!(rebuilt.grid, cp.grid, "{unreadable}: the screen is kept");
+        assert_eq!(rebuilt.cursor, cp.cursor, "{unreadable}");
+    }
+}
+
 #[test]
 fn an_unreadable_output_state_costs_only_itself() {
     let cp = live_checkpoint();

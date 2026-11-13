@@ -432,7 +432,7 @@ fn app_pause_revokes_only_cancelled_unclaimed_permissions_and_bind_transfers_sco
     let bound = lifetime.enter().unwrap();
     let bound_cancel = bound.cancellation();
     let mut bound = launch(bound);
-    bound.bind(process);
+    bound.bind(process).unwrap();
     assert!(bound_cancel.retired());
     registry
         .state

@@ -82,7 +82,7 @@ fn valid_name(program: &str) -> bool {
 /// Sets or clears the local pin for `program`, returning `Ok(changed)`.
 ///
 /// # Errors
-/// Refuses invalid names, unreadable prior state, bounds violations and publication failures.
+/// Refuses invalid names, lock failures, unreadable prior state, bounds violations and publication failures.
 pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bool> {
     if !valid_name(program) {
         return Err(io::Error::new(
@@ -91,6 +91,8 @@ pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bo
              outer whitespace, CR/LF, or NUL)",
         ));
     }
+    layout.ensure_dir(&layout.prefix)?;
+    let _writer = crate::lock::lock_metadata(&layout.prefix.join("pins.lock"))?;
     let mut set = pinned_set(layout)?;
     let changed = if pinned {
         set.insert(program.to_string())
@@ -110,7 +112,8 @@ pub fn set_pinned(layout: &Layout, program: &str, pinned: bool) -> io::Result<bo
             format!("pin file exceeds {MAX_PIN_FILE_BYTES}-byte limit"),
         ));
     }
-    layout.ensure_dir(&layout.prefix)?;
+    #[cfg(test)]
+    tests::before_publish();
     aterm_uds::atomic_file::write(&pins_path(layout), body.as_bytes(), 0o600)?;
     Ok(changed)
 }

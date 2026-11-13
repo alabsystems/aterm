@@ -40,6 +40,15 @@ impl NativeRequestStart {
     }
 }
 
+/// The deadline of a local file lock's bounded wait, `wait` from now (now itself, so one try,
+/// when that overflows). A lock wait is the native filesystem's, like the journal's
+/// [`aterm_uds::private_file::PrivateLock`]: no tape records or replays it.
+#[cfg(unix)]
+pub(crate) fn lock_deadline(wait: Duration) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_add(wait).unwrap_or(now)
+}
+
 use aterm_types::{MutexExt, http_retry::Retry};
 
 /// A real elapsed native validation phase, observed only on a simulated client.

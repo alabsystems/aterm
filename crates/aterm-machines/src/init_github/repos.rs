@@ -1571,7 +1571,7 @@ fn git_read(sys: &dyn System, user: &User, path: &Path, args: &[&str]) -> Result
 /// Whether the repository at `path` borrows objects from another store: its
 /// `objects/info/alternates` is there, or what is at that path cannot be read. The path git
 /// computes reads no object, so no lazy fetch can start: the read runs on every git, with no
-/// `--no-lazy-fetch`, which a git before 2.44 refuses.
+/// `--no-lazy-fetch`, which a git before 2.45 refuses.
 ///
 /// # Errors
 /// git could not name the path.

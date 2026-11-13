@@ -147,8 +147,8 @@ fn a_wait_ready_ends_on_its_descriptor_or_its_stop() {
     use std::os::fd::AsFd as _;
 
     let stop = Arc::new(Stop::new());
-    let (quiet, _keep) = std::io::pipe().unwrap();
-    let (readable, mut source) = std::io::pipe().unwrap();
+    let (quiet, _keep) = crate::pipe().unwrap();
+    let (readable, mut source) = crate::pipe().unwrap();
     source.write_all(b"r").unwrap();
     assert_eq!(
         stop.wait_ready(&[quiet.as_fd(), readable.as_fd()], None)
@@ -159,7 +159,7 @@ fn a_wait_ready_ends_on_its_descriptor_or_its_stop() {
     let waiter = {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            let (quiet, _keep) = std::io::pipe().unwrap();
+            let (quiet, _keep) = crate::pipe().unwrap();
             let entered = std::time::Instant::now();
             let ready = stop
                 .wait_ready(&[quiet.as_fd()], Some(entered + HANG))

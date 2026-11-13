@@ -22,7 +22,10 @@ use aterm_gui_timing::now_ms;
 
 pub mod fleet_mail;
 pub mod handler_tally;
+mod hold_clock;
 pub mod report;
+
+pub use hold_clock::HoldObservation;
 
 /// What the fabric needs of a session.
 pub trait FabricSession: Send + Sync {
@@ -851,6 +854,7 @@ pub struct Inbox {
     /// the ring once, with no second mark.
     carried_marks: HashSet<u64>,
     holds: Holds,
+    hold_history: hold_clock::HoldHistory,
     advisory: Option<(Hold, u64)>,
     hold_fenced: bool,
     retirements_fenced: bool,
@@ -1878,6 +1882,13 @@ impl SessionFabric {
         self.lock().holds.first()
     }
 
+    /// The aggregate hold and its release history, read in one transaction.
+    #[must_use]
+    pub fn hold_observation(&self) -> HoldObservation {
+        let inbox = self.lock();
+        inbox.hold_history.observation(inbox.holds.is_held())
+    }
+
     /// Every standing halt on the session, one slot per origin.
     pub fn holds(&self) -> Holds {
         self.lock().holds.clone()
@@ -1994,15 +2005,15 @@ impl SessionFabric {
     }
 
     /// Run `change`, a change the handoff carries that lives off this endpoint (a task mark,
-    /// `task_record::mark_session_task`), under the fabric lock once no update fences the session;
-    /// `None` past `wait`.
+    /// `task_record::mark_session_task`), with its locked aggregate hold observation once no
+    /// update fences the session; `None` past `wait`.
     pub fn run_unfenced<T>(
         &self,
         wait: std::time::Duration,
-        change: impl FnOnce() -> T,
+        change: impl FnOnce(HoldObservation) -> T,
     ) -> Option<T> {
         let unfenced = self.wait_unfenced(self.lock(), wait)?;
-        let out = change();
+        let out = change(unfenced.hold_history.observation(unfenced.holds.is_held()));
         drop(unfenced);
         Some(out)
     }
@@ -2350,6 +2361,10 @@ impl SessionFabric {
         if inbox.holds == before {
             return;
         }
+        let held = inbox.holds.is_held();
+        inbox
+            .hold_history
+            .moved(before.is_held(), held, std::time::Instant::now());
         let (origin, reason, hold_origin) = inbox.holds.event_fields("local");
         let fact = FabricFact::Hold {
             held: true,
@@ -4367,6 +4382,9 @@ fn apply_hold_as(
         drop(inbox);
         return Applied::Unchanged { held };
     }
+    inbox
+        .hold_history
+        .moved(before.is_held(), held, std::time::Instant::now());
     if issuer == HoldIssuer::Person && matches!(act, HoldAct::Set(_)) {
         ctx.fabric().person_refusals.store(0, Ordering::Relaxed);
     }

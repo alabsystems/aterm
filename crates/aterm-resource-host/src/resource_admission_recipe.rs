@@ -26,6 +26,7 @@ pub(super) enum Kind {
     Metadata,
     Resolver,
     Workload,
+    NativeJob,
     BootstrapGraph,
     Preflight,
 }
@@ -410,6 +411,7 @@ impl Recipe {
             }
             let resolver = resolver_root::closed_request(request);
             let workload = workload::closed_request(request);
+            let native_job = workload::native_job_request(request);
             let graph = bootstrap_graph::closed_request(request);
             let mut environment =
                 service_environment(request, &selected, resolver || workload || graph)?;
@@ -463,7 +465,11 @@ impl Recipe {
                 sdk.require_resolver_protocol(native_inputs::deadline(Instant::now()))?;
             }
             if workload {
-                sdk.require_workload_protocol(native_inputs::deadline(Instant::now()))?;
+                if native_job {
+                    sdk.require_native_job_protocol(native_inputs::deadline(Instant::now()))?;
+                } else {
+                    sdk.require_workload_protocol(native_inputs::deadline(Instant::now()))?;
+                }
                 // Still in the paid Preparing worker, before any Root GO or
                 // project/configuration. Capture the compiler/runtime once;
                 // Ready and each graph member reuse its original held inputs.
@@ -500,6 +506,8 @@ impl Recipe {
             return Ok(Some(PreparedRecipe::Direct(Self {
                 kind: if graph {
                     Kind::BootstrapGraph
+                } else if native_job {
+                    Kind::NativeJob
                 } else if workload {
                     Kind::Workload
                 } else if resolver {

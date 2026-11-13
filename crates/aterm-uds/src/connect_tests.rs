@@ -16,6 +16,7 @@ fn deadline() -> Instant {
 #[test]
 fn a_closed_unix_peer_keeps_its_queued_reply() {
     let (mut client, mut server) = CtlStream::pair().unwrap();
+    client.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
     server.write_all(b"queued verdict").unwrap();
     drop(server);
     aterm_spec::wait::until_peer_closed(&client);
@@ -192,6 +193,22 @@ fn a_dial_the_partition_cuts_reaches_no_listener_until_the_cut_heals() {
 #[cfg(target_os = "linux")]
 #[test]
 fn full_linux_backlog_refuses_without_returning_an_unconnected_stream() {
+    // Linux also reports a never-connected Unix socket writable with SO_ERROR=0.
+    // That is not a pending connect: the real backlog EAGAIN below must still refuse.
+    let unconnected = crate::CtlStream::from(socket(libc::AF_UNIX, libc::SOCK_STREAM).unwrap());
+    unconnected.set_nonblocking(true).unwrap();
+    crate::ready::until_cancelled(
+        unconnected.as_fd(),
+        crate::ready::Interest::Write,
+        deadline(),
+        None,
+    )
+    .unwrap();
+    assert!(unconnected.take_error().unwrap().is_none());
+    assert_eq!(
+        unconnected.peer_addr().unwrap_err().kind(),
+        ErrorKind::NotConnected
+    );
     let root = aterm_tempfile::tempdir().unwrap();
     let path = root.path().join("backlog.sock");
     let listener = crate::CtlListener::bind(&path).unwrap();
@@ -202,4 +219,116 @@ fn full_linux_backlog_refuses_without_returning_an_unconnected_stream() {
     let refused = until(&path, deadline()).unwrap_err();
     assert_eq!(refused.raw_os_error(), Some(libc::EAGAIN));
     assert!(first.peer_addr().is_ok());
+}
+
+const CLOSED_VERDICT: &[u8] = b"verdict sent before the peer closes";
+
+fn read_closed_verdict(mut stream: impl Read + AsRawFd) {
+    // SAFETY: both fcntl calls read flags from the live test stream.
+    let status = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFL) };
+    // SAFETY: as above.
+    let descriptor = unsafe { libc::fcntl(stream.as_raw_fd(), libc::F_GETFD) };
+    assert!(status >= 0 && status & libc::O_NONBLOCK == 0);
+    assert!(descriptor >= 0 && descriptor & libc::FD_CLOEXEC != 0);
+    let mut bytes = Vec::new();
+    stream.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, CLOSED_VERDICT);
+}
+
+#[test]
+fn a_unix_peer_can_finish_sending_before_connect_completion_is_checked() {
+    let root = aterm_tempfile::tempdir().unwrap();
+    let path = root.path().join("closing.sock");
+    let listener = crate::CtlListener::bind(&path).unwrap();
+    crate::keep_out_of_children(&listener).unwrap();
+    let (accepted, was_accepted) = std::sync::mpsc::channel();
+    let (release, may_close) = std::sync::mpsc::channel();
+    let (closed, was_closed) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .unwrap();
+        accepted.send(()).unwrap();
+        may_close.recv_timeout(MUST_HAPPEN).unwrap();
+        stream.write_all(CLOSED_VERDICT).unwrap();
+        drop(stream);
+        closed.send(()).unwrap();
+    });
+    let client = until_cancelled_after_connect(&path, deadline(), None, |stream, error| {
+        assert!(
+            error.is_none(),
+            "the fresh Unix listener connected: {error:?}"
+        );
+        was_accepted.recv_timeout(MUST_HAPPEN).unwrap();
+        assert!(
+            stream.peer_addr().is_ok(),
+            "the established peer is still open"
+        );
+        stream.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+        release.send(()).unwrap();
+        was_closed.recv_timeout(MUST_HAPPEN).unwrap();
+        #[cfg(target_vendor = "apple")]
+        assert_eq!(
+            stream.peer_addr().unwrap_err().raw_os_error(),
+            Some(libc::EINVAL),
+            "Darwin forgets the peer address while its bytes remain readable"
+        );
+    })
+    .expect("a successful connect retains the peer's queued verdict after it closes");
+    assert_eq!(crate::peer::peer_uid(&client), Some(crate::peer::our_uid()));
+    read_closed_verdict(client);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_tcp_peer_can_finish_sending_before_connect_completion_is_checked() {
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+    crate::keep_out_of_children(&listener).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (accepted, was_accepted) = std::sync::mpsc::channel();
+    let (release, may_close) = std::sync::mpsc::channel();
+    let (closed, was_closed) = std::sync::mpsc::channel();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = crate::accept(
+            &listener,
+            crate::AcceptWait::Forever,
+            crate::AcceptedMode::Blocking,
+        )
+        .unwrap();
+        accepted.send(()).unwrap();
+        may_close.recv_timeout(MUST_HAPPEN).unwrap();
+        stream.write_all(CLOSED_VERDICT).unwrap();
+        drop(stream);
+        closed.send(()).unwrap();
+    });
+    let client = tcp_until_cancelled_after_connect(
+        &address,
+        deadline(),
+        |_| Ok(()),
+        None,
+        |stream, error| {
+            assert!(
+                error.is_none()
+                    || error.is_some_and(|error| {
+                        matches!(error.raw_os_error(), Some(libc::EINPROGRESS | libc::EINTR))
+                    }),
+                "the fresh TCP listener connected or began connecting: {error:?}"
+            );
+            eprintln!("closed TCP peer initial connect result: {error:?}");
+            was_accepted.recv_timeout(MUST_HAPPEN).unwrap();
+            assert!(
+                stream.peer_addr().is_ok(),
+                "the established peer is still open"
+            );
+            stream.set_read_timeout(Some(MUST_HAPPEN)).unwrap();
+            release.send(()).unwrap();
+            was_closed.recv_timeout(MUST_HAPPEN).unwrap();
+        },
+    )
+    .expect("the completed TCP connect retains the peer's queued verdict after it closes");
+    read_closed_verdict(client);
+    server.join().unwrap();
 }

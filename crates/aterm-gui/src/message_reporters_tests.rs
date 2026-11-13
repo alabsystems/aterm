@@ -1885,6 +1885,7 @@ fn reopened_with_agent(
         claude_auth: None,
         word: String::new(),
         pid: 4242,
+        lifetime: None,
         start: "Sat Sep 27 01:02:03 2026".into(),
         program: "/opt/claude/bin/claude".into(),
         argv: vec!["/opt/claude/bin/claude".into()],
@@ -3324,6 +3325,70 @@ fn a_held_episode_is_a_record_at_its_opening_and_its_drain() {
         assert_eq!(msg.key.as_deref(), Some(super::PROGRAM_CHECK_EPISODE_KEY));
         assert!(super::PROGRAM_CHECK_EPISODE_KEY.starts_with("program-check."));
     }
+}
+
+/// PROGRAMS STRANDED TEN MINUTES ARE ONE ENTRY (leftover §5.1, §6.6): one key whatever syspolicyd
+/// runs, an Info Later ask restated at once that counts every row, names the two held longest by
+/// the bound they passed (ties by pid) and the syspolicyd running now, and logs the oldest; the
+/// plural speaks of each, and no row is no entry.
+#[test]
+fn programs_stranded_ten_minutes_are_one_entry_naming_the_two_held_longest() {
+    use aterm_messages::exceptions::Family;
+    use aterm_messages::need::Need;
+    let named = |pid, for_ms| aterm_vitals::jobs::Named {
+        pid,
+        exec_version: Some(u64::from(pid)),
+        name: format!("band-{pid}"),
+        tab: None,
+        job: None,
+        for_ms,
+    };
+    let rows = [
+        named(300, 700_000),
+        named(100, 1_860_000),
+        named(200, 1_860_000),
+    ];
+    let entry = super::stranded_entry(&rows.iter().collect::<Vec<_>>(), 4242)
+        .expect("a stranded row is an entry");
+    assert_eq!(
+        (entry.family(), entry.key().as_str()),
+        (Family::Stranded, "vitals.stranded.programs.held")
+    );
+    assert_eq!(
+        entry.log_line_text(),
+        Some("program-check-stranded n=3 daemon=4242 oldest_ms=1860000")
+    );
+    let msg = entry.message().expect("a valid entry");
+    assert_eq!(msg.severity, aterm_messages::Severity::Info);
+    assert_eq!(msg.title, "3 programs stranded at macOS's check");
+    assert!(
+        msg.detail.ends_with(&[
+            "pid 100 band-100: held 10 m or more".to_owned(),
+            "pid 200 band-200: held 10 m or more".to_owned(),
+            "The syspolicyd running now (pid 4242) checks new programs".to_owned(),
+        ]),
+        "the two held longest, ties by pid, then the syspolicyd running now: {:?}",
+        msg.detail
+    );
+    let Need::Later(ask) = msg.need() else {
+        panic!("a stranded program is a Later ask, never a Now");
+    };
+    assert!(ask.restates_at_once());
+    assert_eq!(
+        ask.why_words(),
+        "their check went to a syspolicyd that is no longer running, and aterm ends no held program"
+    );
+    assert_eq!(
+        ask.then().words(),
+        "Stop what started each, then run it again"
+    );
+    let other = super::stranded_entry(&rows.iter().collect::<Vec<_>>(), 11291)
+        .expect("a stranded row is an entry");
+    assert_eq!(other.key(), entry.key(), "a relaunch keeps the one key");
+    assert!(
+        super::stranded_entry(&[], 4242).is_none(),
+        "no row is no entry"
+    );
 }
 
 #[test]

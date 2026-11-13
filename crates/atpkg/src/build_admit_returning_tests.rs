@@ -218,7 +218,7 @@ pub(super) fn settlement_observer_failure_refuses_return(world: &Path, seat: &Se
             resource,
         )
         .unwrap();
-    let (control, _send) = std::io::pipe().unwrap();
+    let (control, _send) = aterm_uds::pipe().unwrap();
     let by = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
     let completed = loop {
         let mut completed = jobs

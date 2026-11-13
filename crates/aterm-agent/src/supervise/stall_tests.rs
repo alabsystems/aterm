@@ -748,10 +748,11 @@ fn remedy_run_as(
     opts.policy.stall_term_after_s = term_after_s;
     opts.policy.stall_term = stall_term;
     let (lines, _) = watch_lines(&mut m, &opts);
+    // By its verb: a loop that names its session (the observe table's) says it first.
     let signals = m
         .requests
         .iter()
-        .filter(|r| r.starts_with("signal") || r.starts_with("restart"))
+        .filter(|r| matches!(verb_of(r), "signal" | "restart"))
         .cloned()
         .collect();
     let informed = host
@@ -900,6 +901,55 @@ fn the_remedy_is_the_servers_restart_and_its_refusals_decide() {
     }
 }
 
+/// Run `run` as the observe table's unconfirmed agent's loop when `observed` ([`Mode::Observe`]:
+/// the host confirms agents and reads this one's image unconfirmed), else as a loop whose host
+/// confirms nothing; the table is unset on every way out.
+fn observed_as<T>(observed: bool, run: impl FnOnce() -> T) -> T {
+    struct Unset;
+    impl Drop for Unset {
+        fn drop(&mut self) {
+            TABLE.with_borrow_mut(|t| *t = None);
+        }
+    }
+    if !observed {
+        return run();
+    }
+    TABLE.with_borrow_mut(|t| *t = Some((Mode::Observe, Vec::new())));
+    let unset = Unset;
+    let out = run();
+    drop(unset);
+    out
+}
+
+/// The stall remedy's restarts and signals, with `[harness] stall_term` on, of an agent frozen
+/// past the bound ([`super::observe_table`]'s restart rows: the table's mode is the thread's).
+pub(super) fn observe_row_stall_restart() -> Vec<String> {
+    remedy_run(INPUT_STALLED_LONG, true, 600, |_| {}).0
+}
+
+/// The memory ceiling's restarts beside a proven self-claim, of an agent at its own idle point
+/// over its ceiling ([`super::observe_table`]'s restart rows).
+pub(super) fn observe_row_memory_restart() -> Vec<String> {
+    let mut m = Mock::new(vec![vec!["idle".to_string()]]);
+    m.verb_replies.insert("text", memory_text_at(7));
+    let mut s = session(&mut m, None);
+    s.set_beside(Some("codex-alab@4242".to_string()));
+    s.stall_host = Some(Beside::new(true, None) as Arc<dyn IdleHost>);
+    let opts = auto(30);
+    let mut review = IdleMemoryReview { unattended: true };
+    let first = Instant::now();
+    for now in [first, first + WAIT_STEP] {
+        s.beside_memory_remedy_at(actionable_memory(), 7, || now, &opts, &mut review)
+            .expect("scripted memory remedy");
+    }
+    drop(s);
+    m.requests
+        .iter()
+        .filter(|r| matches!(verb_of(r), "signal" | "restart"))
+        .cloned()
+        .collect()
+}
+
 #[test]
 fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
     use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -920,8 +970,15 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
                 st["host"],
                 st["beside"],
                 st["rest"],
+                st["observed"],
             );
-            configs.insert(key, m.action_enabled("Term", &st));
+            configs.insert(
+                key,
+                (
+                    m.action_enabled("Term", &st),
+                    m.action_enabled("Withhold", &st),
+                ),
+            );
             if m.action_enabled("Term", &st) {
                 let mut after = st.clone();
                 assert!(m.fire("Term", &mut after));
@@ -935,13 +992,18 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
             }
         }
     }
-    assert_eq!(configs.len(), 128, "every configuration is reachable");
+    assert_eq!(configs.len(), 256, "every configuration is reachable");
     assert_eq!(
-        configs.values().filter(|t| **t).count(),
+        configs.values().filter(|(t, _)| *t).count(),
         4,
         "four configurations term (beside or not, its record at rest or not): {configs:?}"
     );
-    for (&(stalled, aged, off, hand, host, beside, rest), &term) in &configs {
+    assert_eq!(
+        configs.values().filter(|(_, w)| *w).count(),
+        4,
+        "the same four, observed, withhold: {configs:?}"
+    );
+    for (&(stalled, aged, off, hand, host, beside, rest, observed), &(term, withhold)) in &configs {
         let input = match (stalled, aged) {
             (1, 1) => INPUT_STALLED_LONG,
             (1, _) => INPUT_STALLED,
@@ -954,21 +1016,36 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
             }
         };
         let run = |stall_term: bool| {
-            if beside == 1 {
-                beside_remedy_run(input, host == 1, bound, stall_term, rest == 1, tweak)
-            } else if stall_term {
-                let (signals, lines) = remedy_run(input, host == 1, bound, tweak);
-                (signals, lines, Vec::new())
-            } else {
-                warn_run(input, host == 1, bound, tweak)
-            }
+            observed_as(observed == 1, || {
+                if beside == 1 {
+                    beside_remedy_run(input, host == 1, bound, stall_term, rest == 1, tweak)
+                } else if stall_term {
+                    let (signals, lines) = remedy_run(input, host == 1, bound, tweak);
+                    (signals, lines, Vec::new())
+                } else {
+                    warn_run(input, host == 1, bound, tweak)
+                }
+            })
         };
         let (signals, lines, _) = run(true);
         let want: &[&str] = if term { &[RESTART] } else { &[] };
         assert_eq!(
             signals, want,
             "stalled={stalled} aged={aged} off={off} hand={hand} host={host} beside={beside} \
-             rest={rest}: {lines:#?}"
+             rest={rest} observed={observed}: {lines:#?}"
+        );
+        let withheld: Vec<&String> = lines
+            .iter()
+            .filter(|l| {
+                l.starts_with("STALL-WARNED")
+                    && l.ends_with(&format!("ended=no ({})", super::observe::RESTART_WITHHELD))
+            })
+            .collect();
+        assert_eq!(
+            withheld.len(),
+            usize::from(withhold),
+            "withheld once, said why: stalled={stalled} aged={aged} off={off} hand={hand} \
+             host={host} beside={beside} rest={rest} observed={observed}: {lines:#?}"
         );
         let (signals, lines, informed) = run(false);
         let warned = lines
@@ -978,9 +1055,9 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
         assert!(signals.is_empty(), "the default never signals: {signals:?}");
         assert_eq!(
             (warned, informed.len()),
-            if term { (1, 1) } else { (0, 0) },
+            if term || withhold { (1, 1) } else { (0, 0) },
             "stalled={stalled} aged={aged} off={off} hand={hand} host={host} beside={beside} \
-             rest={rest}: {lines:#?}"
+             rest={rest} observed={observed}: {lines:#?}"
         );
     }
     let mut st = m.init_state();
@@ -1025,6 +1102,16 @@ fn tier1_the_real_remedy_signals_exactly_where_the_model_terms() {
     );
     let (signals, ..) = beside_remedy_run(INPUT_STALLED_LONG, true, 600, true, false, |_| {});
     assert_eq!(signals, [RESTART], "beside, its record busy");
+    let mut st = buggy.init_state();
+    for action in ["ObservedFlips", "Freeze", "Age"] {
+        assert!(buggy.fire(action, &mut st), "{action} at {st:?}");
+    }
+    assert!(
+        buggy.action_enabled("TermObserved", &st),
+        "a remedy blind to the image"
+    );
+    let (signals, lines) = observed_as(true, || remedy_run(INPUT_STALLED_LONG, true, 600, |_| {}));
+    assert!(signals.is_empty(), "observed, no restart: {lines:#?}");
 }
 
 /// A host the loop runs beside a proven self-claim: it relaunches the agent
@@ -1119,7 +1206,7 @@ fn beside_remedy_run(
     let signals = m
         .requests
         .iter()
-        .filter(|r| r.starts_with("signal") || r.starts_with("restart"))
+        .filter(|r| matches!(verb_of(r), "signal" | "restart"))
         .cloned()
         .collect();
     let informed = host

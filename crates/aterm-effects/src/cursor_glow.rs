@@ -5,6 +5,7 @@
 //! premultiplied additive quads along the swept path, a bloom crown around the head, and
 //! per-style particles.
 
+use aterm_scene::smoothstep;
 use aterm_time::Instant;
 use std::time::Duration;
 
@@ -1397,6 +1398,13 @@ impl ColourPins {
 /// as long as the light stands on that row, so nothing shows and hides with it.
 pub(crate) const RISE_CLEAR_PX: f32 = 1.0;
 
+/// The far edge, on each axis, of the pixel space an overlay quad (`GlowQuad`, `RainHalo`,
+/// `FirePatch`) stores its rect in: their fields are `u16`. The effects box is `i32`
+/// (`origin + cols * cw`) and passes it on a grid of 4096 columns of 16 px, so a producer
+/// clips its rect here before it narrows a pixel: a bare `as u16` lays the light at
+/// `x mod 65,536`, on the far side of the frame.
+pub(crate) const OVERLAY_PX_MAX: i32 = u16::MAX as i32;
+
 /// Window-space geometry the host passes in (pixels).
 #[derive(Clone, Copy)]
 pub struct Geom {
@@ -1451,14 +1459,18 @@ impl Geom {
         )
     }
 
-    /// Returns the beam rasterizer clip for this geometry.
+    /// Returns the beam rasterizer clip for this geometry. It is the effects box inside the
+    /// overlay pixel space ([`OVERLAY_PX_MAX`]), clipped once here because a beam lays a quad
+    /// per pixel row.
     #[inline]
     pub(crate) const fn beam_clip(&self) -> BeamClip {
+        let space = OVERLAY_PX_MAX;
+        let (x1, y1) = (self.fx_right(), self.fx_bot());
         BeamClip {
             x0: self.fx_left(),
             y0: self.fx_top(),
-            x1: self.fx_right(),
-            y1: self.fx_bot(),
+            x1: if x1 < space { x1 } else { space },
+            y1: if y1 < space { y1 } else { space },
             cell_h: self.ch as i32,
             origin_y: self.origin_y as i32,
         }

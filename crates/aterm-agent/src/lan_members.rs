@@ -13,6 +13,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     io::{self, Read as _, Write as _},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    ops::ControlFlow,
     os::fd::AsFd as _,
     sync::{
         Arc, Mutex, PoisonError, Weak,
@@ -34,6 +35,10 @@ const MAX_LINKS: usize = 8;
 const MAX_PEERS: usize = 64;
 const REFRESH: Duration = Duration::from_secs(1);
 const RETRANSMIT: Duration = Duration::from_millis(100);
+/// How long after a change of network was heard the responder looks at its sources once more
+/// ([`next_look`]): the look made at the change can come before what the change brings (an
+/// address after its link) is there to bind.
+const SETTLE: Duration = Duration::from_millis(200);
 
 fn contained() -> bool {
     cfg!(test)
@@ -525,6 +530,20 @@ impl ControlState {
 }
 
 impl Control {
+    /// A responder's control and the end its worker reads the owner's word from.
+    fn pipe() -> io::Result<(std::io::PipeReader, Arc<Self>)> {
+        let (reader, writer) = aterm_uds::pipe()?;
+        let control = Arc::new(Self {
+            state: Mutex::new(ControlState {
+                writer: Some(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
+                rung: false,
+                stopped: false,
+                ready: None,
+            }),
+        });
+        Ok((reader, control))
+    }
+
     fn announce(&self, generation: Weak<AtomicBool>) {
         if !generation
             .upgrade()
@@ -623,23 +642,32 @@ impl Responder {
         allowed: impl Fn() -> bool + Send + 'static,
         network: Network,
     ) -> io::Result<Self> {
-        let (reader, writer) = std::io::pipe()?;
-        let control = Arc::new(Control {
-            state: Mutex::new(ControlState {
-                writer: Some(std::fs::File::from(std::os::fd::OwnedFd::from(writer))),
-                rung: false,
-                stopped: false,
-                ready: None,
-            }),
-        });
+        let changes = Changes::of(network.scope);
+        Self::start_over(port, key, allowed, network, changes)
+    }
+
+    /// [`Self::start_on`] hearing changes of network on `changes`, which a test hands a stand-in.
+    fn start_over(
+        port: u16,
+        key: NodeKey,
+        allowed: impl Fn() -> bool + Send + 'static,
+        network: Network,
+        changes: Changes,
+    ) -> io::Result<Self> {
+        let (reader, control) = Control::pipe()?;
         let mut incarnation = [0; NONCE];
         aterm_uds::rand::fill(&mut incarnation)?;
+        let serving = Serving::new(
+            reader,
+            Arc::clone(&control),
+            (port, key, incarnation),
+            allowed,
+            network,
+            changes,
+        );
         let task = thread::Builder::new()
             .name("aterm-member-lan".into())
-            .spawn({
-                let control = Arc::clone(&control);
-                move || serve(reader, &control, port, key, incarnation, allowed, network)
-            })?;
+            .spawn(move || serve(serving))?;
         Ok(Self {
             port,
             key,
@@ -658,157 +686,381 @@ impl Drop for Responder {
     }
 }
 
-fn serve(
-    mut stop: std::io::PipeReader,
-    control: &Control,
+/// The kernel's network-change socket a responder waits on beside its links
+/// ([`aterm_uds::network::RouteChanges`]): its word is what prompts a look at the sources, so a
+/// responder that holds one waits with no deadline ([`next_look`]). None is held on a loopback
+/// network, where it could not be opened, once it has failed, and on an OS that has none; a
+/// responder without one looks every [`REFRESH`].
+struct Changes(
+    #[cfg(any(target_os = "macos", target_os = "linux"))] Option<aterm_uds::network::RouteChanges>,
+);
+
+impl Changes {
+    /// The socket for a responder on `scope`: the kernel's for a LAN, none for loopback, which
+    /// no change of network moves.
+    fn of(scope: Scope) -> Self {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            Self(
+                (scope == Scope::Lan)
+                    .then(aterm_uds::network::RouteChanges::open)
+                    .and_then(Result::ok),
+            )
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            let _ = scope;
+            Self()
+        }
+    }
+
+    /// Whether a socket is held, so a change of network will be heard.
+    fn held(&self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            self.0.is_some()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
+    /// The held socket's readiness, to poll beside the links.
+    fn fd(&self) -> Option<std::os::fd::BorrowedFd<'_>> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            self.0.as_ref().map(|changes| changes.as_fd())
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+
+    /// Read what a poll found waiting, and the rest of its burst: whether it named a change of
+    /// network. `None` when the socket failed, which drops it: it would poll readable again at
+    /// once and fail again, a spin.
+    fn read(&mut self) -> Option<bool> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let heard = self.0.as_ref()?.read_waiting();
+            if heard.is_none() {
+                self.0 = None;
+            }
+            heard
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            None
+        }
+    }
+}
+
+/// When a responder next looks at its sources with nothing to prompt it, decided at the look it
+/// began at `now`; `None` is no deadline, a wait until a link, its owner or the kernel has news.
+///
+/// - A change of network `heard` less than [`SETTLE`] before this look owes one more look
+///   `SETTLE` after it was heard, whatever else prompted this one ([`Serving::heard`]).
+/// - Otherwise a look is owed [`REFRESH`] from now where nothing else will prompt one: no change
+///   socket is held (`watched` is false), or this look left something `owed` that no change of
+///   network brings ([`Serving::look`]: it was refused while a source exists, or a bind or an
+///   announcement failed).
+/// - Otherwise none is: every source is served or refused by this network's own rule, and the
+///   kernel names the change that could alter either.
+fn next_look(now: Instant, watched: bool, owed: bool, heard: Option<Instant>) -> Option<Instant> {
+    heard
+        .map(|at| at + SETTLE)
+        .filter(|settle| *settle > now)
+        .or_else(|| (!watched || owed).then(|| now + REFRESH))
+}
+
+/// Whether a source [`Multicast::bind`] failed on is owed another try with no change of network
+/// to prompt it. A refusal by rule (`PermissionDenied`: a loopback or tunnel address on a LAN, an
+/// attachment that is not a live physical one) is decided by this machine's interfaces and
+/// addresses, whose changes the change socket names, so it is not; any other failure (no LAN
+/// broker, a port in use, a socket or join error) can end with none, so it is.
+fn bind_owed(error: &io::Error) -> bool {
+    error.kind() != io::ErrorKind::PermissionDenied
+}
+
+/// One responder's worker: what it answers with, the links it holds and when it next looks.
+struct Serving<A> {
+    stop: std::io::PipeReader,
+    control: Arc<Control>,
     port: u16,
     key: NodeKey,
     incarnation: [u8; NONCE],
-    allowed: impl Fn() -> bool,
+    allowed: A,
     network: Network,
-) {
-    #[cfg(test)]
-    let mut network = network;
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    let mut routes = (network.scope == Scope::Lan)
-        .then(aterm_uds::network::RouteChanges::open)
-        .and_then(Result::ok);
-    let mut sockets = Vec::new();
-    let mut refresh = Instant::now();
-    let mut replies = ReplyWindow::new(Instant::now());
-    let mut generation = 0_u64;
-    'serving: loop {
+    changes: Changes,
+    sockets: Vec<(Ipv4Addr, Multicast)>,
+    /// When the next look at the sources is owed; `None` waits with no deadline.
+    look: Option<Instant>,
+    /// When the last change of network was heard, until a look begins [`SETTLE`] or more after
+    /// it: every look begun sooner owes the settled one ([`next_look`]), so a look something
+    /// else prompts in between (a link that failed, a refused answer) does not end it.
+    heard: Option<Instant>,
+    /// Whether the last wait left its ready links unserved to look at a change first
+    /// ([`Self::wait_and_serve`]).
+    put_off: bool,
+    replies: ReplyWindow,
+    generation: u64,
+}
+
+impl<A: Fn() -> bool> Serving<A> {
+    /// A worker that holds no link yet and owes its first look now.
+    fn new(
+        stop: std::io::PipeReader,
+        control: Arc<Control>,
+        (port, key, incarnation): (u16, NodeKey, [u8; NONCE]),
+        allowed: A,
+        network: Network,
+        changes: Changes,
+    ) -> Self {
         let now = Instant::now();
-        if now >= refresh {
-            let current = (network.sources)();
-            sockets.retain(|(source, link): &(Ipv4Addr, Multicast)| {
-                current.contains(source) && link.recheck().is_ok()
-            });
-            let mut announcements = Vec::new();
-            if allowed() {
-                'sources: for source in current {
-                    if sockets.len() >= MAX_LINKS {
-                        break;
-                    }
-                    if !sockets.iter().any(|(held, _)| *held == source) {
-                        for link in links(&[source], network.port, network.scope) {
-                            let Some(next) = generation.checked_add(1) else {
-                                return;
-                            };
-                            generation = next;
-                            if !allowed() {
-                                sockets.clear();
-                                announcements.clear();
-                                break 'sources;
-                            }
-                            announcements.push((sockets.len(), generation));
-                            sockets.push(link);
-                        }
-                    }
-                }
-            } else {
-                sockets.clear();
-            }
-            // Finish every potentially blocking bind before announcing any attachment.
-            // Each newly bound allowed link emits once; healthy refreshes emit nothing.
-            for (index, generation) in announcements {
-                if !allowed() {
-                    sockets.clear();
+        Self {
+            stop,
+            control,
+            port,
+            key,
+            incarnation,
+            allowed,
+            network,
+            changes,
+            sockets: Vec::new(),
+            look: Some(now),
+            heard: None,
+            put_off: false,
+            replies: ReplyWindow::new(now),
+            generation: 0,
+        }
+    }
+
+    /// Look at the sources when a look is owed at `now`, and decide the next ([`next_look`]).
+    /// Breaks when the worker ends ([`Self::look`]).
+    fn look_if_due(&mut self, now: Instant) -> ControlFlow<()> {
+        if self.look.is_none_or(|at| now < at) {
+            return ControlFlow::Continue(());
+        }
+        let owed = self.look()?;
+        self.look = next_look(now, self.changes.held(), owed, self.heard);
+        self.heard = self.heard.filter(|heard| now < *heard + SETTLE);
+        #[cfg(test)]
+        if let Some(ready) = self.network.ready.take() {
+            let _ = ready.send(self.sockets.len());
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// One look: ask the sources once, drop each link whose source is gone or whose attachment
+    /// no longer checks, and, where `allowed`, bind each source that has no link and announce it.
+    /// A look `allowed` refuses holds no link. Says whether it left something owed that no change
+    /// of network will prompt ([`next_look`]): it was refused while a source exists, a bind
+    /// failed otherwise than by rule ([`bind_owed`]), or an announcement could not be sent.
+    /// Breaks when the announcement generations are spent, which ends the worker.
+    fn look(&mut self) -> ControlFlow<(), bool> {
+        let current = (self.network.sources)();
+        self.sockets
+            .retain(|(source, link)| current.contains(source) && link.recheck().is_ok());
+        let mut announcements = Vec::new();
+        let mut owed = false;
+        if (self.allowed)() {
+            'sources: for source in current {
+                if self.sockets.len() >= MAX_LINKS {
                     break;
                 }
-                let _ = sockets[index]
-                    .1
-                    .send(&announcement(&incarnation, generation));
+                if self.sockets.iter().any(|(held, _)| *held == source) {
+                    continue;
+                }
+                let link =
+                    match Multicast::bind(source, GROUP, self.network.port, self.network.scope) {
+                        Ok(link) => link,
+                        Err(error) => {
+                            owed |= bind_owed(&error);
+                            continue;
+                        }
+                    };
+                let Some(next) = self.generation.checked_add(1) else {
+                    return ControlFlow::Break(());
+                };
+                self.generation = next;
+                if !(self.allowed)() {
+                    self.sockets.clear();
+                    announcements.clear();
+                    owed = true;
+                    break 'sources;
+                }
+                announcements.push((self.sockets.len(), self.generation));
+                self.sockets.push((source, link));
             }
-            refresh = now + REFRESH;
-            #[cfg(test)]
-            if let Some(ready) = network.ready.take() {
-                let _ = ready.send(sockets.len());
+        } else {
+            self.sockets.clear();
+            owed = !current.is_empty();
+        }
+        // Finish every potentially blocking bind before announcing any attachment.
+        // Each newly bound allowed link emits once; healthy looks emit nothing.
+        for (index, generation) in announcements {
+            if !(self.allowed)() {
+                self.sockets.clear();
+                owed = true;
+                break;
             }
+            owed |= self.sockets[index]
+                .1
+                .send(&announcement(&self.incarnation, generation))
+                .is_err();
         }
-        let mut fds: Vec<_> = sockets.iter().map(|(_, link)| link.as_fd()).collect();
-        fds.push(stop.as_fd());
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        if let Some(routes) = &routes {
-            fds.push(routes.as_fd());
-        }
-        let Ok(ready) = aterm_uds::ready::any_until(&fds, refresh) else {
-            return;
+        ControlFlow::Continue(owed)
+    }
+
+    /// Wait for news until the next look is owed, with no deadline where none is, and serve
+    /// what came: a change of network, the owner's word, then the requests on each ready link.
+    /// Breaks when the owner stops the worker or the wait itself fails.
+    ///
+    /// Whatever can leave a link unfit owes a look now, since no timer comes to find it: a
+    /// heard change of network; a `receive` or `send` that failed (a withdrawn link fails its
+    /// `receive` before reading, so its datagram stays queued and its descriptor readable until
+    /// the look drops it: left to the next wait, that is a spin); and an answer or announcement
+    /// `allowed` refused, whose look drops the links as a refused look does.
+    ///
+    /// A wait that hears a change serves no link: the look comes first, and the requests stay
+    /// queued for the links it keeps. The wait after such a one serves its ready links whatever
+    /// it hears, so changes that keep coming (an interface that flaps) put the answers off by
+    /// one look and no more; each answer still asks `allowed`, and each link its own attachment.
+    fn wait_and_serve(&mut self) -> ControlFlow<()> {
+        let links = self.sockets.len();
+        let ready = {
+            let mut fds: Vec<_> = self.sockets.iter().map(|(_, link)| link.as_fd()).collect();
+            fds.push(self.stop.as_fd());
+            fds.extend(self.changes.fd());
+            match aterm_uds::ready::any(&fds, self.look) {
+                Ok(ready) => ready,
+                Err(_) => return ControlFlow::Break(()),
+            }
         };
-        if ready.contains(&sockets.len()) {
-            match control.take(&mut stop) {
-                ControlEvent::Stop => return,
+        let changed = ready.contains(&(links + 1)) && self.hear();
+        if ready.contains(&links) {
+            match self.control.take(&mut self.stop) {
+                ControlEvent::Stop => return ControlFlow::Break(()),
                 ControlEvent::Ready(Some(live)) => {
-                    let mut withdrawn = false;
-                    for (_, link) in &sockets {
-                        if !live
-                            .upgrade()
-                            .is_some_and(|live| live.load(Ordering::Acquire))
-                        {
-                            break;
-                        }
-                        if !allowed() {
-                            withdrawn = true;
-                            break;
-                        }
-                        if !live
-                            .upgrade()
-                            .is_some_and(|live| live.load(Ordering::Acquire))
-                        {
-                            break;
-                        }
-                        let Some(next) = generation.checked_add(1) else {
-                            return;
-                        };
-                        generation = next;
-                        let _ = link.send(&announcement(&incarnation, generation));
-                    }
-                    if withdrawn {
-                        // Match ordinary refresh's hold semantics. A transient failed
-                        // check must not consume the capability edge while retaining
-                        // silent old bindings when permission returns.
-                        sockets.clear();
-                        refresh = Instant::now();
-                        continue 'serving;
+                    if self.announce(&live)? {
+                        return ControlFlow::Continue(());
                     }
                 }
                 ControlEvent::Ready(None) => {}
             }
         }
+        self.put_off = changed && !self.put_off;
+        if self.put_off {
+            // The look comes before any answer: a request stays queued on its link, and is
+            // answered after the look by whichever links the look kept.
+            return ControlFlow::Continue(());
+        }
+        let mut look = false;
         for index in ready {
-            if index == sockets.len() {
-                continue;
-            }
-            if index > sockets.len() {
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
-                // A route socket that fails is dropped: it would poll readable again at once
-                // and fail again, a spin; the refresh timer still paces the rounds.
-                match routes
-                    .as_ref()
-                    .map(aterm_uds::network::RouteChanges::read_waiting)
-                {
-                    Some(Some(true)) => refresh = Instant::now(),
-                    Some(None) => routes = None,
-                    Some(Some(false)) | None => {}
-                }
+            if index >= links {
                 continue;
             }
             for _ in 0..MAX_PEERS {
-                let Ok(Some((wire, source))) = sockets[index].1.receive() else {
-                    break;
+                let (wire, source) = match self.sockets[index].1.receive() {
+                    Ok(Some(datagram)) => datagram,
+                    Ok(None) => break,
+                    Err(_) => {
+                        look = true;
+                        break;
+                    }
                 };
-                let Some(reply) = response(&wire, port, key) else {
+                let Some(reply) = response(&wire, self.port, self.key) else {
                     continue;
                 };
                 // Bounded replies allow concurrent local joiners and lost-packet
                 // retransmissions. Every answer goes to the fixed one-hop group.
-                if !replies.admit(source.ip(), &wire, Instant::now()) || !allowed() {
+                if !self.replies.admit(source.ip(), &wire, Instant::now()) {
                     continue;
                 }
-                let _ = sockets[index].1.send(&reply);
+                if !(self.allowed)() {
+                    look = true;
+                    continue;
+                }
+                look |= self.sockets[index].1.send(&reply).is_err();
+            }
+        }
+        if look {
+            self.look = Some(Instant::now());
+        }
+        ControlFlow::Continue(())
+    }
+
+    /// Read the change socket a poll found ready: whether it named a change of network, which
+    /// owes a look now and one more [`SETTLE`] on. A socket that fails is dropped and owes a look
+    /// now too, at which [`next_look`] starts the [`REFRESH`] pace of a responder that hears
+    /// nothing.
+    fn hear(&mut self) -> bool {
+        let heard = self.changes.read();
+        let now = Instant::now();
+        match heard {
+            Some(true) => {
+                self.heard = Some(now);
+                self.look = Some(now);
+                true
+            }
+            Some(false) => false,
+            None => {
+                self.look = Some(now);
+                false
             }
         }
     }
+
+    /// Announce on every link that a listener generation (`live`) became usable, asking `allowed`
+    /// before each: whether it was refused, which drops every link. Breaks when the announcement
+    /// generations are spent, which ends the worker.
+    fn announce(&mut self, live: &Weak<AtomicBool>) -> ControlFlow<(), bool> {
+        let lives = || {
+            live.upgrade()
+                .is_some_and(|live| live.load(Ordering::Acquire))
+        };
+        let mut withdrawn = false;
+        let mut failed = false;
+        for (_, link) in &self.sockets {
+            if !lives() {
+                break;
+            }
+            if !(self.allowed)() {
+                withdrawn = true;
+                break;
+            }
+            if !lives() {
+                break;
+            }
+            let Some(next) = self.generation.checked_add(1) else {
+                return ControlFlow::Break(());
+            };
+            self.generation = next;
+            failed |= link
+                .send(&announcement(&self.incarnation, self.generation))
+                .is_err();
+        }
+        if withdrawn {
+            // Match an ordinary look's hold semantics. A transient failed
+            // check must not consume the capability edge while retaining
+            // silent old bindings when permission returns.
+            self.sockets.clear();
+        }
+        if withdrawn || failed {
+            self.look = Some(Instant::now());
+        }
+        ControlFlow::Continue(withdrawn)
+    }
+}
+
+/// Run one responder's worker until its owner stops it: look at the sources when a look is owed,
+/// then wait for news and serve it.
+fn serve<A: Fn() -> bool>(mut serving: Serving<A>) {
+    while serving.look_if_due(Instant::now()).is_continue()
+        && serving.wait_and_serve().is_continue()
+    {}
 }
 
 #[cfg(test)]

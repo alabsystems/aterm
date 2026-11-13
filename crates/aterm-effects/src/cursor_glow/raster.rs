@@ -1431,14 +1431,20 @@ pub(crate) fn push_halo_rows(
     let rxi = (rx.round() as i32).max(1);
     let ryi = (ry.round() as i32).max(1);
     let (cxi, cyi) = (cx.round() as i32, cy.round() as i32);
+    // The effects box inside the overlay pixel space ([`OVERLAY_PX_MAX`]): every narrowing
+    // below is then exact.
+    let space = OVERLAY_PX_MAX;
     let x0 = (cxi - rxi).max(geom.fx_left());
-    let x1 = (cxi + rxi).min(geom.fx_right());
+    let x1 = (cxi + rxi).min(geom.fx_right()).min(space);
     let y0 = (cyi - ryi).max(geom.fx_top());
-    let y1 = (cyi + ryi).min(geom.fx_bot());
+    let y1 = (cyi + ryi).min(geom.fx_bot()).min(space);
     if x1 <= x0 || y1 <= y0 {
         return;
     }
-    if cxi < 0 || cyi < 0 {
+    // The centre and radii are stored as given, never clamped (a clamped centre would lay the
+    // sliver left in the box near peak weight): a halo whose centre or radius the space cannot
+    // hold has only its dim tail in it, and is dropped.
+    if cxi < 0 || cyi < 0 || cxi > space || cyi > space || rxi > space || ryi > space {
         return;
     }
     let ch = geom.ch as i32;
@@ -1567,7 +1573,7 @@ pub(super) const fn bolt_flash(u: f32) -> f32 {
         1.0
     } else {
         const INV_SPAN: f32 = 1.0 / (1.0 - BOLT_HOLD);
-        1.0 - BOLT_FADE * smoothstep01((u - BOLT_HOLD) * INV_SPAN)
+        1.0 - BOLT_FADE * smoothstep((u - BOLT_HOLD) * INV_SPAN)
     }
 }
 
@@ -1614,11 +1620,4 @@ pub(crate) const fn hsv2rgb(h: f32, s: f32, v: f32) -> u32 {
         (c.clamp(0.0, 1.0) * 255.0 + 0.5) as u32
     }
     (u(r) << 16) | (u(g) << 8) | u(b)
-}
-
-/// Cubic smoothstep `0..1` (Hermite): the classic AA/feather easing.
-#[inline]
-pub(super) const fn smoothstep01(x: f32) -> f32 {
-    let x = x.clamp(0.0, 1.0);
-    x * x * (3.0 - 2.0 * x)
 }

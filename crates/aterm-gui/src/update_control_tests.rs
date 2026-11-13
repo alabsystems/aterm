@@ -22,6 +22,10 @@ fn status() -> aterm_update::UpdateStatus {
         failing_persistent: false,
         failing_checks_kind: String::new(),
         channel_unreadable: false,
+        hold: None,
+        last: None,
+        offered: None,
+        behind: false,
         linux: None,
     }
 }
@@ -193,7 +197,11 @@ fn the_restored_agents_hold_is_named_while_it_holds() {
     );
 
     snapshot.posture = Some(ApplyPosture::Automatic);
-    snapshot.lane_hold = Some("setup-draft");
+    snapshot.lane_hold = Some(HoldSnapshot {
+        hold: LaneHold::SetupDraft,
+        elapsed_ms: 100,
+        boundary_item: None,
+    });
     assert_eq!(
         snapshot.apply_held(&status),
         Some("restored-agents"),
@@ -207,6 +215,151 @@ fn the_restored_agents_hold_is_named_while_it_holds() {
     );
     snapshot.posture = Some(ApplyPosture::ManualByConfig);
     assert_eq!(snapshot.apply_held(&status), None);
+}
+
+#[test]
+fn hold_diagnostics_follow_the_exact_artifact_and_the_selected_hold() {
+    use crate::native_updater_service::{
+        CheckCompletion, CheckStart, DurableUpdateStatus, NativeUpdaterService,
+    };
+    use std::time::{Duration, Instant};
+
+    let stage = |app: &mut App, status: &aterm_update::UpdateStatus| {
+        let mut service = NativeUpdaterService::new(10, "test", true);
+        let CheckStart::Start(ticket) = service.request_check() else {
+            panic!("fresh service");
+        };
+        assert_eq!(
+            service.finish_check(
+                ticket,
+                DurableUpdateStatus {
+                    linux_host: false,
+                    linux: None,
+                    enabled: status.enabled,
+                    current_build: status.current_build,
+                    staged_build: status.staged_build,
+                    staged_version: status.staged_version.clone(),
+                    staged_commit: status.staged_commit.clone(),
+                    staged_dmg_sha256: status.staged_dmg_sha256.clone(),
+                    changelog: None,
+                    outcome: String::new(),
+                    failing_checks: 0,
+                    failing_persistent: false,
+                    failing_kind: String::new(),
+                    failing_applies: 0,
+                    apply_failure: String::new(),
+                    apply_failure_build: 0,
+                    apply_failures_for_target: 0,
+                    installable: Some(true),
+                    channel_unreadable: false,
+                    checked_at: None,
+                    hold: None,
+                    behind: false,
+                }
+            ),
+            CheckCompletion::Reduced
+        );
+        app.native_updater_service = service;
+    };
+    let env = || crate::app_update_screen::ApplyPostureEnv {
+        handoff_unavailable: None,
+        auto_apply: crate::app_config::AutoApplySetting::On,
+        nudge_seam: false,
+    };
+    let mut status = status();
+    let mut app = App::headless_for_test();
+    stage(&mut app, &status);
+    let began = Instant::now();
+    let observed = began + Duration::from_secs(90);
+    let mut held = crate::native_update_lane_hold::NamedHold::default();
+    let _ = held.hold(11, LaneHold::BoundaryItem, "test mutation", began, 0);
+    app.auto_apply_intent = Some(crate::AutoApplyIntent {
+        build: 11,
+        dmg_sha256: [0xbb; 32],
+        retry_at: began,
+        attempts: 0,
+        deadline_owner: crate::AutoApplyDeadlineOwner::Ordinary,
+        held,
+    });
+    let capture = |app: &App, item| Snapshot::capture_at(app, env(), observed, item);
+    let first = capture(&app, Some(GuardedItem::HarnessNativeMutation));
+    assert_eq!(
+        first.apply_hold_fields(&status),
+        " apply_held=boundary-item apply_held_ms=90000 apply_boundary_item=harness-native-mutation"
+    );
+
+    status.staged_dmg_sha256 = Some("cc".repeat(32));
+    assert_eq!(
+        first.apply_hold_fields(&status),
+        "",
+        "a ledger reading of other bytes is unreconciled"
+    );
+    stage(&mut app, &status);
+    let replacement = capture(&app, Some(GuardedItem::HarnessNativeMutation));
+    assert!(
+        replacement.lane_hold.is_none(),
+        "same build, other bytes: the prior intent's hold is not this artifact's"
+    );
+    assert_eq!(replacement.apply_hold_fields(&status), "");
+
+    let intent = app.auto_apply_intent.as_mut().unwrap();
+    intent.dmg_sha256 = [0xcc; 32];
+    intent.held = crate::native_update_lane_hold::NamedHold::default();
+    let _ = intent
+        .held
+        .hold(11, LaneHold::BoundaryItem, "test publication", observed, 0);
+    let mut current = Snapshot::capture_at(
+        &app,
+        env(),
+        observed + Duration::from_millis(5),
+        Some(GuardedItem::ClonePublishRename),
+    );
+    assert_eq!(
+        current.apply_hold_fields(&status),
+        " apply_held=boundary-item apply_held_ms=5 apply_boundary_item=clone-publish-rename"
+    );
+    current.restored_hold = true;
+    assert_eq!(
+        current.apply_hold_fields(&status),
+        " apply_held=restored-agents",
+        "another hold's age is not the restored agents' age"
+    );
+    current.restored_hold = false;
+    current.applying = true;
+    current.account_work_hold = true;
+    assert_eq!(
+        current.apply_hold_fields(&status),
+        " apply_held=account-work"
+    );
+    current.applying = false;
+    current.posture = Some(ApplyPosture::ManualByConfig);
+    assert_eq!(
+        current.apply_hold_fields(&status),
+        "",
+        "manual policy names no automatic hold"
+    );
+
+    let unknown_item = capture(&app, None);
+    assert_eq!(
+        unknown_item.apply_hold_fields(&status),
+        " apply_held=boundary-item apply_held_ms=0",
+        "no boundary evidence is invented after its guard has gone"
+    );
+    let intent = app.auto_apply_intent.as_mut().unwrap();
+    intent.held = crate::native_update_lane_hold::NamedHold::default();
+    let _ = intent
+        .held
+        .hold(11, LaneHold::SetupDraft, "a draft", began, 0);
+    assert_eq!(
+        capture(&app, Some(GuardedItem::HarnessNativeMutation)).apply_hold_fields(&status),
+        " apply_held=setup-draft apply_held_ms=90000",
+        "an unrelated boundary does not describe this hold"
+    );
+    app.auto_apply_intent = None;
+    assert_eq!(
+        capture(&app, Some(GuardedItem::HarnessNativeMutation)).apply_hold_fields(&status),
+        ""
+    );
 }
 
 #[test]

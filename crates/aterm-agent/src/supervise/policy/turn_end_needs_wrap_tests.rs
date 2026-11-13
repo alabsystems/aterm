@@ -113,12 +113,12 @@ fn a_wrapped_need_is_read_whole_on_every_reader() {
                 cols,
                 &[
                     &["Merged the parser."],
-                    &["NEEDS YOU: the signing key", NEXT_LINE],
+                    &["NEEDS YOU: the signing nod", NEXT_LINE],
                 ],
             );
             assert_eq!(
                 needs_at_point(program, &short),
-                ["the signing key"],
+                ["the signing nod"],
                 "CONTROL: {at}: {short:#?}"
             );
         }
@@ -142,19 +142,19 @@ const PANES: [(Program, usize); 6] = [
 /// long first need's cap cut the second away.
 #[test]
 fn a_need_ending_near_the_edge_keeps_the_next_line_apart() {
-    const NEXT: &str = "NEEDS YOU: the signing key";
+    const NEXT: &str = "NEEDS YOU: the signing nod";
     for (program, cols) in PANES {
         let room = room(program, cols);
         let at = format!("{program:?} at {cols}");
-        let near = row_of("NEEDS YOU: the password", room - 3, "please");
+        let near = row_of("NEEDS YOU: the approval", room - 3, "please");
         let rows = reply_screen(program, cols, &[&["Merged the parser."], &[&near, NEXT]]);
         let need = near.trim_start_matches("NEEDS YOU: ");
         assert_eq!(
             needs_at_point(program, &rows),
-            [need, "the signing key"],
+            [need, "the signing nod"],
             "{at}: {rows:#?}"
         );
-        let first = row_of("NEEDS YOU: the Developer ID", room - 2, "cert,");
+        let first = row_of("NEEDS YOU: the release date", room - 2, "plan,");
         let second = row_of("which lives in", room - 3, "at all");
         let long = format!("{first} {second}");
         assert_eq!(ink_wrap(&long, room), [first.clone(), second], "{at}");
@@ -162,10 +162,10 @@ fn a_need_ending_near_the_edge_keeps_the_next_line_apart() {
         let need = long.trim_start_matches("NEEDS YOU: ");
         assert_eq!(
             needs_at_point(program, &rows),
-            [need, "the signing key"],
+            [need, "the signing nod"],
             "{at}: {rows:#?}"
         );
-        let ended = row_of("NEEDS YOU: the signing key for", room - 1, "0.145.0.");
+        let ended = row_of("NEEDS YOU: the signing nod for", room - 1, "0.145.0.");
         let rows = reply_screen(program, cols, &[&["Merged."], &[&ended, NEXT_LINE]]);
         assert_eq!(
             needs_at_point(program, &rows),
@@ -266,10 +266,10 @@ fn a_bare_head_its_clause_has_for_subject_is_prose_on_every_reader() {
             "{at}: {rows:#?}"
         );
         for need in [
-            "NEEDS YOU is the release key still valid for the notary's ticket, or should it be \
+            "NEEDS YOU is the release nod still valid for the lawyer's ticket, or should it be \
              rotated before the release goes out?",
             "NEEDS YOU must log in to the Apple Developer portal and accept the new agreement \
-             before the notary run.",
+             before the lawyer run.",
         ] {
             assert!(ink_wrap(need, room).len() > 1, "{at}");
             let rows = reply_screen(program, cols, &[&["Merged the parser."], &[need]]);

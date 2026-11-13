@@ -48,6 +48,7 @@ fn this_macs_real_readings_make_a_row() {
         chosen: None,
         hw_hint: "aaaaaaaaaaaaaaaa".into(),
         enrolled_ms: None,
+        former: Vec::new(),
     };
     let live = std::collections::BTreeSet::new();
     let made = plan(
@@ -58,8 +59,7 @@ fn this_macs_real_readings_make_a_row() {
             heard: true,
             now_ms: 400 * 86_400_000,
         },
-        &Default::default(),
-        &Default::default(),
+        &aterm_db::alab::View::empty_for_test(),
     )
     .expect("every reading fits its column or keeps out of the row");
     assert!(matches!(made.outcome, Outcome::Born { .. }));

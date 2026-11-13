@@ -55,7 +55,7 @@ fn grounds() -> Vec<Ground> {
 fn ground(name: &str) -> Ground {
     grounds()
         .into_iter()
-        .find(|g| g.name == name)
+        .find(|g| g.name.eq_ignore_ascii_case(name))
         .unwrap_or_else(|| panic!("{name} is a built-in"))
 }
 
@@ -657,6 +657,21 @@ fn a_cards_border_is_the_launch_cards_arc() {
                 "{rows}x{cols} ({r}, {c}): {got} against the launch card's {want}"
             );
         }
+        // The same mapping at any point of an edge, not a cell's centre alone: a pixel frame
+        // reads it by the pixel.
+        for (side, edge, long) in [
+            (0, Edge::Top, w),
+            (1, Edge::Right, h),
+            (2, Edge::Bottom, w),
+            (3, Edge::Left, h),
+        ] {
+            for at in [0.0, 0.125 * long, 0.5 * long, long - 0.3] {
+                let point = if side % 2 == 0 { (at, 0.0) } else { (0.0, at) };
+                let want = launch_arc(side, point, (w, h));
+                let got = perimeter_at(edge, at, w, h);
+                assert!((got - want).abs() < 1e-5, "{rows}x{cols} {edge:?} at {at}");
+            }
+        }
         let walk: Vec<f32> = clockwise(rows, cols)
             .into_iter()
             .map(|(r, c)| perimeter(r, c, rows, cols))
@@ -687,4 +702,48 @@ fn a_cards_border_is_the_launch_cards_arc() {
             "CONTROL: the reversed arc's top right at its mark"
         );
     }
+}
+
+/// A CARD'S FRAME TAKES THE ARC'S INKS ROUND ITS LINE (§1.4): [`GlassInks::border_at`] closes on
+/// itself (`0` and `1` are one ink) and mirrors about the corner it starts from, so a frame
+/// drawn in pixels meets itself at the top-left corner; under a palette it changes down a side,
+/// where a rule hued by its column alone is one ink, and round the card, read at each border
+/// cell's centre ([`perimeter`]). With no palette it is Claude's rule grey all round. Negative
+/// control: the arc read at one fraction all round is one ink.
+#[test]
+fn border_at_matches_the_cell_arc_at_cell_centres() {
+    let night = grounds().into_iter().next().expect("a built-in ground");
+    let (rows, cols) = (14, 62);
+    for palette in PALETTES {
+        let glass = GlassInks::of(palette, night.ground, night.ink, 0x0088_8888);
+        assert_eq!(glass.border_at(0.0), glass.border_at(1.0), "closed");
+        assert_eq!(glass.border_at(0.25), glass.border_at(0.75), "mirrored");
+        let round: std::collections::BTreeSet<u32> = clockwise(rows, cols)
+            .into_iter()
+            .map(|(r, c)| glass.border_at(perimeter(r, c, rows, cols)))
+            .collect();
+        match palette {
+            None => assert_eq!(
+                round.into_iter().collect::<Vec<_>>(),
+                [0x0088_8888],
+                "no palette: the rule grey all round"
+            ),
+            Some(_) => assert!(round.len() > 1, "{palette:?}: the arc, not one ink"),
+        }
+    }
+    let cruise = GlassInks::of(
+        Some(CardPalette::Cruise),
+        night.ground,
+        night.ink,
+        0x0088_8888,
+    );
+    let side: std::collections::BTreeSet<u32> = (1..rows - 1)
+        .map(|r| cruise.border_at(perimeter(r, cols - 1, rows, cols)))
+        .collect();
+    assert!(side.len() > 1, "the arc runs down a side");
+    let fixed: std::collections::BTreeSet<u32> = clockwise(rows, cols)
+        .into_iter()
+        .map(|_| cruise.border_at(0.125))
+        .collect();
+    assert_eq!(fixed.len(), 1, "CONTROL: one fraction is one ink");
 }

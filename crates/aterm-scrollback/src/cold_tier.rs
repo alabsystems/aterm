@@ -175,6 +175,16 @@ impl ColdTier {
     /// Get a line by index (0 = oldest available line, after `front_offset`).
     #[cfg_attr(trust_verify, trust::skip)]
     pub(crate) fn get_line(&self, idx: usize) -> Result<Option<Line>, super::ScrollbackError> {
+        self.with_line(idx, Clone::clone)
+    }
+
+    /// Borrow a line by index (`0` = oldest available line, after `front_offset`) without cloning.
+    #[cfg_attr(trust_verify, trust::skip)]
+    pub(crate) fn with_line<R>(
+        &self,
+        idx: usize,
+        f: impl FnOnce(&Line) -> R,
+    ) -> Result<Option<R>, super::ScrollbackError> {
         if idx >= self.line_count {
             return Ok(None);
         }
@@ -197,7 +207,7 @@ impl ColdTier {
                 .flatten()
                 .find(|(cached_idx, _)| *cached_idx == page_idx)
             {
-                let Some(line) = lines.get(line_in_page).cloned() else {
+                let Some(line) = lines.get(line_in_page) else {
                     return Err(super::ScrollbackError::Io(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
@@ -205,7 +215,7 @@ impl ColdTier {
                         ),
                     )));
                 };
-                return Ok(Some(line));
+                return Ok(Some(f(line)));
             }
         }
 
@@ -216,7 +226,7 @@ impl ColdTier {
             )));
         };
         let lines = page.decompress()?;
-        let Some(line) = lines.get(line_in_page).cloned() else {
+        let Some(line) = lines.get(line_in_page) else {
             return Err(super::ScrollbackError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -224,8 +234,9 @@ impl ColdTier {
                 ),
             )));
         };
+        let out = f(line);
         self.cache_page(page_idx, lines);
-        Ok(Some(line))
+        Ok(Some(out))
     }
 
     /// Resolve a physical line index to `(page_idx, line_in_page)`: the one

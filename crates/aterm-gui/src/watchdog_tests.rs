@@ -123,6 +123,7 @@ fn a_work_root_turn_is_attributable_and_a_designed_park_is_never_booked() {
         Breadcrumb::AboutToWait,
         Breadcrumb::UpdateHandoff,
         Breadcrumb::Modal,
+        Breadcrumb::Launching,
     ] {
         assert_eq!(
             TurnLedger::attributable_span(park, OPEN, OPEN + PARK_NS),
@@ -276,6 +277,8 @@ fn each_root_is_a_stall_only_as_a_work_root_past_the_bar() {
         (Breadcrumb::UpdateHandoff, ten_min, RELEASE_STALL_THRESHOLD, false),
         (Breadcrumb::AboutToWaitWork, STALL_THRESHOLD, STALL_THRESHOLD, true),
         (Breadcrumb::ShutdownWait, ten_min, STALL_THRESHOLD, false),
+        (Breadcrumb::Launching, ten_min, STALL_THRESHOLD, true),
+        (Breadcrumb::Launching, LAUNCH_STALL_BAR, LAUNCH_STALL_BAR, true),
     ];
     for (bc, frozen, bar, stall) in table {
         assert_eq!(
@@ -332,9 +335,10 @@ fn a_fork_waits_for_the_main_thread_to_park() {
         Breadcrumb::Startup,
         Breadcrumb::Modal,
         Breadcrumb::UpdateHandoff,
+        Breadcrumb::Launching,
     ] {
         beat_on(&watch, park);
-        assert!(watch.parked(), "{park:?} is a park point");
+        assert!(watch.parked(), "{park:?} lets a fork go");
         assert!(watch.wait_for_park(Duration::from_secs(60)), "{park:?}");
     }
 }
@@ -1411,6 +1415,7 @@ fn a_designed_freeze_or_a_thread_that_never_beat_is_never_refused() {
         Breadcrumb::Modal,
         Breadcrumb::UpdateHandoff,
         Breadcrumb::Startup,
+        Breadcrumb::Launching,
     ] {
         assert_eq!(
             main_stall(late, beat, root, false, Some(beat)),
@@ -1679,14 +1684,21 @@ fn beat_private(
 }
 
 #[cfg(any(unix, windows))]
-/// A test pace: a 100 ms bar sampled every 50 ms, no CPU reading and no stack.
+/// A test pace: a 100 ms bar sampled every 50 ms (the launch's too), no CPU reading and no
+/// stack; the launch's stage reads `TEST_STAGE` and a launch leaves by returning.
 const TEST_JUDGE: Judge = Judge {
     threshold: Duration::from_millis(100),
     sample: Duration::from_millis(50),
     abort: false,
     cpu: || None,
     stack: || None,
+    launch_bar: Duration::from_millis(100),
+    stage: || Some(TEST_STAGE),
+    leave: |_| {},
 };
+
+#[cfg(any(unix, windows))]
+const TEST_STAGE: &str = "inside a test's launch";
 
 #[cfg(any(unix, windows))]
 /// A loop running on `main` with `judge` and a wall watch told by hand (or none): what it saw,
@@ -1701,6 +1713,17 @@ struct Loop {
 #[cfg(any(unix, windows))]
 impl Loop {
     fn start(main: &'static MainWatch, judge: Option<Judge>, wall: bool) -> Self {
+        Self::start_with(main, judge, wall, |_| {})
+    }
+
+    /// [`Loop::start`], with `step` run on the loop's own thread at each event it sees, before
+    /// the event is sent: what `step` does lands at that point of the loop, with no timing.
+    fn start_with(
+        main: &'static MainWatch,
+        judge: Option<Judge>,
+        wall: bool,
+        step: impl Fn(Seen) + Send + 'static,
+    ) -> Self {
         let wall: Option<&'static aterm_uds::wall_watch::WallWatch> = wall.then(|| {
             &*Box::leak(Box::new(
                 aterm_uds::wall_watch::WallWatch::by_hand().expect("doorbell"),
@@ -1716,7 +1739,10 @@ impl Loop {
                 &move || {
                     let _ = moved_tx.send(());
                 },
-                &move |event| seen_tx.send(event).is_ok(),
+                &move |event| {
+                    step(event);
+                    seen_tx.send(event).is_ok()
+                },
             );
         });
         Self { seen, moved, wall }
@@ -1742,11 +1768,22 @@ impl Loop {
         );
     }
 
-    /// Events until `want`, which is returned with what came before it.
+    /// Events until `want`, which is returned with what came before it: one one-minute hang
+    /// detector for the whole wait, not one per event, so a loop that samples on and on without
+    /// `want` fails instead of hanging.
     fn until(&self, want: Seen) -> Vec<Seen> {
+        let deadline = Instant::now() + aterm_spec::wait::MUST_HAPPEN;
         let mut before = Vec::new();
         loop {
-            let event = self.next();
+            let left = deadline.saturating_duration_since(Instant::now());
+            let event = self.seen.recv_timeout(left).unwrap_or_else(|error| {
+                let last = &before[before.len().saturating_sub(8)..];
+                panic!(
+                    "the watchdog loop shows {want:?} within a minute ({error}), after {} other \
+                     events, the last {last:?}",
+                    before.len()
+                )
+            });
             if event == want {
                 return before;
             }
@@ -2019,6 +2056,475 @@ fn an_exit_inside_about_to_wait_parks_where_the_sampler_judges() {
         !main.claim_rest(true),
         "where a spin is judged, never rested"
     );
+}
+
+/// THE LAUNCH IS JUDGED AT ITS OWN BAR: a main thread that has not left the launch two seconds
+/// after it began is reported, under the release stall threshold, once per repeat interval, and a
+/// beat (the loop's first root) ends it. NEGATIVE CONTROL, in the test: the identical frozen
+/// schedule under `Startup`, the breadcrumb a launch had before the launch watch, reports nothing,
+/// even ten minutes on, which is how every 0.187.0 successor on m16 hung unseen. Reverting the fix
+/// (`Launching` a park point, or judged at the stall threshold) fails "reported at its bar".
+#[test]
+fn a_launch_frozen_past_its_bar_is_reported_and_the_same_schedule_at_startup_is_not() {
+    let schedule = [
+        (Duration::from_millis(1_900), false),
+        (LAUNCH_STALL_BAR, true),
+        (Duration::from_secs(3), false),
+        (Duration::from_secs(600), true),
+    ];
+    let t0 = Instant::now();
+    let mut launching = Sampler::with_threshold(t0, 1, RELEASE_STALL_THRESHOLD);
+    let mut startup = Sampler::with_threshold(t0, 1, RELEASE_STALL_THRESHOLD);
+    assert!(LAUNCH_STALL_BAR < RELEASE_STALL_THRESHOLD, "PRECONDITION");
+    for (at, reported) in schedule {
+        assert_eq!(
+            launching.poll(t0 + at, 1, Breadcrumb::Launching),
+            reported.then_some(Breadcrumb::Launching),
+            "reported at its bar, once per repeat interval: at {at:?}"
+        );
+        assert_eq!(
+            startup.poll(t0 + at, 1, Breadcrumb::Startup),
+            None,
+            "the same frozen schedule at Startup is never judged: at {at:?}"
+        );
+    }
+    assert_eq!(
+        launching.poll(
+            t0 + Duration::from_secs(601),
+            2,
+            Breadcrumb::AboutToWaitWork
+        ),
+        None,
+        "the loop's first root ends it"
+    );
+    assert_eq!(
+        launching.take_ended().map(|ended| (ended.root, ended.by)),
+        Some((Breadcrumb::Launching, EndedBy::Beat)),
+        "and the end is said"
+    );
+}
+
+/// A LAUNCH WITH AN EXIT BOUND LEAVES AT IT, ONCE; ONE WITHOUT NEVER DOES: the exit is decided
+/// only at `Launching`, only with an exit bound (a handoff successor's whose parent reads no
+/// progress), only once the launch has gone the bound without a beat, and once per launch.
+/// NEGATIVE CONTROLS, in the test: the same schedule with no bound (a launch that only reports)
+/// and at `Startup` with a bound never leave. Reverting the fix (`leave_due` answering `None`)
+/// fails "leaves at its bound".
+#[test]
+fn a_launch_unfinished_at_its_exit_bound_leaves_once_and_one_without_never() {
+    let bound = Some(LAUNCH_EXIT_BOUND);
+    let before = LAUNCH_EXIT_BOUND - Duration::from_secs(1);
+    let t0 = Instant::now();
+    let mut s = Sampler::with_threshold(t0, 1, RELEASE_STALL_THRESHOLD);
+    let at = |s: &mut Sampler, after: Duration, beat: u64, bc: Breadcrumb, exit| {
+        let now = t0 + after;
+        let _ = s.poll(now, beat, bc);
+        s.leave_due(now, beat, bc, exit)
+    };
+    assert_eq!(at(&mut s, before, 1, Breadcrumb::Launching, bound), None);
+    assert_eq!(
+        at(&mut s, LAUNCH_EXIT_BOUND, 1, Breadcrumb::Launching, bound),
+        Some(LAUNCH_EXIT_BOUND),
+        "leaves at its bound"
+    );
+    assert_eq!(
+        at(
+            &mut s,
+            LAUNCH_EXIT_BOUND * 2,
+            1,
+            Breadcrumb::Launching,
+            bound
+        ),
+        None,
+        "once"
+    );
+    let resumed = LAUNCH_EXIT_BOUND * 3;
+    assert_eq!(at(&mut s, resumed, 2, Breadcrumb::Launching, bound), None);
+    assert_eq!(
+        at(
+            &mut s,
+            resumed + LAUNCH_EXIT_BOUND,
+            2,
+            Breadcrumb::Launching,
+            bound
+        ),
+        Some(LAUNCH_EXIT_BOUND),
+        "a beat starts the next launch's count"
+    );
+
+    for (bc, exit, case) in [
+        (
+            Breadcrumb::Launching,
+            None,
+            "a launch without an exit bound only reports",
+        ),
+        (Breadcrumb::Startup, bound, "Startup is not the launch"),
+    ] {
+        let mut s = Sampler::with_threshold(t0, 1, RELEASE_STALL_THRESHOLD);
+        for after in [LAUNCH_EXIT_BOUND, Duration::from_secs(3_600)] {
+            assert_eq!(at(&mut s, after, 1, bc, exit), None, "{case}");
+        }
+    }
+}
+
+/// THE LAUNCH'S POLICY AND ITS END: `launching` stamps `Launching` with its exit bound, and
+/// `launch_finished` goes back to `Startup` and forgets the bound, so the synchronous launch after
+/// it (the dial, the claim) is unjudged as before and nothing later leaves by it.
+#[test]
+fn a_finished_launch_goes_back_to_startup_and_forgets_its_exit() {
+    let watch = MainWatch::new();
+    let _serial = beat_serial();
+    let exit = OnLaunchStall::Exit {
+        after: LAUNCH_EXIT_BOUND,
+        code: 72,
+    };
+    launching_on(&watch, exit);
+    assert_eq!(watch.current(), Breadcrumb::Launching);
+    assert_eq!(watch.on_launch_stall(), exit);
+    let beat = watch.heartbeat.load(Ordering::Relaxed);
+    launch_finished_on(&watch);
+    assert_eq!(watch.current(), Breadcrumb::Startup);
+    assert_eq!(watch.on_launch_stall(), OnLaunchStall::Log);
+    assert_eq!(
+        watch.heartbeat.load(Ordering::Relaxed),
+        beat + 1,
+        "the end is a beat"
+    );
+    launching_on(&watch, OnLaunchStall::Log);
+    assert_eq!(
+        (watch.current(), watch.on_launch_stall()),
+        (Breadcrumb::Launching, OnLaunchStall::Log)
+    );
+}
+
+/// THE REPORT NAMES WHERE AND WHAT NEXT: the AppKit stage the launch reached, and either that it
+/// only reports or the code and bound it leaves at; the exit line names the code.
+#[test]
+fn the_launch_report_names_the_stage_and_what_comes_next() {
+    let stage = "inside AppKit's own launch work";
+    let frozen = Duration::from_secs(2);
+    let logged = launch_stall_message(1, frozen, Some(stage), OnLaunchStall::Log, false);
+    assert!(logged.starts_with("LAUNCH STALL:"), "{logged}");
+    assert!(logged.contains(stage), "{logged}");
+    assert!(logged.contains("only reports"), "{logged}");
+    let exit = OnLaunchStall::Exit {
+        after: LAUNCH_EXIT_BOUND,
+        code: 72,
+    };
+    let leaving = launch_stall_message(1, frozen, Some(stage), exit, false);
+    assert!(
+        leaving.contains("exits with 72") && leaving.contains("20s"),
+        "{leaving}"
+    );
+    let again = launch_stall_message(2, frozen * 30, None, exit, true);
+    assert!(
+        again.starts_with("LAUNCH STALL CONTINUES:") && again.contains("ON-CPU"),
+        "{again}"
+    );
+    let left = launch_exit_message(LAUNCH_EXIT_BOUND, Some(stage), 72);
+    assert!(
+        left.starts_with("aterm could not start:")
+            && left.contains(stage)
+            && left.contains("exits with 72"),
+        "{left}"
+    );
+}
+
+/// The code [`LEAVING_JUDGE`]'s `leave` was last called with (0: not called).
+#[cfg(any(unix, windows))]
+static LEFT_WITH: AtomicI32 = AtomicI32::new(0);
+
+/// [`TEST_JUDGE`] whose `leave` records its code in [`LEFT_WITH`] and returns.
+#[cfg(any(unix, windows))]
+const LEAVING_JUDGE: Judge = Judge {
+    leave: |code| LEFT_WITH.store(code, Ordering::SeqCst),
+    ..TEST_JUDGE
+};
+
+/// THE SAMPLER CATCHES A STALLED LAUNCH FROM REST AND ONE WITH AN EXIT BOUND LEAVES: started over
+/// `Startup` it rests (nothing there is judged); the launch's beat rings it, it samples at the
+/// launch's pace, reports `Launching` at the bar and, with an exit bound, leaves through the
+/// judge's exit with its code. NEGATIVE CONTROLS, in the test: a launch that only reports (an
+/// ordinary one, or a successor's whose parent reads progress) is reported and never leaves;
+/// reverting the fix (no `leave(code)` in the loop, or `leave_due` answering `None`) fails "the
+/// exit itself ran with the code" or "shows Left(72) within a minute", never hangs.
+#[cfg(any(unix, windows))]
+#[test]
+fn a_stalled_launch_is_caught_from_rest_and_only_one_with_an_exit_bound_leaves() {
+    for (on_stall, leaves) in [
+        (
+            OnLaunchStall::Exit {
+                after: Duration::from_millis(300),
+                code: 72,
+            },
+            true,
+        ),
+        (OnLaunchStall::Log, false),
+    ] {
+        LEFT_WITH.store(0, Ordering::SeqCst);
+        let watch = private_watch();
+        let looped = Loop::start(watch.0, Some(LEAVING_JUDGE), true);
+        looped.settles();
+        watch.0.set_launch_policy(on_stall);
+        beat_private(watch, Breadcrumb::Launching);
+        let before = looped.until(Seen::Hit(Breadcrumb::Launching));
+        assert!(
+            !before.contains(&Seen::Waits { rest: true }),
+            "{on_stall:?}: armed throughout the stalled launch: {before:?}"
+        );
+        if leaves {
+            let before = looped.until(Seen::Left(72));
+            assert!(!before.contains(&Seen::Waits { rest: true }), "{before:?}");
+            assert_eq!(
+                LEFT_WITH.load(Ordering::SeqCst),
+                72,
+                "the exit itself ran with the code"
+            );
+        } else {
+            // 16 samples at the 50 ms pace: well past where the first case's 300 ms bound left.
+            let mut sampled = 0_usize;
+            while sampled < 16 {
+                let event = looped.next();
+                assert!(
+                    !matches!(event, Seen::Left(_)),
+                    "a launch that only reports never leaves: {event:?}"
+                );
+                sampled += usize::from(event == Seen::Sampled);
+            }
+            assert_eq!(LEFT_WITH.load(Ordering::SeqCst), 0, "and never exits");
+        }
+    }
+}
+
+/// THE LAUNCH IS SAMPLED AT HALF ITS BAR: at `Launching` the pace is the sample interval or half
+/// the launch's bar, whichever is shorter (release's 2.5 s sample against the 2 s bar: 1 s, so,
+/// counted from the sample the launch's own beat rings, the report comes at 2 s, not 2.5 s);
+/// every other root keeps the sample interval. NEGATIVE CONTROL: `pace` answering the sample
+/// interval at `Launching` fails "half the bar".
+#[test]
+fn the_launch_is_sampled_at_half_its_bar_and_every_other_root_at_the_sample() {
+    let release = Judge {
+        threshold: RELEASE_STALL_THRESHOLD,
+        sample: RELEASE_STALL_THRESHOLD / 2,
+        abort: false,
+        cpu: || None,
+        stack: || None,
+        launch_bar: LAUNCH_STALL_BAR,
+        stage: || None,
+        leave: |_| {},
+    };
+    assert_eq!(
+        release.pace(Breadcrumb::Launching),
+        Duration::from_secs(1),
+        "half the bar"
+    );
+    for bc in Breadcrumb::ALL {
+        if bc != Breadcrumb::Launching {
+            assert_eq!(release.pace(bc), release.sample, "{bc:?}");
+        }
+    }
+    let fast = Judge {
+        sample: Duration::from_millis(250),
+        ..release
+    };
+    assert_eq!(
+        fast.pace(Breadcrumb::Launching),
+        fast.sample,
+        "a sample already under half the bar stays"
+    );
+}
+
+/// THE EXIT BOUND COUNTS FROM THE PROCESS'S BIRTH, AND A LATE LAUNCH STILL GETS THE FLOOR: a
+/// launch that begins `age` into the process gets what is left of the bound, but never less than
+/// the floor (four report bars, about a hundred of m16's healthy launches). 0.177.0's 30 s dial
+/// clock starts at its launch request, before this birth, and the bound leaves the rest of its
+/// 30 s, 10 s, for LaunchServices' start of this process (before the birth) and the parent's
+/// notice of the exit (after it). Up to a 12 s start
+/// (the bound less the floor) the exit lands 20 s after the birth, the same point of the outgoing
+/// process's dial wait however long the start took; from 12 s to 22 s (the 30 s less the floor)
+/// it moves later, up to 30 s after the birth, eating that margin, so it can come after 0.177.0's
+/// dial bound; past 22 s it lands more than 30 s after the birth, always after that bound, where
+/// 0.177.0 books TimedOut as before the launch watch. An unread birth counts from the launch's
+/// start. NEGATIVE CONTROLS: answering the whole bound whatever the age (the launch-anchored
+/// bound) fails "what is left since the birth"; the floor at the report bar (the 2 s floor before
+/// this) fails "a launch that begins at the bound still gets the floor".
+#[test]
+fn the_launch_exit_bound_counts_from_the_process_birth_and_never_undercuts_the_floor() {
+    let cases = [
+        (
+            Some(Duration::ZERO),
+            LAUNCH_EXIT_BOUND,
+            "a launch at the birth",
+        ),
+        (
+            Some(Duration::from_secs(5)),
+            LAUNCH_EXIT_BOUND - Duration::from_secs(5),
+            "what is left since the birth",
+        ),
+        (
+            Some(LAUNCH_EXIT_BOUND - LAUNCH_EXIT_FLOOR),
+            LAUNCH_EXIT_FLOOR,
+            "the floor's edge",
+        ),
+        (
+            Some(LAUNCH_EXIT_BOUND),
+            LAUNCH_EXIT_FLOOR,
+            "a launch that begins at the bound still gets the floor",
+        ),
+        (
+            Some(Duration::from_secs(25)),
+            LAUNCH_EXIT_FLOOR,
+            "never under the floor",
+        ),
+        (
+            None,
+            LAUNCH_EXIT_BOUND,
+            "an unread birth counts from the launch",
+        ),
+    ];
+    for (age, after, case) in cases {
+        assert_eq!(launch_exit_after(age), after, "{case}: age {age:?}");
+    }
+    for ms in (0..=30_000).step_by(250) {
+        let age = Duration::from_millis(ms);
+        let after = launch_exit_after(Some(age));
+        assert!(after >= LAUNCH_EXIT_FLOOR, "the floor: {age:?}");
+        if age + LAUNCH_EXIT_FLOOR <= LAUNCH_EXIT_BOUND {
+            assert_eq!(
+                age + after,
+                LAUNCH_EXIT_BOUND,
+                "at the bound from the birth: {age:?}"
+            );
+        }
+        if age + LAUNCH_EXIT_FLOOR <= OLDEST_DIAL_BOUND {
+            assert!(
+                age + after <= OLDEST_DIAL_BOUND,
+                "within 30 s of the birth while the start took at most 22 s (0.177.0's own dial \
+                 clock starts earlier, at its launch request): {age:?}"
+            );
+        }
+    }
+}
+
+/// A SUCCESSOR LEAVES ITS STALLED LAUNCH TO A PARENT THAT READS PROGRESS: such a parent books a
+/// hang before the dial itself (Stalled, an unexplained failure whose repeats converge), so the
+/// launch only reports, however late it began; a parent that reads no progress (0.177.0) is sent
+/// the exit, with its code, after what is left of the bound since the birth, never under the
+/// floor. NEGATIVE CONTROL: `launch_stall_policy` answering the exit whatever the parent (the
+/// policy before this fix) fails "a parent that reads progress judges the hang itself".
+#[cfg(unix)]
+#[test]
+fn a_successor_leaves_its_stalled_launch_to_a_parent_that_reads_progress() {
+    for age in [
+        None,
+        Some(Duration::ZERO),
+        Some(Duration::from_secs(5)),
+        Some(Duration::from_secs(25)),
+    ] {
+        assert_eq!(
+            launch_stall_policy(true, age),
+            OnLaunchStall::Log,
+            "a parent that reads progress judges the hang itself: age {age:?}"
+        );
+        assert_eq!(
+            launch_stall_policy(false, age),
+            OnLaunchStall::Exit {
+                after: launch_exit_after(age),
+                code: crate::seamless::EXIT_SUCCESSOR_LAUNCH_STALLED,
+            },
+            "a parent that reads no progress is sent the exit: age {age:?}"
+        );
+    }
+    assert_eq!(
+        launch_stall_policy(false, Some(Duration::from_secs(25))),
+        OnLaunchStall::Exit {
+            after: LAUNCH_EXIT_FLOOR,
+            code: 72,
+        },
+        "a start past the bound still leaves the launch the floor"
+    );
+}
+
+/// THE LAUNCH'S BEAT WAKES A SAMPLER BETWEEN SAMPLES, WALL WATCH OR NOT: a sampler about to enter
+/// a timed wait (an hour long here, so nothing but a ring ends it within the test; no sample has
+/// found the main thread quiet yet, so it does not rest and a beat alone rings nothing) samples as
+/// soon as `launching` stamps the launch, so the launch's clock starts at its beat and the
+/// launch's pace (half its 100 ms bar) applies from there: the report follows. The beat lands
+/// inside the loop's own step, after the pace is chosen and before the wait begins, so no timing
+/// decides the sequence: the doorbell must already hold the ring when the wait looks, with no wall
+/// watch too. NEGATIVE CONTROLS: `launching_on` without its ring leaves the sampler in its hour's
+/// wait and fails "the launch's beat woke the sampler" at the one-minute hang detector, wall watch
+/// or not; the code before this fix (the doorbell made up front only beside a wall watch, and a
+/// ring that finds only a doorbell already made) fails the same with no wall watch.
+#[cfg(any(unix, windows))]
+#[test]
+fn the_launchs_beat_wakes_a_sampler_between_samples() {
+    let _serial = beat_serial();
+    for wall in [true, false] {
+        let watch = private_watch();
+        let hourly = Judge {
+            sample: Duration::from_secs(3_600),
+            ..TEST_JUDGE
+        };
+        let first = std::sync::atomic::AtomicBool::new(true);
+        let looped = Loop::start_with(watch.0, Some(hourly), wall, move |event| {
+            if event == (Seen::Waits { rest: false }) && first.swap(false, Ordering::SeqCst) {
+                launching_on(watch.0, OnLaunchStall::Log);
+            }
+        });
+        assert_eq!(
+            looped.next(),
+            Seen::Waits { rest: false },
+            "a timed wait at Startup (wall watch: {wall})"
+        );
+        let woke = looped
+            .seen
+            .recv_timeout(aterm_spec::wait::MUST_HAPPEN)
+            .unwrap_or_else(|error| {
+                panic!("the launch's beat woke the sampler (wall watch: {wall}): {error}")
+            });
+        assert_eq!(woke, Seen::Sampled, "wall watch: {wall}");
+        let before = looped.until(Seen::Hit(Breadcrumb::Launching));
+        assert!(
+            !before.contains(&Seen::Waits { rest: true }),
+            "armed throughout the stalled launch (wall watch: {wall}): {before:?}"
+        );
+    }
+}
+
+/// WITH THE JUDGING SWITCHED OFF, A LAUNCH'S RING WAKES NOTHING: `launching` rings the doorbell
+/// whatever the sampler, and the loop that judges nothing hears the wall alone. It makes no
+/// doorbell, so none it never clears can wake it on and on, and after a launch's ring a wall move
+/// is still the next thing it sees, then it waits again. NEGATIVE CONTROL: that loop polling the
+/// doorbell (the code before this fix, which made it at the first wait and never cleared it)
+/// fails "the loop that judges nothing makes no doorbell".
+#[cfg(any(unix, windows))]
+#[test]
+fn with_the_judging_switched_off_a_launchs_ring_wakes_nothing() {
+    let _serial = beat_serial();
+    let watch = private_watch();
+    let looped = Loop::start(watch.0, None, true);
+    let wall = looped.wall.expect("a wall watch");
+    let stepped = aterm_uds::wall_watch::Moved {
+        stepped: true,
+        ..Default::default()
+    };
+    assert_eq!(looped.next(), Seen::Waits { rest: true });
+    wall.tell(stepped);
+    assert_eq!(looped.next(), Seen::WallMoved);
+    assert_eq!(looped.next(), Seen::Waits { rest: true });
+    assert!(
+        watch.0.bell.get().is_none(),
+        "the loop that judges nothing makes no doorbell: it has waited once"
+    );
+    launching_on(watch.0, OnLaunchStall::Log);
+    wall.tell(stepped);
+    assert_eq!(
+        looped.next(),
+        Seen::WallMoved,
+        "the wall, not the ring, wakes the loop that judges nothing"
+    );
+    assert_eq!(looped.next(), Seen::Waits { rest: true });
 }
 
 /// Windows' std `Instant` counts a suspend, so the span it counted less the time the machine was

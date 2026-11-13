@@ -211,6 +211,7 @@ pub(super) fn begin(canon: PathBuf, policy: &Policy) -> Result<Walk, Refusal> {
         shares_blocks,
         policy: policy.clone(),
         links: policy.links_out.then(HashMap::new),
+        dirs_alloc: 0,
         link_totals: None,
         walked: 0,
         calls: 0,
@@ -256,6 +257,7 @@ fn file_sums(e: &Entry<'_>, private: bool) -> Sums {
 struct Sink<'a> {
     tree: &'a mut Tree,
     links: Option<&'a mut HashMap<(u64, u64), Link>>,
+    dirs_alloc: &'a mut u64,
     policy: &'a Policy,
     private: bool,
     walked: &'a mut u64,
@@ -324,6 +326,7 @@ impl Sink<'_> {
         } else {
             self.policy.deny.denies(&self.path.join(&name))
         };
+        *self.dirs_alloc = self.dirs_alloc.saturating_add(e.alloc);
         let r = self.tree.rec_mut(child);
         r.own.alloc_fair = e.alloc;
         r.subtree.alloc_fair = e.alloc;
@@ -444,6 +447,7 @@ impl Walk {
             stack,
             tree,
             links,
+            dirs_alloc,
             policy,
             walked,
             root_dev,
@@ -470,6 +474,7 @@ impl Walk {
             let mut sink = Sink {
                 tree,
                 links: links.as_mut(),
+                dirs_alloc,
                 policy,
                 private,
                 walked,

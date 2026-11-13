@@ -37,7 +37,7 @@ fn flushes<T>(f: impl FnOnce() -> T) -> (u64, u64) {
 /// fails on it.
 #[test]
 fn a_table_operation_takes_one_full_flush_on_an_ordered_journal() {
-    let lab = Lab::new(&[Role::Writer, Role::Writer]);
+    let lab = Lab::new(&[Role::Writer; 5]);
     let root = aterm_tempfile::tempdir().unwrap();
     let a = lab.bootstrap(0);
     let ours = Session::open(&a).unwrap();
@@ -46,7 +46,7 @@ fn a_table_operation_takes_one_full_flush_on_an_ordered_journal() {
     let b = lab.bootstrap(1);
     let theirs = Session::open(&b).unwrap();
     let mut peer = Store::join(&theirs, &root.path().join("b"), scope).unwrap();
-    let wires: Vec<Vec<u8>> = (0..3)
+    let wires: Vec<Vec<u8>> = (0..256)
         .map(|n| {
             let receipt = peer
                 .commit_catalog(&theirs, format!("peer {n}").as_bytes())
@@ -84,9 +84,34 @@ fn a_table_operation_takes_one_full_flush_on_an_ordered_journal() {
         let _durable = aterm_journal::seam::mutate(aterm_journal::seam::Mutant::Durable);
         flushes(|| control.ingest(&ours, &wires[2]).unwrap())
     };
+    // Keep the group readings in this test: the tally is process-wide, so a
+    // parallel test in this binary could count another writer's flushes.
+    let group_wires: Vec<_> = wires.iter().map(Vec::as_slice).collect();
+    let mut groups = Vec::new();
+    for (name, strict, apart) in [
+        ("group", false, false),
+        ("strict-group", true, false),
+        ("apart-group", false, true),
+    ] {
+        let _strict = strict.then(aterm_journal::seam::serve_strict);
+        let _apart = apart.then(aterm_journal::seam::apart);
+        // Each actor has one replica per scope; distinct receivers keep their
+        // custody independent instead of trying to enroll it at another path.
+        let bootstrap = lab.bootstrap(2 + groups.len());
+        let receiver = Session::open(&bootstrap).unwrap();
+        let mut group = Store::join(&receiver, &root.path().join(name), scope).unwrap();
+        let cost = flushes(|| {
+            let receipts = group.ingest_batch(&receiver, &group_wires).unwrap();
+            assert_eq!(receipts.len(), 256);
+        });
+        let retry = flushes(|| group.ingest_batch(&receiver, &group_wires).unwrap());
+        assert_eq!(retry, (0, 0), "exact retry of {name} must write nothing");
+        groups.push(cost);
+    }
     println!(
         "served={served:?}: local {local:?}, ingest {ingest:?}, strict local {strict_local:?}, \
-         strict ingest {strict_ingest:?}, durable (control) ingest {control_ingest:?}"
+         strict ingest {strict_ingest:?}, durable (control) ingest {control_ingest:?}, \
+         256-record groups (same-device, strict, apart) {groups:?}"
     );
     assert_eq!(
         served == astream_broker::Tier::Ordered,
@@ -104,6 +129,7 @@ fn a_table_operation_takes_one_full_flush_on_an_ordered_journal() {
     assert_eq!((strict_local, strict_ingest), ((5, 0), (5, 0)));
     assert_eq!(control_ingest, (5, 1));
     assert!(!one_commit(control_ingest), "the control is caught");
+    assert_eq!(groups, [(3, 260), (262, 0), (5, 258)]);
 }
 
 /// The `p`th percentile of `sorted`, nearest rank.

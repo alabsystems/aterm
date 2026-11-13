@@ -113,6 +113,9 @@ mod harness_versions;
 #[path = "../../src/hook.rs"]
 #[allow(dead_code)]
 mod hook;
+#[path = "../../src/host_fit.rs"]
+#[allow(dead_code)]
+mod host_fit;
 #[path = "../../src/input_record.rs"]
 mod input_record;
 #[path = "../../src/interrupt.rs"]
@@ -159,6 +162,9 @@ mod release_disk;
 #[path = "../../src/release_keychain.rs"]
 #[allow(dead_code)]
 mod release_keychain;
+#[path = "../../src/release_pump.rs"]
+#[allow(dead_code)]
+mod release_pump;
 #[path = "../../src/release_status.rs"]
 #[allow(dead_code)]
 mod release_status;

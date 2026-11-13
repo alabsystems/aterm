@@ -103,7 +103,7 @@ fn stand_in(script: &str) -> Command {
 /// spawned and no other; the command's stdout is the caller's and its code comes back.
 #[test]
 fn a_started_command_is_bound_for_its_life_and_reports_its_exit() {
-    let (reader, writer) = std::io::pipe().expect("pipe");
+    let (reader, writer) = aterm_uds::pipe().expect("pipe");
     let mut command = stand_in("echo ran; exit 7");
     command.stdout(writer);
     let marker = "/bin/bound-for-its-life".to_owned();
@@ -222,9 +222,9 @@ fn admitted_stdio_waits_for_its_native_sender() {
         let expired = age >= aterm_spec::wait::MUST_HAPPEN;
         let (client, server) = CtlStream::pair().unwrap();
         server.set_nonblocking(true).unwrap();
-        let (stdin, mut input) = std::io::pipe().unwrap();
-        let (mut output, stdout) = std::io::pipe().unwrap();
-        let (mut errors, stderr) = std::io::pipe().unwrap();
+        let (stdin, mut input) = aterm_uds::pipe().unwrap();
+        let (mut output, stdout) = aterm_uds::pipe().unwrap();
+        let (mut errors, stderr) = aterm_uds::pipe().unwrap();
         input.write_all(b"stdin proof").unwrap();
         drop(input);
         aterm_uds::fdpass::send_with_fds(
@@ -282,7 +282,7 @@ fn admitted_stdio_waits_for_its_native_sender() {
 fn stdio_is_exactly_three_descriptors() {
     use std::os::fd::AsFd as _;
     let (client, server) = CtlStream::pair().expect("pair");
-    let (read, write) = std::io::pipe().expect("pipe");
+    let (read, write) = aterm_uds::pipe().expect("pipe");
     aterm_uds::fdpass::send_with_fds(&client, b"s", &[read.as_fd(), write.as_fd(), write.as_fd()])
         .expect("send");
     assert!(receive_stdio(&server).is_some());
